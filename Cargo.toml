@@ -19,14 +19,21 @@ cli = [
 
 [dependencies]
 anyhow = "1"
-wasmer = { version = ">=7.1.0-rc.2" }
+# Vendored-in-Wasmer default: when this crate lives at `lib/napi`, resolve the
+# sibling Wasmer crates from the repo checkout.
+#
+# Cargo cannot override a direct `path = ...` dependency back to crates.io via
+# `[patch]`, so standalone builds of this repo should use
+# `./cargo-standalone.sh`, which selects `Cargo.standalone.toml` when the
+# sibling `../api`, `../wasix`, etc. tree is not present.
+wasmer = { version = "=7.1.0-rc.2", path = "../api" }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { version = ">=7.1.0-rc.2", optional = true }
-wasmer-compiler-llvm = { version = ">=7.1.0-rc.2", optional = true }
-wasmer-types = { version = ">=7.1.0-rc.2", optional = true }
-wasmer-wasix = { version = ">=0.701.0-rc.2", optional = true }
-virtual-fs = { version = ">=0.701.0-rc.2", optional = true }
+wasmer-cache = { version = "=7.1.0-rc.2", path = "../cache", optional = true }
+wasmer-compiler-llvm = { version = "=7.1.0-rc.2", path = "../compiler-llvm", optional = true }
+wasmer-types = { version = "=7.1.0-rc.2", path = "../types", optional = true }
+wasmer-wasix = { version = "=0.701.0-rc.2", path = "../wasix", optional = true }
+virtual-fs = { version = "=0.701.0-rc.2", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true}
 
 [build-dependencies]

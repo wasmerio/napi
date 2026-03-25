@@ -48,7 +48,7 @@ fn build_cli_binary() -> PathBuf {
     CLI_PATH
         .get_or_init(|| {
             let root = crate_root();
-            let status = Command::new(env!("CARGO"))
+            let status = Command::new("./cargo-standalone.sh")
                 .args(["build", "--features", "cli", "--bin", "napi_wasmer"])
                 .current_dir(&root)
                 .status()
