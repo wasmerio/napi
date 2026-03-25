@@ -38,8 +38,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=v8/src");
-    println!("cargo:rerun-if-changed=../src/edge_napi_embedder_hooks.cc");
-    println!("cargo:rerun-if-changed=../src/edge_napi_embedder_hooks.h");
+    println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.cc");
+    println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.h");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -57,12 +57,8 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-    let project_root = manifest_dir
-        .parent()
-        .expect("napi crate must live directly under the repo root");
     let napi_include = manifest_dir.join("include");
     let napi_v8_src = manifest_dir.join("v8/src");
-    let edge_src = project_root.join("src");
     let v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
     assert!(
         v8.include_dir.join("v8.h").exists(),
@@ -86,16 +82,10 @@ fn main() {
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
         .include(&v8.include_dir)
-        .include(edge_src.to_str().unwrap())
         .include(napi_include.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
-        .file(
-            edge_src
-                .join("edge_napi_embedder_hooks.cc")
-                .to_str()
-                .unwrap(),
-        )
+        .file("src/edge_napi_embedder_hooks.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
         .file(
