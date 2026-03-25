@@ -1,0 +1,4 @@
+.direnv
+target/
+jsc/build-jsc-check/
+jsc/tools/__pycache__/
