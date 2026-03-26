@@ -4,10 +4,10 @@
 
 use wasmer::FunctionEnvMut;
 
-use crate::{GuestBackingStoreMapping, HostBufferCopy, RuntimeEnv};
+use crate::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
 
 pub fn write_guest_bytes(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
     data: &[u8],
 ) -> bool {
@@ -19,32 +19,32 @@ pub fn write_guest_bytes(
     view.write(guest_ptr as u64, data).is_ok()
 }
 
-pub fn write_guest_u32(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: u32) -> bool {
+pub fn write_guest_u32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u32) -> bool {
     write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
 }
 
-pub fn write_guest_i32(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: i32) -> bool {
+pub fn write_guest_i32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: i32) -> bool {
     write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
 }
 
-pub fn write_guest_u64(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: u64) -> bool {
+pub fn write_guest_u64(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u64) -> bool {
     write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
 }
 
-pub fn write_guest_i64(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: i64) -> bool {
+pub fn write_guest_i64(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: i64) -> bool {
     write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
 }
 
-pub fn write_guest_f64(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: f64) -> bool {
+pub fn write_guest_f64(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: f64) -> bool {
     write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
 }
 
-pub fn write_guest_u8(env: &mut FunctionEnvMut<RuntimeEnv>, guest_ptr: u32, val: u8) -> bool {
+pub fn write_guest_u8(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u8) -> bool {
     write_guest_bytes(env, guest_ptr, &[val])
 }
 
 pub fn read_guest_bytes(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
     len: usize,
 ) -> Option<Vec<u8>> {
@@ -59,7 +59,7 @@ pub fn read_guest_bytes(
     Some(out)
 }
 
-pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<RuntimeEnv>, data: &[u8]) -> Option<u32> {
+pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
     let malloc_fn = env.data().malloc_fn.clone()?;
     let len = i32::try_from(data.len()).ok()?;
     let guest_ptr: i32 = {
@@ -75,7 +75,7 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<RuntimeEnv>, data: &[u8]) -
     Some(guest_ptr as u32)
 }
 
-pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<RuntimeEnv>, host_addr: u64) -> Option<u32> {
+pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
     let memory = env.data().memory.clone()?;
     let (_, store_ref) = env.data_and_store_mut();
     let view = memory.view(&store_ref);
@@ -102,7 +102,7 @@ pub fn resolve_guest_backing_store_mapping(
 }
 
 pub fn resolve_or_copy_host_data_to_guest(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     handle_id: u32,
     backing_store_token: u64,
     host_addr: u64,
@@ -156,7 +156,7 @@ pub fn resolve_or_copy_host_data_to_guest(
 }
 
 pub fn read_guest_u32_array(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
     count: usize,
 ) -> Option<Vec<u32>> {
@@ -169,7 +169,7 @@ pub fn read_guest_u32_array(
 }
 
 pub fn read_guest_c_string(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
 ) -> Option<Vec<u8>> {
     if guest_ptr < 0 {

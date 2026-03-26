@@ -8,7 +8,7 @@ use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
-    NapiVersion, NapiWasmerExtensionVersion, RuntimeEnv,
+    NapiVersion, NapiWasmerExtensionVersion, NapiEnv,
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
@@ -51,7 +51,7 @@ struct NapiSessionInner {
     ctx: Arc<NapiCtxInner>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
-    func_env: Mutex<Option<FunctionEnv<RuntimeEnv>>>,
+    func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
 }
 
 impl std::fmt::Debug for NapiSession {
@@ -274,7 +274,7 @@ impl NapiSession {
         let mut import_object = Imports::new();
         register_env_imports(store, &mut import_object);
 
-        let func_env = FunctionEnv::new(store, RuntimeEnv::default());
+        let func_env = FunctionEnv::new(store, NapiEnv::default());
         {
             let mut guard = self
                 .inner
@@ -321,7 +321,7 @@ impl NapiSession {
             func_env.as_mut(&mut *store).memory = Some(memory.clone());
         }
 
-        for export_name in ["unofficial_napi_guest_malloc", "ubi_guest_malloc", "malloc"] {
+        for export_name in ["unofficial_napi_guest_malloc", "malloc"] {
             if let Ok(malloc) = instance
                 .exports
                 .get_typed_function::<i32, i32>(&store, export_name)

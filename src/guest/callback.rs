@@ -2,11 +2,11 @@ use std::ffi::c_void;
 
 use wasmer::{FunctionEnvMut, Table, Value};
 
-use crate::{RuntimeEnv, snapi::SnapiEnv};
+use crate::{NapiEnv, snapi::SnapiEnv};
 
 use super::util::read_guest_bytes;
 
-type RawFunctionEnvMut = FunctionEnvMut<'static, RuntimeEnv>;
+type RawFunctionEnvMut = FunctionEnvMut<'static, NapiEnv>;
 
 #[repr(C)]
 struct CallbackInvocationCtx {
@@ -14,7 +14,7 @@ struct CallbackInvocationCtx {
 }
 
 fn call_guest_callback(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     table: &Table,
     guest_env: i32,
     wasm_fn_ptr: u32,
@@ -45,7 +45,7 @@ fn call_guest_callback(
 }
 
 fn flush_host_buffer_copies(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     frame_start: usize,
 ) {
@@ -53,7 +53,7 @@ fn flush_host_buffer_copies(
     env.data_mut().host_buffer_copy_frames.pop();
 }
 
-pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<RuntimeEnv>, snapi_env: SnapiEnv) {
+pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
     if snapi_env.is_null() || env.data().host_buffer_copies.is_empty() {
         return;
     }
@@ -92,7 +92,7 @@ pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<RuntimeEnv>, sn
 }
 
 pub fn flush_host_buffer_copies_since(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     frame_start: usize,
 ) {
@@ -127,7 +127,7 @@ pub fn flush_host_buffer_copies_since(
 }
 
 pub fn with_callback_state<R>(
-    env: &mut FunctionEnvMut<RuntimeEnv>,
+    env: &mut FunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     f: impl FnOnce() -> R,
 ) -> R {
@@ -136,7 +136,7 @@ pub fn with_callback_state<R>(
     }
 
     let mut ctx = CallbackInvocationCtx {
-        env: (env as *mut FunctionEnvMut<'_, RuntimeEnv>).cast::<RawFunctionEnvMut>(),
+        env: (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>(),
     };
     let frame_start = env.data().host_buffer_copies.len();
     let method_frame_depth = env.data().host_buffer_method_frames.len();
@@ -157,7 +157,7 @@ pub fn with_callback_state<R>(
     impl Drop for CallbackStateGuard {
         fn drop(&mut self) {
             if !self.env.is_null() {
-                let env = unsafe { &mut *self.env.cast::<FunctionEnvMut<'_, RuntimeEnv>>() };
+                let env = unsafe { &mut *self.env.cast::<FunctionEnvMut<'_, NapiEnv>>() };
                 flush_host_buffer_copies(env, self.snapi_env, self.frame_start);
                 env.data_mut()
                     .host_buffer_method_frames
@@ -199,7 +199,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] callback scope env cleared");
         return 0;
     }
-    let env = unsafe { &mut *ctx.env.cast::<FunctionEnvMut<'_, RuntimeEnv>>() };
+    let env = unsafe { &mut *ctx.env.cast::<FunctionEnvMut<'_, NapiEnv>>() };
     let Some(table) = env.data().table.clone() else {
         return 0;
     };

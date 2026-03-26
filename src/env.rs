@@ -18,7 +18,7 @@ pub(crate) struct GuestBackingStoreMapping {
 }
 
 #[derive(Default)]
-pub(crate) struct RuntimeEnv {
+pub(crate) struct NapiEnv {
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -45,7 +45,7 @@ pub(crate) struct RuntimeEnv {
     pub(crate) napi_scopes: HashMap<u32, u32>,
 }
 
-impl RuntimeEnv {
+impl NapiEnv {
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         let env_id = self.next_napi_env_id.max(1);
         self.next_napi_env_id = env_id.saturating_add(1);
@@ -82,7 +82,7 @@ impl RuntimeEnv {
     }
 }
 
-impl Drop for RuntimeEnv {
+impl Drop for NapiEnv {
     fn drop(&mut self) {
         let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
         for scope_id in scope_ids {
