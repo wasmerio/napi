@@ -24,8 +24,8 @@ wasmer = { version = "=7.1.0-rc.3" }
 wasmer-cache = { version = "=7.1.0-rc.3", optional = true }
 wasmer-compiler-llvm = { version = "=7.1.0-rc.3", optional = true }
 wasmer-types = { version = "=7.1.0-rc.3", optional = true }
-wasmer-wasix = { version = "=0.701.0-rc.2", optional = true }
-virtual-fs = { version = "=0.701.0-rc.2", optional = true }
+wasmer-wasix = { version = "=0.701.0-rc.3", optional = true }
+virtual-fs = { version = "=0.701.0-rc.3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true}
 enum-iterator = "2.3.0"
 

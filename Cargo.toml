@@ -31,8 +31,8 @@ wasmer = { version = "=7.1.0-rc.3", path = "../api" }
 wasmer-cache = { version = "=7.1.0-rc.3", path = "../cache", optional = true }
 wasmer-compiler-llvm = { version = "=7.1.0-rc.3", path = "../compiler-llvm", optional = true }
 wasmer-types = { version = "=7.1.0-rc.3", path = "../types", optional = true }
-wasmer-wasix = { version = "=0.701.0-rc.2", path = "../wasix", optional = true }
-virtual-fs = { version = "=0.701.0-rc.2", path = "../virtual-fs", optional = true }
+wasmer-wasix = { version = "=0.701.0-rc.3", path = "../wasix", optional = true }
+virtual-fs = { version = "=0.701.0-rc.3", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true}
 enum-iterator = "2.3.0"
 
