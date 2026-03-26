@@ -4,18 +4,29 @@ mod ctx;
 mod env;
 mod guest;
 mod snapi;
+use std::fmt::Display;
 
-pub(crate) const NAPI_MODULE_NAME: &str = "napi";
-pub(crate) const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
-pub(crate) const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
+pub const NAPI_MODULE_NAME: &str = "napi";
+pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
+pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 
 pub use ctx::{NapiCtx, NapiCtxBuilder, NapiLimits, NapiRuntimeHooks, NapiSession};
+use enum_iterator::Sequence;
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum NapiVersion {
     V10,
     Unknown,
+}
+
+impl Display for NapiVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NapiVersion::Unknown => write!(f, "napi_unknown"),
+            NapiVersion::V10 => write!(f, "napi_v10"),
+        }
+    }
 }
 
 impl NapiVersion {
