@@ -13,6 +13,7 @@ enum V8Method {
     Source,
 }
 
+#[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V8Origin {
     Local,
@@ -24,6 +25,7 @@ struct V8Config {
     include_dir: PathBuf,
     library_path: PathBuf,
     extra_links: Vec<ExtraLink>,
+    #[allow(unused)]
     origin: V8Origin,
 }
 
@@ -119,10 +121,6 @@ fn main() {
     emit_library_link(&v8.library_path);
     for extra_link in &v8.extra_links {
         emit_extra_link(extra_link);
-    }
-
-    if v8.origin == V8Origin::Prebuilt {
-        println!("cargo:warning=using prebuilt V8 {}", PREBUILT_V8_VERSION);
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
