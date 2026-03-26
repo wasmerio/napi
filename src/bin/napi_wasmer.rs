@@ -34,12 +34,7 @@ fn maybe_add_builtin_mounts(
             if node_lib.is_dir() {
                 std::fs::canonicalize(&node_lib).ok().unwrap_or(node_lib)
             } else {
-                bail!(
-                    "builtin js dir is not configured: neither {} nor {} exists under {}",
-                    repo_root.join("lib").display(),
-                    repo_root.join("node-lib").display(),
-                    repo_root.display()
-                );
+                return Ok(());
             }
         }
     };
@@ -91,6 +86,66 @@ fn maybe_add_builtin_mounts(
     Ok(())
 }
 
+fn resolve_app_dir_mount(extra_mounts: &mut Vec<GuestMount>, host_dir: &str) -> Result<()> {
+    let host_path = std::fs::canonicalize(host_dir)
+        .with_context(|| format!("failed to resolve app dir {}", host_dir))?;
+    if !host_path.is_dir() {
+        bail!("app dir must be a directory: {}", host_path.display());
+    }
+    extra_mounts.push(GuestMount {
+        host_path,
+        guest_path: PathBuf::from("/app"),
+    });
+    Ok(())
+}
+
+fn maybe_remap_first_guest_arg_to_app_mount(
+    guest_args: &mut [String],
+    extra_mounts: &mut Vec<GuestMount>,
+) -> Result<()> {
+    let Some(first_arg) = guest_args.first_mut() else {
+        return Ok(());
+    };
+    if first_arg.starts_with('-') {
+        return Ok(());
+    }
+
+    let host_script = PathBuf::from(&*first_arg);
+    let host_script = if host_script.is_absolute() {
+        host_script
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current dir")?
+            .join(host_script)
+    };
+
+    let Ok(host_script) = std::fs::canonicalize(&host_script) else {
+        return Ok(());
+    };
+    if !host_script.is_file() {
+        return Ok(());
+    }
+
+    let script_parent = host_script
+        .parent()
+        .ok_or_else(|| anyhow!("script has no parent dir: {}", host_script.display()))?;
+    if !extra_mounts
+        .iter()
+        .any(|mount| mount.guest_path == Path::new("/app"))
+    {
+        extra_mounts.push(GuestMount {
+            host_path: script_parent.to_path_buf(),
+            guest_path: PathBuf::from("/app"),
+        });
+    }
+
+    let script_name = host_script
+        .file_name()
+        .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
+    *first_arg = format!("/app/{}", script_name.to_string_lossy());
+    Ok(())
+}
+
 fn parse_mount(spec: &str) -> Result<GuestMount> {
     let (host, guest) = spec
         .split_once(':')
@@ -114,45 +169,43 @@ fn parse_mount(spec: &str) -> Result<GuestMount> {
 }
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let wasm_path = match args.next() {
+    let mut argv = std::env::args().skip(1);
+    let wasm_path = match argv.next() {
         Some(path) => PathBuf::from(path),
         None => {
             bail!(
-                "usage: napi_wasmer <wasm-file> [<script.js>] [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>]"
+                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--] [guest-args...]"
             );
         }
     };
 
-    let mut script_arg: Option<String> = None;
     let mut builtin_js_dir: Option<String> = None;
     let mut extra_mounts = Vec::new();
+    let mut guest_args = Vec::new();
+    let mut forwarding_guest_args = false;
 
-    while let Some(arg) = args.next() {
+    while let Some(arg) = argv.next() {
+        if forwarding_guest_args {
+            guest_args.push(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => forwarding_guest_args = true,
             "--app-dir" => {
-                let host_dir = args
+                let host_dir = argv
                     .next()
                     .ok_or_else(|| anyhow!("--app-dir requires a host directory"))?;
-                let host_path = std::fs::canonicalize(&host_dir)
-                    .with_context(|| format!("failed to resolve app dir {}", host_dir))?;
-                if !host_path.is_dir() {
-                    bail!("app dir must be a directory: {}", host_path.display());
-                }
-                extra_mounts.push(GuestMount {
-                    host_path,
-                    guest_path: PathBuf::from("/app"),
-                });
+                resolve_app_dir_mount(&mut extra_mounts, &host_dir)?;
             }
             "--mount" => {
-                let spec = args
+                let spec = argv
                     .next()
                     .ok_or_else(|| anyhow!("--mount requires <host-dir>:<guest-dir>"))?;
                 extra_mounts.push(parse_mount(&spec)?);
             }
             "--builtin-js-dir" => {
                 builtin_js_dir = Some(
-                    args.next()
+                    argv.next()
                         .ok_or_else(|| anyhow!("--builtin-js-dir requires a host directory"))?,
                 );
             }
@@ -164,51 +217,17 @@ fn main() -> Result<()> {
             }
             _ if arg.starts_with("--app-dir=") => {
                 let host_dir = arg.trim_start_matches("--app-dir=");
-                let host_path = std::fs::canonicalize(host_dir)
-                    .with_context(|| format!("failed to resolve app dir {}", host_dir))?;
-                if !host_path.is_dir() {
-                    bail!("app dir must be a directory: {}", host_path.display());
-                }
-                extra_mounts.push(GuestMount {
-                    host_path,
-                    guest_path: PathBuf::from("/app"),
-                });
+                resolve_app_dir_mount(&mut extra_mounts, host_dir)?;
             }
-            _ if script_arg.is_none() => script_arg = Some(arg),
-            _ => bail!("unexpected argument: {arg}"),
+            _ => {
+                forwarding_guest_args = true;
+                guest_args.push(arg);
+            }
         }
     }
 
-    let mut guest_args = Vec::new();
-    if let Some(script) = script_arg {
-        let host_script = PathBuf::from(&script);
-        let host_script = if host_script.is_absolute() {
-            host_script
-        } else {
-            std::env::current_dir()
-                .context("failed to resolve current dir")?
-                .join(host_script)
-        };
-        let host_script = std::fs::canonicalize(&host_script)
-            .with_context(|| format!("failed to resolve script {}", script))?;
-        let script_parent = host_script
-            .parent()
-            .ok_or_else(|| anyhow!("script has no parent dir: {}", host_script.display()))?;
-        if !extra_mounts
-            .iter()
-            .any(|mount| mount.guest_path == Path::new("/app"))
-        {
-            extra_mounts.push(GuestMount {
-                host_path: script_parent.to_path_buf(),
-                guest_path: PathBuf::from("/app"),
-            });
-        }
-        let script_name = host_script
-            .file_name()
-            .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
-        guest_args.push(format!("/app/{}", script_name.to_string_lossy()));
-        maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
-    }
+    maybe_remap_first_guest_arg_to_app_mount(&mut guest_args, &mut extra_mounts)?;
+    maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
 
     let ctx = NapiCtx::default();
     let (exit_code, _stdout, _stderr) =
