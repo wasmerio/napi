@@ -34,6 +34,7 @@ wasmer-types = { version = "=7.1.0-rc.2", path = "../types", optional = true }
 wasmer-wasix = { version = "=0.701.0-rc.2", path = "../wasix", optional = true }
 virtual-fs = { version = "=0.701.0-rc.2", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true}
+enum-iterator = "2.3.0"
 
 [build-dependencies]
 cc = "1"
