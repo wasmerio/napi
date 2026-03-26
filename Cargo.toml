@@ -1,10 +1,9 @@
 [package]
-name = "napi-wasmer"
+name = "wasmer-napi"
 version = "0.1.0"
 description = "NAPI library for Wasmer WebAssembly runtime"
 edition = "2024"
 license = "MIT"
-
 resolver = "2"
 
 [features]
