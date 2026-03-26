@@ -8,7 +8,7 @@ use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
-    NapiVersion, NapiWasmerExtensionVersion, NapiEnv,
+    NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
@@ -472,10 +472,7 @@ mod tests {
 
         assert_eq!(
             NapiCtx::module_needs_napi(&module),
-            (
-                Some(NapiVersion::V10),
-                Some(NapiWasmerExtensionVersion::V0)
-            )
+            (Some(NapiVersion::V10), Some(NapiWasmerExtensionVersion::V0))
         );
     }
 
@@ -489,17 +486,16 @@ mod tests {
 
     #[test]
     fn napi_wasmer_extension_version_compatibility_is_strict() {
-        assert!(NapiWasmerExtensionVersion::V0.is_compatible_with(
-            NapiWasmerExtensionVersion::V0
-        ));
-        assert!(!NapiWasmerExtensionVersion::V0.is_compatible_with(
-            NapiWasmerExtensionVersion::Unknown
-        ));
-        assert!(!NapiWasmerExtensionVersion::Unknown.is_compatible_with(
-            NapiWasmerExtensionVersion::V0
-        ));
-        assert!(!NapiWasmerExtensionVersion::Unknown.is_compatible_with(
-            NapiWasmerExtensionVersion::Unknown
-        ));
+        assert!(NapiWasmerExtensionVersion::V0.is_compatible_with(NapiWasmerExtensionVersion::V0));
+        assert!(
+            !NapiWasmerExtensionVersion::V0.is_compatible_with(NapiWasmerExtensionVersion::Unknown)
+        );
+        assert!(
+            !NapiWasmerExtensionVersion::Unknown.is_compatible_with(NapiWasmerExtensionVersion::V0)
+        );
+        assert!(
+            !NapiWasmerExtensionVersion::Unknown
+                .is_compatible_with(NapiWasmerExtensionVersion::Unknown)
+        );
     }
 }

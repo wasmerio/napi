@@ -656,10 +656,7 @@ fn guest_unofficial_napi_set_fatal_error_callbacks(
     unsafe { snapi_bridge_unofficial_set_fatal_error_callbacks(env_handle, fatal_id, oom_id) }
 }
 
-fn guest_unofficial_napi_terminate_execution(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-) -> i32 {
+fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
 }
@@ -761,8 +758,7 @@ fn guest_unofficial_napi_deserialize_value(
     0
 }
 
-fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<NapiEnv>, _payload: i32) {
-}
+fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<NapiEnv>, _payload: i32) {}
 
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
@@ -2210,12 +2206,7 @@ fn guest_napi_create_string_latin1(
     s
 }
 
-fn guest_napi_create_int32(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    value: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_create_int32(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_int32(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
@@ -2225,12 +2216,7 @@ fn guest_napi_create_int32(
     s
 }
 
-fn guest_napi_create_uint32(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    value: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_create_uint32(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_uint32(snapi_env(&env, e), value as u32, &mut out) };
     if s == 0 {
@@ -2239,12 +2225,7 @@ fn guest_napi_create_uint32(
     s
 }
 
-fn guest_napi_create_double(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    value: f64,
-    rp: i32,
-) -> i32 {
+fn guest_napi_create_double(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: f64, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_double(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
@@ -2253,12 +2234,7 @@ fn guest_napi_create_double(
     s
 }
 
-fn guest_napi_create_int64(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    value: i64,
-    rp: i32,
-) -> i32 {
+fn guest_napi_create_int64(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i64, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_int64(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
@@ -2301,12 +2277,7 @@ fn guest_napi_create_array_with_length(
     s
 }
 
-fn guest_napi_create_symbol(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    desc: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_create_symbol(mut env: FunctionEnvMut<NapiEnv>, e: i32, desc: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_symbol(snapi_env(&env, e), desc as u32, &mut out) };
     if s == 0 {
@@ -2497,12 +2468,7 @@ fn guest_napi_get_value_string_latin1(
     0
 }
 
-fn guest_napi_get_value_int32(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_value_int32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i32 = 0;
     let s = unsafe { snapi_bridge_get_value_int32(snapi_env(&env, e), vh as u32, &mut r) };
     if s == 0 {
@@ -2511,12 +2477,7 @@ fn guest_napi_get_value_int32(
     s
 }
 
-fn guest_napi_get_value_uint32(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_value_uint32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: u32 = 0;
     let s = unsafe { snapi_bridge_get_value_uint32(snapi_env(&env, e), vh as u32, &mut r) };
     if s == 0 {
@@ -2525,12 +2486,7 @@ fn guest_napi_get_value_uint32(
     s
 }
 
-fn guest_napi_get_value_double(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_value_double(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: f64 = 0.0;
     let s = unsafe { snapi_bridge_get_value_double(snapi_env(&env, e), vh as u32, &mut r) };
     if s == 0 {
@@ -2539,12 +2495,7 @@ fn guest_napi_get_value_double(
     s
 }
 
-fn guest_napi_get_value_int64(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_value_int64(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i64 = 0;
     let s = unsafe { snapi_bridge_get_value_int64(snapi_env(&env, e), vh as u32, &mut r) };
     if s == 0 {
@@ -2905,12 +2856,7 @@ fn guest_napi_delete_element(
     s
 }
 
-fn guest_napi_get_array_length(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    ah: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: i32, ah: i32, rp: i32) -> i32 {
     let mut r: u32 = 0;
     let s = unsafe { snapi_bridge_get_array_length(snapi_env(&env, e), ah as u32, &mut r) };
     if s == 0 {
@@ -2919,12 +2865,7 @@ fn guest_napi_get_array_length(
     s
 }
 
-fn guest_napi_get_property_names(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    o: i32,
-    rp: i32,
-) -> i32 {
+fn guest_napi_get_property_names(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_get_property_names(snapi_env(&env, e), o as u32, &mut out) };
     if s == 0 {

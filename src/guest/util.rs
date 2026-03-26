@@ -6,11 +6,7 @@ use wasmer::FunctionEnvMut;
 
 use crate::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
 
-pub fn write_guest_bytes(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: u32,
-    data: &[u8],
-) -> bool {
+pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
     let (state, store) = env.data_and_store_mut();
     let Some(memory) = state.memory.clone() else {
         return false;
@@ -168,10 +164,7 @@ pub fn read_guest_u32_array(
     Some(result)
 }
 
-pub fn read_guest_c_string(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
-) -> Option<Vec<u8>> {
+pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) -> Option<Vec<u8>> {
     if guest_ptr < 0 {
         return None;
     }
