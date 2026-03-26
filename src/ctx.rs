@@ -7,8 +7,9 @@ use std::sync::{
 use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
 use crate::{
-    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, RuntimeEnv,
-    guest::napi::{register_env_imports, register_napi_imports},
+    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
+    NapiVersion, NapiWasmerExtensionVersion, RuntimeEnv,
+    guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -119,13 +120,36 @@ impl NapiCtx {
         self.new_session(module)
     }
 
-    pub fn module_needs_napi(module: &Module) -> bool {
-        module.imports().any(|import| {
-            matches!(
-                import.module(),
-                NAPI_MODULE_NAME | NAPI_EXTENSION_WASMER_MODULE_NAME
-            )
-        })
+    pub fn module_needs_napi(
+        module: &Module,
+    ) -> (Option<NapiVersion>, Option<NapiWasmerExtensionVersion>) {
+        let mut napi_version = None;
+        let mut napi_extension_version = None;
+
+        for import in module.imports() {
+            if import.module() == NAPI_MODULE_NAME {
+                napi_version = Some(match napi_version {
+                    Some(NapiVersion::Unknown) => NapiVersion::Unknown,
+                    _ if is_known_napi_import(import.name()) => NapiVersion::V10,
+                    _ => NapiVersion::Unknown,
+                });
+                continue;
+            }
+
+            let Some(detected_extension_version) =
+                napi_wasmer_extension_version_from_namespace(import.module())
+            else {
+                continue;
+            };
+
+            napi_extension_version = Some(match napi_extension_version {
+                None => detected_extension_version,
+                Some(existing) if existing == detected_extension_version => existing,
+                Some(_) => NapiWasmerExtensionVersion::Unknown,
+            });
+        }
+
+        (napi_version, napi_extension_version)
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
@@ -181,8 +205,21 @@ impl NapiRuntimeHooks {
     }
 
     pub fn additional_imports(&self, module: &Module, store: &mut StoreMut<'_>) -> Result<Imports> {
-        if !NapiCtx::module_needs_napi(module) {
+        let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
+        if napi_version.is_none() && napi_extension_version.is_none() {
             return Ok(Imports::new());
+        }
+
+        if let Some(version) = napi_version
+            && !NapiVersion::V10.is_compatible_with(version)
+        {
+            bail!("unsupported N-API import version: {version:?}");
+        }
+
+        if let Some(version) = napi_extension_version
+            && !NapiWasmerExtensionVersion::V0.is_compatible_with(version)
+        {
+            bail!("unsupported Wasmer N-API extension version: {version:?}");
         }
 
         let session = self.ctx.prepare_module(module)?;
@@ -205,7 +242,8 @@ impl NapiRuntimeHooks {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
     ) -> Result<()> {
-        if !NapiCtx::module_needs_napi(module) {
+        let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
+        if napi_version.is_none() && napi_extension_version.is_none() {
             return Ok(());
         }
 
@@ -300,10 +338,26 @@ impl NapiSession {
     }
 }
 
+fn napi_wasmer_extension_version_from_namespace(
+    namespace: &str,
+) -> Option<NapiWasmerExtensionVersion> {
+    if namespace == NAPI_EXTENSION_WASMER_MODULE_NAME {
+        return Some(NapiWasmerExtensionVersion::V0);
+    }
+
+    let suffix = namespace.strip_prefix(NAPI_EXTENSION_WASMER_MODULE_PREFIX)?;
+    Some(match suffix {
+        "0" => NapiWasmerExtensionVersion::V0,
+        _ => NapiWasmerExtensionVersion::Unknown,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::NapiCtx;
+    use crate::{NapiVersion, NapiWasmerExtensionVersion};
     use wasmer::{Module, Store};
+    use wat::parse_str;
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
@@ -326,5 +380,126 @@ mod tests {
             .prepare_module(&module)
             .expect("session slot should be released after drop");
         assert_eq!(ctx.active_sessions(), 1);
+    }
+
+    fn compile_wat(store: &Store, wat: &str) -> Module {
+        let wasm = parse_str(wat).expect("wat module parses");
+        Module::new(store, wasm).expect("wat module compiles")
+    }
+
+    #[test]
+    fn module_needs_napi_detects_none() {
+        let store = Store::default();
+        let module = Module::new(&store, EMPTY_WASM_MODULE).expect("empty wasm module compiles");
+
+        assert_eq!(NapiCtx::module_needs_napi(&module), (None, None));
+    }
+
+    #[test]
+    fn module_needs_napi_detects_core_napi_v10() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (Some(NapiVersion::V10), None)
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_detects_unknown_core_napi() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_future_function" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (Some(NapiVersion::Unknown), None)
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_detects_extension_v0() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi_extension_wasmer_v0" "unofficial_napi_get_hash_seed" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (None, Some(NapiWasmerExtensionVersion::V0))
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_detects_unknown_extension_version() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi_extension_wasmer_v1" "unofficial_napi_get_hash_seed" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (None, Some(NapiWasmerExtensionVersion::Unknown))
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_detects_mixed_namespaces() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func))
+                (import "napi_extension_wasmer_v0" "unofficial_napi_get_hash_seed" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (
+                Some(NapiVersion::V10),
+                Some(NapiWasmerExtensionVersion::V0)
+            )
+        );
+    }
+
+    #[test]
+    fn napi_version_compatibility_is_additive() {
+        assert!(NapiVersion::V10.is_compatible_with(NapiVersion::V10));
+        assert!(!NapiVersion::V10.is_compatible_with(NapiVersion::Unknown));
+        assert!(NapiVersion::Unknown.is_compatible_with(NapiVersion::V10));
+        assert!(!NapiVersion::Unknown.is_compatible_with(NapiVersion::Unknown));
+    }
+
+    #[test]
+    fn napi_wasmer_extension_version_compatibility_is_strict() {
+        assert!(NapiWasmerExtensionVersion::V0.is_compatible_with(
+            NapiWasmerExtensionVersion::V0
+        ));
+        assert!(!NapiWasmerExtensionVersion::V0.is_compatible_with(
+            NapiWasmerExtensionVersion::Unknown
+        ));
+        assert!(!NapiWasmerExtensionVersion::Unknown.is_compatible_with(
+            NapiWasmerExtensionVersion::V0
+        ));
+        assert!(!NapiWasmerExtensionVersion::Unknown.is_compatible_with(
+            NapiWasmerExtensionVersion::Unknown
+        ));
     }
 }

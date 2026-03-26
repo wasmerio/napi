@@ -171,7 +171,8 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
         let mut runtime = PluggableRuntime::new(task_manager);
         runtime.set_engine(engine.clone());
 
-        if NapiCtx::module_needs_napi(&module) {
+        let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(&module);
+        if napi_version.is_some() || napi_extension_version.is_some() {
             runner
                 .capabilities_mut()
                 .threading

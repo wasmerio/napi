@@ -2071,6 +2071,7 @@ dependencies = [
  "wasmer-compiler-llvm",
  "wasmer-types",
  "wasmer-wasix",
+ "wat",
  "xz",
 ]
 
