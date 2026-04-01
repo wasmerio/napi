@@ -133,6 +133,64 @@ napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
   return value;
 }
 
+napi_value GetNamedPropertyOrNull(napi_env env, napi_value object, const char* name) {
+  if (env == nullptr || object == nullptr || name == nullptr) return nullptr;
+  bool has_property = false;
+  if (napi_has_named_property(env, object, name, &has_property) != napi_ok || !has_property) {
+    return nullptr;
+  }
+  napi_value result = nullptr;
+  if (napi_get_named_property(env, object, name, &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+napi_status CreateCallerLocationFromCallSite(napi_env env,
+                                             napi_value callsite,
+                                             napi_value* location_out) {
+  if (env == nullptr || location_out == nullptr) return napi_invalid_arg;
+  *location_out = nullptr;
+  if (callsite == nullptr) return napi_ok;
+
+  napi_value file = GetNamedPropertyOrNull(env, callsite, "scriptNameOrSourceURL");
+  if (file == nullptr) file = GetNamedPropertyOrNull(env, callsite, "scriptName");
+  napi_value line_value = GetNamedPropertyOrNull(env, callsite, "lineNumber");
+  napi_value column_value = GetNamedPropertyOrNull(env, callsite, "columnNumber");
+  if (file == nullptr || line_value == nullptr || column_value == nullptr) return napi_ok;
+
+  napi_valuetype file_type = napi_undefined;
+  size_t file_length = 0;
+  if (napi_typeof(env, file, &file_type) != napi_ok || file_type != napi_string ||
+      napi_get_value_string_utf8(env, file, nullptr, 0, &file_length) != napi_ok || file_length == 0) {
+    return napi_ok;
+  }
+
+  uint32_t line = 0;
+  uint32_t column = 0;
+  if (napi_get_value_uint32(env, line_value, &line) != napi_ok ||
+      napi_get_value_uint32(env, column_value, &column) != napi_ok) {
+    return napi_ok;
+  }
+
+  napi_value location = nullptr;
+  napi_value line_out = nullptr;
+  napi_value column_out = nullptr;
+  if (napi_create_array_with_length(env, 3, &location) != napi_ok || location == nullptr ||
+      napi_create_uint32(env, line, &line_out) != napi_ok || line_out == nullptr ||
+      napi_create_uint32(env, column, &column_out) != napi_ok || column_out == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_element(env, location, 0, line_out) != napi_ok ||
+      napi_set_element(env, location, 1, column_out) != napi_ok ||
+      napi_set_element(env, location, 2, file) != napi_ok) {
+    return napi_generic_failure;
+  }
+
+  *location_out = location;
+  return napi_ok;
+}
+
 uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
   return backing_store == nullptr
              ? 0
@@ -2644,13 +2702,14 @@ extern "C" int snapi_bridge_unofficial_preview_entries(SnapiEnvState* env_state,
 
 extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
                                                       uint32_t frames,
+                                                      uint32_t skip_frames,
                                                       uint32_t* callsites_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_call_sites(env, frames, &callsites);
+  napi_status s = unofficial_napi_get_call_sites(env, frames, skip_frames, &callsites);
   if (s != napi_ok) return s;
   if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
   return napi_ok;
@@ -2665,7 +2724,7 @@ extern "C" int snapi_bridge_unofficial_get_current_stack_trace(
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_current_stack_trace(env, frames, &callsites);
+  napi_status s = unofficial_napi_get_call_sites(env, frames, 0, &callsites);
   if (s != napi_ok) return s;
   if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
   return napi_ok;
@@ -2677,9 +2736,20 @@ extern "C" int snapi_bridge_unofficial_get_caller_location(SnapiEnvState* env_st
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value location = nullptr;
-  napi_status s = unofficial_napi_get_caller_location(env, &location);
+  napi_value callsites = nullptr;
+  napi_status s = unofficial_napi_get_call_sites(env, 1, 1, &callsites);
   if (s != napi_ok) return s;
+  napi_value location = nullptr;
+  if (callsites != nullptr) {
+    napi_value callsite = nullptr;
+    uint32_t length = 0;
+    if (napi_get_array_length(env, callsites, &length) != napi_ok) return napi_generic_failure;
+    if (length > 0 && napi_get_element(env, callsites, 0, &callsite) != napi_ok) {
+      return napi_generic_failure;
+    }
+    s = CreateCallerLocationFromCallSite(env, callsite, &location);
+    if (s != napi_ok) return s;
+  }
   if (location_out != nullptr) *location_out = StoreValue(*bridge_state, location);
   return napi_ok;
 }
@@ -3228,7 +3298,7 @@ extern "C" int snapi_bridge_unofficial_structured_clone(SnapiEnvState* env_state
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
-  napi_status s = unofficial_napi_structured_clone(env, value, &result);
+  napi_status s = unofficial_napi_structured_clone(env, value, nullptr, &result);
   if (s != napi_ok) return s;
   if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
@@ -3247,7 +3317,7 @@ extern "C" int snapi_bridge_unofficial_structured_clone_with_transfer(
   napi_value transfer_list = LoadValue(*bridge_state, transfer_list_id);
   if (value == nullptr || transfer_list == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
-  napi_status s = unofficial_napi_structured_clone_with_transfer(
+  napi_status s = unofficial_napi_structured_clone(
       env, value, transfer_list, &result);
   if (s != napi_ok) return s;
   if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
@@ -3496,52 +3566,6 @@ extern "C" int snapi_bridge_unofficial_contextify_create_cached_data(
       &result);
   if (s != napi_ok) return s;
   if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_start_sigint_watchdog(
-    SnapiEnvState* env_state,
-    int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (result_out == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_contextify_start_sigint_watchdog(env, &result);
-  if (s != napi_ok) return s;
-  *result_out = result ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
-    SnapiEnvState* env_state,
-    int* had_pending_signal_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (had_pending_signal_out == nullptr) return napi_invalid_arg;
-  bool had_pending_signal = false;
-  napi_status s =
-      unofficial_napi_contextify_stop_sigint_watchdog(env, &had_pending_signal);
-  if (s != napi_ok) return s;
-  *had_pending_signal_out = had_pending_signal ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
-    SnapiEnvState* env_state,
-    int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (result_out == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_contextify_watchdog_has_pending_sigint(env, &result);
-  if (s != napi_ok) return s;
-  *result_out = result ? 1 : 0;
   return napi_ok;
 }
 

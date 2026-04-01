@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -2115,13 +2116,6 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
 napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
-    napi_value* result_out) {
-  return StructuredCloneImpl(env, value, nullptr, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
-    napi_env env,
-    napi_value value,
     napi_value transfer_list,
     napi_value* result_out) {
   return StructuredCloneImpl(env, value, transfer_list, result_out);
@@ -2457,7 +2451,8 @@ napi_status GetCallSitesImpl(napi_env env,
                              uint32_t skip_frames,
                              napi_value* callsites_out) {
   if (env == nullptr || env->isolate == nullptr || callsites_out == nullptr) return napi_invalid_arg;
-  if (frames < 1 || frames > 200) return napi_invalid_arg;
+  if (frames < 1 || frames > 200 || skip_frames > 200) return napi_invalid_arg;
+  if (frames > std::numeric_limits<uint32_t>::max() - skip_frames) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope scope(isolate);
@@ -2488,6 +2483,10 @@ napi_status GetCallSitesImpl(napi_env env,
 
     v8::Local<v8::Value> script_name = frame->GetScriptName();
     if (script_name.IsEmpty()) script_name = v8::String::Empty(isolate);
+    v8::Local<v8::Value> script_name_or_source_url = frame->GetScriptNameOrSourceURL();
+    if (script_name_or_source_url.IsEmpty()) {
+      script_name_or_source_url = v8::String::Empty(isolate);
+    }
     const std::string script_id = std::to_string(frame->GetScriptId());
     v8::Local<v8::String> script_id_v8;
     if (!v8::String::NewFromUtf8(isolate,
@@ -2503,6 +2502,7 @@ napi_status GetCallSitesImpl(napi_env env,
     if (!set_named(callsite, "functionName", function_name) ||
         !set_named(callsite, "scriptId", script_id_v8) ||
         !set_named(callsite, "scriptName", script_name) ||
+        !set_named(callsite, "scriptNameOrSourceURL", script_name_or_source_url) ||
         !set_named(callsite, "lineNumber", v8::Integer::NewFromUnsigned(isolate, line)) ||
         !set_named(callsite, "columnNumber", v8::Integer::NewFromUnsigned(isolate, col)) ||
         !set_named(callsite, "column", v8::Integer::NewFromUnsigned(isolate, col)) ||
@@ -2520,41 +2520,9 @@ napi_status GetCallSitesImpl(napi_env env,
 
 napi_status NAPI_CDECL unofficial_napi_get_call_sites(napi_env env,
                                                       uint32_t frames,
+                                                      uint32_t skip_frames,
                                                       napi_value* callsites_out) {
-  return GetCallSitesImpl(env, frames, 1, callsites_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
-                                                               uint32_t frames,
-                                                               napi_value* callsites_out) {
-  return GetCallSitesImpl(env, frames, 0, callsites_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_value* location_out) {
-  if (env == nullptr || env->isolate == nullptr || location_out == nullptr) return napi_invalid_arg;
-  *location_out = nullptr;
-
-  v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
-
-  v8::Local<v8::StackTrace> trace = v8::StackTrace::CurrentStackTrace(isolate, 2);
-  if (trace->GetFrameCount() != 2) {
-    return napi_ok;
-  }
-
-  v8::Local<v8::StackFrame> frame = trace->GetFrame(isolate, 1);
-  v8::Local<v8::Value> file = frame->GetScriptNameOrSourceURL();
-  if (file.IsEmpty()) {
-    return napi_ok;
-  }
-  v8::Local<v8::Value> values[] = {
-      v8::Integer::New(isolate, frame->GetLineNumber()),
-      v8::Integer::New(isolate, frame->GetColumn()),
-      file,
-  };
-  v8::Local<v8::Array> location = v8::Array::New(isolate, values, 3);
-  *location_out = napi_v8_wrap_value(env, location);
-  return *location_out == nullptr ? napi_generic_failure : napi_ok;
+  return GetCallSitesImpl(env, frames, skip_frames, callsites_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,

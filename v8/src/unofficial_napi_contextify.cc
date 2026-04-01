@@ -2101,32 +2101,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_create_cached_data(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_start_sigint_watchdog(
-    napi_env env,
-    bool* result_out) {
-  if (env == nullptr || result_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> action_lock(SigintWatchdogHelper::GetActionMutex());
-  *result_out = SigintWatchdogHelper::GetInstance().Start() == 0;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_contextify_stop_sigint_watchdog(
-    napi_env env,
-    bool* had_pending_signal_out) {
-  if (env == nullptr || had_pending_signal_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> action_lock(SigintWatchdogHelper::GetActionMutex());
-  *had_pending_signal_out = SigintWatchdogHelper::GetInstance().Stop();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_contextify_watchdog_has_pending_sigint(
-    napi_env env,
-    bool* result_out) {
-  if (env == nullptr || result_out == nullptr) return napi_invalid_arg;
-  *result_out = SigintWatchdogHelper::GetInstance().HasPendingSignal();
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     napi_env env,
     napi_value wrapper,

@@ -229,15 +229,13 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_preview_entries(napi_en
                                                         napi_value* entries_out,
                                                         bool* is_key_value_out);
 
+// Unofficial helper for Node-style util.getCallSites() / stack helpers.
+// Returns an array of callsite objects for the current stack, skipping the
+// first `skip_frames` entries.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_call_sites(napi_env env,
                                                        uint32_t frames,
+                                                       uint32_t skip_frames,
                                                        napi_value* callsites_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_current_stack_trace(napi_env env,
-                                                                uint32_t frames,
-                                                                napi_value* callsites_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_caller_location(napi_env env,
-                                                            napi_value* location_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                     napi_value value,
@@ -270,12 +268,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_private_symbol(n
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
-    napi_value* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone_with_transfer(
-    napi_env env,
-    napi_value value,
-    napi_value transfer_list,
+    napi_value transfer_list_or_null,
     napi_value* result_out);
 
 // Unofficial helpers for env-agnostic message payload queues.
@@ -487,18 +480,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_create_cache
     int32_t column_offset,
     napi_value host_defined_option_id,
     napi_value* cached_data_buffer_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_start_sigint_watchdog(
-    napi_env env,
-    bool* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_stop_sigint_watchdog(
-    napi_env env,
-    bool* had_pending_signal_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_watchdog_has_pending_sigint(
-    napi_env env,
-    bool* result_out);
 
 // Unofficial helpers for implementing internalBinding('module_wrap') on embedders.
 // These keep V8 module objects behind an opaque native handle so bindings stay N-API only.

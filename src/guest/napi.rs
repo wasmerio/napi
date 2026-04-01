@@ -464,12 +464,18 @@ fn guest_unofficial_napi_get_call_sites(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     frames: i32,
+    skip_frames: i32,
     callsites_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut callsites_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id)
+        snapi_bridge_unofficial_get_call_sites(
+            env_handle,
+            frames as u32,
+            skip_frames as u32,
+            &mut callsites_id,
+        )
     };
     if status == 0 && callsites_ptr > 0 {
         write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
@@ -1577,58 +1583,6 @@ fn guest_unofficial_napi_contextify_create_cached_data(
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
-fn guest_unofficial_napi_contextify_start_sigint_watchdog(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result = 0i32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_start_sigint_watchdog(env_handle, &mut result)
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
-    }
-    status
-}
-
-fn guest_unofficial_napi_contextify_stop_sigint_watchdog(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    had_pending_signal_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut had_pending_signal = 0i32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_stop_sigint_watchdog(env_handle, &mut had_pending_signal)
-    };
-    if status == 0 && had_pending_signal_ptr > 0 {
-        write_guest_u8(
-            &mut env,
-            had_pending_signal_ptr as u32,
-            (had_pending_signal != 0) as u8,
-        );
-    }
-    status
-}
-
-fn guest_unofficial_napi_contextify_watchdog_has_pending_sigint(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result = 0i32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(env_handle, &mut result)
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
     }
     status
 }
@@ -5250,9 +5204,6 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_contextify_compile_function_for_cjs_loader" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function_for_cjs_loader),
         "unofficial_napi_contextify_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_create_cached_data),
-        "unofficial_napi_contextify_start_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_start_sigint_watchdog),
-        "unofficial_napi_contextify_stop_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_stop_sigint_watchdog),
-        "unofficial_napi_contextify_watchdog_has_pending_sigint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_watchdog_has_pending_sigint),
         "unofficial_napi_module_wrap_create_source_text" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_source_text),
         "unofficial_napi_module_wrap_create_synthetic" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_synthetic),
         "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),

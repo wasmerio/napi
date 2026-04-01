@@ -120,6 +120,7 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_get_call_sites(
         env: SnapiEnv,
         frames: u32,
+        skip_frames: u32,
         callsites_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_current_stack_trace(
@@ -337,18 +338,6 @@ unsafe extern "C" {
         column_offset: i32,
         host_defined_option_id: u32,
         result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
-        env: SnapiEnv,
-        result_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
-        env: SnapiEnv,
-        had_pending_signal_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
-        env: SnapiEnv,
-        result_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_source_text(
         env: SnapiEnv,
