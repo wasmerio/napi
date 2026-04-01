@@ -322,14 +322,6 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
-        env: SnapiEnv,
-        code_id: u32,
-        filename_id: u32,
-        is_sea_main: i32,
-        should_detect_module: i32,
-        result_out: *mut u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_create_cached_data(
         env: SnapiEnv,
         code_id: u32,

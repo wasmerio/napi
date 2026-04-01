@@ -1526,33 +1526,6 @@ fn guest_unofficial_napi_contextify_compile_function(
     status
 }
 
-fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    code: i32,
-    filename: i32,
-    is_sea_main: i32,
-    should_detect_module: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
-            env_handle,
-            code as u32,
-            filename as u32,
-            is_sea_main,
-            should_detect_module,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_create_cached_data(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -5202,7 +5175,6 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_dispose_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_dispose_context),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
-        "unofficial_napi_contextify_compile_function_for_cjs_loader" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function_for_cjs_loader),
         "unofficial_napi_contextify_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_create_cached_data),
         "unofficial_napi_module_wrap_create_source_text" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_source_text),
         "unofficial_napi_module_wrap_create_synthetic" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_synthetic),

@@ -3515,28 +3515,6 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
-    SnapiEnvState* env_state,
-    uint32_t code_id,
-    uint32_t filename_id,
-    int is_sea_main,
-    int should_detect_module,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value code = LoadValue(*bridge_state, code_id);
-  napi_value filename = LoadValue(*bridge_state, filename_id);
-  if (code == nullptr || filename == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_contextify_compile_function_for_cjs_loader(
-      env, code, filename, is_sea_main != 0, should_detect_module != 0, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
 extern "C" int snapi_bridge_unofficial_contextify_create_cached_data(
     SnapiEnvState* env_state,
     uint32_t code_id,

@@ -532,6 +532,50 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 
 }  // namespace
 
+namespace napi_v8_internal {
+
+napi_status GetPropertyNames(napi_env env,
+                             napi_value object,
+                             v8::KeyCollectionMode collection_mode,
+                             uint32_t key_filter_bits,
+                             v8::IndexFilter index_filter,
+                             napi_key_conversion key_conversion,
+                             const char* error_message,
+                             napi_value* result_out) {
+  if (!::CheckValue(env, object) || result_out == nullptr) return ::InvalidArg(env);
+
+  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
+  if (!target->IsObject()) return napi_object_expected;
+
+  int property_filter = v8::ALL_PROPERTIES;
+  if ((key_filter_bits & napi_key_writable) != 0) property_filter |= v8::ONLY_WRITABLE;
+  if ((key_filter_bits & napi_key_enumerable) != 0) property_filter |= v8::ONLY_ENUMERABLE;
+  if ((key_filter_bits & napi_key_configurable) != 0) property_filter |= v8::ONLY_CONFIGURABLE;
+  if ((key_filter_bits & napi_key_skip_strings) != 0) property_filter |= v8::SKIP_STRINGS;
+  if ((key_filter_bits & napi_key_skip_symbols) != 0) property_filter |= v8::SKIP_SYMBOLS;
+
+  v8::KeyConversionMode conversion_mode =
+      (key_conversion == napi_key_keep_numbers) ? v8::KeyConversionMode::kKeepNumbers
+                                                : v8::KeyConversionMode::kConvertToString;
+
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Array> names;
+  if (!target.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              collection_mode,
+                              static_cast<v8::PropertyFilter>(property_filter),
+                              index_filter,
+                              conversion_mode)
+           .ToLocal(&names)) {
+    return ::ReturnPendingIfCaught(env, tc, error_message);
+  }
+
+  *result_out = napi_v8_wrap_value(env, names);
+  return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+}  // namespace napi_v8_internal
+
 napi_value__::napi_value__(napi_env env, v8::Local<v8::Value> local)
     : env(env), value(env->isolate, local) {}
 
@@ -2179,22 +2223,14 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
 napi_status NAPI_CDECL napi_get_property_names(napi_env env,
                                                napi_value object,
                                                napi_value* result) {
-  if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
-  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  if (!target->IsObject()) return napi_object_expected;
-  v8::TryCatch tc(env->isolate);
-  v8::Local<v8::Array> names;
-  if (!target.As<v8::Object>()
-           ->GetPropertyNames(env->context(),
-                              v8::KeyCollectionMode::kIncludePrototypes,
-                              static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS),
-                              v8::IndexFilter::kIncludeIndices,
-                              v8::KeyConversionMode::kConvertToString)
-           .ToLocal(&names)) {
-    return ReturnPendingIfCaught(env, tc, "Exception while getting property names");
-  }
-  *result = napi_v8_wrap_value(env, names);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_internal::GetPropertyNames(env,
+                                            object,
+                                            v8::KeyCollectionMode::kIncludePrototypes,
+                                            napi_key_enumerable | napi_key_skip_symbols,
+                                            v8::IndexFilter::kIncludeIndices,
+                                            napi_key_numbers_to_strings,
+                                            "Exception while getting property names",
+                                            result);
 }
 
 napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
@@ -2203,37 +2239,17 @@ napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
                                                    napi_key_filter key_filter,
                                                    napi_key_conversion key_conversion,
                                                    napi_value* result) {
-  if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
-  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  if (!target->IsObject()) return napi_object_expected;
-
   v8::KeyCollectionMode collection_mode =
       (key_mode == napi_key_own_only) ? v8::KeyCollectionMode::kOwnOnly
                                       : v8::KeyCollectionMode::kIncludePrototypes;
-  int property_filter = v8::ALL_PROPERTIES;
-  if ((key_filter & napi_key_writable) != 0) property_filter |= v8::ONLY_WRITABLE;
-  if ((key_filter & napi_key_enumerable) != 0) property_filter |= v8::ONLY_ENUMERABLE;
-  if ((key_filter & napi_key_configurable) != 0) property_filter |= v8::ONLY_CONFIGURABLE;
-  if ((key_filter & napi_key_skip_strings) != 0) property_filter |= v8::SKIP_STRINGS;
-  if ((key_filter & napi_key_skip_symbols) != 0) property_filter |= v8::SKIP_SYMBOLS;
-
-  v8::KeyConversionMode conversion_mode =
-      (key_conversion == napi_key_keep_numbers) ? v8::KeyConversionMode::kKeepNumbers
-                                                : v8::KeyConversionMode::kConvertToString;
-
-  v8::TryCatch tc(env->isolate);
-  v8::Local<v8::Array> names;
-  if (!target.As<v8::Object>()
-           ->GetPropertyNames(env->context(),
-                              collection_mode,
-                              static_cast<v8::PropertyFilter>(property_filter),
-                              v8::IndexFilter::kIncludeIndices,
-                              conversion_mode)
-           .ToLocal(&names)) {
-    return ReturnPendingIfCaught(env, tc, "Exception while getting all property names");
-  }
-  *result = napi_v8_wrap_value(env, names);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_internal::GetPropertyNames(env,
+                                            object,
+                                            collection_mode,
+                                            static_cast<uint32_t>(key_filter),
+                                            v8::IndexFilter::kIncludeIndices,
+                                            key_conversion,
+                                            "Exception while getting all property names",
+                                            result);
 }
 
 napi_status NAPI_CDECL napi_set_named_property(napi_env env,

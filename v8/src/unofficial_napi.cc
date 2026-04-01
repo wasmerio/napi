@@ -2551,22 +2551,14 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
     napi_value value,
     uint32_t filter_bits,
     napi_value* result_out) {
-  if (env == nullptr || value == nullptr || result_out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
-
-  v8::Local<v8::Array> properties;
-  if (!raw.As<v8::Object>()
-           ->GetPropertyNames(env->context(),
-                              v8::KeyCollectionMode::kOwnOnly,
-                              static_cast<v8::PropertyFilter>(filter_bits),
-                              v8::IndexFilter::kSkipIndices)
-           .ToLocal(&properties)) {
-    return napi_generic_failure;
-  }
-
-  *result_out = napi_v8_wrap_value(env, properties);
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+  return napi_v8_internal::GetPropertyNames(env,
+                                            value,
+                                            v8::KeyCollectionMode::kOwnOnly,
+                                            filter_bits,
+                                            v8::IndexFilter::kSkipIndices,
+                                            napi_key_keep_numbers,
+                                            "Exception while getting own non-index properties",
+                                            result_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,

@@ -99,4 +99,17 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_finalize_buffer_records(napi_env env);
 
+namespace napi_v8_internal {
+
+napi_status GetPropertyNames(napi_env env,
+                             napi_value object,
+                             v8::KeyCollectionMode collection_mode,
+                             uint32_t key_filter_bits,
+                             v8::IndexFilter index_filter,
+                             napi_key_conversion key_conversion,
+                             const char* error_message,
+                             napi_value* result_out);
+
+}  // namespace napi_v8_internal
+
 #endif  // NAPI_V8_ENV_H_

@@ -143,36 +143,38 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EXPECT_TRUE(is_typedarray);
 }
 
-TEST_F(Test65UnofficialContextify, CjsLoaderAndSyntaxDetection) {
+TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
   EnvScope s(runtime_.get());
 
+  napi_value params = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 5, &params), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 0, Str(s.env, "exports")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 1, Str(s.env, "require")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 2, Str(s.env, "module")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 3, Str(s.env, "__filename")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 4, Str(s.env, "__dirname")), napi_ok);
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
   napi_value out = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_compile_function_for_cjs_loader(
-                s.env,
-                Str(s.env, "module.exports = 1;"),
-                Str(s.env, "cjs.js"),
-                false,
-                true,
-                &out),
+  ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "module.exports = 1;"),
+                                                        Str(s.env, "cjs.js"),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        params,
+                                                        undef,
+                                                        &out),
             napi_ok);
   ASSERT_NE(out, nullptr);
-  napi_value can_parse = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, out, "canParseAsESM", &can_parse), napi_ok);
-  bool can_parse_bool = true;
-  ASSERT_EQ(napi_get_value_bool(s.env, can_parse, &can_parse_bool), napi_ok);
-  EXPECT_FALSE(can_parse_bool);
-
-  ASSERT_EQ(unofficial_napi_contextify_compile_function_for_cjs_loader(
-                s.env,
-                Str(s.env, "export const x = 1;"),
-                Str(s.env, "esmish.js"),
-                false,
-                true,
-                &out),
-            napi_ok);
-  ASSERT_EQ(napi_get_named_property(s.env, out, "canParseAsESM", &can_parse), napi_ok);
-  ASSERT_EQ(napi_get_value_bool(s.env, can_parse, &can_parse_bool), napi_ok);
-  EXPECT_TRUE(can_parse_bool);
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, out, "function", &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
 
   bool contains = false;
   ASSERT_EQ(unofficial_napi_contextify_contains_module_syntax(s.env,

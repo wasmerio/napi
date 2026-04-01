@@ -456,14 +456,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_func
     napi_value host_defined_option_id,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function_for_cjs_loader(
-    napi_env env,
-    napi_value code,
-    napi_value filename,
-    bool is_sea_main,
-    bool should_detect_module,
-    napi_value* result_out);
-
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_module_syntax(
     napi_env env,
     napi_value code,
