@@ -2598,36 +2598,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_ob
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_import_module_dynamically(
-    napi_env env,
-    size_t argc,
-    napi_value* argv,
-    napi_value* result_out) {
-  if (env == nullptr || argv == nullptr || result_out == nullptr) return napi_invalid_arg;
-  *result_out = nullptr;
-
-  auto* state = GetModuleWrapState(env);
-  if (state == nullptr) return napi_generic_failure;
-  napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
-  if (callback == nullptr) return napi_invalid_arg;
-
-  napi_value global = nullptr;
-  napi_get_global(env, &global);
-  if (argc >= 5) {
-    return napi_call_function(env, global, callback, 5, argv, result_out);
-  }
-
-  napi_value referrer_symbol = GetVmDynamicImportDefaultInternalSymbol(env);
-  napi_value phase = nullptr;
-  napi_create_int32(env, 2, &phase);
-  std::vector<v8::Local<v8::Name>> empty_names;
-  std::vector<v8::Local<v8::Value>> empty_values;
-  napi_value attrs = napi_v8_wrap_value(env, CreateFrozenNullProtoObject(env, empty_names, empty_values));
-  napi_value referrer_name = argc >= 2 ? argv[1] : nullptr;
-  napi_value call_argv[5] = {referrer_symbol, argv[0], phase, attrs, referrer_name};
-  return napi_call_function(env, global, callback, 5, call_argv, result_out);
-}
-
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,
     void* handle,

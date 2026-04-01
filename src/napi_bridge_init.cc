@@ -3904,29 +3904,6 @@ snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
   return unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(env, callback);
 }
 
-extern "C" int snapi_bridge_unofficial_module_wrap_import_module_dynamically(
-    SnapiEnvState* env_state,
-    uint32_t argc,
-    const uint32_t* argv_ids,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  std::vector<napi_value> argv(argc, nullptr);
-  for (uint32_t i = 0; i < argc; ++i) {
-    napi_value value = LoadValue(*bridge_state, argv_ids[i]);
-    if (value == nullptr) return napi_invalid_arg;
-    argv[i] = value;
-  }
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_module_wrap_import_module_dynamically(
-      env, argc, argc == 0 ? nullptr : argv.data(), &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
 extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade(
     SnapiEnvState* env_state,
     uint32_t handle_id,

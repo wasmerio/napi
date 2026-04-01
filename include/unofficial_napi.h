@@ -584,12 +584,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_initial
     napi_env env,
     napi_value callback);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_import_module_dynamically(
-    napi_env env,
-    size_t argc,
-    napi_value* argv,
-    napi_value* result_out);
-
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,
     void* handle,

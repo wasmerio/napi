@@ -1985,38 +1985,6 @@ fn guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
     }
 }
 
-fn guest_unofficial_napi_module_wrap_import_module_dynamically(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    argc: i32,
-    argv_ptr: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let argc_u = argc as u32;
-    let argv_ids = if argc_u > 0 {
-        let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
-            return 1;
-        };
-        ids
-    } else {
-        Vec::new()
-    };
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_import_module_dynamically(
-            env_handle,
-            argc_u,
-            argv_ids.as_ptr(),
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -5196,7 +5164,6 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
         "unofficial_napi_module_wrap_set_import_module_dynamically_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_import_module_dynamically_callback),
         "unofficial_napi_module_wrap_set_initialize_import_meta_object_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback),
-        "unofficial_napi_module_wrap_import_module_dynamically" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_import_module_dynamically),
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 

@@ -438,12 +438,6 @@ unsafe extern "C" {
         env: SnapiEnv,
         callback_id: u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_import_module_dynamically(
-        env: SnapiEnv,
-        argc: u32,
-        argv_ids: *const u32,
-        result_out: *mut u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_required_module_facade(
         env: SnapiEnv,
         handle_id: u32,
