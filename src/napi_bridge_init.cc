@@ -2702,29 +2702,13 @@ extern "C" int snapi_bridge_unofficial_preview_entries(SnapiEnvState* env_state,
 
 extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
                                                       uint32_t frames,
-                                                      uint32_t skip_frames,
                                                       uint32_t* callsites_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_call_sites(env, frames, skip_frames, &callsites);
-  if (s != napi_ok) return s;
-  if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_get_current_stack_trace(
-    SnapiEnvState* env_state,
-    uint32_t frames,
-    uint32_t* callsites_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_call_sites(env, frames, 0, &callsites);
+  napi_status s = unofficial_napi_get_call_sites(env, frames, &callsites);
   if (s != napi_ok) return s;
   if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
   return napi_ok;
@@ -2737,14 +2721,14 @@ extern "C" int snapi_bridge_unofficial_get_caller_location(SnapiEnvState* env_st
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_call_sites(env, 1, 1, &callsites);
+  napi_status s = unofficial_napi_get_call_sites(env, 2, &callsites);
   if (s != napi_ok) return s;
   napi_value location = nullptr;
   if (callsites != nullptr) {
     napi_value callsite = nullptr;
     uint32_t length = 0;
     if (napi_get_array_length(env, callsites, &length) != napi_ok) return napi_generic_failure;
-    if (length > 0 && napi_get_element(env, callsites, 0, &callsite) != napi_ok) {
+    if (length > 1 && napi_get_element(env, callsites, 1, &callsite) != napi_ok) {
       return napi_generic_failure;
     }
     s = CreateCallerLocationFromCallSite(env, callsite, &location);

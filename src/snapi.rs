@@ -120,12 +120,6 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_get_call_sites(
         env: SnapiEnv,
         frames: u32,
-        skip_frames: u32,
-        callsites_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_current_stack_trace(
-        env: SnapiEnv,
-        frames: u32,
         callsites_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_caller_location(

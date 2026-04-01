@@ -464,40 +464,12 @@ fn guest_unofficial_napi_get_call_sites(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     frames: i32,
-    skip_frames: i32,
     callsites_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut callsites_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_call_sites(
-            env_handle,
-            frames as u32,
-            skip_frames as u32,
-            &mut callsites_id,
-        )
-    };
-    if status == 0 && callsites_ptr > 0 {
-        write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
-    }
-    status
-}
-
-fn guest_unofficial_napi_get_current_stack_trace(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    frames: i32,
-    callsites_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut callsites_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_current_stack_trace(
-            env_handle,
-            frames as u32,
-            &mut callsites_id,
-        )
-    };
+    let status =
+        unsafe { snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id) };
     if status == 0 && callsites_ptr > 0 {
         write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
     }
@@ -5070,7 +5042,6 @@ pub fn register_napi_imports(
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),
         "unofficial_napi_preview_entries" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preview_entries),
         "unofficial_napi_get_call_sites" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_call_sites),
-        "unofficial_napi_get_current_stack_trace" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_stack_trace),
         "unofficial_napi_get_caller_location" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_caller_location),
         "unofficial_napi_arraybuffer_view_has_buffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_arraybuffer_view_has_buffer),
         "unofficial_napi_get_constructor_name" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_constructor_name),
@@ -5084,6 +5055,7 @@ pub fn register_napi_imports(
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
         "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
+        "unofficial_napi_structured_clone_with_transfer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
         "unofficial_napi_serialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_serialize_value),
         "unofficial_napi_deserialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_deserialize_value),
         "unofficial_napi_release_serialized_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_serialized_value),

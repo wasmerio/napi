@@ -2434,24 +2434,19 @@ napi_status NAPI_CDECL unofficial_napi_preview_entries(napi_env env,
 
 namespace {
 
-napi_status GetCallSitesImpl(napi_env env,
-                             uint32_t frames,
-                             uint32_t skip_frames,
-                             napi_value* callsites_out) {
+napi_status GetCallSitesImpl(napi_env env, uint32_t frames, napi_value* callsites_out) {
   if (env == nullptr || env->isolate == nullptr || callsites_out == nullptr) return napi_invalid_arg;
-  if (frames < 1 || frames > 200 || skip_frames > 200) return napi_invalid_arg;
-  if (frames > std::numeric_limits<uint32_t>::max() - skip_frames) return napi_invalid_arg;
+  // Allow one extra raw frame so embedders can trim their own helper frame
+  // outside the N-API surface without shrinking the user-visible limit.
+  if (frames < 1 || frames > 201) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope scope(isolate);
   v8::Local<v8::Context> context = env->context();
 
-  v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(isolate, frames + skip_frames);
+  v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(isolate, frames);
   const int frame_count = stack->GetFrameCount();
-  const int start_index = frame_count > 0 ? static_cast<int>(skip_frames) : 0;
-  const int available = frame_count - start_index;
-  uint32_t count = available > 0 ? static_cast<uint32_t>(available) : 0;
-  if (count > frames) count = frames;
+  uint32_t count = frame_count > 0 ? static_cast<uint32_t>(frame_count) : 0;
   v8::Local<v8::Array> out = v8::Array::New(isolate, count);
 
   auto set_named = [&](v8::Local<v8::Object> obj, const char* key, v8::Local<v8::Value> value) -> bool {
@@ -2461,7 +2456,7 @@ napi_status GetCallSitesImpl(napi_env env,
   };
 
   for (uint32_t out_index = 0; out_index < count; ++out_index) {
-    const int i = start_index + static_cast<int>(out_index);
+    const int i = static_cast<int>(out_index);
     v8::Local<v8::StackFrame> frame = stack->GetFrame(isolate, i);
     v8::Local<v8::Object> callsite = v8::Object::New(isolate);
     if (callsite->SetPrototype(context, v8::Null(isolate)).IsNothing()) return napi_generic_failure;
@@ -2508,9 +2503,8 @@ napi_status GetCallSitesImpl(napi_env env,
 
 napi_status NAPI_CDECL unofficial_napi_get_call_sites(napi_env env,
                                                       uint32_t frames,
-                                                      uint32_t skip_frames,
                                                       napi_value* callsites_out) {
-  return GetCallSitesImpl(env, frames, skip_frames, callsites_out);
+  return GetCallSitesImpl(env, frames, callsites_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,

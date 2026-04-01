@@ -226,11 +226,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_preview_entries(napi_en
                                                         bool* is_key_value_out);
 
 // Unofficial helper for Node-style util.getCallSites() / stack helpers.
-// Returns an array of callsite objects for the current stack, skipping the
-// first `skip_frames` entries.
+// Returns an array of callsite objects for the current stack.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_call_sites(napi_env env,
                                                        uint32_t frames,
-                                                       uint32_t skip_frames,
                                                        napi_value* callsites_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
@@ -261,11 +259,23 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_private_symbol(n
 // Unofficial helper for internalBinding('messaging').structuredClone().
 // This mirrors the engine's structured clone path closely enough to preserve
 // SharedArrayBuffer backing stores during clone/deserialization.
+#if defined(__wasm__)
+// Keep the WASM import name compatible with older Wasmer runtimes that still
+// export the merged 4-argument helper under the old "_with_transfer" symbol.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone_with_transfer(
+    napi_env env,
+    napi_value value,
+    napi_value transfer_list_or_null,
+    napi_value* result_out);
+#define unofficial_napi_structured_clone unofficial_napi_structured_clone_with_transfer
+#else
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
     napi_value transfer_list_or_null,
     napi_value* result_out);
+#define unofficial_napi_structured_clone_with_transfer unofficial_napi_structured_clone
+#endif
 
 // Unofficial helpers for env-agnostic message payload queues.
 // The returned opaque payload must be released with
