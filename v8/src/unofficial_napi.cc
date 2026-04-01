@@ -1622,93 +1622,7 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 #endif
 }
 
-extern "C" {
-
-napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
-    const unofficial_napi_embedder_hooks* hooks) {
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  if (hooks == nullptr) {
-    g_embedder_hooks.hooks = unofficial_napi_embedder_hooks{};
-  } else {
-    g_embedder_hooks.hooks = *hooks;
-  }
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
-    napi_env env,
-    unofficial_napi_enqueue_foreground_task_callback callback,
-    void* target) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->enqueue_foreground_task_callback = callback;
-  env->enqueue_foreground_task_target = target;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    if (g_runtime.platform != nullptr &&
-        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
-      return napi_generic_failure;
-    }
-  }
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
-    v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result) {
-  if (result == nullptr || context.IsEmpty()) return napi_invalid_arg;
-  context->GetIsolate()->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
-  auto* env = new (std::nothrow) napi_env__(context, module_api_version);
-  if (env == nullptr) return napi_generic_failure;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_env_by_isolate[env->isolate] = env;
-  }
-  *result = env;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* environment) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->edge_environment = environment;
-  return napi_ok;
-}
-
-void* unofficial_napi_get_edge_environment(napi_env env) {
-  return env == nullptr ? nullptr : env->edge_environment;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
-    napi_env env,
-    unofficial_napi_env_cleanup_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_cleanup_callback = callback;
-  env->env_cleanup_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
-    napi_env env,
-    unofficial_napi_env_destroy_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_destroy_callback = callback;
-  env->env_destroy_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
-    napi_env env,
-    unofficial_napi_context_token_callback assign_callback,
-    unofficial_napi_context_token_callback unassign_callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->context_token_assign_callback = assign_callback;
-  env->context_token_unassign_callback = unassign_callback;
-  env->context_token_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
+napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   if (env->env_cleanup_callback != nullptr) {
     env->env_cleanup_callback(env, env->env_cleanup_callback_data);
@@ -1763,6 +1677,88 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
     env->isolate->SetOOMErrorHandler(nullptr);
   }
   delete env;
+  return napi_ok;
+}
+
+extern "C" {
+
+napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
+    const unofficial_napi_embedder_hooks* hooks) {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (hooks == nullptr) {
+    g_embedder_hooks.hooks = unofficial_napi_embedder_hooks{};
+  } else {
+    g_embedder_hooks.hooks = *hooks;
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
+    napi_env env,
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->enqueue_foreground_task_callback = callback;
+  env->enqueue_foreground_task_target = target;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr &&
+        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
+      return napi_generic_failure;
+    }
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
+    v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result) {
+  if (result == nullptr || context.IsEmpty()) return napi_invalid_arg;
+  context->GetIsolate()->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+  auto* env = new (std::nothrow) napi_env__(context, module_api_version);
+  if (env == nullptr) return napi_generic_failure;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    g_env_by_isolate[env->isolate] = env;
+  }
+  *result = env;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* environment) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->edge_environment = environment;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_env env,
+    unofficial_napi_env_cleanup_callback callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->env_cleanup_callback = callback;
+  env->env_cleanup_callback_data = data;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
+    napi_env env,
+    unofficial_napi_env_destroy_callback callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->env_destroy_callback = callback;
+  env->env_destroy_callback_data = data;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
+    napi_env env,
+    unofficial_napi_context_token_callback assign_callback,
+    unofficial_napi_context_token_callback unassign_callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->context_token_assign_callback = assign_callback;
+  env->context_token_unassign_callback = unassign_callback;
+  env->context_token_callback_data = data;
   return napi_ok;
 }
 
@@ -1919,7 +1915,7 @@ napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
-    status = unofficial_napi_destroy_env_instance(scope->env);
+    status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }
 
@@ -2068,16 +2064,8 @@ napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) 
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_pending_exception(napi_env env,
-                                                             napi_value error) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
-    return napi_invalid_arg;
-  }
-  env->last_exception.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
-  env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(error));
-  return napi_ok;
+napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env) {
+  return DestroyEnvInstance(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(

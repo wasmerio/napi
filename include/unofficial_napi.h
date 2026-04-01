@@ -49,7 +49,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env_with_options
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_embedder_hooks(
     const unofficial_napi_embedder_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_edge_environment(napi_env env, void* environment);
-NAPI_EXTENSION_WASMER_EXTERN void* unofficial_napi_get_edge_environment(napi_env env);
 using unofficial_napi_env_cleanup_callback = void (*)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
     napi_env env,
@@ -66,7 +65,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_context_token_callb
     unofficial_napi_context_token_callback assign_callback,
     unofficial_napi_context_token_callback unassign_callback,
     void* data);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_destroy_env_instance(napi_env env);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(void* scope);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env_with_loop(
     void* scope,
@@ -94,8 +92,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // used when embedder code intentionally stops a worker but still needs the
 // current JS stack to unwind normally.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_pending_exception(napi_env env,
-                                                              napi_value error);
 
 using unofficial_napi_interrupt_callback = void (*)(napi_env env, void* data);
 

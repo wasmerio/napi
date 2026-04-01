@@ -12,7 +12,7 @@
 extern "C" {
 napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
     v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result);
-napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env);
+napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env);
 }
 
 class V8Runtime {
@@ -67,7 +67,7 @@ struct EnvScope {
 
   ~EnvScope() {
     if (env != nullptr) {
-      EXPECT_EQ(unofficial_napi_destroy_env_instance(env), napi_ok);
+      EXPECT_EQ(unofficial_napi_destroy_env_instance_for_testing(env), napi_ok);
       env = nullptr;
     }
   }
