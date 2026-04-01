@@ -698,23 +698,6 @@ fn guest_unofficial_napi_structured_clone(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     value: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let value_id = if value > 0 { value as u32 } else { 0 };
-    let mut out = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_structured_clone(env_handle, value_id, &mut out) };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, out);
-    }
-    status
-}
-
-fn guest_unofficial_napi_structured_clone_with_transfer(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    value: i32,
     transfer_list: i32,
     result_ptr: i32,
 ) -> i32 {
@@ -727,12 +710,7 @@ fn guest_unofficial_napi_structured_clone_with_transfer(
     };
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_structured_clone_with_transfer(
-            env_handle,
-            value_id,
-            transfer_list_id,
-            &mut out,
-        )
+        snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
@@ -5106,7 +5084,6 @@ pub fn register_napi_imports(
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
         "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
-        "unofficial_napi_structured_clone_with_transfer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone_with_transfer),
         "unofficial_napi_serialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_serialize_value),
         "unofficial_napi_deserialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_deserialize_value),
         "unofficial_napi_release_serialized_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_serialized_value),

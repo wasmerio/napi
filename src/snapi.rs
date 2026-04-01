@@ -261,11 +261,6 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
         value_id: u32,
-        out_id: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_structured_clone_with_transfer(
-        env: SnapiEnv,
-        value_id: u32,
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
