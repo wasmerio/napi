@@ -666,9 +666,13 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
         from_value->IsFunction()) {
       v8::Local<v8::Value> argv[1] = {view};
       v8::Local<v8::Value> buffer_out;
+      v8::TryCatch try_catch(isolate);
       if (from_value.As<v8::Function>()->Call(context, buffer_ctor_value, 1, argv).ToLocal(&buffer_out)) {
         *out = napi_v8_wrap_value(env, buffer_out);
         return *out != nullptr;
+      }
+      if (try_catch.HasCaught()) {
+        try_catch.Reset();
       }
     }
   }

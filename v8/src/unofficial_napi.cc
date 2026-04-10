@@ -870,6 +870,7 @@ v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
                                          size_t offset,
                                          size_t length) {
   v8::Isolate* isolate = context->GetIsolate();
+  v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(array_buffer, offset, length);
   v8::Local<v8::Object> global = context->Global();
 
   v8::Local<v8::Value> buffer_ctor_value;
@@ -885,14 +886,27 @@ v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
           v8::Number::New(isolate, static_cast<double>(length)),
       };
       v8::Local<v8::Value> maybe_buffer;
+      v8::TryCatch try_catch(isolate);
       if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
           maybe_buffer->IsObject()) {
         return maybe_buffer.As<v8::Object>();
       }
+      if (try_catch.HasCaught()) {
+        try_catch.Reset();
+      }
+
+      v8::Local<v8::Value> view_argv[1] = {view};
+      if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 1, view_argv).ToLocal(&maybe_buffer) &&
+          maybe_buffer->IsObject()) {
+        return maybe_buffer.As<v8::Object>();
+      }
+      if (try_catch.HasCaught()) {
+        try_catch.Reset();
+      }
     }
   }
 
-  return v8::Uint8Array::New(array_buffer, offset, length);
+  return view;
 }
 
 bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,

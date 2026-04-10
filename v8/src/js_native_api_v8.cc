@@ -300,6 +300,7 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
                                          size_t offset,
                                          size_t length) {
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
+  v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(ab, offset, length);
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Object> global = context->Global();
 
@@ -320,15 +321,34 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
           v8::Number::New(env->isolate, static_cast<double>(length)),
       };
       v8::Local<v8::Value> maybe_buffer;
+      v8::TryCatch try_catch(env->isolate);
       if (from_fn->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
           maybe_buffer->IsObject()) {
         return maybe_buffer.As<v8::Object>();
+      }
+      // Some contexts cannot materialize Buffer.from(arrayBuffer, ...) even
+      // though we can still fall back to a Uint8Array view. Swallow the failed
+      // conversion so a hidden pending exception does not surface later during
+      // unrelated teardown work.
+      if (try_catch.HasCaught()) {
+        try_catch.Reset();
+      }
+
+      // Some bridge contexts reject the ArrayBuffer overload but still accept
+      // Buffer.from(Uint8Array). Prefer that before exposing a raw view to JS.
+      v8::Local<v8::Value> view_argv[1] = {view};
+      if (from_fn->Call(context, buffer_ctor, 1, view_argv).ToLocal(&maybe_buffer) &&
+          maybe_buffer->IsObject()) {
+        return maybe_buffer.As<v8::Object>();
+      }
+      if (try_catch.HasCaught()) {
+        try_catch.Reset();
       }
     }
   }
 
   // Fallback used during very early bootstrap before Buffer is available.
-  return v8::Uint8Array::New(ab, offset, length);
+  return view;
 }
 
 inline bool CheckValue(napi_env env, napi_value value) {
