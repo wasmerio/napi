@@ -21,7 +21,9 @@ struct napi_value__
 
 struct napi_env__
 {
-    napi_env__();
+    explicit napi_env__(JSContext *context, int32_t module_api_version);
+    ~napi_env__();
+
     JSContext *context() const;
 
     JSContext *ctx;
@@ -33,6 +35,8 @@ struct napi_env__
     // JSValue last_exception_message;
     // std::string last_exception_source_line;
     // std::string last_exception_thrown_at;
+    
+    int32_t module_api_version = 8;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

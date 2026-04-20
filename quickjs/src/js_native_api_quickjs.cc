@@ -1,9 +1,5 @@
 #include "internal/quickjs_env.h"
 
-// typedef void(NAPI_CDECL* napi_finalize)(napi_env env,
-//                                         void* finalize_data,
-//                                         void* finalize_hint);
-
 struct napi_external_backing_store_hint__
 {
   napi_env env = nullptr;
@@ -136,8 +132,60 @@ napi_value__::napi_value__(napi_env env, JSValue local)
 
 napi_value__::~napi_value__() = default;
 
-napi_env__::napi_env__() : last_exception{JS_UNINITIALIZED}
+napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
+    : ctx{context},
+      last_exception{JS_UNINITIALIZED},
+      module_api_version(module_api_version)
 {
+  // TODO: We might needs some of that
+  // isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
+  // v8::Local<v8::Private> wrapKey = v8::Private::ForApi(
+  //     isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap"));
+  // wrap_private_key.Reset(isolate, wrapKey);
+  // v8::Local<v8::Private> wrapRefKey = v8::Private::ForApi(
+  //     isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap_ref"));
+  // wrap_ref_private_key.Reset(isolate, wrapRefKey);
+  // v8::Local<v8::Private> wrapFinalizeKey = v8::Private::ForApi(
+  //     isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap_finalize"));
+  // wrap_finalizer_private_key.Reset(isolate, wrapFinalizeKey);
+  // v8::Local<v8::Private> bufferKey = v8::Private::ForApi(
+  //     isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record"));
+  // buffer_private_key.Reset(isolate, bufferKey);
+  napi_quickjs_clear_last_error(this);
+}
+
+napi_env__::~napi_env__()
+{
+  // TODO: Need to implement cleanup
+  // RunEnvCleanupHooks(this);
+  // napi_v8_finalize_buffer_records(this);
+
+  // for (auto* raw_record : wrap_finalizers) {
+  //   auto* record = static_cast<WrapFinalizerRecord*>(raw_record);
+  //   if (record != nullptr) {
+  //     InvokeWrapFinalizer(record);
+  //     record->handle.Reset();
+  //     delete record;
+  //   }
+  // }
+  // wrap_finalizers.clear();
+
+  // for (auto* raw_tsfn : threadsafe_functions) {
+  //   auto* tsfn = static_cast<napi_threadsafe_function__*>(raw_tsfn);
+  //   if (tsfn != nullptr && !tsfn->finalized.exchange(true) && tsfn->finalize_cb != nullptr) {
+  //     tsfn->finalize_cb(this, tsfn->finalize_data, nullptr);
+  //   }
+  //   delete tsfn;
+  // }
+  // threadsafe_functions.clear();
+
+  // if (instance_data_finalize_cb != nullptr) {
+  //   instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
+  // }
+  // if (env_destroy_callback != nullptr) {
+  //   env_destroy_callback(this, env_destroy_callback_data);
+  // }
+  // edge_environment = nullptr;
 }
 
 JSContext *napi_env__::context() const
@@ -446,6 +494,7 @@ extern "C"
       auto hint = new (std::nothrow) napi_external_backing_store_hint__();
       if (hint == nullptr)
         return napi_generic_failure;
+
       hint->env = env;
       hint->external_data = external_data;
       hint->finalize_cb = finalize_cb;
