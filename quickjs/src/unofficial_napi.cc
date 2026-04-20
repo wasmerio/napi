@@ -72,6 +72,9 @@ napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
         return (status == napi_ok) ? napi_generic_failure : status;
     }
 
+    // TODO: Check error
+    RegisterExternalClass(rt);
+
     *scope_out = reinterpret_cast<void *>(scope);
     *env_out = scope->env;
 

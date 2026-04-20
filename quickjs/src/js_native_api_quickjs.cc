@@ -11,9 +11,39 @@ struct napi_external_backing_store_hint__
 };
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
+// 1. Declare a Class ID (usually stored in your env or globally)
+JSClassID napi_external_class_id = 0;
+
+// 2. Define the QuickJS finalizer function
+static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
+{
+  // Extract the hint struct we attached to the object
+  auto *hint = static_cast<napi_external_backing_store_hint *>(JS_GetOpaque(val, napi_external_class_id));
+  if (hint != nullptr)
+  {
+    // Call the Node-API finalizer callback if the user provided one
+    if (hint->finalize_cb != nullptr)
+    {
+      hint->finalize_cb(hint->env, hint->external_data, hint->finalize_hint);
+    }
+    // Delete the hint struct itself
+    delete hint;
+  }
+}
+
+// 3. Register the class (Call this ONCE when setting up your JSRuntime)
+void RegisterExternalClass(JSRuntime *rt)
+{
+  JS_NewClassID(rt, &napi_external_class_id);
+  JSClassDef def = {};
+  def.class_name = "NapiExternal";
+  def.finalizer = napi_quickjs_external_finalizer;
+  JS_NewClass(rt, napi_external_class_id, &def);
+  // TODO: Check error
+}
+
 namespace
 {
-
   inline bool CheckEnv(napi_env env)
   {
     return env != nullptr && env->ctx != nullptr;
@@ -126,7 +156,6 @@ namespace
     }
     delete hint;
   }
-
 }
 
 napi_value__::napi_value__(napi_env env, JSValue local)
@@ -388,47 +417,58 @@ extern "C"
 
   napi_status NAPI_CDECL napi_create_external(napi_env env,
                                               void *data,
-                                              node_api_basic_finalize finalize_cb,
+                                              napi_finalize finalize_cb,
                                               void *finalize_hint,
                                               napi_value *result)
   {
-    (void)finalize_cb;
-    (void)finalize_hint;
     if (!CheckEnv(env) || result == nullptr)
       return napi_invalid_arg;
-    // TODO: Figure out how to create JS object with external data and finalizer.
 
-    // 1. Generate new class ID
-    // JS_EXTERN JSClassID JS_NewClassID(JSRuntime *rt, JSClassID *pclass_id);
+    // 1. Create a new QuickJS object using our custom external class
+    // NOTE: Replace `napi_external_class_id` with how you access it in your engine.
+    JSValue obj = JS_NewObjectClass(env->ctx, napi_external_class_id);
+    if (JS_IsException(obj))
+    {
+      return ReturnPendingIfCaught(env, "Failed to create external object");
+    }
 
-    // 2. Populate class definition
-    // typedef struct JSClassDef {
-    //     const char *class_name; /* pure ASCII only! */
-    //     JSClassFinalizer *finalizer;
-    //     JSClassGCMark *gc_mark;
-    //     /* if call != NULL, the object is a function. If (flags &
-    //        JS_CALL_FLAG_CONSTRUCTOR) != 0, the function is called as a
-    //        constructor. In this case, 'this_val' is new.target. A
-    //        constructor call only happens if the object constructor bit is
-    //        set (see JS_SetConstructorBit()). */
-    //     JSClassCall *call;
-    //     /* XXX: suppress this indirection ? It is here only to save memory
-    //        because only a few classes need these methods */
-    //     JSClassExoticMethods *exotic;
-    // } JSClassDef;
+    // 2. Allocate the hint struct to hold the Node-API finalizer info
+    auto *hint = new napi_external_backing_store_hint();
+    hint->env = env;
+    hint->external_data = data;
+    hint->finalize_cb = finalize_cb;
+    hint->finalize_hint = finalize_hint;
 
-    // 3. Register class definition
-    // JS_EXTERN int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def);
+    // 3. Attach the struct to the QuickJS object
+    JS_SetOpaque(obj, hint);
 
-    // 4. Create object `proto_val = null` and `class_id = <registered class>`
-    // JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
-    //                                JSClassID class_id)
+    // 4. Wrap it in a napi_value and return
+    *result = napi_quickjs_wrap_value(env, obj);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
-    // Steps 1...3 should be done once at the installation of NAPI, and
-    // the `proto_val = null` will result in object without properties,
-    // which is what we probably want for opaque external objects?
+  napi_status NAPI_CDECL napi_get_value_external(napi_env env,
+                                                 napi_value value,
+                                                 void **result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
 
-    return napi_quickjs_set_last_error(env, napi_generic_failure, "External creation not supported yet");
+    JSValue local = napi_quickjs_unwrap_value(value);
+
+    // Get the opaque data, ensuring the object is actually of our external class
+    auto *hint = static_cast<napi_external_backing_store_hint *>(
+        JS_GetOpaque(local, napi_external_class_id));
+
+    if (hint == nullptr)
+    {
+      return napi_invalid_arg; // Not an external object or opaque data is null
+    }
+
+    // Return the original raw C pointer
+    *result = hint->external_data;
+
+    return napi_ok;
   }
 
   napi_status NAPI_CDECL napi_create_arraybuffer(napi_env env,
@@ -944,6 +984,18 @@ extern "C"
       // Externals in N-API are usually objects with an opaque pointer.
       // We'd need to check if it has the specific class ID used for externals if we implemented them.
       *result = napi_object;
+    }
+    else if (JS_IsObject(local))
+    {
+      // Check if it's our external class
+      if (JS_GetOpaque(local, napi_external_class_id) != nullptr)
+      {
+        *result = napi_external;
+      }
+      else
+      {
+        *result = napi_object;
+      }
     }
     else
     {
