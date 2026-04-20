@@ -21,6 +21,96 @@ namespace
     return env != nullptr && env->ctx != nullptr;
   }
 
+  inline bool CheckValue(napi_env env, napi_value value)
+  {
+    return CheckEnv(env) && value != nullptr;
+  }
+
+  void ClearLastException(napi_env env)
+  {
+    if (env == nullptr)
+      return;
+
+    if (JS_IsUndefined(env->last_exception))
+      return;
+
+    JS_FreeValue(env->ctx, env->last_exception);
+
+    env->last_exception = JS_UNDEFINED;
+  }
+
+  void SetLastException(napi_env env, JSValue exception)
+  {
+    if (env == nullptr)
+      return;
+
+    ClearLastException(env);
+
+    env->last_exception = exception;
+  }
+
+  inline napi_status ReturnPendingIfCaught(napi_env env, const char *message)
+  {
+    if (JS_HasException(env->ctx))
+    {
+      auto exc = JS_GetException(env->ctx);
+      SetLastException(env, exc);
+      return napi_quickjs_set_last_error(env, napi_pending_exception, message);
+    }
+    return napi_quickjs_set_last_error(env, napi_generic_failure, message);
+  }
+
+  inline napi_status InvalidArg(napi_env env)
+  {
+    if (CheckEnv(env))
+    {
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
+    return napi_invalid_arg;
+  }
+
+  inline JSTypedArrayEnum ToQuickJSArrayType(napi_typedarray_type type)
+  {
+    switch (type)
+    {
+    case napi_int8_array:
+      return JS_TYPED_ARRAY_INT8;
+
+    case napi_uint8_array:
+      return JS_TYPED_ARRAY_UINT8;
+
+    case napi_uint8_clamped_array:
+      return JS_TYPED_ARRAY_UINT8C;
+
+    case napi_int16_array:
+      return JS_TYPED_ARRAY_INT16;
+
+    case napi_uint16_array:
+      return JS_TYPED_ARRAY_UINT16;
+
+    case napi_int32_array:
+      return JS_TYPED_ARRAY_INT32;
+
+    case napi_uint32_array:
+      return JS_TYPED_ARRAY_UINT32;
+
+    case napi_float32_array:
+      return JS_TYPED_ARRAY_FLOAT32;
+
+    case napi_float64_array:
+      return JS_TYPED_ARRAY_FLOAT64;
+
+    case napi_bigint64_array:
+      return JS_TYPED_ARRAY_BIG_INT64;
+
+    case napi_biguint64_array:
+      return JS_TYPED_ARRAY_BIG_UINT64;
+
+    case napi_float16_array:
+      return JS_TYPED_ARRAY_FLOAT16;
+    }
+  }
+
   void FreeArrayBufferData(JSRuntime *rt, void *opaque, void *ptr)
   {
     js_free_rt(rt, ptr);
@@ -45,6 +135,10 @@ napi_value__::napi_value__(napi_env env, JSValue local)
     : env(env), value(local) {}
 
 napi_value__::~napi_value__() = default;
+
+napi_env__::napi_env__() : last_exception{JS_UNINITIALIZED}
+{
+}
 
 JSContext *napi_env__::context() const
 {
@@ -221,7 +315,7 @@ extern "C"
     auto out = JS_NewDate(env->ctx, time); // TODO: Confirm that `time` is `epoch_ms`
     if (JS_IsException(out))
     {
-      return napi_generic_failure;
+      return ReturnPendingIfCaught(env, "Failed to create date");
     }
     *result = napi_quickjs_wrap_value(env, out);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -310,6 +404,11 @@ extern "C"
                                 byte_length,
                                 &FreeArrayBufferData, nullptr,
                                 true); // TODO: shared or not-shared?
+    if (JS_IsException(ab))
+    {
+      js_free_rt(rt, buf);
+      return ReturnPendingIfCaught(env, "Failed to create array buffer");
+    }
 
     *result = napi_quickjs_wrap_value(env, ab);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -334,7 +433,7 @@ extern "C"
       out = JS_NewArrayBufferCopy(env->ctx, &buf, 1);
       if (JS_IsException(out))
       {
-        return napi_generic_failure;
+        return ReturnPendingIfCaught(env, "Failed to create detached array");
       }
       JS_DetachArrayBuffer(env->ctx, out);
     }
@@ -343,6 +442,7 @@ extern "C"
       if (external_data == nullptr)
         return napi_invalid_arg;
 
+      // TODO: Maybe instead allocate using js_rt_alloc()
       auto hint = new (std::nothrow) napi_external_backing_store_hint__();
       if (hint == nullptr)
         return napi_generic_failure;
@@ -356,10 +456,11 @@ extern "C"
                               &FreeExternalArrayBufferData,
                               hint,
                               true); // TODO: shared or not-shared?
+
       if (JS_IsException(out))
       {
         delete hint;
-        return napi_generic_failure;
+        return ReturnPendingIfCaught(env, "Failed to create external array");
       }
     }
 
@@ -367,47 +468,41 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_is_typedarray(napi_env env, napi_value value, bool* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
-  //   *result = napi_quickjs_unwrap_value(value)->IsTypedArray();
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_is_typedarray(napi_env env, napi_value value, bool *result)
+  {
+    if (!CheckEnv(env) || value == nullptr || result == nullptr)
+      return napi_invalid_arg;
+    *result = JS_GetTypedArrayType(napi_quickjs_unwrap_value(value));
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
-  //                                               napi_typedarray_type type,
-  //                                               size_t length,
-  //                                               napi_value arraybuffer,
-  //                                               size_t byte_offset,
-  //                                               napi_value* result) {
-  //   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return InvalidArg(env);
-  //   quickjs::Local<quickjs::Value> local = napi_quickjs_unwrap_value(arraybuffer);
-  //   if (!local->IsArrayBuffer()) return napi_arraybuffer_expected;
+  napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
+                                                napi_typedarray_type type,
+                                                size_t length,
+                                                napi_value arraybuffer,
+                                                size_t byte_offset,
+                                                napi_value *result)
+  {
+    if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr)
+      return InvalidArg(env);
 
-  //   const char* ctor_name = TypedArrayConstructorName(type);
-  //   if (ctor_name == nullptr) return InvalidArg(env);
+    JSValue argv[] = {
+        napi_quickjs_unwrap_value(arraybuffer),
+        JS_NewBigUint64(env->ctx, byte_offset),
+        JS_NewBigUint64(env->ctx, length)};
 
-  //   quickjs::TryCatch tc(env->ctx);
-  //   quickjs::Local<quickjs::String> key;
-  //   if (!quickjs::String::NewFromUtf8(env->ctx, ctor_name, quickjs::NewStringType::kNormal).ToLocal(&key)) {
-  //     return napi_generic_failure;
-  //   }
-  //   quickjs::Local<quickjs::Value> ctor_value;
-  //   if (!env->context()->Global()->Get(env->context(), key).ToLocal(&ctor_value) ||
-  //       !ctor_value->IsFunction()) {
-  //     return napi_generic_failure;
-  //   }
-  //   quickjs::Local<quickjs::Value> args[3] = {
-  //       local,
-  //       quickjs::Integer::NewFromUnsigned(env->ctx, static_cast<uint32_t>(byte_offset)),
-  //       quickjs::Integer::NewFromUnsigned(env->ctx, static_cast<uint32_t>(length)),
-  //   };
-  //   quickjs::Local<quickjs::Object> view;
-  //   if (!ctor_value.As<quickjs::Function>()->NewInstance(env->context(), 3, args).ToLocal(&view)) {
-  //     return ReturnPendingIfCaught(env, tc, "Failed to create TypedArray");
-  //   }
-  //   *result = napi_quickjs_wrap_value(env, view);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    JSTypedArrayEnum array_type = ToQuickJSArrayType(type);
+
+    JSValue view = JS_NewTypedArray(env->ctx, 3, argv, array_type);
+
+    if (JS_IsException(view))
+    {
+      return ReturnPendingIfCaught(env, "Failed to create TypedArray");
+    }
+
+    *result = napi_quickjs_wrap_value(env, view);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
   // napi_status NAPI_CDECL napi_get_typedarray_info(napi_env env,
   //                                                 napi_value typedarray,
