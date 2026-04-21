@@ -19,6 +19,15 @@ struct napi_value__
     JSValue value;
 };
 
+struct napi_callback_info__
+{
+  napi_env env;
+  JSValueConst this_val;
+  int argc;
+  JSValueConst *argv;
+  void *data;
+};
+
 struct napi_env__
 {
     explicit napi_env__(JSContext *context, int32_t module_api_version);
