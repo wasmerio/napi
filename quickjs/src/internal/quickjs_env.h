@@ -57,6 +57,6 @@ napi_status napi_quickjs_clear_last_error(napi_env env);
 napi_value napi_quickjs_wrap_value(napi_env env, JSValue value);
 JSValue napi_quickjs_unwrap_value(napi_value value);
 
-void RegisterExternalClass(JSRuntime *rt);
+int RegisterExternalClass(JSRuntime *rt);
 
 #endif // NAPI_QUICKJS_ENV_H_

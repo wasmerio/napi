@@ -4,7 +4,6 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-
 #include "test_env.h"
 
 inline std::string ReadTextFile(const std::string &path)
@@ -17,46 +16,54 @@ inline std::string ReadTextFile(const std::string &path)
 
 inline bool RunScript(EnvScope &s, const std::string &source_text, const char *label)
 {
-  // v8::TryCatch tc(s.isolate);
-  // v8::Local<v8::String> source =
-  //     v8::String::NewFromUtf8(s.isolate, source_text.c_str(), v8::NewStringType::kNormal)
-  //         .ToLocalChecked();
-  // v8::Local<v8::Script> script;
-  // if (!v8::Script::Compile(s.context, source).ToLocal(&script)) return false;
-  // v8::Local<v8::Value> out;
-  // if (!script->Run(s.context).ToLocal(&out)) {
-  //   if (tc.HasCaught()) {
-  //     v8::String::Utf8Value msg(s.isolate, tc.Exception());
-  //     ADD_FAILURE() << "JS exception (" << label << "): " << (*msg ? *msg : "<empty>");
-  //   }
-  //   return false;
-  // }
-  // s.isolate->PerformMicrotaskCheckpoint();
+  // 1. Evaluate the script
+  JSValue val = JS_Eval(s.ctx, source_text.c_str(), source_text.size(), label, JS_EVAL_TYPE_GLOBAL);
+
+  // 2. Handle exceptions
+  if (JS_IsException(val))
+  {
+    JSValue exc = JS_GetException(s.ctx);
+    const char *msg = JS_ToCString(s.ctx, exc);
+    ADD_FAILURE() << "JS exception (" << label << "): " << (msg ? msg : "<empty>");
+    JS_FreeCString(s.ctx, msg);
+    JS_FreeValue(s.ctx, exc);
+    return false;
+  }
+  JS_FreeValue(s.ctx, val);
+
+  // 3. Perform Microtask Checkpoint (execute Promises/jobs)
+  JSContext *ctx1;
+  while (JS_ExecutePendingJob(JS_GetRuntime(s.ctx), &ctx1) > 0)
+    ;
+
   return true;
 }
 
-// inline void ForceGcCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
-// v8::Isolate* isolate = info.GetIsolate();
-// isolate->LowMemoryNotification();
-// isolate->PerformMicrotaskCheckpoint();
-// info.GetReturnValue().Set(v8::Undefined(isolate));
-// }
+// Global GC callback for QuickJS
+inline JSValue ForceGcCallback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  JS_RunGC(JS_GetRuntime(ctx));
+  return JS_UNDEFINED;
+}
 
 inline bool InstallUpstreamJsShim(EnvScope &s, napi_value addon_exports)
 {
-  // napi_value global = nullptr;
-  // if (napi_get_global(s.env, &global) != napi_ok) return false;
-  // if (napi_set_named_property(s.env, global, "__napi_test_addon", addon_exports) != napi_ok) {
-  //   return false;
-  // }
-  // v8::Local<v8::Function> gc_fn;
-  // if (!v8::Function::New(s.context, ForceGcCallback).ToLocal(&gc_fn)) return false;
-  // if (!s.context->Global()
-  //          ->Set(s.context, v8::String::NewFromUtf8Literal(s.isolate, "__napi_force_gc"), gc_fn)
-  //          .FromMaybe(false)) {
-  //   return false;
-  // }
+  // 1. Set the addon exports on the global object for 'require' to find
+  napi_value global = nullptr;
+  if (napi_get_global(s.env, &global) != napi_ok)
+    return false;
+  if (napi_set_named_property(s.env, global, "__napi_test_addon", addon_exports) != napi_ok)
+  {
+    return false;
+  }
 
+  // 2. Register the manual GC function
+  JSValue global_obj = JS_GetGlobalObject(s.ctx);
+  JS_SetPropertyStr(s.ctx, global_obj, "__napi_force_gc",
+                    JS_NewCFunction(s.ctx, ForceGcCallback, "__napi_force_gc", 0));
+  JS_FreeValue(s.ctx, global_obj);
+
+  // 3. Define the shim script (already provided in your snippet)
   const char *shim = R"JS(
 (() => {
   'use strict';

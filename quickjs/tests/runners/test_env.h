@@ -1,89 +1,69 @@
-#ifndef NAPI_V8_TEST_ENV_H_
-#define NAPI_V8_TEST_ENV_H_
+#ifndef NAPI_QUICKJS_TEST_ENV_H_
+#define NAPI_QUICKJS_TEST_ENV_H_
 
 #include <memory>
-
 #include <gtest/gtest.h>
-// #include <libplatform/libplatform.h>
-// #include <v8.h>
-
+#include "quickjs.h"
 #include "unofficial_napi.h"
 
-// extern "C" {
-// napi_status napi_cdecl unofficial_napi_create_env_from_context(
-//     v8::local<v8::context> context, int32_t module_api_version, napi_env* result);
-// napi_status napi_cdecl unofficial_napi_destroy_env_instance_for_testing(napi_env env);
-// }
-
-class V8Runtime
+// External declarations for the environment bridge
+extern "C"
 {
-  //  public:
-  //   V8Runtime() {
-  //     static constexpr char kDefaultFlags[] = "--js-float16array";
-  //     v8::V8::SetFlagsFromString(kDefaultFlags, static_cast<int>(sizeof(kDefaultFlags) - 1));
-  //     v8::V8::InitializeICUDefaultLocation("");
-  //     v8::V8::InitializeExternalStartupData("");
-  //     platform_ = v8::platform::NewDefaultPlatform();
-  //     v8::V8::InitializePlatform(platform_.get());
-  //     v8::V8::Initialize();
+  napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
+      JSContext *context, int32_t module_api_version, napi_env *result);
+  napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env);
+}
 
-  //     params_.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
-  //     isolate_ = v8::Isolate::New(params_);
-  //   }
+class QuickJSRuntime
+{
+public:
+  QuickJSRuntime()
+  {
+    rt_ = JS_NewRuntime();
+  }
 
-  //   ~V8Runtime() {
-  //     isolate_->Dispose();
-  //     delete params_.array_buffer_allocator;
-  //     v8::V8::Dispose();
-  //     v8::V8::DisposePlatform();
-  //   }
+  ~QuickJSRuntime()
+  {
+    JS_FreeRuntime(rt_);
+  }
 
-  //   v8::Isolate* isolate() const { return isolate_; }
+  JSRuntime *runtime() const { return rt_; }
 
-  //  private:
-  //   std::unique_ptr<v8::Platform> platform_;
-  //   v8::Isolate::CreateParams params_{};
-  //   v8::Isolate* isolate_ = nullptr;
+private:
+  JSRuntime *rt_ = nullptr;
 };
 
 class FixtureTestBase : public ::testing::Test
 {
 protected:
-  static void SetUpTestSuite() { runtime_ = std::make_unique<V8Runtime>(); }
+  static void SetUpTestSuite() { runtime_ = std::make_unique<QuickJSRuntime>(); }
   static void TearDownTestSuite() { runtime_.reset(); }
-  static std::unique_ptr<V8Runtime> runtime_;
+  static std::unique_ptr<QuickJSRuntime> runtime_;
 };
 
-inline std::unique_ptr<V8Runtime> FixtureTestBase::runtime_;
+inline std::unique_ptr<QuickJSRuntime> FixtureTestBase::runtime_;
 
 struct EnvScope
 {
-  explicit EnvScope(V8Runtime *runtime)
-  // : isolate(runtime->isolate()),
-  //   isolate_scope(isolate),
-  //   handle_scope(isolate),
-  //   context(v8::Context::New(isolate)),
-  //   context_scope(context)
+  explicit EnvScope(QuickJSRuntime *runtime)
   {
-    // EXPECT_EQ(unofficial_napi_create_env_from_context(context, 8, &env), napi_ok);
-    // EXPECT_NE(env, nullptr);
+    ctx = JS_NewContext(runtime->runtime());
+    // Initialize the Node-API environment from the QuickJS context
+    EXPECT_EQ(unofficial_napi_create_env_from_context(ctx, 8, &env), napi_ok);
+    EXPECT_NE(env, nullptr);
   }
 
   ~EnvScope()
   {
-    // if (env != nullptr)
-    // {
-    //   EXPECT_EQ(unofficial_napi_destroy_env_instance_for_testing(env), napi_ok);
-    //   env = nullptr;
-    // }
+    if (env != nullptr)
+    {
+      unofficial_napi_destroy_env_instance_for_testing(env);
+      env = nullptr;
+    }
   }
 
-  // v8::Isolate* isolate;
-  // v8::Isolate::Scope isolate_scope;
-  // v8::HandleScope handle_scope;
-  // v8::Local<v8::Context> context;
-  // v8::Context::Scope context_scope;
+  JSContext *ctx;
   napi_env env = nullptr;
 };
 
-#endif // NAPI_V8_TEST_ENV_H_
+#endif // NAPI_QUICKJS_TEST_ENV_H_
