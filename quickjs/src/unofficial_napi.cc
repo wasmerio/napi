@@ -3,12 +3,6 @@
 #include <unordered_map>
 #include <mutex>
 
-namespace
-{
-    std::mutex g_env_by_context_mu;
-    std::unordered_map<JSContext *, napi_env> g_env_by_context;
-}
-
 struct UnofficialEnvScope
 {
     JSRuntime *rt;
@@ -36,11 +30,8 @@ extern "C"
         auto env = new (std::nothrow) napi_env__(context, module_api_version);
         if (env == nullptr)
             return napi_generic_failure;
-
-        {
-            std::lock_guard<std::mutex> lock{g_env_by_context_mu};
-            g_env_by_context[env->ctx] = env;
-        }
+        
+        JS_SetContextOpaque(context, env);
 
         *result = env;
         return napi_ok;

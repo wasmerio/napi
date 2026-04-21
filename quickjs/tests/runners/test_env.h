@@ -20,6 +20,7 @@ public:
   QuickJSRuntime()
   {
     rt_ = JS_NewRuntime();
+    JS_SetDumpFlags(rt_, JS_DUMP_LEAKS);
   }
 
   ~QuickJSRuntime()
