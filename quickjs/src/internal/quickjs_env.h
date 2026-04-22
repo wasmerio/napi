@@ -21,11 +21,24 @@ struct napi_value__
 
 struct napi_callback_info__
 {
-  napi_env env;
-  JSValueConst this_val;
-  int argc;
-  JSValueConst *argv;
-  void *data;
+    napi_env env;
+    JSValueConst this_val;
+    JSValue new_target;
+    int argc;
+    JSValueConst *argv;
+    void *data;
+};
+
+struct napi_ref__
+{
+    explicit napi_ref__(napi_env env, JSValue local, uint32_t initial_ref_count);
+    ~napi_ref__();
+
+    napi_env env;
+    JSValue value;
+
+    bool can_be_weak;
+    uint32_t ref_count;
 };
 
 struct napi_env__
@@ -44,8 +57,12 @@ struct napi_env__
     // JSValue last_exception_message;
     // std::string last_exception_source_line;
     // std::string last_exception_thrown_at;
-    
+
     int32_t module_api_version = 8;
+
+    void *instance_data = nullptr;
+    napi_finalize instance_data_finalize_cb = nullptr;
+    void *instance_data_finalize_hint = nullptr;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

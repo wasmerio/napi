@@ -101,36 +101,36 @@ if(NAPI_QUICKJS_LIBRARY)
     )
   endfunction()
 
-#   add_fixture_test(napi_quickjs_test_2
-#     runners/test_2_function_arguments.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/2_function_arguments/2_function_arguments.c
-#   )
-#   add_fixture_test(napi_quickjs_test_3
-#     runners/test_3_callbacks.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/3_callbacks/3_callbacks.c
-#   )
-#   add_fixture_test(napi_quickjs_test_4
-#     runners/test_4_object_factory.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/4_object_factory/4_object_factory.c
-#   )
-#   add_fixture_test(napi_quickjs_test_5
-#     runners/test_5_function_factory.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/5_function_factory/5_function_factory.c
-#   )
-#   add_fixture_test(napi_quickjs_test_6
-#     runners/test_6_object_wrap.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/6_object_wrap/myobject.cc
-#   )
-#   add_fixture_test(napi_quickjs_test_7
-#     runners/test_7_factory_wrap.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/7_factory_wrap/7_factory_wrap.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/7_factory_wrap/myobject.cc
-#   )
-#   add_fixture_test(napi_quickjs_test_8
-#     runners/test_8_passing_wrapped.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/8_passing_wrapped/8_passing_wrapped.cc
-#     ${NAPI_TESTS_ROOT}/js-native-api/8_passing_wrapped/myobject.cc
-#   )
+  add_fixture_test(napi_quickjs_test_2
+    runners/test_2_function_arguments.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/2_function_arguments/2_function_arguments.c
+  )
+  add_fixture_test(napi_quickjs_test_3
+    runners/test_3_callbacks.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/3_callbacks/3_callbacks.c
+  )
+  add_fixture_test(napi_quickjs_test_4
+    runners/test_4_object_factory.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/4_object_factory/4_object_factory.c
+  )
+  add_fixture_test(napi_quickjs_test_5
+    runners/test_5_function_factory.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/5_function_factory/5_function_factory.c
+  )
+  add_fixture_test(napi_quickjs_test_6
+    runners/test_6_object_wrap.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/6_object_wrap/myobject.cc
+  )
+  # add_fixture_test(napi_quickjs_test_7
+  #   runners/test_7_factory_wrap.cc
+  #   ${NAPI_TESTS_ROOT}/js-native-api/7_factory_wrap/7_factory_wrap.cc
+  #   ${NAPI_TESTS_ROOT}/js-native-api/7_factory_wrap/myobject.cc
+  # )
+  # add_fixture_test(napi_quickjs_test_8
+  #   runners/test_8_passing_wrapped.cc
+  #   ${NAPI_TESTS_ROOT}/js-native-api/8_passing_wrapped/8_passing_wrapped.cc
+  #   ${NAPI_TESTS_ROOT}/js-native-api/8_passing_wrapped/myobject.cc
+  # )
   add_fixture_test(napi_quickjs_test_9_array
     runners/test_9_array.cc
     ${NAPI_TESTS_ROOT}/js-native-api/test_array/test_array.c
