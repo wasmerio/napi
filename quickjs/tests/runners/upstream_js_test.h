@@ -16,6 +16,25 @@ inline std::string ReadTextFile(const std::string &path)
 
 inline bool RunScript(EnvScope &s, const std::string &source_text, const char *label)
 {
+  // napi_value source;
+  // if (napi_ok != napi_create_string_utf8(s.env, source_text.c_str(), source_text.size(), &source))
+  // {
+  //   ADD_FAILURE() << "Failed to create UTF8 String";
+  //   return false;
+  // }
+
+  // napi_value result;
+  // if (napi_ok != napi_run_script(s.env, source, &result))
+  // {
+  //   ADD_FAILURE() << "Failed to run script";
+  //   return false;
+  // }
+
+  // TODO^^:
+  // - get last exception
+  // - introspect exception
+  // - free returned value
+
   // 1. Evaluate the script
   JSValue val = JS_Eval(s.ctx, source_text.c_str(), source_text.size(), label, JS_EVAL_TYPE_GLOBAL);
 

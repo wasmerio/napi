@@ -29,6 +29,12 @@ struct napi_callback_info__
     void *data;
 };
 
+struct napi_deferred__ {
+  napi_env env = nullptr;
+  JSValue resolve = JS_UNDEFINED; // resolving_funcs[0]
+  JSValue reject  = JS_UNDEFINED; // resolving_funcs[1]
+};
+
 struct napi_ref__
 {
     explicit napi_ref__(napi_env env, JSValue local, uint32_t initial_ref_count);

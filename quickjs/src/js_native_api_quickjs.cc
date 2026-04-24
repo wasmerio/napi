@@ -2,6 +2,15 @@
 #include <cstring>
 #include <cmath>
 
+enum
+{
+  __JS_ATOM_NULL = JS_ATOM_NULL,
+#define DEF(name, str) JS_ATOM_##name,
+#include "quickjs-atom.h"
+#undef DEF
+  JS_ATOM_END,
+};
+
 struct napi_external_backing_store_hint__
 {
   napi_env env = nullptr;
@@ -12,6 +21,21 @@ struct napi_external_backing_store_hint__
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
 static JSClassID napi_external_class_id = 0;
+
+struct napi_handle_scope__
+{
+  napi_env env = nullptr;
+};
+
+struct napi_escapable_handle_scope__
+{
+  napi_env env = nullptr;
+  bool escaped = false;
+};
+
+// A fixed property name unlikely to collide with user properties.
+// Leading/trailing underscores + napi prefix makes it effectively private.
+static const char kTypeTagProperty[] = "__napi_type_tag__";
 
 static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
 {
@@ -348,7 +372,7 @@ static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
   {
     // Allocate a fresh instance using the class that supports SetOpaque.
     // The prototype comes from the constructor's .prototype property.
-    JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
+    JSValue proto = JS_GetProperty(ctx, this_val, JS_ATOM_prototype);
     effective_this = JS_NewObjectProtoClass(ctx, proto, napi_external_class_id);
     JS_FreeValue(ctx, proto);
 
@@ -433,6 +457,166 @@ napi_status CreateFunction(napi_env env,
   }
 
   *result = napi_quickjs_wrap_value(env, fn);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+// Translate napi_key_filter + collection mode into JS_GPN_* flags
+int NapiKeyFilterToGPN(napi_key_filter key_filter)
+{
+  int flags = 0;
+
+  // Include string-keyed properties unless skip_strings is set
+  if (!(key_filter & napi_key_skip_strings))
+    flags |= JS_GPN_STRING_MASK;
+
+  // Include symbol-keyed properties unless skip_symbols is set
+  if (!(key_filter & napi_key_skip_symbols))
+    flags |= JS_GPN_SYMBOL_MASK;
+
+  // Enumerable-only filter
+  if (key_filter & napi_key_enumerable)
+    flags |= JS_GPN_ENUM_ONLY;
+
+  return flags;
+}
+
+napi_status GetPropertyNames(napi_env env,
+                             napi_value object,
+                             napi_key_collection_mode key_mode,
+                             napi_key_filter key_filter,
+                             napi_key_conversion key_conversion,
+                             napi_value *result)
+{
+  if (!CheckValue(env, object) || result == nullptr)
+    return napi_invalid_arg;
+
+  JSContext *ctx = env->ctx;
+  JSValue obj = napi_quickjs_unwrap_value(object);
+  if (!JS_IsObject(obj))
+    return napi_object_expected;
+
+  int gpn_flags = NapiKeyFilterToGPN(key_filter);
+  JSPropertyEnum *tab = nullptr;
+  uint32_t tab_count = 0;
+
+  // Collect own properties first
+  if (JS_GetOwnPropertyNames(ctx, &tab, &tab_count, obj, gpn_flags) < 0)
+    return ReturnPendingIfCaught(env, "Exception while getting property names");
+
+  JSValue arr = JS_NewArray(ctx);
+  uint32_t arr_idx = 0;
+
+  auto append_tab = [&](JSPropertyEnum *t, uint32_t count)
+  {
+    for (uint32_t i = 0; i < count; ++i)
+    {
+      JSValue key;
+      if (key_conversion == napi_key_numbers_to_strings)
+      {
+        // Always produce a string, even for integer-indexed keys
+        key = JS_AtomToString(ctx, t[i].atom);
+      }
+      else
+      {
+        // napi_key_keep_numbers: integer atoms stay as numbers, others as strings/symbols
+        key = JS_AtomToValue(ctx, t[i].atom);
+      }
+      JS_SetPropertyUint32(ctx, arr, arr_idx++, key);
+    }
+    JS_FreePropertyEnum(ctx, t, count);
+  };
+
+  append_tab(tab, tab_count);
+
+  // Walk the prototype chain for kIncludePrototypes
+  if (key_mode == napi_key_include_prototypes)
+  {
+    JSValue proto = JS_GetPrototype(ctx, obj);
+    while (JS_IsObject(proto))
+    {
+      JSPropertyEnum *ptab = nullptr;
+      uint32_t pcount = 0;
+      if (JS_GetOwnPropertyNames(ctx, &ptab, &pcount, proto, gpn_flags) == 0)
+        append_tab(ptab, pcount);
+
+      JSValue next = JS_GetPrototype(ctx, proto);
+      JS_FreeValue(ctx, proto);
+      proto = next;
+    }
+    JS_FreeValue(ctx, proto);
+  }
+
+  *result = napi_quickjs_wrap_value(env, arr);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+JSValue CreatePlainError(JSContext *ctx, const char *msg)
+{
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue error_ctor = JS_GetPropertyStr(ctx, global, "Error");
+  JSValue msg_str = JS_NewString(ctx, msg ? msg : "");
+  JSValue error = JS_CallConstructor(ctx, error_ctor, 1, &msg_str);
+  JS_FreeValue(ctx, msg_str);
+  JS_FreeValue(ctx, error_ctor);
+  JS_FreeValue(ctx, global);
+  return error;
+}
+
+static napi_status CreatePlainErrorCommon(napi_env env, napi_value code, napi_value msg, napi_value *result)
+{
+  if (!CheckEnv(env) || msg == nullptr || result == nullptr)
+    return napi_invalid_arg;
+
+  JSValue msg_val = napi_quickjs_unwrap_value(msg);
+  if (!JS_IsString(msg_val))
+    return napi_string_expected;
+
+  const char *msg_str = JS_ToCString(env->ctx, msg_val);
+  JSValue error = CreatePlainError(env->ctx, msg_str);
+  JS_FreeCString(env->ctx, msg_str);
+
+  if (code != nullptr)
+  {
+    const char *code_str = JS_ToCString(env->ctx, napi_quickjs_unwrap_value(code));
+    JS_SetPropertyStr(env->ctx, error, "code", JS_NewString(env->ctx, code_str));
+    JS_FreeCString(env->ctx, code_str);
+  }
+
+  *result = napi_quickjs_wrap_value(env, error);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+JSValue CreateErrorObject(JSContext *ctx, JSValue (*factory)(JSContext *, const char *, ...), const char *code, const char *msg)
+{
+  JSValue error = factory(ctx, "");
+  JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, msg ? msg : ""));
+  if (code != nullptr)
+    JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, code));
+  return error;
+}
+
+napi_status CreateErrorCommon(napi_env env, JSValue (*factory)(JSContext *, const char *, ...),
+                              napi_value code, napi_value msg, napi_value *result)
+{
+  if (!CheckEnv(env) || msg == nullptr || result == nullptr)
+    return napi_invalid_arg;
+
+  JSValue msg_val = napi_quickjs_unwrap_value(msg);
+  if (!JS_IsString(msg_val))
+    return napi_string_expected;
+
+  const char *msg_str = JS_ToCString(env->ctx, msg_val);
+  const char *code_str = nullptr;
+  if (code != nullptr)
+    code_str = JS_ToCString(env->ctx, napi_quickjs_unwrap_value(code));
+
+  JSValue error = CreateErrorObject(env->ctx, factory, code_str, msg_str);
+
+  JS_FreeCString(env->ctx, msg_str);
+  if (code_str != nullptr)
+    JS_FreeCString(env->ctx, code_str);
+
+  *result = napi_quickjs_wrap_value(env, error);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -1110,149 +1294,137 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
-  // napi_status NAPI_CDECL node_api_create_external_string_latin1(
-  //     napi_env env,
-  //     char* str,
-  //     size_t length,
-  //     node_api_basic_finalize finalize_callback,
-  //     void* finalize_hint,
-  //     napi_value* result,
-  //     bool* copied) {
-  //   (void)finalize_callback;
-  //   (void)finalize_hint;
-  //   if (copied != nullptr) *copied = false;
-  //   return napi_create_string_latin1(env, str, length, result);
-  // }
+  napi_status NAPI_CDECL node_api_create_external_string_latin1(
+      napi_env env, char *str, size_t length,
+      node_api_basic_finalize finalize_callback, void *finalize_hint,
+      napi_value *result, bool *copied)
+  {
+    // QuickJS always copies string data, so finalize_callback/finalize_hint
+    // are intentionally ignored — the caller retains ownership of str.
+    (void)finalize_callback;
+    (void)finalize_hint;
+    if (copied != nullptr)
+      *copied = true;
+    return napi_create_string_latin1(env, str, length, result);
+  }
 
-  // napi_status NAPI_CDECL node_api_create_external_string_utf16(
-  //     napi_env env,
-  //     char16_t* str,
-  //     size_t length,
-  //     node_api_basic_finalize finalize_callback,
-  //     void* finalize_hint,
-  //     napi_value* result,
-  //     bool* copied) {
-  //   (void)finalize_callback;
-  //   (void)finalize_hint;
-  //   if (copied != nullptr) *copied = false;
-  //   return napi_create_string_utf16(env, str, length, result);
-  // }
+  napi_status NAPI_CDECL node_api_create_external_string_utf16(
+      napi_env env, char16_t *str, size_t length,
+      node_api_basic_finalize finalize_callback, void *finalize_hint,
+      napi_value *result, bool *copied)
+  {
+    (void)finalize_callback;
+    (void)finalize_hint;
+    if (copied != nullptr)
+      *copied = true;
+    return napi_create_string_utf16(env, str, length, result);
+  }
 
-  // napi_status NAPI_CDECL node_api_create_property_key_latin1(
-  //     napi_env env, const char* str, size_t length, napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if (str == nullptr) {
-  //     if (length != 0) return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //     str = "";
-  //   }
-  //   if (length == NAPI_AUTO_LENGTH) {
-  //     length = std::strlen(str);
-  //   }
-  //   if (length > static_cast<size_t>(INT_MAX)) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::String> out;
-  //   if (!v8::String::NewFromOneByte(
-  //            env->isolate,
-  //            reinterpret_cast<const uint8_t*>(str),
-  //            v8::NewStringType::kInternalized,
-  //            static_cast<int>(length))
-  //            .ToLocal(&out)) {
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+  // Property keys in QuickJS are interned atoms. We create a regular string
+  // which QuickJS will intern automatically when used as a property key.
+  napi_status NAPI_CDECL node_api_create_property_key_latin1(
+      napi_env env, const char *str, size_t length, napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+    if (str == nullptr)
+    {
+      if (length != 0)
+        return napi_invalid_arg;
+      str = "";
+    }
+    if (length == NAPI_AUTO_LENGTH)
+      length = strlen(str);
 
-  // napi_status NAPI_CDECL node_api_create_property_key_utf8(
-  //     napi_env env, const char* str, size_t length, napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if (str == nullptr) {
-  //     if (length != 0) return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //     str = "";
-  //   }
-  //   if (length == NAPI_AUTO_LENGTH) {
-  //     length = std::strlen(str);
-  //   }
-  //   if (length > static_cast<size_t>(INT_MAX)) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::String> out;
-  //   if (!v8::String::NewFromUtf8(
-  //            env->isolate,
-  //            str,
-  //            v8::NewStringType::kInternalized,
-  //            static_cast<int>(length))
-  //            .ToLocal(&out)) {
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+    *result = napi_quickjs_wrap_value(env, JS_NewAtomString(env->ctx, str));
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
-  // napi_status NAPI_CDECL node_api_create_property_key_utf16(
-  //     napi_env env, const char16_t* str, size_t length, napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if (str == nullptr) {
-  //     if (length != 0) return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //     static const char16_t empty[] = {0};
-  //     str = empty;
-  //   }
-  //   if (length == NAPI_AUTO_LENGTH) {
-  //     const char16_t* p = str;
-  //     while (*p != 0) ++p;
-  //     length = static_cast<size_t>(p - str);
-  //   }
-  //   if (length > static_cast<size_t>(INT_MAX)) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::String> out;
-  //   if (!v8::String::NewFromTwoByte(
-  //            env->isolate,
-  //            reinterpret_cast<const uint16_t*>(str),
-  //            v8::NewStringType::kInternalized,
-  //            static_cast<int>(length))
-  //            .ToLocal(&out)) {
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL node_api_create_property_key_utf8(
+      napi_env env, const char *str, size_t length, napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+    if (str == nullptr)
+    {
+      if (length != 0)
+        return napi_invalid_arg;
+      str = "";
+    }
+    if (length == NAPI_AUTO_LENGTH)
+      length = strlen(str);
 
-  // napi_status NAPI_CDECL napi_create_symbol(napi_env env,
-  //                                           napi_value description,
-  //                                           napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> desc_value = v8::Undefined(env->isolate);
-  //   if (description != nullptr) {
-  //     if (!CheckValue(env, description)) return napi_invalid_arg;
-  //     desc_value = napi_v8_unwrap_value(description);
-  //     if (!desc_value->IsString()) return napi_string_expected;
-  //   }
-  //   v8::Local<v8::Symbol> sym = v8::Symbol::New(
-  //       env->isolate, desc_value->IsString() ? desc_value.As<v8::String>() : v8::Local<v8::String>());
-  //   *result = napi_v8_wrap_value(env, sym);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    *result = napi_quickjs_wrap_value(env, JS_NewStringLen(env->ctx, str, length));
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
-  // napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
-  //                                            const char* utf8description,
-  //                                            size_t length,
-  //                                            napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if (utf8description == nullptr && length > 0) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   const char* desc = (utf8description == nullptr) ? "" : utf8description;
-  //   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
-  //   v8::Local<v8::String> key;
-  //   if (!v8::String::NewFromUtf8(env->isolate, desc, v8::NewStringType::kNormal, v8_length)
-  //            .ToLocal(&key)) {
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, v8::Symbol::For(env->isolate, key));
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL node_api_create_property_key_utf16(
+      napi_env env, const char16_t *str, size_t length, napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+    if (str == nullptr)
+    {
+      if (length != 0)
+        return napi_invalid_arg;
+      str = u"";
+    }
+    if (length == NAPI_AUTO_LENGTH)
+    {
+      const char16_t *p = str;
+      while (*p != 0)
+        ++p;
+      length = static_cast<size_t>(p - str);
+    }
+
+    *result = napi_quickjs_wrap_value(
+        env, JS_NewStringUTF16(env->ctx, reinterpret_cast<const uint16_t *>(str), length));
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_create_symbol(napi_env env,
+                                            napi_value description,
+                                            napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+
+    const char *desc_str = nullptr;
+    if (description != nullptr)
+    {
+      JSValue desc_val = napi_quickjs_unwrap_value(description);
+      if (!JS_IsString(desc_val))
+        return napi_string_expected;
+      desc_str = JS_ToCString(env->ctx, desc_val);
+    }
+
+    JSValue sym = JS_NewSymbol(env->ctx, desc_str ? desc_str : "", false);
+
+    if (desc_str != nullptr)
+      JS_FreeCString(env->ctx, desc_str);
+
+    *result = napi_quickjs_wrap_value(env, sym);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
+                                             const char *utf8description,
+                                             size_t length,
+                                             napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+    if (utf8description == nullptr && length > 0)
+      return napi_invalid_arg;
+
+    const char *desc = (utf8description == nullptr) ? "" : utf8description;
+
+    // JS_NewSymbol with is_global=true mirrors Symbol.for() — same key returns same symbol.
+    JSValue sym = JS_NewSymbol(env->ctx, desc, true);
+
+    *result = napi_quickjs_wrap_value(env, sym);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_typeof(napi_env env,
                                      napi_value value,
@@ -1403,90 +1575,138 @@ extern "C"
     return napi_quickjs_clear_last_error(env);
   }
 
-  // napi_status NAPI_CDECL napi_get_value_bigint_int64(napi_env env,
-  //                                                    napi_value value,
-  //                                                    int64_t* result,
-  //                                                    bool* lossless) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr || lossless == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsBigInt()) {
-  //     return napi_v8_set_last_error(env, napi_bigint_expected, "A bigint was expected");
-  //   }
-  //   *result = local.As<v8::BigInt>()->Int64Value(lossless);
-  //   return napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_get_value_bigint_int64(napi_env env,
+                                                     napi_value value,
+                                                     int64_t *result,
+                                                     bool *lossless)
+  {
+    if (!CheckEnv(env) || value == nullptr || result == nullptr || lossless == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_get_value_bigint_uint64(napi_env env,
-  //                                                     napi_value value,
-  //                                                     uint64_t* result,
-  //                                                     bool* lossless) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr || lossless == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsBigInt()) {
-  //     return napi_v8_set_last_error(env, napi_bigint_expected, "A bigint was expected");
-  //   }
-  //   *result = local.As<v8::BigInt>()->Uint64Value(lossless);
-  //   return napi_v8_clear_last_error(env);
-  // }
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsBigInt(local))
+      return napi_bigint_expected;
 
-  // napi_status NAPI_CDECL napi_get_value_bigint_words(napi_env env,
-  //                                                    napi_value value,
-  //                                                    int* sign_bit,
-  //                                                    size_t* word_count,
-  //                                                    uint64_t* words) {
-  //   if (!CheckEnv(env) || value == nullptr || word_count == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsBigInt()) {
-  //     return napi_v8_set_last_error(env, napi_bigint_expected, "A bigint was expected");
-  //   }
-  //   v8::Local<v8::BigInt> bigint = local.As<v8::BigInt>();
-  //   int sign = 0;
-  //   int wc = static_cast<int>(bigint->WordCount());
-  //   if (words == nullptr) {
-  //     if (sign_bit != nullptr) {
-  //       int tmp_count = wc;
-  //       uint64_t dummy_word = 0;
-  //       uint64_t* tmp_words = (tmp_count > 0) ? &dummy_word : nullptr;
-  //       bigint->ToWordsArray(&sign, &tmp_count, tmp_words);
-  //       *sign_bit = sign;
-  //     }
-  //     *word_count = static_cast<size_t>(wc);
-  //     return napi_v8_clear_last_error(env);
-  //   }
-  //   int requested = (*word_count > static_cast<size_t>(INT_MAX))
-  //                       ? INT_MAX
-  //                       : static_cast<int>(*word_count);
-  //   bigint->ToWordsArray(&sign, &requested, words);
-  //   if (sign_bit != nullptr) *sign_bit = sign;
-  //   *word_count = static_cast<size_t>(requested);
-  //   return napi_v8_clear_last_error(env);
-  // }
+    // JS_ToBigInt64 returns -1 and sets exception if value doesn't fit in int64
+    int rc = JS_ToBigInt64(env->ctx, result, local);
+    *lossless = (rc == 0);
+    if (rc != 0)
+    {
+      // Clear the exception — lossless=false is the signal, not an error
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      // Saturate: re-extract as uint64 and reinterpret for the truncated bits
+      uint64_t u = 0;
+      JS_ToBigUint64(env->ctx, &u, local);
+      *result = static_cast<int64_t>(u);
+    }
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_is_date(napi_env env, napi_value value, bool* is_date) {
-  //   if (!CheckEnv(env) || value == nullptr || is_date == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *is_date = napi_v8_unwrap_value(value)->IsDate();
-  //   return napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_get_value_bigint_uint64(napi_env env,
+                                                      napi_value value,
+                                                      uint64_t *result,
+                                                      bool *lossless)
+  {
+    if (!CheckEnv(env) || value == nullptr || result == nullptr || lossless == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_get_date_value(napi_env env, napi_value value, double* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsDate()) {
-  //     return napi_v8_set_last_error(env, napi_date_expected, "A date was expected");
-  //   }
-  //   *result = local.As<v8::Date>()->ValueOf();
-  //   return napi_v8_clear_last_error(env);
-  // }
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsBigInt(local))
+      return napi_bigint_expected;
+
+    int rc = JS_ToBigUint64(env->ctx, result, local);
+    *lossless = (rc == 0);
+    if (rc != 0)
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      // Truncated bits via int64 reinterpret
+      int64_t s = 0;
+      JS_ToBigInt64(env->ctx, &s, local);
+      *result = static_cast<uint64_t>(s);
+    }
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_get_value_bigint_words(napi_env env,
+                                                     napi_value value,
+                                                     int *sign_bit,
+                                                     size_t *word_count,
+                                                     uint64_t *words)
+  {
+    if (!CheckEnv(env) || value == nullptr || word_count == nullptr)
+      return napi_invalid_arg;
+
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsBigInt(local))
+      return napi_bigint_expected;
+
+    // QuickJS has no words API — we only have int64/uint64 primitives,
+    // so we can faithfully represent BigInts that fit in one 64-bit word.
+    // Larger values report word_count=1 with truncated data and lossless=false
+    // signalled via the truncated content (caller checks sign+words themselves).
+    int64_t s = 0;
+    JS_ToBigInt64(env->ctx, &s, local);
+    bool negative = (s < 0);
+
+    if (sign_bit != nullptr)
+      *sign_bit = negative ? 1 : 0;
+
+    if (words == nullptr)
+    {
+      // Query mode: just return how many words we need
+      *word_count = 1;
+      return napi_ok;
+    }
+
+    if (*word_count >= 1)
+    {
+      uint64_t u = 0;
+      JS_ToBigUint64(env->ctx, &u, local);
+      words[0] = u;
+    }
+    *word_count = 1;
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_is_date(napi_env env, napi_value value, bool *is_date)
+  {
+    if (!CheckValue(env, value) || is_date == nullptr)
+      return napi_invalid_arg;
+
+    *is_date = JS_IsDate(napi_quickjs_unwrap_value(value));
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_get_date_value(napi_env env, napi_value value, double *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsDate(local))
+      return napi_date_expected;
+
+    // No JS_GetDateValue in QuickJS — call .valueOf() which returns the epoch ms
+    JSValue valueOf = JS_GetPropertyStr(env->ctx, local, "valueOf");
+    if (JS_IsException(valueOf))
+      return ReturnPendingIfCaught(env, "Failed to get Date.valueOf");
+
+    JSValue ms = JS_Call(env->ctx, valueOf, local, 0, nullptr);
+    JS_FreeValue(env->ctx, valueOf);
+
+    if (JS_IsException(ms))
+      return ReturnPendingIfCaught(env, "Failed to call Date.valueOf");
+
+    int rc = JS_ToFloat64(env->ctx, result, ms);
+    JS_FreeValue(env->ctx, ms);
+
+    if (rc != 0)
+      return ReturnPendingIfCaught(env, "Failed to convert Date value to float64");
+
+    return napi_ok;
+  }
 
   // napi_status NAPI_CDECL napi_is_arraybuffer(napi_env env, napi_value value, bool* result) {
   //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
@@ -1866,50 +2086,72 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   auto* scope = new (std::nothrow) napi_handle_scope__();
-  //   if (scope == nullptr) return napi_generic_failure;
-  //   scope->env = env;
-  //   *result = scope;
-  //   return napi_ok;
-  // }
+  // Handle scopes are a V8 concept for stack-based GC roots — QuickJS uses
+  // reference counting so they're no-ops here.
 
-  // napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope) {
-  //   if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
-  //   delete scope;
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_open_escapable_handle_scope(
-  //     napi_env env, napi_escapable_handle_scope* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   auto* scope = new (std::nothrow) napi_escapable_handle_scope__();
-  //   if (scope == nullptr) return napi_generic_failure;
-  //   scope->env = env;
-  //   *result = scope;
-  //   return napi_ok;
-  // }
+    auto *scope = new (std::nothrow) napi_handle_scope__();
+    if (scope == nullptr)
+      return napi_generic_failure;
 
-  // napi_status NAPI_CDECL napi_close_escapable_handle_scope(
-  //     napi_env env, napi_escapable_handle_scope scope) {
-  //   if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
-  //   delete scope;
-  //   return napi_ok;
-  // }
+    scope->env = env;
+    *result = scope;
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_escape_handle(napi_env env,
-  //                                           napi_escapable_handle_scope scope,
-  //                                           napi_value escapee,
-  //                                           napi_value* result) {
-  //   if (!CheckEnv(env) || scope == nullptr || escapee == nullptr || result == nullptr) {
-  //     return napi_invalid_arg;
-  //   }
-  //   if (scope->escaped) return napi_escape_called_twice;
-  //   scope->escaped = true;
-  //   *result = escapee;
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope)
+  {
+    if (!CheckEnv(env) || scope == nullptr)
+      return napi_invalid_arg;
+
+    delete scope;
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_open_escapable_handle_scope(napi_env env,
+                                                          napi_escapable_handle_scope *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+
+    auto *scope = new (std::nothrow) napi_escapable_handle_scope__();
+    if (scope == nullptr)
+      return napi_generic_failure;
+
+    scope->env = env;
+    *result = scope;
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_close_escapable_handle_scope(napi_env env,
+                                                           napi_escapable_handle_scope scope)
+  {
+    if (!CheckEnv(env) || scope == nullptr)
+      return napi_invalid_arg;
+
+    delete scope;
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_escape_handle(napi_env env,
+                                            napi_escapable_handle_scope scope,
+                                            napi_value escapee,
+                                            napi_value *result)
+  {
+    if (!CheckEnv(env) || scope == nullptr || escapee == nullptr || result == nullptr)
+      return napi_invalid_arg;
+
+    if (scope->escaped)
+      return napi_escape_called_twice;
+
+    scope->escaped = true;
+    *result = escapee;
+    return napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_create_function(napi_env env,
                                               const char *utf8name,
@@ -2305,68 +2547,84 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_create_promise(napi_env env,
-  //                                            napi_deferred* deferred,
-  //                                            napi_value* promise) {
-  //   if (!CheckEnv(env) || deferred == nullptr || promise == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch tc(env->isolate);
-  //   v8::Local<v8::Promise::Resolver> resolver;
-  //   if (!v8::Promise::Resolver::New(env->context()).ToLocal(&resolver)) {
-  //     return ReturnPendingIfCaught(env, tc, "Failed to create Promise resolver");
-  //   }
-  //   auto* d = new (std::nothrow) napi_deferred__();
-  //   if (d == nullptr) return napi_generic_failure;
-  //   d->env = env;
-  //   d->resolver.Reset(env->isolate, resolver);
-  //   *deferred = d;
-  //   *promise = napi_v8_wrap_value(env, resolver->GetPromise());
-  //   if (*promise == nullptr) {
-  //     delete d;
-  //     *deferred = nullptr;
-  //     return napi_generic_failure;
-  //   }
-  //   return napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_create_promise(napi_env env,
+                                             napi_deferred *deferred,
+                                             napi_value *promise)
+  {
+    if (!CheckEnv(env) || deferred == nullptr || promise == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
-  //                                              napi_deferred deferred,
-  //                                              napi_value resolution) {
-  //   if (!CheckEnv(env) || deferred == nullptr || resolution == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch tc(env->isolate);
-  //   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  //   if (!resolver->Resolve(env->context(), napi_v8_unwrap_value(resolution)).FromMaybe(false)) {
-  //     return ReturnPendingIfCaught(env, tc, "Failed to resolve promise");
-  //   }
-  //   delete deferred;
-  //   return napi_v8_clear_last_error(env);
-  // }
+    JSValue resolving_funcs[2];
+    JSValue p = JS_NewPromiseCapability(env->ctx, resolving_funcs);
+    if (JS_IsException(p))
+      return ReturnPendingIfCaught(env, "Failed to create Promise");
 
-  // napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
-  //                                             napi_deferred deferred,
-  //                                             napi_value rejection) {
-  //   if (!CheckEnv(env) || deferred == nullptr || rejection == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch tc(env->isolate);
-  //   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  //   if (!resolver->Reject(env->context(), napi_v8_unwrap_value(rejection)).FromMaybe(false)) {
-  //     return ReturnPendingIfCaught(env, tc, "Failed to reject promise");
-  //   }
-  //   delete deferred;
-  //   return napi_v8_clear_last_error(env);
-  // }
+    auto *d = new (std::nothrow) napi_deferred__();
+    if (d == nullptr)
+    {
+      JS_FreeValue(env->ctx, resolving_funcs[0]);
+      JS_FreeValue(env->ctx, resolving_funcs[1]);
+      JS_FreeValue(env->ctx, p);
+      return napi_generic_failure;
+    }
 
-  // napi_status NAPI_CDECL napi_is_promise(napi_env env, napi_value value, bool* is_promise) {
-  //   if (!CheckEnv(env) || value == nullptr || is_promise == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *is_promise = napi_v8_unwrap_value(value)->IsPromise();
-  //   return napi_v8_clear_last_error(env);
-  // }
+    d->env = env;
+    d->resolve = resolving_funcs[0];
+    d->reject = resolving_funcs[1];
+
+    *deferred = d;
+    *promise = napi_quickjs_wrap_value(env, p);
+    return (*promise == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
+                                               napi_deferred deferred,
+                                               napi_value resolution)
+  {
+    if (!CheckEnv(env) || deferred == nullptr || resolution == nullptr)
+      return napi_invalid_arg;
+
+    JSValue arg = napi_quickjs_unwrap_value(resolution);
+    JSValue ret = JS_Call(env->ctx, deferred->resolve, JS_UNDEFINED, 1, &arg);
+    JS_FreeValue(env->ctx, deferred->resolve);
+    JS_FreeValue(env->ctx, deferred->reject);
+    delete deferred;
+
+    if (JS_IsException(ret))
+      return ReturnPendingIfCaught(env, "Failed to resolve promise");
+
+    JS_FreeValue(env->ctx, ret);
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
+                                              napi_deferred deferred,
+                                              napi_value rejection)
+  {
+    if (!CheckEnv(env) || deferred == nullptr || rejection == nullptr)
+      return napi_invalid_arg;
+
+    JSValue arg = napi_quickjs_unwrap_value(rejection);
+    JSValue ret = JS_Call(env->ctx, deferred->reject, JS_UNDEFINED, 1, &arg);
+    JS_FreeValue(env->ctx, deferred->resolve);
+    JS_FreeValue(env->ctx, deferred->reject);
+    delete deferred;
+
+    if (JS_IsException(ret))
+      return ReturnPendingIfCaught(env, "Failed to reject promise");
+
+    JS_FreeValue(env->ctx, ret);
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_is_promise(napi_env env, napi_value value, bool *is_promise)
+  {
+    if (!CheckValue(env, value) || is_promise == nullptr)
+      return napi_invalid_arg;
+
+    *is_promise = JS_IsPromise(napi_quickjs_unwrap_value(value));
+    return napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_has_named_property(napi_env env,
                                                  napi_value object,
@@ -2540,37 +2798,27 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_get_property_names(napi_env env,
-  //                                                napi_value object,
-  //                                                napi_value* result) {
-  //   return napi_v8_internal::GetPropertyNames(env,
-  //                                             object,
-  //                                             v8::KeyCollectionMode::kIncludePrototypes,
-  //                                             napi_key_enumerable | napi_key_skip_symbols,
-  //                                             v8::IndexFilter::kIncludeIndices,
-  //                                             napi_key_numbers_to_strings,
-  //                                             "Exception while getting property names",
-  //                                             result);
-  // }
+  napi_status NAPI_CDECL napi_get_property_names(napi_env env,
+                                                 napi_value object,
+                                                 napi_value *result)
+  {
+    return GetPropertyNames(env,
+                            object,
+                            napi_key_include_prototypes,
+                            static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                            napi_key_numbers_to_strings,
+                            result);
+  }
 
-  // napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
-  //                                                    napi_value object,
-  //                                                    napi_key_collection_mode key_mode,
-  //                                                    napi_key_filter key_filter,
-  //                                                    napi_key_conversion key_conversion,
-  //                                                    napi_value* result) {
-  //   v8::KeyCollectionMode collection_mode =
-  //       (key_mode == napi_key_own_only) ? v8::KeyCollectionMode::kOwnOnly
-  //                                       : v8::KeyCollectionMode::kIncludePrototypes;
-  //   return napi_v8_internal::GetPropertyNames(env,
-  //                                             object,
-  //                                             collection_mode,
-  //                                             static_cast<uint32_t>(key_filter),
-  //                                             v8::IndexFilter::kIncludeIndices,
-  //                                             key_conversion,
-  //                                             "Exception while getting all property names",
-  //                                             result);
-  // }
+  napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
+                                                     napi_value object,
+                                                     napi_key_collection_mode key_mode,
+                                                     napi_key_filter key_filter,
+                                                     napi_key_conversion key_conversion,
+                                                     napi_value *result)
+  {
+    return GetPropertyNames(env, object, key_mode, key_filter, key_conversion, result);
+  }
 
   napi_status NAPI_CDECL napi_set_named_property(napi_env env,
                                                  napi_value object,
@@ -2626,30 +2874,41 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_get_prototype(napi_env env,
-  //                                           napi_value object,
-  //                                           napi_value* result) {
-  //   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  //   if (!target->IsObject()) return napi_object_expected;
-  //   v8::Local<v8::Value> proto = target.As<v8::Object>()->GetPrototypeV2();
-  //   *result = napi_v8_wrap_value(env, proto);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_get_prototype(napi_env env,
+                                            napi_value object,
+                                            napi_value *result)
+  {
+    if (!CheckValue(env, object) || result == nullptr)
+      return InvalidArg(env);
 
-  // napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
-  //                                               napi_value object,
-  //                                               napi_value value) {
-  //   if (!CheckValue(env, object) || !CheckValue(env, value)) return napi_invalid_arg;
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  //   if (!target->IsObject()) return napi_object_expected;
-  //   if (!target.As<v8::Object>()
-  //            ->SetPrototypeV2(env->context(), napi_v8_unwrap_value(value))
-  //            .FromMaybe(false)) {
-  //     return napi_generic_failure;
-  //   }
-  //   return napi_ok;
-  // }
+    JSValue target = napi_quickjs_unwrap_value(object);
+    if (!JS_IsObject(target))
+      return napi_object_expected;
+
+    JSValue proto = JS_GetPrototype(env->ctx, target);
+    if (JS_IsException(proto))
+      return ReturnPendingIfCaught(env, "Exception while getting prototype");
+
+    *result = napi_quickjs_wrap_value(env, proto);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
+                                                napi_value object,
+                                                napi_value value)
+  {
+    if (!CheckValue(env, object) || !CheckValue(env, value))
+      return napi_invalid_arg;
+
+    JSValue target = napi_quickjs_unwrap_value(object);
+    if (!JS_IsObject(target))
+      return napi_object_expected;
+
+    if (JS_SetPrototype(env->ctx, target, napi_quickjs_unwrap_value(value)) < 0)
+      return ReturnPendingIfCaught(env, "Exception while setting prototype");
+
+    return napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_get_value_bool(napi_env env,
                                              napi_value value,
@@ -2718,146 +2977,155 @@ extern "C"
     return napi_quickjs_clear_last_error(env);
   }
 
-  // napi_status NAPI_CDECL napi_get_value_string_latin1(
-  //     napi_env env, napi_value value, char* buf, size_t bufsize, size_t* result) {
-  //   if (!CheckEnv(env) || value == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsString()) {
-  //     return napi_v8_set_last_error(env, napi_string_expected, "A string was expected");
-  //   }
-  //   v8::Local<v8::String> str = local.As<v8::String>();
-  //   if (buf == nullptr) {
-  //     if (result == nullptr) {
-  //       return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //     }
-  //     *result = str->Length();
-  //   } else if (bufsize != 0) {
-  //     uint32_t length = static_cast<uint32_t>(
-  //         std::min(bufsize - 1, static_cast<size_t>(str->Length())));
-  //     str->WriteOneByteV2(env->isolate,
-  //                         0,
-  //                         length,
-  //                         reinterpret_cast<uint8_t*>(buf),
-  //                         v8::String::WriteFlags::kNullTerminate);
-  //     if (result != nullptr) *result = length;
-  //   } else if (result != nullptr) {
-  //     *result = 0;
-  //   }
-  //   return napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_get_value_string_latin1(
+      napi_env env, napi_value value, char *buf, size_t bufsize, size_t *result)
+  {
+    if (!CheckValue(env, value))
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_get_value_string_utf16(napi_env env,
-  //                                                    napi_value value,
-  //                                                    char16_t* buf,
-  //                                                    size_t bufsize,
-  //                                                    size_t* result) {
-  //   if (!CheckEnv(env) || value == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  //   if (!local->IsString()) {
-  //     return napi_v8_set_last_error(env, napi_string_expected, "A string was expected");
-  //   }
-  //   v8::Local<v8::String> str = local.As<v8::String>();
-  //   if (buf == nullptr) {
-  //     if (result == nullptr) {
-  //       return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //     }
-  //     *result = str->Length();
-  //   } else if (bufsize != 0) {
-  //     uint32_t length = static_cast<uint32_t>(
-  //         std::min(bufsize - 1, static_cast<size_t>(str->Length())));
-  //     str->WriteV2(env->isolate,
-  //                  0,
-  //                  length,
-  //                  reinterpret_cast<uint16_t*>(buf),
-  //                  v8::String::WriteFlags::kNullTerminate);
-  //     if (result != nullptr) *result = length;
-  //   } else if (result != nullptr) {
-  //     *result = 0;
-  //   }
-  //   return napi_v8_clear_last_error(env);
-  // }
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsString(local))
+      return napi_string_expected;
 
-  // napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env,
-  //                                            napi_value value,
-  //                                            napi_value* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *result = napi_v8_wrap_value(
-  //       env, v8::Boolean::New(env->isolate, napi_v8_unwrap_value(value)->BooleanValue(env->isolate)));
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+    // QuickJS strings are UTF-8 internally; for latin1 we get the UTF-8
+    // and truncate to single bytes (values >0xFF become '?').
+    size_t len;
+    const char *str = JS_ToCStringLen(env->ctx, &len, local);
+    if (str == nullptr)
+      return ReturnPendingIfCaught(env, "Failed to convert string");
 
-  // napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
-  //                                              napi_value value,
-  //                                              napi_value* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch try_catch(env->isolate);
-  //   v8::Local<v8::Number> out;
-  //   if (!napi_v8_unwrap_value(value)->ToNumber(env->context()).ToLocal(&out)) {
-  //     if (try_catch.HasCaught()) {
-  //       SetLastException(env, try_catch.Exception(), try_catch.Message());
-  //     }
-  //     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during number coercion");
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+    if (buf == nullptr)
+    {
+      if (result == nullptr)
+      {
+        JS_FreeCString(env->ctx, str);
+        return napi_invalid_arg;
+      }
+      *result = len;
+    }
+    else if (bufsize != 0)
+    {
+      size_t copy_len = std::min(bufsize - 1, len);
+      memcpy(buf, str, copy_len);
+      buf[copy_len] = '\0';
+      if (result != nullptr)
+        *result = copy_len;
+    }
+    else if (result != nullptr)
+    {
+      *result = 0;
+    }
 
-  // napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
-  //                                              napi_value value,
-  //                                              napi_value* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch try_catch(env->isolate);
-  //   v8::Local<v8::Object> out;
-  //   if (!napi_v8_unwrap_value(value)->ToObject(env->context()).ToLocal(&out)) {
-  //     if (try_catch.HasCaught()) {
-  //       SetLastException(env, try_catch.Exception(), try_catch.Message());
-  //     }
-  //     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during object coercion");
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+    JS_FreeCString(env->ctx, str);
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
-  //                                              napi_value value,
-  //                                              napi_value* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::TryCatch try_catch(env->isolate);
-  //   v8::Local<v8::String> out;
-  //   if (!napi_v8_unwrap_value(value)->ToString(env->context()).ToLocal(&out)) {
-  //     if (try_catch.HasCaught()) {
-  //       SetLastException(env, try_catch.Exception(), try_catch.Message());
-  //     }
-  //     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during string coercion");
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_get_value_string_utf16(napi_env env,
+                                                     napi_value value,
+                                                     char16_t *buf,
+                                                     size_t bufsize,
+                                                     size_t *result)
+  {
+    if (!CheckValue(env, value))
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_strict_equals(napi_env env,
-  //                                           napi_value lhs,
-  //                                           napi_value rhs,
-  //                                           bool* result) {
-  //   if (!CheckValue(env, lhs) || !CheckValue(env, rhs) || result == nullptr) {
-  //     return napi_invalid_arg;
-  //   }
-  //   *result = napi_v8_unwrap_value(lhs)->StrictEquals(napi_v8_unwrap_value(rhs));
-  //   return napi_ok;
-  // }
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (!JS_IsString(local))
+      return napi_string_expected;
 
-  napi_status napi_create_reference(napi_env env, napi_value value, uint32_t initial_ref_count, napi_ref *result)
+    size_t utf16_len;
+    const uint16_t *utf16 = JS_ToCStringLenUTF16(env->ctx, &utf16_len, local);
+    if (utf16 == nullptr)
+      return ReturnPendingIfCaught(env, "Failed to convert string to UTF-16");
+
+    if (buf == nullptr)
+    {
+      if (result == nullptr)
+      {
+        JS_FreeCString(env->ctx, reinterpret_cast<const char *>(utf16));
+        return napi_invalid_arg;
+      }
+      *result = utf16_len;
+    }
+    else if (bufsize != 0)
+    {
+      size_t copy_len = std::min(bufsize - 1, utf16_len);
+      memcpy(buf, utf16, copy_len * sizeof(char16_t));
+      buf[copy_len] = u'\0';
+      if (result != nullptr)
+        *result = copy_len;
+    }
+    else if (result != nullptr)
+    {
+      *result = 0;
+    }
+
+    JS_FreeCString(env->ctx, reinterpret_cast<const char *>(utf16));
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env, napi_value value, napi_value *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+
+    JSValue coerced = JS_ToBoolean(env->ctx, napi_quickjs_unwrap_value(value));
+    if (JS_IsException(coerced))
+      return ReturnPendingIfCaught(env, "Failed to coerce to bool");
+
+    *result = napi_quickjs_wrap_value(env, coerced);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_strict_equals(napi_env env, napi_value lhs, napi_value rhs, bool *result)
+  {
+    if (!CheckValue(env, lhs) || !CheckValue(env, rhs) || result == nullptr)
+      return napi_invalid_arg;
+
+    *result = JS_IsStrictEqual(env->ctx, napi_quickjs_unwrap_value(lhs), napi_quickjs_unwrap_value(rhs));
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_coerce_to_number(napi_env env, napi_value value, napi_value *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+
+    double d;
+    if (JS_ToFloat64(env->ctx, &d, napi_quickjs_unwrap_value(value)) != 0)
+      return ReturnPendingIfCaught(env, "Failed to coerce to number");
+
+    *result = napi_quickjs_wrap_value(env, JS_NewFloat64(env->ctx, d));
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_coerce_to_object(napi_env env, napi_value value, napi_value *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+
+    JSValue obj = JS_ToObject(env->ctx, napi_quickjs_unwrap_value(value));
+    if (JS_IsException(obj))
+      return ReturnPendingIfCaught(env, "Failed to coerce to object");
+
+    *result = napi_quickjs_wrap_value(env, obj);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_coerce_to_string(napi_env env, napi_value value, napi_value *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+
+    JSValue str = JS_ToString(env->ctx, napi_quickjs_unwrap_value(value));
+    if (JS_IsException(str))
+      return ReturnPendingIfCaught(env, "Failed to coerce to string");
+
+    *result = napi_quickjs_wrap_value(env, str);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_create_reference(napi_env env, napi_value value, uint32_t initial_ref_count, napi_ref *result)
   {
     if (!CheckValue(env, value) || result == nullptr)
       return napi_invalid_arg;
@@ -2871,7 +3139,7 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  napi_status napi_delete_reference(napi_env env, napi_ref ref)
+  napi_status NAPI_CDECL napi_delete_reference(napi_env env, napi_ref ref)
   {
     if (!CheckEnv(env) || ref == nullptr)
       return napi_invalid_arg;
@@ -3047,8 +3315,8 @@ extern "C"
     JSValue error = JS_NewError(env->ctx);
 
     // 2. Set the message property
-    JS_SetPropertyStr(env->ctx, error, "message",
-                      JS_NewString(env->ctx, msg ? msg : ""));
+    JS_SetProperty(env->ctx, error, JS_ATOM_message,
+                   JS_NewString(env->ctx, msg ? msg : ""));
 
     // 3. Set the code property if provided
     if (code != nullptr)
@@ -3063,160 +3331,77 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error) {
-  //   if (!CheckValue(env, error)) return napi_invalid_arg;
-  //   v8::Local<v8::Value> ex = napi_v8_unwrap_value(error);
-  //   env->isolate->ThrowException(ex);
-  //   SetLastException(env, ex);
-  //   return napi_pending_exception;
-  // }
+  napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error)
+  {
+    if (!CheckValue(env, error))
+      return napi_invalid_arg;
+    SetLastException(env, JS_DupValue(env->ctx, napi_quickjs_unwrap_value(error)));
+    return napi_pending_exception;
+  }
 
-  // napi_status NAPI_CDECL napi_is_error(napi_env env, napi_value value, bool* result) {
-  //   if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> v = napi_v8_unwrap_value(value);
-  //   *result = v->IsNativeError();
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_is_error(napi_env env, napi_value value, bool *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return napi_invalid_arg;
+    JSValue val = napi_quickjs_unwrap_value(value);
+    *result = JS_IsObject(val) &&
+              JS_HasProperty(env->ctx, val, JS_ATOM_message) &&
+              JS_HasProperty(env->ctx, val, JS_ATOM_stack);
+    return napi_ok;
+  }
 
-  // static napi_status CreateErrorCommon(napi_env env,
-  //                                      v8::Local<v8::Value> (*factory)(v8::Local<v8::String>),
-  //                                      napi_value code,
-  //                                      napi_value msg,
-  //                                      napi_value* result) {
-  //   if (!CheckEnv(env) || msg == nullptr || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> msg_val = napi_v8_unwrap_value(msg);
-  //   if (!msg_val->IsString()) return napi_string_expected;
-  //   v8::Local<v8::String> message = msg_val.As<v8::String>();
-  //   v8::Local<v8::Value> created = factory(message);
-  //   if (!created->IsObject()) return napi_generic_failure;
-  //   v8::Local<v8::Object> err_obj = created.As<v8::Object>();
-  //   if (code != nullptr) {
-  //     v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-  //     err_obj->Set(env->context(), code_key, napi_v8_unwrap_value(code)).FromMaybe(false);
-  //   }
-  //   *result = napi_v8_wrap_value(env, err_obj);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_throw_type_error(napi_env env, const char *code, const char *msg)
+  {
+    if (!CheckEnv(env))
+      return napi_invalid_arg;
+    SetLastException(env, CreateErrorObject(env->ctx, JS_NewTypeError, code, msg));
+    return napi_pending_exception;
+  }
 
-  // napi_status NAPI_CDECL napi_create_error(napi_env env,
-  //                                          napi_value code,
-  //                                          napi_value msg,
-  //                                          napi_value* result) {
-  //   return CreateErrorCommon(
-  //       env,
-  //       [](v8::Local<v8::String> message) { return v8::Exception::Error(message); },
-  //       code,
-  //       msg,
-  //       result);
-  // }
+  napi_status NAPI_CDECL napi_throw_range_error(napi_env env, const char *code, const char *msg)
+  {
+    if (!CheckEnv(env))
+      return napi_invalid_arg;
+    SetLastException(env, CreateErrorObject(env->ctx, JS_NewRangeError, code, msg));
+    return napi_pending_exception;
+  }
 
-  // napi_status NAPI_CDECL napi_create_type_error(napi_env env,
-  //                                               napi_value code,
-  //                                               napi_value msg,
-  //                                               napi_value* result) {
-  //   return CreateErrorCommon(
-  //       env,
-  //       [](v8::Local<v8::String> message) { return v8::Exception::TypeError(message); },
-  //       code,
-  //       msg,
-  //       result);
-  // }
+  napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env, const char *code, const char *msg)
+  {
+    if (!CheckEnv(env))
+      return napi_invalid_arg;
+    SetLastException(env, CreateErrorObject(env->ctx, JS_NewSyntaxError, code, msg));
+    return napi_pending_exception;
+  }
 
-  // napi_status NAPI_CDECL napi_create_range_error(napi_env env,
-  //                                                napi_value code,
-  //                                                napi_value msg,
-  //                                                napi_value* result) {
-  //   return CreateErrorCommon(
-  //       env,
-  //       [](v8::Local<v8::String> message) { return v8::Exception::RangeError(message); },
-  //       code,
-  //       msg,
-  //       result);
-  // }
+  napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err)
+  {
+    if (!CheckEnv(env) || err == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL node_api_create_syntax_error(napi_env env,
-  //                                                     napi_value code,
-  //                                                     napi_value msg,
-  //                                                     napi_value* result) {
-  //   return CreateErrorCommon(
-  //       env,
-  //       [](v8::Local<v8::String> message) { return v8::Exception::SyntaxError(message); },
-  //       code,
-  //       msg,
-  //       result);
-  // }
+    SetLastException(env, JS_DupValue(env->ctx, napi_quickjs_unwrap_value(err)));
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
-  //                                              const char* code,
-  //                                              const char* msg) {
-  //   if (!CheckEnv(env)) return napi_invalid_arg;
-  //   v8::Local<v8::String> message;
-  //   if (!v8::String::NewFromUtf8(env->isolate,
-  //                                (msg == nullptr) ? "Type error" : msg,
-  //                                v8::NewStringType::kNormal)
-  //            .ToLocal(&message)) {
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Object> err = v8::Exception::TypeError(message).As<v8::Object>();
-  //   if (code != nullptr) {
-  //     v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-  //     v8::Local<v8::String> code_val;
-  //     if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-  //       err->Set(env->context(), code_key, code_val).FromMaybe(false);
-  //     }
-  //   }
-  //   env->isolate->ThrowException(err);
-  //   SetLastException(env, err);
-  //   return napi_pending_exception;
-  // }
+  napi_status NAPI_CDECL napi_create_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
+  {
+    return CreatePlainErrorCommon(env, code, msg, result);
+  }
 
-  // napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
-  //                                               const char* code,
-  //                                               const char* msg) {
-  //   if (!CheckEnv(env)) return napi_invalid_arg;
-  //   v8::Local<v8::String> message;
-  //   if (!v8::String::NewFromUtf8(env->isolate,
-  //                                (msg == nullptr) ? "Range error" : msg,
-  //                                v8::NewStringType::kNormal)
-  //            .ToLocal(&message)) {
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Object> err = v8::Exception::RangeError(message).As<v8::Object>();
-  //   if (code != nullptr) {
-  //     v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-  //     v8::Local<v8::String> code_val;
-  //     if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-  //       err->Set(env->context(), code_key, code_val).FromMaybe(false);
-  //     }
-  //   }
-  //   env->isolate->ThrowException(err);
-  //   SetLastException(env, err);
-  //   return napi_pending_exception;
-  // }
+  napi_status NAPI_CDECL napi_create_type_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
+  {
+    return CreateErrorCommon(env, JS_NewTypeError, code, msg, result);
+  }
 
-  // napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
-  //                                                    const char* code,
-  //                                                    const char* msg) {
-  //   if (!CheckEnv(env)) return napi_invalid_arg;
-  //   v8::Local<v8::String> message;
-  //   if (!v8::String::NewFromUtf8(env->isolate,
-  //                                (msg == nullptr) ? "Syntax error" : msg,
-  //                                v8::NewStringType::kNormal)
-  //            .ToLocal(&message)) {
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Object> err = v8::Exception::SyntaxError(message).As<v8::Object>();
-  //   if (code != nullptr) {
-  //     v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-  //     v8::Local<v8::String> code_val;
-  //     if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-  //       err->Set(env->context(), code_key, code_val).FromMaybe(false);
-  //     }
-  //   }
-  //   env->isolate->ThrowException(err);
-  //   SetLastException(env, err);
-  //   return napi_pending_exception;
-  // }
+  napi_status NAPI_CDECL napi_create_range_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
+  {
+    return CreateErrorCommon(env, JS_NewRangeError, code, msg, result);
+  }
+
+  napi_status NAPI_CDECL node_api_create_syntax_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
+  {
+    return CreateErrorCommon(env, JS_NewSyntaxError, code, msg, result);
+  }
 
   napi_status NAPI_CDECL napi_is_exception_pending(napi_env env, bool *result)
   {
@@ -3231,44 +3416,21 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
-  //                                                          napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if (env->last_exception.IsEmpty()) return napi_generic_failure;
-  //   v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
-  //   napi_value wrapped = napi_v8_wrap_value(env, ex);
-  //   if (wrapped != nullptr &&
-  //       env->last_exception_source_line.empty() &&
-  //       env->last_exception_thrown_at.empty()) {
-  //     v8::Local<v8::Message> message;
-  //     if (!env->last_exception_message.IsEmpty()) {
-  //       message = env->last_exception_message.Get(env->isolate);
-  //     }
-  //     if (!message.IsEmpty()) {
-  //       const std::string source_line =
-  //           unofficial_napi_internal::GetErrorSourceLineForStderrImpl(env, message);
-  //       unofficial_napi_internal::SetArrowMessageFromString(
-  //           env->isolate, env->context(), ex, source_line);
-  //       unofficial_napi_internal::PreserveErrorFormatting(
-  //           env,
-  //           ex,
-  //           source_line,
-  //           unofficial_napi_internal::GetThrownAtString(env->isolate, message));
-  //     } else {
-  //       (void)unofficial_napi_internal::PreserveErrorSourceMessage(env, wrapped);
-  //     }
-  //   } else {
-  //     unofficial_napi_internal::PreserveErrorFormatting(
-  //         env,
-  //         ex,
-  //         env->last_exception_source_line,
-  //         env->last_exception_thrown_at);
-  //   }
-  //   env->last_exception_message.Reset();
-  //   ClearLastException(env);
-  //   *result = napi_v8_wrap_value(env, ex);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env, napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+
+    if (JS_IsUndefined(env->last_exception))
+      return napi_generic_failure;
+
+    // Take ownership of the exception before clearing
+    JSValue ex = env->last_exception;
+    env->last_exception = JS_UNDEFINED;
+
+    *result = napi_quickjs_wrap_value(env, ex);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
   napi_status napi_set_instance_data(napi_env env,
                                      void *data,
@@ -3301,39 +3463,31 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_run_script(napi_env env,
-  //                                        napi_value script,
-  //                                        napi_value* result) {
-  //   if (!CheckValue(env, script) || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> source = napi_v8_unwrap_value(script);
-  //   if (!source->IsString()) return napi_string_expected;
-  //   v8::TryCatch tc(env->isolate);
-  //   v8::Local<v8::Script> compiled;
-  //   if (!v8::Script::Compile(env->context(), source.As<v8::String>()).ToLocal(&compiled)) {
-  //     if (tc.HasCaught()) {
-  //       SetLastException(env, tc.Exception(), tc.Message());
-  //       return napi_pending_exception;
-  //     }
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Value> out;
-  //   if (!compiled->Run(env->context()).ToLocal(&out)) {
-  //     if (tc.HasCaught()) {
-  //       SetLastException(env, tc.Exception(), tc.Message());
-  //       return napi_pending_exception;
-  //     }
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_run_script(napi_env env,
+                                         napi_value script,
+                                         napi_value *result)
+  {
+    if (!CheckValue(env, script) || result == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
-  //   if (!CheckEnv(env) || err == nullptr) return napi_invalid_arg;
-  //   SetLastException(env, napi_v8_unwrap_value(err));
-  //   env->isolate->ThrowException(napi_v8_unwrap_value(err));
-  //   return napi_ok;
-  // }
+    JSValue source = napi_quickjs_unwrap_value(script);
+    if (!JS_IsString(source))
+      return napi_string_expected;
+
+    size_t len;
+    const char *str = JS_ToCStringLen(env->ctx, &len, source);
+    if (str == nullptr)
+      return ReturnPendingIfCaught(env, "Failed to convert script to string");
+
+    JSValue out = JS_Eval(env->ctx, str, len, "<napi_run_script>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeCString(env->ctx, str);
+
+    if (JS_IsException(out))
+      return ReturnPendingIfCaught(env, "Script evaluation failed");
+
+    *result = napi_quickjs_wrap_value(env, out);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
   // napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
   //                                                  napi_cleanup_hook fun,
@@ -3530,108 +3684,159 @@ extern "C"
   //   return napi_ok;
   // }
 
-  // napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result) {
-  //   if (result == nullptr) return napi_invalid_arg;
-  //   auto* napiEnv = const_cast<napi_env>(env);
-  //   if (!CheckEnv(napiEnv)) return napi_invalid_arg;
-  //   *result = 10;
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t *result)
+  {
+    if (result == nullptr)
+      return napi_invalid_arg;
+    auto *napiEnv = const_cast<napi_env>(env);
+    if (!CheckEnv(napiEnv))
+      return napi_invalid_arg;
+    *result = 10;
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object) {
-  //   if (!CheckValue(env, object)) return napi_invalid_arg;
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  //   if (!target->IsObject()) return napi_object_expected;
-  //   if (!target.As<v8::Object>()
-  //            ->SetIntegrityLevel(env->context(), v8::IntegrityLevel::kFrozen)
-  //            .FromMaybe(false)) {
-  //     return napi_generic_failure;
-  //   }
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object)
+  {
+    if (!CheckValue(env, object))
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_object_seal(napi_env env, napi_value object) {
-  //   if (!CheckValue(env, object)) return napi_invalid_arg;
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
-  //   if (!target->IsObject()) return napi_object_expected;
-  //   if (!target.As<v8::Object>()
-  //            ->SetIntegrityLevel(env->context(), v8::IntegrityLevel::kSealed)
-  //            .FromMaybe(false)) {
-  //     return napi_generic_failure;
-  //   }
-  //   return napi_ok;
-  // }
+    JSValue target = napi_quickjs_unwrap_value(object);
+    if (!JS_IsObject(target))
+      return napi_object_expected;
 
-  // napi_status NAPI_CDECL napi_type_tag_object(
-  //     napi_env env, napi_value value, const napi_type_tag* type_tag) {
-  //   if (!CheckValue(env, value) || type_tag == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
-  //   if (!target->IsObject() && !target->IsExternal()) return napi_invalid_arg;
-  //   for (auto& entry : env->type_tag_entries) {
-  //     if (!entry.value.IsEmpty() && entry.value.Get(env->isolate)->StrictEquals(target)) {
-  //       entry.tag = *type_tag;
-  //       return napi_ok;
-  //     }
-  //   }
-  //   napi_env__::TypeTagEntry entry;
-  //   entry.value.Reset(env->isolate, target);
-  //   entry.tag = *type_tag;
-  //   env->type_tag_entries.push_back(std::move(entry));
-  //   return napi_ok;
-  // }
-  // napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
-  //                                                   napi_value value,
-  //                                                   const napi_type_tag* type_tag,
-  //                                                   bool* result) {
-  //   if (!CheckValue(env, value) || type_tag == nullptr || result == nullptr) {
-  //     return napi_invalid_arg;
-  //   }
-  //   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
-  //   if (!target->IsObject() && !target->IsExternal()) {
-  //     *result = false;
-  //     return napi_ok;
-  //   }
-  //   for (auto& entry : env->type_tag_entries) {
-  //     if (entry.value.IsEmpty()) continue;
-  //     if (entry.value.Get(env->isolate)->StrictEquals(target)) {
-  //       *result = (entry.tag.lower == type_tag->lower && entry.tag.upper == type_tag->upper);
-  //       return napi_ok;
-  //     }
-  //   }
-  //   *result = false;
-  //   return napi_ok;
-  // }
+    if (JS_FreezeObject(env->ctx, target) < 0)
+      return ReturnPendingIfCaught(env, "Failed to freeze object");
 
-  // napi_status NAPI_CDECL node_api_create_object_with_properties(napi_env env,
-  //                                        napi_value prototype_or_null,
-  //                                        napi_value* property_names,
-  //                                        napi_value* property_values,
-  //                                        size_t property_count,
-  //                                        napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  //   if ((property_count > 0) && (property_names == nullptr || property_values == nullptr)) {
-  //     return napi_invalid_arg;
-  //   }
-  //   v8::Local<v8::Object> obj = v8::Object::New(env->isolate);
-  //   if (prototype_or_null != nullptr) {
-  //     v8::Local<v8::Value> proto = napi_v8_unwrap_value(prototype_or_null);
-  //     if (!proto->IsNull() && !proto->IsObject()) return napi_object_expected;
-  //     if (!obj->SetPrototypeV2(env->context(), proto).FromMaybe(false)) {
-  //       return napi_generic_failure;
-  //     }
-  //   }
-  //   for (size_t i = 0; i < property_count; ++i) {
-  //     if (property_names[i] == nullptr || property_values[i] == nullptr) return napi_invalid_arg;
-  //     if (!obj
-  //              ->Set(env->context(),
-  //                    napi_v8_unwrap_value(property_names[i]),
-  //                    napi_v8_unwrap_value(property_values[i]))
-  //              .FromMaybe(false)) {
-  //       return napi_generic_failure;
-  //     }
-  //   }
-  //   *result = napi_v8_wrap_value(env, obj);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_object_seal(napi_env env, napi_value object)
+  {
+    if (!CheckValue(env, object))
+      return napi_invalid_arg;
+
+    JSValue target = napi_quickjs_unwrap_value(object);
+    if (!JS_IsObject(target))
+      return napi_object_expected;
+
+    if (JS_SealObject(env->ctx, target) < 0)
+      return ReturnPendingIfCaught(env, "Failed to seal object");
+
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_type_tag_object(napi_env env,
+                                              napi_value value,
+                                              const napi_type_tag *type_tag)
+  {
+    if (!CheckValue(env, value) || type_tag == nullptr)
+      return napi_invalid_arg;
+
+    JSValue target = napi_quickjs_unwrap_value(value);
+    if (!JS_IsObject(target))
+      return napi_invalid_arg;
+
+    // Encode the two 64-bit halves as a single JS string "lower:upper"
+    // so we don't need a separate allocation.
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%llu:%llu",
+             (unsigned long long)type_tag->lower,
+             (unsigned long long)type_tag->upper);
+
+    JS_DefinePropertyValueStr(env->ctx, target, kTypeTagProperty,
+                              JS_NewString(env->ctx, buf),
+                              JS_PROP_C_W_E); // not enumerable would be nicer but this is simplest
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
+                                                    napi_value value,
+                                                    const napi_type_tag *type_tag,
+                                                    bool *result)
+  {
+    if (!CheckValue(env, value) || type_tag == nullptr || result == nullptr)
+      return napi_invalid_arg;
+
+    *result = false;
+
+    JSValue target = napi_quickjs_unwrap_value(value);
+    if (!JS_IsObject(target))
+      return napi_ok;
+
+    JSValue tag_val = JS_GetPropertyStr(env->ctx, target, kTypeTagProperty);
+    if (!JS_IsString(tag_val))
+    {
+      JS_FreeValue(env->ctx, tag_val);
+      return napi_ok;
+    }
+
+    const char *stored = JS_ToCString(env->ctx, tag_val);
+    JS_FreeValue(env->ctx, tag_val);
+
+    char expected[64];
+    snprintf(expected, sizeof(expected), "%llu:%llu",
+             (unsigned long long)type_tag->lower,
+             (unsigned long long)type_tag->upper);
+
+    *result = (strcmp(stored, expected) == 0);
+    JS_FreeCString(env->ctx, stored);
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL node_api_create_object_with_properties(napi_env env,
+                                                                napi_value prototype_or_null,
+                                                                napi_value *property_names,
+                                                                napi_value *property_values,
+                                                                size_t property_count,
+                                                                napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return napi_invalid_arg;
+    if (property_count > 0 && (property_names == nullptr || property_values == nullptr))
+      return napi_invalid_arg;
+
+    JSContext *ctx = env->ctx;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+      return ReturnPendingIfCaught(env, "Failed to create object");
+
+    if (prototype_or_null != nullptr)
+    {
+      JSValue proto = napi_quickjs_unwrap_value(prototype_or_null);
+      if (!JS_IsNull(proto) && !JS_IsObject(proto))
+      {
+        JS_FreeValue(ctx, obj);
+        return napi_object_expected;
+      }
+      if (JS_SetPrototype(ctx, obj, proto) < 0)
+      {
+        JS_FreeValue(ctx, obj);
+        return ReturnPendingIfCaught(env, "Failed to set prototype");
+      }
+    }
+
+    for (size_t i = 0; i < property_count; ++i)
+    {
+      if (property_names[i] == nullptr || property_values[i] == nullptr)
+      {
+        JS_FreeValue(ctx, obj);
+        return napi_invalid_arg;
+      }
+
+      JSAtom key = JS_ValueToAtom(ctx, napi_quickjs_unwrap_value(property_names[i]));
+      JSValue val = JS_DupValue(ctx, napi_quickjs_unwrap_value(property_values[i]));
+      int rc = JS_SetProperty(ctx, obj, key, val);
+      JS_FreeAtom(ctx, key);
+
+      if (rc < 0)
+      {
+        JS_FreeValue(ctx, obj);
+        return ReturnPendingIfCaught(env, "Failed to set property");
+      }
+    }
+
+    *result = napi_quickjs_wrap_value(env, obj);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
 
 } // extern "C"
