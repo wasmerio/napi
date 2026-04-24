@@ -12,7 +12,6 @@ struct napi_external_backing_store_hint__
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
 static JSClassID napi_external_class_id = 0;
-static JSClassID qjs_node_instance_class_id = 0;
 
 static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
 {
@@ -327,20 +326,13 @@ static JSValue napi_quickjs_create_function_internal(napi_env env,
   return napi_quickjs_unwrap_value(fn_val);
 }
 
-static JSValue napi_quickjs_function_bridge(JSContext *ctx, JSValueConst this_val,
-                                            int argc, JSValueConst *argv,
-                                            int magic, JSValue *func_data)
+static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic, JSValue *func_data)
 {
-  // func_data[0] contains the napi_callback (wrapped in an external)
-  // func_data[1] contains the user's data (wrapped in an external)
-
-  // Recover the napi_env from the context (or stored in func_data if preferred)
-  // In many implementations, the env is retrievable via JS_GetContextOpaque
   auto env = static_cast<napi_env>(JS_GetContextOpaque(ctx));
   if (!CheckEnv(env))
-  {
     return JS_ThrowReferenceError(ctx, "Null NAPI env");
-  }
 
   auto cb_ptr = GetExternalValue(func_data[0]);
   if (cb_ptr == nullptr)
@@ -349,38 +341,99 @@ static JSValue napi_quickjs_function_bridge(JSContext *ctx, JSValueConst this_va
   auto cb = reinterpret_cast<napi_callback>(cb_ptr);
   auto user_data = GetExternalValue(func_data[1]);
 
-  auto info = napi_callback_info__{env, this_val, JS_UNDEFINED, argc, argv, user_data};
+  JSValue effective_this = this_val;
+  JSValue new_target = JS_UNDEFINED;
 
-  // If this_val is an object, it's highly likely a constructor call
-  if (JS_IsObject(this_val))
+  if (magic == JS_CFUNC_constructor_magic)
   {
-    // Grab the constructor from the prototype chain
-    JSValue ctor = JS_GetPropertyStr(ctx, this_val, "constructor");
+    // Allocate a fresh instance using the class that supports SetOpaque.
+    // The prototype comes from the constructor's .prototype property.
+    JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
+    effective_this = JS_NewObjectProtoClass(ctx, proto, napi_external_class_id);
+    JS_FreeValue(ctx, proto);
 
-    if (JS_IsFunction(ctx, ctor))
-    {
-      // Store it. We own this reference now.
-      info.new_target = ctor;
-    }
-    else
-    {
-      JS_FreeValue(ctx, ctor);
-    }
+    if (JS_IsException(effective_this))
+      return effective_this;
+
+    // new.target is the constructor itself
+    new_target = this_val;
   }
 
+  auto info = napi_callback_info__{env, effective_this, new_target, argc, argv, user_data};
   auto result = cb(env, reinterpret_cast<napi_callback_info>(&info));
 
-  // Should external function result in exception, we want to rethrow into
-  // parent JSContext.
   if (RethrowLastException(env, ctx))
   {
+    if (magic == JS_CFUNC_constructor_magic)
+      JS_FreeValue(ctx, effective_this);
     return JS_EXCEPTION;
+  }
+
+  if (magic == JS_CFUNC_constructor_magic)
+  {
+    // Node-API constructors return _this, but in QuickJS constructor
+    // magic mode the return value IS the new instance. If the callback
+    // returned something explicit (e.g. a different object), use that,
+    // otherwise return our allocated effective_this.
+    if (result != nullptr)
+    {
+      JS_FreeValue(ctx, effective_this);
+      return napi_quickjs_unwrap_value_and_delete(result);
+    }
+    return effective_this; // most common path
   }
 
   if (result == nullptr)
     return JS_UNDEFINED;
-
   return napi_quickjs_unwrap_value_and_delete(result);
+}
+
+napi_status CreateFunction(napi_env env,
+                           const char *utf8name,
+                           size_t length,
+                           napi_callback cb,
+                           void *data,
+                           int magic,
+                           napi_value *result)
+{
+  if (!CheckEnv(env) || cb == nullptr || result == nullptr)
+  {
+    return InvalidArg(env);
+  }
+
+  // 1. wrap the callback and user data into externals so we can
+  // pass them safely as "data" to the QuickJS function.
+  napi_value cb_external, data_external;
+  napi_create_external(env, reinterpret_cast<void *>(cb), nullptr, nullptr, &cb_external);
+  napi_create_external(env, data, nullptr, nullptr, &data_external);
+
+  JSValue data_values[2];
+  data_values[0] = napi_quickjs_unwrap_value_and_delete(cb_external);
+  data_values[1] = napi_quickjs_unwrap_value_and_delete(data_external);
+
+  // 2. Create the C function with data
+  // JS_NewCFunctionData allows us to attach 'magic' values to the function object.
+  // NOTE: data_values are js_dup() -ed, need to free them
+  JSValue fn = JS_NewCFunctionData(env->ctx, napi_quickjs_trampoline,
+                                   0, magic, 2, data_values);
+
+  if (JS_IsException(fn))
+  {
+    return ReturnPendingIfCaught(env, "Failed to create function");
+  }
+
+  // 3. Set the function name if provided
+  if (utf8name != nullptr)
+  {
+    // If length is NAPI_AUTO_LENGTH, QuickJS will handle null-terminated string
+    JS_DefinePropertyValueStr(env->ctx, fn, "name",
+                              JS_NewStringLen(env->ctx, utf8name,
+                                              (length == NAPI_AUTO_LENGTH) ? strlen(utf8name) : length),
+                              JS_PROP_CONFIGURABLE);
+  }
+
+  *result = napi_quickjs_wrap_value(env, fn);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
 extern "C"
@@ -1865,44 +1918,7 @@ extern "C"
                                               void *data,
                                               napi_value *result)
   {
-    if (!CheckEnv(env) || cb == nullptr || result == nullptr)
-    {
-      return InvalidArg(env);
-    }
-
-    // 1. wrap the callback and user data into externals so we can
-    // pass them safely as "data" to the QuickJS function.
-    napi_value cb_external, data_external;
-    napi_create_external(env, reinterpret_cast<void *>(cb), nullptr, nullptr, &cb_external);
-    napi_create_external(env, data, nullptr, nullptr, &data_external);
-
-    JSValue data_values[2];
-    data_values[0] = napi_quickjs_unwrap_value(cb_external);
-    data_values[1] = napi_quickjs_unwrap_value(data_external);
-
-    // 2. Create the C function with data
-    // JS_NewCFunctionData allows us to attach 'magic' values to the function object.
-    // NOTE: data_values are js_dup() -ed, need to free them
-    JSValue fn = JS_NewCFunctionData(env->ctx, napi_quickjs_function_bridge,
-                                     0, 0, 2, data_values);
-
-    if (JS_IsException(fn))
-    {
-      return ReturnPendingIfCaught(env, "Failed to create function");
-    }
-
-    // 3. Set the function name if provided
-    if (utf8name != nullptr)
-    {
-      // If length is NAPI_AUTO_LENGTH, QuickJS will handle null-terminated string
-      JS_DefinePropertyValueStr(env->ctx, fn, "name",
-                                JS_NewStringLen(env->ctx, utf8name,
-                                                (length == NAPI_AUTO_LENGTH) ? strlen(utf8name) : length),
-                                JS_PROP_CONFIGURABLE);
-    }
-
-    *result = napi_quickjs_wrap_value(env, fn);
-    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    return CreateFunction(env, utf8name, length, cb, data, 0, result);
   }
 
   napi_status NAPI_CDECL napi_define_class(napi_env env,
@@ -1930,23 +1946,17 @@ extern "C"
     // 1. Create the constructor function
     // We reuse napi_create_function which handles the JS-to-C trampoline for Node-API.
     napi_value ctor_napi_value = nullptr;
-    napi_status status = napi_create_function(
-        env, utf8name, length, constructor, data, &ctor_napi_value);
+    napi_status status = CreateFunction(
+        env, utf8name, length, constructor, data, JS_CFUNC_constructor_magic, &ctor_napi_value);
     if (status != napi_ok)
       return status;
 
-    // Replace `unwrap_value` with your specific macro/function for extracting JSValue
-    JSValue ctor = napi_quickjs_unwrap_value(ctor_napi_value);
-
     // 2. Setup the prototype chain
-    // Normal functions in QuickJS automatically get a 'prototype' object, but we
-    // ensure it exists to attach instance methods to.
-    JSValue proto = JS_GetPrototype(ctx, ctor);
-    if (JS_IsUndefined(proto))
-    {
-      proto = JS_NewObject(ctx);
-      JS_SetConstructor(ctx, ctor, proto);
-    }
+    JSValue ctor = napi_quickjs_unwrap_value(ctor_napi_value);
+    JSValue proto = JS_NewObject(ctx);
+
+    JS_SetConstructor(ctx, ctor, proto);
+    JS_SetConstructorBit(ctx, ctor, true);
 
     // 3. Iterate over the descriptors and define them
     for (size_t i = 0; i < property_count; ++i)
@@ -1993,8 +2003,8 @@ extern "C"
           method_flags |= JS_PROP_WRITABLE;
 
         napi_value method_val = nullptr;
-        status = napi_create_function(
-            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.method, desc.data, &method_val);
+        status = CreateFunction(
+            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.method, desc.data, JS_CFUNC_generic_magic, &method_val);
 
         if (status == napi_ok)
         {
@@ -2010,7 +2020,7 @@ extern "C"
         if (desc.getter != nullptr)
         {
           napi_value g_val = nullptr;
-          if (napi_create_function(env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, &g_val) == napi_ok)
+          if (CreateFunction(env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, JS_CFUNC_getter_magic, &g_val) == napi_ok)
           {
             getter = napi_quickjs_unwrap_value_and_delete(g_val);
           }
@@ -2018,7 +2028,7 @@ extern "C"
         if (desc.setter != nullptr)
         {
           napi_value s_val = nullptr;
-          if (napi_create_function(env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, &s_val) == napi_ok)
+          if (CreateFunction(env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, JS_CFUNC_setter_magic, &s_val) == napi_ok)
           {
             setter = napi_quickjs_unwrap_value_and_delete(s_val);
           }
@@ -2955,37 +2965,36 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  napi_status napi_wrap(napi_env env,
-                        napi_value js_object,
-                        void *native_object,
-                        napi_finalize finalize_cb,
-                        void *finalize_hint,
-                        napi_ref *result)
+  napi_status napi_wrap(napi_env env, napi_value js_object,
+                        void *native_object, napi_finalize finalize_cb,
+                        void *finalize_hint, napi_ref *result)
   {
     if (!CheckValue(env, js_object))
       return napi_invalid_arg;
 
-    // TODO: Should that be entry in a map, one per class perhaps?
-    if (qjs_node_instance_class_id == 0)
-    {
-      auto rt = JS_GetRuntime(env->ctx);
-      JS_NewClassID(rt, &qjs_node_instance_class_id);
-    }
-
     auto obj = napi_quickjs_unwrap_value(js_object);
-    if (JS_IsObject(obj))
+    if (!JS_IsObject(obj))
       return napi_object_expected;
 
-    // Attach the native pointer as opaque data
-    if (JS_SetOpaque(obj, native_object) != 0)
-      return napi_generic_failure;
-
-    // TODO: If a finalize callback is provided, you'd typically handle it via
-    // a JSClassDef, but for a quick bridge:
-    if (result != nullptr)
+    auto *wrap = new (std::nothrow) napi_external_backing_store_hint__{
+        .env = env,
+        .external_data = native_object,
+        .finalize_cb = finalize_cb,
+        .finalize_hint = finalize_hint};
+    if (wrap == nullptr)
     {
-      return napi_create_reference(env, js_object, 1, result);
+      return napi_generic_failure;
     }
+
+    if (JS_SetOpaque(obj, wrap) != 0)
+    {
+      delete wrap;
+      return napi_generic_failure;
+    }
+
+    if (result != nullptr)
+      return napi_create_reference(env, js_object, 1, result);
+
     return napi_ok;
   }
 
@@ -2995,11 +3004,13 @@ extern "C"
       return napi_invalid_arg;
 
     auto obj = napi_quickjs_unwrap_value(js_object);
-    if (JS_IsObject(obj))
-      return napi_object_expected;
+    auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
+        JS_GetOpaque(obj, napi_external_class_id));
+    if (wrap == nullptr)
+      return napi_invalid_arg;
 
-    *result = JS_GetOpaque(obj, qjs_node_instance_class_id);
-    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    *result = wrap->external_data;
+    return napi_ok;
   }
 
   napi_status napi_remove_wrap(napi_env env, napi_value js_object, void **result)
@@ -3008,90 +3019,20 @@ extern "C"
       return napi_invalid_arg;
 
     auto obj = napi_quickjs_unwrap_value(js_object);
-    if (JS_IsObject(obj))
+    if (!JS_IsObject(obj))
       return napi_object_expected;
 
-    *result = JS_GetOpaque(obj, qjs_node_instance_class_id);
+    auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
+        JS_GetOpaque(obj, napi_external_class_id));
+    if (wrap == nullptr)
+      return napi_generic_failure;
+
     if (JS_SetOpaque(obj, nullptr) != 0)
       return napi_generic_failure;
 
+    *result = wrap->external_data;
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
-
-  // napi_status NAPI_CDECL napi_wrap(napi_env env,
-  //                                  napi_value js_object,
-  //                                  void* native_object,
-  //                                  node_api_basic_finalize finalize_cb,
-  //                                  void* finalize_hint,
-  //                                  napi_ref* result) {
-  //   if (!CheckValue(env, js_object)) return napi_invalid_arg;
-  //   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
-  //   if (!value->IsObject()) return napi_object_expected;
-  //   v8::Local<v8::Object> object = value.As<v8::Object>();
-  //   v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
-  //   v8::Local<v8::Value> existing;
-  //   if (object->GetPrivate(env->context(), wrapKey).ToLocal(&existing) &&
-  //       existing->IsExternal()) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   if (!object->SetPrivate(env->context(), wrapKey, v8::External::New(env->isolate, native_object))
-  //            .FromMaybe(false)) {
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Private> wrapFinalizeKey = env->wrap_finalizer_private_key.Get(env->isolate);
-  //   if (finalize_cb != nullptr) {
-  //     auto* record = new (std::nothrow) wrapFinalizerRecord();
-  //     if (record == nullptr) return napi_generic_failure;
-  //     record->env = env;
-  //     record->native_object = native_object;
-  //     record->finalize_cb = finalize_cb;
-  //     record->finalize_hint = finalize_hint;
-  //     record->handle.Reset(env->isolate, object);
-  //     record->handle.SetWeak(record, wrapWeakCallback, v8::WeakCallbackType::kParameter);
-  //     env->wrap_finalizers.push_back(record);
-  //     object
-  //         ->SetPrivate(env->context(), wrapFinalizeKey, v8::External::New(env->isolate, record))
-  //         .FromMaybe(false);
-  //   } else {
-  //     object->DeletePrivate(env->context(), wrapFinalizeKey).FromMaybe(false);
-  //   }
-  //   if (result != nullptr) {
-  //     napi_status s = napi_create_reference(env, js_object, 0, result);
-  //     if (s != napi_ok) return s;
-  //     v8::Local<v8::Private> wrapRefKey = env->wrap_ref_private_key.Get(env->isolate);
-  //     object
-  //         ->SetPrivate(env->context(), wrapRefKey, v8::External::New(env->isolate, *result))
-  //         .FromMaybe(false);
-  //   }
-  //   return napi_ok;
-  // }
-
-  // napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void** result) {
-  //   if (!CheckValue(env, js_object)) return napi_invalid_arg;
-  //   void* out = nullptr;
-  //   napi_status status = napi_unwrap(env, js_object, &out);
-  //   if (status != napi_ok) return status;
-  //   v8::Local<v8::Object> object = napi_v8_unwrap_value(js_object).As<v8::Object>();
-  //   v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
-  //   object->DeletePrivate(env->context(), wrapKey).FromMaybe(false);
-  //   v8::Local<v8::Private> wrapRefKey = env->wrap_ref_private_key.Get(env->isolate);
-  //   object->DeletePrivate(env->context(), wrapRefKey).FromMaybe(false);
-  //   v8::Local<v8::Private> wrapFinalizeKey = env->wrap_finalizer_private_key.Get(env->isolate);
-  //   v8::Local<v8::Value> finalizeValue;
-  //   if (object->GetPrivate(env->context(), wrapFinalizeKey).ToLocal(&finalizeValue) &&
-  //       finalizeValue->IsExternal()) {
-  //     auto* record = static_cast<wrapFinalizerRecord*>(finalizeValue.As<v8::External>()->Value());
-  //     if (record != nullptr) {
-  //       record->cancelled = true;
-  //       record->handle.Reset();
-  //       RemovewrapFinalizerRecord(env, record);
-  //       delete record;
-  //     }
-  //   }
-  //   object->DeletePrivate(env->context(), wrapFinalizeKey).FromMaybe(false);
-  //   if (result != nullptr) *result = out;
-  //   return napi_ok;
-  // }
 
   napi_status NAPI_CDECL napi_throw_error(napi_env env,
                                           const char *code,
