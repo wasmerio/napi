@@ -249,25 +249,25 @@ if(NAPI_QUICKJS_LIBRARY)
   #   runners/test_34_new_target.cc
   #   ${NAPI_TESTS_ROOT}/js-native-api/test_new_target/test_new_target.c
   # )
-  # add_fixture_test(napi_quickjs_test_35_promise
-  #   runners/test_35_promise.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_promise/test_promise.c
-  # )
-  # add_fixture_test(napi_quickjs_test_36_handle_scope
-  #   runners/test_36_handle_scope.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_handle_scope/test_handle_scope.c
-  # )
-  # add_fixture_test(napi_quickjs_test_37_reference_double_free
-  #   runners/test_37_reference_double_free.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_reference_double_free/test_reference_double_free.c
-  # )
-  # add_fixture_test(napi_quickjs_test_38_finalizer
-  #   runners/test_38_finalizer.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_finalizer/test_finalizer.c
-  # )
-  # if(TARGET napi_quickjs_test_38_finalizer)
-  #   target_compile_definitions(napi_quickjs_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
-  # endif()
+  add_fixture_test(napi_quickjs_test_35_promise
+    runners/test_35_promise.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_promise/test_promise.c
+  )
+  add_fixture_test(napi_quickjs_test_36_handle_scope
+    runners/test_36_handle_scope.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_handle_scope/test_handle_scope.c
+  )
+  add_fixture_test(napi_quickjs_test_37_reference_double_free
+    runners/test_37_reference_double_free.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_reference_double_free/test_reference_double_free.c
+  )
+  add_fixture_test(napi_quickjs_test_38_finalizer
+    runners/test_38_finalizer.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_finalizer/test_finalizer.c
+  )
+  if(TARGET napi_quickjs_test_38_finalizer)
+    target_compile_definitions(napi_quickjs_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  endif()
   # add_fixture_test(napi_quickjs_test_39_cannot_run_js
   #   runners/test_39_cannot_run_js.cc
   #   ${NAPI_TESTS_ROOT}/js-native-api/test_cannot_run_js/test_cannot_run_js.c
@@ -281,107 +281,6 @@ if(NAPI_QUICKJS_LIBRARY)
   # add_fixture_test(napi_quickjs_test_41_instance_data
   #   runners/test_41_instance_data.cc
   #   ${NAPI_TESTS_ROOT}/js-native-api/test_instance_data/test_instance_data.c
-  # )
-  # add_fixture_test(napi_quickjs_test_42_node_async
-  #   runners/test_42_node_async.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_async/test_async.c
-  # )
-  # add_fixture_test(napi_quickjs_test_43_node_hello_world
-  #   runners/test_43_node_hello_world.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/1_hello_world/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_44_node_async_cleanup_hook
-  #   runners/test_44_node_async_cleanup_hook.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_async_cleanup_hook/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_45_node_async_context
-  #   runners/test_45_node_async_context.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_async_context/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_46_node_buffer
-  #   runners/test_46_node_buffer.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_buffer/test_buffer.c
-  # )
-  # if(TARGET napi_quickjs_test_46_node_buffer)
-  #   target_compile_definitions(napi_quickjs_test_46_node_buffer PRIVATE NAPI_VERSION=10)
-  # endif()
-  # add_fixture_test(napi_quickjs_test_47_node_buffer_finalizer
-  #   runners/test_47_node_buffer_finalizer.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_buffer/test_finalizer.c
-  # )
-  # add_fixture_test(napi_quickjs_test_48_node_callback_scope
-  #   runners/test_48_node_callback_scope.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_callback_scope/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_49_node_cleanup_hook
-  #   runners/test_49_node_cleanup_hook.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_cleanup_hook/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_50_node_env_teardown_gc
-  #   runners/test_50_node_env_teardown_gc.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_env_teardown_gc/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_51_node_fatal
-  #   runners/test_51_node_fatal.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_fatal/test_fatal.c
-  # )
-  # add_fixture_test(napi_quickjs_test_52_node_fatal_exception
-  #   runners/test_52_node_fatal_exception.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_fatal_exception/test_fatal_exception.c
-  # )
-  # add_fixture_test(napi_quickjs_test_53_node_init_order
-  #   runners/test_53_node_init_order.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_init_order/test_init_order.cc
-  # )
-  # add_fixture_test(napi_quickjs_test_54_node_make_callback
-  #   runners/test_54_node_make_callback.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_make_callback/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_55_node_make_callback_recurse
-  #   runners/test_55_node_make_callback_recurse.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_make_callback_recurse/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_56_node_reference_by_api_v9
-  #   runners/test_56_node_reference_by_api_v9.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_reference_by_node_api_version/test_reference_by_node_api_version.c
-  # )
-  # if(TARGET napi_quickjs_test_56_node_reference_by_api_v9)
-  #   target_compile_definitions(napi_quickjs_test_56_node_reference_by_api_v9 PRIVATE NAPI_VERSION=9)
-  # endif()
-  # add_fixture_test(napi_quickjs_test_57_node_reference_by_api_v10
-  #   runners/test_57_node_reference_by_api_v10.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_reference_by_node_api_version/test_reference_by_node_api_version.c
-  # )
-  # if(TARGET napi_quickjs_test_57_node_reference_by_api_v10)
-  #   target_compile_definitions(napi_quickjs_test_57_node_reference_by_api_v10 PRIVATE NAPI_VERSION=10)
-  # endif()
-  # add_fixture_test(napi_quickjs_test_58_node_threadsafe_function
-  #   runners/test_58_node_threadsafe_function.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_threadsafe_function/binding.c
-  # )
-  # add_fixture_test(napi_quickjs_test_59_node_threadsafe_function_shutdown
-  #   runners/test_59_node_threadsafe_function_shutdown.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_threadsafe_function_shutdown/binding.cc
-  # )
-  # add_fixture_test(napi_quickjs_test_60_node_uv_loop
-  #   runners/test_60_node_uv_loop.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_uv_loop/test_uv_loop.cc
-  # )
-  # add_fixture_test(napi_quickjs_test_61_node_uv_threadpool_size
-  #   runners/test_61_node_uv_threadpool_size.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_uv_threadpool_size/test_uv_threadpool_size.c
-  # )
-  # add_fixture_test(napi_quickjs_test_62_node_worker_buffer_callback
-  #   runners/test_62_node_worker_buffer_callback.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_worker_buffer_callback/test_worker_buffer_callback.c
-  # )
-  # add_fixture_test(napi_quickjs_test_63_node_worker_terminate
-  #   runners/test_63_node_worker_terminate.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_worker_terminate/test_worker_terminate.c
-  # )
-  # add_fixture_test(napi_quickjs_test_64_node_worker_terminate_finalization
-  #   runners/test_64_node_worker_terminate_finalization.cc
-  #   ${NAPI_TESTS_ROOT}/node-api/test_worker_terminate_finalization/test_worker_terminate_finalization.c
   # )
   # add_fixture_test(napi_quickjs_test_65_unofficial_contextify
   #   runners/test_65_unofficial_contextify.cc
