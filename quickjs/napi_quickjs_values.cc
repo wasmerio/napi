@@ -1552,28 +1552,46 @@ napi_status NAPI_CDECL napi_create_async_work(
     napi_async_complete_callback complete, void* data, napi_async_work* result) {
   (void)async_resource;
   (void)async_resource_name;
-  (void)execute;
-  (void)complete;
-  (void)data;
   if (env == nullptr || result == nullptr) return NapiQuickjsInvalidArg(env);
-  *result = reinterpret_cast<napi_async_work>(new (std::nothrow) int(0));
+  auto* work = new (std::nothrow) napi_async_work__();
+  if (work == nullptr) return napi_generic_failure;
+  work->env = env;
+  work->execute = execute;
+  work->complete = complete;
+  work->data = data;
+  *result = work;
   return *result != nullptr ? NapiQuickjsClearLastError(env) : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL napi_delete_async_work(napi_env env, napi_async_work work) {
   if (env == nullptr || work == nullptr) return NapiQuickjsInvalidArg(env);
-  delete reinterpret_cast<int*>(work);
+  delete work;
   return NapiQuickjsClearLastError(env);
 }
 
 napi_status NAPI_CDECL napi_queue_async_work(node_api_basic_env env, napi_async_work work) {
-  (void)work;
-  return env != nullptr ? NapiQuickjsClearLastError(env) : napi_invalid_arg;
+  if (env == nullptr || work == nullptr) return napi_invalid_arg;
+  if (work->queued) {
+    return NapiQuickjsSetLastError(reinterpret_cast<napi_env>(env),
+                                   napi_invalid_arg,
+                                   "Async work has already been queued");
+  }
+  work->queued = true;
+  if (!work->cancelled && work->execute != nullptr) {
+    work->execute(reinterpret_cast<napi_env>(env), work->data);
+  }
+  if (work->complete != nullptr) {
+    work->complete(reinterpret_cast<napi_env>(env),
+                   work->cancelled ? napi_cancelled : napi_ok,
+                   work->data);
+  }
+  return NapiQuickjsClearLastError(reinterpret_cast<napi_env>(env));
 }
 
 napi_status NAPI_CDECL napi_cancel_async_work(node_api_basic_env env, napi_async_work work) {
-  (void)work;
-  return env != nullptr ? NapiQuickjsClearLastError(env) : napi_invalid_arg;
+  if (env == nullptr || work == nullptr) return napi_invalid_arg;
+  work->cancelled = true;
+  return NapiQuickjsClearLastError(reinterpret_cast<napi_env>(env));
 }
 
 napi_status NAPI_CDECL napi_get_node_version(node_api_basic_env env, const napi_node_version** version) {

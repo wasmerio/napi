@@ -91,6 +91,15 @@ struct napi_async_cleanup_hook_handle__ {
   bool removed = false;
 };
 
+struct napi_async_work__ {
+  napi_env env = nullptr;
+  napi_async_execute_callback execute = nullptr;
+  napi_async_complete_callback complete = nullptr;
+  void* data = nullptr;
+  bool queued = false;
+  bool cancelled = false;
+};
+
 struct NapiQuickjsNativeCallback {
   napi_callback callback = nullptr;
   void* data = nullptr;
