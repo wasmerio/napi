@@ -1216,30 +1216,53 @@ napi_status NAPI_CDECL napi_create_promise(napi_env env, napi_deferred* deferred
   JSValue js_promise = JS_NewPromiseCapability(env->context, funcs);
   if (JS_IsException(js_promise)) return NapiQuickjsStorePendingException(env);
   napi_status status = NapiQuickjsStoreOwnedJsValue(env, js_promise, promise);
-  JS_FreeValue(env->context, funcs[0]);
-  JS_FreeValue(env->context, funcs[1]);
-  if (status != napi_ok) return status;
+  if (status != napi_ok) {
+    JS_FreeValue(env->context, funcs[0]);
+    JS_FreeValue(env->context, funcs[1]);
+    return status;
+  }
   (*promise)->kind = NapiQuickjsValueKind::kPromise;
   auto* d = new (std::nothrow) napi_deferred__();
-  if (d == nullptr) return napi_generic_failure;
+  if (d == nullptr) {
+    JS_FreeValue(env->context, funcs[0]);
+    JS_FreeValue(env->context, funcs[1]);
+    return napi_generic_failure;
+  }
   d->env = env;
   d->promise = *promise;
+  status = NapiQuickjsStoreOwnedJsValue(env, funcs[0], &d->resolve);
+  if (status != napi_ok) {
+    JS_FreeValue(env->context, funcs[1]);
+    delete d;
+    return status;
+  }
+  status = NapiQuickjsStoreOwnedJsValue(env, funcs[1], &d->reject);
+  if (status != napi_ok) {
+    delete d;
+    return status;
+  }
   *deferred = d;
   return NapiQuickjsClearLastError(env);
 }
 
 napi_status NAPI_CDECL napi_resolve_deferred(napi_env env, napi_deferred deferred, napi_value resolution) {
   if (env == nullptr || deferred == nullptr) return NapiQuickjsInvalidArg(env);
-  (void)resolution;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  napi_value argv[1] = {resolution != nullptr ? resolution : undefined};
+  napi_status status = napi_call_function(env, undefined, deferred->resolve, 1, argv, nullptr);
   delete deferred;
-  return NapiQuickjsClearLastError(env);
+  return status == napi_ok ? NapiQuickjsClearLastError(env) : status;
 }
 
 napi_status NAPI_CDECL napi_reject_deferred(napi_env env, napi_deferred deferred, napi_value rejection) {
   if (env == nullptr || deferred == nullptr) return NapiQuickjsInvalidArg(env);
-  (void)rejection;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  napi_value argv[1] = {rejection != nullptr ? rejection : undefined};
+  napi_status status = napi_call_function(env, undefined, deferred->reject, 1, argv, nullptr);
   delete deferred;
-  return NapiQuickjsClearLastError(env);
+  return status == napi_ok ? NapiQuickjsClearLastError(env) : status;
 }
 
 napi_status NAPI_CDECL napi_is_promise(napi_env env, napi_value value, bool* is_promise) {
@@ -1259,6 +1282,11 @@ napi_status NAPI_CDECL napi_run_script(napi_env env, napi_value script, napi_val
   JS_FreeCString(env->context, source);
   if (JS_IsException(value)) {
     return NapiQuickjsStorePendingException(env);
+  }
+  napi_status drain_status = NapiQuickjsDrainPromiseJobs(env);
+  if (drain_status != napi_ok) {
+    JS_FreeValue(env->context, value);
+    return drain_status;
   }
 
   return result != nullptr ? NapiQuickjsStoreOwnedJsValue(env, value, result)
@@ -1460,7 +1488,9 @@ napi_status NAPI_CDECL napi_async_destroy(napi_env env, napi_async_context async
 napi_status NAPI_CDECL napi_make_callback(
     napi_env env, napi_async_context async_context, napi_value recv, napi_value func, size_t argc, const napi_value* argv, napi_value* result) {
   (void)async_context;
-  return napi_call_function(env, recv, func, argc, argv, result);
+  napi_status status = napi_call_function(env, recv, func, argc, argv, result);
+  if (status != napi_ok) return status;
+  return NapiQuickjsDrainPromiseJobs(env);
 }
 
 napi_status NAPI_CDECL napi_create_buffer(napi_env env, size_t length, void** data, napi_value* result) {

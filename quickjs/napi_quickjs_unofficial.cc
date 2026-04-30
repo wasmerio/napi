@@ -21,6 +21,152 @@ bool IsNullish(napi_value value) {
          value->kind == NapiQuickjsValueKind::kNull;
 }
 
+bool IsFunction(napi_env env, napi_value value) {
+  return env != nullptr &&
+         value != nullptr &&
+         value->has_js_value &&
+         JS_IsFunction(env->context, value->js_value);
+}
+
+void ClearPendingExceptionIfAny(napi_env env) {
+  if (env == nullptr) return;
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_value ignored = nullptr;
+    (void)napi_get_and_clear_last_exception(env, &ignored);
+  }
+}
+
+napi_value StoreHookArgument(napi_env env, JSValueConst value) {
+  napi_value out = nullptr;
+  if (NapiQuickjsStoreJsValue(env, value, &out) != napi_ok) {
+    ClearPendingExceptionIfAny(env);
+    return nullptr;
+  }
+  return out;
+}
+
+void CallPromiseHook(napi_env env, napi_value hook, size_t argc, napi_value* argv) {
+  if (!IsFunction(env, hook)) return;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, global, hook, argc, argv, &ignored) != napi_ok) {
+    ClearPendingExceptionIfAny(env);
+  }
+}
+
+void CapturePromiseContextFrame(napi_env env, JSValueConst promise) {
+  void* identity = NapiQuickjsJsIdentity(promise);
+  if (env == nullptr || identity == nullptr) return;
+  env->promise_context_frames[identity] = env->continuation_preserved_embedder_data;
+}
+
+void EnterPromiseContextFrame(napi_env env, JSValueConst promise) {
+  if (env == nullptr) return;
+  env->promise_context_frame_stack.push_back(env->continuation_preserved_embedder_data);
+
+  napi_value frame = nullptr;
+  void* identity = NapiQuickjsJsIdentity(promise);
+  if (identity != nullptr) {
+    auto it = env->promise_context_frames.find(identity);
+    if (it != env->promise_context_frames.end()) {
+      frame = it->second;
+    }
+  }
+  if (frame == nullptr) {
+    napi_get_undefined(env, &frame);
+  }
+  env->continuation_preserved_embedder_data = frame;
+}
+
+void LeavePromiseContextFrame(napi_env env, JSValueConst promise) {
+  if (env == nullptr || env->promise_context_frame_stack.empty()) return;
+  env->continuation_preserved_embedder_data = env->promise_context_frame_stack.back();
+  env->promise_context_frame_stack.pop_back();
+
+  void* identity = NapiQuickjsJsIdentity(promise);
+  if (identity != nullptr) {
+    env->promise_context_frames.erase(identity);
+  }
+}
+
+JSValue QuickjsMicrotaskJob(JSContext* ctx, int argc, JSValueConst* argv) {
+  if (argc < 1 || !JS_IsFunction(ctx, argv[0])) {
+    return JS_UNDEFINED;
+  }
+  return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, nullptr);
+}
+
+void QuickjsPromiseHook(JSContext* ctx,
+                        JSPromiseHookType type,
+                        JSValueConst promise,
+                        JSValueConst parent_promise,
+                        void* opaque) {
+  napi_env env = static_cast<napi_env>(opaque);
+  if (env == nullptr || env->context != ctx) return;
+
+  if (type == JS_PROMISE_HOOK_INIT) {
+    CapturePromiseContextFrame(env, promise);
+  } else if (type == JS_PROMISE_HOOK_BEFORE) {
+    EnterPromiseContextFrame(env, promise);
+  }
+
+  const size_t hook_index = static_cast<size_t>(type);
+  if (hook_index >= 4) {
+    if (type == JS_PROMISE_HOOK_AFTER) LeavePromiseContextFrame(env, promise);
+    return;
+  }
+  napi_value hook = env->promise_hooks[hook_index];
+  if (!IsFunction(env, hook)) {
+    if (type == JS_PROMISE_HOOK_AFTER) LeavePromiseContextFrame(env, promise);
+    return;
+  }
+
+  napi_value promise_arg = StoreHookArgument(env, promise);
+  if (promise_arg == nullptr) {
+    if (type == JS_PROMISE_HOOK_AFTER) LeavePromiseContextFrame(env, promise);
+    return;
+  }
+
+  if (type == JS_PROMISE_HOOK_INIT) {
+    napi_value parent_arg = StoreHookArgument(env, parent_promise);
+    if (parent_arg == nullptr) return;
+    napi_value argv[2] = {promise_arg, parent_arg};
+    CallPromiseHook(env, hook, 2, argv);
+    return;
+  }
+
+  napi_value argv[1] = {promise_arg};
+  CallPromiseHook(env, hook, 1, argv);
+  if (type == JS_PROMISE_HOOK_AFTER) {
+    LeavePromiseContextFrame(env, promise);
+  }
+}
+
+void QuickjsPromiseRejectionTracker(JSContext* ctx,
+                                    JSValueConst promise,
+                                    JSValueConst reason,
+                                    bool is_handled,
+                                    void* opaque) {
+  napi_env env = static_cast<napi_env>(opaque);
+  if (env == nullptr || env->context != ctx || !IsFunction(env, env->promise_reject_callback)) {
+    return;
+  }
+
+  napi_value event_type = nullptr;
+  napi_value promise_arg = StoreHookArgument(env, promise);
+  napi_value reason_arg = StoreHookArgument(env, reason);
+  if (promise_arg == nullptr || reason_arg == nullptr ||
+      napi_create_int32(env, is_handled ? 1 : 0, &event_type) != napi_ok ||
+      event_type == nullptr) {
+    return;
+  }
+
+  napi_value argv[3] = {event_type, promise_arg, reason_arg};
+  CallPromiseHook(env, env->promise_reject_callback, 3, argv);
+}
+
 napi_status GetStringValue(napi_env env, napi_value value, const char* fallback, std::string* out) {
   if (env == nullptr || out == nullptr) return napi_invalid_arg;
   if (value == nullptr || value->kind == NapiQuickjsValueKind::kUndefined) {
@@ -217,6 +363,7 @@ napi_status CreateEnvImpl(int32_t module_api_version, napi_env* env_out, void** 
     return napi_generic_failure;
   }
   JS_SetContextOpaque(env->context, env);
+  JS_SetPromiseHook(env->runtime, QuickjsPromiseHook, env);
   NapiQuickjsClearLastError(env);
   if (InstallBootstrapGlobalShims(env) != napi_ok) {
     NapiQuickjsReleaseEnv(env);
@@ -325,7 +472,7 @@ napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
 }
 
 napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
-  return env != nullptr ? NapiQuickjsClearLastError(env) : napi_invalid_arg;
+  return env != nullptr ? NapiQuickjsDrainPromiseJobs(env) : napi_invalid_arg;
 }
 
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
@@ -352,22 +499,40 @@ napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {
-  (void)callback;
-  return Unsupported(env, "QuickJS provider does not support engine microtasks yet");
+  if (env == nullptr || env->context == nullptr || callback == nullptr) return napi_invalid_arg;
+  if (!IsFunction(env, callback)) {
+    return NapiQuickjsSetLastError(env, napi_function_expected, "Function expected");
+  }
+  JSValueConst job_args[1] = {callback->js_value};
+  if (JS_EnqueueJob(env->context, QuickjsMicrotaskJob, 1, job_args) < 0) {
+    return NapiQuickjsStorePendingException(env);
+  }
+  return NapiQuickjsClearLastError(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env, napi_value callback) {
-  (void)callback;
-  return Unsupported(env, "QuickJS provider does not support promise reject hooks yet");
+  if (env == nullptr || env->runtime == nullptr) return napi_invalid_arg;
+  env->promise_reject_callback = IsFunction(env, callback) ? callback : nullptr;
+  JS_SetHostPromiseRejectionTracker(env->runtime,
+                                    env->promise_reject_callback != nullptr
+                                        ? QuickjsPromiseRejectionTracker
+                                        : nullptr,
+                                    env);
+  return NapiQuickjsClearLastError(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(
     napi_env env, napi_value init, napi_value before, napi_value after, napi_value resolve) {
-  (void)init;
-  (void)before;
-  (void)after;
-  (void)resolve;
-  return Unsupported(env, "QuickJS provider does not support promise hooks yet");
+  if (env == nullptr || env->runtime == nullptr) return napi_invalid_arg;
+  napi_value hooks[4] = {init, before, after, resolve};
+  bool any_hook = false;
+  for (size_t i = 0; i < 4; ++i) {
+    env->promise_hooks[i] = IsFunction(env, hooks[i]) ? hooks[i] : nullptr;
+    any_hook = any_hook || env->promise_hooks[i] != nullptr;
+  }
+  (void)any_hook;
+  JS_SetPromiseHook(env->runtime, QuickjsPromiseHook, env);
+  return NapiQuickjsClearLastError(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(

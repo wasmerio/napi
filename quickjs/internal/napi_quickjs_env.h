@@ -80,6 +80,8 @@ struct napi_callback_info__ {
 struct napi_deferred__ {
   napi_env env = nullptr;
   napi_value promise = nullptr;
+  napi_value resolve = nullptr;
+  napi_value reject = nullptr;
 };
 
 struct napi_async_cleanup_hook_handle__ {
@@ -104,6 +106,10 @@ struct napi_env__ {
   napi_value pending_exception = nullptr;
   napi_value continuation_preserved_embedder_data = nullptr;
   napi_value host_defined_option_symbol = nullptr;
+  napi_value promise_hooks[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_value promise_reject_callback = nullptr;
+  std::unordered_map<void*, napi_value> promise_context_frames;
+  std::vector<napi_value> promise_context_frame_stack;
   std::vector<napi_value> host_defined_option_referrers;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
@@ -162,5 +168,6 @@ napi_value NapiQuickjsFindNapiValue(napi_env env, JSValueConst js_value);
 napi_status NapiQuickjsStorePendingException(napi_env env);
 JSValue NapiQuickjsTakePendingException(napi_env env);
 JSValue NapiQuickjsCreateNativeFunction(napi_env env, napi_value function_value);
+napi_status NapiQuickjsDrainPromiseJobs(napi_env env);
 
 #endif  // NAPI_QUICKJS_ENV_H_

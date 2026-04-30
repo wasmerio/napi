@@ -246,6 +246,27 @@ JSValue NapiQuickjsCreateNativeFunction(napi_env env, napi_value function_value)
   return function;
 }
 
+napi_status NapiQuickjsDrainPromiseJobs(napi_env env) {
+  if (env == nullptr || env->runtime == nullptr) return NapiQuickjsInvalidArg(env);
+
+  JSContext* job_context = nullptr;
+  for (;;) {
+    int status = JS_ExecutePendingJob(env->runtime, &job_context);
+    if (status <= 0) {
+      if (status < 0) {
+        napi_env job_env = env;
+        if (job_context != nullptr) {
+          if (auto* opaque_env = static_cast<napi_env>(JS_GetContextOpaque(job_context))) {
+            job_env = opaque_env;
+          }
+        }
+        return NapiQuickjsStorePendingException(job_env);
+      }
+      return NapiQuickjsClearLastError(env);
+    }
+  }
+}
+
 napi_status NapiQuickjsValueToPropertyKey(napi_env env,
                                           napi_value value,
                                           std::string* key) {
@@ -351,6 +372,8 @@ napi_status NapiQuickjsReleaseEnv(napi_env env) {
   }
   env->host_defined_option_referrers.clear();
   env->host_defined_option_symbol = nullptr;
+  env->promise_context_frames.clear();
+  env->promise_context_frame_stack.clear();
 
   if (env->context != nullptr) {
     env->pending_exception = nullptr;

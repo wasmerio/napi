@@ -12,6 +12,7 @@ FetchContent_Declare(quickjs_ng_sources
   SOURCE_SUBDIR edge-cmake-noop
 )
 FetchContent_MakeAvailable(quickjs_ng_sources)
+include("${CMAKE_CURRENT_SOURCE_DIR}/patch_quickjs_ng.cmake")
 
 add_library(quickjs_ng STATIC
   "${quickjs_ng_sources_SOURCE_DIR}/dtoa.c"
