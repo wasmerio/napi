@@ -135,11 +135,11 @@ if(NAPI_QUICKJS_LIBRARY)
     runners/test_9_array.cc
     ${NAPI_TESTS_ROOT}/js-native-api/test_array/test_array.c
   )
-  # add_fixture_test(napi_quickjs_test_10_number
-  #   runners/test_10_number.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_number.c
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_null.c
-  # )
+  add_fixture_test(napi_quickjs_test_10_number
+    runners/test_10_number.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_number.c
+    ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_null.c
+  )
   # add_fixture_test(napi_quickjs_test_11_constructor
   #   runners/test_11_constructor.cc
   #   ${NAPI_TESTS_ROOT}/js-native-api/test_constructor/test_constructor.c

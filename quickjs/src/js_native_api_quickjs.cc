@@ -695,7 +695,7 @@ extern "C"
   {
     if (!CheckEnv(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = napi_quickjs_wrap_value(env, JS_NewInt64(env->ctx, static_cast<double>(value)));
+    *result = napi_quickjs_wrap_value(env, JS_NewInt64(env->ctx, value));
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -1336,7 +1336,7 @@ extern "C"
     if (length == NAPI_AUTO_LENGTH)
       length = strlen(str);
 
-    *result = napi_quickjs_wrap_value(env, JS_NewAtomString(env->ctx, str));
+    *result = napi_quickjs_wrap_value(env, JS_NewStringLen(env->ctx, str, length));
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -1469,13 +1469,6 @@ extern "C"
     }
     else if (JS_IsObject(local))
     {
-      // QuickJS doesn't have a direct "IsExternal" type tag in the same way V8 does.
-      // Externals in N-API are usually objects with an opaque pointer.
-      // We'd need to check if it has the specific class ID used for externals if we implemented them.
-      *result = napi_object;
-    }
-    else if (JS_IsObject(local))
-    {
       // Check if it's our external class
       if (JS_GetOpaque(local, napi_external_class_id) != nullptr)
       {
@@ -1568,10 +1561,30 @@ extern "C"
     {
       return napi_quickjs_set_last_error(env, napi_number_expected, "A number was expected");
     }
-    if (JS_ToInt64(env->ctx, result, local) < 0)
+
+    double number = 0;
+    if (JS_ToFloat64(env->ctx, &number, local) < 0)
     {
       return ReturnPendingIfCaught(env, "Exception during int64 coercion");
     }
+
+    if (!std::isfinite(number))
+    {
+      *result = 0;
+    }
+    else if (number >= 9223372036854775808.0)
+    {
+      *result = std::numeric_limits<int64_t>::max();
+    }
+    else if (number <= -9223372036854775808.0)
+    {
+      *result = std::numeric_limits<int64_t>::min();
+    }
+    else
+    {
+      *result = static_cast<int64_t>(number);
+    }
+
     return napi_quickjs_clear_last_error(env);
   }
 
@@ -2344,8 +2357,7 @@ extern "C"
     // 5. Check for exceptions
     if (JS_IsException(instance))
     {
-      // You might want to move the exception to the env's last_exception field here
-      return napi_pending_exception;
+      return ReturnPendingIfCaught(env, "Exception during constructor call");
     }
 
     // 6. Wrap and return
@@ -3144,19 +3156,9 @@ extern "C"
     if (!CheckEnv(env) || ref == nullptr)
       return napi_invalid_arg;
 
-    // shouldn't be deleting napi_ref if count didn't reach 0,
-    // because we risk use-after-free on external C side.
     if (ref->ref_count > 0)
-      return napi_generic_failure;
-
-    // we can drop napi_ref (wrapper itself) when underlying
-    // is not GC collectible, e.g. int, float,
-    // otherwise object finalizer should do that.
-
-    if (!ref->can_be_weak)
     {
-      ref->value = JS_UNDEFINED;
-      return napi_ok;
+      JS_FreeValue(env->ctx, ref->value);
     }
 
     delete ref;

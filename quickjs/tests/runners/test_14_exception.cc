@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <string>
 
-#include "../../src/internal/napi_v8_env.h"
 #include "test_env.h"
 #include "upstream_js_test.h"
 #include "unofficial_napi.h"
@@ -26,24 +25,13 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 std::string GetArrowMessage(napi_env env, napi_value exception) {
   if (env == nullptr || exception == nullptr) return {};
 
-  v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(exception);
-  if (raw.IsEmpty() || !raw->IsObject()) return {};
-
-  v8::Local<v8::String> key_name =
-      v8::String::NewFromUtf8(isolate, "node:arrowMessage", v8::NewStringType::kInternalized)
-          .ToLocalChecked();
-  v8::Local<v8::Private> arrow_key = v8::Private::ForApi(isolate, key_name);
-  v8::Local<v8::Value> arrow;
-  if (!raw.As<v8::Object>()->GetPrivate(context, arrow_key).ToLocal(&arrow) || arrow.IsEmpty()) {
+  napi_value arrow = nullptr;
+  if (napi_get_named_property(env, exception, "node:arrowMessage", &arrow) != napi_ok ||
+      arrow == nullptr) {
     return {};
   }
 
-  napi_value wrapped_arrow = napi_v8_wrap_value(env, arrow);
-  if (wrapped_arrow == nullptr) return {};
-  return ValueToUtf8(env, wrapped_arrow);
+  return ValueToUtf8(env, arrow);
 }
 
 }  // namespace

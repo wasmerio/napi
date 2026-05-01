@@ -1,6 +1,7 @@
 #include <string>
 
 #include "test_env.h"
+#include "upstream_js_test.h"
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
@@ -16,27 +17,8 @@ TEST_F(Test27Object, PortedCoreFlow) {
   ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, global, "__to", exports), napi_ok);
 
-  auto run_js = [&](const char* source_text) {
-    v8::TryCatch tc(s.isolate);
-    std::string wrapped = std::string("(() => { 'use strict'; ") + source_text + " })();";
-    v8::Local<v8::String> source =
-        v8::String::NewFromUtf8(s.isolate, wrapped.c_str(), v8::NewStringType::kNormal)
-            .ToLocalChecked();
-    v8::Local<v8::Script> script;
-    if (!v8::Script::Compile(s.context, source).ToLocal(&script)) return false;
-    v8::Local<v8::Value> out;
-    if (!script->Run(s.context).ToLocal(&out)) {
-      if (tc.HasCaught()) {
-        v8::String::Utf8Value msg(s.isolate, tc.Exception());
-        ADD_FAILURE() << "JS exception: " << (*msg ? *msg : "<empty>")
-                      << " while running: " << source_text;
-      }
-      return false;
-    }
-    return true;
-  };
-
-  ASSERT_TRUE(run_js(R"JS(
+  ASSERT_TRUE(RunScript(s, R"JS(
+(() => { 'use strict';
 const assert = {
   ok(v,m){ if(!v) throw new Error(m||'assert'); },
   strictEqual(a,b,m){ if(a!==b) throw new Error(m||`strictEqual:${a}!=${b}`); },
@@ -218,5 +200,6 @@ assert.deepStrictEqual(__to.GetEnumerableWritableNames(pnObj), ['5','normal','wr
 assert.deepStrictEqual(__to.GetOwnWritableNames(pnObj), ['5','normal','unenumerable','writable',fooSymbol]);
 assert.deepStrictEqual(__to.GetEnumerableConfigurableNames(pnObj), ['5','normal','configurable',fooSymbol,'inherited']);
 assert.deepStrictEqual(__to.GetOwnConfigurableNames(pnObj), ['5','normal','unenumerable','configurable',fooSymbol]);
-)JS"));
+})();
+)JS", "test_27_object"));
 }
