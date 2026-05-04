@@ -845,8 +845,12 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
+        const size_t description_length =
+            utf8description == nullptr ? 0
+            : length == NAPI_AUTO_LENGTH ? std::strlen(utf8description)
+                                         : length;
         std::string description(utf8description == nullptr ? "" : utf8description,
-                                utf8description == nullptr ? 0 : length);
+                                description_length);
         JSValue symbol = JS_NewSymbol(Ctx(env), description.c_str(), false);
         if (JS_IsException(symbol))
             return napi_pending_exception;

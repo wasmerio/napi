@@ -261,12 +261,9 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
 
-    if (data == nullptr && byte_length == 0)
-      return napi_invalid_arg;
-
     auto rt = JS_GetRuntime(env->context());
     auto buf = js_malloc_rt(rt, byte_length);
-    if (buf != nullptr)
+    if (data != nullptr)
     {
       *data = buf;
     }

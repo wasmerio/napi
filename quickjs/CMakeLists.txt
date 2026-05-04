@@ -25,10 +25,19 @@ set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # napi_v8_resolve_configuration()
 
 set(PROJECT_ROOT "${NAPI_QUICKJS_ROOT}/../..")
-set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
+if(NOT NAPI_INCLUDE_ROOT)
+  set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
+endif()
 set(NAPI_QUICKJS_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/quickjs")
-set(NAPI_QUICKJS_INCLUDE_DIR "${NAPI_QUICKJS_NODE_ROOT_DEFAULT}")
-set(NAPI_QUICKJS_LIBRARY "${PROJECT_ROOT}/build-quickjs-napi/quickjs/libqjs.a")
+set(NAPI_QUICKJS_INCLUDE_DIR
+  "${NAPI_QUICKJS_NODE_ROOT_DEFAULT}"
+  CACHE PATH "Path to QuickJS headers"
+)
+set(NAPI_QUICKJS_LIBRARY_DEFAULT "${PROJECT_ROOT}/build-quickjs-napi/quickjs/libqjs.a")
+set(NAPI_QUICKJS_LIBRARY
+  "${NAPI_QUICKJS_LIBRARY_DEFAULT}"
+  CACHE FILEPATH "Path to QuickJS static library for standalone builds"
+)
 
 include("${NAPI_QUICKJS_ROOT}/cmake/NapiEngine.cmake")
 napi_engine_set_layout("${NAPI_QUICKJS_ROOT}")
@@ -92,7 +101,9 @@ endif()
 if(NAPI_QUICKJS_DEFINES)
   target_compile_definitions(napi_quickjs PRIVATE ${NAPI_QUICKJS_DEFINES})
 endif()
-if(NAPI_QUICKJS_LIBRARY)
+if(TARGET qjs)
+  target_link_libraries(napi_quickjs PUBLIC qjs)
+elseif(NAPI_QUICKJS_LIBRARY)
   target_link_libraries(napi_quickjs PUBLIC "${NAPI_QUICKJS_LIBRARY}")
 endif()
 if(NAPI_QUICKJS_EXTRA_LIBS)
