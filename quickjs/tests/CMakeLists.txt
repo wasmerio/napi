@@ -37,7 +37,7 @@ if(NAPI_QUICKJS_LIBRARY)
 
   function(add_fixture_test target_name)
     if(NOT NAPI_QUICKJS_BUILD_NODE_API_TESTS AND
-       target_name MATCHES "^napi_quickjs_test_(20_node_general|21_general|22_node_exception|23_instance_data_ref_then_set|24_instance_data_set_then_ref|28_node_instance_data|38_finalizer|42_node_async|43_node_hello_world|44_node_async_cleanup_hook|45_node_async_context|46_node_buffer|47_node_buffer_finalizer|48_node_callback_scope|49_node_cleanup_hook|50_node_env_teardown_gc|51_node_fatal|52_node_fatal_exception|53_node_init_order|54_node_make_callback|55_node_make_callback_recurse|56_node_reference_by_api_v9|57_node_reference_by_api_v10|58_node_threadsafe_function|59_node_threadsafe_function_shutdown|60_node_uv_loop|61_node_uv_threadpool_size|62_node_worker_buffer_callback|63_node_worker_terminate|64_node_worker_terminate_finalization)$")
+       target_name MATCHES "^napi_quickjs_test_(20_node_general|22_node_exception|23_instance_data_ref_then_set|24_instance_data_set_then_ref|28_node_instance_data|42_node_async|43_node_hello_world|44_node_async_cleanup_hook|45_node_async_context|46_node_buffer|47_node_buffer_finalizer|48_node_callback_scope|49_node_cleanup_hook|50_node_env_teardown_gc|51_node_fatal|52_node_fatal_exception|53_node_init_order|54_node_make_callback|55_node_make_callback_recurse|56_node_reference_by_api_v9|57_node_reference_by_api_v10|58_node_threadsafe_function|59_node_threadsafe_function_shutdown|60_node_uv_loop|61_node_uv_threadpool_size|62_node_worker_buffer_callback|63_node_worker_terminate|64_node_worker_terminate_finalization)$")
       return()
     endif()
 
@@ -186,7 +186,7 @@ if(NAPI_QUICKJS_LIBRARY)
   )
   add_fixture_test(napi_quickjs_test_21_general
     runners/test_21_general.cc
-    ${NAPI_TESTS_ROOT}/js-native-api/test_general/test_general.c
+    runners/addon_21_general.cc
   )
   if(TARGET napi_quickjs_test_21_general)
     target_compile_definitions(napi_quickjs_test_21_general PRIVATE NAPI_EXPERIMENTAL)
@@ -263,7 +263,7 @@ if(NAPI_QUICKJS_LIBRARY)
   )
   add_fixture_test(napi_quickjs_test_38_finalizer
     runners/test_38_finalizer.cc
-    ${NAPI_TESTS_ROOT}/js-native-api/test_finalizer/test_finalizer.c
+    runners/addon_38_finalizer.cc
   )
   if(TARGET napi_quickjs_test_38_finalizer)
     target_compile_definitions(napi_quickjs_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)

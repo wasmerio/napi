@@ -100,6 +100,7 @@ struct napi_escapable_handle_scope__
 static const char kTypeTagProperty[] = "__napi_type_tag__";
 static const char kWrapProperty[] = "__napi_wrap__";
 static const char kBufferProperty[] = "__napi_buffer__";
+static const char kFinalizerProperty[] = "__napi_finalizer__";
 
 static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
 {
@@ -3839,6 +3840,9 @@ extern "C"
     if (!JS_IsObject(obj))
       return napi_object_expected;
 
+    if (GetWrapRecord(env->ctx, obj) != nullptr)
+      return InvalidArg(env);
+
     auto *wrap = new (std::nothrow) napi_external_backing_store_hint__{
         .env = env,
         .external_data = native_object,
@@ -3903,19 +3907,39 @@ extern "C"
     if (wrap == nullptr)
       return napi_generic_failure;
 
+    *result = wrap->external_data;
+
     if (JS_SetOpaque(obj, nullptr) != 0)
     {
+      JSValue stored = JS_GetPropertyStr(env->ctx, obj, kWrapProperty);
+      if (JS_IsException(stored))
+      {
+        JSValue exc = JS_GetException(env->ctx);
+        JS_FreeValue(env->ctx, exc);
+        return ReturnPendingIfCaught(env, "Failed to get wrap record");
+      }
+      if (!JS_IsUndefined(stored))
+      {
+        JS_SetOpaque(stored, nullptr);
+      }
+
       JSAtom key = JS_NewAtom(env->ctx, kWrapProperty);
       if (JS_DeleteProperty(env->ctx, obj, key, 0) < 0)
       {
+        if (!JS_IsUndefined(stored))
+        {
+          JS_SetOpaque(stored, wrap);
+        }
+        JS_FreeValue(env->ctx, stored);
         JS_FreeAtom(env->ctx, key);
         return ReturnPendingIfCaught(env, "Failed to remove wrap record");
       }
+      JS_FreeValue(env->ctx, stored);
       JS_FreeAtom(env->ctx, key);
     }
 
-    *result = wrap->external_data;
-    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    delete wrap;
+    return napi_ok;
   }
 
   napi_status NAPI_CDECL napi_throw_error(napi_env env,
@@ -4312,15 +4336,42 @@ extern "C"
                                             void *finalize_hint,
                                             napi_ref *result)
   {
-    (void)finalize_data;
-    (void)finalize_cb;
-    (void)finalize_hint;
     if (!CheckValue(env, js_object) || finalize_cb == nullptr)
       return InvalidArg(env);
-    if (!JS_IsObject(napi_quickjs_unwrap_value(js_object)))
+
+    JSValue obj = napi_quickjs_unwrap_value(js_object);
+    if (!JS_IsObject(obj))
       return napi_object_expected;
+
+    auto *hint = new (std::nothrow) napi_external_backing_store_hint__{
+        .env = env,
+        .external_data = finalize_data,
+        .finalize_cb = finalize_cb,
+        .finalize_hint = finalize_hint,
+        .weak_target = obj};
+    if (hint == nullptr)
+      return napi_generic_failure;
+
+    JSValue stored = JS_NewObjectClass(env->ctx, napi_external_class_id);
+    if (JS_IsException(stored))
+    {
+      delete hint;
+      return ReturnPendingIfCaught(env, "Failed to create finalizer record");
+    }
+
+    JS_SetOpaque(stored, hint);
+    if (JS_DefinePropertyValueStr(env->ctx, obj, kFinalizerProperty, stored,
+                                  JS_PROP_CONFIGURABLE) < 0)
+    {
+      JS_SetOpaque(stored, nullptr);
+      JS_FreeValue(env->ctx, stored);
+      delete hint;
+      return ReturnPendingIfCaught(env, "Failed to attach finalizer record");
+    }
+
     if (result != nullptr)
       return napi_create_reference(env, js_object, 0, result);
+
     return napi_ok;
   }
 
