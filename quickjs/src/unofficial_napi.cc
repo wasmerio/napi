@@ -1,4 +1,5 @@
 #include "internal/napi_env.h"
+#include "internal/napi_external.h"
 
 #include <unordered_map>
 #include <mutex>
@@ -73,7 +74,7 @@ extern "C"
         // context->GetIsolate()->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
 
         auto rt = JS_GetRuntime(context);
-        if (0 != RegisterExternalClass(rt)) {
+        if (0 != napi_external__::register_class(rt)) {
             return napi_generic_failure;
         }
 

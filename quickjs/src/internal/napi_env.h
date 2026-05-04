@@ -74,6 +74,4 @@ napi_status napi_quickjs_set_last_error(napi_env env,
 
 napi_status napi_quickjs_clear_last_error(napi_env env);
 
-int RegisterExternalClass(JSRuntime *rt);
-
 #endif // NAPI_QUICKJS_ENV_H_

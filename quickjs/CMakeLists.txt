@@ -62,10 +62,13 @@ add_library(napi_quickjs STATIC
   src/napi_env.cc
   src/napi_env_cleanup_hook.cc
   src/napi_escapable_handle_scope.cc
+  src/napi_external.cc
   src/napi_external_backing_store_hint.cc
+  src/napi_function.cc
   src/napi_handle_scope.cc
   src/napi_ref.cc
   src/napi_scope.cc
+  src/napi_util.cc
   src/napi_value.cc
   src/unofficial_napi.cc
 )
