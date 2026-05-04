@@ -53,6 +53,8 @@ namespace
         JSValue promise_reject_callback = JS_UNDEFINED;
         JSValue promise_hooks[4] = {JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
         JSValue continuation_preserved_embedder_data = JS_UNDEFINED;
+        std::unordered_map<void *, JSValue> promise_context_frames;
+        std::vector<JSValue> promise_context_frame_stack;
         JSValue import_module_dynamically_callback = JS_UNDEFINED;
         JSValue initialize_import_meta_object_callback = JS_UNDEFINED;
         ErrorFormattingState error_formatting;
@@ -73,6 +75,8 @@ namespace
     std::mutex g_mu;
     EmbedderHooksState g_embedder_hooks;
     std::unordered_map<napi_env, EnvState> g_env_states;
+
+    EnvState &EnsureEnvState(napi_env env);
 
     bool CheckEnv(napi_env env)
     {
@@ -254,6 +258,215 @@ namespace
         return out;
     }
 
+    void FreeStoredValue(JSContext *ctx, JSValue *value)
+    {
+        if (value != nullptr && !JS_IsUndefined(*value))
+        {
+            JS_FreeValue(ctx, *value);
+            *value = JS_UNDEFINED;
+        }
+    }
+
+    void ReplaceStoredValue(napi_env env, JSValue *target, JSValueConst value)
+    {
+        JSContext *ctx = Ctx(env);
+        FreeStoredValue(ctx, target);
+        *target = JS_DupValue(ctx, value);
+    }
+
+    void *JsIdentity(JSValueConst value)
+    {
+        return JS_IsObject(value) ? JS_VALUE_GET_PTR(value) : nullptr;
+    }
+
+    void ClearPendingExceptionIfAny(JSContext *ctx)
+    {
+        if (ctx == nullptr || !JS_HasException(ctx))
+            return;
+        JSValue exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, exception);
+    }
+
+    void CallPromiseHook(napi_env env, JSValueConst hook, int argc, JSValueConst *argv)
+    {
+        if (!CheckEnv(env) || !JS_IsFunction(Ctx(env), hook))
+            return;
+
+        JSContext *ctx = Ctx(env);
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue ret = JS_Call(ctx, hook, global, argc, argv);
+        JS_FreeValue(ctx, global);
+        if (JS_IsException(ret))
+        {
+            ClearPendingExceptionIfAny(ctx);
+            return;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+
+    void CapturePromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+        void *identity = JsIdentity(promise);
+        if (identity == nullptr)
+            return;
+
+        auto &state = EnsureEnvState(env);
+        if (JS_IsUndefined(state.continuation_preserved_embedder_data))
+            return;
+        JSContext *ctx = Ctx(env);
+        JSValue frame = JS_DupValue(ctx, state.continuation_preserved_embedder_data);
+        auto it = state.promise_context_frames.find(identity);
+        if (it != state.promise_context_frames.end())
+        {
+            FreeStoredValue(ctx, &it->second);
+            it->second = frame;
+        }
+        else
+        {
+            state.promise_context_frames.emplace(identity, frame);
+        }
+    }
+
+    void EnterPromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+
+        auto &state = EnsureEnvState(env);
+        JSContext *ctx = Ctx(env);
+        state.promise_context_frame_stack.push_back(
+            JS_DupValue(ctx, state.continuation_preserved_embedder_data));
+
+        JSValueConst frame = JS_UNDEFINED;
+        void *identity = JsIdentity(promise);
+        if (identity != nullptr)
+        {
+            auto it = state.promise_context_frames.find(identity);
+            if (it != state.promise_context_frames.end())
+                frame = it->second;
+        }
+        ReplaceStoredValue(env, &state.continuation_preserved_embedder_data, frame);
+    }
+
+    void LeavePromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+
+        auto &state = EnsureEnvState(env);
+        JSContext *ctx = Ctx(env);
+        if (!state.promise_context_frame_stack.empty())
+        {
+            JSValue previous = state.promise_context_frame_stack.back();
+            state.promise_context_frame_stack.pop_back();
+            FreeStoredValue(ctx, &state.continuation_preserved_embedder_data);
+            state.continuation_preserved_embedder_data = previous;
+        }
+
+        void *identity = JsIdentity(promise);
+        if (identity != nullptr)
+        {
+            auto it = state.promise_context_frames.find(identity);
+            if (it != state.promise_context_frames.end())
+            {
+                FreeStoredValue(ctx, &it->second);
+                state.promise_context_frames.erase(it);
+            }
+        }
+    }
+
+    JSValue GetStoredFunction(napi_env env, JSValueConst value)
+    {
+        if (!CheckEnv(env) || !JS_IsFunction(Ctx(env), value))
+            return JS_UNDEFINED;
+        return JS_DupValue(Ctx(env), value);
+    }
+
+    JSValue GetPromiseHook(napi_env env, size_t index)
+    {
+        if (!CheckEnv(env) || index >= 4)
+            return JS_UNDEFINED;
+        auto &state = EnsureEnvState(env);
+        return GetStoredFunction(env, state.promise_hooks[index]);
+    }
+
+    JSValue GetPromiseRejectCallback(napi_env env)
+    {
+        if (!CheckEnv(env))
+            return JS_UNDEFINED;
+        auto &state = EnsureEnvState(env);
+        return GetStoredFunction(env, state.promise_reject_callback);
+    }
+
+    JSValue QuickjsMicrotaskJob(JSContext *ctx, int argc, JSValueConst *argv)
+    {
+        if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+            return JS_UNDEFINED;
+        return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, nullptr);
+    }
+
+    void QuickjsPromiseHook(JSContext *ctx,
+                            JSPromiseHookType type,
+                            JSValueConst promise,
+                            JSValueConst parent_promise,
+                            void *opaque)
+    {
+        napi_env env = static_cast<napi_env>(opaque);
+        if (!CheckEnv(env) || Ctx(env) != ctx)
+            return;
+
+        if (type == JS_PROMISE_HOOK_INIT)
+            CapturePromiseContextFrame(env, promise);
+        else if (type == JS_PROMISE_HOOK_BEFORE)
+            EnterPromiseContextFrame(env, promise);
+
+        size_t hook_index = static_cast<size_t>(type);
+        JSValue hook = GetPromiseHook(env, hook_index);
+        if (JS_IsFunction(ctx, hook))
+        {
+            if (type == JS_PROMISE_HOOK_INIT)
+            {
+                JSValueConst argv[] = {promise, parent_promise};
+                CallPromiseHook(env, hook, 2, argv);
+            }
+            else
+            {
+                JSValueConst argv[] = {promise};
+                CallPromiseHook(env, hook, 1, argv);
+            }
+        }
+        JS_FreeValue(ctx, hook);
+
+        if (type == JS_PROMISE_HOOK_AFTER)
+            LeavePromiseContextFrame(env, promise);
+    }
+
+    void QuickjsPromiseRejectionTracker(JSContext *ctx,
+                                        JSValueConst promise,
+                                        JSValueConst reason,
+                                        bool is_handled,
+                                        void *opaque)
+    {
+        napi_env env = static_cast<napi_env>(opaque);
+        if (!CheckEnv(env) || Ctx(env) != ctx)
+            return;
+
+        JSValue callback = GetPromiseRejectCallback(env);
+        if (!JS_IsFunction(ctx, callback))
+        {
+            JS_FreeValue(ctx, callback);
+            return;
+        }
+
+        JSValue event_type = JS_NewInt32(ctx, is_handled ? 1 : 0);
+        JSValueConst argv[] = {event_type, promise, reason};
+        CallPromiseHook(env, callback, 3, argv);
+        JS_FreeValue(ctx, event_type);
+        JS_FreeValue(ctx, callback);
+    }
+
     void FreeEnvStateValues(napi_env env, EnvState *state)
     {
         if (!CheckEnv(env) || state == nullptr)
@@ -272,6 +485,12 @@ namespace
         for (JSValue &hook : state->promise_hooks)
             free_value(&hook);
         free_value(&state->continuation_preserved_embedder_data);
+        for (auto &entry : state->promise_context_frames)
+            free_value(&entry.second);
+        state->promise_context_frames.clear();
+        for (JSValue &frame : state->promise_context_frame_stack)
+            free_value(&frame);
+        state->promise_context_frame_stack.clear();
         free_value(&state->import_module_dynamically_callback);
         free_value(&state->initialize_import_meta_object_callback);
         free_value(&state->error_formatting.get_source_map_error_source);
@@ -319,6 +538,9 @@ namespace
             state.destroy_callback(env, state.destroy_callback_data);
 
         JSContext *ctx = env->context();
+        JSRuntime *rt = JS_GetRuntime(ctx);
+        JS_SetPromiseHook(rt, nullptr, nullptr);
+        JS_SetHostPromiseRejectionTracker(rt, nullptr, nullptr);
         JS_SetContextOpaque(ctx, nullptr);
         delete env;
 
@@ -489,6 +711,7 @@ extern "C"
 
         JS_SetContextOpaque(context, env);
         EnsureEnvState(env);
+        JS_SetPromiseHook(rt, QuickjsPromiseHook, env);
 
         *result = env;
         return napi_ok;
@@ -697,21 +920,9 @@ extern "C"
         if (!CheckEnv(env) || !IsCallable(env, callback))
             return napi_invalid_arg;
         JSContext *ctx = Ctx(env);
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue promise_ctor = JS_GetPropertyStr(ctx, global, "Promise");
-        JS_FreeValue(ctx, global);
-        JSValue resolve = JS_GetPropertyStr(ctx, promise_ctor, "resolve");
-        JSValue promise = JS_Call(ctx, resolve, promise_ctor, 0, nullptr);
-        JSValue then = JS_GetPropertyStr(ctx, promise, "then");
-        JSValue argv[] = {callback->get_inner()};
-        JSValue ret = JS_Call(ctx, then, promise, 1, argv);
-        JS_FreeValue(ctx, then);
-        JS_FreeValue(ctx, promise);
-        JS_FreeValue(ctx, resolve);
-        JS_FreeValue(ctx, promise_ctor);
-        if (JS_IsException(ret))
-            return napi_pending_exception;
-        JS_FreeValue(ctx, ret);
+        JSValueConst argv[] = {callback->get_inner()};
+        if (JS_EnqueueJob(ctx, QuickjsMicrotaskJob, 1, argv) < 0)
+            return JS_HasException(ctx) ? napi_pending_exception : napi_generic_failure;
         return napi_ok;
     }
 
@@ -720,7 +931,15 @@ extern "C"
     {
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).promise_reject_callback);
+        auto &state = EnsureEnvState(env);
+        napi_status status = StoreOptionalFunction(env, callback, &state.promise_reject_callback);
+        if (status != napi_ok)
+            return status;
+        JS_SetHostPromiseRejectionTracker(
+            Rt(env),
+            JS_IsFunction(Ctx(env), state.promise_reject_callback) ? QuickjsPromiseRejectionTracker : nullptr,
+            env);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
@@ -739,6 +958,7 @@ extern "C"
             if (status != napi_ok)
                 return status;
         }
+        JS_SetPromiseHook(Rt(env), QuickjsPromiseHook, env);
         return napi_ok;
     }
 
