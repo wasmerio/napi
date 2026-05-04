@@ -140,46 +140,46 @@ if(NAPI_QUICKJS_LIBRARY)
     ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_number.c
     ${NAPI_TESTS_ROOT}/js-native-api/test_number/test_null.c
   )
-  # add_fixture_test(napi_quickjs_test_11_constructor
-  #   runners/test_11_constructor.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_constructor/test_constructor.c
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_constructor/test_null.c
-  # )
-  # add_fixture_test(napi_quickjs_test_12_error
-  #   runners/test_12_error.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_error/test_error.c
-  # )
+  add_fixture_test(napi_quickjs_test_11_constructor
+    runners/test_11_constructor.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_constructor/test_constructor.c
+    ${NAPI_TESTS_ROOT}/js-native-api/test_constructor/test_null.c
+  )
+  add_fixture_test(napi_quickjs_test_12_error
+    runners/test_12_error.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_error/test_error.c
+  )
   add_fixture_test(napi_quickjs_test_13_symbol
     runners/test_13_symbol.cc
     ${NAPI_TESTS_ROOT}/js-native-api/test_symbol/test_symbol.c
   )
-  # add_fixture_test(napi_quickjs_test_14_exception
-  #   runners/test_14_exception.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_exception/test_exception.c
-  # )
-  # add_fixture_test(napi_quickjs_test_15_function
-  #   runners/test_15_function.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_function/test_function.c
-  # )
-  # add_fixture_test(napi_quickjs_test_16_reference
-  #   runners/test_16_reference.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_reference/test_reference.c
-  # )
-  # add_fixture_test(napi_quickjs_test_17_string
-  #   runners/test_17_string.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_string/test_string.c
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_string/test_null.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_17_string PRIVATE NAPI_VERSION=10)
-  # add_fixture_test(napi_quickjs_test_18_conversions
-  #   runners/test_18_conversions.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_conversions/test_conversions.c
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_conversions/test_null.c
-  # )
-  # add_fixture_test(napi_quickjs_test_19_properties
-  #   runners/test_19_properties.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_properties/test_properties.c
-  # )
+  add_fixture_test(napi_quickjs_test_14_exception
+    runners/test_14_exception.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_exception/test_exception.c
+  )
+  add_fixture_test(napi_quickjs_test_15_function
+    runners/test_15_function.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_function/test_function.c
+  )
+  add_fixture_test(napi_quickjs_test_16_reference
+    runners/test_16_reference.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_reference/test_reference.c
+  )
+  add_fixture_test(napi_quickjs_test_17_string
+    runners/test_17_string.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_string/test_string.c
+    ${NAPI_TESTS_ROOT}/js-native-api/test_string/test_null.c
+  )
+  target_compile_definitions(napi_quickjs_test_17_string PRIVATE NAPI_VERSION=10)
+  add_fixture_test(napi_quickjs_test_18_conversions
+    runners/test_18_conversions.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_conversions/test_conversions.c
+    ${NAPI_TESTS_ROOT}/js-native-api/test_conversions/test_null.c
+  )
+  add_fixture_test(napi_quickjs_test_19_properties
+    runners/test_19_properties.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_properties/test_properties.c
+  )
   add_fixture_test(napi_quickjs_test_20_node_general
     runners/test_20_node_general.cc
     ${NAPI_TESTS_ROOT}/node-api/test_general/test_general.c
@@ -205,50 +205,50 @@ if(NAPI_QUICKJS_LIBRARY)
     ${NAPI_TESTS_ROOT}/node-api/test_instance_data/addon.c
     ${NAPI_TESTS_ROOT}/node-api/test_instance_data/test_set_then_ref.c
   )
-  # add_fixture_test(napi_quickjs_test_25_object_exceptions
-  #   runners/test_25_object_exceptions.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_exceptions.c
-  # )
-  # add_fixture_test(napi_quickjs_test_26_object_null
-  #   runners/test_26_object_null.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_null.c
-  # )
-  # add_fixture_test(napi_quickjs_test_27_object
-  #   runners/test_27_object.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_object.c
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_null.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_27_object PRIVATE NAPI_EXPERIMENTAL)
+  add_fixture_test(napi_quickjs_test_25_object_exceptions
+    runners/test_25_object_exceptions.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_exceptions.c
+  )
+  add_fixture_test(napi_quickjs_test_26_object_null
+    runners/test_26_object_null.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_null.c
+  )
+  add_fixture_test(napi_quickjs_test_27_object
+    runners/test_27_object.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_object.c
+    ${NAPI_TESTS_ROOT}/js-native-api/test_object/test_null.c
+  )
+  target_compile_definitions(napi_quickjs_test_27_object PRIVATE NAPI_EXPERIMENTAL)
   add_fixture_test(napi_quickjs_test_28_node_instance_data
     runners/test_28_node_instance_data.cc
     ${NAPI_TESTS_ROOT}/node-api/test_instance_data/test_instance_data.c
   )
-  # add_fixture_test(napi_quickjs_test_29_bigint
-  #   runners/test_29_bigint.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_bigint/test_bigint.c
-  # )
+  add_fixture_test(napi_quickjs_test_29_bigint
+    runners/test_29_bigint.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_bigint/test_bigint.c
+  )
   add_fixture_test(napi_quickjs_test_30_date
     runners/test_30_date.cc
     ${NAPI_TESTS_ROOT}/js-native-api/test_date/test_date.c
   )
-  # add_fixture_test(napi_quickjs_test_31_dataview
-  #   runners/test_31_dataview.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_dataview/test_dataview.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_31_dataview PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
-  # add_fixture_test(napi_quickjs_test_32_sharedarraybuffer
-  #   runners/test_32_sharedarraybuffer.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_sharedarraybuffer/test_sharedarraybuffer.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_32_sharedarraybuffer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
-  # add_fixture_test(napi_quickjs_test_33_typedarray
-  #   runners/test_33_typedarray.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_typedarray/test_typedarray.c
-  # )
-  # add_fixture_test(napi_quickjs_test_34_new_target
-  #   runners/test_34_new_target.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_new_target/test_new_target.c
-  # )
+  add_fixture_test(napi_quickjs_test_31_dataview
+    runners/test_31_dataview.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_dataview/test_dataview.c
+  )
+  target_compile_definitions(napi_quickjs_test_31_dataview PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  add_fixture_test(napi_quickjs_test_32_sharedarraybuffer
+    runners/test_32_sharedarraybuffer.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_sharedarraybuffer/test_sharedarraybuffer.c
+  )
+  target_compile_definitions(napi_quickjs_test_32_sharedarraybuffer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  add_fixture_test(napi_quickjs_test_33_typedarray
+    runners/test_33_typedarray.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_typedarray/test_typedarray.c
+  )
+  add_fixture_test(napi_quickjs_test_34_new_target
+    runners/test_34_new_target.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_new_target/test_new_target.c
+  )
   add_fixture_test(napi_quickjs_test_35_promise
     runners/test_35_promise.cc
     ${NAPI_TESTS_ROOT}/js-native-api/test_promise/test_promise.c
@@ -268,23 +268,23 @@ if(NAPI_QUICKJS_LIBRARY)
   if(TARGET napi_quickjs_test_38_finalizer)
     target_compile_definitions(napi_quickjs_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
   endif()
-  # add_fixture_test(napi_quickjs_test_39_cannot_run_js
-  #   runners/test_39_cannot_run_js.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_cannot_run_js/test_cannot_run_js.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_39_cannot_run_js PRIVATE NAPI_VERSION=10)
-  # add_fixture_test(napi_quickjs_test_40_pending_exception
-  #   runners/test_40_pending_exception.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_cannot_run_js/test_cannot_run_js.c
-  # )
-  # target_compile_definitions(napi_quickjs_test_40_pending_exception PRIVATE NAPI_VERSION=9)
-  # add_fixture_test(napi_quickjs_test_41_instance_data
-  #   runners/test_41_instance_data.cc
-  #   ${NAPI_TESTS_ROOT}/js-native-api/test_instance_data/test_instance_data.c
-  # )
-  # add_fixture_test(napi_quickjs_test_65_unofficial_contextify
-  #   runners/test_65_unofficial_contextify.cc
-  # )
+  add_fixture_test(napi_quickjs_test_39_cannot_run_js
+    runners/test_39_cannot_run_js.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_cannot_run_js/test_cannot_run_js.c
+  )
+  target_compile_definitions(napi_quickjs_test_39_cannot_run_js PRIVATE NAPI_VERSION=10)
+  add_fixture_test(napi_quickjs_test_40_pending_exception
+    runners/test_40_pending_exception.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_cannot_run_js/test_cannot_run_js.c
+  )
+  target_compile_definitions(napi_quickjs_test_40_pending_exception PRIVATE NAPI_VERSION=9)
+  add_fixture_test(napi_quickjs_test_41_instance_data
+    runners/test_41_instance_data.cc
+    ${NAPI_TESTS_ROOT}/js-native-api/test_instance_data/test_instance_data.c
+  )
+  add_fixture_test(napi_quickjs_test_65_unofficial_contextify
+    runners/test_65_unofficial_contextify.cc
+  )
 else()
   message(STATUS "Skipping napi_quickjs_tier1_tests: set NAPI_QUICKJS_LIBRARY to link QUICKJS runtime")
 endif()

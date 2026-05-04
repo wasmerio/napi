@@ -42,8 +42,14 @@ inline bool RunScript(EnvScope &s, const std::string &source_text, const char *l
   if (JS_IsException(val))
   {
     JSValue exc = JS_GetException(s.ctx);
+    JSValue stack = JS_GetPropertyStr(s.ctx, exc, "stack");
     const char *msg = JS_ToCString(s.ctx, exc);
-    ADD_FAILURE() << "JS exception (" << label << "): " << (msg ? msg : "<empty>");
+    const char *stack_msg = JS_IsException(stack) ? nullptr : JS_ToCString(s.ctx, stack);
+    ADD_FAILURE() << "JS exception (" << label << "): " << (msg ? msg : "<empty>")
+                  << (stack_msg ? "\nstack: " : "") << (stack_msg ? stack_msg : "");
+    if (stack_msg)
+      JS_FreeCString(s.ctx, stack_msg);
+    JS_FreeValue(s.ctx, stack);
     JS_FreeCString(s.ctx, msg);
     JS_FreeValue(s.ctx, exc);
     return false;
@@ -129,7 +135,7 @@ inline bool InstallUpstreamJsShim(EnvScope &s, napi_value addon_exports)
   };
   __assert.deepStrictEqual = function(actual, expected, message) {
     if (!__deepEqual(actual, expected)) {
-      throw new Error(message || 'deepStrictEqual failed');
+      throw new Error(message || `deepStrictEqual failed: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
     }
   };
   __assert.notStrictEqual = function(actual, expected, message) {
@@ -147,8 +153,16 @@ inline bool InstallUpstreamJsShim(EnvScope &s, napi_value addon_exports)
     if (!threw) throw new Error('assert.throws failed: no throw');
     if (expected === undefined) return;
     if (expected instanceof RegExp) {
-      if (!expected.test(String(err))) {
-        throw new Error(`assert.throws regex mismatch: ${String(err)}`);
+      const message = String(err);
+      const source = String(expected);
+      const quickjsReadOnly =
+        source.includes('Cannot assign to read only property') &&
+        /^TypeError: '.+' is read-only$/.test(message);
+      const quickjsGetterOnly =
+        source.includes('which has only a getter') &&
+        /^TypeError: no setter for property$/.test(message);
+      if (!expected.test(message) && !quickjsReadOnly && !quickjsGetterOnly) {
+        throw new Error(`assert.throws regex mismatch: ${message}`);
       }
       return;
     }
@@ -201,6 +215,11 @@ inline bool InstallUpstreamJsShim(EnvScope &s, napi_value addon_exports)
   globalThis.module = {};
   globalThis.global = globalThis;
   globalThis.gc = globalThis.__napi_force_gc;
+  globalThis.console = {
+    log() {},
+    error() {},
+    warn() {},
+  };
 
   globalThis.__napi_verify_must_call = function() {
     for (const rec of __mustCallRecords) {

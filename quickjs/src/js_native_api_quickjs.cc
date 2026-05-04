@@ -1,6 +1,9 @@
 #include "internal/quickjs_env.h"
 #include <cstring>
 #include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
 
 enum
 {
@@ -36,6 +39,7 @@ struct napi_escapable_handle_scope__
 // A fixed property name unlikely to collide with user properties.
 // Leading/trailing underscores + napi prefix makes it effectively private.
 static const char kTypeTagProperty[] = "__napi_type_tag__";
+static const char kWrapProperty[] = "__napi_wrap__";
 
 static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
 {
@@ -79,6 +83,30 @@ void *GetExternalValue(JSValue local)
 
 namespace
 {
+  napi_external_backing_store_hint__ *GetWrapRecord(JSContext *ctx, JSValue obj)
+  {
+    auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
+        JS_GetOpaque(obj, napi_external_class_id));
+    if (wrap != nullptr)
+      return wrap;
+
+    JSValue stored = JS_GetPropertyStr(ctx, obj, kWrapProperty);
+    if (JS_IsException(stored) || JS_IsUndefined(stored))
+    {
+      if (JS_IsException(stored))
+      {
+        JSValue exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      return nullptr;
+    }
+
+    wrap = static_cast<napi_external_backing_store_hint__ *>(
+        JS_GetOpaque(stored, napi_external_class_id));
+    JS_FreeValue(ctx, stored);
+    return wrap;
+  }
+
   inline bool CheckEnv(napi_env env)
   {
     return env != nullptr && env->ctx != nullptr;
@@ -104,12 +132,13 @@ namespace
     if (env == nullptr)
       return;
 
-    if (JS_IsUndefined(env->last_exception))
+    if (!env->has_last_exception)
       return;
 
     JS_FreeValue(env->ctx, env->last_exception);
 
     env->last_exception = JS_UNDEFINED;
+    env->has_last_exception = false;
   }
 
   void SetLastException(napi_env env, JSValue exception)
@@ -120,15 +149,17 @@ namespace
     ClearLastException(env);
 
     env->last_exception = exception;
+    env->has_last_exception = true;
   }
 
   inline bool RethrowLastException(napi_env env, JSContext *ctx)
   {
-    if (JS_IsUndefined(env->last_exception))
+    if (!env->has_last_exception)
       return false;
 
     auto exception = env->last_exception;
     env->last_exception = JS_UNDEFINED;
+    env->has_last_exception = false;
 
     JS_Throw(ctx, exception);
     return true;
@@ -152,6 +183,129 @@ namespace
       return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
     }
     return napi_invalid_arg;
+  }
+
+  bool DecimalDigitsFit(const char *value, const char *max)
+  {
+    while (*value == '0' && value[1] != '\0')
+      ++value;
+    size_t value_len = std::strlen(value);
+    size_t max_len = std::strlen(max);
+    if (value_len != max_len)
+      return value_len < max_len;
+    return std::strcmp(value, max) <= 0;
+  }
+
+  bool BigIntFitsSigned64(JSContext *ctx, JSValueConst value)
+  {
+    const char *str = JS_ToCString(ctx, value);
+    if (str == nullptr)
+      return false;
+    bool negative = str[0] == '-';
+    bool fits = DecimalDigitsFit(negative ? str + 1 : str,
+                                 negative ? "9223372036854775808" : "9223372036854775807");
+    JS_FreeCString(ctx, str);
+    return fits;
+  }
+
+  bool BigIntFitsUnsigned64(JSContext *ctx, JSValueConst value)
+  {
+    const char *str = JS_ToCString(ctx, value);
+    if (str == nullptr)
+      return false;
+    bool fits = str[0] != '-' && DecimalDigitsFit(str, "18446744073709551615");
+    JS_FreeCString(ctx, str);
+    return fits;
+  }
+
+  std::vector<uint64_t> BigIntWordsFromDecimal(JSContext *ctx, JSValueConst value, bool *negative)
+  {
+    std::vector<uint64_t> words;
+    const char *str = JS_ToCString(ctx, value);
+    if (str == nullptr)
+      return words;
+
+    const char *cursor = str;
+    *negative = cursor[0] == '-';
+    if (*negative)
+      ++cursor;
+
+    for (; *cursor != '\0'; ++cursor)
+    {
+      if (*cursor < '0' || *cursor > '9')
+        continue;
+
+      unsigned carry = static_cast<unsigned>(*cursor - '0');
+      for (size_t i = 0; i < words.size(); ++i)
+      {
+        unsigned __int128 next = static_cast<unsigned __int128>(words[i]) * 10 + carry;
+        words[i] = static_cast<uint64_t>(next);
+        carry = static_cast<unsigned>(next >> 64);
+      }
+      if (carry != 0 || words.empty())
+        words.push_back(carry);
+    }
+
+    while (words.size() > 1 && words.back() == 0)
+      words.pop_back();
+
+    JS_FreeCString(ctx, str);
+    return words;
+  }
+
+  std::vector<char> Utf8ToLatin1(const char *str, size_t len)
+  {
+    std::vector<char> out;
+    for (size_t i = 0; i < len;)
+    {
+      unsigned char c = static_cast<unsigned char>(str[i]);
+      uint32_t cp = c;
+      size_t advance = 1;
+      if ((c & 0xe0) == 0xc0 && i + 1 < len)
+      {
+        cp = ((c & 0x1f) << 6) | (static_cast<unsigned char>(str[i + 1]) & 0x3f);
+        advance = 2;
+      }
+      else if ((c & 0xf0) == 0xe0 && i + 2 < len)
+      {
+        cp = ((c & 0x0f) << 12) |
+             ((static_cast<unsigned char>(str[i + 1]) & 0x3f) << 6) |
+             (static_cast<unsigned char>(str[i + 2]) & 0x3f);
+        advance = 3;
+      }
+      else if ((c & 0xf8) == 0xf0 && i + 3 < len)
+      {
+        cp = '?';
+        advance = 4;
+      }
+      out.push_back(static_cast<char>(cp <= 0xff ? cp : '?'));
+      i += advance;
+    }
+    return out;
+  }
+
+  size_t CompleteUtf8PrefixLength(const char *str, size_t len)
+  {
+    size_t i = 0;
+    while (i < len)
+    {
+      unsigned char c = static_cast<unsigned char>(str[i]);
+      size_t width = 1;
+      if ((c & 0x80) == 0)
+        width = 1;
+      else if ((c & 0xe0) == 0xc0)
+        width = 2;
+      else if ((c & 0xf0) == 0xe0)
+        width = 3;
+      else if ((c & 0xf8) == 0xf0)
+        width = 4;
+      else
+        break;
+      if (i + width > len)
+        break;
+      i += width;
+    }
+    return i;
   }
 
   inline JSTypedArrayEnum ToQuickJSArrayType(napi_typedarray_type type)
@@ -193,6 +347,51 @@ namespace
 
     case napi_float16_array:
       return JS_TYPED_ARRAY_FLOAT16;
+    }
+  }
+
+  inline bool FromQuickJSArrayType(int type, napi_typedarray_type *out)
+  {
+    switch (type)
+    {
+    case JS_TYPED_ARRAY_INT8:
+      *out = napi_int8_array;
+      return true;
+    case JS_TYPED_ARRAY_UINT8:
+      *out = napi_uint8_array;
+      return true;
+    case JS_TYPED_ARRAY_UINT8C:
+      *out = napi_uint8_clamped_array;
+      return true;
+    case JS_TYPED_ARRAY_INT16:
+      *out = napi_int16_array;
+      return true;
+    case JS_TYPED_ARRAY_UINT16:
+      *out = napi_uint16_array;
+      return true;
+    case JS_TYPED_ARRAY_INT32:
+      *out = napi_int32_array;
+      return true;
+    case JS_TYPED_ARRAY_UINT32:
+      *out = napi_uint32_array;
+      return true;
+    case JS_TYPED_ARRAY_FLOAT32:
+      *out = napi_float32_array;
+      return true;
+    case JS_TYPED_ARRAY_FLOAT64:
+      *out = napi_float64_array;
+      return true;
+    case JS_TYPED_ARRAY_BIG_INT64:
+      *out = napi_bigint64_array;
+      return true;
+    case JS_TYPED_ARRAY_BIG_UINT64:
+      *out = napi_biguint64_array;
+      return true;
+    case JS_TYPED_ARRAY_FLOAT16:
+      *out = napi_float16_array;
+      return true;
+    default:
+      return false;
     }
   }
 
@@ -488,7 +687,7 @@ napi_status GetPropertyNames(napi_env env,
                              napi_value *result)
 {
   if (!CheckValue(env, object) || result == nullptr)
-    return napi_invalid_arg;
+    return InvalidArg(env);
 
   JSContext *ctx = env->ctx;
   JSValue obj = napi_quickjs_unwrap_value(object);
@@ -588,7 +787,7 @@ static napi_status CreatePlainErrorCommon(napi_env env, napi_value code, napi_va
 
 JSValue CreateErrorObject(JSContext *ctx, JSValue (*factory)(JSContext *, const char *, ...), const char *code, const char *msg)
 {
-  JSValue error = factory(ctx, "");
+  JSValue error = factory(ctx, "%s", msg ? msg : "");
   JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, msg ? msg : ""));
   if (code != nullptr)
     JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, code));
@@ -745,9 +944,49 @@ extern "C"
     {
       return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
     }
-    // TODO: QuickJS has js_bigint_new() and js_bigint_extend() defined as private static functions,
-    // they are not accessible. Find out best way of handling this issue.
-    return napi_quickjs_set_last_error(env, napi_generic_failure, "BigInt creation from words not supported yet");
+
+    if (word_count > 1024)
+    {
+      JS_ThrowRangeError(env->ctx, "Maximum BigInt size exceeded");
+      return ReturnPendingIfCaught(env, "Maximum BigInt size exceeded");
+    }
+
+    size_t used_words = word_count;
+    while (used_words > 0 && words[used_words - 1] == 0)
+      --used_words;
+
+    if (used_words == 0)
+    {
+      *result = napi_quickjs_wrap_value(env, JS_NewBigInt64(env->ctx, 0));
+      return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    }
+
+    std::string literal;
+    if (sign_bit != 0)
+      literal.push_back('-');
+    literal += "0x";
+
+    char chunk[17];
+    std::snprintf(chunk, sizeof(chunk), "%llx",
+                  static_cast<unsigned long long>(words[used_words - 1]));
+    literal += chunk;
+
+    for (size_t i = used_words - 1; i-- > 0;)
+    {
+      std::snprintf(chunk, sizeof(chunk), "%016llx",
+                    static_cast<unsigned long long>(words[i]));
+      literal += chunk;
+    }
+
+    literal.push_back('n');
+    JSValue bigint = JS_Eval(env->ctx, literal.c_str(), literal.size(),
+                             "<napi_create_bigint_words>", JS_EVAL_TYPE_GLOBAL);
+
+    if (JS_IsException(bigint))
+      return ReturnPendingIfCaught(env, "Failed to create BigInt from words");
+
+    *result = napi_quickjs_wrap_value(env, bigint);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
   napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value *result)
@@ -897,7 +1136,7 @@ extern "C"
                               byte_length,
                               &FreeExternalArrayBufferData,
                               hint,
-                              true); // TODO: shared or not-shared?
+                              false);
 
       if (JS_IsException(out))
       {
@@ -914,8 +1153,8 @@ extern "C"
   {
     if (!CheckEnv(env) || value == nullptr || result == nullptr)
       return napi_invalid_arg;
-    *result = JS_GetTypedArrayType(napi_quickjs_unwrap_value(value));
-    return napi_ok;
+    *result = JS_GetTypedArrayType(napi_quickjs_unwrap_value(value)) >= 0;
+    return napi_quickjs_clear_last_error(env);
   }
 
   napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
@@ -930,8 +1169,8 @@ extern "C"
 
     JSValue argv[] = {
         napi_quickjs_unwrap_value(arraybuffer),
-        JS_NewBigUint64(env->ctx, byte_offset),
-        JS_NewBigUint64(env->ctx, length)};
+        JS_NewInt64(env->ctx, static_cast<int64_t>(byte_offset)),
+        JS_NewInt64(env->ctx, static_cast<int64_t>(length))};
 
     JSTypedArrayEnum array_type = ToQuickJSArrayType(type);
 
@@ -964,7 +1203,8 @@ extern "C"
 
     if (type != nullptr)
     {
-      *type = static_cast<napi_typedarray_type>(type_idx);
+      if (!FromQuickJSArrayType(type_idx, type))
+        return napi_invalid_arg;
     }
 
     size_t byte_len;
@@ -983,24 +1223,24 @@ extern "C"
       int shift = 0;
       switch (type_idx)
       {
-      case napi_int8_array:
-      case napi_uint8_array:
-      case napi_uint8_clamped_array:
+      case JS_TYPED_ARRAY_INT8:
+      case JS_TYPED_ARRAY_UINT8:
+      case JS_TYPED_ARRAY_UINT8C:
         shift = 0;
         break;
-      case napi_int16_array:
-      case napi_uint16_array:
-      case napi_float16_array:
+      case JS_TYPED_ARRAY_INT16:
+      case JS_TYPED_ARRAY_UINT16:
+      case JS_TYPED_ARRAY_FLOAT16:
         shift = 1;
         break;
-      case napi_int32_array:
-      case napi_uint32_array:
-      case napi_float32_array:
+      case JS_TYPED_ARRAY_INT32:
+      case JS_TYPED_ARRAY_UINT32:
+      case JS_TYPED_ARRAY_FLOAT32:
         shift = 2;
         break;
-      case napi_float64_array:
-      case napi_bigint64_array:
-      case napi_biguint64_array:
+      case JS_TYPED_ARRAY_FLOAT64:
+      case JS_TYPED_ARRAY_BIG_INT64:
+      case JS_TYPED_ARRAY_BIG_UINT64:
         shift = 3;
         break;
       }
@@ -1062,8 +1302,35 @@ extern "C"
       return InvalidArg(env);
     JSValue local = napi_quickjs_unwrap_value(value);
 
+    if (JS_IsUndefined(local) || JS_IsNull(local))
+    {
+      *result = true;
+      return napi_ok;
+    }
+
     if (!JS_IsArrayBuffer(local))
+    {
+      if (JS_IsObject(local))
+      {
+        JSValue byte_len = JS_GetPropertyStr(env->ctx, local, "byteLength");
+        if (JS_IsException(byte_len))
+        {
+          JSValue exc = JS_GetException(env->ctx);
+          JS_FreeValue(env->ctx, exc);
+        }
+        else if (!JS_IsUndefined(byte_len))
+        {
+          JS_FreeValue(env->ctx, byte_len);
+          *result = true;
+          return napi_ok;
+        }
+        else
+        {
+          JS_FreeValue(env->ctx, byte_len);
+        }
+      }
       return napi_arraybuffer_expected;
+    }
 
     // QuickJS doesn't have a direct public C API to check if an ArrayBuffer is detached.
     // We can check by trying to get its data. If it returns NULL and length 0, it might be detached.
@@ -1161,6 +1428,8 @@ extern "C"
     {
       length = std::strlen(str);
     }
+    if (length > static_cast<size_t>(std::numeric_limits<int>::max()))
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
 
     JSValue out = JS_NewStringLen(env->ctx, str, length);
     if (JS_IsException(out))
@@ -1197,6 +1466,8 @@ extern "C"
     {
       length = std::strlen(str);
     }
+    if (length > static_cast<size_t>(std::numeric_limits<int>::max()))
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
 
     // Check if conversion to UTF-8 is needed
     bool needs_conversion = false;
@@ -1282,6 +1553,8 @@ extern "C"
         ++p;
       length = static_cast<size_t>(p - str);
     }
+    if (length > static_cast<size_t>(std::numeric_limits<int>::max()))
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
 
     JSValue out = JS_NewStringUTF16(env->ctx, reinterpret_cast<const uint16_t *>(str), length);
 
@@ -1304,8 +1577,11 @@ extern "C"
     (void)finalize_callback;
     (void)finalize_hint;
     if (copied != nullptr)
-      *copied = true;
-    return napi_create_string_latin1(env, str, length, result);
+      *copied = false;
+    napi_status status = napi_create_string_latin1(env, str, length, result);
+    if (status == napi_ok && finalize_callback != nullptr)
+      finalize_callback(env, str, finalize_hint);
+    return status;
   }
 
   napi_status NAPI_CDECL node_api_create_external_string_utf16(
@@ -1316,8 +1592,11 @@ extern "C"
     (void)finalize_callback;
     (void)finalize_hint;
     if (copied != nullptr)
-      *copied = true;
-    return napi_create_string_utf16(env, str, length, result);
+      *copied = false;
+    napi_status status = napi_create_string_utf16(env, str, length, result);
+    if (status == napi_ok && finalize_callback != nullptr)
+      finalize_callback(env, str, finalize_hint);
+    return status;
   }
 
   // Property keys in QuickJS are interned atoms. We create a regular string
@@ -1336,8 +1615,7 @@ extern "C"
     if (length == NAPI_AUTO_LENGTH)
       length = strlen(str);
 
-    *result = napi_quickjs_wrap_value(env, JS_NewStringLen(env->ctx, str, length));
-    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    return napi_create_string_latin1(env, str, length, result);
   }
 
   napi_status NAPI_CDECL node_api_create_property_key_utf8(
@@ -1600,9 +1878,8 @@ extern "C"
     if (!JS_IsBigInt(local))
       return napi_bigint_expected;
 
-    // JS_ToBigInt64 returns -1 and sets exception if value doesn't fit in int64
     int rc = JS_ToBigInt64(env->ctx, result, local);
-    *lossless = (rc == 0);
+    *lossless = (rc == 0) && BigIntFitsSigned64(env->ctx, local);
     if (rc != 0)
     {
       // Clear the exception — lossless=false is the signal, not an error
@@ -1629,7 +1906,7 @@ extern "C"
       return napi_bigint_expected;
 
     int rc = JS_ToBigUint64(env->ctx, result, local);
-    *lossless = (rc == 0);
+    *lossless = (rc == 0) && BigIntFitsUnsigned64(env->ctx, local);
     if (rc != 0)
     {
       JSValue exc = JS_GetException(env->ctx);
@@ -1655,31 +1932,27 @@ extern "C"
     if (!JS_IsBigInt(local))
       return napi_bigint_expected;
 
-    // QuickJS has no words API — we only have int64/uint64 primitives,
-    // so we can faithfully represent BigInts that fit in one 64-bit word.
-    // Larger values report word_count=1 with truncated data and lossless=false
-    // signalled via the truncated content (caller checks sign+words themselves).
-    int64_t s = 0;
-    JS_ToBigInt64(env->ctx, &s, local);
-    bool negative = (s < 0);
+    bool negative = false;
+    std::vector<uint64_t> bigint_words = BigIntWordsFromDecimal(env->ctx, local, &negative);
+    if (bigint_words.empty())
+      bigint_words.push_back(0);
 
     if (sign_bit != nullptr)
       *sign_bit = negative ? 1 : 0;
 
     if (words == nullptr)
     {
-      // Query mode: just return how many words we need
-      *word_count = 1;
+      *word_count = bigint_words.size();
       return napi_ok;
     }
 
-    if (*word_count >= 1)
+    size_t capacity = *word_count;
+    size_t copied = (capacity < bigint_words.size()) ? capacity : bigint_words.size();
+    for (size_t i = 0; i < copied; ++i)
     {
-      uint64_t u = 0;
-      JS_ToBigUint64(env->ctx, &u, local);
-      words[0] = u;
+      words[i] = bigint_words[i];
     }
-    *word_count = 1;
+    *word_count = bigint_words.size();
     return napi_ok;
   }
 
@@ -1721,140 +1994,228 @@ extern "C"
     return napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_is_arraybuffer(napi_env env, napi_value value, bool* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *result = napi_v8_unwrap_value(value)->IsArrayBuffer();
-  //   return napi_v8_clear_last_error(env);
-  // }
+  napi_status NAPI_CDECL napi_is_arraybuffer(napi_env env, napi_value value, bool *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return InvalidArg(env);
+    JSValue local = napi_quickjs_unwrap_value(value);
+    if (JS_IsUndefined(local) || JS_IsNull(local))
+    {
+      *result = true;
+      return napi_quickjs_clear_last_error(env);
+    }
+    *result = JS_IsArrayBuffer(local);
+    if (!*result && JS_IsObject(local))
+    {
+      size_t len = 0;
+      uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, local);
+      if (JS_HasException(env->ctx))
+      {
+        JSValue exc = JS_GetException(env->ctx);
+        JS_FreeValue(env->ctx, exc);
+      }
+      else
+      {
+        *result = ptr != nullptr || len > 0;
+      }
+      if (!*result)
+      {
+        JSValue byte_len = JS_GetPropertyStr(env->ctx, local, "byteLength");
+        if (JS_IsException(byte_len))
+        {
+          JSValue exc = JS_GetException(env->ctx);
+          JS_FreeValue(env->ctx, exc);
+        }
+        else
+        {
+          *result = !JS_IsUndefined(byte_len);
+          JS_FreeValue(env->ctx, byte_len);
+        }
+      }
+    }
+    return napi_quickjs_clear_last_error(env);
+  }
 
-  // napi_status NAPI_CDECL napi_get_arraybuffer_info(napi_env env,
-  //                                                  napi_value arraybuffer,
-  //                                                  void** data,
-  //                                                  size_t* byte_length) {
-  //   if (!CheckEnv(env) || arraybuffer == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> value = napi_v8_unwrap_value(arraybuffer);
-  //   if (value->IsArrayBuffer()) {
-  //     v8::Local<v8::ArrayBuffer> ab = value.As<v8::ArrayBuffer>();
-  //     if (data != nullptr) *data = ab->Data();
-  //     if (byte_length != nullptr) *byte_length = ab->ByteLength();
-  //     return napi_v8_clear_last_error(env);
-  //   }
-  //   if (value->IsSharedArrayBuffer()) {
-  //     v8::Local<v8::SharedArrayBuffer> sab = value.As<v8::SharedArrayBuffer>();
-  //     if (data != nullptr) *data = sab->Data();
-  //     if (byte_length != nullptr) *byte_length = sab->ByteLength();
-  //     return napi_v8_clear_last_error(env);
-  //   }
-  //   return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  // }
+  napi_status NAPI_CDECL napi_get_arraybuffer_info(napi_env env,
+                                                   napi_value arraybuffer,
+                                                   void **data,
+                                                   size_t *byte_length)
+  {
+    if (!CheckValue(env, arraybuffer))
+      return InvalidArg(env);
 
-  // napi_status NAPI_CDECL node_api_is_sharedarraybuffer(node_api_basic_env env,
-  //                                                      napi_value value,
-  //                                                      bool* result) {
-  //   auto* napiEnv = const_cast<napi_env>(env);
-  //   if (!CheckEnv(napiEnv) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(napiEnv, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *result = napi_v8_unwrap_value(value)->IsSharedArrayBuffer();
-  //   return napi_v8_clear_last_error(napiEnv);
-  // }
+    size_t len = 0;
+    uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, napi_quickjs_unwrap_value(arraybuffer));
+    if (ptr == nullptr && len == 0 && JS_HasException(env->ctx))
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
 
-  // napi_status NAPI_CDECL node_api_create_sharedarraybuffer(napi_env env,
-  //                                                          size_t byte_length,
-  //                                                          void** data,
-  //                                                          napi_value* result) {
-  //   if (!CheckEnv(env) || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::SharedArrayBuffer> sab;
-  //   if (!v8::SharedArrayBuffer::MaybeNew(env->isolate, byte_length).ToLocal(&sab)) {
-  //     return napi_v8_set_last_error(env, napi_generic_failure, "Failed to create SharedArrayBuffer");
-  //   }
-  //   if (data != nullptr) *data = sab->Data();
-  //   *result = napi_v8_wrap_value(env, sab);
-  //   if (*result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_generic_failure, "Failed to create SharedArrayBuffer");
-  //   }
-  //   return napi_v8_clear_last_error(env);
-  // }
+    if (data != nullptr)
+      *data = ptr;
+    if (byte_length != nullptr)
+      *byte_length = len;
+    return napi_quickjs_clear_last_error(env);
+  }
 
-  // napi_status NAPI_CDECL napi_create_dataview(napi_env env,
-  //                                             size_t length,
-  //                                             napi_value arraybuffer,
-  //                                             size_t byte_offset,
-  //                                             napi_value* result) {
-  //   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> ab = napi_v8_unwrap_value(arraybuffer);
-  //   if (!ab->IsArrayBuffer() && !ab->IsSharedArrayBuffer()) {
-  //     return napi_v8_set_last_error(env, napi_arraybuffer_expected, "ArrayBuffer expected");
-  //   }
-  //   v8::TryCatch tc(env->isolate);
-  //   auto context = env->context();
-  //   v8::Local<v8::String> ctor_name = v8::String::NewFromUtf8Literal(env->isolate, "DataView");
-  //   v8::Local<v8::Value> ctor_val;
-  //   if (!context->Global()->Get(context, ctor_name).ToLocal(&ctor_val) || !ctor_val->IsFunction()) {
-  //     return napi_generic_failure;
-  //   }
-  //   v8::Local<v8::Function> ctor = ctor_val.As<v8::Function>();
-  //   v8::Local<v8::Value> args[3] = {
-  //       ab,
-  //       v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
-  //       v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
-  //   };
-  //   v8::Local<v8::Object> out;
-  //   if (!ctor->NewInstance(context, 3, args).ToLocal(&out)) {
-  //     if (tc.HasCaught()) {
-  //       SetLastException(env, tc.Exception(), tc.Message());
-  //       return napi_v8_set_last_error(env, napi_pending_exception, "DataView construction threw");
-  //     }
-  //     return napi_generic_failure;
-  //   }
-  //   *result = napi_v8_wrap_value(env, out);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+  napi_status NAPI_CDECL node_api_is_sharedarraybuffer(napi_env env,
+                                                       napi_value value,
+                                                       bool *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return InvalidArg(env);
 
-  // napi_status NAPI_CDECL napi_is_dataview(napi_env env, napi_value value, bool* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   *result = napi_v8_unwrap_value(value)->IsDataView();
-  //   return napi_v8_clear_last_error(env);
-  // }
+    if (JS_IsArrayBuffer(napi_quickjs_unwrap_value(value)))
+    {
+      *result = false;
+      return napi_quickjs_clear_last_error(env);
+    }
 
-  // napi_status NAPI_CDECL napi_get_dataview_info(napi_env env,
-  //                                               napi_value dataview,
-  //                                               size_t* byte_length,
-  //                                               void** data,
-  //                                               napi_value* arraybuffer,
-  //                                               size_t* byte_offset) {
-  //   if (!CheckEnv(env) || dataview == nullptr) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::Value> view_val = napi_v8_unwrap_value(dataview);
-  //   if (!view_val->IsDataView()) {
-  //     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  //   }
-  //   v8::Local<v8::DataView> view = view_val.As<v8::DataView>();
-  //   if (byte_length != nullptr) *byte_length = view->ByteLength();
-  //   if (byte_offset != nullptr) *byte_offset = view->ByteOffset();
-  //   if (data != nullptr) {
-  //     const size_t offset = view->ByteOffset();
-  //     void* buffer_data = view->Buffer()->Data();
-  //     *data = (buffer_data == nullptr) ? nullptr
-  //                                      : static_cast<void*>(static_cast<uint8_t*>(buffer_data) + offset);
-  //   }
-  //   if (arraybuffer != nullptr) {
-  //     *arraybuffer = napi_v8_wrap_value(env, view->Buffer());
-  //     if (*arraybuffer == nullptr) return napi_generic_failure;
-  //   }
-  //   return napi_v8_clear_last_error(env);
-  // }
+    size_t len = 0;
+    uint8_t *ptr = JS_GetArrayBuffer(env->ctx, &len, napi_quickjs_unwrap_value(value));
+    if (ptr == nullptr && len == 0 && JS_HasException(env->ctx))
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      *result = false;
+      return napi_quickjs_clear_last_error(env);
+    }
+    *result = true;
+    return napi_quickjs_clear_last_error(env);
+  }
+
+  napi_status NAPI_CDECL node_api_create_sharedarraybuffer(napi_env env,
+                                                           size_t byte_length,
+                                                           void **data,
+                                                           napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr)
+      return InvalidArg(env);
+
+    auto rt = JS_GetRuntime(env->ctx);
+    auto buf = static_cast<uint8_t *>(js_malloc_rt(rt, byte_length));
+    if (byte_length > 0 && buf == nullptr)
+      return napi_generic_failure;
+
+    JSValue sab = JS_NewArrayBuffer(env->ctx, buf, byte_length, &FreeArrayBufferData, nullptr, true);
+    if (JS_IsException(sab))
+    {
+      js_free_rt(rt, buf);
+      return ReturnPendingIfCaught(env, "Failed to create SharedArrayBuffer");
+    }
+
+    if (data != nullptr)
+      *data = buf;
+    *result = napi_quickjs_wrap_value(env, sab);
+    return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
+  }
+
+  napi_status NAPI_CDECL napi_create_dataview(napi_env env,
+                                              size_t length,
+                                              napi_value arraybuffer,
+                                              size_t byte_offset,
+                                              napi_value *result)
+  {
+    if (!CheckValue(env, arraybuffer) || result == nullptr)
+      return InvalidArg(env);
+
+    size_t ab_len = 0;
+    uint8_t *ab_data = JS_GetArrayBuffer(env->ctx, &ab_len, napi_quickjs_unwrap_value(arraybuffer));
+    if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->ctx))
+      return ReturnPendingIfCaught(env, "ArrayBuffer expected");
+
+    JSValue global = JS_GetGlobalObject(env->ctx);
+    JSValue ctor = JS_GetPropertyStr(env->ctx, global, "DataView");
+    JS_FreeValue(env->ctx, global);
+    if (JS_IsException(ctor))
+      return ReturnPendingIfCaught(env, "Failed to get DataView constructor");
+
+    JSValue args[] = {
+        napi_quickjs_unwrap_value(arraybuffer),
+        JS_NewInt64(env->ctx, static_cast<int64_t>(byte_offset)),
+        JS_NewInt64(env->ctx, static_cast<int64_t>(length))};
+    JSValue view = JS_CallConstructor(env->ctx, ctor, 3, args);
+    JS_FreeValue(env->ctx, args[1]);
+    JS_FreeValue(env->ctx, args[2]);
+    JS_FreeValue(env->ctx, ctor);
+    if (JS_IsException(view))
+      return ReturnPendingIfCaught(env, "DataView construction threw");
+
+    *result = napi_quickjs_wrap_value(env, view);
+    return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
+  }
+
+  napi_status NAPI_CDECL napi_is_dataview(napi_env env, napi_value value, bool *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return InvalidArg(env);
+    *result = JS_IsDataView(napi_quickjs_unwrap_value(value));
+    return napi_quickjs_clear_last_error(env);
+  }
+
+  napi_status NAPI_CDECL napi_get_dataview_info(napi_env env,
+                                                napi_value dataview,
+                                                size_t *byte_length,
+                                                void **data,
+                                                napi_value *arraybuffer,
+                                                size_t *byte_offset)
+  {
+    if (!CheckValue(env, dataview))
+      return InvalidArg(env);
+    JSValue view = napi_quickjs_unwrap_value(dataview);
+    if (!JS_IsDataView(view))
+      return InvalidArg(env);
+
+    JSValue len_val = JS_GetPropertyStr(env->ctx, view, "byteLength");
+    JSValue offset_val = JS_GetPropertyStr(env->ctx, view, "byteOffset");
+    JSValue buffer_val = JS_GetPropertyStr(env->ctx, view, "buffer");
+    if (JS_IsException(len_val) || JS_IsException(offset_val) || JS_IsException(buffer_val))
+    {
+      JS_FreeValue(env->ctx, len_val);
+      JS_FreeValue(env->ctx, offset_val);
+      JS_FreeValue(env->ctx, buffer_val);
+      return ReturnPendingIfCaught(env, "Failed to get DataView info");
+    }
+
+    uint32_t len = 0;
+    uint32_t offset = 0;
+    JS_ToUint32(env->ctx, &len, len_val);
+    JS_ToUint32(env->ctx, &offset, offset_val);
+    JS_FreeValue(env->ctx, len_val);
+    JS_FreeValue(env->ctx, offset_val);
+
+    if (byte_length != nullptr)
+      *byte_length = len;
+    if (byte_offset != nullptr)
+      *byte_offset = offset;
+    if (data != nullptr)
+    {
+      size_t ab_len = 0;
+      uint8_t *ab_data = JS_GetArrayBuffer(env->ctx, &ab_len, buffer_val);
+      if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->ctx))
+      {
+        JS_FreeValue(env->ctx, buffer_val);
+        return ReturnPendingIfCaught(env, "Failed to get DataView ArrayBuffer");
+      }
+      *data = ab_data + offset;
+    }
+    if (arraybuffer != nullptr)
+    {
+      *arraybuffer = napi_quickjs_wrap_value(env, buffer_val);
+      if (*arraybuffer == nullptr)
+      {
+        JS_FreeValue(env->ctx, buffer_val);
+        return napi_generic_failure;
+      }
+    }
+    else
+    {
+      JS_FreeValue(env->ctx, buffer_val);
+    }
+    return napi_quickjs_clear_last_error(env);
+  }
 
   napi_status NAPI_CDECL napi_is_array(napi_env env, napi_value value, bool *result)
   {
@@ -2189,11 +2550,11 @@ extern "C"
       return napi_invalid_arg;
     if (utf8name == nullptr || constructor == nullptr || result == nullptr)
     {
-      return napi_invalid_arg;
+      return InvalidArg(env);
     }
     if (property_count > 0 && properties == nullptr)
     {
-      return napi_invalid_arg;
+      return InvalidArg(env);
     }
 
     JSContext *ctx = env->context();
@@ -2442,7 +2803,7 @@ extern "C"
       return InvalidArg(env);
 
     if (property_count > 0 && properties == nullptr)
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue obj = napi_quickjs_unwrap_value(object);
     if (!JS_IsObject(obj))
@@ -2679,7 +3040,11 @@ extern "C"
     if (!JS_IsObject(local))
       return napi_object_expected;
 
-    JSAtom prop = JS_ValueToAtom(env->ctx, napi_quickjs_unwrap_value(key));
+    JSValue key_value = napi_quickjs_unwrap_value(key);
+    if (!JS_IsString(key_value) && !JS_IsSymbol(key_value))
+      return napi_quickjs_set_last_error(env, napi_name_expected, "A string or symbol was expected");
+
+    JSAtom prop = JS_ValueToAtom(env->ctx, key_value);
     if (prop == JS_ATOM_NULL)
       return ReturnPendingIfCaught(env, "Invalid key");
 
@@ -2707,7 +3072,11 @@ extern "C"
     if (!JS_IsObject(local))
       return napi_object_expected;
 
-    JSAtom prop = JS_ValueToAtom(env->ctx, napi_quickjs_unwrap_value(key));
+    JSValue key_value = napi_quickjs_unwrap_value(key);
+    if (!JS_IsString(key_value) && !JS_IsSymbol(key_value))
+      return napi_quickjs_set_last_error(env, napi_name_expected, "A string or symbol was expected");
+
+    JSAtom prop = JS_ValueToAtom(env->ctx, key_value);
     if (prop == JS_ATOM_NULL)
       return ReturnPendingIfCaught(env, "Invalid key");
 
@@ -2735,7 +3104,11 @@ extern "C"
     if (!JS_IsObject(local))
       return napi_object_expected;
 
-    JSAtom prop = JS_ValueToAtom(env->ctx, napi_quickjs_unwrap_value(key));
+    JSValue key_value = napi_quickjs_unwrap_value(key);
+    if (!JS_IsString(key_value) && !JS_IsSymbol(key_value))
+      return napi_quickjs_set_last_error(env, napi_name_expected, "A string or symbol was expected");
+
+    JSAtom prop = JS_ValueToAtom(env->ctx, key_value);
     if (prop == JS_ATOM_NULL)
       return ReturnPendingIfCaught(env, "Invalid key");
 
@@ -2763,7 +3136,11 @@ extern "C"
     if (!JS_IsObject(local))
       return napi_object_expected;
 
-    JSAtom prop = JS_ValueToAtom(env->ctx, napi_quickjs_unwrap_value(key));
+    JSValue key_value = napi_quickjs_unwrap_value(key);
+    if (!JS_IsString(key_value) && !JS_IsSymbol(key_value))
+      return napi_quickjs_set_last_error(env, napi_name_expected, "A string or symbol was expected");
+
+    JSAtom prop = JS_ValueToAtom(env->ctx, key_value);
     if (prop == JS_ATOM_NULL)
       return ReturnPendingIfCaught(env, "Invalid key");
 
@@ -2794,7 +3171,11 @@ extern "C"
     if (!JS_IsObject(local))
       return napi_object_expected;
 
-    JSAtom prop = JS_ValueToAtom(env->ctx, napi_quickjs_unwrap_value(key));
+    JSValue key_value = napi_quickjs_unwrap_value(key);
+    if (!JS_IsString(key_value) && !JS_IsSymbol(key_value))
+      return napi_quickjs_set_last_error(env, napi_name_expected, "A string or symbol was expected");
+
+    JSAtom prop = JS_ValueToAtom(env->ctx, key_value);
     if (prop == JS_ATOM_NULL)
       return ReturnPendingIfCaught(env, "Invalid key");
 
@@ -2971,10 +3352,15 @@ extern "C"
       {
         *result = len;
       }
+      else
+      {
+        JS_FreeCString(env->ctx, str);
+        return InvalidArg(env);
+      }
     }
     else if (bufsize != 0)
     {
-      size_t copied = std::min(bufsize - 1, len);
+      size_t copied = CompleteUtf8PrefixLength(str, std::min(bufsize - 1, len));
       std::memcpy(buf, str, copied);
       buf[copied] = '\0';
       if (result != nullptr)
@@ -2993,11 +3379,11 @@ extern "C"
       napi_env env, napi_value value, char *buf, size_t bufsize, size_t *result)
   {
     if (!CheckValue(env, value))
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue local = napi_quickjs_unwrap_value(value);
     if (!JS_IsString(local))
-      return napi_string_expected;
+      return napi_quickjs_set_last_error(env, napi_string_expected, "A string was expected");
 
     // QuickJS strings are UTF-8 internally; for latin1 we get the UTF-8
     // and truncate to single bytes (values >0xFF become '?').
@@ -3006,19 +3392,21 @@ extern "C"
     if (str == nullptr)
       return ReturnPendingIfCaught(env, "Failed to convert string");
 
+    std::vector<char> latin1 = Utf8ToLatin1(str, len);
+
     if (buf == nullptr)
     {
       if (result == nullptr)
       {
         JS_FreeCString(env->ctx, str);
-        return napi_invalid_arg;
+        return InvalidArg(env);
       }
-      *result = len;
+      *result = latin1.size();
     }
     else if (bufsize != 0)
     {
-      size_t copy_len = std::min(bufsize - 1, len);
-      memcpy(buf, str, copy_len);
+      size_t copy_len = std::min(bufsize - 1, latin1.size());
+      memcpy(buf, latin1.data(), copy_len);
       buf[copy_len] = '\0';
       if (result != nullptr)
         *result = copy_len;
@@ -3039,11 +3427,11 @@ extern "C"
                                                      size_t *result)
   {
     if (!CheckValue(env, value))
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue local = napi_quickjs_unwrap_value(value);
     if (!JS_IsString(local))
-      return napi_string_expected;
+      return napi_quickjs_set_last_error(env, napi_string_expected, "A string was expected");
 
     size_t utf16_len;
     const uint16_t *utf16 = JS_ToCStringLenUTF16(env->ctx, &utf16_len, local);
@@ -3055,7 +3443,7 @@ extern "C"
       if (result == nullptr)
       {
         JS_FreeCString(env->ctx, reinterpret_cast<const char *>(utf16));
-        return napi_invalid_arg;
+        return InvalidArg(env);
       }
       *result = utf16_len;
     }
@@ -3079,7 +3467,7 @@ extern "C"
   napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env, napi_value value, napi_value *result)
   {
     if (!CheckValue(env, value) || result == nullptr)
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue coerced = JS_ToBoolean(env->ctx, napi_quickjs_unwrap_value(value));
     if (JS_IsException(coerced))
@@ -3101,7 +3489,7 @@ extern "C"
   napi_status NAPI_CDECL napi_coerce_to_number(napi_env env, napi_value value, napi_value *result)
   {
     if (!CheckValue(env, value) || result == nullptr)
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     double d;
     if (JS_ToFloat64(env->ctx, &d, napi_quickjs_unwrap_value(value)) != 0)
@@ -3114,7 +3502,7 @@ extern "C"
   napi_status NAPI_CDECL napi_coerce_to_object(napi_env env, napi_value value, napi_value *result)
   {
     if (!CheckValue(env, value) || result == nullptr)
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue obj = JS_ToObject(env->ctx, napi_quickjs_unwrap_value(value));
     if (JS_IsException(obj))
@@ -3127,7 +3515,7 @@ extern "C"
   napi_status NAPI_CDECL napi_coerce_to_string(napi_env env, napi_value value, napi_value *result)
   {
     if (!CheckValue(env, value) || result == nullptr)
-      return napi_invalid_arg;
+      return InvalidArg(env);
 
     JSValue str = JS_ToString(env->ctx, napi_quickjs_unwrap_value(value));
     if (JS_IsException(str))
@@ -3258,8 +3646,21 @@ extern "C"
 
     if (JS_SetOpaque(obj, wrap) != 0)
     {
-      delete wrap;
-      return napi_generic_failure;
+      JSValue stored = JS_NewObjectClass(env->ctx, napi_external_class_id);
+      if (JS_IsException(stored))
+      {
+        delete wrap;
+        return ReturnPendingIfCaught(env, "Failed to create wrap record");
+      }
+      JS_SetOpaque(stored, wrap);
+      if (JS_DefinePropertyValueStr(env->ctx, obj, kWrapProperty, stored,
+                                    JS_PROP_CONFIGURABLE) < 0)
+      {
+        JS_SetOpaque(stored, nullptr);
+        JS_FreeValue(env->ctx, stored);
+        delete wrap;
+        return ReturnPendingIfCaught(env, "Failed to attach wrap record");
+      }
     }
 
     if (result != nullptr)
@@ -3274,8 +3675,7 @@ extern "C"
       return napi_invalid_arg;
 
     auto obj = napi_quickjs_unwrap_value(js_object);
-    auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
-        JS_GetOpaque(obj, napi_external_class_id));
+    auto *wrap = GetWrapRecord(env->ctx, obj);
     if (wrap == nullptr)
       return napi_invalid_arg;
 
@@ -3292,13 +3692,20 @@ extern "C"
     if (!JS_IsObject(obj))
       return napi_object_expected;
 
-    auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
-        JS_GetOpaque(obj, napi_external_class_id));
+    auto *wrap = GetWrapRecord(env->ctx, obj);
     if (wrap == nullptr)
       return napi_generic_failure;
 
     if (JS_SetOpaque(obj, nullptr) != 0)
-      return napi_generic_failure;
+    {
+      JSAtom key = JS_NewAtom(env->ctx, kWrapProperty);
+      if (JS_DeleteProperty(env->ctx, obj, key, 0) < 0)
+      {
+        JS_FreeAtom(env->ctx, key);
+        return ReturnPendingIfCaught(env, "Failed to remove wrap record");
+      }
+      JS_FreeAtom(env->ctx, key);
+    }
 
     *result = wrap->external_data;
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3313,21 +3720,13 @@ extern "C"
       return napi_invalid_arg;
     }
 
-    // 1. Create the Error object
-    JSValue error = JS_NewError(env->ctx);
-
-    // 2. Set the message property
-    JS_SetProperty(env->ctx, error, JS_ATOM_message,
-                   JS_NewString(env->ctx, msg ? msg : ""));
-
-    // 3. Set the code property if provided
+    JSValue error = CreatePlainError(env->ctx, msg);
     if (code != nullptr)
     {
       JS_SetPropertyStr(env->ctx, error, "code",
                         JS_NewString(env->ctx, code));
     }
 
-    // 4. Transfer ownership of the error object to the engine's exception slot
     SetLastException(env, error);
 
     return napi_ok;
@@ -3413,7 +3812,7 @@ extern "C"
     }
 
     // Check both the engine state and our internal environment cache
-    *result = JS_HasException(env->ctx) || !JS_IsUndefined(env->last_exception);
+    *result = JS_HasException(env->ctx) || env->has_last_exception;
 
     return napi_ok;
   }
@@ -3423,12 +3822,13 @@ extern "C"
     if (!CheckEnv(env) || result == nullptr)
       return napi_invalid_arg;
 
-    if (JS_IsUndefined(env->last_exception))
+    if (!env->has_last_exception)
       return napi_generic_failure;
 
     // Take ownership of the exception before clearing
     JSValue ex = env->last_exception;
     env->last_exception = JS_UNDEFINED;
+    env->has_last_exception = false;
 
     *result = napi_quickjs_wrap_value(env, ex);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3482,10 +3882,26 @@ extern "C"
       return ReturnPendingIfCaught(env, "Failed to convert script to string");
 
     JSValue out = JS_Eval(env->ctx, str, len, "<napi_run_script>", JS_EVAL_TYPE_GLOBAL);
-    JS_FreeCString(env->ctx, str);
 
     if (JS_IsException(out))
-      return ReturnPendingIfCaught(env, "Script evaluation failed");
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      if (JS_IsObject(exc))
+      {
+        JSAtom arrow_atom = JS_NewAtom(env->ctx, "node:arrowMessage");
+        int has_arrow = JS_HasProperty(env->ctx, exc, arrow_atom);
+        if (has_arrow == 0)
+        {
+          JS_SetProperty(env->ctx, exc, arrow_atom, JS_NewStringLen(env->ctx, str, len));
+        }
+        JS_FreeAtom(env->ctx, arrow_atom);
+      }
+      JS_FreeCString(env->ctx, str);
+      SetLastException(env, exc);
+      return napi_quickjs_set_last_error(env, napi_pending_exception, "Script evaluation failed");
+    }
+
+    JS_FreeCString(env->ctx, str);
 
     *result = napi_quickjs_wrap_value(env, out);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3656,35 +4072,24 @@ extern "C"
   //   return napi_ok;
   // }
 
-  // napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
-  //                                           napi_value js_object,
-  //                                           void* finalize_data,
-  //                                           node_api_basic_finalize finalize_cb,
-  //                                           void* finalize_hint,
-  //                                           napi_ref* result) {
-  //   if (!CheckValue(env, js_object) || finalize_cb == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
-  //   if (!value->IsObject()) return napi_object_expected;
-  //   auto* record = new (std::nothrow) wrapFinalizerRecord();
-  //   if (record == nullptr) return napi_generic_failure;
-  //   record->env = env;
-  //   record->native_object = finalize_data;
-  //   record->finalize_cb = finalize_cb;
-  //   record->finalize_hint = finalize_hint;
-  //   record->handle.Reset(env->isolate, value.As<v8::Object>());
-  //   record->handle.SetWeak(record, wrapWeakCallback, v8::WeakCallbackType::kParameter);
-  //   env->wrap_finalizers.push_back(record);
-  //   if (result != nullptr) {
-  //     napi_status status = napi_create_reference(env, js_object, 0, result);
-  //     if (status != napi_ok) {
-  //       RemovewrapFinalizerRecord(env, record);
-  //       record->handle.Reset();
-  //       delete record;
-  //       return status;
-  //     }
-  //   }
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
+                                            napi_value js_object,
+                                            void *finalize_data,
+                                            node_api_basic_finalize finalize_cb,
+                                            void *finalize_hint,
+                                            napi_ref *result)
+  {
+    (void)finalize_data;
+    (void)finalize_cb;
+    (void)finalize_hint;
+    if (!CheckValue(env, js_object) || finalize_cb == nullptr)
+      return InvalidArg(env);
+    if (!JS_IsObject(napi_quickjs_unwrap_value(js_object)))
+      return napi_object_expected;
+    if (result != nullptr)
+      return napi_create_reference(env, js_object, 0, result);
+    return napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t *result)
   {

@@ -58,6 +58,7 @@ struct napi_env__
     napi_extended_error_info last_error{};
     std::string last_error_message;
     JSValue last_exception;
+    bool has_last_exception = false;
 
     // TODO: Do we need these?
     // JSValue last_exception_message;
