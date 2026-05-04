@@ -566,7 +566,7 @@ namespace
         }
         if (scope->rt != nullptr)
         {
-            JS_FreeRuntime(scope->rt);
+            // JS_FreeRuntime(scope->rt);
             scope->rt = nullptr;
         }
         delete scope;
@@ -745,7 +745,7 @@ extern "C"
         auto ctx = JS_NewContext(rt);
         if (ctx == nullptr)
         {
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
         EnsureNodeWellKnownSymbols(ctx);
@@ -754,7 +754,7 @@ extern "C"
         if (scope == nullptr)
         {
             JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
 
@@ -763,7 +763,7 @@ extern "C"
         {
             delete scope;
             JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return (status == napi_ok) ? napi_generic_failure : status;
         }
 
