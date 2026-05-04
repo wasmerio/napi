@@ -162,15 +162,15 @@ const sealObj = {x:'a',y:'b',z:'c'};
 __to.TestSeal(sealObj);
 assert.strictEqual(Object.isSealed(sealObj), true);
 assert.throws(() => { sealObj.w = 'd'; }, /object is not extensible/);
-assert.throws(() => { delete sealObj.x; }, /Cannot delete property/);
+assert.throws(() => { delete sealObj.x; }, /Cannot delete property|could not delete property/);
 sealObj.x = 'd';
 
 const freezeObj = {x:10,y:10,z:10};
 __to.TestFreeze(freezeObj);
 assert.strictEqual(Object.isFrozen(freezeObj), true);
-assert.throws(() => { freezeObj.x = 10; }, /read only property/);
+assert.throws(() => { freezeObj.x = 10; }, /read only property|read-only/);
 assert.throws(() => { freezeObj.w = 15; }, /object is not extensible/);
-assert.throws(() => { delete freezeObj.x; }, /Cannot delete property/);
+assert.throws(() => { delete freezeObj.x; }, /Cannot delete property|could not delete property/);
 
 const owp = __to.TestCreateObjectWithProperties();
 assert.strictEqual(typeof owp, 'object');

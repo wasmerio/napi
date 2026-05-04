@@ -4,9 +4,17 @@
 // TBD: relative path makes VCode less confused - probably need to fix CMakeFiles or VSCode settings
 // I think VSCode is confused with includes in /node directory.
 #include "../../../include/js_native_api.h"
+#include "../../../include/node_api_types.h"
 
 #include <string>
+#include <vector>
 #include <quickjs.h>
+
+struct napi_env_cleanup_hook__
+{
+    napi_cleanup_hook hook = nullptr;
+    void *arg = nullptr;
+};
 
 struct napi_value__
 {
@@ -70,6 +78,9 @@ struct napi_env__
     void *instance_data = nullptr;
     napi_finalize instance_data_finalize_cb = nullptr;
     void *instance_data_finalize_hint = nullptr;
+    std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks;
+    std::vector<napi_ref> weak_refs;
+    int64_t external_memory = 0;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

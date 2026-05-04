@@ -20,10 +20,69 @@ struct napi_external_backing_store_hint__
   void *external_data = nullptr;
   node_api_basic_finalize finalize_cb = nullptr;
   void *finalize_hint = nullptr;
+  JSValue weak_target = JS_UNDEFINED;
 };
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
 static JSClassID napi_external_class_id = 0;
+
+static bool IsRefEmptyValue(JSValue value)
+{
+  return JS_IsUninitialized(value) || JS_IsUndefined(value) || JS_IsNull(value);
+}
+
+static bool SameRefCountedValue(JSValueConst left, JSValueConst right)
+{
+  return JS_VALUE_HAS_REF_COUNT(left) &&
+         JS_VALUE_HAS_REF_COUNT(right) &&
+         JS_VALUE_GET_TAG(left) == JS_VALUE_GET_TAG(right) &&
+         JS_VALUE_GET_PTR(left) == JS_VALUE_GET_PTR(right);
+}
+
+static void RemoveWeakRef(napi_env env, napi_ref ref)
+{
+  if (env == nullptr || ref == nullptr)
+    return;
+
+  auto &refs = env->weak_refs;
+  for (auto it = refs.begin(); it != refs.end(); ++it)
+  {
+    if (*it == ref)
+    {
+      refs.erase(it);
+      return;
+    }
+  }
+}
+
+static void TrackWeakRef(napi_env env, napi_ref ref)
+{
+  if (env == nullptr || ref == nullptr || !ref->can_be_weak || ref->ref_count != 0)
+    return;
+
+  for (auto *tracked : env->weak_refs)
+  {
+    if (tracked == ref)
+      return;
+  }
+  env->weak_refs.push_back(ref);
+}
+
+static void ClearWeakRefsForValue(napi_env env, JSValueConst value)
+{
+  if (env == nullptr || !JS_VALUE_HAS_REF_COUNT(value))
+    return;
+
+  for (auto *ref : env->weak_refs)
+  {
+    if (ref != nullptr && ref->ref_count == 0 &&
+        !IsRefEmptyValue(ref->value) &&
+        SameRefCountedValue(ref->value, value))
+    {
+      ref->value = JS_UNDEFINED;
+    }
+  }
+}
 
 struct napi_handle_scope__
 {
@@ -40,6 +99,7 @@ struct napi_escapable_handle_scope__
 // Leading/trailing underscores + napi prefix makes it effectively private.
 static const char kTypeTagProperty[] = "__napi_type_tag__";
 static const char kWrapProperty[] = "__napi_wrap__";
+static const char kBufferProperty[] = "__napi_buffer__";
 
 static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
 {
@@ -47,6 +107,9 @@ static void napi_quickjs_external_finalizer(JSRuntime *rt, JSValue val)
   auto *hint = static_cast<napi_external_backing_store_hint *>(JS_GetOpaque(val, napi_external_class_id));
   if (hint != nullptr)
   {
+    JSValue target = JS_IsUndefined(hint->weak_target) ? val : hint->weak_target;
+    ClearWeakRefsForValue(hint->env, target);
+
     // Call the Node-API finalizer callback if the user provided one
     if (hint->finalize_cb != nullptr)
     {
@@ -308,6 +371,59 @@ namespace
     return i;
   }
 
+  napi_status MarkBuffer(napi_env env, JSValue value)
+  {
+    if (JS_DefinePropertyValueStr(env->ctx, value, kBufferProperty,
+                                  JS_NewBool(env->ctx, true),
+                                  JS_PROP_CONFIGURABLE) < 0)
+      return ReturnPendingIfCaught(env, "Failed to mark Buffer");
+    return napi_ok;
+  }
+
+  bool IsBufferValue(napi_env env, JSValue value)
+  {
+    if (!JS_IsObject(value))
+      return false;
+    JSValue marker = JS_GetPropertyStr(env->ctx, value, kBufferProperty);
+    if (JS_IsException(marker))
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      return false;
+    }
+    bool is_buffer = JS_ToBool(env->ctx, marker) == 1;
+    JS_FreeValue(env->ctx, marker);
+    return is_buffer;
+  }
+
+  napi_status GetBufferInfo(napi_env env, JSValue value, void **data, size_t *length)
+  {
+    if (!IsBufferValue(env, value))
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+
+    size_t offset = 0;
+    size_t byte_len = 0;
+    JSValue arraybuffer = JS_GetTypedArrayBuffer(env->ctx, value, &offset, &byte_len, nullptr);
+    if (JS_IsException(arraybuffer))
+      return ReturnPendingIfCaught(env, "Failed to get Buffer backing store");
+
+    size_t arraybuffer_len = 0;
+    uint8_t *arraybuffer_data = JS_GetArrayBuffer(env->ctx, &arraybuffer_len, arraybuffer);
+    JS_FreeValue(env->ctx, arraybuffer);
+    if (arraybuffer_data == nullptr && JS_HasException(env->ctx))
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
+
+    if (data != nullptr)
+      *data = arraybuffer_data == nullptr ? nullptr : arraybuffer_data + offset;
+    if (length != nullptr)
+      *length = byte_len;
+    return napi_quickjs_clear_last_error(env);
+  }
+
   inline JSTypedArrayEnum ToQuickJSArrayType(napi_typedarray_type type)
   {
     switch (type)
@@ -455,6 +571,15 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
 
 napi_env__::~napi_env__()
 {
+  for (auto it = env_cleanup_hooks.rbegin(); it != env_cleanup_hooks.rend(); ++it)
+  {
+    auto *entry = *it;
+    if (entry != nullptr && entry->hook != nullptr)
+      entry->hook(entry->arg);
+    delete entry;
+  }
+  env_cleanup_hooks.clear();
+
   // TODO: Need to implement cleanup
   // RunEnvCleanupHooks(this);
   // napi_v8_finalize_buffer_records(this);
@@ -566,11 +691,15 @@ static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
 
   JSValue effective_this = this_val;
   JSValue new_target = JS_UNDEFINED;
+  bool called_as_constructor =
+      magic == JS_CFUNC_constructor_magic ||
+      (magic == 0 && JS_IsConstructor(ctx, this_val));
 
-  if (magic == JS_CFUNC_constructor_magic)
+  if (called_as_constructor)
   {
     // Allocate a fresh instance using the class that supports SetOpaque.
-    // The prototype comes from the constructor's .prototype property.
+    // For JS_CLASS_C_FUNCTION_DATA constructors QuickJS passes new.target
+    // as this_val, so the instance prototype follows new.target.prototype.
     JSValue proto = JS_GetProperty(ctx, this_val, JS_ATOM_prototype);
     effective_this = JS_NewObjectProtoClass(ctx, proto, napi_external_class_id);
     JS_FreeValue(ctx, proto);
@@ -578,7 +707,6 @@ static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(effective_this))
       return effective_this;
 
-    // new.target is the constructor itself
     new_target = this_val;
   }
 
@@ -587,12 +715,12 @@ static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
 
   if (RethrowLastException(env, ctx))
   {
-    if (magic == JS_CFUNC_constructor_magic)
+    if (called_as_constructor)
       JS_FreeValue(ctx, effective_this);
     return JS_EXCEPTION;
   }
 
-  if (magic == JS_CFUNC_constructor_magic)
+  if (called_as_constructor)
   {
     // Node-API constructors return _this, but in QuickJS constructor
     // magic mode the return value IS the new instance. If the callback
@@ -609,6 +737,18 @@ static JSValue napi_quickjs_trampoline(JSContext *ctx, JSValueConst this_val,
   if (result == nullptr)
     return JS_UNDEFINED;
   return napi_quickjs_unwrap_value_and_delete(result);
+}
+
+static napi_status MakeFunctionConstructible(napi_env env, JSValue fn)
+{
+  JSValue proto = JS_NewObject(env->ctx);
+  if (JS_IsException(proto))
+    return ReturnPendingIfCaught(env, "Failed to create function prototype");
+
+  JS_SetConstructor(env->ctx, fn, proto);
+  JS_SetConstructorBit(env->ctx, fn, true);
+  JS_FreeValue(env->ctx, proto);
+  return napi_ok;
 }
 
 napi_status CreateFunction(napi_env env,
@@ -705,27 +845,73 @@ napi_status GetPropertyNames(napi_env env,
   JSValue arr = JS_NewArray(ctx);
   uint32_t arr_idx = 0;
 
-  auto append_tab = [&](JSPropertyEnum *t, uint32_t count)
+  auto passes_descriptor_filter = [&](JSValue owner, JSAtom atom) -> int
+  {
+    if (!(key_filter & (napi_key_writable | napi_key_configurable)))
+      return 1;
+
+    JSPropertyDescriptor desc;
+    int has = JS_GetOwnProperty(ctx, &desc, owner, atom);
+    if (has <= 0)
+      return has;
+
+    bool include = true;
+    if ((key_filter & napi_key_writable) && !(desc.flags & JS_PROP_WRITABLE))
+      include = false;
+    if ((key_filter & napi_key_configurable) && !(desc.flags & JS_PROP_CONFIGURABLE))
+      include = false;
+
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+    return include ? 1 : 0;
+  };
+
+  auto append_tab = [&](JSValue owner, JSPropertyEnum *t, uint32_t count) -> napi_status
   {
     for (uint32_t i = 0; i < count; ++i)
     {
+      int include = passes_descriptor_filter(owner, t[i].atom);
+      if (include < 0)
+      {
+        JS_FreePropertyEnum(ctx, t, count);
+        return ReturnPendingIfCaught(env, "Exception while filtering property names");
+      }
+      if (include == 0)
+        continue;
+
       JSValue key;
       if (key_conversion == napi_key_numbers_to_strings)
       {
-        // Always produce a string, even for integer-indexed keys
-        key = JS_AtomToString(ctx, t[i].atom);
+        key = JS_AtomToValue(ctx, t[i].atom);
+        if (!JS_IsSymbol(key))
+        {
+          JS_FreeValue(ctx, key);
+          key = JS_AtomToString(ctx, t[i].atom);
+        }
       }
       else
       {
         // napi_key_keep_numbers: integer atoms stay as numbers, others as strings/symbols
         key = JS_AtomToValue(ctx, t[i].atom);
       }
+      if (JS_IsException(key))
+      {
+        JS_FreePropertyEnum(ctx, t, count);
+        return ReturnPendingIfCaught(env, "Failed to convert property name");
+      }
       JS_SetPropertyUint32(ctx, arr, arr_idx++, key);
     }
     JS_FreePropertyEnum(ctx, t, count);
+    return napi_ok;
   };
 
-  append_tab(tab, tab_count);
+  napi_status status = append_tab(obj, tab, tab_count);
+  if (status != napi_ok)
+  {
+    JS_FreeValue(ctx, arr);
+    return status;
+  }
 
   // Walk the prototype chain for kIncludePrototypes
   if (key_mode == napi_key_include_prototypes)
@@ -736,7 +922,15 @@ napi_status GetPropertyNames(napi_env env,
       JSPropertyEnum *ptab = nullptr;
       uint32_t pcount = 0;
       if (JS_GetOwnPropertyNames(ctx, &ptab, &pcount, proto, gpn_flags) == 0)
-        append_tab(ptab, pcount);
+      {
+        status = append_tab(proto, ptab, pcount);
+        if (status != napi_ok)
+        {
+          JS_FreeValue(ctx, proto);
+          JS_FreeValue(ctx, arr);
+          return status;
+        }
+      }
 
       JSValue next = JS_GetPrototype(ctx, proto);
       JS_FreeValue(ctx, proto);
@@ -1083,7 +1277,7 @@ extern "C"
     auto ab = JS_NewArrayBuffer(env->ctx, reinterpret_cast<uint8_t *>(buf),
                                 byte_length,
                                 &FreeArrayBufferData, nullptr,
-                                true); // TODO: shared or not-shared?
+                                false);
     if (JS_IsException(ab))
     {
       js_free_rt(rt, buf);
@@ -2887,6 +3081,13 @@ extern "C"
           JS_FreeAtom(env->ctx, prop_name);
           return ReturnPendingIfCaught(env, "Failed to create method");
         }
+        status = MakeFunctionConstructible(env, method_fn);
+        if (status != napi_ok)
+        {
+          JS_FreeAtom(env->ctx, prop_name);
+          JS_FreeValue(env->ctx, method_fn);
+          return status;
+        }
 
         int method_flags = flags | JS_PROP_HAS_VALUE;
         if (p.attributes & napi_writable)
@@ -3530,13 +3731,13 @@ extern "C"
     if (!CheckValue(env, value) || result == nullptr)
       return napi_invalid_arg;
 
-    // When initial_ref_count = 0, then we're creating weak-reference to GC collectible object.
-    // Otherwise if initial_ref_count > 0, the, we're creating strong-reference.
-
     *result = new (std::nothrow)
         napi_ref__(env, napi_quickjs_unwrap_value(value), initial_ref_count);
+    if (*result == nullptr)
+      return napi_generic_failure;
 
-    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+    TrackWeakRef(env, *result);
+    return napi_ok;
   }
 
   napi_status NAPI_CDECL napi_delete_reference(napi_env env, napi_ref ref)
@@ -3544,10 +3745,10 @@ extern "C"
     if (!CheckEnv(env) || ref == nullptr)
       return napi_invalid_arg;
 
+    RemoveWeakRef(env, ref);
+
     if (ref->ref_count > 0)
-    {
       JS_FreeValue(env->ctx, ref->value);
-    }
 
     delete ref;
     return napi_ok;
@@ -3566,6 +3767,7 @@ extern "C"
       // an owner and napi_ref becomes strong.
       if (ref->ref_count == 0)
       {
+        RemoveWeakRef(env, ref);
         // we only increment internal count once
         JS_DupValue(env->ctx, ref->value);
       }
@@ -3598,7 +3800,10 @@ extern "C"
       // and is elligible for GC collection.
       if (ref->ref_count == 0)
       {
+        TrackWeakRef(env, ref);
         JS_FreeValue(env->ctx, ref->value);
+        if (!ref->can_be_weak)
+          ref->value = JS_UNDEFINED;
       }
     }
 
@@ -3619,7 +3824,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = napi_quickjs_wrap_value(env, ref->value);
+    *result = napi_quickjs_wrap_value(env, JS_DupValue(env->ctx, ref->value));
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -3652,10 +3857,12 @@ extern "C"
         delete wrap;
         return ReturnPendingIfCaught(env, "Failed to create wrap record");
       }
+      wrap->weak_target = obj;
       JS_SetOpaque(stored, wrap);
       if (JS_DefinePropertyValueStr(env->ctx, obj, kWrapProperty, stored,
                                     JS_PROP_CONFIGURABLE) < 0)
       {
+        wrap->weak_target = JS_UNDEFINED;
         JS_SetOpaque(stored, nullptr);
         JS_FreeValue(env->ctx, stored);
         delete wrap;
@@ -3907,170 +4114,196 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  // napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
-  //                                                  napi_cleanup_hook fun,
-  //                                                  void* arg) {
-  //   auto* napiEnv = const_cast<napi_env>(env);
-  //   if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
-  //   auto* entry = new (std::nothrow) napi_env_cleanup_hook__();
-  //   if (entry == nullptr) return napi_generic_failure;
-  //   entry->hook = fun;
-  //   entry->arg = arg;
-  //   napiEnv->env_cleanup_hooks.push_back(entry);
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+      napi_env env,
+      napi_value arraybuffer,
+      size_t byte_offset,
+      size_t byte_length,
+      napi_value *result);
 
-  // napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env env,
-  //                                                     napi_cleanup_hook fun,
-  //                                                     void* arg) {
-  //   auto* napiEnv = const_cast<napi_env>(env);
-  //   if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
-  //   auto& hooks = napiEnv->env_cleanup_hooks;
-  //   for (auto it = hooks.begin(); it != hooks.end(); ++it) {
-  //     auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
-  //     if (entry != nullptr && entry->hook == fun && entry->arg == arg) {
-  //       delete entry;
-  //       hooks.erase(it);
-  //       return napi_ok;
-  //     }
-  //   }
-  //   return napi_invalid_arg;
-  // }
+  napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env basic_env,
+                                                   napi_cleanup_hook fun,
+                                                   void *arg)
+  {
+    auto *env = const_cast<napi_env>(basic_env);
+    if (!CheckEnv(env) || fun == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_create_buffer(napi_env env,
-  //                                           size_t length,
-  //                                           void** data,
-  //                                           napi_value* result) {
-  //   if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Context> context = env->context();
-  //   v8::Context::Scope context_scope(context);
-  //   auto backing = v8::ArrayBuffer::NewBackingStore(env->isolate, length);
-  //   if (!backing) return napi_generic_failure;
-  //   *data = backing->Data();
-  //   auto* record = new (std::nothrow) napi_buffer_record__();
-  //   if (record == nullptr) return napi_generic_failure;
-  //   record->env = env;
-  //   record->backing_store = std::move(backing);
-  //   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
-  //   record->holder.Reset(env->isolate, buffer_obj);
-  //   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  //   v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  //   buffer_obj
-  //       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
-  //       .FromJust();
-  //   env->buffer_records.push_back(record);
-  //   *result = napi_v8_wrap_value(env, buffer_obj);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    auto *entry = new (std::nothrow) napi_env_cleanup_hook__();
+    if (entry == nullptr)
+      return napi_generic_failure;
+    entry->hook = fun;
+    entry->arg = arg;
+    env->env_cleanup_hooks.push_back(entry);
+    return napi_ok;
+  }
 
-  // napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
-  //                                                size_t length,
-  //                                                const void* data,
-  //                                                void** result_data,
-  //                                                napi_value* result) {
-  //   void* out = nullptr;
-  //   napi_status status = napi_create_buffer(env, length, &out, result);
-  //   if (status != napi_ok) return status;
-  //   if (length > 0 && data != nullptr) {
-  //     std::memcpy(out, data, length);
-  //   }
-  //   if (result_data != nullptr) *result_data = out;
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env basic_env,
+                                                      napi_cleanup_hook fun,
+                                                      void *arg)
+  {
+    auto *env = const_cast<napi_env>(basic_env);
+    if (!CheckEnv(env) || fun == nullptr)
+      return napi_invalid_arg;
 
-  // napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
-  //                                                    size_t length,
-  //                                                    void* data,
-  //                                                    node_api_basic_finalize finalize_cb,
-  //                                                    void* finalize_hint,
-  //                                                    napi_value* result) {
-  //   if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Context> context = env->context();
-  //   v8::Context::Scope context_scope(context);
-  //   auto* hint = new (std::nothrow) napi_external_backing_store_hint__();
-  //   if (hint == nullptr) return napi_generic_failure;
-  //   hint->env = env;
-  //   hint->external_data = data;
-  //   hint->finalize_cb = finalize_cb;
-  //   hint->finalize_hint = finalize_hint;
-  //   std::unique_ptr<v8::BackingStore> backing =
-  //       v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter, hint);
-  //   if (!backing) {
-  //     delete hint;
-  //     return napi_generic_failure;
-  //   }
-  //   auto* record = new (std::nothrow) napi_buffer_record__();
-  //   if (record == nullptr) return napi_generic_failure;
-  //   record->env = env;
-  //   record->backing_store = std::move(backing);
-  //   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
-  //   record->holder.Reset(env->isolate, buffer_obj);
-  //   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  //   v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  //   buffer_obj
-  //       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
-  //       .FromJust();
-  //   env->buffer_records.push_back(record);
-  //   *result = napi_v8_wrap_value(env, buffer_obj);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    auto &hooks = env->env_cleanup_hooks;
+    for (auto it = hooks.begin(); it != hooks.end(); ++it)
+    {
+      auto *entry = *it;
+      if (entry != nullptr && entry->hook == fun && entry->arg == arg)
+      {
+        delete entry;
+        hooks.erase(it);
+        return napi_ok;
+      }
+    }
+    return napi_invalid_arg;
+  }
 
-  // napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
-  //   if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  //   *result = raw->IsArrayBufferView();
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_create_buffer(napi_env env,
+                                            size_t length,
+                                            void **data,
+                                            napi_value *result)
+  {
+    if (!CheckEnv(env) || data == nullptr || result == nullptr)
+      return InvalidArg(env);
 
-  // napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
-  //                                             napi_value value,
-  //                                             void** data,
-  //                                             size_t* length) {
-  //   if (!CheckEnv(env) || value == nullptr) return napi_invalid_arg;
-  //   if (!GetArrayBufferViewInfo(napi_v8_unwrap_value(value), data, length)) {
-  //     return napi_invalid_arg;
-  //   }
-  //   return napi_ok;
-  // }
+    napi_value arraybuffer = nullptr;
+    napi_status status = napi_create_arraybuffer(env, length, data, &arraybuffer);
+    if (status != napi_ok)
+      return status;
 
-  // napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
-  //     napi_env env,
-  //     napi_value arraybuffer,
-  //     size_t byte_offset,
-  //     size_t byte_length,
-  //     napi_value* result) {
-  //   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return napi_invalid_arg;
-  //   v8::Local<v8::Value> raw = napi_v8_unwrap_value(arraybuffer);
-  //   if (!raw->IsArrayBuffer()) return napi_invalid_arg;
-  //   v8::Local<v8::ArrayBuffer> ab = raw.As<v8::ArrayBuffer>();
-  //   size_t ab_length = ab->ByteLength();
-  //   if (byte_offset > ab_length || byte_length > (ab_length - byte_offset)) {
-  //     return napi_invalid_arg;
-  //   }
-  //   auto* record = new (std::nothrow) napi_buffer_record__();
-  //   if (record == nullptr) return napi_generic_failure;
-  //   record->env = env;
-  //   record->backing_store = ab->GetBackingStore();
-  //   v8::Local<v8::Object> buffer_obj =
-  //       CreateBufferObject(env, record->backing_store, byte_offset, byte_length);
-  //   record->holder.Reset(env->isolate, buffer_obj);
-  //   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  //   v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  //   buffer_obj
-  //       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
-  //       .FromJust();
-  //   env->buffer_records.push_back(record);
-  //   *result = napi_v8_wrap_value(env, buffer_obj);
-  //   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-  // }
+    status = node_api_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
+    delete arraybuffer;
+    return status;
+  }
 
-  // napi_status NAPI_CDECL napi_adjust_external_memory(
-  //     node_api_basic_env basic_env, int64_t change_in_bytes, int64_t* adjusted_value) {
-  //   napi_env env = const_cast<napi_env>(basic_env);
-  //   if (!CheckEnv(env) || adjusted_value == nullptr) return napi_invalid_arg;
-  //   *adjusted_value = env->isolate->AdjustAmountOfExternalAllocatedMemory(change_in_bytes);
-  //   return napi_ok;
-  // }
+  napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
+                                                 size_t length,
+                                                 const void *data,
+                                                 void **result_data,
+                                                 napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr || (length > 0 && data == nullptr))
+      return InvalidArg(env);
+
+    void *out = nullptr;
+    napi_status status = napi_create_buffer(env, length, &out, result);
+    if (status != napi_ok)
+      return status;
+
+    if (length > 0)
+      std::memcpy(out, data, length);
+    if (result_data != nullptr)
+      *result_data = out;
+    return napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
+                                                     size_t length,
+                                                     void *data,
+                                                     node_api_basic_finalize finalize_cb,
+                                                     void *finalize_hint,
+                                                     napi_value *result)
+  {
+    if (!CheckEnv(env) || result == nullptr || (length > 0 && data == nullptr))
+      return InvalidArg(env);
+
+    napi_value arraybuffer = nullptr;
+    napi_status status = napi_create_external_arraybuffer(
+        env, data, length, finalize_cb, finalize_hint, &arraybuffer);
+    if (status != napi_ok)
+      return status;
+
+    status = node_api_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
+    delete arraybuffer;
+    return status;
+  }
+
+  napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool *result)
+  {
+    if (!CheckValue(env, value) || result == nullptr)
+      return InvalidArg(env);
+    *result = IsBufferValue(env, napi_quickjs_unwrap_value(value));
+    return napi_quickjs_clear_last_error(env);
+  }
+
+  napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
+                                              napi_value value,
+                                              void **data,
+                                              size_t *length)
+  {
+    if (!CheckValue(env, value))
+      return InvalidArg(env);
+    return GetBufferInfo(env, napi_quickjs_unwrap_value(value), data, length);
+  }
+
+  napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+      napi_env env,
+      napi_value arraybuffer,
+      size_t byte_offset,
+      size_t byte_length,
+      napi_value *result)
+  {
+    if (!CheckValue(env, arraybuffer) || result == nullptr)
+      return InvalidArg(env);
+
+    size_t arraybuffer_length = 0;
+    uint8_t *arraybuffer_data = JS_GetArrayBuffer(
+        env->ctx, &arraybuffer_length, napi_quickjs_unwrap_value(arraybuffer));
+    if (arraybuffer_data == nullptr && JS_HasException(env->ctx))
+    {
+      JSValue exc = JS_GetException(env->ctx);
+      JS_FreeValue(env->ctx, exc);
+      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
+    if (byte_offset > arraybuffer_length || byte_length > arraybuffer_length - byte_offset)
+      return InvalidArg(env);
+
+    JSValue argv[] = {
+        napi_quickjs_unwrap_value(arraybuffer),
+        JS_NewInt64(env->ctx, static_cast<int64_t>(byte_offset)),
+        JS_NewInt64(env->ctx, static_cast<int64_t>(byte_length))};
+    JSValue buffer = JS_NewTypedArray(env->ctx, 3, argv, JS_TYPED_ARRAY_UINT8);
+    if (JS_IsException(buffer))
+      return ReturnPendingIfCaught(env, "Failed to create Buffer");
+
+    napi_status status = MarkBuffer(env, buffer);
+    if (status != napi_ok)
+    {
+      JS_FreeValue(env->ctx, buffer);
+      return status;
+    }
+
+    *result = napi_quickjs_wrap_value(env, buffer);
+    return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  }
+
+  napi_status NAPI_CDECL napi_adjust_external_memory(
+      node_api_basic_env basic_env, int64_t change_in_bytes, int64_t *adjusted_value)
+  {
+    auto *env = const_cast<napi_env>(basic_env);
+    if (!CheckEnv(env) || adjusted_value == nullptr)
+      return napi_invalid_arg;
+
+    if (change_in_bytes > 0 &&
+        env->external_memory > std::numeric_limits<int64_t>::max() - change_in_bytes)
+    {
+      env->external_memory = std::numeric_limits<int64_t>::max();
+    }
+    else if (change_in_bytes < 0 &&
+             env->external_memory < std::numeric_limits<int64_t>::min() - change_in_bytes)
+    {
+      env->external_memory = std::numeric_limits<int64_t>::min();
+    }
+    else
+    {
+      env->external_memory += change_in_bytes;
+    }
+
+    *adjusted_value = env->external_memory;
+    return napi_ok;
+  }
 
   napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
                                             napi_value js_object,
