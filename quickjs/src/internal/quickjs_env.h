@@ -5,6 +5,7 @@
 // I think VSCode is confused with includes in /node directory.
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
+#include "napi_value.h"
 
 #include <string>
 #include <vector>
@@ -14,17 +15,6 @@ struct napi_env_cleanup_hook__
 {
     napi_cleanup_hook hook = nullptr;
     void *arg = nullptr;
-};
-
-struct napi_value__
-{
-    explicit napi_value__(napi_env env, JSValue local);
-    ~napi_value__();
-
-    JSValue local() const;
-
-    napi_env env;
-    JSValue value;
 };
 
 struct napi_callback_info__
@@ -80,6 +70,8 @@ struct napi_env__
     void *instance_data_finalize_hint = nullptr;
     std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks;
     std::vector<napi_ref> weak_refs;
+    napi_scope__ *root_scope = nullptr;
+    napi_scope__ *current_scope = nullptr;
     int64_t external_memory = 0;
 };
 
@@ -88,9 +80,6 @@ napi_status napi_quickjs_set_last_error(napi_env env,
                                         const char *message);
 
 napi_status napi_quickjs_clear_last_error(napi_env env);
-
-napi_value napi_quickjs_wrap_value(napi_env env, JSValue value);
-JSValue napi_quickjs_unwrap_value(napi_value value);
 
 int RegisterExternalClass(JSRuntime *rt);
 

@@ -57,6 +57,7 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 
 add_library(napi_quickjs STATIC
   src/js_native_api_quickjs.cc
+  src/napi_value.cc
   src/unofficial_napi.cc
 )
 
