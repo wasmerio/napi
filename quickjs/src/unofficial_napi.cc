@@ -1,4 +1,4 @@
-#include "internal/quickjs_env.h"
+#include "internal/napi_env.h"
 
 #include <unordered_map>
 #include <mutex>
@@ -19,21 +19,21 @@ namespace
     {
         if (env == nullptr || value == nullptr)
             return {};
-        const char *str = JS_ToCString(env->ctx, value->get_inner());
+        const char *str = JS_ToCString(env->context(), value->get_inner());
         if (str == nullptr)
             return {};
         std::string out(str);
-        JS_FreeCString(env->ctx, str);
+        JS_FreeCString(env->context(), str);
         return out;
     }
 
     bool IsTruthyProperty(napi_env env, napi_value object, const char *name)
     {
-        JSValue prop = JS_GetPropertyStr(env->ctx, object->get_inner(), name);
+        JSValue prop = JS_GetPropertyStr(env->context(), object->get_inner(), name);
         if (JS_IsException(prop))
             return false;
-        bool out = JS_ToBool(env->ctx, prop);
-        JS_FreeValue(env->ctx, prop);
+        bool out = JS_ToBool(env->context(), prop);
+        JS_FreeValue(env->context(), prop);
         return out;
     }
 
@@ -54,7 +54,7 @@ namespace
             return;
         if (!JS_IsUndefined(it->second.get_source_map_error_source))
         {
-            JS_FreeValue(env->ctx, it->second.get_source_map_error_source);
+            JS_FreeValue(env->context(), it->second.get_source_map_error_source);
         }
         g_error_formatting_states.erase(it);
     }
@@ -80,7 +80,7 @@ extern "C"
         auto env = new (std::nothrow) napi_env__(context, module_api_version);
         if (env == nullptr)
             return napi_generic_failure;
-        if (env->root_scope == nullptr)
+        if (env->root_scope() == nullptr)
         {
             delete env;
             return napi_generic_failure;
@@ -136,7 +136,7 @@ extern "C"
     {
         // TODO: gracefull shutdown
         ClearErrorFormattingState(env);
-        JSContext *ctx = env->ctx;
+        JSContext *ctx = env->context();
         JS_SetContextOpaque(ctx, nullptr);
         delete env;
         JS_FreeContext(ctx);
@@ -147,7 +147,7 @@ extern "C"
         napi_env env,
         bool enabled)
     {
-        if (env == nullptr || env->ctx == nullptr)
+        if (env == nullptr || env->context() == nullptr)
             return napi_invalid_arg;
 
         std::lock_guard<std::mutex> lock(g_error_formatting_mu);
@@ -159,22 +159,22 @@ extern "C"
         napi_env env,
         napi_value callback)
     {
-        if (env == nullptr || env->ctx == nullptr)
+        if (env == nullptr || env->context() == nullptr)
             return napi_invalid_arg;
 
         std::lock_guard<std::mutex> lock(g_error_formatting_mu);
         auto &state = g_error_formatting_states[env];
         if (!JS_IsUndefined(state.get_source_map_error_source))
         {
-            JS_FreeValue(env->ctx, state.get_source_map_error_source);
+            JS_FreeValue(env->context(), state.get_source_map_error_source);
             state.get_source_map_error_source = JS_UNDEFINED;
         }
         if (callback != nullptr)
         {
             JSValue value = callback->get_inner();
-            if (!JS_IsFunction(env->ctx, value))
+            if (!JS_IsFunction(env->context(), value))
                 return napi_invalid_arg;
-            state.get_source_map_error_source = JS_DupValue(env->ctx, value);
+            state.get_source_map_error_source = JS_DupValue(env->context(), value);
         }
         return napi_ok;
     }
@@ -183,7 +183,7 @@ extern "C"
         napi_env env,
         napi_value error)
     {
-        if (env == nullptr || env->ctx == nullptr || error == nullptr)
+        if (env == nullptr || env->context() == nullptr || error == nullptr)
             return napi_invalid_arg;
 
         JSValue callback = JS_UNDEFINED;
@@ -196,28 +196,28 @@ extern "C"
             {
                 return napi_ok;
             }
-            callback = JS_DupValue(env->ctx, it->second.get_source_map_error_source);
+            callback = JS_DupValue(env->context(), it->second.get_source_map_error_source);
         }
 
-        JSValue mapped = JS_Call(env->ctx, callback, JS_UNDEFINED, 0, nullptr);
-        JS_FreeValue(env->ctx, callback);
+        JSValue mapped = JS_Call(env->context(), callback, JS_UNDEFINED, 0, nullptr);
+        JS_FreeValue(env->context(), callback);
         if (JS_IsException(mapped))
         {
-            JSValue exc = JS_GetException(env->ctx);
-            JS_FreeValue(env->ctx, exc);
+            JSValue exc = JS_GetException(env->context());
+            JS_FreeValue(env->context(), exc);
             return napi_generic_failure;
         }
 
         if (JS_IsString(mapped))
         {
-            JS_SetPropertyStr(env->ctx,
+            JS_SetPropertyStr(env->context(),
                               error->get_inner(),
                               "node:arrowMessage",
                               mapped);
         }
         else
         {
-            JS_FreeValue(env->ctx, mapped);
+            JS_FreeValue(env->context(), mapped);
         }
 
         return napi_ok;
@@ -240,14 +240,14 @@ extern "C"
         (void)allow_code_gen_wasm;
         (void)own_microtask_queue;
         (void)host_defined_option_id;
-        if (env == nullptr || env->ctx == nullptr || sandbox_or_symbol == nullptr || result_out == nullptr)
+        if (env == nullptr || env->context() == nullptr || sandbox_or_symbol == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         JSValue sandbox = sandbox_or_symbol->get_inner();
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
-        JS_SetPropertyStr(env->ctx, sandbox, "__quickjs_contextified", JS_NewBool(env->ctx, true));
-        JS_SetPropertyStr(env->ctx, sandbox, "globalThis", JS_DupValue(env->ctx, sandbox));
-        *result_out = env->current_scope->wrap_value(JS_DupValue(env->ctx, sandbox), true);
+        JS_SetPropertyStr(env->context(), sandbox, "__quickjs_contextified", JS_NewBool(env->context(), true));
+        JS_SetPropertyStr(env->context(), sandbox, "globalThis", JS_DupValue(env->context(), sandbox));
+        *result_out = env->current_scope()->wrap_value(JS_DupValue(env->context(), sandbox), true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
@@ -272,7 +272,7 @@ extern "C"
         (void)break_on_sigint;
         (void)break_on_first_line;
         (void)host_defined_option_id;
-        if (env == nullptr || env->ctx == nullptr || source == nullptr || result_out == nullptr)
+        if (env == nullptr || env->context() == nullptr || source == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         if (sandbox_or_null != nullptr && !JS_IsNull(sandbox_or_null->get_inner()) &&
             !IsTruthyProperty(env, sandbox_or_null, "__quickjs_contextified"))
@@ -283,7 +283,7 @@ extern "C"
         JSValue result = JS_UNDEFINED;
         if (sandbox_or_null != nullptr && !JS_IsNull(sandbox_or_null->get_inner()))
         {
-            JSValue wrapper = JS_Eval(env->ctx,
+            JSValue wrapper = JS_Eval(env->context(),
                                       "(function(__sandbox, __source) { with (__sandbox) { return eval(__source); } })",
                                       std::strlen("(function(__sandbox, __source) { with (__sandbox) { return eval(__source); } })"),
                                       "<contextify-wrapper>",
@@ -291,16 +291,16 @@ extern "C"
             if (JS_IsException(wrapper))
                 return napi_pending_exception;
             JSValue argv[] = {sandbox_or_null->get_inner(), source->get_inner()};
-            result = JS_Call(env->ctx, wrapper, JS_UNDEFINED, 2, argv);
-            JS_FreeValue(env->ctx, wrapper);
+            result = JS_Call(env->context(), wrapper, JS_UNDEFINED, 2, argv);
+            JS_FreeValue(env->context(), wrapper);
         }
         else
         {
-            result = JS_Eval(env->ctx, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
+            result = JS_Eval(env->context(), src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
         }
         if (JS_IsException(result))
             return napi_pending_exception;
-        *result_out = env->current_scope->wrap_value(result, true);
+        *result_out = env->current_scope()->wrap_value(result, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
@@ -308,12 +308,12 @@ extern "C"
         napi_env env,
         napi_value sandbox_or_context_global)
     {
-        if (env == nullptr || env->ctx == nullptr || sandbox_or_context_global == nullptr)
+        if (env == nullptr || env->context() == nullptr || sandbox_or_context_global == nullptr)
             return napi_invalid_arg;
         JSValue sandbox = sandbox_or_context_global->get_inner();
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
-        JS_SetPropertyStr(env->ctx, sandbox, "__quickjs_contextified", JS_NewBool(env->ctx, false));
+        JS_SetPropertyStr(env->context(), sandbox, "__quickjs_contextified", JS_NewBool(env->context(), false));
         return napi_ok;
     }
 
@@ -339,37 +339,37 @@ extern "C"
         (void)parsing_context_or_undefined;
         (void)context_extensions_or_undefined;
         (void)host_defined_option_id;
-        if (env == nullptr || env->ctx == nullptr || code == nullptr || result_out == nullptr)
+        if (env == nullptr || env->context() == nullptr || code == nullptr || result_out == nullptr)
             return napi_invalid_arg;
 
         std::vector<JSValue> argv;
         if (params_or_undefined != nullptr && JS_IsArray(params_or_undefined->get_inner()))
         {
             uint32_t length = 0;
-            JSValue len_val = JS_GetPropertyStr(env->ctx, params_or_undefined->get_inner(), "length");
-            JS_ToUint32(env->ctx, &length, len_val);
-            JS_FreeValue(env->ctx, len_val);
+            JSValue len_val = JS_GetPropertyStr(env->context(), params_or_undefined->get_inner(), "length");
+            JS_ToUint32(env->context(), &length, len_val);
+            JS_FreeValue(env->context(), len_val);
             for (uint32_t i = 0; i < length; ++i)
             {
-                JSValue param = JS_GetPropertyUint32(env->ctx, params_or_undefined->get_inner(), i);
+                JSValue param = JS_GetPropertyUint32(env->context(), params_or_undefined->get_inner(), i);
                 argv.push_back(param);
             }
         }
         argv.push_back(code->get_inner());
 
-        JSValue global = JS_GetGlobalObject(env->ctx);
-        JSValue function_ctor = JS_GetPropertyStr(env->ctx, global, "Function");
-        JS_FreeValue(env->ctx, global);
-        JSValue fn = JS_CallConstructor(env->ctx, function_ctor, static_cast<int>(argv.size()), argv.data());
-        JS_FreeValue(env->ctx, function_ctor);
+        JSValue global = JS_GetGlobalObject(env->context());
+        JSValue function_ctor = JS_GetPropertyStr(env->context(), global, "Function");
+        JS_FreeValue(env->context(), global);
+        JSValue fn = JS_CallConstructor(env->context(), function_ctor, static_cast<int>(argv.size()), argv.data());
+        JS_FreeValue(env->context(), function_ctor);
         for (size_t i = 0; i + 1 < argv.size(); ++i)
-            JS_FreeValue(env->ctx, argv[i]);
+            JS_FreeValue(env->context(), argv[i]);
         if (JS_IsException(fn))
             return napi_pending_exception;
 
-        JSValue out = JS_NewObject(env->ctx);
-        JS_SetPropertyStr(env->ctx, out, "function", fn);
-        *result_out = env->current_scope->wrap_value(out, true);
+        JSValue out = JS_NewObject(env->context());
+        JS_SetPropertyStr(env->context(), out, "function", fn);
+        *result_out = env->current_scope()->wrap_value(out, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
