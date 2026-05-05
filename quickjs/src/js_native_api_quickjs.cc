@@ -1186,38 +1186,10 @@ extern "C"
     JSValue local = value->get_inner();
     if (JS_IsUndefined(local) || JS_IsNull(local))
     {
-      *result = true;
+      *result = false;
       return napi_quickjs_clear_last_error(env);
     }
     *result = JS_IsArrayBuffer(local);
-    if (!*result && JS_IsObject(local))
-    {
-      size_t len = 0;
-      uint8_t *ptr = JS_GetArrayBuffer(env->context(), &len, local);
-      if (JS_HasException(env->context()))
-      {
-        JSValue exc = JS_GetException(env->context());
-        JS_FreeValue(env->context(), exc);
-      }
-      else
-      {
-        *result = ptr != nullptr || len > 0;
-      }
-      if (!*result)
-      {
-        JSValue byte_len = JS_GetPropertyStr(env->context(), local, "byteLength");
-        if (JS_IsException(byte_len))
-        {
-          JSValue exc = JS_GetException(env->context());
-          JS_FreeValue(env->context(), exc);
-        }
-        else
-        {
-          *result = !JS_IsUndefined(byte_len);
-          JS_FreeValue(env->context(), byte_len);
-        }
-      }
-    }
     return napi_quickjs_clear_last_error(env);
   }
 
