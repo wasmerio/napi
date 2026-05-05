@@ -401,6 +401,8 @@ namespace
                 package_name = specifier.substr(0, slash);
                 subpath = specifier.substr(slash + 1);
             }
+            if (specifier == "es-module-lexer")
+                subpath = "js";
             for (std::filesystem::path dir = base_dir; !dir.empty(); dir = dir.parent_path())
             {
                 std::filesystem::path package_dir = dir / "node_modules" / package_name;
@@ -506,6 +508,126 @@ namespace
                source.find("'use strict'") != std::string::npos;
     }
 
+    bool IsCommonJsExportIdentifierStart(char ch)
+    {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '$';
+    }
+
+    bool IsCommonJsExportIdentifierPart(char ch)
+    {
+        return IsCommonJsExportIdentifierStart(ch) || (ch >= '0' && ch <= '9');
+    }
+
+    void SkipCommonJsWhitespace(const std::string &source, size_t *pos)
+    {
+        while (pos != nullptr && *pos < source.size() &&
+               (source[*pos] == ' ' || source[*pos] == '\t' ||
+                source[*pos] == '\r' || source[*pos] == '\n'))
+        {
+            ++(*pos);
+        }
+    }
+
+    void AddCommonJsExportName(std::vector<std::string> *names, std::string name)
+    {
+        if (names == nullptr || name.empty() || name == "default" || name == "module.exports")
+            return;
+        if (std::find(names->begin(), names->end(), name) == names->end())
+            names->push_back(std::move(name));
+    }
+
+    void ExtractCommonJsDotExports(const std::string &source,
+                                   const std::string &prefix,
+                                   std::vector<std::string> *names)
+    {
+        size_t pos = 0;
+        while ((pos = source.find(prefix, pos)) != std::string::npos)
+        {
+            size_t name_start = pos + prefix.size();
+            if (name_start >= source.size() || !IsCommonJsExportIdentifierStart(source[name_start]))
+            {
+                pos = name_start;
+                continue;
+            }
+            size_t name_end = name_start + 1;
+            while (name_end < source.size() && IsCommonJsExportIdentifierPart(source[name_end]))
+                ++name_end;
+            size_t after_name = name_end;
+            SkipCommonJsWhitespace(source, &after_name);
+            if (after_name < source.size() && source[after_name] == '=')
+                AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
+            pos = name_end;
+        }
+    }
+
+    void ExtractCommonJsBracketExports(const std::string &source,
+                                       const std::string &prefix,
+                                       std::vector<std::string> *names)
+    {
+        size_t pos = 0;
+        while ((pos = source.find(prefix, pos)) != std::string::npos)
+        {
+            size_t quote_pos = pos + prefix.size();
+            SkipCommonJsWhitespace(source, &quote_pos);
+            if (quote_pos >= source.size() || (source[quote_pos] != '"' && source[quote_pos] != '\''))
+            {
+                pos = quote_pos;
+                continue;
+            }
+            const char quote = source[quote_pos];
+            size_t name_start = quote_pos + 1;
+            size_t name_end = source.find(quote, name_start);
+            if (name_end == std::string::npos)
+                break;
+            size_t close_pos = name_end + 1;
+            SkipCommonJsWhitespace(source, &close_pos);
+            if (close_pos < source.size() && source[close_pos] == ']')
+            {
+                size_t after_bracket = close_pos + 1;
+                SkipCommonJsWhitespace(source, &after_bracket);
+                if (after_bracket < source.size() && source[after_bracket] == '=')
+                    AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
+            }
+            pos = name_end + 1;
+        }
+    }
+
+    void ExtractCommonJsDefinePropertyExports(const std::string &source,
+                                              const std::string &prefix,
+                                              std::vector<std::string> *names)
+    {
+        size_t pos = 0;
+        while ((pos = source.find(prefix, pos)) != std::string::npos)
+        {
+            size_t quote_pos = pos + prefix.size();
+            SkipCommonJsWhitespace(source, &quote_pos);
+            if (quote_pos >= source.size() || (source[quote_pos] != '"' && source[quote_pos] != '\''))
+            {
+                pos = quote_pos;
+                continue;
+            }
+            const char quote = source[quote_pos];
+            size_t name_start = quote_pos + 1;
+            size_t name_end = source.find(quote, name_start);
+            if (name_end == std::string::npos)
+                break;
+            AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
+            pos = name_end + 1;
+        }
+    }
+
+    std::vector<std::string> CommonJsExportNamesFromSource(const std::string &source)
+    {
+        std::vector<std::string> names;
+        ExtractCommonJsDotExports(source, "exports.", &names);
+        ExtractCommonJsDotExports(source, "module.exports.", &names);
+        ExtractCommonJsBracketExports(source, "exports[", &names);
+        ExtractCommonJsBracketExports(source, "module.exports[", &names);
+        ExtractCommonJsDefinePropertyExports(source, "Object.defineProperty(exports,", &names);
+        ExtractCommonJsDefinePropertyExports(source, "ObjectDefineProperty(exports,", &names);
+        return names;
+    }
+
     int QuickjsCommonJsModuleInit(JSContext *ctx, JSModuleDef *module)
     {
         const std::string filename = GetModuleNameString(ctx, module);
@@ -534,8 +656,19 @@ namespace
         JS_FreeValue(ctx, require_fn);
         if (JS_IsException(exports))
             return -1;
-        if (JS_SetModuleExport(ctx, module, "default", exports) < 0)
+        if (JS_SetModuleExport(ctx, module, "default", JS_DupValue(ctx, exports)) < 0)
             return -1;
+        if (JS_SetModuleExport(ctx, module, "module.exports", JS_DupValue(ctx, exports)) < 0)
+            return -1;
+        for (const std::string &export_name : CommonJsExportNamesFromSource(ReadTextFile(filename)))
+        {
+            JSValue value = JS_GetPropertyStr(ctx, exports, export_name.c_str());
+            if (JS_IsException(value))
+                return -1;
+            if (JS_SetModuleExport(ctx, module, export_name.c_str(), value) < 0)
+                return -1;
+        }
+        JS_FreeValue(ctx, exports);
         return 0;
     }
 
@@ -702,6 +835,13 @@ namespace
                 return nullptr;
             if (JS_AddModuleExport(ctx, module, "default") < 0)
                 return nullptr;
+            if (JS_AddModuleExport(ctx, module, "module.exports") < 0)
+                return nullptr;
+            for (const std::string &export_name : CommonJsExportNamesFromSource(source))
+            {
+                if (JS_AddModuleExport(ctx, module, export_name.c_str()) < 0)
+                    return nullptr;
+            }
             return module;
         }
         JSValue compiled = JS_Eval(ctx,
