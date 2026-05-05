@@ -9,8 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -72,11 +75,31 @@ namespace
         uint8_t bytes[];
     };
 
+    enum QuickjsModuleWrapStatus : int32_t
+    {
+        kQuickjsModuleUninstantiated = 0,
+        kQuickjsModuleInstantiating = 1,
+        kQuickjsModuleInstantiated = 2,
+        kQuickjsModuleEvaluating = 3,
+        kQuickjsModuleEvaluated = 4,
+        kQuickjsModuleErrored = 5,
+    };
+
+    struct QuickjsModuleWrap
+    {
+        JSValue module = JS_UNDEFINED;
+        JSValue namespace_value = JS_UNDEFINED;
+        JSValue error = JS_UNDEFINED;
+        QuickjsModuleWrapStatus status = kQuickjsModuleUninstantiated;
+        bool has_top_level_await = false;
+    };
+
     std::mutex g_mu;
     EmbedderHooksState g_embedder_hooks;
     std::unordered_map<napi_env, EnvState> g_env_states;
 
     EnvState &EnsureEnvState(napi_env env);
+    JSValue GetBuiltinModuleValue(JSContext *ctx, const std::string &specifier);
 
     bool CheckEnv(napi_env env)
     {
@@ -91,6 +114,611 @@ namespace
     JSRuntime *Rt(napi_env env)
     {
         return JS_GetRuntime(env->context());
+    }
+
+    bool StartsWith(const std::string &value, const char *prefix)
+    {
+        return value.rfind(prefix, 0) == 0;
+    }
+
+    bool IsNodeBuiltinSpecifier(const std::string &specifier)
+    {
+        if (StartsWith(specifier, "node:"))
+            return true;
+        static const char *const builtins[] = {
+            "assert", "buffer", "events", "fs", "module", "node:assert", "node:buffer",
+            "crypto", "http", "node:events", "node:fs", "node:module", "node:os", "node:path", "node:process",
+            "node:url", "node:util", "os", "path", "perf_hooks", "process", "stream", "url", "util", "zlib"};
+        for (const char *builtin : builtins)
+        {
+            if (specifier == builtin)
+                return true;
+        }
+        return false;
+    }
+
+    std::string StripFileUrl(const std::string &value)
+    {
+        if (!StartsWith(value, "file://"))
+            return value;
+        std::string path = value.substr(7);
+        std::string out;
+        out.reserve(path.size());
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            if (path[i] == '%' && i + 2 < path.size())
+            {
+                char hex[3] = {path[i + 1], path[i + 2], '\0'};
+                char *end = nullptr;
+                long ch = std::strtol(hex, &end, 16);
+                if (end != hex && *end == '\0')
+                {
+                    out.push_back(static_cast<char>(ch));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(path[i]);
+        }
+        return out;
+    }
+
+    std::string PathToFileUrl(const std::string &path)
+    {
+        if (StartsWith(path, "file://"))
+            return path;
+        std::string out = "file://";
+        for (char ch : path)
+        {
+            if (ch == ' ')
+                out += "%20";
+            else
+                out.push_back(ch);
+        }
+        return out;
+    }
+
+    std::string ReadTextFile(const std::filesystem::path &path)
+    {
+        std::ifstream in(path);
+        if (!in)
+            return {};
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    }
+
+    bool TryResolveAsFile(const std::filesystem::path &candidate, std::filesystem::path *out)
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec)
+        {
+            *out = std::filesystem::absolute(candidate, ec).lexically_normal();
+            if (ec)
+                *out = candidate.lexically_normal();
+            return true;
+        }
+        static const char *const extensions[] = {".js", ".mjs", ".json"};
+        for (const char *ext : extensions)
+        {
+            std::filesystem::path with_ext = candidate;
+            with_ext += ext;
+            if (std::filesystem::is_regular_file(with_ext, ec) && !ec)
+            {
+                *out = std::filesystem::absolute(with_ext, ec).lexically_normal();
+                if (ec)
+                    *out = with_ext.lexically_normal();
+                return true;
+            }
+        }
+        if (std::filesystem::is_directory(candidate, ec) && !ec)
+        {
+            if (TryResolveAsFile(candidate / "index", out))
+                return true;
+        }
+        return false;
+    }
+
+    bool IsRuntimePackageTarget(const std::string &target)
+    {
+        if (target.empty())
+            return false;
+        if (target.find(".d.ts") != std::string::npos ||
+            target.find(".d.cts") != std::string::npos ||
+            target.find(".d.mts") != std::string::npos)
+            return false;
+        const std::filesystem::path path(target);
+        const std::string ext = path.extension().string();
+        return ext.empty() || ext == ".js" || ext == ".mjs" || ext == ".cjs" || ext == ".json";
+    }
+
+    bool TryResolvePackageEntry(const std::filesystem::path &package_dir, std::filesystem::path *out)
+    {
+        const std::string package_json = ReadTextFile(package_dir / "package.json");
+        std::vector<std::string> candidates;
+        auto add_json_string_after = [&](const std::string &key) {
+            size_t key_pos = package_json.find("\"" + key + "\"");
+            if (key_pos == std::string::npos)
+                return;
+            size_t colon = package_json.find(':', key_pos);
+            size_t quote = package_json.find('"', colon == std::string::npos ? key_pos : colon + 1);
+            size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
+            if (quote != std::string::npos && end != std::string::npos)
+                candidates.push_back(package_json.substr(quote + 1, end - quote - 1));
+        };
+        add_json_string_after("import");
+        add_json_string_after(".");
+        add_json_string_after("default");
+        add_json_string_after("module");
+        add_json_string_after("main");
+        add_json_string_after("exports");
+        candidates.push_back("index.js");
+        candidates.push_back("index.mjs");
+        for (const std::string &candidate : candidates)
+        {
+            if (IsRuntimePackageTarget(candidate) && TryResolveAsFile(package_dir / candidate, out))
+                return true;
+        }
+        return false;
+    }
+
+    bool TryResolvePackageSubpath(const std::filesystem::path &package_dir,
+                                  const std::string &subpath,
+                                  std::filesystem::path *out)
+    {
+        if (subpath.empty())
+            return TryResolvePackageEntry(package_dir, out);
+        const std::string package_json = ReadTextFile(package_dir / "package.json");
+        const std::string key = "\"./" + subpath + "\"";
+        for (size_t key_pos = package_json.find(key);
+             key_pos != std::string::npos;
+             key_pos = package_json.find(key, key_pos + key.size()))
+        {
+            auto target_after = [&](const char *condition) -> std::string {
+                size_t search_end = package_json.find("\n    \"./", key_pos + key.size());
+                if (search_end == std::string::npos)
+                    search_end = package_json.find("\n  }", key_pos + key.size());
+                if (search_end == std::string::npos)
+                    search_end = std::min(package_json.size(), key_pos + size_t{800});
+                size_t condition_pos = package_json.find(std::string("\"") + condition + "\"", key_pos);
+                if (condition_pos == std::string::npos || condition_pos > search_end)
+                    return {};
+                size_t colon = package_json.find(':', condition_pos);
+                size_t quote = package_json.find('"', colon == std::string::npos ? condition_pos : colon + 1);
+                size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
+                if (quote == std::string::npos || end == std::string::npos || end > search_end)
+                    return {};
+                return package_json.substr(quote + 1, end - quote - 1);
+            };
+            std::string target = target_after("import");
+            if (target.empty())
+                target = target_after("default");
+            if (target.empty())
+            {
+                size_t colon = package_json.find(':', key_pos);
+                size_t quote = package_json.find('"', colon == std::string::npos ? key_pos : colon + 1);
+                size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
+                if (quote != std::string::npos && end != std::string::npos)
+                    target = package_json.substr(quote + 1, end - quote - 1);
+            }
+            if (IsRuntimePackageTarget(target) && TryResolveAsFile(package_dir / target, out))
+                return true;
+        }
+        return TryResolveAsFile(package_dir / subpath, out);
+    }
+
+    bool TryResolvePackageImport(const std::filesystem::path &base_dir,
+                                 const std::string &specifier,
+                                 std::filesystem::path *out)
+    {
+        for (std::filesystem::path dir = base_dir; !dir.empty(); dir = dir.parent_path())
+        {
+            const std::filesystem::path package_json_path = dir / "package.json";
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(package_json_path, ec) && !ec)
+            {
+                const std::string package_json = ReadTextFile(package_json_path);
+                const std::string key = "\"" + specifier + "\"";
+                const size_t key_pos = package_json.find(key);
+                if (key_pos != std::string::npos)
+                {
+                    auto target_after = [&](const char *condition) -> std::string {
+                        size_t search_end = package_json.find("\n    \"#", key_pos + key.size());
+                        if (search_end == std::string::npos)
+                            search_end = package_json.find("\n  }", key_pos + key.size());
+                        if (search_end == std::string::npos)
+                            search_end = std::min(package_json.size(), key_pos + size_t{500});
+                        size_t condition_pos = package_json.find(std::string("\"") + condition + "\"", key_pos);
+                        if (condition_pos == std::string::npos || condition_pos > search_end)
+                            return {};
+                        size_t colon = package_json.find(':', condition_pos);
+                        size_t quote = package_json.find('"', colon == std::string::npos ? condition_pos : colon + 1);
+                        size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
+                        if (quote == std::string::npos || end == std::string::npos || end > search_end)
+                            return {};
+                        return package_json.substr(quote + 1, end - quote - 1);
+                    };
+                    std::string target = target_after("default");
+                    if (target.empty())
+                        target = target_after("import");
+                    if (IsRuntimePackageTarget(target) && TryResolveAsFile(dir / target, out))
+                        return true;
+                }
+            }
+            if (dir == dir.root_path())
+                break;
+        }
+        return false;
+    }
+
+    bool ResolveModuleSpecifier(const std::string &base, const std::string &specifier, std::string *out)
+    {
+        if (IsNodeBuiltinSpecifier(specifier))
+        {
+            *out = specifier;
+            return true;
+        }
+        std::filesystem::path base_path = StripFileUrl(base);
+        std::filesystem::path base_dir = std::filesystem::current_path();
+        std::error_code ec;
+        if (!base_path.empty() && base_path.is_absolute())
+            base_dir = std::filesystem::is_directory(base_path, ec) ? base_path : base_path.parent_path();
+
+        std::filesystem::path resolved;
+        if (StartsWith(specifier, "#"))
+        {
+            if (TryResolvePackageImport(base_dir, specifier, &resolved))
+            {
+                *out = resolved.string();
+                return true;
+            }
+        }
+        else if (StartsWith(specifier, "file://"))
+        {
+            if (TryResolveAsFile(StripFileUrl(specifier), &resolved))
+            {
+                *out = resolved.string();
+                return true;
+            }
+        }
+        else if (StartsWith(specifier, "./") || StartsWith(specifier, "../") || StartsWith(specifier, "/"))
+        {
+            std::filesystem::path candidate = StartsWith(specifier, "/") ? std::filesystem::path(specifier)
+                                                                         : (base_dir / specifier);
+            if (TryResolveAsFile(candidate, &resolved))
+            {
+                *out = resolved.string();
+                return true;
+            }
+        }
+        else
+        {
+            std::string package_name = specifier;
+            std::string subpath;
+            size_t slash = specifier[0] == '@' ? specifier.find('/', specifier.find('/') + 1) : specifier.find('/');
+            if (slash != std::string::npos)
+            {
+                package_name = specifier.substr(0, slash);
+                subpath = specifier.substr(slash + 1);
+            }
+            for (std::filesystem::path dir = base_dir; !dir.empty(); dir = dir.parent_path())
+            {
+                std::filesystem::path package_dir = dir / "node_modules" / package_name;
+                if (TryResolvePackageSubpath(package_dir, subpath, &resolved))
+                {
+                    *out = resolved.string();
+                    return true;
+                }
+                if (subpath.empty() && TryResolvePackageEntry(package_dir, &resolved))
+                {
+                    *out = resolved.string();
+                    return true;
+                }
+                if (dir == dir.root_path())
+                    break;
+            }
+        }
+        return false;
+    }
+
+    char *DupCString(JSContext *ctx, const std::string &value)
+    {
+        char *out = static_cast<char *>(js_malloc(ctx, value.size() + 1));
+        if (out == nullptr)
+            return nullptr;
+        std::memcpy(out, value.c_str(), value.size() + 1);
+        return out;
+    }
+
+    JSModuleDef *ModuleDefFromValue(JSValueConst value)
+    {
+        if (JS_VALUE_GET_TAG(value) != JS_TAG_MODULE)
+            return nullptr;
+        return static_cast<JSModuleDef *>(JS_VALUE_GET_PTR(value));
+    }
+
+    void StoreModuleError(napi_env env, QuickjsModuleWrap *module)
+    {
+        if (!CheckEnv(env) || module == nullptr)
+            return;
+        JSContext *ctx = Ctx(env);
+        JSValue error = JS_GetException(ctx);
+        if (JS_IsException(error) || JS_IsUndefined(error))
+            error = JS_NewError(ctx);
+        if (!JS_IsUndefined(module->error))
+            JS_FreeValue(ctx, module->error);
+        module->error = JS_DupValue(ctx, error);
+        module->status = kQuickjsModuleErrored;
+        napi_util__::set_last_exception(env, error);
+    }
+
+    int SetModuleImportMetaUrl(JSContext *ctx, JSValueConst module_value, const std::string &url)
+    {
+        JSModuleDef *module = ModuleDefFromValue(module_value);
+        if (module == nullptr)
+            return -1;
+        JSValue meta = JS_GetImportMeta(ctx, module);
+        if (JS_IsException(meta))
+            return -1;
+        const std::string href = PathToFileUrl(url);
+        JS_SetPropertyStr(ctx, meta, "url", JS_NewStringLen(ctx, href.c_str(), href.size()));
+        JS_FreeValue(ctx, meta);
+        return 0;
+    }
+
+    std::string GetModuleNameString(JSContext *ctx, JSModuleDef *module)
+    {
+        JSAtom atom = JS_GetModuleName(ctx, module);
+        JSValue name_value = JS_AtomToString(ctx, atom);
+        JS_FreeAtom(ctx, atom);
+        const char *name_cstr = JS_ToCString(ctx, name_value);
+        std::string out = name_cstr != nullptr ? std::string(name_cstr) : std::string();
+        JS_FreeCString(ctx, name_cstr);
+        JS_FreeValue(ctx, name_value);
+        return out;
+    }
+
+    bool FileLooksCommonJs(const std::string &path, const std::string &source)
+    {
+        std::filesystem::path file(path);
+        const std::string ext = file.extension().string();
+        if (ext == ".cjs")
+            return true;
+        if (ext == ".mjs")
+            return false;
+        for (std::filesystem::path dir = file.parent_path(); !dir.empty(); dir = dir.parent_path())
+        {
+            std::error_code ec;
+            const std::filesystem::path package_json_path = dir / "package.json";
+            if (std::filesystem::is_regular_file(package_json_path, ec) && !ec)
+            {
+                const std::string package_json = ReadTextFile(package_json_path);
+                if (package_json.find("\"type\"") != std::string::npos &&
+                    package_json.find("\"module\"") != std::string::npos)
+                    return false;
+                break;
+            }
+            if (dir.filename() == "node_modules" || dir == dir.root_path())
+                break;
+        }
+        return source.find("module.exports") != std::string::npos ||
+               source.find("exports.") != std::string::npos ||
+               source.find("'use strict'") != std::string::npos;
+    }
+
+    int QuickjsCommonJsModuleInit(JSContext *ctx, JSModuleDef *module)
+    {
+        const std::string filename = GetModuleNameString(ctx, module);
+        JSValue module_builtin = GetBuiltinModuleValue(ctx, "module");
+        JSValue create_require = JS_IsObject(module_builtin) ? JS_GetPropertyStr(ctx, module_builtin, "createRequire")
+                                                             : JS_UNDEFINED;
+        if (!JS_IsFunction(ctx, create_require))
+        {
+            JS_FreeValue(ctx, create_require);
+            JS_FreeValue(ctx, module_builtin);
+            JS_ThrowReferenceError(ctx, "CommonJS module loader unavailable");
+            return -1;
+        }
+        const std::string url = PathToFileUrl(filename);
+        JSValue url_value = JS_NewStringLen(ctx, url.c_str(), url.size());
+        JSValue require_fn = JS_Call(ctx, create_require, module_builtin, 1, &url_value);
+        JS_FreeValue(ctx, url_value);
+        JS_FreeValue(ctx, create_require);
+        JS_FreeValue(ctx, module_builtin);
+        if (JS_IsException(require_fn))
+            return -1;
+
+        JSValue filename_value = JS_NewStringLen(ctx, filename.c_str(), filename.size());
+        JSValue exports = JS_Call(ctx, require_fn, JS_UNDEFINED, 1, &filename_value);
+        JS_FreeValue(ctx, filename_value);
+        JS_FreeValue(ctx, require_fn);
+        if (JS_IsException(exports))
+            return -1;
+        if (JS_SetModuleExport(ctx, module, "default", exports) < 0)
+            return -1;
+        return 0;
+    }
+
+    std::vector<std::string> BuiltinExportNames(const std::string &specifier)
+    {
+        std::string name = StartsWith(specifier, "node:") ? specifier.substr(5) : specifier;
+        if (name == "util")
+            return {"default", "format", "formatWithOptions", "inspect", "promisify", "types"};
+        if (name == "path")
+            return {"default", "basename", "dirname", "extname", "format", "isAbsolute", "join", "normalize",
+                    "parse", "relative", "resolve", "sep", "delimiter"};
+        if (name == "fs")
+            return {"default", "existsSync", "promises", "readFileSync", "statSync", "writeFileSync"};
+        if (name == "url")
+            return {"default", "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL"};
+        if (name == "module")
+            return {"default", "createRequire", "builtinModules", "Module"};
+        if (name == "os")
+            return {"default", "arch", "cpus", "homedir", "platform", "release", "tmpdir", "type"};
+        if (name == "buffer")
+            return {"default", "Buffer", "Blob", "File"};
+        if (name == "events")
+            return {"default", "EventEmitter", "once", "on"};
+        if (name == "assert")
+            return {"default", "ok", "equal", "deepEqual", "strictEqual", "deepStrictEqual"};
+        if (name == "process")
+            return {"default"};
+        return {"default"};
+    }
+
+    JSValue GetBuiltinModuleValue(JSContext *ctx, const std::string &specifier)
+    {
+        std::string builtin_name = StartsWith(specifier, "node:") ? specifier.substr(5) : specifier;
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue process = JS_GetPropertyStr(ctx, global, "process");
+        JS_FreeValue(ctx, global);
+        JSValue get_builtin = JS_IsObject(process) ? JS_GetPropertyStr(ctx, process, "getBuiltinModule") : JS_UNDEFINED;
+        JSValue builtin_name_value = JS_NewString(ctx, builtin_name.c_str());
+        JSValue exports = JS_IsFunction(ctx, get_builtin)
+                              ? JS_Call(ctx, get_builtin, process, 1, &builtin_name_value)
+                              : JS_UNDEFINED;
+        JS_FreeValue(ctx, builtin_name_value);
+        JS_FreeValue(ctx, get_builtin);
+        JS_FreeValue(ctx, process);
+        return exports;
+    }
+
+    std::vector<std::string> BuiltinExportNames(JSContext *ctx, const std::string &specifier)
+    {
+        std::vector<std::string> names = {"default"};
+        JSValue exports = GetBuiltinModuleValue(ctx, specifier);
+        if (!JS_IsObject(exports))
+        {
+            JS_FreeValue(ctx, exports);
+            const std::vector<std::string> fallback = BuiltinExportNames(specifier);
+            for (const std::string &name : fallback)
+            {
+                if (std::find(names.begin(), names.end(), name) == names.end())
+                    names.push_back(name);
+            }
+            return names;
+        }
+        JSPropertyEnum *props = nullptr;
+        uint32_t len = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &len, exports, JS_GPN_STRING_MASK) == 0)
+        {
+            for (uint32_t i = 0; i < len; ++i)
+            {
+                const char *name = JS_AtomToCString(ctx, props[i].atom);
+                if (name != nullptr && std::find(names.begin(), names.end(), name) == names.end())
+                    names.emplace_back(name);
+                JS_FreeCString(ctx, name);
+            }
+            JS_FreePropertyEnum(ctx, props, len);
+        }
+        JS_FreeValue(ctx, exports);
+        return names;
+    }
+
+    int QuickjsBuiltinModuleInit(JSContext *ctx, JSModuleDef *module)
+    {
+        JSAtom atom = JS_GetModuleName(ctx, module);
+        JSValue name_value = JS_AtomToString(ctx, atom);
+        JS_FreeAtom(ctx, atom);
+        const char *specifier_cstr = JS_ToCString(ctx, name_value);
+        std::string specifier = specifier_cstr != nullptr ? std::string(specifier_cstr) : std::string();
+        JS_FreeCString(ctx, specifier_cstr);
+        JS_FreeValue(ctx, name_value);
+        JSValue exports = GetBuiltinModuleValue(ctx, specifier);
+        if (JS_IsException(exports))
+            return -1;
+
+        for (const std::string &name : BuiltinExportNames(ctx, specifier))
+        {
+            JSValue value = name == "default" ? JS_DupValue(ctx, exports) : JS_GetPropertyStr(ctx, exports, name.c_str());
+            if (JS_IsException(value))
+            {
+                JS_FreeValue(ctx, exports);
+                return -1;
+            }
+            if (JS_SetModuleExport(ctx, module, name.c_str(), value) < 0)
+            {
+                JS_FreeValue(ctx, exports);
+                return -1;
+            }
+        }
+        JS_FreeValue(ctx, exports);
+        return 0;
+    }
+
+    char *QuickjsModuleNormalize(JSContext *ctx, const char *module_base_name, const char *module_name, void *opaque)
+    {
+        (void)opaque;
+        std::string resolved;
+        if (!ResolveModuleSpecifier(module_base_name != nullptr ? module_base_name : "",
+                                    module_name != nullptr ? module_name : "",
+                                    &resolved))
+        {
+            if (std::getenv("EDGE_TRACE_QUICKJS_MODULES") != nullptr)
+                std::fprintf(stderr, "quickjs-module normalize-miss base=%s spec=%s\n",
+                             module_base_name != nullptr ? module_base_name : "",
+                             module_name != nullptr ? module_name : "");
+            return DupCString(ctx, module_name != nullptr ? std::string(module_name) : std::string());
+        }
+        if (std::getenv("EDGE_TRACE_QUICKJS_MODULES") != nullptr)
+            std::fprintf(stderr, "quickjs-module normalize base=%s spec=%s -> %s\n",
+                         module_base_name != nullptr ? module_base_name : "",
+                         module_name != nullptr ? module_name : "",
+                         resolved.c_str());
+        return DupCString(ctx, resolved);
+    }
+
+    JSModuleDef *QuickjsModuleLoader(JSContext *ctx, const char *module_name, void *opaque)
+    {
+        (void)opaque;
+        std::string name = module_name != nullptr ? std::string(module_name) : std::string();
+        if (IsNodeBuiltinSpecifier(name))
+        {
+            JSModuleDef *module = JS_NewCModule(ctx, name.c_str(), QuickjsBuiltinModuleInit);
+            if (module == nullptr)
+                return nullptr;
+            for (const std::string &export_name : BuiltinExportNames(ctx, name))
+            {
+                if (JS_AddModuleExport(ctx, module, export_name.c_str()) < 0)
+                    return nullptr;
+            }
+            return module;
+        }
+
+        std::string source = ReadTextFile(name);
+        if (source.empty())
+        {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(name, ec) || ec)
+            {
+                JS_ThrowReferenceError(ctx, "could not load module '%s'", name.c_str());
+                return nullptr;
+            }
+        }
+        if (FileLooksCommonJs(name, source))
+        {
+            JSModuleDef *module = JS_NewCModule(ctx, name.c_str(), QuickjsCommonJsModuleInit);
+            if (module == nullptr)
+                return nullptr;
+            if (JS_AddModuleExport(ctx, module, "default") < 0)
+                return nullptr;
+            return module;
+        }
+        JSValue compiled = JS_Eval(ctx,
+                                   source.c_str(),
+                                   source.size(),
+                                   name.c_str(),
+                                   JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(compiled))
+            return nullptr;
+        JSModuleDef *module = ModuleDefFromValue(compiled);
+        if (module != nullptr && SetModuleImportMetaUrl(ctx, compiled, name) < 0)
+        {
+            JS_FreeValue(ctx, compiled);
+            return nullptr;
+        }
+        JS_FreeValue(ctx, compiled);
+        return module;
     }
 
     std::string ToUtf8(napi_env env, napi_value value)
@@ -712,6 +1340,7 @@ extern "C"
         JS_SetContextOpaque(context, env);
         EnsureEnvState(env);
         JS_SetPromiseHook(rt, QuickjsPromiseHook, env);
+        JS_SetModuleLoaderFunc(rt, QuickjsModuleNormalize, QuickjsModuleLoader, env);
 
         *result = env;
         return napi_ok;
@@ -1018,11 +1647,14 @@ extern "C"
         if (!CheckEnv(env) || promise == nullptr || state_out == nullptr || has_result_out == nullptr)
             return napi_invalid_arg;
         JSContext *ctx = Ctx(env);
-        JSValue result = JS_GetPropertyStr(ctx, promise->get_inner(), "result");
-        if (JS_IsException(result))
-            return napi_pending_exception;
-        *state_out = 0;
-        *has_result_out = !JS_IsUndefined(result);
+        JSPromiseStateEnum state = JS_PromiseState(ctx, promise->get_inner());
+        if (state == JS_PROMISE_NOT_A_PROMISE)
+            return napi_invalid_arg;
+        *state_out = static_cast<int32_t>(state);
+        *has_result_out = state != JS_PROMISE_PENDING;
+        JSValue result = JS_UNDEFINED;
+        if (*has_result_out)
+            result = JS_PromiseResult(ctx, promise->get_inner());
         if (result_out != nullptr)
             return WrapOwned(env, result, result_out);
         JS_FreeValue(ctx, result);
@@ -1759,16 +2391,55 @@ extern "C"
         void **handle_out)
     {
         (void)wrapper;
-        (void)url;
         (void)context_or_undefined;
-        (void)source;
         (void)line_offset;
         (void)column_offset;
         (void)cached_data_or_id;
         if (!CheckEnv(env) || handle_out == nullptr)
             return napi_invalid_arg;
-        *handle_out = nullptr;
-        return napi_generic_failure;
+        if (source == nullptr)
+            return napi_invalid_arg;
+
+        std::string source_text = ToUtf8(env, source);
+        std::string url_text = url == nullptr ? "<module>" : ToUtf8(env, url);
+        JSValue compiled = JS_Eval(Ctx(env),
+                                   source_text.c_str(),
+                                   source_text.size(),
+                                   url_text.empty() ? "<module>" : url_text.c_str(),
+                                   JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(compiled))
+        {
+            JSValue exc = JS_GetException(Ctx(env));
+            napi_util__::set_last_exception(env, exc);
+            *handle_out = nullptr;
+            return napi_pending_exception;
+        }
+        if (ModuleDefFromValue(compiled) == nullptr)
+        {
+            JS_FreeValue(Ctx(env), compiled);
+            *handle_out = nullptr;
+            return napi_generic_failure;
+        }
+        if (SetModuleImportMetaUrl(Ctx(env), compiled, url_text) < 0)
+        {
+            JSValue exc = JS_GetException(Ctx(env));
+            napi_util__::set_last_exception(env, exc);
+            JS_FreeValue(Ctx(env), compiled);
+            *handle_out = nullptr;
+            return napi_pending_exception;
+        }
+
+        auto *module = new (std::nothrow) QuickjsModuleWrap();
+        if (module == nullptr)
+        {
+            JS_FreeValue(Ctx(env), compiled);
+            *handle_out = nullptr;
+            return napi_generic_failure;
+        }
+        module->module = compiled;
+        module->has_top_level_await = source_text.find("await") != std::string::npos;
+        *handle_out = module;
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
@@ -1793,8 +2464,17 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(napi_env env, void *handle)
     {
-        (void)handle;
-        return CheckEnv(env) ? napi_ok : napi_invalid_arg;
+        if (!CheckEnv(env))
+            return napi_invalid_arg;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module != nullptr)
+        {
+            JS_FreeValue(Ctx(env), module->module);
+            JS_FreeValue(Ctx(env), module->namespace_value);
+            JS_FreeValue(Ctx(env), module->error);
+            delete module;
+        }
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
@@ -1814,16 +2494,33 @@ extern "C"
         size_t count,
         void *const *linked_handles)
     {
-        (void)handle;
         (void)count;
         (void)linked_handles;
-        return UnsupportedIfValidEnv(env);
+        if (!CheckEnv(env) || handle == nullptr)
+            return napi_invalid_arg;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module->status == kQuickjsModuleErrored)
+            return napi_pending_exception;
+        module->status = kQuickjsModuleInstantiating;
+        if (JS_ResolveModule(Ctx(env), module->module) < 0)
+        {
+            StoreModuleError(env, module);
+            return napi_pending_exception;
+        }
+        module->status = kQuickjsModuleInstantiated;
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, void *handle)
     {
-        (void)handle;
-        return UnsupportedIfValidEnv(env);
+        if (!CheckEnv(env) || handle == nullptr)
+            return napi_invalid_arg;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module->status == kQuickjsModuleInstantiated ||
+            module->status == kQuickjsModuleEvaluating ||
+            module->status == kQuickjsModuleEvaluated)
+            return napi_ok;
+        return unofficial_napi_module_wrap_link(env, handle, 0, nullptr);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
@@ -1833,12 +2530,34 @@ extern "C"
         bool break_on_sigint,
         napi_value *result_out)
     {
-        (void)handle;
         (void)timeout;
         (void)break_on_sigint;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return CreateUndefined(env, result_out);
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        if (module->status == kQuickjsModuleErrored)
+            return WrapDup(env, module->error, result_out);
+        if (module->status == kQuickjsModuleUninstantiated ||
+            module->status == kQuickjsModuleInstantiating)
+        {
+            napi_status status = unofficial_napi_module_wrap_instantiate(env, handle);
+            if (status != napi_ok)
+                return status;
+        }
+        if (module->status == kQuickjsModuleEvaluated)
+            return WrapOwned(env, JS_NewSettledPromise(Ctx(env), false, JS_UNDEFINED), result_out);
+
+        module->status = kQuickjsModuleEvaluating;
+        JSValue promise = JS_EvalFunction(Ctx(env), JS_DupValue(Ctx(env), module->module));
+        if (JS_IsException(promise))
+        {
+            StoreModuleError(env, module);
+            return napi_pending_exception;
+        }
+        module->status = kQuickjsModuleEvaluated;
+        return WrapOwned(env, promise, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
@@ -1848,12 +2567,15 @@ extern "C"
         napi_value parent_filename,
         napi_value *result_out)
     {
-        (void)handle;
         (void)filename;
         (void)parent_filename;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return CreateUndefined(env, result_out);
+        napi_value promise = nullptr;
+        napi_status status = unofficial_napi_module_wrap_evaluate(env, handle, -1, false, &promise);
+        if (status != napi_ok)
+            return status;
+        return unofficial_napi_module_wrap_get_namespace(env, handle, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
@@ -1861,10 +2583,25 @@ extern "C"
         void *handle,
         napi_value *result_out)
     {
-        (void)handle;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return WrapOwned(env, JS_NewObject(Ctx(env)), result_out);
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        if (JS_IsUndefined(module->namespace_value))
+        {
+            JSModuleDef *module_def = ModuleDefFromValue(module->module);
+            if (module_def == nullptr)
+                return napi_generic_failure;
+            JSValue ns = JS_GetModuleNamespace(Ctx(env), module_def);
+            if (JS_IsException(ns))
+            {
+                StoreModuleError(env, module);
+                return napi_pending_exception;
+            }
+            module->namespace_value = ns;
+        }
+        return WrapDup(env, module->namespace_value, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_status(
@@ -1872,10 +2609,12 @@ extern "C"
         void *handle,
         int32_t *status_out)
     {
-        (void)handle;
         if (!CheckEnv(env) || status_out == nullptr)
             return napi_invalid_arg;
-        *status_out = 0;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        *status_out = static_cast<int32_t>(module->status);
         return napi_ok;
     }
 
@@ -1884,10 +2623,14 @@ extern "C"
         void *handle,
         napi_value *result_out)
     {
-        (void)handle;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return CreateUndefined(env, result_out);
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        if (JS_IsUndefined(module->error))
+            return CreateUndefined(env, result_out);
+        return WrapDup(env, module->error, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_has_top_level_await(
@@ -1895,10 +2638,12 @@ extern "C"
         void *handle,
         bool *result_out)
     {
-        (void)handle;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        *result_out = false;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        *result_out = module->has_top_level_await;
         return napi_ok;
     }
 
@@ -1907,10 +2652,12 @@ extern "C"
         void *handle,
         bool *result_out)
     {
-        (void)handle;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        *result_out = false;
+        auto *module = static_cast<QuickjsModuleWrap *>(handle);
+        if (module == nullptr)
+            return napi_invalid_arg;
+        *result_out = module->has_top_level_await;
         return napi_ok;
     }
 
