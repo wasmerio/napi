@@ -195,3 +195,17 @@ TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
             napi_ok);
   EXPECT_FALSE(contains);
 }
+
+TEST_F(Test65UnofficialContextify, PrivateSymbolAcceptsAutoLength) {
+  EnvScope s(runtime_.get());
+
+  napi_value symbol = nullptr;
+  ASSERT_EQ(unofficial_napi_create_private_symbol(
+                s.env, "node:arrowMessage", NAPI_AUTO_LENGTH, &symbol),
+            napi_ok);
+  ASSERT_NE(symbol, nullptr);
+
+  napi_valuetype type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, symbol, &type), napi_ok);
+  EXPECT_EQ(type, napi_symbol);
+}

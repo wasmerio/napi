@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -51,6 +53,8 @@ namespace
         JSValue promise_reject_callback = JS_UNDEFINED;
         JSValue promise_hooks[4] = {JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
         JSValue continuation_preserved_embedder_data = JS_UNDEFINED;
+        std::unordered_map<void *, JSValue> promise_context_frames;
+        std::vector<JSValue> promise_context_frame_stack;
         JSValue import_module_dynamically_callback = JS_UNDEFINED;
         JSValue initialize_import_meta_object_callback = JS_UNDEFINED;
         ErrorFormattingState error_formatting;
@@ -71,6 +75,8 @@ namespace
     std::mutex g_mu;
     EmbedderHooksState g_embedder_hooks;
     std::unordered_map<napi_env, EnvState> g_env_states;
+
+    EnvState &EnsureEnvState(napi_env env);
 
     bool CheckEnv(napi_env env)
     {
@@ -99,6 +105,149 @@ namespace
         return out;
     }
 
+    std::string ToUtf8(JSContext *ctx, JSValueConst value)
+    {
+        if (ctx == nullptr)
+            return {};
+        const char *str = JS_ToCString(ctx, value);
+        if (str == nullptr)
+            return {};
+        std::string out(str);
+        JS_FreeCString(ctx, str);
+        return out;
+    }
+
+    bool ContextifyCompileTraceEnabled()
+    {
+        return std::getenv("EDGE_TRACE_QUICKJS_CONTEXTIFY") != nullptr ||
+               std::getenv("EDGE_TRACE_BUILTINS") != nullptr;
+    }
+
+    int32_t GetInt32PropertyOr(JSContext *ctx, JSValueConst object, const char *name, int32_t fallback)
+    {
+        JSValue value = JS_GetPropertyStr(ctx, object, name);
+        if (JS_IsException(value) || JS_IsUndefined(value) || JS_IsNull(value))
+        {
+            JS_FreeValue(ctx, value);
+            return fallback;
+        }
+        int32_t out = fallback;
+        (void)JS_ToInt32(ctx, &out, value);
+        JS_FreeValue(ctx, value);
+        return out;
+    }
+
+    std::string GetStringPropertyOrEmpty(JSContext *ctx, JSValueConst object, const char *name)
+    {
+        JSValue value = JS_GetPropertyStr(ctx, object, name);
+        if (JS_IsException(value) || JS_IsUndefined(value) || JS_IsNull(value))
+        {
+            JS_FreeValue(ctx, value);
+            return {};
+        }
+        std::string out = ToUtf8(ctx, value);
+        JS_FreeValue(ctx, value);
+        return out;
+    }
+
+    std::string BuiltinIdFromResourceName(const std::string &resource_name)
+    {
+        const char prefix[] = "node:";
+        if (resource_name.rfind(prefix, 0) == 0)
+            return resource_name.substr(sizeof(prefix) - 1);
+        return {};
+    }
+
+    std::string SourceLineAt(const std::string &source, int32_t one_based_line)
+    {
+        if (source.empty() || one_based_line <= 0)
+            return {};
+        size_t pos = 0;
+        for (int32_t line = 1; line < one_based_line; ++line)
+        {
+            pos = source.find('\n', pos);
+            if (pos == std::string::npos)
+                return {};
+            ++pos;
+        }
+        size_t end = source.find('\n', pos);
+        std::string line = source.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.size() > 240)
+            line = line.substr(0, 240) + "...";
+        return line;
+    }
+
+    void SetStringProperty(JSContext *ctx, JSValueConst object, const char *name, const std::string &value)
+    {
+        JS_SetPropertyStr(ctx, object, name, JS_NewStringLen(ctx, value.c_str(), value.size()));
+    }
+
+    void SetInt32Property(JSContext *ctx, JSValueConst object, const char *name, int32_t value)
+    {
+        JS_SetPropertyStr(ctx, object, name, JS_NewInt32(ctx, value));
+    }
+
+    void AnnotateContextifyCompileException(napi_env env,
+                                            JSValueConst exception,
+                                            const std::string &source,
+                                            const std::string &resource_name,
+                                            int32_t line_offset,
+                                            int32_t column_offset)
+    {
+        if (!CheckEnv(env) || !JS_IsObject(exception))
+            return;
+
+        JSContext *ctx = Ctx(env);
+        const std::string builtin_id = BuiltinIdFromResourceName(resource_name);
+        const std::string quickjs_file = GetStringPropertyOrEmpty(ctx, exception, "fileName");
+        const int32_t quickjs_line = GetInt32PropertyOr(ctx, exception, "lineNumber", -1);
+        const int32_t mapped_line = quickjs_line > 0 ? quickjs_line + line_offset : -1;
+
+        JS_SetPropertyStr(ctx, exception, "node:quickjsContextifyCompile", JS_NewBool(ctx, true));
+        SetStringProperty(ctx, exception, "node:quickjsCompileResourceName", resource_name);
+        if (!builtin_id.empty())
+            SetStringProperty(ctx, exception, "node:quickjsCompileBuiltinId", builtin_id);
+        SetInt32Property(ctx, exception, "node:quickjsCompileLineOffset", line_offset);
+        SetInt32Property(ctx, exception, "node:quickjsCompileColumnOffset", column_offset);
+        if (quickjs_line > 0)
+            SetInt32Property(ctx, exception, "node:quickjsCompileQuickJSLine", quickjs_line);
+        if (mapped_line > 0)
+            SetInt32Property(ctx, exception, "node:quickjsCompileMappedLine", mapped_line);
+
+        if (!ContextifyCompileTraceEnabled())
+            return;
+
+        std::string summary = "[quickjs contextify compile]";
+        if (!resource_name.empty())
+            summary += " resource=" + resource_name;
+        if (!builtin_id.empty())
+            summary += " builtin=" + builtin_id;
+        if (!quickjs_file.empty())
+            summary += " quickjsFile=" + quickjs_file;
+        if (quickjs_line > 0)
+            summary += " quickjsLine=" + std::to_string(quickjs_line);
+        if (mapped_line > 0)
+            summary += " mappedLine=" + std::to_string(mapped_line);
+        summary += " lineOffset=" + std::to_string(line_offset);
+        summary += " columnOffset=" + std::to_string(column_offset);
+
+        std::string source_line = SourceLineAt(source, quickjs_line);
+        if (!source_line.empty())
+            summary += " sourceLine=\"" + source_line + "\"";
+
+        std::fprintf(stderr, "%s\n", summary.c_str());
+
+        JSValue stack = JS_GetPropertyStr(ctx, exception, "stack");
+        std::string stack_text;
+        if (!JS_IsException(stack) && !JS_IsUndefined(stack) && !JS_IsNull(stack))
+            stack_text = ToUtf8(ctx, stack);
+        JS_FreeValue(ctx, stack);
+        if (!stack_text.empty())
+            SetStringProperty(ctx, exception, "stack", summary + "\n" + stack_text);
+    }
+
     bool IsTruthyProperty(napi_env env, napi_value object, const char *name)
     {
         JSValue prop = JS_GetPropertyStr(Ctx(env), object->get_inner(), name);
@@ -107,6 +256,215 @@ namespace
         bool out = JS_ToBool(Ctx(env), prop);
         JS_FreeValue(Ctx(env), prop);
         return out;
+    }
+
+    void FreeStoredValue(JSContext *ctx, JSValue *value)
+    {
+        if (value != nullptr && !JS_IsUndefined(*value))
+        {
+            JS_FreeValue(ctx, *value);
+            *value = JS_UNDEFINED;
+        }
+    }
+
+    void ReplaceStoredValue(napi_env env, JSValue *target, JSValueConst value)
+    {
+        JSContext *ctx = Ctx(env);
+        FreeStoredValue(ctx, target);
+        *target = JS_DupValue(ctx, value);
+    }
+
+    void *JsIdentity(JSValueConst value)
+    {
+        return JS_IsObject(value) ? JS_VALUE_GET_PTR(value) : nullptr;
+    }
+
+    void ClearPendingExceptionIfAny(JSContext *ctx)
+    {
+        if (ctx == nullptr || !JS_HasException(ctx))
+            return;
+        JSValue exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, exception);
+    }
+
+    void CallPromiseHook(napi_env env, JSValueConst hook, int argc, JSValueConst *argv)
+    {
+        if (!CheckEnv(env) || !JS_IsFunction(Ctx(env), hook))
+            return;
+
+        JSContext *ctx = Ctx(env);
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue ret = JS_Call(ctx, hook, global, argc, argv);
+        JS_FreeValue(ctx, global);
+        if (JS_IsException(ret))
+        {
+            ClearPendingExceptionIfAny(ctx);
+            return;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+
+    void CapturePromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+        void *identity = JsIdentity(promise);
+        if (identity == nullptr)
+            return;
+
+        auto &state = EnsureEnvState(env);
+        if (JS_IsUndefined(state.continuation_preserved_embedder_data))
+            return;
+        JSContext *ctx = Ctx(env);
+        JSValue frame = JS_DupValue(ctx, state.continuation_preserved_embedder_data);
+        auto it = state.promise_context_frames.find(identity);
+        if (it != state.promise_context_frames.end())
+        {
+            FreeStoredValue(ctx, &it->second);
+            it->second = frame;
+        }
+        else
+        {
+            state.promise_context_frames.emplace(identity, frame);
+        }
+    }
+
+    void EnterPromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+
+        auto &state = EnsureEnvState(env);
+        JSContext *ctx = Ctx(env);
+        state.promise_context_frame_stack.push_back(
+            JS_DupValue(ctx, state.continuation_preserved_embedder_data));
+
+        JSValueConst frame = JS_UNDEFINED;
+        void *identity = JsIdentity(promise);
+        if (identity != nullptr)
+        {
+            auto it = state.promise_context_frames.find(identity);
+            if (it != state.promise_context_frames.end())
+                frame = it->second;
+        }
+        ReplaceStoredValue(env, &state.continuation_preserved_embedder_data, frame);
+    }
+
+    void LeavePromiseContextFrame(napi_env env, JSValueConst promise)
+    {
+        if (!CheckEnv(env))
+            return;
+
+        auto &state = EnsureEnvState(env);
+        JSContext *ctx = Ctx(env);
+        if (!state.promise_context_frame_stack.empty())
+        {
+            JSValue previous = state.promise_context_frame_stack.back();
+            state.promise_context_frame_stack.pop_back();
+            FreeStoredValue(ctx, &state.continuation_preserved_embedder_data);
+            state.continuation_preserved_embedder_data = previous;
+        }
+
+        void *identity = JsIdentity(promise);
+        if (identity != nullptr)
+        {
+            auto it = state.promise_context_frames.find(identity);
+            if (it != state.promise_context_frames.end())
+            {
+                FreeStoredValue(ctx, &it->second);
+                state.promise_context_frames.erase(it);
+            }
+        }
+    }
+
+    JSValue GetStoredFunction(napi_env env, JSValueConst value)
+    {
+        if (!CheckEnv(env) || !JS_IsFunction(Ctx(env), value))
+            return JS_UNDEFINED;
+        return JS_DupValue(Ctx(env), value);
+    }
+
+    JSValue GetPromiseHook(napi_env env, size_t index)
+    {
+        if (!CheckEnv(env) || index >= 4)
+            return JS_UNDEFINED;
+        auto &state = EnsureEnvState(env);
+        return GetStoredFunction(env, state.promise_hooks[index]);
+    }
+
+    JSValue GetPromiseRejectCallback(napi_env env)
+    {
+        if (!CheckEnv(env))
+            return JS_UNDEFINED;
+        auto &state = EnsureEnvState(env);
+        return GetStoredFunction(env, state.promise_reject_callback);
+    }
+
+    JSValue QuickjsMicrotaskJob(JSContext *ctx, int argc, JSValueConst *argv)
+    {
+        if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+            return JS_UNDEFINED;
+        return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, nullptr);
+    }
+
+    void QuickjsPromiseHook(JSContext *ctx,
+                            JSPromiseHookType type,
+                            JSValueConst promise,
+                            JSValueConst parent_promise,
+                            void *opaque)
+    {
+        napi_env env = static_cast<napi_env>(opaque);
+        if (!CheckEnv(env) || Ctx(env) != ctx)
+            return;
+
+        if (type == JS_PROMISE_HOOK_INIT)
+            CapturePromiseContextFrame(env, promise);
+        else if (type == JS_PROMISE_HOOK_BEFORE)
+            EnterPromiseContextFrame(env, promise);
+
+        size_t hook_index = static_cast<size_t>(type);
+        JSValue hook = GetPromiseHook(env, hook_index);
+        if (JS_IsFunction(ctx, hook))
+        {
+            if (type == JS_PROMISE_HOOK_INIT)
+            {
+                JSValueConst argv[] = {promise, parent_promise};
+                CallPromiseHook(env, hook, 2, argv);
+            }
+            else
+            {
+                JSValueConst argv[] = {promise};
+                CallPromiseHook(env, hook, 1, argv);
+            }
+        }
+        JS_FreeValue(ctx, hook);
+
+        if (type == JS_PROMISE_HOOK_AFTER)
+            LeavePromiseContextFrame(env, promise);
+    }
+
+    void QuickjsPromiseRejectionTracker(JSContext *ctx,
+                                        JSValueConst promise,
+                                        JSValueConst reason,
+                                        bool is_handled,
+                                        void *opaque)
+    {
+        napi_env env = static_cast<napi_env>(opaque);
+        if (!CheckEnv(env) || Ctx(env) != ctx)
+            return;
+
+        JSValue callback = GetPromiseRejectCallback(env);
+        if (!JS_IsFunction(ctx, callback))
+        {
+            JS_FreeValue(ctx, callback);
+            return;
+        }
+
+        JSValue event_type = JS_NewInt32(ctx, is_handled ? 1 : 0);
+        JSValueConst argv[] = {event_type, promise, reason};
+        CallPromiseHook(env, callback, 3, argv);
+        JS_FreeValue(ctx, event_type);
+        JS_FreeValue(ctx, callback);
     }
 
     void FreeEnvStateValues(napi_env env, EnvState *state)
@@ -127,6 +485,12 @@ namespace
         for (JSValue &hook : state->promise_hooks)
             free_value(&hook);
         free_value(&state->continuation_preserved_embedder_data);
+        for (auto &entry : state->promise_context_frames)
+            free_value(&entry.second);
+        state->promise_context_frames.clear();
+        for (JSValue &frame : state->promise_context_frame_stack)
+            free_value(&frame);
+        state->promise_context_frame_stack.clear();
         free_value(&state->import_module_dynamically_callback);
         free_value(&state->initialize_import_meta_object_callback);
         free_value(&state->error_formatting.get_source_map_error_source);
@@ -174,6 +538,9 @@ namespace
             state.destroy_callback(env, state.destroy_callback_data);
 
         JSContext *ctx = env->context();
+        JSRuntime *rt = JS_GetRuntime(ctx);
+        JS_SetPromiseHook(rt, nullptr, nullptr);
+        JS_SetHostPromiseRejectionTracker(rt, nullptr, nullptr);
         JS_SetContextOpaque(ctx, nullptr);
         delete env;
 
@@ -199,7 +566,7 @@ namespace
         }
         if (scope->rt != nullptr)
         {
-            JS_FreeRuntime(scope->rt);
+            // JS_FreeRuntime(scope->rt);
             scope->rt = nullptr;
         }
         delete scope;
@@ -285,6 +652,39 @@ namespace
     {
         return CheckEnv(env) ? napi_generic_failure : napi_invalid_arg;
     }
+
+    void EnsureSymbolProperty(JSContext *ctx,
+                              JSValueConst symbol_ctor,
+                              const char *name,
+                              const char *description)
+    {
+        JSValue existing = JS_GetPropertyStr(ctx, symbol_ctor, name);
+        if (JS_IsException(existing))
+            return;
+        bool missing = JS_IsUndefined(existing);
+        JS_FreeValue(ctx, existing);
+        if (!missing)
+            return;
+
+        JS_DefinePropertyValueStr(
+            ctx, symbol_ctor, name, JS_NewSymbol(ctx, description, false), 0);
+    }
+
+    void EnsureNodeWellKnownSymbols(JSContext *ctx)
+    {
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue symbol_ctor = JS_GetPropertyStr(ctx, global, "Symbol");
+        JS_FreeValue(ctx, global);
+        if (JS_IsException(symbol_ctor) || !JS_IsObject(symbol_ctor))
+        {
+            JS_FreeValue(ctx, symbol_ctor);
+            return;
+        }
+
+        EnsureSymbolProperty(ctx, symbol_ctor, "dispose", "Symbol.dispose");
+        EnsureSymbolProperty(ctx, symbol_ctor, "asyncDispose", "Symbol.asyncDispose");
+        JS_FreeValue(ctx, symbol_ctor);
+    }
 }
 
 extern "C"
@@ -311,6 +711,7 @@ extern "C"
 
         JS_SetContextOpaque(context, env);
         EnsureEnvState(env);
+        JS_SetPromiseHook(rt, QuickjsPromiseHook, env);
 
         *result = env;
         return napi_ok;
@@ -344,15 +745,16 @@ extern "C"
         auto ctx = JS_NewContext(rt);
         if (ctx == nullptr)
         {
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
+        EnsureNodeWellKnownSymbols(ctx);
 
         auto scope = new (std::nothrow) UnofficialEnvScope{.rt = rt, .ctx = ctx};
         if (scope == nullptr)
         {
             JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
 
@@ -361,7 +763,7 @@ extern "C"
         {
             delete scope;
             JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
+            // JS_FreeRuntime(rt);
             return (status == napi_ok) ? napi_generic_failure : status;
         }
 
@@ -518,21 +920,9 @@ extern "C"
         if (!CheckEnv(env) || !IsCallable(env, callback))
             return napi_invalid_arg;
         JSContext *ctx = Ctx(env);
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue promise_ctor = JS_GetPropertyStr(ctx, global, "Promise");
-        JS_FreeValue(ctx, global);
-        JSValue resolve = JS_GetPropertyStr(ctx, promise_ctor, "resolve");
-        JSValue promise = JS_Call(ctx, resolve, promise_ctor, 0, nullptr);
-        JSValue then = JS_GetPropertyStr(ctx, promise, "then");
-        JSValue argv[] = {callback->get_inner()};
-        JSValue ret = JS_Call(ctx, then, promise, 1, argv);
-        JS_FreeValue(ctx, then);
-        JS_FreeValue(ctx, promise);
-        JS_FreeValue(ctx, resolve);
-        JS_FreeValue(ctx, promise_ctor);
-        if (JS_IsException(ret))
-            return napi_pending_exception;
-        JS_FreeValue(ctx, ret);
+        JSValueConst argv[] = {callback->get_inner()};
+        if (JS_EnqueueJob(ctx, QuickjsMicrotaskJob, 1, argv) < 0)
+            return JS_HasException(ctx) ? napi_pending_exception : napi_generic_failure;
         return napi_ok;
     }
 
@@ -541,7 +931,15 @@ extern "C"
     {
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).promise_reject_callback);
+        auto &state = EnsureEnvState(env);
+        napi_status status = StoreOptionalFunction(env, callback, &state.promise_reject_callback);
+        if (status != napi_ok)
+            return status;
+        JS_SetHostPromiseRejectionTracker(
+            Rt(env),
+            JS_IsFunction(Ctx(env), state.promise_reject_callback) ? QuickjsPromiseRejectionTracker : nullptr,
+            env);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
@@ -560,6 +958,7 @@ extern "C"
             if (status != napi_ok)
                 return status;
         }
+        JS_SetPromiseHook(Rt(env), QuickjsPromiseHook, env);
         return napi_ok;
     }
 
@@ -845,8 +1244,12 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
+        const size_t description_length =
+            utf8description == nullptr ? 0
+            : length == NAPI_AUTO_LENGTH ? std::strlen(utf8description)
+                                         : length;
         std::string description(utf8description == nullptr ? "" : utf8description,
-                                utf8description == nullptr ? 0 : length);
+                                description_length);
         JSValue symbol = JS_NewSymbol(Ctx(env), description.c_str(), false);
         if (JS_IsException(symbol))
             return napi_pending_exception;
@@ -1234,9 +1637,6 @@ extern "C"
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        (void)filename;
-        (void)line_offset;
-        (void)column_offset;
         (void)cached_data_or_undefined;
         (void)produce_cached_data;
         (void)parsing_context_or_undefined;
@@ -1258,20 +1658,48 @@ extern "C"
                 argv.push_back(param);
             }
         }
-        argv.push_back(code->get_inner());
+
+        std::string source = ToUtf8(env, code);
+        std::string source_url;
+        JSValue code_arg = JS_DupValue(Ctx(env), code->get_inner());
+        if (filename != nullptr && !JS_IsUndefined(filename->get_inner()) && !JS_IsNull(filename->get_inner()))
+        {
+            source_url = ToUtf8(env, filename);
+            if (!source.empty() && !source_url.empty())
+            {
+                source += "\n//# sourceURL=";
+                source += source_url;
+                JSValue with_source_url =
+                    JS_NewStringLen(Ctx(env), source.c_str(), source.size());
+                if (!JS_IsException(with_source_url))
+                {
+                    JS_FreeValue(Ctx(env), code_arg);
+                    code_arg = with_source_url;
+                }
+            }
+        }
+        argv.push_back(code_arg);
 
         JSValue global = JS_GetGlobalObject(Ctx(env));
         JSValue function_ctor = JS_GetPropertyStr(Ctx(env), global, "Function");
         JS_FreeValue(Ctx(env), global);
         JSValue fn = JS_CallConstructor(Ctx(env), function_ctor, static_cast<int>(argv.size()), argv.data());
         JS_FreeValue(Ctx(env), function_ctor);
-        for (size_t i = 0; i + 1 < argv.size(); ++i)
-            JS_FreeValue(Ctx(env), argv[i]);
+        for (JSValue arg : argv)
+            JS_FreeValue(Ctx(env), arg);
         if (JS_IsException(fn))
+        {
+            JSValue exc = JS_GetException(Ctx(env));
+            AnnotateContextifyCompileException(env, exc, source, source_url, line_offset, column_offset);
+            napi_util__::set_last_exception(env, exc);
             return napi_pending_exception;
+        }
 
         JSValue out = JS_NewObject(Ctx(env));
         JS_SetPropertyStr(Ctx(env), out, "function", fn);
+        if (!source_url.empty())
+            SetStringProperty(Ctx(env), out, "sourceURL", source_url);
+        JS_SetPropertyStr(Ctx(env), out, "sourceMapURL", JS_UNDEFINED);
         return WrapOwned(env, out, result_out);
     }
 
