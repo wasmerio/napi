@@ -79,6 +79,7 @@ add_library(napi_quickjs STATIC
   src/internal/napi_scope.cc
   src/internal/napi_util.cc
   src/internal/napi_value.cc
+  src/quickjs_cjs_exports.cc
   src/unofficial_napi.cc
 )
 

@@ -3,6 +3,7 @@
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_util.h"
+#include "quickjs_cjs_exports.h"
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +28,8 @@ struct UnofficialEnvScope
 
 namespace
 {
+    constexpr size_t kDefaultEdgeQuickjsStackSize = 4 * 1024 * 1024;
+
     struct ErrorFormattingState
     {
         bool source_maps_enabled = false;
@@ -188,14 +191,24 @@ namespace
         return ss.str();
     }
 
+    std::filesystem::path NormalizeResolvedPath(const std::filesystem::path &path)
+    {
+        std::error_code ec;
+        std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
+        if (!ec)
+            return resolved.lexically_normal();
+        resolved = std::filesystem::absolute(path, ec);
+        if (!ec)
+            return resolved.lexically_normal();
+        return path.lexically_normal();
+    }
+
     bool TryResolveAsFile(const std::filesystem::path &candidate, std::filesystem::path *out)
     {
         std::error_code ec;
         if (std::filesystem::is_regular_file(candidate, ec) && !ec)
         {
-            *out = std::filesystem::absolute(candidate, ec).lexically_normal();
-            if (ec)
-                *out = candidate.lexically_normal();
+            *out = NormalizeResolvedPath(candidate);
             return true;
         }
         static const char *const extensions[] = {".js", ".mjs", ".json"};
@@ -205,9 +218,7 @@ namespace
             with_ext += ext;
             if (std::filesystem::is_regular_file(with_ext, ec) && !ec)
             {
-                *out = std::filesystem::absolute(with_ext, ec).lexically_normal();
-                if (ec)
-                    *out = with_ext.lexically_normal();
+                *out = NormalizeResolvedPath(with_ext);
                 return true;
             }
         }
@@ -232,9 +243,205 @@ namespace
         return ext.empty() || ext == ".js" || ext == ".mjs" || ext == ".cjs" || ext == ".json";
     }
 
+    size_t SkipJsonWhitespace(const std::string &json, size_t pos, size_t limit)
+    {
+        while (pos < limit && pos < json.size())
+        {
+            const char ch = json[pos];
+            if (ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t')
+                break;
+            ++pos;
+        }
+        return pos;
+    }
+
+    size_t FindJsonStringEnd(const std::string &json, size_t quote_pos, size_t limit)
+    {
+        bool escaped = false;
+        for (size_t i = quote_pos + 1; i < limit && i < json.size(); ++i)
+        {
+            const char ch = json[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\')
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+                return i;
+        }
+        return std::string::npos;
+    }
+
+    std::string JsonStringValueAt(const std::string &json, size_t quote_pos, size_t limit)
+    {
+        if (quote_pos >= limit || quote_pos >= json.size() || json[quote_pos] != '"')
+            return {};
+        const size_t end = FindJsonStringEnd(json, quote_pos, limit);
+        if (end == std::string::npos)
+            return {};
+        return json.substr(quote_pos + 1, end - quote_pos - 1);
+    }
+
+    size_t FindJsonObjectEnd(const std::string &json, size_t open_pos, size_t limit)
+    {
+        if (open_pos >= limit || open_pos >= json.size() || json[open_pos] != '{')
+            return std::string::npos;
+
+        size_t depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (size_t i = open_pos; i < limit && i < json.size(); ++i)
+        {
+            const char ch = json[i];
+            if (in_string)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == '\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == '"')
+                {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (ch == '"')
+            {
+                in_string = true;
+                continue;
+            }
+            if (ch == '{')
+            {
+                ++depth;
+            }
+            else if (ch == '}')
+            {
+                if (depth == 0)
+                    return std::string::npos;
+                --depth;
+                if (depth == 0)
+                    return i + 1;
+            }
+        }
+        return std::string::npos;
+    }
+
+    std::string JsonTargetAfterCondition(const std::string &json,
+                                         size_t range_start,
+                                         size_t range_end,
+                                         const char *condition)
+    {
+        const std::string key = std::string("\"") + condition + "\"";
+        for (size_t condition_pos = json.find(key, range_start);
+             condition_pos != std::string::npos && condition_pos < range_end;
+             condition_pos = json.find(key, condition_pos + key.size()))
+        {
+            const size_t colon = json.find(':', condition_pos + key.size());
+            if (colon == std::string::npos || colon >= range_end)
+                return {};
+            const size_t value_pos = SkipJsonWhitespace(json, colon + 1, range_end);
+            if (value_pos >= range_end || value_pos >= json.size())
+                return {};
+            if (json[value_pos] == '"')
+                return JsonStringValueAt(json, value_pos, range_end);
+            if (json[value_pos] == '{')
+            {
+                const size_t object_end = FindJsonObjectEnd(json, value_pos, range_end);
+                if (object_end == std::string::npos)
+                    return {};
+                const std::string nested_default = JsonTargetAfterCondition(json,
+                                                                            value_pos + 1,
+                                                                            object_end - 1,
+                                                                            "default");
+                if (!nested_default.empty())
+                    return nested_default;
+            }
+        }
+        return {};
+    }
+
+    std::string JsonDirectStringValueAfterKey(const std::string &json,
+                                              size_t key_pos,
+                                              size_t key_size,
+                                              size_t range_end)
+    {
+        const size_t colon = json.find(':', key_pos + key_size);
+        if (colon == std::string::npos || colon >= range_end)
+            return {};
+        const size_t value_pos = SkipJsonWhitespace(json, colon + 1, range_end);
+        return JsonStringValueAt(json, value_pos, range_end);
+    }
+
+    std::string ExpandPackageTarget(const std::string &target, const std::string &subpath)
+    {
+        std::string expanded = target;
+        for (size_t star = expanded.find('*');
+             star != std::string::npos;
+             star = expanded.find('*', star + subpath.size()))
+        {
+            expanded.replace(star, 1, subpath);
+        }
+        return expanded;
+    }
+
+    bool TryResolvePackageTarget(const std::filesystem::path &package_dir,
+                                 const std::string &target,
+                                 const std::string &subpath,
+                                 std::filesystem::path *out)
+    {
+        const std::string expanded = ExpandPackageTarget(target, subpath);
+        return IsRuntimePackageTarget(expanded) && TryResolveAsFile(package_dir / expanded, out);
+    }
+
+    size_t PackageExportsSearchEnd(const std::string &package_json, size_t key_pos, size_t fallback_size)
+    {
+        size_t search_end = package_json.find("\n    \"./", key_pos + 1);
+        if (search_end == std::string::npos)
+            search_end = package_json.find("\n  }", key_pos + 1);
+        if (search_end == std::string::npos)
+            search_end = std::min(package_json.size(), key_pos + fallback_size);
+        return search_end;
+    }
+
+    bool TryResolvePackageExportsKey(const std::filesystem::path &package_dir,
+                                     const std::string &package_json,
+                                     const std::string &key,
+                                     const std::string &subpath,
+                                     std::filesystem::path *out)
+    {
+        for (size_t key_pos = package_json.find(key);
+             key_pos != std::string::npos;
+             key_pos = package_json.find(key, key_pos + key.size()))
+        {
+            const size_t search_end = PackageExportsSearchEnd(package_json, key_pos, size_t{1000});
+            const char *const conditions[] = {"import", "module", "default"};
+            for (const char *condition : conditions)
+            {
+                const std::string target = JsonTargetAfterCondition(package_json, key_pos + key.size(), search_end, condition);
+                if (TryResolvePackageTarget(package_dir, target, subpath, out))
+                    return true;
+            }
+            const std::string target = JsonDirectStringValueAfterKey(package_json, key_pos, key.size(), search_end);
+            if (TryResolvePackageTarget(package_dir, target, subpath, out))
+                return true;
+        }
+        return false;
+    }
+
     bool TryResolvePackageEntry(const std::filesystem::path &package_dir, std::filesystem::path *out)
     {
         const std::string package_json = ReadTextFile(package_dir / "package.json");
+        if (TryResolvePackageExportsKey(package_dir, package_json, "\".\"", "", out))
+            return true;
         std::vector<std::string> candidates;
         auto add_json_string_after = [&](const std::string &key) {
             size_t key_pos = package_json.find("\"" + key + "\"");
@@ -248,8 +455,8 @@ namespace
         };
         add_json_string_after("import");
         add_json_string_after(".");
-        add_json_string_after("default");
         add_json_string_after("module");
+        add_json_string_after("default");
         add_json_string_after("main");
         add_json_string_after("exports");
         candidates.push_back("index.js");
@@ -270,41 +477,18 @@ namespace
             return TryResolvePackageEntry(package_dir, out);
         const std::string package_json = ReadTextFile(package_dir / "package.json");
         const std::string key = "\"./" + subpath + "\"";
-        for (size_t key_pos = package_json.find(key);
-             key_pos != std::string::npos;
-             key_pos = package_json.find(key, key_pos + key.size()))
+        if (TryResolvePackageExportsKey(package_dir, package_json, key, "", out))
+            return true;
+        if (TryResolvePackageExportsKey(package_dir, package_json, "\"./*\"", subpath, out))
+            return true;
+        const std::filesystem::path subpath_dir = package_dir / subpath;
+        std::error_code ec;
+        if (std::filesystem::is_directory(subpath_dir, ec) && !ec &&
+            TryResolvePackageEntry(subpath_dir, out))
         {
-            auto target_after = [&](const char *condition) -> std::string {
-                size_t search_end = package_json.find("\n    \"./", key_pos + key.size());
-                if (search_end == std::string::npos)
-                    search_end = package_json.find("\n  }", key_pos + key.size());
-                if (search_end == std::string::npos)
-                    search_end = std::min(package_json.size(), key_pos + size_t{800});
-                size_t condition_pos = package_json.find(std::string("\"") + condition + "\"", key_pos);
-                if (condition_pos == std::string::npos || condition_pos > search_end)
-                    return {};
-                size_t colon = package_json.find(':', condition_pos);
-                size_t quote = package_json.find('"', colon == std::string::npos ? condition_pos : colon + 1);
-                size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
-                if (quote == std::string::npos || end == std::string::npos || end > search_end)
-                    return {};
-                return package_json.substr(quote + 1, end - quote - 1);
-            };
-            std::string target = target_after("import");
-            if (target.empty())
-                target = target_after("default");
-            if (target.empty())
-            {
-                size_t colon = package_json.find(':', key_pos);
-                size_t quote = package_json.find('"', colon == std::string::npos ? key_pos : colon + 1);
-                size_t end = quote == std::string::npos ? std::string::npos : package_json.find('"', quote + 1);
-                if (quote != std::string::npos && end != std::string::npos)
-                    target = package_json.substr(quote + 1, end - quote - 1);
-            }
-            if (IsRuntimePackageTarget(target) && TryResolveAsFile(package_dir / target, out))
-                return true;
+            return true;
         }
-        return TryResolveAsFile(package_dir / subpath, out);
+        return TryResolveAsFile(subpath_dir, out);
     }
 
     bool TryResolvePackageImport(const std::filesystem::path &base_dir,
@@ -508,126 +692,6 @@ namespace
                source.find("'use strict'") != std::string::npos;
     }
 
-    bool IsCommonJsExportIdentifierStart(char ch)
-    {
-        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '$';
-    }
-
-    bool IsCommonJsExportIdentifierPart(char ch)
-    {
-        return IsCommonJsExportIdentifierStart(ch) || (ch >= '0' && ch <= '9');
-    }
-
-    void SkipCommonJsWhitespace(const std::string &source, size_t *pos)
-    {
-        while (pos != nullptr && *pos < source.size() &&
-               (source[*pos] == ' ' || source[*pos] == '\t' ||
-                source[*pos] == '\r' || source[*pos] == '\n'))
-        {
-            ++(*pos);
-        }
-    }
-
-    void AddCommonJsExportName(std::vector<std::string> *names, std::string name)
-    {
-        if (names == nullptr || name.empty() || name == "default" || name == "module.exports")
-            return;
-        if (std::find(names->begin(), names->end(), name) == names->end())
-            names->push_back(std::move(name));
-    }
-
-    void ExtractCommonJsDotExports(const std::string &source,
-                                   const std::string &prefix,
-                                   std::vector<std::string> *names)
-    {
-        size_t pos = 0;
-        while ((pos = source.find(prefix, pos)) != std::string::npos)
-        {
-            size_t name_start = pos + prefix.size();
-            if (name_start >= source.size() || !IsCommonJsExportIdentifierStart(source[name_start]))
-            {
-                pos = name_start;
-                continue;
-            }
-            size_t name_end = name_start + 1;
-            while (name_end < source.size() && IsCommonJsExportIdentifierPart(source[name_end]))
-                ++name_end;
-            size_t after_name = name_end;
-            SkipCommonJsWhitespace(source, &after_name);
-            if (after_name < source.size() && source[after_name] == '=')
-                AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
-            pos = name_end;
-        }
-    }
-
-    void ExtractCommonJsBracketExports(const std::string &source,
-                                       const std::string &prefix,
-                                       std::vector<std::string> *names)
-    {
-        size_t pos = 0;
-        while ((pos = source.find(prefix, pos)) != std::string::npos)
-        {
-            size_t quote_pos = pos + prefix.size();
-            SkipCommonJsWhitespace(source, &quote_pos);
-            if (quote_pos >= source.size() || (source[quote_pos] != '"' && source[quote_pos] != '\''))
-            {
-                pos = quote_pos;
-                continue;
-            }
-            const char quote = source[quote_pos];
-            size_t name_start = quote_pos + 1;
-            size_t name_end = source.find(quote, name_start);
-            if (name_end == std::string::npos)
-                break;
-            size_t close_pos = name_end + 1;
-            SkipCommonJsWhitespace(source, &close_pos);
-            if (close_pos < source.size() && source[close_pos] == ']')
-            {
-                size_t after_bracket = close_pos + 1;
-                SkipCommonJsWhitespace(source, &after_bracket);
-                if (after_bracket < source.size() && source[after_bracket] == '=')
-                    AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
-            }
-            pos = name_end + 1;
-        }
-    }
-
-    void ExtractCommonJsDefinePropertyExports(const std::string &source,
-                                              const std::string &prefix,
-                                              std::vector<std::string> *names)
-    {
-        size_t pos = 0;
-        while ((pos = source.find(prefix, pos)) != std::string::npos)
-        {
-            size_t quote_pos = pos + prefix.size();
-            SkipCommonJsWhitespace(source, &quote_pos);
-            if (quote_pos >= source.size() || (source[quote_pos] != '"' && source[quote_pos] != '\''))
-            {
-                pos = quote_pos;
-                continue;
-            }
-            const char quote = source[quote_pos];
-            size_t name_start = quote_pos + 1;
-            size_t name_end = source.find(quote, name_start);
-            if (name_end == std::string::npos)
-                break;
-            AddCommonJsExportName(names, source.substr(name_start, name_end - name_start));
-            pos = name_end + 1;
-        }
-    }
-
-    std::vector<std::string> CommonJsExportNamesFromSource(const std::string &source)
-    {
-        std::vector<std::string> names;
-        ExtractCommonJsDotExports(source, "exports.", &names);
-        ExtractCommonJsDotExports(source, "module.exports.", &names);
-        ExtractCommonJsBracketExports(source, "exports[", &names);
-        ExtractCommonJsBracketExports(source, "module.exports[", &names);
-        ExtractCommonJsDefinePropertyExports(source, "Object.defineProperty(exports,", &names);
-        ExtractCommonJsDefinePropertyExports(source, "ObjectDefineProperty(exports,", &names);
-        return names;
-    }
-
     int QuickjsCommonJsModuleInit(JSContext *ctx, JSModuleDef *module)
     {
         const std::string filename = GetModuleNameString(ctx, module);
@@ -660,7 +724,8 @@ namespace
             return -1;
         if (JS_SetModuleExport(ctx, module, "module.exports", JS_DupValue(ctx, exports)) < 0)
             return -1;
-        for (const std::string &export_name : CommonJsExportNamesFromSource(ReadTextFile(filename)))
+        for (const std::string &export_name :
+             quickjs_napi::common_js_export_names_for_file(filename, ReadTextFile(filename)))
         {
             JSValue value = JS_GetPropertyStr(ctx, exports, export_name.c_str());
             if (JS_IsException(value))
@@ -837,7 +902,8 @@ namespace
                 return nullptr;
             if (JS_AddModuleExport(ctx, module, "module.exports") < 0)
                 return nullptr;
-            for (const std::string &export_name : CommonJsExportNamesFromSource(source))
+            for (const std::string &export_name :
+                 quickjs_napi::common_js_export_names_for_file(name, source))
             {
                 if (JS_AddModuleExport(ctx, module, export_name.c_str()) < 0)
                     return nullptr;
@@ -1505,6 +1571,7 @@ extern "C"
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
             return napi_generic_failure;
+        JS_SetMaxStackSize(rt, kDefaultEdgeQuickjsStackSize);
         if (options != nullptr)
         {
             if (options->max_old_generation_size_in_bytes > 0)
