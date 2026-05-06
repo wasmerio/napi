@@ -4,6 +4,7 @@
 #include "internal/napi_external.h"
 #include "internal/napi_util.h"
 #include "quickjs_cjs_exports.h"
+#include "unofficial_module_loader.h"
 
 #include <algorithm>
 #include <chrono>
@@ -181,9 +182,53 @@ namespace
         return out;
     }
 
+    std::filesystem::path ResolveSymlinkComponents(const std::filesystem::path &path)
+    {
+        std::filesystem::path current;
+        for (const std::filesystem::path &part : path.lexically_normal())
+        {
+            if (part == "." || part.empty())
+                continue;
+            if (part == "..")
+            {
+                current /= part;
+                continue;
+            }
+            if (part == path.root_name() || part == path.root_directory())
+            {
+                current /= part;
+                continue;
+            }
+
+            std::filesystem::path candidate = current.empty() ? part : current / part;
+            std::error_code ec;
+            if (std::filesystem::is_symlink(candidate, ec) && !ec)
+            {
+                std::filesystem::path target = std::filesystem::read_symlink(candidate, ec);
+                if (!ec)
+                {
+                    current = target.is_absolute() ? target : (candidate.parent_path() / target);
+                    current = current.lexically_normal();
+                    continue;
+                }
+            }
+            current = candidate;
+        }
+        return current.lexically_normal();
+    }
+
     std::string ReadTextFile(const std::filesystem::path &path)
     {
         std::ifstream in(path);
+        if (!in)
+        {
+            const std::filesystem::path resolved = ResolveSymlinkComponents(path);
+            if (resolved != path.lexically_normal())
+            {
+                in.clear();
+                in.open(resolved);
+            }
+        }
         if (!in)
             return {};
         std::ostringstream ss;
@@ -197,13 +242,16 @@ namespace
         std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
         if (!ec)
             return resolved.lexically_normal();
+        resolved = ResolveSymlinkComponents(path);
+        if (resolved != path.lexically_normal())
+            return resolved.lexically_normal();
         resolved = std::filesystem::absolute(path, ec);
         if (!ec)
             return resolved.lexically_normal();
         return path.lexically_normal();
     }
 
-    bool TryResolveAsFile(const std::filesystem::path &candidate, std::filesystem::path *out)
+    bool IsRegularFileFollowingSymlinks(const std::filesystem::path &candidate, std::filesystem::path *out)
     {
         std::error_code ec;
         if (std::filesystem::is_regular_file(candidate, ec) && !ec)
@@ -211,20 +259,56 @@ namespace
             *out = NormalizeResolvedPath(candidate);
             return true;
         }
+        const std::filesystem::path resolved = ResolveSymlinkComponents(candidate);
+        if (resolved != candidate.lexically_normal())
+        {
+            ec.clear();
+            if (std::filesystem::is_regular_file(resolved, ec) && !ec)
+            {
+                *out = NormalizeResolvedPath(resolved);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsDirectoryFollowingSymlinks(const std::filesystem::path &candidate, std::filesystem::path *out)
+    {
+        std::error_code ec;
+        if (std::filesystem::is_directory(candidate, ec) && !ec)
+        {
+            *out = NormalizeResolvedPath(candidate);
+            return true;
+        }
+        const std::filesystem::path resolved = ResolveSymlinkComponents(candidate);
+        if (resolved != candidate.lexically_normal())
+        {
+            ec.clear();
+            if (std::filesystem::is_directory(resolved, ec) && !ec)
+            {
+                *out = NormalizeResolvedPath(resolved);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool TryResolveAsFile(const std::filesystem::path &candidate, std::filesystem::path *out)
+    {
+        if (IsRegularFileFollowingSymlinks(candidate, out))
+            return true;
         static const char *const extensions[] = {".js", ".mjs", ".json"};
         for (const char *ext : extensions)
         {
             std::filesystem::path with_ext = candidate;
             with_ext += ext;
-            if (std::filesystem::is_regular_file(with_ext, ec) && !ec)
-            {
-                *out = NormalizeResolvedPath(with_ext);
+            if (IsRegularFileFollowingSymlinks(with_ext, out))
                 return true;
-            }
         }
-        if (std::filesystem::is_directory(candidate, ec) && !ec)
+        std::filesystem::path directory;
+        if (IsDirectoryFollowingSymlinks(candidate, &directory))
         {
-            if (TryResolveAsFile(candidate / "index", out))
+            if (TryResolveAsFile(directory / "index", out))
                 return true;
         }
         return false;
@@ -542,69 +626,7 @@ namespace
             *out = specifier;
             return true;
         }
-        std::filesystem::path base_path = StripFileUrl(base);
-        std::filesystem::path base_dir = std::filesystem::current_path();
-        std::error_code ec;
-        if (!base_path.empty() && base_path.is_absolute())
-            base_dir = std::filesystem::is_directory(base_path, ec) ? base_path : base_path.parent_path();
-
-        std::filesystem::path resolved;
-        if (StartsWith(specifier, "#"))
-        {
-            if (TryResolvePackageImport(base_dir, specifier, &resolved))
-            {
-                *out = resolved.string();
-                return true;
-            }
-        }
-        else if (StartsWith(specifier, "file://"))
-        {
-            if (TryResolveAsFile(StripFileUrl(specifier), &resolved))
-            {
-                *out = resolved.string();
-                return true;
-            }
-        }
-        else if (StartsWith(specifier, "./") || StartsWith(specifier, "../") || StartsWith(specifier, "/"))
-        {
-            std::filesystem::path candidate = StartsWith(specifier, "/") ? std::filesystem::path(specifier)
-                                                                         : (base_dir / specifier);
-            if (TryResolveAsFile(candidate, &resolved))
-            {
-                *out = resolved.string();
-                return true;
-            }
-        }
-        else
-        {
-            std::string package_name = specifier;
-            std::string subpath;
-            size_t slash = specifier[0] == '@' ? specifier.find('/', specifier.find('/') + 1) : specifier.find('/');
-            if (slash != std::string::npos)
-            {
-                package_name = specifier.substr(0, slash);
-                subpath = specifier.substr(slash + 1);
-            }
-            if (specifier == "es-module-lexer")
-                subpath = "js";
-            for (std::filesystem::path dir = base_dir; !dir.empty(); dir = dir.parent_path())
-            {
-                std::filesystem::path package_dir = dir / "node_modules" / package_name;
-                if (TryResolvePackageSubpath(package_dir, subpath, &resolved))
-                {
-                    *out = resolved.string();
-                    return true;
-                }
-                if (subpath.empty() && TryResolvePackageEntry(package_dir, &resolved))
-                {
-                    *out = resolved.string();
-                    return true;
-                }
-                if (dir == dir.root_path())
-                    break;
-            }
-        }
-        return false;
+        return edge_quickjs::module_loader::ResolveESMPath(base, specifier, out);
     }
 
     char *DupCString(JSContext *ctx, const std::string &value)
@@ -678,9 +700,7 @@ namespace
             const std::filesystem::path package_json_path = dir / "package.json";
             if (std::filesystem::is_regular_file(package_json_path, ec) && !ec)
             {
-                const std::string package_json = ReadTextFile(package_json_path);
-                if (package_json.find("\"type\"") != std::string::npos &&
-                    package_json.find("\"module\"") != std::string::npos)
+                if (edge_quickjs::module_loader::PackageTypeIsModule(package_json_path))
                     return false;
                 break;
             }
