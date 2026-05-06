@@ -79,6 +79,7 @@ add_library(napi_quickjs STATIC
   src/internal/napi_scope.cc
   src/internal/napi_util.cc
   src/internal/napi_value.cc
+  src/unofficial_module_loader.cc
   src/quickjs_cjs_exports.cc
   src/unofficial_napi.cc
 )
@@ -86,8 +87,8 @@ add_library(napi_quickjs STATIC
 target_include_directories(napi_quickjs
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
-  PRIVATE
     "${NAPI_QUICKJS_ROOT}/src"
+  PRIVATE
     "${NAPI_QUICKJS_INCLUDE_DIR}"
 )
 
