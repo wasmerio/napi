@@ -57,6 +57,75 @@ namespace
     }
     JS_FreeValue(ctx, prototype);
   }
+
+  bool exception_message_contains(JSContext *ctx, JSValueConst exception, const char *needle)
+  {
+    if (needle == nullptr)
+      return false;
+
+    JSValue message = JS_GetPropertyStr(ctx, exception, "message");
+    const char *text = nullptr;
+    if (!JS_IsException(message) && !JS_IsUndefined(message) && !JS_IsNull(message))
+      text = JS_ToCString(ctx, message);
+    else if (JS_IsException(message))
+      clear_quickjs_exception(ctx);
+    if (text == nullptr)
+    {
+      text = JS_ToCString(ctx, exception);
+      if (text == nullptr && JS_HasException(ctx))
+        clear_quickjs_exception(ctx);
+    }
+
+    bool found = text != nullptr && std::strstr(text, needle) != nullptr;
+    if (text != nullptr)
+      JS_FreeCString(ctx, text);
+    JS_FreeValue(ctx, message);
+    return found;
+  }
+
+  bool should_define_own_property_after_set_failure(JSContext *ctx,
+                                                    JSValueConst object,
+                                                    JSAtom property,
+                                                    JSValueConst exception)
+  {
+    if (!exception_message_contains(ctx, exception, "read-only") &&
+        !exception_message_contains(ctx, exception, "no setter for property"))
+    {
+      return false;
+    }
+
+    int has_own = JS_GetOwnProperty(ctx, nullptr, object, property);
+    if (has_own < 0)
+    {
+      clear_quickjs_exception(ctx);
+      return false;
+    }
+    return has_own == 0;
+  }
+
+  int set_property_with_node_compat(JSContext *ctx,
+                                    JSValueConst object,
+                                    JSAtom property,
+                                    JSValueConst value)
+  {
+    int rc = JS_SetProperty(ctx, object, property, JS_DupValue(ctx, value));
+    if (rc >= 0 || !JS_HasException(ctx))
+      return rc;
+
+    JSValue exception = JS_GetException(ctx);
+    if (should_define_own_property_after_set_failure(ctx, object, property, exception))
+    {
+      JS_FreeValue(ctx, exception);
+      return JS_DefinePropertyValue(ctx,
+                                    object,
+                                    property,
+                                    JS_DupValue(ctx, value),
+                                    JS_PROP_C_W_E);
+    }
+
+    JS_Throw(ctx, exception);
+    return -1;
+  }
 } // namespace
 
 extern "C"
@@ -2227,8 +2296,7 @@ extern "C"
     if (prop == JS_ATOM_NULL)
       return napi_util__::return_pending_if_caught(env, "Invalid key");
 
-    // JS_SetProperty consumes value
-    int res = JS_SetProperty(env->context(), local, prop, JS_DupValue(env->context(), value->get_inner()));
+    int res = set_property_with_node_compat(env->context(), local, prop, value->get_inner());
     JS_FreeAtom(env->context(), prop);
 
     if (res < 0)
@@ -2415,8 +2483,12 @@ extern "C"
     JSValue val = value->get_inner();
 
     // 4. Set the property.
-    // We use JS_DupValue(val) because JS_SetPropertyStr takes ownership of the value.
-    if (JS_SetPropertyStr(env->context(), obj, utf8name, JS_DupValue(env->context(), val)) < 0)
+    JSAtom key = JS_NewAtom(env->context(), utf8name);
+    if (key == JS_ATOM_NULL)
+      return napi_util__::return_pending_if_caught(env, "Invalid property name");
+    int res = set_property_with_node_compat(env->context(), obj, key, val);
+    JS_FreeAtom(env->context(), key);
+    if (res < 0)
     {
       return napi_util__::return_pending_if_caught(env, "Failed to set named property");
     }
@@ -3418,8 +3490,7 @@ extern "C"
       }
 
       JSAtom key = JS_ValueToAtom(ctx, property_names[i]->get_inner());
-      JSValue val = JS_DupValue(ctx, property_values[i]->get_inner());
-      int rc = JS_SetProperty(ctx, obj, key, val);
+      int rc = set_property_with_node_compat(ctx, obj, key, property_values[i]->get_inner());
       JS_FreeAtom(ctx, key);
 
       if (rc < 0)
