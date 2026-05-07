@@ -2637,11 +2637,10 @@ extern "C"
         return WrapOwned(env, symbol, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_structured_clone(
-        napi_env env,
-        napi_value value,
-        napi_value transfer_list_or_null,
-        napi_value *result_out)
+    static napi_status QuickJSStructuredClone(napi_env env,
+                                              napi_value value,
+                                              napi_value transfer_list_or_null,
+                                              napi_value *result_out)
     {
         (void)transfer_list_or_null;
         if (!CheckEnv(env) || value == nullptr || result_out == nullptr)
@@ -2661,6 +2660,23 @@ extern "C"
         if (JS_IsException(cloned))
             return napi_pending_exception;
         return WrapOwned(env, cloned, result_out);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_structured_clone(
+        napi_env env,
+        napi_value value,
+        napi_value *result_out)
+    {
+        return QuickJSStructuredClone(env, value, nullptr, result_out);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
+        napi_env env,
+        napi_value value,
+        napi_value transfer_list_or_null,
+        napi_value *result_out)
+    {
+        return QuickJSStructuredClone(env, value, transfer_list_or_null, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_serialize_value(

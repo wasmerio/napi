@@ -12,8 +12,6 @@
 #ifndef NAPI_EXTERN
 #ifdef _WIN32
 #define NAPI_EXTERN __declspec(dllexport)
-#elif defined(__wasm__) && defined(EDGE_EMBEDDED_NAPI_PROVIDER)
-#define NAPI_EXTERN __attribute__((visibility("default")))
 #elif defined(__wasm__)
 #define NAPI_EXTERN                                                            \
   __attribute__((visibility("default")))                                       \
@@ -26,8 +24,6 @@
 #ifndef NAPI_EXTENSION_WASMER_EXTERN
 #ifdef _WIN32
 #define NAPI_EXTENSION_WASMER_EXTERN __declspec(dllexport)
-#elif defined(__wasm__) && defined(EDGE_EMBEDDED_NAPI_PROVIDER)
-#define NAPI_EXTENSION_WASMER_EXTERN __attribute__((visibility("default")))
 #elif defined(__wasm__)
 #define NAPI_EXTENSION_WASMER_EXTERN                                                            \
   __attribute__((visibility("default")))                                       \
