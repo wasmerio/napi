@@ -468,8 +468,30 @@ fn guest_unofficial_napi_get_call_sites(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut callsites_id = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id) };
+    let status = unsafe {
+        snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id)
+    };
+    if status == 0 && callsites_ptr > 0 {
+        write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_get_current_stack_trace(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    frames: i32,
+    callsites_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut callsites_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_current_stack_trace(
+            env_handle,
+            frames as u32,
+            &mut callsites_id,
+        )
+    };
     if status == 0 && callsites_ptr > 0 {
         write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
     }
@@ -670,6 +692,23 @@ fn guest_unofficial_napi_structured_clone(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     value: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let value_id = if value > 0 { value as u32 } else { 0 };
+    let mut out = 0u32;
+    let status =
+        unsafe { snapi_bridge_unofficial_structured_clone(env_handle, value_id, &mut out) };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, out);
+    }
+    status
+}
+
+fn guest_unofficial_napi_structured_clone_with_transfer(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    value: i32,
     transfer_list: i32,
     result_ptr: i32,
 ) -> i32 {
@@ -682,7 +721,12 @@ fn guest_unofficial_napi_structured_clone(
     };
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
+        snapi_bridge_unofficial_structured_clone_with_transfer(
+            env_handle,
+            value_id,
+            transfer_list_id,
+            &mut out,
+        )
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
@@ -1476,6 +1520,33 @@ fn guest_unofficial_napi_contextify_compile_function(
     status
 }
 
+fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    code: i32,
+    filename: i32,
+    is_sea_main: i32,
+    should_detect_module: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
+            env_handle,
+            code as u32,
+            filename as u32,
+            is_sea_main,
+            should_detect_module,
+            &mut result_id,
+        )
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
+}
+
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_create_cached_data(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1506,6 +1577,58 @@ fn guest_unofficial_napi_contextify_create_cached_data(
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_start_sigint_watchdog(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_start_sigint_watchdog(env_handle, &mut result)
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_stop_sigint_watchdog(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    had_pending_signal_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut had_pending_signal = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_stop_sigint_watchdog(env_handle, &mut had_pending_signal)
+    };
+    if status == 0 && had_pending_signal_ptr > 0 {
+        write_guest_u8(
+            &mut env,
+            had_pending_signal_ptr as u32,
+            (had_pending_signal != 0) as u8,
+        );
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_watchdog_has_pending_sigint(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(env_handle, &mut result)
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
     }
     status
 }
@@ -1933,6 +2056,38 @@ fn guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
             if callback > 0 { callback as u32 } else { 0 },
         )
     }
+}
+
+fn guest_unofficial_napi_module_wrap_import_module_dynamically(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    argc: i32,
+    argv_ptr: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let argc_u = argc as u32;
+    let argv_ids = if argc_u > 0 {
+        let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
+            return 1;
+        };
+        ids
+    } else {
+        Vec::new()
+    };
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_module_wrap_import_module_dynamically(
+            env_handle,
+            argc_u,
+            argv_ids.as_ptr(),
+            &mut result_id,
+        )
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
 }
 
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(
@@ -5042,6 +5197,7 @@ pub fn register_napi_imports(
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),
         "unofficial_napi_preview_entries" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preview_entries),
         "unofficial_napi_get_call_sites" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_call_sites),
+        "unofficial_napi_get_current_stack_trace" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_stack_trace),
         "unofficial_napi_get_caller_location" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_caller_location),
         "unofficial_napi_arraybuffer_view_has_buffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_arraybuffer_view_has_buffer),
         "unofficial_napi_get_constructor_name" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_constructor_name),
@@ -5055,7 +5211,7 @@ pub fn register_napi_imports(
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
         "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
-        "unofficial_napi_structured_clone_with_transfer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
+        "unofficial_napi_structured_clone_with_transfer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone_with_transfer),
         "unofficial_napi_serialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_serialize_value),
         "unofficial_napi_deserialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_deserialize_value),
         "unofficial_napi_release_serialized_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_serialized_value),
@@ -5092,7 +5248,11 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_dispose_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_dispose_context),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
+        "unofficial_napi_contextify_compile_function_for_cjs_loader" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function_for_cjs_loader),
         "unofficial_napi_contextify_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_create_cached_data),
+        "unofficial_napi_contextify_start_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_start_sigint_watchdog),
+        "unofficial_napi_contextify_stop_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_stop_sigint_watchdog),
+        "unofficial_napi_contextify_watchdog_has_pending_sigint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_watchdog_has_pending_sigint),
         "unofficial_napi_module_wrap_create_source_text" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_source_text),
         "unofficial_napi_module_wrap_create_synthetic" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_synthetic),
         "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),
@@ -5113,6 +5273,7 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
         "unofficial_napi_module_wrap_set_import_module_dynamically_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_import_module_dynamically_callback),
         "unofficial_napi_module_wrap_set_initialize_import_meta_object_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback),
+        "unofficial_napi_module_wrap_import_module_dynamically" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_import_module_dynamically),
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 

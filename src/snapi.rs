@@ -122,6 +122,11 @@ unsafe extern "C" {
         frames: u32,
         callsites_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_get_current_stack_trace(
+        env: SnapiEnv,
+        frames: u32,
+        callsites_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_get_caller_location(
         env: SnapiEnv,
         location_out: *mut u32,
@@ -255,6 +260,11 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
         value_id: u32,
+        out_id: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_structured_clone_with_transfer(
+        env: SnapiEnv,
+        value_id: u32,
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
@@ -311,6 +321,14 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        is_sea_main: i32,
+        should_detect_module: i32,
+        result_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_create_cached_data(
         env: SnapiEnv,
         code_id: u32,
@@ -319,6 +337,18 @@ unsafe extern "C" {
         column_offset: i32,
         host_defined_option_id: u32,
         result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
+        env: SnapiEnv,
+        result_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
+        env: SnapiEnv,
+        had_pending_signal_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
+        env: SnapiEnv,
+        result_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_source_text(
         env: SnapiEnv,
@@ -426,6 +456,12 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
         env: SnapiEnv,
         callback_id: u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_import_module_dynamically(
+        env: SnapiEnv,
+        argc: u32,
+        argv_ids: *const u32,
+        result_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_required_module_facade(
         env: SnapiEnv,
