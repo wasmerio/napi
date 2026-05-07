@@ -96,6 +96,8 @@ target_compile_definitions(napi_quickjs
   PUBLIC
     NAPI_EXTERN=
     EDGE_BUNDLED_NAPI_QUICKJS=1
+  PRIVATE
+    EDGE_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(napi_quickjs PRIVATE -fno-rtti)

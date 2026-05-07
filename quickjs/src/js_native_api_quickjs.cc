@@ -1721,7 +1721,7 @@ extern "C"
     // We reuse napi_create_function which handles the JS-to-C trampoline for Node-API.
     napi_value ctor_napi_value = nullptr;
     napi_status status = napi_function__::create(
-        env, utf8name, length, constructor, data, JS_CFUNC_constructor_magic, &ctor_napi_value);
+        env, utf8name, length, constructor, data, 0, &ctor_napi_value);
     if (status != napi_ok)
       return status;
 

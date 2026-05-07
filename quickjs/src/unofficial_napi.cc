@@ -3,6 +3,7 @@
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_util.h"
+#include "internal/quickjs_trace.h"
 #include "node_api.h"
 #include "quickjs_cjs_exports.h"
 #include "unofficial_module_loader.h"
@@ -891,13 +892,13 @@ namespace
                                     module_name != nullptr ? module_name : "",
                                     &resolved))
         {
-            if (std::getenv("EDGE_TRACE_QUICKJS_MODULES") != nullptr)
+            if (EDGE_TRACE_ENABLED("EDGE_TRACE_QUICKJS_MODULES"))
                 std::fprintf(stderr, "quickjs-module normalize-miss base=%s spec=%s\n",
                              module_base_name != nullptr ? module_base_name : "",
                              module_name != nullptr ? module_name : "");
             return DupCString(ctx, module_name != nullptr ? std::string(module_name) : std::string());
         }
-        if (std::getenv("EDGE_TRACE_QUICKJS_MODULES") != nullptr)
+        if (EDGE_TRACE_ENABLED("EDGE_TRACE_QUICKJS_MODULES"))
             std::fprintf(stderr, "quickjs-module normalize base=%s spec=%s -> %s\n",
                          module_base_name != nullptr ? module_base_name : "",
                          module_name != nullptr ? module_name : "",
@@ -992,8 +993,8 @@ namespace
 
     bool ContextifyCompileTraceEnabled()
     {
-        return std::getenv("EDGE_TRACE_QUICKJS_CONTEXTIFY") != nullptr ||
-               std::getenv("EDGE_TRACE_BUILTINS") != nullptr;
+        return EDGE_TRACE_ENABLED("EDGE_TRACE_QUICKJS_CONTEXTIFY") ||
+               EDGE_TRACE_ENABLED("EDGE_TRACE_BUILTINS");
     }
 
     int32_t GetInt32PropertyOr(JSContext *ctx, JSValueConst object, const char *name, int32_t fallback)
