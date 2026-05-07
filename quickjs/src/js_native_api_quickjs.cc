@@ -10,6 +10,55 @@
 #include <string>
 #include <vector>
 
+namespace
+{
+  void clear_quickjs_exception(JSContext *ctx)
+  {
+    if (!JS_HasException(ctx))
+      return;
+    JSValue exc = JS_GetException(ctx);
+    JS_FreeValue(ctx, exc);
+  }
+
+  void install_runtime_buffer_prototype(napi_env env, JSValueConst buffer)
+  {
+    JSContext *ctx = env->context();
+    JSValue global = JS_GetGlobalObject(ctx);
+    if (JS_IsException(global))
+    {
+      clear_quickjs_exception(ctx);
+      return;
+    }
+
+    JSValue buffer_ctor = JS_GetPropertyStr(ctx, global, "Buffer");
+    JS_FreeValue(ctx, global);
+    if (JS_IsException(buffer_ctor))
+    {
+      clear_quickjs_exception(ctx);
+      return;
+    }
+    if (!JS_IsObject(buffer_ctor))
+    {
+      JS_FreeValue(ctx, buffer_ctor);
+      return;
+    }
+
+    JSValue prototype = JS_GetPropertyStr(ctx, buffer_ctor, "prototype");
+    JS_FreeValue(ctx, buffer_ctor);
+    if (JS_IsException(prototype))
+    {
+      clear_quickjs_exception(ctx);
+      return;
+    }
+
+    if (JS_IsObject(prototype) && JS_SetPrototype(ctx, buffer, prototype) < 0)
+    {
+      clear_quickjs_exception(ctx);
+    }
+    JS_FreeValue(ctx, prototype);
+  }
+} // namespace
+
 extern "C"
 {
   napi_status NAPI_CDECL napi_get_last_error_info(
@@ -518,44 +567,16 @@ extern "C"
       return napi_arraybuffer_expected;
     }
 
-    // QuickJS doesn't have a direct public C API to check if an ArrayBuffer is detached.
-    // We can check by trying to get its data. If it returns NULL and length 0, it might be detached.
-    // However, a cleaner way using the public API is to check its byteLength property.
-    // A detached ArrayBuffer has a byteLength of 0.
-    JSValue byte_len_val = JS_GetPropertyStr(env->context(), local, "byteLength");
-    if (JS_IsException(byte_len_val))
+    size_t ab_len = 0;
+    uint8_t *data = JS_GetArrayBuffer(env->context(), &ab_len, local);
+    if (data == nullptr && JS_HasException(env->context()))
     {
-      return napi_util__::return_pending_if_caught(env, "Failed to check if arraybuffer is detached");
+      napi_util__::clear_last_exception(env);
+      *result = true;
+      return napi_ok;
     }
 
-    int64_t len;
-    JS_ToInt64(env->context(), &len, byte_len_val);
-    JS_FreeValue(env->context(), byte_len_val);
-
-    // While a 0-length array buffer exists, checking if it throws on DataView creation
-    // is a more robust, albeit slightly hacky, way to test for detachment using only public APIs if byteLength isn't sufficient.
-    // Let's use the byteLength == 0 check as a fast path, and if it's 0, we can try to create a TypedArray on it to be sure.
-    if (len > 0)
-    {
-      *result = false;
-    }
-    else
-    {
-      // It's either a 0-length buffer or detached. Let's try to get its data pointer.
-      // JS_GetArrayBuffer returns NULL if detached (or out of memory, but size will be 0).
-      size_t ab_len;
-      uint8_t *data = JS_GetArrayBuffer(env->context(), &ab_len, local);
-      if (data == nullptr)
-      {
-        // It threw an exception (TypeError: ArrayBuffer is detached)
-        napi_util__::clear_last_exception(env); // Clear the expected exception
-        *result = true;
-      }
-      else
-      {
-        *result = false;
-      }
-    }
+    *result = false;
 
     return napi_ok;
   }
@@ -3198,6 +3219,7 @@ extern "C"
       JS_FreeValue(env->context(), buffer);
       return status;
     }
+    install_runtime_buffer_prototype(env, buffer);
 
     *result = env->current_scope()->wrap_value(buffer, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
