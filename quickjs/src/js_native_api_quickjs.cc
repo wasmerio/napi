@@ -3,6 +3,7 @@
 #include "internal/napi_external_backing_store_hint.h"
 #include "internal/napi_function.h"
 #include "internal/napi_util.h"
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>

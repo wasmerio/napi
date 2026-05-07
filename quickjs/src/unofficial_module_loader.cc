@@ -82,19 +82,35 @@ std::string PathToFileUrl(const fs::path& path) {
 
 struct JsonValue {
   enum class Type { kMissing, kNull, kString, kArray, kObject, kOther };
+  JsonValue();
+  JsonValue(const JsonValue&);
+  JsonValue(JsonValue&&) noexcept;
+  JsonValue& operator=(const JsonValue&);
+  JsonValue& operator=(JsonValue&&) noexcept;
+  ~JsonValue();
+
   Type type = Type::kMissing;
   std::string string;
   std::vector<JsonValue> array;
   std::vector<std::pair<std::string, JsonValue>> object;
 
-  const JsonValue* Get(std::string_view key) const {
-    if (type != Type::kObject) return nullptr;
-    for (const auto& entry : object) {
-      if (entry.first == key) return &entry.second;
-    }
-    return nullptr;
-  }
+  const JsonValue* Get(std::string_view key) const;
 };
+
+JsonValue::JsonValue() = default;
+JsonValue::JsonValue(const JsonValue&) = default;
+JsonValue::JsonValue(JsonValue&&) noexcept = default;
+JsonValue& JsonValue::operator=(const JsonValue&) = default;
+JsonValue& JsonValue::operator=(JsonValue&&) noexcept = default;
+JsonValue::~JsonValue() = default;
+
+const JsonValue* JsonValue::Get(std::string_view key) const {
+  if (type != Type::kObject) return nullptr;
+  for (const auto& entry : object) {
+    if (entry.first == key) return &entry.second;
+  }
+  return nullptr;
+}
 
 class JsonParser {
  public:
