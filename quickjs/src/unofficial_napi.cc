@@ -2607,15 +2607,98 @@ extern "C"
         uint32_t filter_bits,
         napi_value *result_out)
     {
-        (void)filter_bits;
         if (!CheckEnv(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        return napi_util__::get_property_names(env,
-                                               value,
-                                               napi_key_own_only,
-                                               napi_key_all_properties,
-                                               napi_key_keep_numbers,
-                                               result_out);
+        JSContext *ctx = Ctx(env);
+        JSValue obj = value->get_inner();
+        if (!JS_IsObject(obj))
+            return napi_object_expected;
+
+        auto is_array_index_atom = [&](JSAtom atom) -> bool
+        {
+            size_t len = 0;
+            const char *name = JS_AtomToCStringLen(ctx, &len, atom);
+            if (name == nullptr)
+                return false;
+            bool is_index = false;
+            if (len > 0 && len <= 10)
+            {
+                uint64_t index = 0;
+                is_index = true;
+                for (size_t i = 0; i < len; ++i)
+                {
+                    if (name[i] < '0' || name[i] > '9')
+                    {
+                        is_index = false;
+                        break;
+                    }
+                    if (i == 0 && len > 1 && name[i] == '0')
+                    {
+                        is_index = false;
+                        break;
+                    }
+                    index = index * 10 + static_cast<uint64_t>(name[i] - '0');
+                }
+                if (is_index && index > 4294967294ULL)
+                    is_index = false;
+            }
+            JS_FreeCString(ctx, name);
+            return is_index;
+        };
+
+        int gpn_flags = napi_util__::key_filter_to_gpn(static_cast<napi_key_filter>(filter_bits));
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, obj, gpn_flags) < 0)
+            return napi_util__::return_pending_if_caught(env, "Exception while getting property names");
+
+        JSValue out = JS_NewArray(ctx);
+        uint32_t out_idx = 0;
+
+        for (uint32_t i = 0; i < prop_count; ++i)
+        {
+            if (is_array_index_atom(props[i].atom))
+                continue;
+
+            if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
+            {
+                JSPropertyDescriptor desc;
+                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
+                if (has < 0)
+                {
+                    JS_FreePropertyEnum(ctx, props, prop_count);
+                    JS_FreeValue(ctx, out);
+                    return napi_util__::return_pending_if_caught(env, "Exception while filtering property names");
+                }
+                if (has == 0)
+                    continue;
+
+                bool include = true;
+                if ((filter_bits & napi_key_writable) != 0 && (desc.flags & JS_PROP_WRITABLE) == 0)
+                    include = false;
+                if ((filter_bits & napi_key_configurable) != 0 && (desc.flags & JS_PROP_CONFIGURABLE) == 0)
+                    include = false;
+
+                JS_FreeValue(ctx, desc.value);
+                JS_FreeValue(ctx, desc.getter);
+                JS_FreeValue(ctx, desc.setter);
+
+                if (!include)
+                    continue;
+            }
+
+            JSValue key = JS_AtomToValue(ctx, props[i].atom);
+            if (JS_IsException(key))
+            {
+                JS_FreePropertyEnum(ctx, props, prop_count);
+                JS_FreeValue(ctx, out);
+                return napi_util__::return_pending_if_caught(env, "Failed to convert property name");
+            }
+            JS_SetPropertyUint32(ctx, out, out_idx++, key);
+        }
+
+        JS_FreePropertyEnum(ctx, props, prop_count);
+        return WrapOwned(env, out, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
