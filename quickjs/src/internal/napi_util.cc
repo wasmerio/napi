@@ -420,7 +420,7 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
   JSValue error = create_plain_error(env->context(), msg_str);
   JS_FreeCString(env->context(), msg_str);
 
-  if (code != nullptr)
+  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
   {
     const char *code_str = JS_ToCString(env->context(), code->get_inner());
     JS_SetPropertyStr(env->context(), error, "code", JS_NewString(env->context(), code_str));
@@ -458,7 +458,7 @@ napi_status napi_util__::create_error_common(napi_env env,
 
   const char *msg_str = JS_ToCString(env->context(), msg_val);
   const char *code_str = nullptr;
-  if (code != nullptr)
+  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
     code_str = JS_ToCString(env->context(), code->get_inner());
 
   JSValue error = create_error_object(env->context(), factory, code_str, msg_str);

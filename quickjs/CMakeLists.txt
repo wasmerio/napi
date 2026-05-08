@@ -24,11 +24,10 @@ set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # )
 # napi_v8_resolve_configuration()
 
-set(PROJECT_ROOT "${NAPI_QUICKJS_ROOT}/../..")
-if(NOT NAPI_INCLUDE_ROOT)
-  set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
-endif()
-set(NAPI_QUICKJS_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/quickjs")
+include("${NAPI_QUICKJS_ROOT}/cmake/NapiEngine.cmake")
+napi_engine_set_layout("${NAPI_QUICKJS_ROOT}")
+
+set(NAPI_QUICKJS_NODE_ROOT_DEFAULT "${NAPI_QUICKJS_ROOT}/src/quickjs")
 set(NAPI_QUICKJS_INCLUDE_DIR
   "${NAPI_QUICKJS_NODE_ROOT_DEFAULT}"
   CACHE PATH "Path to QuickJS headers"
@@ -39,14 +38,10 @@ set(NAPI_QUICKJS_LIBRARY
   CACHE FILEPATH "Path to QuickJS static library for standalone builds"
 )
 
-include("${NAPI_QUICKJS_ROOT}/cmake/NapiEngine.cmake")
-napi_engine_set_layout("${NAPI_QUICKJS_ROOT}")
-
-message("PROJECT_ROOT = ${PROJECT_ROOT}")
-message("NAPI_INCLUDE_ROOT = ${NAPI_INCLUDE_ROOT}")
-message("NAPI_QUICKJS_ROOT = ${NAPI_QUICKJS_ROOT}/src")
-message("NAPI_QUICKJS_INCLUDE_DIR = ${NAPI_QUICKJS_INCLUDE_DIR}")
-message("NAPI_QUICKJS_LIBRARY = ${NAPI_QUICKJS_LIBRARY}")
+message(STATUS "Resolved QuickJS include dir: ${NAPI_QUICKJS_INCLUDE_DIR}")
+if(NOT TARGET qjs)
+  message(STATUS "Resolved QuickJS library: ${NAPI_QUICKJS_LIBRARY}")
+endif()
 
 file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
   "${NAPI_QUICKJS_ROOT}/src/*.h"

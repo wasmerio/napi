@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -6,6 +7,34 @@ use serde::Deserialize;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn path_from_env_or(name: &str, default: PathBuf) -> PathBuf {
+    env::var_os(name)
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                crate_root().join(path)
+            }
+        })
+        .unwrap_or(default)
+}
+
+fn cargo_target_dir() -> PathBuf {
+    path_from_env_or("CARGO_TARGET_DIR", crate_root().join("target"))
+}
+
+fn native_test_dir() -> PathBuf {
+    path_from_env_or("NAPI_NATIVE_TEST_OUT_DIR", cargo_target_dir().join("native"))
+}
+
+fn wasix_test_dir() -> PathBuf {
+    path_from_env_or(
+        "NAPI_WASIX_TEST_OUT_DIR",
+        cargo_target_dir().join("wasm32-wasix/release"),
+    )
 }
 
 #[derive(Deserialize)]
@@ -29,7 +58,7 @@ fn build_native_test(name: &str) -> PathBuf {
         .status()
         .expect("failed to execute tests/build-test-native.sh");
     assert!(status.success(), "failed to build native test: {name}");
-    root.join(format!("target/native/{name}"))
+    native_test_dir().join(name)
 }
 
 fn build_wasix_test(name: &str) -> PathBuf {
@@ -40,7 +69,7 @@ fn build_wasix_test(name: &str) -> PathBuf {
         .status()
         .expect("failed to execute tests/build-test-wasix.sh");
     assert!(status.success(), "failed to build WASIX test: {name}");
-    root.join(format!("target/wasm32-wasix/release/{name}.wasm"))
+    wasix_test_dir().join(format!("{name}.wasm"))
 }
 
 fn build_cli_binary() -> PathBuf {
@@ -54,7 +83,7 @@ fn build_cli_binary() -> PathBuf {
                 .status()
                 .expect("failed to build napi_wasmer CLI binary for tests");
             assert!(status.success(), "failed to build napi_wasmer CLI binary");
-            root.join("target/debug/napi_wasmer")
+            cargo_target_dir().join("debug/napi_wasmer")
         })
         .clone()
 }

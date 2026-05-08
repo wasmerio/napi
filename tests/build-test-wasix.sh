@@ -10,7 +10,8 @@ fi
 TEST_NAME="$1"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
-OUT_DIR="$ROOT_DIR/target/wasm32-wasix/release"
+CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+OUT_DIR="${NAPI_WASIX_TEST_OUT_DIR:-$CARGO_TARGET_ROOT/wasm32-wasix/release}"
 OUT_FILE="$OUT_DIR/${TEST_NAME}.wasm"
 NAPI_INCLUDE_DIR="$ROOT_DIR/include"
 TEST_INCLUDE_DIR="$ROOT_DIR/tests/programs"
