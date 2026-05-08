@@ -45,43 +45,30 @@ if [[ "$subcommand" == -* ]]; then
   exit 1
 fi
 
-if [[ "${NAPI_WASMER_STANDALONE_ACTIVE:-0}" == "1" ]]; then
-  exec "${cargo_cmd[@]}" "$subcommand" --manifest-path "$vendored_manifest" "$@"
-fi
-
 if [[ $use_standalone -eq 0 ]]; then
   exec "${cargo_cmd[@]}" "$subcommand" --manifest-path "$vendored_manifest" "$@"
 fi
 
-lock_dir="$repo_root/.cargo-standalone.lock"
-lock_pid_file="$lock_dir/pid"
-while ! mkdir "$lock_dir" 2>/dev/null; do
-  if [[ -f "$lock_pid_file" ]]; then
-    lock_pid="$(cat "$lock_pid_file")"
-    if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
-      rm -f "$lock_pid_file"
-      rmdir "$lock_dir" 2>/dev/null || true
-      continue
-    fi
-  fi
-  sleep 0.1
-done
+standalone_parent="$(dirname "$repo_root")"
+if [[ -w "$standalone_parent" ]]; then
+  standalone_work_dir="$(mktemp -d "$standalone_parent/.napi-cargo-standalone.XXXXXX")"
+else
+  standalone_work_dir="$(mktemp -d "${TMPDIR:-/tmp}/napi-cargo-standalone.XXXXXX")"
+fi
 
-printf '%s\n' "$$" > "$lock_pid_file"
-
-manifest_backup="$(mktemp "$repo_root/.cargo.toml.backup.XXXXXX")"
-cp "$vendored_manifest" "$manifest_backup"
-
-restore_manifest() {
-  cp "$manifest_backup" "$vendored_manifest"
-  rm -f "$manifest_backup"
-  rm -f "$lock_pid_file"
-  rmdir "$lock_dir" 2>/dev/null || true
+cleanup_standalone_work_dir() {
+  rm -rf "$standalone_work_dir"
 }
 
-trap restore_manifest EXIT
+trap cleanup_standalone_work_dir EXIT
 
-cp "$standalone_manifest" "$vendored_manifest"
+cp "$standalone_manifest" "$standalone_work_dir/Cargo.toml"
+if [[ -f "$repo_root/Cargo.lock" ]]; then
+  cp "$repo_root/Cargo.lock" "$standalone_work_dir/Cargo.lock"
+fi
 
-NAPI_WASMER_STANDALONE_ACTIVE=1 \
-  "${cargo_cmd[@]}" "$subcommand" --manifest-path "$vendored_manifest" "$@"
+for entry in build.rs include src tests v8; do
+  ln -s "$repo_root/$entry" "$standalone_work_dir/$entry"
+done
+
+"${cargo_cmd[@]}" "$subcommand" --manifest-path "$standalone_work_dir/Cargo.toml" "$@"
