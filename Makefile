@@ -78,10 +78,6 @@ build-wasix-napi:
 test-wasix-napi:
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" NAPI_NATIVE_TEST_OUT_DIR="$(NAPI_NATIVE_TEST_OUT_DIR)" NAPI_WASIX_TEST_OUT_DIR="$(NAPI_WASIX_TEST_OUT_DIR)" ./cargo-standalone.sh test --features cli --test manifest_tests -- --nocapture
 
-build-wasix-napi-quickjs:
-	$(BUILD_ENV) cmake -S . -B $(BUILD_WASIX_NAPI_QUICKJS_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DCMAKE_TOOLCHAIN_FILE=$(WASIX_CMAKE_TOOLCHAIN) -DNAPI_PROJECT_ROOT=$(EDGEJS_ROOT) -DNAPI_BUILD_QUICKJS=ON -DNAPI_BUILD_V8=OFF -DNAPI_QUICKJS_BUILD_TESTS=OFF $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
-	$(BUILD_ENV) cmake --build $(BUILD_WASIX_NAPI_QUICKJS_DIR) --target napi_quickjs -j$(JOBS)
-
 test-wasix-napi-quickjs: build-wasix-napi-quickjs
 
 build-native-v8: build-napi

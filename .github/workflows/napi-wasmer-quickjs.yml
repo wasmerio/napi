@@ -56,20 +56,3 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
-  quickjs-wasix-linux:
-    name: quickjs-wasix-linux
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install wasixcc
-        uses: wasix-org/wasixcc@v0.4.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          sysroot-tag: v2026-02-16.1
-          version: v0.4.2
-
-      - name: Build WASIX QuickJS N-API
-        run: make build-wasix-napi-quickjs CMAKE_BUILD_TYPE=Release JOBS=4
