@@ -1,5 +1,13 @@
 #include "unofficial_napi.h"
 
+#include "compat/console.h"
+#include "compat/contextify.h"
+#include "compat/environment.h"
+#include "compat/global_shims.h"
+#include "compat/microtasks.h"
+#include "compat/module_loading.h"
+#include "compat/quickjs_utilities.h"
+#include "compat/serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_util.h"
@@ -7,7 +15,6 @@
 #include "node_api.h"
 #include "quickjs_cjs_exports.h"
 #include "unofficial_module_loader.h"
-#include "unofficial_node_compat.h"
 
 #include <algorithm>
 #include <chrono>
@@ -50,6 +57,7 @@ extern "C"
         JS_SetContextOpaque(context, env);
         EnsureEnvState(env);
         EnsureQuickjsGlobalCompat(context);
+        RepairBootstrapConsoleBindings(env);
         JS_SetPromiseHook(rt, QuickjsPromiseHook, env);
         JS_SetModuleLoaderFunc(rt, QuickjsModuleNormalize, QuickjsModuleLoader, env);
 

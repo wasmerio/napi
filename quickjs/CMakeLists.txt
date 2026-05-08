@@ -60,8 +60,17 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 # endforeach()
 
 add_library(napi_quickjs STATIC
-  src/js_native_api_node_compat.cc
   src/js_native_api_quickjs.cc
+  src/compat/buffer.cc
+  src/compat/console.cc
+  src/compat/contextify.cc
+  src/compat/environment.cc
+  src/compat/global_shims.cc
+  src/compat/microtasks.cc
+  src/compat/module_loading.cc
+  src/compat/properties.cc
+  src/compat/quickjs_utilities.cc
+  src/compat/serdes.cc
   src/internal/napi_callback_info.cc
   src/internal/napi_deferred.cc
   src/internal/napi_env.cc
@@ -77,7 +86,6 @@ add_library(napi_quickjs STATIC
   src/internal/napi_value.cc
   src/unofficial_module_loader.cc
   src/quickjs_cjs_exports.cc
-  src/unofficial_node_compat.cc
   src/unofficial_napi.cc
 )
 

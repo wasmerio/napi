@@ -1,4 +1,5 @@
-#include "js_native_api_node_compat.h"
+#include "compat/buffer.h"
+#include "compat/properties.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_external_backing_store_hint.h"
