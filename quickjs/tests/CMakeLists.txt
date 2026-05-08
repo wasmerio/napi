@@ -12,13 +12,27 @@ endif()
 if(NOT NAPI_QUICKJS_DEFINES AND NAPI_QUICKJS_QUICKJS_DEFINES)
   set(NAPI_QUICKJS_DEFINES "${NAPI_QUICKJS_QUICKJS_DEFINES}")
 endif()
-set(NAPI_QUICKJS_GTEST_ROOT "${PROJECT_ROOT}/deps/googletest")
+set(_napi_quickjs_gtest_root_default "${PROJECT_ROOT}/deps/googletest")
+if(DEFINED NAPI_QUICKJS_GTEST_ROOT AND
+   NOT EXISTS "${NAPI_QUICKJS_GTEST_ROOT}/src/gtest-all.cc" AND
+   EXISTS "${_napi_quickjs_gtest_root_default}/src/gtest-all.cc")
+  set(NAPI_QUICKJS_GTEST_ROOT "${_napi_quickjs_gtest_root_default}" CACHE PATH
+    "Path to a googletest source checkout" FORCE)
+else()
+  set(NAPI_QUICKJS_GTEST_ROOT "${_napi_quickjs_gtest_root_default}" CACHE PATH
+    "Path to a googletest source checkout")
+endif()
+if(NOT EXISTS "${NAPI_QUICKJS_GTEST_ROOT}/src/gtest-all.cc")
+  message(STATUS
+    "Skipping napi_quickjs tier1 tests: googletest not found at ${NAPI_QUICKJS_GTEST_ROOT}")
+  return()
+endif()
 include(GoogleTest)
 option(NAPI_QUICKJS_BUILD_NODE_API_TESTS
   "Build standalone node-api fixture tests in napi-quickjs when dedicated runners exist"
   OFF)
 
-if(NAPI_QUICKJS_LIBRARY)
+if(TARGET qjs OR NAPI_QUICKJS_LIBRARY)
   add_library(napi_quickjs_gtest STATIC
     "${NAPI_QUICKJS_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_QUICKJS_GTEST_ROOT}/src/gtest_main.cc"
@@ -67,8 +81,12 @@ if(NAPI_QUICKJS_LIBRARY)
       PRIVATE
         napi_quickjs_gtest
         napi_quickjs
-        "${NAPI_QUICKJS_LIBRARY}"
     )
+    if(TARGET qjs)
+      target_link_libraries(${target_name} PRIVATE qjs)
+    else()
+      target_link_libraries(${target_name} PRIVATE "${NAPI_QUICKJS_LIBRARY}")
+    endif()
     if(TARGET edge_environment_core)
       target_link_libraries(${target_name} PRIVATE edge_environment_core)
     endif()
@@ -89,11 +107,13 @@ if(NAPI_QUICKJS_LIBRARY)
     if(NAPI_QUICKJS_EXTRA_LIBS)
       target_link_libraries(${target_name} PRIVATE ${NAPI_QUICKJS_EXTRA_LIBS})
     endif()
-    get_filename_component(NAPI_QUICKJS_LIB_DIR "${NAPI_QUICKJS_LIBRARY}" DIRECTORY)
-    set_target_properties(${target_name} PROPERTIES
-      BUILD_RPATH "${NAPI_QUICKJS_LIB_DIR}"
-      INSTALL_RPATH "${NAPI_QUICKJS_LIB_DIR}"
-    )
+    if(NAPI_QUICKJS_LIBRARY)
+      get_filename_component(NAPI_QUICKJS_LIB_DIR "${NAPI_QUICKJS_LIBRARY}" DIRECTORY)
+      set_target_properties(${target_name} PROPERTIES
+        BUILD_RPATH "${NAPI_QUICKJS_LIB_DIR}"
+        INSTALL_RPATH "${NAPI_QUICKJS_LIB_DIR}"
+      )
+    endif()
     gtest_discover_tests(
       ${target_name}
       DISCOVERY_TIMEOUT 30

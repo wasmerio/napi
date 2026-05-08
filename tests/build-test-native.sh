@@ -15,7 +15,8 @@ TEST_NAME="$1"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../ && pwd)"
 # PROJECT_ROOT = top-level repo root
 PROJECT_ROOT="$ROOT_DIR/.."
-OUT_DIR="$ROOT_DIR/target/native"
+CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+OUT_DIR="${NAPI_NATIVE_TEST_OUT_DIR:-$CARGO_TARGET_ROOT/native}"
 OUT_FILE="$OUT_DIR/${TEST_NAME}"
 NAPI_INCLUDE_DIR="$ROOT_DIR/include"
 TEST_INCLUDE_DIR="$ROOT_DIR/tests/programs"
@@ -68,7 +69,7 @@ add_local_v8_extra_links() {
 }
 
 resolve_cached_prebuilt_v8() {
-  local target_os target_arch platform_name include_file include_dir root_dir
+  local target_os target_arch platform_name include_file include_dir root_dir build_cache_dir
   target_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   target_arch="$(uname -m)"
 
@@ -87,8 +88,13 @@ resolve_cached_prebuilt_v8() {
       ;;
   esac
 
+  build_cache_dir="$CARGO_TARGET_ROOT/debug/build"
+  if [[ ! -d "$build_cache_dir" ]]; then
+    return 1
+  fi
+
   include_file="$(
-    find "$ROOT_DIR/target/debug/build" \
+    find "$build_cache_dir" \
       -path "*/v8-prebuilt/${PREBUILT_V8_VERSION}/${platform_name}/include/v8.h" \
       | sort \
       | tail -n 1

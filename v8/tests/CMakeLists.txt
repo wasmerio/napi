@@ -12,7 +12,21 @@ endif()
 if(NOT NAPI_V8_DEFINES AND NAPI_V8_V8_DEFINES)
   set(NAPI_V8_DEFINES "${NAPI_V8_V8_DEFINES}")
 endif()
-set(NAPI_V8_GTEST_ROOT "${PROJECT_ROOT}/deps/googletest")
+set(_napi_v8_gtest_root_default "${PROJECT_ROOT}/deps/googletest")
+if(DEFINED NAPI_V8_GTEST_ROOT AND
+   NOT EXISTS "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc" AND
+   EXISTS "${_napi_v8_gtest_root_default}/src/gtest-all.cc")
+  set(NAPI_V8_GTEST_ROOT "${_napi_v8_gtest_root_default}" CACHE PATH
+    "Path to a googletest source checkout" FORCE)
+else()
+  set(NAPI_V8_GTEST_ROOT "${_napi_v8_gtest_root_default}" CACHE PATH
+    "Path to a googletest source checkout")
+endif()
+if(NOT EXISTS "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc")
+  message(STATUS
+    "Skipping napi_v8 tier1 tests: googletest not found at ${NAPI_V8_GTEST_ROOT}")
+  return()
+endif()
 include(GoogleTest)
 option(NAPI_V8_BUILD_NODE_API_TESTS
   "Build standalone node-api fixture tests in napi-v8 when dedicated runners exist"
