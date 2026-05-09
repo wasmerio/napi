@@ -3,7 +3,54 @@
 #include "internal/napi_env.h"
 #include "internal/napi_value.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <unordered_set>
+
+namespace
+{
+constexpr size_t kMaxSymlinkExpansions = 64;
+
+bool starts_with(std::string_view value, std::string_view prefix)
+{
+  return value.substr(0, prefix.size()) == prefix;
+}
+
+int hex_digit_value(char ch)
+{
+  if (ch >= '0' && ch <= '9')
+    return ch - '0';
+  if (ch >= 'a' && ch <= 'f')
+    return 10 + (ch - 'a');
+  if (ch >= 'A' && ch <= 'F')
+    return 10 + (ch - 'A');
+  return -1;
+}
+
+std::string percent_decode(std::string_view input)
+{
+  std::string out;
+  out.reserve(input.size());
+  for (size_t i = 0; i < input.size(); ++i)
+  {
+    if (input[i] == '%' && i + 2 < input.size())
+    {
+      const int hi = hex_digit_value(input[i + 1]);
+      const int lo = hex_digit_value(input[i + 2]);
+      if (hi >= 0 && lo >= 0)
+      {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(input[i]);
+  }
+  return out;
+}
+} // namespace
 
 bool napi_util__::check_env(napi_env env)
 {
@@ -13,6 +60,16 @@ bool napi_util__::check_env(napi_env env)
 bool napi_util__::check_value(napi_env env, napi_value value)
 {
   return check_env(env) && value != nullptr;
+}
+
+JSContext *napi_util__::context(napi_env env)
+{
+  return env->context();
+}
+
+JSRuntime *napi_util__::runtime(napi_env env)
+{
+  return JS_GetRuntime(context(env));
 }
 
 void napi_util__::clear_last_exception(napi_env env)
@@ -52,6 +109,271 @@ napi_status napi_util__::invalid_arg(napi_env env)
   if (check_env(env))
     return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
   return napi_invalid_arg;
+}
+
+std::filesystem::path napi_util__::strip_file_url(std::string_view value)
+{
+  constexpr std::string_view kScheme = "file://";
+  if (!starts_with(value, kScheme))
+    return std::filesystem::path(std::string(value));
+
+  std::string rest(value.substr(kScheme.size()));
+  if (starts_with(rest, "localhost/"))
+  {
+    rest.erase(0, std::string("localhost").size());
+  }
+  else if (!rest.empty() && rest[0] != '/')
+  {
+    const size_t slash = rest.find('/');
+    if (slash == std::string::npos)
+      return {};
+    rest.erase(0, slash);
+  }
+  return std::filesystem::path(percent_decode(rest));
+}
+
+std::filesystem::path napi_util__::resolve_symlink_components(const std::filesystem::path &path)
+{
+  std::filesystem::path current;
+  size_t expansions = 0;
+  std::unordered_set<std::string> seen;
+
+  for (const std::filesystem::path &part : path.lexically_normal())
+  {
+    if (part == "." || part.empty())
+      continue;
+    if (part == "..")
+    {
+      current /= part;
+      continue;
+    }
+    if (part == path.root_name() || part == path.root_directory())
+    {
+      current /= part;
+      continue;
+    }
+
+    std::filesystem::path candidate = current.empty() ? part : current / part;
+    std::error_code ec;
+    if (std::filesystem::is_symlink(candidate, ec) && !ec)
+    {
+      const std::string key = candidate.lexically_normal().string();
+      if (++expansions > kMaxSymlinkExpansions || !seen.insert(key).second)
+      {
+        current = candidate;
+        continue;
+      }
+      std::filesystem::path target = std::filesystem::read_symlink(candidate, ec);
+      if (!ec)
+      {
+        current = target.is_absolute() ? target : candidate.parent_path() / target;
+        current = current.lexically_normal();
+        continue;
+      }
+    }
+    current = candidate;
+  }
+  return current.lexically_normal();
+}
+
+std::string napi_util__::read_text_file(const std::filesystem::path &path)
+{
+  std::ifstream in(path);
+  if (!in.is_open())
+  {
+    const std::filesystem::path resolved = resolve_symlink_components(path);
+    if (resolved != path.lexically_normal())
+    {
+      in.clear();
+      in.open(resolved);
+    }
+  }
+  if (!in.is_open())
+    return {};
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+std::filesystem::path napi_util__::normalize_resolved_path(const std::filesystem::path &path)
+{
+  std::error_code ec;
+  std::filesystem::path absolute = path;
+  if (!absolute.is_absolute())
+  {
+    absolute = std::filesystem::absolute(path, ec);
+    if (ec)
+    {
+      absolute = path;
+      ec.clear();
+    }
+  }
+  std::filesystem::path canonical = std::filesystem::weakly_canonical(absolute, ec);
+  if (!ec)
+    return canonical.lexically_normal();
+  std::filesystem::path resolved = resolve_symlink_components(absolute);
+  if (resolved != absolute.lexically_normal())
+    return resolved.lexically_normal();
+  return absolute.lexically_normal();
+}
+
+bool napi_util__::is_regular_file_following_symlinks(const std::filesystem::path &candidate,
+                                                     std::filesystem::path *out)
+{
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(candidate, ec) && !ec)
+  {
+    if (out != nullptr)
+      *out = normalize_resolved_path(candidate);
+    return true;
+  }
+  const std::filesystem::path resolved = resolve_symlink_components(candidate);
+  if (resolved != candidate.lexically_normal())
+  {
+    ec.clear();
+    if (std::filesystem::is_regular_file(resolved, ec) && !ec)
+    {
+      if (out != nullptr)
+        *out = normalize_resolved_path(resolved);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool napi_util__::is_directory_following_symlinks(const std::filesystem::path &candidate,
+                                                  std::filesystem::path *out)
+{
+  std::error_code ec;
+  if (std::filesystem::is_directory(candidate, ec) && !ec)
+  {
+    if (out != nullptr)
+      *out = normalize_resolved_path(candidate);
+    return true;
+  }
+  const std::filesystem::path resolved = resolve_symlink_components(candidate);
+  if (resolved != candidate.lexically_normal())
+  {
+    ec.clear();
+    if (std::filesystem::is_directory(resolved, ec) && !ec)
+    {
+      if (out != nullptr)
+        *out = normalize_resolved_path(resolved);
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string napi_util__::to_utf8(napi_env env, napi_value value)
+{
+  if (!check_env(env) || value == nullptr)
+    return {};
+  return to_utf8(context(env), value->get_inner());
+}
+
+std::string napi_util__::to_utf8(JSContext *ctx, JSValueConst value)
+{
+  if (ctx == nullptr)
+    return {};
+  const char *str = JS_ToCString(ctx, value);
+  if (str == nullptr)
+    return {};
+  std::string out(str);
+  JS_FreeCString(ctx, str);
+  return out;
+}
+
+void napi_util__::set_string_property(JSContext *ctx,
+                                      JSValueConst object,
+                                      const char *name,
+                                      const std::string &value)
+{
+  JS_SetPropertyStr(ctx, object, name, JS_NewStringLen(ctx, value.c_str(), value.size()));
+}
+
+bool napi_util__::is_truthy_property(napi_env env, napi_value object, const char *name)
+{
+  JSContext *ctx = context(env);
+  JSValue prop = JS_GetPropertyStr(ctx, object->get_inner(), name);
+  if (JS_IsException(prop))
+    return false;
+  bool out = JS_ToBool(ctx, prop);
+  JS_FreeValue(ctx, prop);
+  return out;
+}
+
+napi_status napi_util__::wrap_owned(napi_env env, JSValue value, napi_value *result)
+{
+  if (result == nullptr)
+  {
+    JS_FreeValue(context(env), value);
+    return napi_invalid_arg;
+  }
+  *result = env->current_scope()->wrap_value(value, true);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status napi_util__::wrap_dup(napi_env env, JSValueConst value, napi_value *result)
+{
+  return wrap_owned(env, JS_DupValue(context(env), value), result);
+}
+
+napi_status napi_util__::create_empty_array(napi_env env, napi_value *result)
+{
+  return wrap_owned(env, JS_NewArray(context(env)), result);
+}
+
+napi_status napi_util__::create_undefined(napi_env env, napi_value *result)
+{
+  return wrap_owned(env, JS_UNDEFINED, result);
+}
+
+napi_value napi_util__::undefined_value(napi_env env)
+{
+  napi_value out = nullptr;
+  napi_get_undefined(env, &out);
+  return out;
+}
+
+bool napi_util__::is_callable(napi_env env, napi_value value)
+{
+  return value != nullptr && JS_IsFunction(context(env), value->get_inner());
+}
+
+napi_status napi_util__::run_pending_jobs(napi_env env)
+{
+  JSContext *job_ctx = nullptr;
+  for (;;)
+  {
+    int rc = JS_ExecutePendingJob(runtime(env), &job_ctx);
+    if (rc == 0)
+      return napi_ok;
+    if (rc < 0)
+      return napi_pending_exception;
+  }
+}
+
+JSValue napi_util__::get_constructor_name_value(napi_env env, JSValueConst value)
+{
+  JSContext *ctx = context(env);
+  JSValue ctor = JS_GetPropertyStr(ctx, value, "constructor");
+  if (JS_IsException(ctor))
+    return JS_EXCEPTION;
+  JSValue name = JS_UNDEFINED;
+  if (JS_IsObject(ctor))
+    name = JS_GetPropertyStr(ctx, ctor, "name");
+  JS_FreeValue(ctx, ctor);
+  if (JS_IsException(name))
+    return JS_EXCEPTION;
+  if (JS_IsUndefined(name))
+    name = JS_NewString(ctx, "");
+  return name;
+}
+
+napi_status napi_util__::unsupported_if_valid_env(napi_env env)
+{
+  return check_env(env) ? napi_generic_failure : napi_invalid_arg;
 }
 
 bool napi_util__::decimal_digits_fit(const char *value, const char *max)

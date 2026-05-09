@@ -1,13 +1,12 @@
 #include "unofficial_module_loader.h"
 
+#include "internal/napi_util.h"
+
 #include <algorithm>
 #include <cstdlib>
-#include <fstream>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -15,8 +14,6 @@ namespace edge_quickjs::module_loader {
 namespace {
 
 namespace fs = std::filesystem;
-
-constexpr size_t kMaxSymlinkExpansions = 64;
 
 bool StartsWith(std::string_view value, std::string_view prefix) {
   return value.substr(0, prefix.size()) == prefix;
@@ -27,57 +24,8 @@ bool EndsWith(std::string_view value, std::string_view suffix) {
          value.substr(value.size() - suffix.size()) == suffix;
 }
 
-int HexDigitValue(char ch) {
-  if (ch >= '0' && ch <= '9') return ch - '0';
-  if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
-  if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
-  return -1;
-}
-
-std::string PercentDecode(std::string_view input) {
-  std::string out;
-  out.reserve(input.size());
-  for (size_t i = 0; i < input.size(); ++i) {
-    if (input[i] == '%' && i + 2 < input.size()) {
-      const int hi = HexDigitValue(input[i + 1]);
-      const int lo = HexDigitValue(input[i + 2]);
-      if (hi >= 0 && lo >= 0) {
-        out.push_back(static_cast<char>((hi << 4) | lo));
-        i += 2;
-        continue;
-      }
-    }
-    out.push_back(input[i]);
-  }
-  return out;
-}
-
-fs::path StripFileUrl(std::string_view value) {
-  constexpr std::string_view kScheme = "file://";
-  if (!StartsWith(value, kScheme)) return fs::path(std::string(value));
-
-  std::string rest(value.substr(kScheme.size()));
-  if (StartsWith(rest, "localhost/")) {
-    rest.erase(0, std::string("localhost").size());
-  } else if (!rest.empty() && rest[0] != '/') {
-    const size_t slash = rest.find('/');
-    if (slash == std::string::npos) return {};
-    rest.erase(0, slash);
-  }
-  return fs::path(PercentDecode(rest));
-}
-
-std::string PathToFileUrl(const fs::path& path) {
-  std::string out = "file://";
-  const std::string input = path.string();
-  for (char ch : input) {
-    if (ch == ' ') {
-      out += "%20";
-    } else {
-      out.push_back(ch);
-    }
-  }
-  return out;
+fs::path strip_file_url(std::string_view value) {
+  return napi_util__::strip_file_url(value);
 }
 
 struct JsonValue {
@@ -834,71 +782,15 @@ bool ResolvePackageSubpathForESM(const fs::path& package_dir,
 }  // namespace
 
 fs::path ResolveSymlinkComponents(const fs::path& path) {
-  fs::path current;
-  size_t expansions = 0;
-  std::unordered_set<std::string> seen;
-
-  for (const fs::path& part : path.lexically_normal()) {
-    if (part == "." || part.empty()) continue;
-    if (part == "..") {
-      current /= part;
-      continue;
-    }
-    if (part == path.root_name() || part == path.root_directory()) {
-      current /= part;
-      continue;
-    }
-
-    fs::path candidate = current.empty() ? part : current / part;
-    std::error_code ec;
-    if (fs::is_symlink(candidate, ec) && !ec) {
-      const std::string key = candidate.lexically_normal().string();
-      if (++expansions > kMaxSymlinkExpansions || !seen.insert(key).second) {
-        current = candidate;
-        continue;
-      }
-      fs::path target = fs::read_symlink(candidate, ec);
-      if (!ec) {
-        current = target.is_absolute() ? target : candidate.parent_path() / target;
-        current = current.lexically_normal();
-        continue;
-      }
-    }
-    current = candidate;
-  }
-  return current.lexically_normal();
+  return napi_util__::resolve_symlink_components(path);
 }
 
 fs::path NormalizeResolvedPath(const fs::path& path) {
-  std::error_code ec;
-  fs::path absolute = path;
-  if (!absolute.is_absolute()) {
-    absolute = fs::absolute(path, ec);
-    if (ec) {
-      absolute = path;
-      ec.clear();
-    }
-  }
-  fs::path canonical = fs::weakly_canonical(absolute, ec);
-  if (!ec) return canonical.lexically_normal();
-  fs::path resolved = ResolveSymlinkComponents(absolute);
-  if (resolved != absolute.lexically_normal()) return resolved.lexically_normal();
-  return absolute.lexically_normal();
+  return napi_util__::normalize_resolved_path(path);
 }
 
 std::string ReadTextFile(const fs::path& path) {
-  std::ifstream in(path);
-  if (!in.is_open()) {
-    const fs::path resolved = ResolveSymlinkComponents(path);
-    if (resolved != path.lexically_normal()) {
-      in.clear();
-      in.open(resolved);
-    }
-  }
-  if (!in.is_open()) return "";
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  return ss.str();
+  return napi_util__::read_text_file(path);
 }
 
 bool PackageTypeIsModule(const fs::path& package_json_path) {
@@ -910,37 +802,11 @@ bool PackageTypeIsModule(const fs::path& package_json_path) {
 }
 
 bool IsRegularFileFollowingSymlinks(const fs::path& candidate, fs::path* out) {
-  std::error_code ec;
-  if (fs::is_regular_file(candidate, ec) && !ec) {
-    if (out != nullptr) *out = NormalizeResolvedPath(candidate);
-    return true;
-  }
-  const fs::path resolved = ResolveSymlinkComponents(candidate);
-  if (resolved != candidate.lexically_normal()) {
-    ec.clear();
-    if (fs::is_regular_file(resolved, ec) && !ec) {
-      if (out != nullptr) *out = NormalizeResolvedPath(resolved);
-      return true;
-    }
-  }
-  return false;
+  return napi_util__::is_regular_file_following_symlinks(candidate, out);
 }
 
 bool IsDirectoryFollowingSymlinks(const fs::path& candidate, fs::path* out) {
-  std::error_code ec;
-  if (fs::is_directory(candidate, ec) && !ec) {
-    if (out != nullptr) *out = NormalizeResolvedPath(candidate);
-    return true;
-  }
-  const fs::path resolved = ResolveSymlinkComponents(candidate);
-  if (resolved != candidate.lexically_normal()) {
-    ec.clear();
-    if (fs::is_directory(resolved, ec) && !ec) {
-      if (out != nullptr) *out = NormalizeResolvedPath(resolved);
-      return true;
-    }
-  }
-  return false;
+  return napi_util__::is_directory_following_symlinks(candidate, out);
 }
 
 bool ResolveCommonJSPath(const std::string& specifier,
@@ -972,7 +838,7 @@ bool ResolveESMPath(const std::string& base,
                     std::string* out) {
   if (out == nullptr || specifier.empty()) return false;
 
-  fs::path base_path = StripFileUrl(base);
+  fs::path base_path = strip_file_url(base);
   fs::path base_dir = fs::current_path();
   std::error_code ec;
   if (!base_path.empty() && base_path.is_absolute()) {
@@ -993,7 +859,7 @@ bool ResolveESMPath(const std::string& base,
 
   if (StartsWith(specifier, "file://")) {
     static const std::vector<std::string> extensions = {".js", ".mjs", ".json"};
-    if (TryResolveAsFileWithExtensions(StripFileUrl(specifier), extensions, &resolved)) {
+    if (TryResolveAsFileWithExtensions(strip_file_url(specifier), extensions, &resolved)) {
       *out = resolved.string();
       return true;
     }

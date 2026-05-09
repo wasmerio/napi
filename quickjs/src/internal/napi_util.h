@@ -4,6 +4,9 @@
 #include "../../../include/js_native_api.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <quickjs.h>
 
@@ -12,12 +15,39 @@ class napi_util__
 public:
   static bool check_env(napi_env env);
   static bool check_value(napi_env env, napi_value value);
+  static JSContext *context(napi_env env);
+  static JSRuntime *runtime(napi_env env);
 
   static void clear_last_exception(napi_env env);
   static void set_last_exception(napi_env env, JSValue exception);
   static bool rethrow_last_exception(napi_env env, JSContext *ctx);
   static napi_status return_pending_if_caught(napi_env env, const char *message);
   static napi_status invalid_arg(napi_env env);
+
+  static std::filesystem::path strip_file_url(std::string_view value);
+  static std::filesystem::path resolve_symlink_components(const std::filesystem::path &path);
+  static std::string read_text_file(const std::filesystem::path &path);
+  static std::filesystem::path normalize_resolved_path(const std::filesystem::path &path);
+  static bool is_regular_file_following_symlinks(const std::filesystem::path &candidate,
+                                                 std::filesystem::path *out);
+  static bool is_directory_following_symlinks(const std::filesystem::path &candidate,
+                                              std::filesystem::path *out);
+  static std::string to_utf8(napi_env env, napi_value value);
+  static std::string to_utf8(JSContext *ctx, JSValueConst value);
+  static void set_string_property(JSContext *ctx,
+                                  JSValueConst object,
+                                  const char *name,
+                                  const std::string &value);
+  static bool is_truthy_property(napi_env env, napi_value object, const char *name);
+  static napi_status wrap_owned(napi_env env, JSValue value, napi_value *result);
+  static napi_status wrap_dup(napi_env env, JSValueConst value, napi_value *result);
+  static napi_status create_empty_array(napi_env env, napi_value *result);
+  static napi_status create_undefined(napi_env env, napi_value *result);
+  static napi_value undefined_value(napi_env env);
+  static bool is_callable(napi_env env, napi_value value);
+  static napi_status run_pending_jobs(napi_env env);
+  static JSValue get_constructor_name_value(napi_env env, JSValueConst value);
+  static napi_status unsupported_if_valid_env(napi_env env);
 
   static bool bigint_fits_signed64(JSContext *ctx, JSValueConst value);
   static bool bigint_fits_unsigned64(JSContext *ctx, JSValueConst value);

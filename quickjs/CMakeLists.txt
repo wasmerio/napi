@@ -61,17 +61,8 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 
 add_library(napi_quickjs STATIC
   src/js_native_api_quickjs.cc
-  src/compat/buffer.cc
-  src/compat/console.cc
-  src/compat/contextify.cc
-  src/compat/environment.cc
-  src/compat/global_shims.cc
-  src/compat/microtasks.cc
-  src/compat/module_loading.cc
-  src/compat/properties.cc
-  src/compat/quickjs_utilities.cc
-  src/compat/serdes.cc
   src/internal/napi_callback_info.cc
+  src/internal/napi_contextify.cc
   src/internal/napi_deferred.cc
   src/internal/napi_env.cc
   src/internal/napi_env_cleanup_hook.cc
@@ -80,12 +71,13 @@ add_library(napi_quickjs STATIC
   src/internal/napi_external_backing_store_hint.cc
   src/internal/napi_function.cc
   src/internal/napi_handle_scope.cc
+  src/internal/napi_promises.cc
   src/internal/napi_ref.cc
   src/internal/napi_scope.cc
+  src/internal/napi_serdes.cc
+  src/internal/napi_set_property.cc
   src/internal/napi_util.cc
   src/internal/napi_value.cc
-  src/unofficial_module_loader.cc
-  src/quickjs_cjs_exports.cc
   src/unofficial_napi.cc
 )
 
@@ -100,9 +92,9 @@ target_include_directories(napi_quickjs
 target_compile_definitions(napi_quickjs
   PUBLIC
     NAPI_EXTERN=
-    EDGE_BUNDLED_NAPI_QUICKJS=1
+    NAPI_BUNDLED_QUICKJS=1
   PRIVATE
-    EDGE_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
+    NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(napi_quickjs PRIVATE -fno-rtti)

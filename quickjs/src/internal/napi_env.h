@@ -4,10 +4,12 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 #include "napi_callback_info.h"
+#include "napi_contextify.h"
 #include "napi_deferred.h"
 #include "napi_env_cleanup_hook.h"
 #include "napi_escapable_handle_scope.h"
 #include "napi_handle_scope.h"
+#include "napi_promises.h"
 #include "napi_ref.h"
 #include "napi_scope.h"
 #include "napi_value.h"
@@ -51,6 +53,11 @@ struct napi_env__
 
   int64_t adjust_external_memory(int64_t change_in_bytes);
 
+  napi_promises__ &promises();
+  const napi_promises__ &promises() const;
+  quickjs::detail::napi_contextify__ &contextify();
+  const quickjs::detail::napi_contextify__ &contextify() const;
+
 private:
   JSContext *context_;
   napi_extended_error_info last_error_{};
@@ -66,6 +73,8 @@ private:
   napi_scope__ *root_scope_ = nullptr;
   napi_scope__ *current_scope_ = nullptr;
   int64_t external_memory_ = 0;
+  napi_promises__ promises_;
+  quickjs::detail::napi_contextify__ contextify_;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

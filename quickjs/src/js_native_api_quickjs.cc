@@ -1,9 +1,8 @@
-#include "compat/buffer.h"
-#include "compat/properties.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_external_backing_store_hint.h"
 #include "internal/napi_function.h"
+#include "internal/napi_set_property.h"
 #include "internal/napi_util.h"
 #include <climits>
 #include <cmath>
@@ -3177,8 +3176,6 @@ extern "C"
       JS_FreeValue(env->context(), buffer);
       return status;
     }
-    install_runtime_buffer_prototype(env, buffer);
-
     *result = env->current_scope()->wrap_value(buffer, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
