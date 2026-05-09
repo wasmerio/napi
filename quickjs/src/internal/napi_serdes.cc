@@ -1,4 +1,4 @@
-#include "compat/serdes.h"
+#include "internal/napi_serdes.h"
 
 #include "compat/quickjs_utilities.h"
 #include "internal/napi_value.h"
@@ -10,12 +10,12 @@
 
 namespace quickjs::detail
 {
-    struct SerdesSerializer
+    struct napi_serdes__::serializer
     {
         std::vector<uint8_t> bytes;
     };
 
-    struct SerdesDeserializer
+    struct napi_serdes__::deserializer
     {
         std::vector<uint8_t> bytes;
         size_t offset = 0;
@@ -137,58 +137,58 @@ namespace quickjs::detail
         return true;
     }
 
-    // Brief: SerdesSerializerFinalize belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_finalize belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    void SerdesSerializerFinalize(napi_env /*env*/, void *data, void * /*hint*/)
+    void napi_serdes__::serializer_finalize(napi_env /*env*/, void *data, void * /*hint*/)
     {
-        delete static_cast<SerdesSerializer *>(data);
+        delete static_cast<napi_serdes__::serializer *>(data);
     }
 
-    // Brief: SerdesDeserializerFinalize belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_finalize belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    void SerdesDeserializerFinalize(napi_env /*env*/, void *data, void * /*hint*/)
+    void napi_serdes__::deserializer_finalize(napi_env /*env*/, void *data, void * /*hint*/)
     {
-        delete static_cast<SerdesDeserializer *>(data);
+        delete static_cast<napi_serdes__::deserializer *>(data);
     }
 
-    // Brief: GetSerdesSerializer belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::get_serializer belongs to the serdes compatibility layer.
     // It unwraps the native serializer state stored on a JavaScript instance.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Invalid instances return null so callers can throw the public serdes error.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    SerdesSerializer *GetSerdesSerializer(napi_env env, napi_value this_arg)
+    napi_serdes__::serializer *napi_serdes__::get_serializer(napi_env env, napi_value this_arg)
     {
         void *data = nullptr;
         if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr)
             return nullptr;
-        return static_cast<SerdesSerializer *>(data);
+        return static_cast<napi_serdes__::serializer *>(data);
     }
 
-    // Brief: GetSerdesDeserializer belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::get_deserializer belongs to the serdes compatibility layer.
     // It unwraps the native deserializer state stored on a JavaScript instance.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Invalid instances return null so callers can throw the public serdes error.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    SerdesDeserializer *GetSerdesDeserializer(napi_env env, napi_value this_arg)
+    napi_serdes__::deserializer *napi_serdes__::get_deserializer(napi_env env, napi_value this_arg)
     {
         void *data = nullptr;
         if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr)
             return nullptr;
-        return static_cast<SerdesDeserializer *>(data);
+        return static_cast<napi_serdes__::deserializer *>(data);
     }
 
-    // Brief: SerdesSerializerNew belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_new belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerNew(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_new(napi_env env, napi_callback_info info)
     {
         napi_value new_target = nullptr;
         if (napi_get_new_target(env, info, &new_target) != napi_ok || new_target == nullptr)
@@ -204,13 +204,13 @@ namespace quickjs::detail
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok || this_arg == nullptr)
             return nullptr;
 
-        auto *serializer = new (std::nothrow) SerdesSerializer();
+        auto *serializer = new (std::nothrow) napi_serdes__::serializer();
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Failed to allocate Serializer");
             return nullptr;
         }
-        if (napi_wrap(env, this_arg, serializer, SerdesSerializerFinalize, nullptr, nullptr) != napi_ok)
+        if (napi_wrap(env, this_arg, serializer, napi_serdes__::serializer_finalize, nullptr, nullptr) != napi_ok)
         {
             delete serializer;
             napi_throw_error(env, nullptr, "Failed to initialize Serializer");
@@ -219,22 +219,22 @@ namespace quickjs::detail
         return nullptr;
     }
 
-    // Brief: SerdesSerializerWriteHeader belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_header belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteHeader(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::serializer_write_header(napi_env env, napi_callback_info /*info*/)
     {
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerWriteValue belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_value belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteValue(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_write_value(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[1] = {nullptr};
@@ -242,7 +242,7 @@ namespace quickjs::detail
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
 
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -270,18 +270,18 @@ namespace quickjs::detail
         return result;
     }
 
-    // Brief: SerdesSerializerReleaseBuffer belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_release_buffer belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerReleaseBuffer(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_release_buffer(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         size_t argc = 0;
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -296,29 +296,29 @@ namespace quickjs::detail
         return buffer;
     }
 
-    // Brief: SerdesSerializerTransferArrayBuffer belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_transfer_array_buffer belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerTransferArrayBuffer(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::serializer_transfer_array_buffer(napi_env env, napi_callback_info /*info*/)
     {
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerWriteUint32 belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_uint32 belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteUint32(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_write_uint32(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[1] = {nullptr};
         size_t argc = 1;
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -331,19 +331,19 @@ namespace quickjs::detail
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerWriteUint64 belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_uint64 belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteUint64(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_write_uint64(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[2] = {nullptr, nullptr};
         size_t argc = 2;
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -359,19 +359,19 @@ namespace quickjs::detail
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerWriteDouble belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_double belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteDouble(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_write_double(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[1] = {nullptr};
         size_t argc = 1;
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -385,19 +385,19 @@ namespace quickjs::detail
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerWriteRawBytes belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_write_raw_bytes belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerWriteRawBytes(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::serializer_write_raw_bytes(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[1] = {nullptr};
         size_t argc = 1;
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesSerializer *serializer = GetSerdesSerializer(env, this_arg);
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Serializer state");
@@ -413,23 +413,23 @@ namespace quickjs::detail
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesSerializerSetTreatArrayBufferViewsAsHostObjects belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::serializer_set_treat_array_buffer_views_as_host_objects belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesSerializerSetTreatArrayBufferViewsAsHostObjects(napi_env env,
+    napi_value napi_serdes__::serializer_set_treat_array_buffer_views_as_host_objects(napi_env env,
                                                                      napi_callback_info /*info*/)
     {
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesDeserializerNew belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_new belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerNew(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_new(napi_env env, napi_callback_info info)
     {
         napi_value new_target = nullptr;
         if (napi_get_new_target(env, info, &new_target) != napi_ok || new_target == nullptr)
@@ -451,7 +451,7 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        auto *deserializer = new (std::nothrow) SerdesDeserializer();
+        auto *deserializer = new (std::nothrow) napi_serdes__::deserializer();
         if (deserializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Failed to allocate Deserializer");
@@ -463,7 +463,7 @@ namespace quickjs::detail
             napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "buffer must be a TypedArray or a DataView");
             return nullptr;
         }
-        if (napi_wrap(env, this_arg, deserializer, SerdesDeserializerFinalize, nullptr, nullptr) != napi_ok)
+        if (napi_wrap(env, this_arg, deserializer, napi_serdes__::deserializer_finalize, nullptr, nullptr) != napi_ok)
         {
             delete deserializer;
             napi_throw_error(env, nullptr, "Failed to initialize Deserializer");
@@ -473,30 +473,30 @@ namespace quickjs::detail
         return nullptr;
     }
 
-    // Brief: SerdesDeserializerReadHeader belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_header belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadHeader(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::deserializer_read_header(napi_env env, napi_callback_info /*info*/)
     {
         napi_value result = nullptr;
         napi_get_boolean(env, true, &result);
         return result;
     }
 
-    // Brief: SerdesDeserializerReadValue belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_value belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadValue(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_read_value(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         size_t argc = 0;
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesDeserializer *deserializer = GetSerdesDeserializer(env, this_arg);
+        napi_serdes__::deserializer *deserializer = napi_serdes__::get_deserializer(env, this_arg);
         if (deserializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Invalid Deserializer state");
@@ -522,40 +522,40 @@ namespace quickjs::detail
         return result;
     }
 
-    // Brief: SerdesDeserializerGetWireFormatVersion belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_get_wire_format_version belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerGetWireFormatVersion(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::deserializer_get_wire_format_version(napi_env env, napi_callback_info /*info*/)
     {
         napi_value result = nullptr;
         napi_create_uint32(env, 0, &result);
         return result;
     }
 
-    // Brief: SerdesDeserializerTransferArrayBuffer belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_transfer_array_buffer belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerTransferArrayBuffer(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::deserializer_transfer_array_buffer(napi_env env, napi_callback_info /*info*/)
     {
         return UndefinedValue(env);
     }
 
-    // Brief: SerdesDeserializerReadUint32 belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_uint32 belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadUint32(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_read_uint32(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         size_t argc = 0;
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesDeserializer *deserializer = GetSerdesDeserializer(env, this_arg);
+        napi_serdes__::deserializer *deserializer = napi_serdes__::get_deserializer(env, this_arg);
         uint64_t value = 0;
         if (deserializer == nullptr || !ReadLittleEndian(deserializer->bytes, &deserializer->offset, 4, &value))
         {
@@ -567,18 +567,18 @@ namespace quickjs::detail
         return result;
     }
 
-    // Brief: SerdesDeserializerReadUint64 belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_uint64 belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadUint64(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_read_uint64(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         size_t argc = 0;
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesDeserializer *deserializer = GetSerdesDeserializer(env, this_arg);
+        napi_serdes__::deserializer *deserializer = napi_serdes__::get_deserializer(env, this_arg);
         uint64_t value = 0;
         if (deserializer == nullptr || !ReadLittleEndian(deserializer->bytes, &deserializer->offset, 8, &value))
         {
@@ -597,18 +597,18 @@ namespace quickjs::detail
         return result;
     }
 
-    // Brief: SerdesDeserializerReadDouble belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_double belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadDouble(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_read_double(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         size_t argc = 0;
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesDeserializer *deserializer = GetSerdesDeserializer(env, this_arg);
+        napi_serdes__::deserializer *deserializer = napi_serdes__::get_deserializer(env, this_arg);
         if (deserializer == nullptr ||
             deserializer->offset > deserializer->bytes.size() ||
             sizeof(double) > deserializer->bytes.size() - deserializer->offset)
@@ -624,19 +624,19 @@ namespace quickjs::detail
         return result;
     }
 
-    // Brief: SerdesDeserializerReadRawBytes belongs to the serdes compatibility layer.
+    // Brief: napi_serdes__::deserializer_read_raw_bytes belongs to the serdes compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value SerdesDeserializerReadRawBytes(napi_env env, napi_callback_info info)
+    napi_value napi_serdes__::deserializer_read_raw_bytes(napi_env env, napi_callback_info info)
     {
         napi_value this_arg = nullptr;
         napi_value argv[1] = {nullptr};
         size_t argc = 1;
         if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
             return nullptr;
-        SerdesDeserializer *deserializer = GetSerdesDeserializer(env, this_arg);
+        napi_serdes__::deserializer *deserializer = napi_serdes__::get_deserializer(env, this_arg);
         int64_t length = 0;
         if (deserializer == nullptr || argc < 1 || napi_get_value_int64(env, argv[0], &length) != napi_ok ||
             length < 0 || deserializer->offset > deserializer->bytes.size() ||

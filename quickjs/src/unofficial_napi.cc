@@ -1,11 +1,11 @@
 #include "unofficial_napi.h"
 
 #include "compat/contextify.h"
-#include "compat/microtasks.h"
 #include "compat/quickjs_utilities.h"
-#include "compat/serdes.h"
+#include "internal/napi_serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
+#include "internal/napi_promises.h"
 #include "internal/napi_util.h"
 #include "internal/quickjs_trace.h"
 #include "node_api.h"
@@ -99,6 +99,7 @@ extern "C"
         }
 
         JS_SetContextOpaque(context, env);
+        JS_SetPromiseHook(rt, napi_promises__::promise_hook, env);
 
         *result = env;
         return napi_ok;
@@ -303,7 +304,7 @@ extern "C"
             return napi_invalid_arg;
         JSContext *ctx = Ctx(env);
         JSValueConst argv[] = {callback->get_inner()};
-        if (JS_EnqueueJob(ctx, QuickjsMicrotaskJob, 1, argv) < 0)
+        if (JS_EnqueueJob(ctx, napi_promises__::microtask_job, 1, argv) < 0)
             return JS_HasException(ctx) ? napi_pending_exception : napi_generic_failure;
         return napi_ok;
     }
@@ -311,9 +312,15 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                        napi_value callback)
     {
-        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
+        napi_status status = env->promises().set_reject_callback(callback);
+        if (status != napi_ok)
+            return status;
+        JS_SetHostPromiseRejectionTracker(
+            Rt(env),
+            env->promises().has_reject_callback() ? napi_promises__::rejection_tracker : nullptr,
+            env);
         return napi_ok;
     }
 
@@ -323,12 +330,12 @@ extern "C"
                                                              napi_value after,
                                                              napi_value resolve)
     {
-        (void)init;
-        (void)before;
-        (void)after;
-        (void)resolve;
         if (!CheckEnv(env))
             return napi_invalid_arg;
+        napi_status status = env->promises().set_hooks(init, before, after, resolve);
+        if (status != napi_ok)
+            return status;
+        JS_SetPromiseHook(Rt(env), napi_promises__::promise_hook, env);
         return napi_ok;
     }
 
@@ -968,16 +975,19 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return CreateUndefined(env, result_out);
+        JSValueConst value = env->promises().continuation_preserved_embedder_data();
+        if (JS_IsUndefined(value))
+            return CreateUndefined(env, result_out);
+        return WrapDup(env, value, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_continuation_preserved_embedder_data(
         napi_env env,
         napi_value value)
     {
-        (void)value;
         if (!CheckEnv(env) || value == nullptr)
             return napi_invalid_arg;
+        env->promises().set_continuation_preserved_embedder_data(value->get_inner());
         return napi_ok;
     }
 
@@ -997,22 +1007,22 @@ extern "C"
             return napi_generic_failure;
 
         napi_property_descriptor serializer_props[] = {
-            {"writeHeader", nullptr, SerdesSerializerWriteHeader, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"writeValue", nullptr, SerdesSerializerWriteValue, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"releaseBuffer", nullptr, SerdesSerializerReleaseBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"transferArrayBuffer", nullptr, SerdesSerializerTransferArrayBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"writeUint32", nullptr, SerdesSerializerWriteUint32, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"writeUint64", nullptr, SerdesSerializerWriteUint64, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"writeDouble", nullptr, SerdesSerializerWriteDouble, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"writeRawBytes", nullptr, SerdesSerializerWriteRawBytes, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"_setTreatArrayBufferViewsAsHostObjects", nullptr, SerdesSerializerSetTreatArrayBufferViewsAsHostObjects, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeHeader", nullptr, napi_serdes__::serializer_write_header, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeValue", nullptr, napi_serdes__::serializer_write_value, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"releaseBuffer", nullptr, napi_serdes__::serializer_release_buffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"transferArrayBuffer", nullptr, napi_serdes__::serializer_transfer_array_buffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeUint32", nullptr, napi_serdes__::serializer_write_uint32, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeUint64", nullptr, napi_serdes__::serializer_write_uint64, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeDouble", nullptr, napi_serdes__::serializer_write_double, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"writeRawBytes", nullptr, napi_serdes__::serializer_write_raw_bytes, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"_setTreatArrayBufferViewsAsHostObjects", nullptr, napi_serdes__::serializer_set_treat_array_buffer_views_as_host_objects, nullptr, nullptr, nullptr, napi_default_method, nullptr},
         };
 
         napi_value serializer_ctor = nullptr;
         if (napi_define_class(env,
                               "Serializer",
                               NAPI_AUTO_LENGTH,
-                              SerdesSerializerNew,
+                              napi_serdes__::serializer_new,
                               nullptr,
                               sizeof(serializer_props) / sizeof(serializer_props[0]),
                               serializer_props,
@@ -1024,21 +1034,21 @@ extern "C"
         }
 
         napi_property_descriptor deserializer_props[] = {
-            {"readHeader", nullptr, SerdesDeserializerReadHeader, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"readValue", nullptr, SerdesDeserializerReadValue, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"getWireFormatVersion", nullptr, SerdesDeserializerGetWireFormatVersion, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"transferArrayBuffer", nullptr, SerdesDeserializerTransferArrayBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"readUint32", nullptr, SerdesDeserializerReadUint32, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"readUint64", nullptr, SerdesDeserializerReadUint64, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"readDouble", nullptr, SerdesDeserializerReadDouble, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-            {"_readRawBytes", nullptr, SerdesDeserializerReadRawBytes, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"readHeader", nullptr, napi_serdes__::deserializer_read_header, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"readValue", nullptr, napi_serdes__::deserializer_read_value, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"getWireFormatVersion", nullptr, napi_serdes__::deserializer_get_wire_format_version, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"transferArrayBuffer", nullptr, napi_serdes__::deserializer_transfer_array_buffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"readUint32", nullptr, napi_serdes__::deserializer_read_uint32, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"readUint64", nullptr, napi_serdes__::deserializer_read_uint64, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"readDouble", nullptr, napi_serdes__::deserializer_read_double, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+            {"_readRawBytes", nullptr, napi_serdes__::deserializer_read_raw_bytes, nullptr, nullptr, nullptr, napi_default_method, nullptr},
         };
 
         napi_value deserializer_ctor = nullptr;
         if (napi_define_class(env,
                               "Deserializer",
                               NAPI_AUTO_LENGTH,
-                              SerdesDeserializerNew,
+                              napi_serdes__::deserializer_new,
                               nullptr,
                               sizeof(deserializer_props) / sizeof(deserializer_props[0]),
                               deserializer_props,
