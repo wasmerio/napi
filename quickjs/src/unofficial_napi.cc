@@ -22,12 +22,6 @@ using namespace quickjs::detail;
 
 namespace
 {
-    struct SerializedValue
-    {
-        size_t length = 0;
-        uint8_t bytes[];
-    };
-
     struct UnofficialEnvScope
     {
         JSRuntime *rt = nullptr;
@@ -764,27 +758,7 @@ extern "C"
         napi_value value,
         void **payload_out)
     {
-        if (!CheckEnv(env) || value == nullptr || payload_out == nullptr)
-            return napi_invalid_arg;
-        size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(Ctx(env),
-                                        &size,
-                                        value->get_inner(),
-                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
-        if (bytes == nullptr)
-            return napi_generic_failure;
-        auto *payload = static_cast<SerializedValue *>(std::malloc(sizeof(SerializedValue) + size));
-        if (payload == nullptr)
-        {
-            js_free(Ctx(env), bytes);
-            return napi_generic_failure;
-        }
-        payload->length = size;
-        if (size > 0)
-            std::memcpy(payload->bytes, bytes, size);
-        js_free(Ctx(env), bytes);
-        *payload_out = payload;
-        return napi_ok;
+        return napi_serdes__::serialize_value(env, value, payload_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_deserialize_value(
@@ -792,21 +766,12 @@ extern "C"
         void *payload,
         napi_value *result_out)
     {
-        if (!CheckEnv(env) || payload == nullptr || result_out == nullptr)
-            return napi_invalid_arg;
-        auto *serialized = static_cast<SerializedValue *>(payload);
-        JSValue value = JS_ReadObject(Ctx(env),
-                                      serialized->bytes,
-                                      serialized->length,
-                                      JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
-        if (JS_IsException(value))
-            return napi_pending_exception;
-        return WrapOwned(env, value, result_out);
+        return napi_serdes__::deserialize_value(env, payload, result_out);
     }
 
     void NAPI_CDECL unofficial_napi_release_serialized_value(void *payload)
     {
-        std::free(payload);
+        napi_serdes__::release_serialized_value(payload);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(

@@ -4,6 +4,7 @@
 #include "internal/napi_value.h"
 #include "node_api.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <vector>
@@ -19,6 +20,12 @@ namespace quickjs::detail
     {
         std::vector<uint8_t> bytes;
         size_t offset = 0;
+    };
+
+    struct napi_serdes__::serialized_value
+    {
+        size_t length = 0;
+        uint8_t bytes[];
     };
 
     // Brief: ReadBytesFromArrayBufferLike belongs to the serdes compatibility layer.
@@ -651,5 +658,53 @@ namespace quickjs::detail
         napi_value result = nullptr;
         napi_create_uint32(env, static_cast<uint32_t>(offset), &result);
         return result;
+    }
+
+    napi_status napi_serdes__::serialize_value(napi_env env,
+                                               napi_value value,
+                                               void **payload_out)
+    {
+        if (!CheckEnv(env) || value == nullptr || payload_out == nullptr)
+            return napi_invalid_arg;
+        size_t size = 0;
+        uint8_t *bytes = JS_WriteObject(Ctx(env),
+                                        &size,
+                                        value->get_inner(),
+                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
+        if (bytes == nullptr)
+            return napi_generic_failure;
+        auto *payload = static_cast<serialized_value *>(std::malloc(sizeof(serialized_value) + size));
+        if (payload == nullptr)
+        {
+            js_free(Ctx(env), bytes);
+            return napi_generic_failure;
+        }
+        payload->length = size;
+        if (size > 0)
+            std::memcpy(payload->bytes, bytes, size);
+        js_free(Ctx(env), bytes);
+        *payload_out = payload;
+        return napi_ok;
+    }
+
+    napi_status napi_serdes__::deserialize_value(napi_env env,
+                                                 void *payload,
+                                                 napi_value *result_out)
+    {
+        if (!CheckEnv(env) || payload == nullptr || result_out == nullptr)
+            return napi_invalid_arg;
+        auto *serialized = static_cast<serialized_value *>(payload);
+        JSValue value = JS_ReadObject(Ctx(env),
+                                      serialized->bytes,
+                                      serialized->length,
+                                      JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
+        if (JS_IsException(value))
+            return napi_pending_exception;
+        return WrapOwned(env, value, result_out);
+    }
+
+    void napi_serdes__::release_serialized_value(void *payload)
+    {
+        std::free(payload);
     }
 }
