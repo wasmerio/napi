@@ -417,25 +417,6 @@ namespace quickjs::detail
         return value != nullptr && JS_IsFunction(Ctx(env), value->get_inner());
     }
 
-    // Brief: StoreOptionalFunction belongs to the general utility compatibility layer.
-    // It keeps Node-facing behavior out of the public N-API entry points.
-    // Inputs stay as QuickJS or N-API handles owned by the caller.
-    // Failures either preserve QuickJS exception state or report N-API status.
-    // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_status StoreOptionalFunction(napi_env env, napi_value callback, JSValue *target)
-    {
-        if (target == nullptr)
-            return napi_invalid_arg;
-        if (callback != nullptr && !JS_IsUndefined(callback->get_inner()) && !JS_IsNull(callback->get_inner()) &&
-            !IsCallable(env, callback))
-            return napi_function_expected;
-
-        if (!JS_IsUndefined(*target))
-            JS_FreeValue(Ctx(env), *target);
-        *target = (callback == nullptr) ? JS_UNDEFINED : JS_DupValue(Ctx(env), callback->get_inner());
-        return napi_ok;
-    }
-
     // Brief: RunPendingJobs belongs to the general utility compatibility layer.
     // It keeps Node-facing behavior out of the public N-API entry points.
     // Inputs stay as QuickJS or N-API handles owned by the caller.

@@ -1,20 +1,20 @@
-#ifndef QUICKJS_TRACE_H_
-#define QUICKJS_TRACE_H_
+#ifndef NAPI_QUICKJS_TRACE_H_
+#define NAPI_QUICKJS_TRACE_H_
 
 #include <cstdlib>
 
-#if !defined(EDGE_ENABLE_TRACE_DIAGNOSTICS)
+#if !defined(NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS)
 #if !defined(NDEBUG)
-#define EDGE_ENABLE_TRACE_DIAGNOSTICS 1
+#define NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS 1
 #else
-#define EDGE_ENABLE_TRACE_DIAGNOSTICS 0
+#define NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS 0
 #endif
 #endif
 
-#if EDGE_ENABLE_TRACE_DIAGNOSTICS
-#define EDGE_TRACE_ENABLED(name) (std::getenv(name) != nullptr)
+#if NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS
+#define NAPI_QUICKJS_TRACE_ENABLED(name) (std::getenv(name) != nullptr)
 #else
-#define EDGE_TRACE_ENABLED(name) false
+#define NAPI_QUICKJS_TRACE_ENABLED(name) false
 #endif
 
-#endif  // QUICKJS_TRACE_H_
+#endif  // NAPI_QUICKJS_TRACE_H_

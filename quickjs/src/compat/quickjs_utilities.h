@@ -34,7 +34,6 @@ namespace quickjs::detail
     napi_status CreateEmptyArray(napi_env env, napi_value *result);
     napi_status CreateUndefined(napi_env env, napi_value *result);
     bool IsCallable(napi_env env, napi_value value);
-    napi_status StoreOptionalFunction(napi_env env, napi_value callback, JSValue *target);
     napi_status RunPendingJobs(napi_env env);
     JSValue GetConstructorNameValue(napi_env env, JSValueConst value);
     napi_status UnsupportedIfValidEnv(napi_env env);

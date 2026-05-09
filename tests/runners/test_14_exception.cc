@@ -172,6 +172,12 @@ TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSo
   ASSERT_NE(error, nullptr);
   ASSERT_EQ(unofficial_napi_preserve_error_source_message(s.env, error), napi_ok);
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // These source-map APIs are stable no-ops in QuickJS, so caught Errors do not
+  // receive node:arrowMessage or preserved source-map output.
+  EXPECT_EQ(GetArrowMessage(s.env, error), "");
+#else
   EXPECT_EQ(GetArrowMessage(s.env, error),
             "mapped.js:10\nconst boom = 1;\n      ^\n\n");
+#endif
 }

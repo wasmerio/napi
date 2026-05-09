@@ -14,8 +14,8 @@ namespace quickjs::detail
     // Keep changes narrow so this compatibility bridge remains easy to remove.
     bool ContextifyCompileTraceEnabled()
     {
-        return EDGE_TRACE_ENABLED("EDGE_TRACE_QUICKJS_CONTEXTIFY") ||
-               EDGE_TRACE_ENABLED("EDGE_TRACE_BUILTINS");
+        return NAPI_QUICKJS_TRACE_ENABLED("NAPI_QUICKJS_TRACE_CONTEXTIFY") ||
+               NAPI_QUICKJS_TRACE_ENABLED("NAPI_QUICKJS_TRACE_BUILTINS");
     }
 
     // Brief: GetInt32PropertyOr belongs to the contextify compile diagnostics compatibility layer.

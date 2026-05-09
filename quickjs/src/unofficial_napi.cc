@@ -1,11 +1,7 @@
 #include "unofficial_napi.h"
 
-#include "compat/console.h"
 #include "compat/contextify.h"
-#include "compat/environment.h"
-#include "compat/global_shims.h"
 #include "compat/microtasks.h"
-#include "compat/module_loading.h"
 #include "compat/quickjs_utilities.h"
 #include "compat/serdes.h"
 #include "internal/napi_env.h"
@@ -13,24 +9,72 @@
 #include "internal/napi_util.h"
 #include "internal/quickjs_trace.h"
 #include "node_api.h"
-#include "quickjs_cjs_exports.h"
-#include "unofficial_module_loader.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <mutex>
 #include <new>
-#include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace quickjs::detail;
+
+namespace
+{
+    struct SerializedValue
+    {
+        size_t length = 0;
+        uint8_t bytes[];
+    };
+
+    struct UnofficialEnvScope
+    {
+        JSRuntime *rt = nullptr;
+        JSContext *ctx = nullptr;
+        napi_env env = nullptr;
+    };
+
+    napi_status DestroyEnvInstance(napi_env env)
+    {
+        if (env == nullptr)
+            return napi_invalid_arg;
+
+        JSContext *ctx = env->context();
+        JSRuntime *rt = JS_GetRuntime(ctx);
+        JS_SetPromiseHook(rt, nullptr, nullptr);
+        JS_SetHostPromiseRejectionTracker(rt, nullptr, nullptr);
+        JS_SetContextOpaque(ctx, nullptr);
+        delete env;
+        return napi_ok;
+    }
+
+    napi_status ReleaseEnvScope(void *scope_ptr)
+    {
+        if (scope_ptr == nullptr)
+            return napi_invalid_arg;
+
+        auto *scope = static_cast<UnofficialEnvScope *>(scope_ptr);
+        napi_status status = napi_ok;
+        if (scope->env != nullptr)
+        {
+            status = DestroyEnvInstance(scope->env);
+            scope->env = nullptr;
+        }
+        if (scope->ctx != nullptr)
+        {
+            JS_FreeContext(scope->ctx);
+            scope->ctx = nullptr;
+        }
+        if (scope->rt != nullptr)
+        {
+            // JS_FreeRuntime(scope->rt);
+            scope->rt = nullptr;
+        }
+        delete scope;
+        return status;
+    }
+}
 
 extern "C"
 {
@@ -55,11 +99,6 @@ extern "C"
         }
 
         JS_SetContextOpaque(context, env);
-        EnsureEnvState(env);
-        EnsureQuickjsGlobalCompat(context);
-        RepairBootstrapConsoleBindings(env);
-        JS_SetPromiseHook(rt, QuickjsPromiseHook, env);
-        JS_SetModuleLoaderFunc(rt, QuickjsModuleNormalize, QuickjsModuleLoader, env);
 
         *result = env;
         return napi_ok;
@@ -84,7 +123,6 @@ extern "C"
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
             return napi_generic_failure;
-        JS_SetMaxStackSize(rt, kDefaultEdgeQuickjsStackSize);
         if (options != nullptr)
         {
             if (options->max_old_generation_size_in_bytes > 0)
@@ -97,7 +135,6 @@ extern "C"
             // JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
-        EnsureQuickjsGlobalCompat(ctx);
 
         auto scope = new (std::nothrow) UnofficialEnvScope{.rt = rt, .ctx = ctx};
         if (scope == nullptr)
@@ -125,16 +162,15 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
         const unofficial_napi_embedder_hooks *hooks)
     {
-        std::lock_guard<std::mutex> lock(g_mu);
-        g_embedder_hooks.hooks = (hooks == nullptr) ? unofficial_napi_embedder_hooks{} : *hooks;
+        (void)hooks;
         return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void *environment)
     {
+        (void)environment;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        EnsureEnvState(env).edge_environment = environment;
         return napi_ok;
     }
 
@@ -143,11 +179,10 @@ extern "C"
         unofficial_napi_env_cleanup_callback callback,
         void *data)
     {
+        (void)callback;
+        (void)data;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.cleanup_callback = callback;
-        state.cleanup_callback_data = data;
         return napi_ok;
     }
 
@@ -156,11 +191,10 @@ extern "C"
         unofficial_napi_env_destroy_callback callback,
         void *data)
     {
+        (void)callback;
+        (void)data;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.destroy_callback = callback;
-        state.destroy_callback_data = data;
         return napi_ok;
     }
 
@@ -170,12 +204,11 @@ extern "C"
         unofficial_napi_context_token_callback unassign_callback,
         void *data)
     {
+        (void)assign_callback;
+        (void)unassign_callback;
+        (void)data;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.context_token_assign_callback = assign_callback;
-        state.context_token_unassign_callback = unassign_callback;
-        state.context_token_callback_data = data;
         return napi_ok;
     }
 
@@ -213,9 +246,10 @@ extern "C"
         napi_env env,
         napi_value callback)
     {
+        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).prepare_stack_trace_callback);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env)
@@ -256,11 +290,10 @@ extern "C"
         unofficial_napi_enqueue_foreground_task_callback callback,
         void *target)
     {
+        (void)callback;
+        (void)target;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.enqueue_foreground_task_callback = callback;
-        state.enqueue_foreground_task_target = target;
         return napi_ok;
     }
 
@@ -278,16 +311,9 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                        napi_value callback)
     {
+        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        napi_status status = StoreOptionalFunction(env, callback, &state.promise_reject_callback);
-        if (status != napi_ok)
-            return status;
-        JS_SetHostPromiseRejectionTracker(
-            Rt(env),
-            JS_IsFunction(Ctx(env), state.promise_reject_callback) ? QuickjsPromiseRejectionTracker : nullptr,
-            env);
         return napi_ok;
     }
 
@@ -297,17 +323,12 @@ extern "C"
                                                              napi_value after,
                                                              napi_value resolve)
     {
+        (void)init;
+        (void)before;
+        (void)after;
+        (void)resolve;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        napi_value callbacks[] = {init, before, after, resolve};
-        for (size_t i = 0; i < 4; ++i)
-        {
-            napi_status status = StoreOptionalFunction(env, callbacks[i], &state.promise_hooks[i]);
-            if (status != napi_ok)
-                return status;
-        }
-        JS_SetPromiseHook(Rt(env), QuickjsPromiseHook, env);
         return napi_ok;
     }
 
@@ -316,11 +337,10 @@ extern "C"
         unofficial_napi_fatal_error_callback fatal_callback,
         unofficial_napi_oom_error_callback oom_callback)
     {
+        (void)fatal_callback;
+        (void)oom_callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.fatal_error_callback = fatal_callback;
-        state.oom_error_callback = oom_callback;
         return napi_ok;
     }
 
@@ -329,11 +349,10 @@ extern "C"
         unofficial_napi_near_heap_limit_callback callback,
         void *data)
     {
+        (void)callback;
+        (void)data;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.near_heap_limit_callback = callback;
-        state.near_heap_limit_callback_data = data;
         return napi_ok;
     }
 
@@ -344,17 +363,14 @@ extern "C"
         (void)heap_limit;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        state.near_heap_limit_callback = nullptr;
-        state.near_heap_limit_callback_data = nullptr;
         return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_stack_limit(napi_env env, void *stack_limit)
     {
+        (void)stack_limit;
         if (!CheckEnv(env) || stack_limit == nullptr)
             return napi_invalid_arg;
-        EnsureEnvState(env).stack_limit = stack_limit;
         return napi_ok;
     }
 
@@ -401,40 +417,18 @@ extern "C"
         return napi_ok;
     }
 
+    // These source-map formatting APIs are V8-shaped: V8 can build a v8::Message
+    // for an arbitrary caught Error and read script name, line, column, and source.
+    // QuickJS has useful throw/compile metadata while handling the exception, but
+    // no equivalent message object after JS catches and returns an Error. Keep the
+    // symbols linkable and argument-validating, but do not emulate V8 formatting.
     napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
         napi_env env,
         napi_value error)
     {
+        // No-op: QuickJS does not expose a V8-style message for this caught Error.
         if (!CheckEnv(env) || error == nullptr)
             return napi_invalid_arg;
-
-        JSValue callback = JS_UNDEFINED;
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            auto it = g_env_states.find(env);
-            if (it == g_env_states.end() ||
-                !it->second.error_formatting.source_maps_enabled ||
-                JS_IsUndefined(it->second.error_formatting.get_source_map_error_source))
-            {
-                return napi_ok;
-            }
-            callback = JS_DupValue(Ctx(env), it->second.error_formatting.get_source_map_error_source);
-        }
-
-        JSValue mapped = JS_Call(Ctx(env), callback, JS_UNDEFINED, 0, nullptr);
-        JS_FreeValue(Ctx(env), callback);
-        if (JS_IsException(mapped))
-        {
-            JSValue exc = JS_GetException(Ctx(env));
-            JS_FreeValue(Ctx(env), exc);
-            return napi_generic_failure;
-        }
-
-        if (JS_IsString(mapped))
-            JS_SetPropertyStr(Ctx(env), error->get_inner(), "node:arrowMessage", mapped);
-        else
-            JS_FreeValue(Ctx(env), mapped);
-
         return napi_ok;
     }
 
@@ -442,9 +436,10 @@ extern "C"
         napi_env env,
         bool enabled)
     {
+        // No-op: QuickJS cannot later reconstruct V8-style caught-Error source messages.
+        (void)enabled;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        EnsureEnvState(env).error_formatting.source_maps_enabled = enabled;
         return napi_ok;
     }
 
@@ -452,9 +447,11 @@ extern "C"
         napi_env env,
         napi_value callback)
     {
+        // No-op: there is no reliable caught-Error location to pass to this callback.
+        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).error_formatting.get_source_map_error_source);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
@@ -830,7 +827,7 @@ extern "C"
     {
         if (!CheckEnv(env) || hash_seed_out == nullptr)
             return napi_invalid_arg;
-        *hash_seed_out = EnsureEnvState(env).hash_seed;
+        *hash_seed_out = 1;
         return napi_ok;
     }
 
@@ -971,22 +968,16 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        if (JS_IsUndefined(state.continuation_preserved_embedder_data))
-            return CreateUndefined(env, result_out);
-        return WrapDup(env, state.continuation_preserved_embedder_data, result_out);
+        return CreateUndefined(env, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_continuation_preserved_embedder_data(
         napi_env env,
         napi_value value)
     {
+        (void)value;
         if (!CheckEnv(env) || value == nullptr)
             return napi_invalid_arg;
-        auto &state = EnsureEnvState(env);
-        if (!JS_IsUndefined(state.continuation_preserved_embedder_data))
-            JS_FreeValue(Ctx(env), state.continuation_preserved_embedder_data);
-        state.continuation_preserved_embedder_data = JS_DupValue(Ctx(env), value->get_inner());
         return napi_ok;
     }
 
@@ -1291,55 +1282,16 @@ extern "C"
         void **handle_out)
     {
         (void)wrapper;
+        (void)url;
         (void)context_or_undefined;
+        (void)source;
         (void)line_offset;
         (void)column_offset;
         (void)cached_data_or_id;
         if (!CheckEnv(env) || handle_out == nullptr)
             return napi_invalid_arg;
-        if (source == nullptr)
-            return napi_invalid_arg;
-
-        std::string source_text = ToUtf8(env, source);
-        std::string url_text = url == nullptr ? "<module>" : ToUtf8(env, url);
-        JSValue compiled = JS_Eval(Ctx(env),
-                                   source_text.c_str(),
-                                   source_text.size(),
-                                   url_text.empty() ? "<module>" : url_text.c_str(),
-                                   JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-        if (JS_IsException(compiled))
-        {
-            JSValue exc = JS_GetException(Ctx(env));
-            napi_util__::set_last_exception(env, exc);
-            *handle_out = nullptr;
-            return napi_pending_exception;
-        }
-        if (ModuleDefFromValue(compiled) == nullptr)
-        {
-            JS_FreeValue(Ctx(env), compiled);
-            *handle_out = nullptr;
-            return napi_generic_failure;
-        }
-        if (SetModuleImportMetaUrl(Ctx(env), compiled, url_text) < 0)
-        {
-            JSValue exc = JS_GetException(Ctx(env));
-            napi_util__::set_last_exception(env, exc);
-            JS_FreeValue(Ctx(env), compiled);
-            *handle_out = nullptr;
-            return napi_pending_exception;
-        }
-
-        auto *module = new (std::nothrow) QuickjsModuleWrap();
-        if (module == nullptr)
-        {
-            JS_FreeValue(Ctx(env), compiled);
-            *handle_out = nullptr;
-            return napi_generic_failure;
-        }
-        module->module = compiled;
-        module->has_top_level_await = source_text.find("await") != std::string::npos;
-        *handle_out = module;
-        return napi_ok;
+        *handle_out = nullptr;
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
@@ -1364,16 +1316,9 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(napi_env env, void *handle)
     {
+        (void)handle;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module != nullptr)
-        {
-            JS_FreeValue(Ctx(env), module->module);
-            JS_FreeValue(Ctx(env), module->namespace_value);
-            JS_FreeValue(Ctx(env), module->error);
-            delete module;
-        }
         return napi_ok;
     }
 
@@ -1398,29 +1343,14 @@ extern "C"
         (void)linked_handles;
         if (!CheckEnv(env) || handle == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module->status == kQuickjsModuleErrored)
-            return napi_pending_exception;
-        module->status = kQuickjsModuleInstantiating;
-        if (JS_ResolveModule(Ctx(env), module->module) < 0)
-        {
-            StoreModuleError(env, module);
-            return napi_pending_exception;
-        }
-        module->status = kQuickjsModuleInstantiated;
-        return napi_ok;
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, void *handle)
     {
         if (!CheckEnv(env) || handle == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module->status == kQuickjsModuleInstantiated ||
-            module->status == kQuickjsModuleEvaluating ||
-            module->status == kQuickjsModuleEvaluated)
-            return napi_ok;
-        return unofficial_napi_module_wrap_link(env, handle, 0, nullptr);
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
@@ -1434,30 +1364,9 @@ extern "C"
         (void)break_on_sigint;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        if (module->status == kQuickjsModuleErrored)
-            return WrapDup(env, module->error, result_out);
-        if (module->status == kQuickjsModuleUninstantiated ||
-            module->status == kQuickjsModuleInstantiating)
-        {
-            napi_status status = unofficial_napi_module_wrap_instantiate(env, handle);
-            if (status != napi_ok)
-                return status;
-        }
-        if (module->status == kQuickjsModuleEvaluated)
-            return WrapOwned(env, JS_NewSettledPromise(Ctx(env), false, JS_UNDEFINED), result_out);
-
-        module->status = kQuickjsModuleEvaluating;
-        JSValue promise = JS_EvalFunction(Ctx(env), JS_DupValue(Ctx(env), module->module));
-        if (JS_IsException(promise))
-        {
-            StoreModuleError(env, module);
-            return napi_pending_exception;
-        }
-        module->status = kQuickjsModuleEvaluated;
-        return WrapOwned(env, promise, result_out);
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
@@ -1471,11 +1380,9 @@ extern "C"
         (void)parent_filename;
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        napi_value promise = nullptr;
-        napi_status status = unofficial_napi_module_wrap_evaluate(env, handle, -1, false, &promise);
-        if (status != napi_ok)
-            return status;
-        return unofficial_napi_module_wrap_get_namespace(env, handle, result_out);
+        if (handle == nullptr)
+            return napi_invalid_arg;
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
@@ -1485,23 +1392,9 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        if (JS_IsUndefined(module->namespace_value))
-        {
-            JSModuleDef *module_def = ModuleDefFromValue(module->module);
-            if (module_def == nullptr)
-                return napi_generic_failure;
-            JSValue ns = JS_GetModuleNamespace(Ctx(env), module_def);
-            if (JS_IsException(ns))
-            {
-                StoreModuleError(env, module);
-                return napi_pending_exception;
-            }
-            module->namespace_value = ns;
-        }
-        return WrapDup(env, module->namespace_value, result_out);
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_status(
@@ -1511,11 +1404,10 @@ extern "C"
     {
         if (!CheckEnv(env) || status_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        *status_out = static_cast<int32_t>(module->status);
-        return napi_ok;
+        *status_out = 0;
+        return napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_error(
@@ -1525,12 +1417,9 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        if (JS_IsUndefined(module->error))
-            return CreateUndefined(env, result_out);
-        return WrapDup(env, module->error, result_out);
+        return CreateUndefined(env, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_has_top_level_await(
@@ -1540,10 +1429,9 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        *result_out = module->has_top_level_await;
+        *result_out = false;
         return napi_ok;
     }
 
@@ -1554,10 +1442,9 @@ extern "C"
     {
         if (!CheckEnv(env) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *module = static_cast<QuickjsModuleWrap *>(handle);
-        if (module == nullptr)
+        if (handle == nullptr)
             return napi_invalid_arg;
-        *result_out = module->has_top_level_await;
+        *result_out = false;
         return napi_ok;
     }
 
@@ -1628,18 +1515,20 @@ extern "C"
         napi_env env,
         napi_value callback)
     {
+        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).import_module_dynamically_callback);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
         napi_env env,
         napi_value callback)
     {
+        (void)callback;
         if (!CheckEnv(env))
             return napi_invalid_arg;
-        return StoreOptionalFunction(env, callback, &EnsureEnvState(env).initialize_import_meta_object_callback);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(

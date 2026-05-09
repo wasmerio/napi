@@ -119,6 +119,7 @@ function(add_fixture_test target_name)
   target_compile_definitions(${target_name}
     PRIVATE
       NAPI_TESTS_ROOT_PATH="${NAPI_TESTS_ROOT}"
+      NAPI_TEST_ENGINE_${_napi_test_engine_upper}=1
   )
   target_compile_options(${target_name}
     PRIVATE
