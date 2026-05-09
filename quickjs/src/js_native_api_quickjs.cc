@@ -1,8 +1,8 @@
-#include "compat/properties.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_external_backing_store_hint.h"
 #include "internal/napi_function.h"
+#include "internal/napi_set_property.h"
 #include "internal/napi_util.h"
 #include <climits>
 #include <cmath>

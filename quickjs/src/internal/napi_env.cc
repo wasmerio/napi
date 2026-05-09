@@ -7,7 +7,8 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
     : context_(context),
       last_exception_(JS_UNDEFINED),
       module_api_version_(module_api_version),
-      promises_(this, context)
+      promises_(this, context),
+      contextify_(this, context)
 {
   root_scope_ = napi_scope__::create(this, nullptr);
   current_scope_ = root_scope_;
@@ -215,6 +216,16 @@ napi_promises__ &napi_env__::promises()
 const napi_promises__ &napi_env__::promises() const
 {
   return promises_;
+}
+
+quickjs::detail::napi_contextify__ &napi_env__::contextify()
+{
+  return contextify_;
+}
+
+const quickjs::detail::napi_contextify__ &napi_env__::contextify() const
+{
+  return contextify_;
 }
 
 napi_status napi_quickjs_set_last_error(napi_env env,

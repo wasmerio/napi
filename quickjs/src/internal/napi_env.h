@@ -4,6 +4,7 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 #include "napi_callback_info.h"
+#include "napi_contextify.h"
 #include "napi_deferred.h"
 #include "napi_env_cleanup_hook.h"
 #include "napi_escapable_handle_scope.h"
@@ -54,6 +55,8 @@ struct napi_env__
 
   napi_promises__ &promises();
   const napi_promises__ &promises() const;
+  quickjs::detail::napi_contextify__ &contextify();
+  const quickjs::detail::napi_contextify__ &contextify() const;
 
 private:
   JSContext *context_;
@@ -71,6 +74,7 @@ private:
   napi_scope__ *current_scope_ = nullptr;
   int64_t external_memory_ = 0;
   napi_promises__ promises_;
+  quickjs::detail::napi_contextify__ contextify_;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

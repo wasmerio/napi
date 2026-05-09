@@ -1,5 +1,5 @@
-#ifndef NAPI_QUICKJS_COMPAT_PROPERTIES_H_
-#define NAPI_QUICKJS_COMPAT_PROPERTIES_H_
+#ifndef NAPI_QUICKJS_INTERNAL_NAPI_SET_PROPERTY_H_
+#define NAPI_QUICKJS_INTERNAL_NAPI_SET_PROPERTY_H_
 
 #include <quickjs.h>
 
@@ -11,4 +11,4 @@ namespace quickjs::detail
                                       JSValueConst value);
 }
 
-#endif // NAPI_QUICKJS_COMPAT_PROPERTIES_H_
+#endif // NAPI_QUICKJS_INTERNAL_NAPI_SET_PROPERTY_H_

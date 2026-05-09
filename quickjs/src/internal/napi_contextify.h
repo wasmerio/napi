@@ -1,0 +1,98 @@
+#ifndef NAPI_QUICKJS_INTERNAL_NAPI_CONTEXTIFY_H_
+#define NAPI_QUICKJS_INTERNAL_NAPI_CONTEXTIFY_H_
+
+#include "unofficial_napi.h"
+
+#include <quickjs.h>
+
+#include <cstdint>
+#include <string>
+
+namespace quickjs::detail
+{
+    class napi_contextify__ final
+    {
+    public:
+        napi_contextify__(napi_env env, JSContext *context);
+        ~napi_contextify__();
+
+        napi_contextify__(const napi_contextify__ &) = delete;
+        napi_contextify__ &operator=(const napi_contextify__ &) = delete;
+
+        napi_status get_error_source_positions(napi_value error,
+                                               unofficial_napi_error_source_positions *out);
+        napi_status preserve_error_source_message(napi_value error);
+        napi_status set_source_maps_enabled(bool enabled);
+        napi_status set_get_source_map_error_source_callback(napi_value callback);
+        napi_status get_error_source_line_for_stderr(napi_value error,
+                                                     napi_value *result_out);
+        napi_status get_error_thrown_at(napi_value error,
+                                        napi_value *result_out);
+        napi_status take_preserved_error_formatting(napi_value error,
+                                                    napi_value *source_line_out,
+                                                    napi_value *thrown_at_out);
+
+        napi_status make_context(napi_value sandbox_or_symbol,
+                                 napi_value name,
+                                 napi_value origin_or_undefined,
+                                 bool allow_code_gen_strings,
+                                 bool allow_code_gen_wasm,
+                                 bool own_microtask_queue,
+                                 napi_value host_defined_option_id,
+                                 napi_value *result_out);
+        napi_status run_script(napi_value sandbox_or_null,
+                               napi_value source,
+                               napi_value filename,
+                               int32_t line_offset,
+                               int32_t column_offset,
+                               int64_t timeout,
+                               bool display_errors,
+                               bool break_on_sigint,
+                               bool break_on_first_line,
+                               napi_value host_defined_option_id,
+                               napi_value *result_out);
+        napi_status dispose_context(napi_value sandbox_or_context_global);
+        napi_status compile_function(napi_value code,
+                                     napi_value filename,
+                                     int32_t line_offset,
+                                     int32_t column_offset,
+                                     napi_value cached_data_or_undefined,
+                                     bool produce_cached_data,
+                                     napi_value parsing_context_or_undefined,
+                                     napi_value context_extensions_or_undefined,
+                                     napi_value params_or_undefined,
+                                     napi_value host_defined_option_id,
+                                     napi_value *result_out);
+        napi_status contains_module_syntax(napi_value code,
+                                           napi_value filename,
+                                           napi_value resource_name_or_undefined,
+                                           bool cjs_var_in_scope,
+                                           bool *result_out);
+        napi_status create_cached_data(napi_value code,
+                                       napi_value filename,
+                                       int32_t line_offset,
+                                       int32_t column_offset,
+                                       napi_value host_defined_option_id,
+                                       napi_value *cached_data_buffer_out);
+
+    private:
+        bool compile_trace_enabled() const;
+        int32_t get_int32_property_or(JSValueConst object, const char *name, int32_t fallback) const;
+        std::string get_string_property_or_empty(JSValueConst object, const char *name) const;
+        std::string builtin_id_from_resource_name(const std::string &resource_name) const;
+        std::string source_line_at(const std::string &source, int32_t one_based_line) const;
+        void set_int32_property(JSValueConst object, const char *name, int32_t value) const;
+        void annotate_compile_exception(JSValueConst exception,
+                                        const std::string &source,
+                                        const std::string &resource_name,
+                                        int32_t line_offset,
+                                        int32_t column_offset);
+
+        napi_env env_;
+        JSContext *ctx_;
+        bool source_maps_enabled_ = false;
+        JSValue source_map_error_source_callback_;
+    };
+}
+
+#endif // NAPI_QUICKJS_INTERNAL_NAPI_CONTEXTIFY_H_

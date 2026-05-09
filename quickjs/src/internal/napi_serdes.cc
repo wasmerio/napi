@@ -1,6 +1,6 @@
 #include "internal/napi_serdes.h"
 
-#include "compat/quickjs_utilities.h"
+#include "internal/napi_util.h"
 #include "internal/napi_value.h"
 #include "node_api.h"
 
@@ -40,7 +40,7 @@ namespace quickjs::detail
         if (value == nullptr || bytes_out == nullptr)
             return false;
 
-        JSContext *ctx = Ctx(env);
+        JSContext *ctx = napi_util__::context(env);
         JSValueConst input = value->get_inner();
         uint8_t *data = nullptr;
         size_t length = 0;
@@ -233,7 +233,7 @@ namespace quickjs::detail
     // Keep changes narrow so this compatibility bridge remains easy to remove.
     napi_value napi_serdes__::serializer_write_header(napi_env env, napi_callback_info /*info*/)
     {
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_write_value belongs to the serdes compatibility layer.
@@ -256,21 +256,21 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        napi_value value = argc >= 1 && argv[0] != nullptr ? argv[0] : UndefinedValue(env);
+        napi_value value = argc >= 1 && argv[0] != nullptr ? argv[0] : napi_util__::undefined_value(env);
         size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(Ctx(env),
+        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
                                         &size,
                                         value->get_inner(),
                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
         if (bytes == nullptr)
         {
-            if (!JS_HasException(Ctx(env)))
+            if (!JS_HasException(napi_util__::context(env)))
                 napi_throw_error(env, nullptr, "Value could not be serialized");
             return nullptr;
         }
 
         serializer->bytes.insert(serializer->bytes.end(), bytes, bytes + size);
-        js_free(Ctx(env), bytes);
+        js_free(napi_util__::context(env), bytes);
 
         napi_value result = nullptr;
         napi_get_boolean(env, true, &result);
@@ -310,7 +310,7 @@ namespace quickjs::detail
     // Keep changes narrow so this compatibility bridge remains easy to remove.
     napi_value napi_serdes__::serializer_transfer_array_buffer(napi_env env, napi_callback_info /*info*/)
     {
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_write_uint32 belongs to the serdes compatibility layer.
@@ -333,9 +333,9 @@ namespace quickjs::detail
         }
         uint32_t value = 0;
         if (argc < 1 || napi_get_value_uint32(env, argv[0], &value) != napi_ok)
-            return UndefinedValue(env);
+            return napi_util__::undefined_value(env);
         AppendLittleEndian<uint32_t>(&serializer->bytes, value);
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_write_uint64 belongs to the serdes compatibility layer.
@@ -360,10 +360,10 @@ namespace quickjs::detail
         uint32_t lo = 0;
         if (argc < 2 || napi_get_value_uint32(env, argv[0], &hi) != napi_ok ||
             napi_get_value_uint32(env, argv[1], &lo) != napi_ok)
-            return UndefinedValue(env);
+            return napi_util__::undefined_value(env);
         AppendLittleEndian<uint64_t>(&serializer->bytes,
                                      (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_write_double belongs to the serdes compatibility layer.
@@ -386,10 +386,10 @@ namespace quickjs::detail
         }
         double value = 0;
         if (argc < 1 || napi_get_value_double(env, argv[0], &value) != napi_ok)
-            return UndefinedValue(env);
+            return napi_util__::undefined_value(env);
         const auto *raw = reinterpret_cast<const uint8_t *>(&value);
         serializer->bytes.insert(serializer->bytes.end(), raw, raw + sizeof(value));
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_write_raw_bytes belongs to the serdes compatibility layer.
@@ -417,7 +417,7 @@ namespace quickjs::detail
             return nullptr;
         }
         serializer->bytes.insert(serializer->bytes.end(), bytes.begin(), bytes.end());
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::serializer_set_treat_array_buffer_views_as_host_objects belongs to the serdes compatibility layer.
@@ -428,7 +428,7 @@ namespace quickjs::detail
     napi_value napi_serdes__::serializer_set_treat_array_buffer_views_as_host_objects(napi_env env,
                                                                      napi_callback_info /*info*/)
     {
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::deserializer_new belongs to the serdes compatibility layer.
@@ -515,7 +515,7 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        JSValue value = JS_ReadObject(Ctx(env),
+        JSValue value = JS_ReadObject(napi_util__::context(env),
                                       deserializer->bytes.data() + deserializer->offset,
                                       deserializer->bytes.size() - deserializer->offset,
                                       JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
@@ -524,7 +524,7 @@ namespace quickjs::detail
         deserializer->offset = deserializer->bytes.size();
 
         napi_value result = nullptr;
-        if (WrapOwned(env, value, &result) != napi_ok)
+        if (napi_util__::wrap_owned(env, value, &result) != napi_ok)
             return nullptr;
         return result;
     }
@@ -548,7 +548,7 @@ namespace quickjs::detail
     // Keep changes narrow so this compatibility bridge remains easy to remove.
     napi_value napi_serdes__::deserializer_transfer_array_buffer(napi_env env, napi_callback_info /*info*/)
     {
-        return UndefinedValue(env);
+        return napi_util__::undefined_value(env);
     }
 
     // Brief: napi_serdes__::deserializer_read_uint32 belongs to the serdes compatibility layer.
@@ -664,10 +664,10 @@ namespace quickjs::detail
                                                napi_value value,
                                                void **payload_out)
     {
-        if (!CheckEnv(env) || value == nullptr || payload_out == nullptr)
+        if (!napi_util__::check_env(env) || value == nullptr || payload_out == nullptr)
             return napi_invalid_arg;
         size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(Ctx(env),
+        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
                                         &size,
                                         value->get_inner(),
                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
@@ -676,13 +676,13 @@ namespace quickjs::detail
         auto *payload = static_cast<serialized_value *>(std::malloc(sizeof(serialized_value) + size));
         if (payload == nullptr)
         {
-            js_free(Ctx(env), bytes);
+            js_free(napi_util__::context(env), bytes);
             return napi_generic_failure;
         }
         payload->length = size;
         if (size > 0)
             std::memcpy(payload->bytes, bytes, size);
-        js_free(Ctx(env), bytes);
+        js_free(napi_util__::context(env), bytes);
         *payload_out = payload;
         return napi_ok;
     }
@@ -691,16 +691,16 @@ namespace quickjs::detail
                                                  void *payload,
                                                  napi_value *result_out)
     {
-        if (!CheckEnv(env) || payload == nullptr || result_out == nullptr)
+        if (!napi_util__::check_env(env) || payload == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         auto *serialized = static_cast<serialized_value *>(payload);
-        JSValue value = JS_ReadObject(Ctx(env),
+        JSValue value = JS_ReadObject(napi_util__::context(env),
                                       serialized->bytes,
                                       serialized->length,
                                       JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
         if (JS_IsException(value))
             return napi_pending_exception;
-        return WrapOwned(env, value, result_out);
+        return napi_util__::wrap_owned(env, value, result_out);
     }
 
     void napi_serdes__::release_serialized_value(void *payload)
