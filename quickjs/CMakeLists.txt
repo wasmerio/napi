@@ -62,6 +62,7 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 add_library(napi_quickjs STATIC
   src/js_native_api_quickjs.cc
   src/internal/napi_callback_info.cc
+  src/internal/napi_callsite.cc
   src/internal/napi_contextify.cc
   src/internal/napi_deferred.cc
   src/internal/napi_env.cc

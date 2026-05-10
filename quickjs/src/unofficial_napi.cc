@@ -1,5 +1,6 @@
 #include "unofficial_napi.h"
 
+#include "internal/napi_callsite.h"
 #include "internal/napi_serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
@@ -538,10 +539,20 @@ extern "C"
                                                           uint32_t frames,
                                                           napi_value *callsites_out)
     {
-        (void)frames;
-        if (!napi_util__::check_env(env) || callsites_out == nullptr)
-            return napi_invalid_arg;
-        return napi_util__::create_empty_array(env, callsites_out);
+        return napi_callsite__::get_call_sites(env, frames, callsites_out);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
+                                                                   uint32_t frames,
+                                                                   napi_value *callsites_out)
+    {
+        return napi_callsite__::get_current_stack_trace(env, frames, callsites_out);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env,
+                                                               napi_value *location_out)
+    {
+        return napi_callsite__::get_caller_location(env, location_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
