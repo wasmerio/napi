@@ -6,6 +6,13 @@ const assert = require('assert');
 const test_symbol = require(`./build/${common.buildType}/13_symbol`);
 
 {
+  assert.strictEqual(typeof Symbol.dispose, 'symbol');
+  assert.strictEqual(Symbol.dispose.description, 'Symbol.dispose');
+  assert.strictEqual(typeof Symbol.asyncDispose, 'symbol');
+  assert.strictEqual(Symbol.asyncDispose.description, 'Symbol.asyncDispose');
+}
+
+{
   const s = test_symbol.New('test');
   assert.strictEqual(s.toString(), 'Symbol(test)');
 }

@@ -71,6 +71,7 @@ add_library(napi_quickjs STATIC
   src/internal/napi_external_backing_store_hint.cc
   src/internal/napi_function.cc
   src/internal/napi_handle_scope.cc
+  src/internal/napi_module_wrap.cc
   src/internal/napi_promises.cc
   src/internal/napi_ref.cc
   src/internal/napi_scope.cc

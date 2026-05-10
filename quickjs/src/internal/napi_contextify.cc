@@ -1,5 +1,6 @@
 #include "internal/napi_contextify.h"
 
+#include "internal/napi_env.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
 #include "internal/quickjs_trace.h"
@@ -285,9 +286,9 @@ namespace quickjs::detail
         (void)display_errors;
         (void)break_on_sigint;
         (void)break_on_first_line;
-        (void)host_defined_option_id;
         if (!napi_util__::check_env(env_) || source == nullptr || result_out == nullptr)
             return napi_invalid_arg;
+        env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
         if (sandbox_or_null != nullptr && !JS_IsNull(sandbox_or_null->get_inner()) &&
             !napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
             return napi_invalid_arg;
