@@ -14,6 +14,7 @@ struct napi_env_cleanup_hook__
 
 private:
   napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook hook, void *arg);
+  ~napi_env_cleanup_hook__();
 
   napi_env env_;
   napi_cleanup_hook hook_;

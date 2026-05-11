@@ -59,7 +59,7 @@ bool napi_util__::check_env(napi_env env)
 
 bool napi_util__::check_value(napi_env env, napi_value value)
 {
-  return check_env(env) && value != nullptr;
+  return check_env(env) && value != nullptr && napi_quickjs_value_slot(env, value) != nullptr;
 }
 
 JSContext *napi_util__::context(napi_env env)
@@ -269,7 +269,7 @@ std::string napi_util__::to_utf8(napi_env env, napi_value value)
 {
   if (!check_env(env) || value == nullptr)
     return {};
-  return to_utf8(context(env), value->get_inner());
+  return to_utf8(context(env), napi_quickjs_value_inner(env, value));
 }
 
 std::string napi_util__::to_utf8(JSContext *ctx, JSValueConst value)
@@ -295,7 +295,7 @@ void napi_util__::set_string_property(JSContext *ctx,
 bool napi_util__::is_truthy_property(napi_env env, napi_value object, const char *name)
 {
   JSContext *ctx = context(env);
-  JSValue prop = JS_GetPropertyStr(ctx, object->get_inner(), name);
+  JSValue prop = JS_GetPropertyStr(ctx, napi_quickjs_value_inner(env, object), name);
   if (JS_IsException(prop))
     return false;
   bool out = JS_ToBool(ctx, prop);
@@ -338,7 +338,7 @@ napi_value napi_util__::undefined_value(napi_env env)
 
 bool napi_util__::is_callable(napi_env env, napi_value value)
 {
-  return value != nullptr && JS_IsFunction(context(env), value->get_inner());
+  return value != nullptr && JS_IsFunction(context(env), napi_quickjs_value_inner(env, value));
 }
 
 napi_status napi_util__::run_pending_jobs(napi_env env)
@@ -604,7 +604,7 @@ napi_status napi_util__::get_property_names(napi_env env,
     return invalid_arg(env);
 
   JSContext *ctx = env->context();
-  JSValue obj = object->get_inner();
+  JSValue obj = napi_quickjs_value_inner(env, object);
   if (!JS_IsObject(obj))
     return napi_object_expected;
 
@@ -734,7 +734,7 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
 
-  JSValue msg_val = msg->get_inner();
+  JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))
     return napi_string_expected;
 
@@ -742,9 +742,9 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
   JSValue error = create_plain_error(env->context(), msg_str);
   JS_FreeCString(env->context(), msg_str);
 
-  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
+  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
   {
-    const char *code_str = JS_ToCString(env->context(), code->get_inner());
+    const char *code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
     JS_SetPropertyStr(env->context(), error, "code", JS_NewString(env->context(), code_str));
     JS_FreeCString(env->context(), code_str);
   }
@@ -774,14 +774,14 @@ napi_status napi_util__::create_error_common(napi_env env,
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
 
-  JSValue msg_val = msg->get_inner();
+  JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))
     return napi_string_expected;
 
   const char *msg_str = JS_ToCString(env->context(), msg_val);
   const char *code_str = nullptr;
-  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
-    code_str = JS_ToCString(env->context(), code->get_inner());
+  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
+    code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
 
   JSValue error = create_error_object(env->context(), factory, code_str, msg_str);
 

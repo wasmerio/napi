@@ -1,6 +1,9 @@
 #include "internal/napi_env_cleanup_hook.h"
 
 #include "internal/napi_env.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
 
 #include <new>
 
@@ -9,6 +12,18 @@ napi_env_cleanup_hook__::napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook
       hook_(hook),
       arg_(arg)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::cleanup_hook, this, env_);
+#endif
+}
+
+napi_env_cleanup_hook__::~napi_env_cleanup_hook__()
+{
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::cleanup_hook, this, env_);
+#endif
 }
 
 napi_env_cleanup_hook__ *napi_env_cleanup_hook__::create(napi_env env, napi_cleanup_hook hook, void *arg)

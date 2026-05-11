@@ -1,6 +1,9 @@
 #include "internal/napi_deferred.h"
 
 #include "internal/napi_env.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
 #include "internal/napi_value.h"
 
 #include <new>
@@ -10,10 +13,18 @@ napi_deferred__::napi_deferred__(napi_env env, JSValue resolve, JSValue reject)
       resolve_(resolve),
       reject_(reject)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::deferred, this, env_);
+#endif
 }
 
 napi_deferred__::~napi_deferred__()
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::deferred, this, env_);
+#endif
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), resolve_);
@@ -46,12 +57,12 @@ void napi_deferred__::destroy(napi_deferred__ *deferred)
 
 JSValue napi_deferred__::call_resolve(napi_value resolution)
 {
-  JSValue arg = resolution->get_inner();
+  JSValue arg = napi_quickjs_value_inner(env_, resolution);
   return JS_Call(env_->context(), resolve_, JS_UNDEFINED, 1, &arg);
 }
 
 JSValue napi_deferred__::call_reject(napi_value rejection)
 {
-  JSValue arg = rejection->get_inner();
+  JSValue arg = napi_quickjs_value_inner(env_, rejection);
   return JS_Call(env_->context(), reject_, JS_UNDEFINED, 1, &arg);
 }

@@ -6,6 +6,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
+option(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  "Enable QuickJS N-API lifetime tracking diagnostics"
+  OFF
+)
+option(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+  "Print QuickJS N-API value/ref allocator stats every 2 seconds"
+  OFF
+)
+
+if(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS AND NOT NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER)
+  message(STATUS
+    "NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS requires "
+    "NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER; enabling lifetime tracker"
+  )
+  set(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER ON)
+endif()
 
 set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -82,6 +98,9 @@ add_library(napi_quickjs STATIC
   src/internal/napi_value.cc
   src/unofficial_napi.cc
 )
+if(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER)
+  target_sources(napi_quickjs PRIVATE src/internal/napi_lifetime_tracker.cc)
+endif()
 
 target_include_directories(napi_quickjs
   PUBLIC
@@ -97,6 +116,8 @@ target_compile_definitions(napi_quickjs
     NAPI_BUNDLED_QUICKJS=1
   PRIVATE
     NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
+    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER}>:NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER=1>
+    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS}>:NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS=1>
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(napi_quickjs PRIVATE -fno-rtti)

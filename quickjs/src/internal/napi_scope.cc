@@ -1,18 +1,35 @@
 #include "internal/napi_scope.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_value.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
 
 #include <new>
 
 napi_scope__::napi_scope__(napi_env env, napi_scope__ *parent)
     : env_(env),
       parent_(parent)
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+      ,
+      values_(quickjs::detail::napi_lifetime_slot_kind::value),
+      refs_(quickjs::detail::napi_lifetime_slot_kind::ref)
+#endif
 {
+  if (parent_ != nullptr)
+    values_.reserve_prefix(parent_->value_slot_count());
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::scope, this, env_);
+#endif
 }
 
 napi_scope__::~napi_scope__()
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::scope, this, env_);
+#endif
   close();
 }
 
@@ -50,7 +67,7 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  napi_value wrapped = napi_value__::create(env_, value, owned);
+  napi_value wrapped = values_.allocate(env_, value, owned);
   if (wrapped == nullptr)
   {
     if (owned && env_ != nullptr && env_->context() != nullptr)
@@ -58,7 +75,6 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  values_.push_back(wrapped);
   return wrapped;
 }
 
@@ -67,7 +83,10 @@ napi_value napi_scope__::escape_value(napi_value value)
   if (parent_ == nullptr || value == nullptr)
     return nullptr;
 
-  return parent_->wrap_value(value->get_inner(), false);
+  napi_value__ *slot = value_from_handle(value);
+  if (slot == nullptr)
+    return nullptr;
+  return parent_->wrap_value(slot->get_inner(), false);
 }
 
 void napi_scope__::delete_value(napi_value value)
@@ -75,15 +94,35 @@ void napi_scope__::delete_value(napi_value value)
   if (value == nullptr)
     return;
 
-  for (auto it = values_.begin(); it != values_.end(); ++it)
-  {
-    if (*it == value)
-    {
-      values_.erase(it);
-      napi_value__::destroy(value);
-      break;
-    }
-  }
+  if (values_.get(value) != nullptr)
+    values_.release(value);
+  else if (parent_ != nullptr)
+    parent_->delete_value(value);
+}
+
+napi_value__ *napi_scope__::value_from_handle(napi_value value)
+{
+  napi_value__ *slot = values_.get(value);
+  if (slot != nullptr)
+    return slot;
+  return parent_ == nullptr ? nullptr : parent_->value_from_handle(value);
+}
+
+napi_ref napi_scope__::wrap_ref(JSValueConst value, uint32_t initial_ref_count)
+{
+  if (closed_ || env_ == nullptr || env_->context() == nullptr)
+    return nullptr;
+  return refs_.allocate(env_, value, initial_ref_count);
+}
+
+void napi_scope__::delete_ref(napi_ref ref)
+{
+  refs_.release(ref);
+}
+
+napi_ref__ *napi_scope__::ref_from_handle(napi_ref ref)
+{
+  return refs_.get(ref);
 }
 
 void napi_scope__::close()
@@ -91,12 +130,14 @@ void napi_scope__::close()
   if (closed_)
     return;
 
-  for (auto it = values_.rbegin(); it != values_.rend(); ++it)
-  {
-    napi_value__::destroy(*it);
-  }
-  values_.clear();
+  refs_.close();
+  values_.close();
   closed_ = true;
+}
+
+size_t napi_scope__::value_slot_count() const
+{
+  return values_.slot_count();
 }
 
 napi_scope__ *napi_scope__::parent() const

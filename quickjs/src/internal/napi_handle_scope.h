@@ -7,6 +7,7 @@ struct napi_handle_scope__ : napi_scope__
 {
   static napi_handle_scope__ *create(napi_env env, napi_scope__ *parent);
   static void destroy(napi_handle_scope__ *scope);
+  ~napi_handle_scope__();
 
 private:
   napi_handle_scope__(napi_env env, napi_scope__ *parent);

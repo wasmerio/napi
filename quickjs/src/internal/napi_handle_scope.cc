@@ -1,12 +1,27 @@
 #include "internal/napi_handle_scope.h"
 
 #include "internal/napi_env.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
 
 #include <new>
 
 napi_handle_scope__::napi_handle_scope__(napi_env env, napi_scope__ *parent)
     : napi_scope__(env, parent)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::handle_scope, this, env);
+#endif
+}
+
+napi_handle_scope__::~napi_handle_scope__()
+{
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::handle_scope, this, env());
+#endif
 }
 
 napi_handle_scope__ *napi_handle_scope__::create(napi_env env, napi_scope__ *parent)

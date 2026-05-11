@@ -21,8 +21,16 @@ namespace quickjs::detail
 
     napi_contextify__::~napi_contextify__()
     {
+        teardown();
+    }
+
+    void napi_contextify__::teardown()
+    {
+        if (torn_down_)
+            return;
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ = JS_UNDEFINED;
+        torn_down_ = true;
     }
 
     bool napi_contextify__::compile_trace_enabled() const
@@ -194,15 +202,15 @@ namespace quickjs::detail
     {
         if (!napi_util__::check_env(env_))
             return napi_invalid_arg;
-        if (callback != nullptr && !JS_IsUndefined(callback->get_inner()) &&
-            !JS_IsNull(callback->get_inner()) && !JS_IsFunction(ctx_, callback->get_inner()))
+        if (callback != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, callback)) &&
+            !JS_IsNull(napi_quickjs_value_inner(env_, callback)) && !JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, callback)))
         {
             return napi_invalid_arg;
         }
 
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ =
-            callback == nullptr ? JS_UNDEFINED : JS_DupValue(ctx_, callback->get_inner());
+            callback == nullptr ? JS_UNDEFINED : JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback));
         return napi_ok;
     }
 
@@ -211,7 +219,7 @@ namespace quickjs::detail
     {
         if (!napi_util__::check_env(env_) || error == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        JSValue value = JS_GetPropertyStr(ctx_, error->get_inner(), "node:arrowMessage");
+        JSValue value = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, error), "node:arrowMessage");
         if (JS_IsException(value))
             return napi_pending_exception;
         if (JS_IsUndefined(value))
@@ -260,7 +268,7 @@ namespace quickjs::detail
         (void)host_defined_option_id;
         if (!napi_util__::check_env(env_) || sandbox_or_symbol == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        JSValue sandbox = sandbox_or_symbol->get_inner();
+        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
         JS_SetPropertyStr(ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, true));
@@ -289,14 +297,14 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env_) || source == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
-        if (sandbox_or_null != nullptr && !JS_IsNull(sandbox_or_null->get_inner()) &&
+        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)) &&
             !napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
             return napi_invalid_arg;
 
         std::string src = napi_util__::to_utf8(env_, source);
         std::string label = filename == nullptr ? "<contextify>" : napi_util__::to_utf8(env_, filename);
         JSValue result = JS_UNDEFINED;
-        if (sandbox_or_null != nullptr && !JS_IsNull(sandbox_or_null->get_inner()))
+        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))
         {
             const char *wrapper_source = "(function(__sandbox, __source) { with (__sandbox) { return eval(__source); } })";
             JSValue wrapper = JS_Eval(ctx_,
@@ -306,7 +314,7 @@ namespace quickjs::detail
                                       JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(wrapper))
                 return napi_pending_exception;
-            JSValue argv[] = {sandbox_or_null->get_inner(), source->get_inner()};
+            JSValue argv[] = {napi_quickjs_value_inner(env_, sandbox_or_null), napi_quickjs_value_inner(env_, source)};
             result = JS_Call(ctx_, wrapper, JS_UNDEFINED, 2, argv);
             JS_FreeValue(ctx_, wrapper);
         }
@@ -323,7 +331,7 @@ namespace quickjs::detail
     {
         if (!napi_util__::check_env(env_) || sandbox_or_context_global == nullptr)
             return napi_invalid_arg;
-        JSValue sandbox = sandbox_or_context_global->get_inner();
+        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_context_global);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
         JS_SetPropertyStr(ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
@@ -351,23 +359,23 @@ namespace quickjs::detail
             return napi_invalid_arg;
 
         std::vector<JSValue> argv;
-        if (params_or_undefined != nullptr && JS_IsArray(params_or_undefined->get_inner()))
+        if (params_or_undefined != nullptr && JS_IsArray(napi_quickjs_value_inner(env_, params_or_undefined)))
         {
             uint32_t length = 0;
-            JSValue len_val = JS_GetPropertyStr(ctx_, params_or_undefined->get_inner(), "length");
+            JSValue len_val = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, params_or_undefined), "length");
             JS_ToUint32(ctx_, &length, len_val);
             JS_FreeValue(ctx_, len_val);
             for (uint32_t i = 0; i < length; ++i)
             {
-                JSValue param = JS_GetPropertyUint32(ctx_, params_or_undefined->get_inner(), i);
+                JSValue param = JS_GetPropertyUint32(ctx_, napi_quickjs_value_inner(env_, params_or_undefined), i);
                 argv.push_back(param);
             }
         }
 
         std::string source = napi_util__::to_utf8(env_, code);
         std::string source_url;
-        JSValue code_arg = JS_DupValue(ctx_, code->get_inner());
-        if (filename != nullptr && !JS_IsUndefined(filename->get_inner()) && !JS_IsNull(filename->get_inner()))
+        JSValue code_arg = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, code));
+        if (filename != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, filename)) && !JS_IsNull(napi_quickjs_value_inner(env_, filename)))
         {
             source_url = napi_util__::to_utf8(env_, filename);
             if (!source.empty() && !source_url.empty())

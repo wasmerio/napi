@@ -17,13 +17,18 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 #include <quickjs.h>
+
+struct napi_external_backing_store_hint__;
 
 struct napi_env__
 {
   explicit napi_env__(JSContext *context, int32_t module_api_version);
   ~napi_env__();
+
+  void prepare_teardown();
 
   JSContext *context() const;
   int32_t module_api_version() const;
@@ -51,6 +56,9 @@ struct napi_env__
   void track_weak_ref(napi_ref ref);
   void remove_weak_ref(napi_ref ref);
   void clear_weak_refs_for_value(JSValueConst value);
+  void track_external_array_buffer_hint(JSValueConst arraybuffer, napi_external_backing_store_hint__ *hint);
+  napi_external_backing_store_hint__ *external_array_buffer_hint(JSValueConst arraybuffer) const;
+  void untrack_external_array_buffer_hint(napi_external_backing_store_hint__ *hint);
 
   int64_t adjust_external_memory(int64_t change_in_bytes);
 
@@ -73,12 +81,14 @@ private:
   void *instance_data_finalize_hint_ = nullptr;
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
   std::vector<napi_ref> weak_refs_;
+  std::vector<std::pair<void *, napi_external_backing_store_hint__ *>> external_array_buffer_hints_;
   napi_scope__ *root_scope_ = nullptr;
   napi_scope__ *current_scope_ = nullptr;
   int64_t external_memory_ = 0;
   napi_promises__ promises_;
   quickjs::detail::napi_contextify__ contextify_;
   quickjs::detail::napi_module_wrap__ module_wrap_;
+  bool torn_down_ = false;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

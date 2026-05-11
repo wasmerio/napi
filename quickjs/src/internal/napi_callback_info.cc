@@ -1,5 +1,9 @@
 #include "internal/napi_callback_info.h"
 
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
+
 napi_callback_info__::napi_callback_info__(napi_env env,
                                            JSValueConst this_val,
                                            JSValue new_target,
@@ -13,6 +17,18 @@ napi_callback_info__::napi_callback_info__(napi_env env,
       argv_(argv),
       data_(data)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::callback_info, this, env_);
+#endif
+}
+
+napi_callback_info__::~napi_callback_info__()
+{
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::callback_info, this, env_);
+#endif
 }
 
 napi_env napi_callback_info__::env() const

@@ -18,6 +18,8 @@ public:
   napi_module_wrap__(napi_env env, JSContext *context);
   ~napi_module_wrap__();
 
+  void teardown();
+
   napi_status create_source_text(napi_value wrapper,
                                  napi_value url,
                                  napi_value context_or_undefined,
@@ -122,6 +124,7 @@ private:
   std::vector<record *> records_;
   std::vector<script_referrer> script_referrers_;
   uint64_t facade_counter_ = 0;
+  bool torn_down_ = false;
 };
 
 } // namespace quickjs::detail

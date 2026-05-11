@@ -1,6 +1,7 @@
 #include "internal/napi_promises.h"
 
 #include "internal/napi_env.h"
+#include "internal/napi_value.h"
 
 namespace
 {
@@ -21,7 +22,15 @@ napi_promises__::napi_promises__(napi_env env, JSContext *context)
 
 napi_promises__::~napi_promises__()
 {
+  teardown();
+}
+
+void napi_promises__::teardown()
+{
+  if (torn_down_)
+    return;
   clear_stored_values();
+  torn_down_ = true;
 }
 
 napi_status napi_promises__::set_optional_function(napi_value value, JSValue *target)
@@ -30,19 +39,19 @@ napi_status napi_promises__::set_optional_function(napi_value value, JSValue *ta
     return napi_invalid_arg;
 
   if (value != nullptr &&
-      !JS_IsUndefined(value->get_inner()) &&
-      !JS_IsNull(value->get_inner()) &&
-      !JS_IsFunction(context_, value->get_inner()))
+      !JS_IsUndefined(napi_quickjs_value_inner(env_, value)) &&
+      !JS_IsNull(napi_quickjs_value_inner(env_, value)) &&
+      !JS_IsFunction(context_, napi_quickjs_value_inner(env_, value)))
   {
     return napi_function_expected;
   }
 
   JSValue replacement = JS_UNDEFINED;
   if (value != nullptr &&
-      !JS_IsUndefined(value->get_inner()) &&
-      !JS_IsNull(value->get_inner()))
+      !JS_IsUndefined(napi_quickjs_value_inner(env_, value)) &&
+      !JS_IsNull(napi_quickjs_value_inner(env_, value)))
   {
-    replacement = JS_DupValue(context_, value->get_inner());
+    replacement = JS_DupValue(context_, napi_quickjs_value_inner(env_, value));
   }
 
   JS_FreeValue(context_, *target);
@@ -132,18 +141,18 @@ napi_status napi_promises__::set_hooks(napi_value init,
   {
     napi_value callback = callbacks[i];
     if (callback == nullptr ||
-        JS_IsUndefined(callback->get_inner()) ||
-        JS_IsNull(callback->get_inner()))
+        JS_IsUndefined(napi_quickjs_value_inner(env_, callback)) ||
+        JS_IsNull(napi_quickjs_value_inner(env_, callback)))
     {
       continue;
     }
-    if (!JS_IsFunction(context_, callback->get_inner()))
+    if (!JS_IsFunction(context_, napi_quickjs_value_inner(env_, callback)))
     {
       for (JSValue replacement : replacements)
         JS_FreeValue(context_, replacement);
       return napi_function_expected;
     }
-    replacements[i] = JS_DupValue(context_, callback->get_inner());
+    replacements[i] = JS_DupValue(context_, napi_quickjs_value_inner(env_, callback));
   }
 
   for (size_t i = 0; i < 4; ++i)

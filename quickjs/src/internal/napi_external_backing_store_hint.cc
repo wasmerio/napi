@@ -1,6 +1,9 @@
 #include "internal/napi_external_backing_store_hint.h"
 
 #include "internal/napi_env.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
 
 #include <new>
 
@@ -10,10 +13,23 @@ napi_external_backing_store_hint__::napi_external_backing_store_hint__(
     node_api_basic_finalize finalize_cb,
     void *finalize_hint)
     : env_(env),
+      rt_(JS_GetRuntime(env->context())),
       external_data_(external_data),
       finalize_cb_(finalize_cb),
       finalize_hint_(finalize_hint)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::external_hint, this, env_);
+#endif
+}
+
+napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
+{
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::external_hint, this, env_);
+#endif
 }
 
 napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(
@@ -37,21 +53,54 @@ void napi_external_backing_store_hint__::destroy(napi_external_backing_store_hin
   if (hint == nullptr)
     return;
 
-  napi_env env = hint->env_;
-  hint->~napi_external_backing_store_hint__();
-  if (env != nullptr && env->context() != nullptr)
-    js_free(env->context(), hint);
+  JSRuntime *rt = hint->rt_;
+  destroy_with_runtime(rt, hint);
 }
 
-void napi_external_backing_store_hint__::invoke_finalizer() const
+void napi_external_backing_store_hint__::destroy_with_runtime(
+    JSRuntime *rt,
+    napi_external_backing_store_hint__ *hint)
 {
+  if (hint == nullptr)
+    return;
+
+  hint->~napi_external_backing_store_hint__();
+  if (rt != nullptr)
+    js_free_rt(rt, hint);
+}
+
+void napi_external_backing_store_hint__::invoke_finalizer()
+{
+  if (finalize_invoked_)
+    return;
+  finalize_invoked_ = true;
   if (finalize_cb_ != nullptr)
     finalize_cb_(env_, external_data_, finalize_hint_);
+}
+
+void napi_external_backing_store_hint__::begin_detach()
+{
+  detaching_ = true;
+}
+
+void napi_external_backing_store_hint__::end_detach()
+{
+  detaching_ = false;
+}
+
+bool napi_external_backing_store_hint__::is_detaching() const
+{
+  return detaching_;
 }
 
 napi_env napi_external_backing_store_hint__::env() const
 {
   return env_;
+}
+
+JSRuntime *napi_external_backing_store_hint__::runtime() const
+{
+  return rt_;
 }
 
 void *napi_external_backing_store_hint__::external_data() const

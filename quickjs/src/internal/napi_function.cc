@@ -18,7 +18,7 @@ JSValue napi_function__::create_internal(napi_env env,
   if (status != napi_ok)
     return JS_EXCEPTION;
 
-  return JS_DupValue(env->context(), fn_val->get_inner());
+  return JS_DupValue(env->context(), napi_quickjs_value_inner(env, fn_val));
 }
 
 JSValue napi_function__::trampoline(JSContext *ctx,
@@ -73,7 +73,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
     if (result != nullptr)
     {
       JS_FreeValue(ctx, effective_this);
-      returned = JS_DupValue(ctx, result->get_inner());
+      returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
       env->current_scope()->delete_value(result);
     }
     else
@@ -83,7 +83,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
   }
   else if (result != nullptr)
   {
-    returned = JS_DupValue(ctx, result->get_inner());
+    returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
     env->current_scope()->delete_value(result);
   }
 
@@ -118,8 +118,8 @@ napi_status napi_function__::create(napi_env env,
   napi_create_external(env, data, nullptr, nullptr, &data_external);
 
   JSValue data_values[2];
-  data_values[0] = JS_DupValue(env->context(), cb_external->get_inner());
-  data_values[1] = JS_DupValue(env->context(), data_external->get_inner());
+  data_values[0] = JS_DupValue(env->context(), napi_quickjs_value_inner(env, cb_external));
+  data_values[1] = JS_DupValue(env->context(), napi_quickjs_value_inner(env, data_external));
 
   JSValue fn = JS_NewCFunctionData(env->context(), trampoline, 0, magic, 2, data_values);
   JS_FreeValue(env->context(), data_values[0]);

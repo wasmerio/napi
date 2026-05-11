@@ -14,9 +14,14 @@ struct napi_external_backing_store_hint__
       node_api_basic_finalize finalize_cb,
       void *finalize_hint);
   static void destroy(napi_external_backing_store_hint__ *hint);
+  static void destroy_with_runtime(JSRuntime *rt, napi_external_backing_store_hint__ *hint);
 
-  void invoke_finalizer() const;
+  void invoke_finalizer();
+  void begin_detach();
+  void end_detach();
+  bool is_detaching() const;
   napi_env env() const;
+  JSRuntime *runtime() const;
   void *external_data() const;
   JSValue weak_target() const;
   JSValue finalizer_target(JSValue fallback) const;
@@ -27,11 +32,15 @@ private:
                                      void *external_data,
                                      node_api_basic_finalize finalize_cb,
                                      void *finalize_hint);
+  ~napi_external_backing_store_hint__();
 
   napi_env env_;
+  JSRuntime *rt_ = nullptr;
   void *external_data_;
   node_api_basic_finalize finalize_cb_;
   void *finalize_hint_;
+  bool finalize_invoked_ = false;
+  bool detaching_ = false;
   JSValue weak_target_ = JS_UNDEFINED;
 };
 

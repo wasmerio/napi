@@ -16,6 +16,8 @@ namespace quickjs::detail
         napi_contextify__(napi_env env, JSContext *context);
         ~napi_contextify__();
 
+        void teardown();
+
         napi_contextify__(const napi_contextify__ &) = delete;
         napi_contextify__ &operator=(const napi_contextify__ &) = delete;
 
@@ -92,6 +94,7 @@ namespace quickjs::detail
         JSContext *ctx_;
         bool source_maps_enabled_ = false;
         JSValue source_map_error_source_callback_;
+        bool torn_down_ = false;
     };
 }
 

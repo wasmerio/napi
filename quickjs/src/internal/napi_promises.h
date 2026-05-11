@@ -16,6 +16,8 @@ public:
   napi_promises__(napi_env env, JSContext *context);
   ~napi_promises__();
 
+  void teardown();
+
   napi_status set_reject_callback(napi_value callback);
   bool has_reject_callback() const;
   JSValue dup_reject_callback() const;
@@ -58,6 +60,7 @@ private:
   JSValue continuation_preserved_embedder_data_;
   std::unordered_map<void *, JSValue> promise_context_frames_;
   std::vector<JSValue> promise_context_frame_stack_;
+  bool torn_down_ = false;
 };
 
 #endif // NAPI_QUICKJS_INTERNAL_NAPI_PROMISES_H_

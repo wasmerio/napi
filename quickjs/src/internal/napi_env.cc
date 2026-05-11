@@ -1,5 +1,9 @@
 #include "internal/napi_env.h"
 
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
+
 #include <algorithm>
 #include <limits>
 
@@ -11,6 +15,10 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       contextify_(this, context),
       module_wrap_(this, context)
 {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::env, this, this);
+#endif
   root_scope_ = napi_scope__::create(this, nullptr);
   current_scope_ = root_scope_;
   clear_last_error();
@@ -18,6 +26,17 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
 
 napi_env__::~napi_env__()
 {
+  prepare_teardown();
+}
+
+void napi_env__::prepare_teardown()
+{
+  if (torn_down_)
+    return;
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::dump("napi_env__ teardown begin");
+#endif
   for (auto it = env_cleanup_hooks_.rbegin(); it != env_cleanup_hooks_.rend(); ++it)
   {
     auto *entry = *it;
@@ -34,8 +53,25 @@ napi_env__::~napi_env__()
 
   clear_last_exception();
 
-  root_scope_ = nullptr;
+  if (root_scope_ != nullptr)
+  {
+    root_scope_->close();
+    if (context_ != nullptr)
+      JS_RunGC(JS_GetRuntime(context_));
+  }
+  napi_scope__::destroy(root_scope_);
   current_scope_ = nullptr;
+  root_scope_ = nullptr;
+  weak_refs_.clear();
+  module_wrap_.teardown();
+  contextify_.teardown();
+  promises_.teardown();
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::env, this, this);
+  quickjs::detail::napi_lifetime_tracker__::dump("napi_env__ teardown end");
+#endif
+  torn_down_ = true;
 }
 
 JSContext *napi_env__::context() const
@@ -164,7 +200,8 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
 
 void napi_env__::track_weak_ref(napi_ref ref)
 {
-  if (ref == nullptr || !ref->is_weak())
+  napi_ref__ *slot = napi_quickjs_ref_slot(this, ref);
+  if (slot == nullptr || !slot->is_weak())
     return;
 
   if (std::find(weak_refs_.begin(), weak_refs_.end(), ref) == weak_refs_.end())
@@ -185,9 +222,41 @@ void napi_env__::clear_weak_refs_for_value(JSValueConst value)
 
   for (auto *ref : weak_refs_)
   {
-    if (ref != nullptr)
-      ref->clear_if_matches(value);
+    napi_ref__ *slot = napi_quickjs_ref_slot(this, ref);
+    if (slot != nullptr)
+      slot->clear_if_matches(value);
   }
+}
+
+void napi_env__::track_external_array_buffer_hint(
+    JSValueConst arraybuffer,
+    napi_external_backing_store_hint__ *hint)
+{
+  if (hint == nullptr)
+    return;
+  external_array_buffer_hints_.push_back({JS_VALUE_GET_PTR(arraybuffer), hint});
+}
+
+napi_external_backing_store_hint__ *napi_env__::external_array_buffer_hint(JSValueConst arraybuffer) const
+{
+  void *identity = JS_VALUE_GET_PTR(arraybuffer);
+  for (auto it = external_array_buffer_hints_.rbegin();
+       it != external_array_buffer_hints_.rend();
+       ++it)
+  {
+    if (it->first == identity)
+      return it->second;
+  }
+  return nullptr;
+}
+
+void napi_env__::untrack_external_array_buffer_hint(napi_external_backing_store_hint__ *hint)
+{
+  external_array_buffer_hints_.erase(
+      std::remove_if(external_array_buffer_hints_.begin(),
+                     external_array_buffer_hints_.end(),
+                     [hint](const auto &entry) { return entry.second == hint; }),
+      external_array_buffer_hints_.end());
 }
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)

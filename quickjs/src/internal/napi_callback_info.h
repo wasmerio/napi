@@ -14,6 +14,7 @@ struct napi_callback_info__
                        int argc,
                        JSValueConst *argv,
                        void *data);
+  ~napi_callback_info__();
 
   napi_env env() const;
   JSValueConst this_value() const;

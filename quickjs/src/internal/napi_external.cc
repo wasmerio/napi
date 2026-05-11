@@ -128,24 +128,27 @@ napi_status napi_external__::get_buffer_info(napi_env env, JSValueConst value, v
 
 void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr)
 {
-  (void)rt;
   (void)ptr;
   auto *hint = reinterpret_cast<napi_external_backing_store_hint *>(opaque);
   if (hint == nullptr)
     return;
   hint->invoke_finalizer();
-  napi_external_backing_store_hint__::destroy(hint);
+  if (hint->is_detaching())
+    return;
+  if (hint->env() != nullptr)
+    hint->env()->untrack_external_array_buffer_hint(hint);
+  napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
 }
 
 void napi_external__::finalizer(JSRuntime *rt, JSValue value)
 {
-  (void)rt;
   auto *hint = static_cast<napi_external_backing_store_hint *>(JS_GetOpaque(value, external_class_id));
   if (hint == nullptr)
     return;
 
   JSValue target = hint->finalizer_target(value);
-  hint->env()->clear_weak_refs_for_value(target);
+  if (hint->env() != nullptr)
+    hint->env()->clear_weak_refs_for_value(target);
   hint->invoke_finalizer();
-  napi_external_backing_store_hint__::destroy(hint);
+  napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
 }

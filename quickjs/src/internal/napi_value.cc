@@ -1,49 +1,90 @@
 #include "internal/napi_value.h"
 
 #include "internal/napi_env.h"
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
+#include "internal/napi_scope.h"
 
-#include <new>
-
-napi_value__::napi_value__(napi_env env, JSValue value, bool owned)
-    : env_(env),
-      value_(owned ? value : JS_DupValue(env->context(), value))
+napi_value__::napi_value__(napi_value__ &&other) noexcept
+    : env_(other.env_),
+      value_(other.value_),
+      active_(other.active_)
 {
+  other.env_ = nullptr;
+  other.value_ = JS_UNDEFINED;
+  other.active_ = false;
+}
+
+napi_value__ &napi_value__::operator=(napi_value__ &&other) noexcept
+{
+  if (this == &other)
+    return *this;
+
+  release();
+  env_ = other.env_;
+  value_ = other.value_;
+  active_ = other.active_;
+  other.env_ = nullptr;
+  other.value_ = JS_UNDEFINED;
+  other.active_ = false;
+  return *this;
 }
 
 napi_value__::~napi_value__()
 {
+  release();
+}
+
+void napi_value__::initialize(napi_env env, JSValue value, bool owned)
+{
+  release();
+  env_ = env;
+  value_ = owned ? value : JS_DupValue(env->context(), value);
+  active_ = true;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::value, this, env_);
+#endif
+}
+
+void napi_value__::release()
+{
+  if (!active_)
+    return;
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::value, this, env_);
+#endif
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), value_);
   }
+  env_ = nullptr;
+  value_ = JS_UNDEFINED;
+  active_ = false;
 }
 
-napi_value__ *napi_value__::create(napi_env env, JSValue value, bool owned)
+bool napi_value__::is_active() const
 {
-  if (env == nullptr || env->context() == nullptr)
-    return nullptr;
-
-  void *memory = js_mallocz(env->context(), sizeof(napi_value__));
-  if (memory == nullptr)
-    return nullptr;
-
-  return new (memory) napi_value__(env, value, owned);
-}
-
-void napi_value__::destroy(napi_value__ *value)
-{
-  if (value == nullptr)
-    return;
-
-  napi_env env = value->env_;
-  value->~napi_value__();
-  if (env != nullptr && env->context() != nullptr)
-  {
-    js_free(env->context(), value);
-  }
+  return active_;
 }
 
 JSValueConst napi_value__::get_inner() const
 {
   return value_;
+}
+
+napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value)
+{
+  if (env == nullptr || value == nullptr || env->current_scope() == nullptr)
+    return nullptr;
+  return env->current_scope()->value_from_handle(value);
+}
+
+JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)
+{
+  napi_value__ *slot = napi_quickjs_value_slot(env, value);
+  return slot == nullptr ? JS_UNDEFINED : slot->get_inner();
 }

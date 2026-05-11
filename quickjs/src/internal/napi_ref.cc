@@ -1,8 +1,10 @@
 #include "internal/napi_ref.h"
 
 #include "internal/napi_env.h"
-
-#include <new>
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#include "internal/napi_lifetime_tracker.h"
+#endif
+#include "internal/napi_scope.h"
 
 namespace
 {
@@ -20,43 +22,81 @@ bool SameRefCountedValue(JSValueConst left, JSValueConst right)
 }
 } // namespace
 
-napi_ref__::napi_ref__(napi_env env, JSValueConst value, uint32_t initial_ref_count)
-    : env_(env),
-      value_(value),
-      can_be_weak_(JS_VALUE_HAS_REF_COUNT(value)),
-      ref_count_(initial_ref_count)
+napi_ref__::napi_ref__(napi_ref__ &&other) noexcept
+    : env_(other.env_),
+      value_(other.value_),
+      can_be_weak_(other.can_be_weak_),
+      ref_count_(other.ref_count_),
+      active_(other.active_)
 {
-  if (ref_count_ > 0)
-    JS_DupValue(env_->context(), value_);
+  other.env_ = nullptr;
+  other.value_ = JS_UNDEFINED;
+  other.can_be_weak_ = false;
+  other.ref_count_ = 0;
+  other.active_ = false;
+}
+
+napi_ref__ &napi_ref__::operator=(napi_ref__ &&other) noexcept
+{
+  if (this == &other)
+    return *this;
+
+  release();
+  env_ = other.env_;
+  value_ = other.value_;
+  can_be_weak_ = other.can_be_weak_;
+  ref_count_ = other.ref_count_;
+  active_ = other.active_;
+  other.env_ = nullptr;
+  other.value_ = JS_UNDEFINED;
+  other.can_be_weak_ = false;
+  other.ref_count_ = 0;
+  other.active_ = false;
+  return *this;
 }
 
 napi_ref__::~napi_ref__()
 {
-  if (env_ != nullptr && env_->context() != nullptr && ref_count_ > 0)
-    JS_FreeValue(env_->context(), value_);
+  release();
 }
 
-napi_ref__ *napi_ref__::create(napi_env env, JSValueConst value, uint32_t initial_ref_count)
+void napi_ref__::initialize(napi_env env, JSValueConst value, uint32_t initial_ref_count)
 {
-  if (env == nullptr || env->context() == nullptr)
-    return nullptr;
-
-  void *memory = js_mallocz(env->context(), sizeof(napi_ref__));
-  if (memory == nullptr)
-    return nullptr;
-
-  return new (memory) napi_ref__(env, value, initial_ref_count);
+  release();
+  env_ = env;
+  value_ = value;
+  can_be_weak_ = JS_VALUE_HAS_REF_COUNT(value);
+  ref_count_ = initial_ref_count;
+  active_ = true;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_create(
+      quickjs::detail::napi_lifetime_kind::ref, this, env_);
+#endif
+  if (ref_count_ > 0)
+    JS_DupValue(env_->context(), value_);
 }
 
-void napi_ref__::destroy(napi_ref__ *ref)
+void napi_ref__::release()
 {
-  if (ref == nullptr)
+  if (!active_)
     return;
 
-  napi_env env = ref->env_;
-  ref->~napi_ref__();
-  if (env != nullptr && env->context() != nullptr)
-    js_free(env->context(), ref);
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+  quickjs::detail::napi_lifetime_tracker__::record_destroy(
+      quickjs::detail::napi_lifetime_kind::ref, this, env_);
+#endif
+  if (env_ != nullptr && env_->context() != nullptr && ref_count_ > 0)
+    JS_FreeValue(env_->context(), value_);
+  env_ = nullptr;
+  value_ = JS_UNDEFINED;
+  can_be_weak_ = false;
+  ref_count_ = 0;
+  active_ = false;
+}
+
+bool napi_ref__::is_active() const
+{
+  return active_;
 }
 
 uint32_t napi_ref__::add_ref()
@@ -119,4 +159,11 @@ void napi_ref__::clear_if_matches(JSValueConst value)
 {
   if (is_weak() && SameRefCountedValue(value_, value))
     value_ = JS_UNDEFINED;
+}
+
+napi_ref__ *napi_quickjs_ref_slot(napi_env env, napi_ref ref)
+{
+  if (env == nullptr || ref == nullptr || env->root_scope() == nullptr)
+    return nullptr;
+  return env->root_scope()->ref_from_handle(ref);
 }
