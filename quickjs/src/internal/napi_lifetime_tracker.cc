@@ -225,7 +225,7 @@ namespace quickjs::detail
 
     struct scope_scan
     {
-      size_t scope_index = 0;
+      size_t scope_level = 0;
       size_t value_slots_total = 0;
       size_t active_values = 0;
       size_t ref_slots_total = 0;
@@ -254,7 +254,7 @@ namespace quickjs::detail
     void scan_scope(napi_env env, const napi_scope__ &scope, env_scan &scan)
     {
       scope_scan scope_result;
-      scope_result.scope_index = scope.index();
+      scope_result.scope_level = scope.level();
       scope_result.value_slots_total = scope.value_storage_slot_count();
       scope_result.active_values = scope.active_value_count();
       scope_result.ref_slots_total = scope.ref_storage_slot_count();
@@ -306,12 +306,12 @@ namespace quickjs::detail
     }
 
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-    void dump_tag_line(size_t scope_index, const char *label, const tag_counters &counters)
+    void dump_tag_line(size_t scope_level, const char *label, const tag_counters &counters)
     {
       if (!has_tags(counters))
         return;
 
-      std::fprintf(stderr, "[napi-lifetime-tags] scope=%zu %s", scope_index, label);
+      std::fprintf(stderr, "[napi-lifetime-tags] scope_level=%zu %s", scope_level, label);
       for (size_t i = 0; i < k_tag_bucket_count; ++i)
       {
         size_t count = counters.slots[i];
@@ -323,7 +323,7 @@ namespace quickjs::detail
 #endif
 
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-    void dump_string_symbol_entries(size_t scope_index,
+    void dump_string_symbol_entries(size_t scope_level,
                                     const char *label,
                                     const std::vector<string_symbol_entry> &entries)
     {
@@ -337,16 +337,16 @@ namespace quickjs::detail
         }
 
         std::fprintf(stderr,
-                     "[napi-lifetime-values] scope=%zu %s tag=%s count=%zu value=\"%s\"\n",
-                     scope_index,
+                     "[napi-lifetime-values] scope_level=%zu %s tag=%s count=%zu value=\"%s\"\n",
+                     scope_level,
                      label,
                      tag_bucket_name(tag_bucket_index(entry.tag)),
                      entry.count,
                      entry.value.c_str());
       }
       std::fprintf(stderr,
-                   "[napi-lifetime-values] scope=%zu %s singular_string_count=%zu\n",
-                   scope_index,
+                   "[napi-lifetime-values] scope_level=%zu %s singular_string_count=%zu\n",
+                   scope_level,
                    label,
                    singular_count);
     }
@@ -372,16 +372,16 @@ namespace quickjs::detail
       for (const auto &scope : scan.scopes)
       {
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-        dump_tag_line(scope.scope_index, "napi_value", scope.value_tags);
-        dump_tag_line(scope.scope_index, "napi_ref", scope.ref_tags);
+        dump_tag_line(scope.scope_level, "napi_value", scope.value_tags);
+        dump_tag_line(scope.scope_level, "napi_ref", scope.ref_tags);
 #endif
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
         if (include_string_symbol_values)
         {
           dump_string_symbol_entries(
-              scope.scope_index, "napi_value", scope.value_strings_symbols);
+              scope.scope_level, "napi_value", scope.value_strings_symbols);
           dump_string_symbol_entries(
-              scope.scope_index, "napi_ref", scope.ref_strings_symbols);
+              scope.scope_level, "napi_ref", scope.ref_strings_symbols);
         }
 #else
         (void)include_string_symbol_values;

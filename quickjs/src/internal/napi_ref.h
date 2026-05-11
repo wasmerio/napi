@@ -17,7 +17,6 @@ struct napi_ref__
   ~napi_ref__();
 
   void initialize(napi_env env,
-                  size_t scope_index,
                   JSValueConst value,
                   uint32_t initial_ref_count);
   void release();
@@ -34,7 +33,6 @@ struct napi_ref__
 
 private:
   napi_env env_;
-  size_t scope_index_ = 0;
   JSValue value_ = JS_UNDEFINED;
   bool can_be_weak_ = false;
   uint32_t ref_count_ = 0;

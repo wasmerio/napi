@@ -24,7 +24,7 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
 
   release();
   env_ = other.env_;
-  index_ = other.index_;
+  level_ = other.level_;
   parent_ = other.parent_;
   values_ = static_cast<napi_allocator__<napi_value__> &&>(other.values_);
   refs_ = static_cast<napi_allocator__<napi_ref__> &&>(other.refs_);
@@ -32,7 +32,7 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
   active_ = other.active_;
   escaped_ = other.escaped_;
   other.env_ = nullptr;
-  other.index_ = 0;
+  other.level_ = 0;
   other.parent_ = nullptr;
   other.closed_ = true;
   other.active_ = false;
@@ -44,13 +44,13 @@ void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
 {
   release();
   env_ = env;
-  index_ = 0;
   parent_ = parent;
   closed_ = false;
   active_ = true;
   escaped_ = false;
 
   napi_scope__ *parent_scope = this->parent();
+  level_ = parent_scope == nullptr ? 0 : parent_scope->level() + 1;
   if (parent_scope != nullptr)
     values_.reserve_prefix(parent_scope->value_slot_count());
 }
@@ -62,7 +62,7 @@ void napi_scope__::release()
 
   close();
   env_ = nullptr;
-  index_ = 0;
+  level_ = 0;
   parent_ = nullptr;
   escaped_ = false;
   active_ = false;
@@ -73,14 +73,9 @@ bool napi_scope__::is_active() const
   return active_;
 }
 
-void napi_scope__::set_index(size_t index)
+size_t napi_scope__::level() const
 {
-  index_ = index;
-}
-
-size_t napi_scope__::index() const
-{
-  return index_;
+  return level_;
 }
 
 napi_value napi_scope__::wrap_value(JSValue value, bool owned)
@@ -92,7 +87,7 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  napi_value wrapped = values_.allocate(env_, index_, value, owned);
+  napi_value wrapped = values_.allocate(env_, value, owned);
   if (wrapped == nullptr)
   {
     if (owned && env_ != nullptr && env_->context() != nullptr)
@@ -141,7 +136,7 @@ napi_ref napi_scope__::wrap_ref(JSValueConst value, uint32_t initial_ref_count)
 {
   if (closed_ || env_ == nullptr || env_->context() == nullptr)
     return nullptr;
-  napi_ref wrapped = refs_.allocate(env_, index_, value, initial_ref_count);
+  napi_ref wrapped = refs_.allocate(env_, value, initial_ref_count);
   NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
   return wrapped;
 }

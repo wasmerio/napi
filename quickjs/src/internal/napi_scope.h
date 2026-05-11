@@ -17,8 +17,7 @@ struct napi_scope__
   void initialize(napi_env env, napi_handle_scope parent);
   void release();
   bool is_active() const;
-  void set_index(size_t index);
-  size_t index() const;
+  size_t level() const;
 
   napi_value wrap_value(JSValue value, bool owned);
   napi_value escape_value(napi_value value);
@@ -62,7 +61,7 @@ struct napi_scope__
 
 private:
   napi_env env_ = nullptr;
-  size_t index_ = 0;
+  size_t level_ = 0;
   napi_handle_scope parent_ = nullptr;
   napi_allocator__<napi_value__> values_;
   napi_allocator__<napi_ref__> refs_;

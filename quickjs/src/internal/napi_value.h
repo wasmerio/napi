@@ -15,14 +15,13 @@ struct napi_value__
   napi_value__ &operator=(napi_value__ &&other) noexcept;
   ~napi_value__();
 
-  void initialize(napi_env env, size_t scope_index, JSValue value, bool owned);
+  void initialize(napi_env env, JSValue value, bool owned);
   void release();
   bool is_active() const;
   JSValueConst get_inner() const;
 
 private:
   napi_env env_;
-  size_t scope_index_ = 0;
   JSValue value_ = JS_UNDEFINED;
   bool active_ = false;
 };
