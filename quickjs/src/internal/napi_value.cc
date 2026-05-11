@@ -51,14 +51,15 @@ void napi_value__::release()
   if (!active_)
     return;
 
-  if (env_ != nullptr && env_->context() != nullptr)
-  {
-    JS_FreeValue(env_->context(), value_);
-  }
+  napi_env env = env_;
+  JSValue value = value_;
+  active_ = false;
   env_ = nullptr;
   scope_index_ = 0;
   value_ = JS_UNDEFINED;
-  active_ = false;
+
+  if (env != nullptr && env->context() != nullptr)
+    JS_FreeValue(env->context(), value);
 }
 
 bool napi_value__::is_active() const
@@ -75,7 +76,7 @@ napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value)
 {
   if (env == nullptr || value == nullptr || env->current_scope() == nullptr)
     return nullptr;
-  return env->scope_from_handle(env->current_scope())->value_from_handle(value);
+  return env->value_from_current_scope(value);
 }
 
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)

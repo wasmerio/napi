@@ -126,8 +126,6 @@ void napi_scope__::delete_value(napi_value value)
     values_.release(value);
     NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
   }
-  else if (parent() != nullptr)
-    parent()->delete_value(value);
 }
 
 napi_value__ *napi_scope__::value_from_handle(napi_value value)

@@ -22,6 +22,7 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
 napi_env__::~napi_env__()
 {
   prepare_teardown();
+  finalize_instance_data();
 }
 
 void napi_env__::prepare_teardown()
@@ -30,19 +31,16 @@ void napi_env__::prepare_teardown()
     return;
 
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  for (auto it = env_cleanup_hooks_.rbegin(); it != env_cleanup_hooks_.rend(); ++it)
+  while (!env_cleanup_hooks_.empty())
   {
-    auto *entry = *it;
+    auto *entry = env_cleanup_hooks_.back();
+    env_cleanup_hooks_.pop_back();
     if (entry != nullptr)
     {
       entry->run();
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
-  env_cleanup_hooks_.clear();
-
-  if (instance_data_ != nullptr && instance_data_finalize_cb_ != nullptr)
-    instance_data_finalize_cb_(this, instance_data_, instance_data_finalize_hint_);
 
   clear_last_exception();
 
@@ -62,6 +60,20 @@ void napi_env__::prepare_teardown()
   promises_.teardown();
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
+}
+
+void napi_env__::finalize_instance_data()
+{
+  void *data = instance_data_;
+  napi_finalize finalize_cb = instance_data_finalize_cb_;
+  void *finalize_hint = instance_data_finalize_hint_;
+
+  instance_data_ = nullptr;
+  instance_data_finalize_cb_ = nullptr;
+  instance_data_finalize_hint_ = nullptr;
+
+  if (data != nullptr && finalize_cb != nullptr)
+    finalize_cb(this, data, finalize_hint);
 }
 
 JSContext *napi_env__::context() const
@@ -106,6 +118,44 @@ napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope) const
 {
   return const_cast<napi_allocator__<napi_scope__> &>(scopes_).get(
       reinterpret_cast<napi_scope__ *>(scope));
+}
+
+napi_value napi_env__::wrap_value_in_current_scope(JSValue value, bool owned)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  return scope == nullptr ? nullptr : scope->wrap_value(value, owned);
+}
+
+void napi_env__::delete_value_from_current_scope(napi_value value)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  if (scope != nullptr)
+    scope->delete_value(value);
+}
+
+napi_value__ *napi_env__::value_from_current_scope(napi_value value)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  return scope == nullptr ? nullptr : scope->value_from_handle(value);
+}
+
+napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
+{
+  napi_scope__ *scope = scope_from_handle(root_scope_);
+  return scope == nullptr ? nullptr : scope->wrap_ref(value, initial_ref_count);
+}
+
+void napi_env__::delete_ref_from_root_scope(napi_ref ref)
+{
+  napi_scope__ *scope = scope_from_handle(root_scope_);
+  if (scope != nullptr)
+    scope->delete_ref(ref);
+}
+
+napi_ref__ *napi_env__::ref_from_root_scope(napi_ref ref)
+{
+  napi_scope__ *scope = scope_from_handle(root_scope_);
+  return scope == nullptr ? nullptr : scope->ref_from_handle(ref);
 }
 
 bool napi_env__::is_current_scope(napi_handle_scope scope) const
@@ -223,8 +273,16 @@ void *napi_env__::instance_data() const
 
 void napi_env__::set_instance_data(void *data, napi_finalize finalize_cb, void *finalize_hint)
 {
-  if (instance_data_ != nullptr && instance_data_finalize_cb_ != nullptr)
-    instance_data_finalize_cb_(this, instance_data_, instance_data_finalize_hint_);
+  void *old_data = instance_data_;
+  napi_finalize old_finalize_cb = instance_data_finalize_cb_;
+  void *old_finalize_hint = instance_data_finalize_hint_;
+
+  instance_data_ = nullptr;
+  instance_data_finalize_cb_ = nullptr;
+  instance_data_finalize_hint_ = nullptr;
+
+  if (old_data != nullptr && old_finalize_cb != nullptr)
+    old_finalize_cb(this, old_data, old_finalize_hint);
 
   instance_data_ = data;
   instance_data_finalize_cb_ = finalize_cb;

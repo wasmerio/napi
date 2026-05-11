@@ -66,6 +66,10 @@ namespace
             JS_FreeRuntime(scope->rt);
             scope->rt = nullptr;
         }
+        if (env_to_delete != nullptr)
+        {
+            env_to_delete->finalize_instance_data();
+        }
         delete env_to_delete;
         delete scope;
         return status;

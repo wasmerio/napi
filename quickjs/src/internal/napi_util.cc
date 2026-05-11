@@ -310,7 +310,7 @@ napi_status napi_util__::wrap_owned(napi_env env, JSValue value, napi_value *res
     JS_FreeValue(context(env), value);
     return napi_invalid_arg;
   }
-  *result = env->scope_from_handle(env->current_scope())->wrap_value(value, true);
+  *result = env->wrap_value_in_current_scope(value, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -710,7 +710,7 @@ napi_status napi_util__::get_property_names(napi_env env,
     JS_FreeValue(ctx, proto);
   }
 
-  *result = env->scope_from_handle(env->current_scope())->wrap_value(arr, true);
+  *result = env->wrap_value_in_current_scope(arr, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -749,7 +749,7 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
     JS_FreeCString(env->context(), code_str);
   }
 
-  *result = env->scope_from_handle(env->current_scope())->wrap_value(error, true);
+  *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -789,6 +789,6 @@ napi_status napi_util__::create_error_common(napi_env env,
   if (code_str != nullptr)
     JS_FreeCString(env->context(), code_str);
 
-  *result = env->scope_from_handle(env->current_scope())->wrap_value(error, true);
+  *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

@@ -27,6 +27,7 @@ struct napi_env__
   ~napi_env__();
 
   void prepare_teardown();
+  void finalize_instance_data();
 
   JSContext *context() const;
   int32_t module_api_version() const;
@@ -36,6 +37,12 @@ struct napi_env__
   napi_handle_scope create_scope(napi_handle_scope parent);
   void destroy_scope(napi_handle_scope scope);
   napi_scope__ *scope_from_handle(napi_handle_scope scope) const;
+  napi_value wrap_value_in_current_scope(JSValue value, bool owned);
+  void delete_value_from_current_scope(napi_value value);
+  napi_value__ *value_from_current_scope(napi_value value);
+  napi_ref wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count);
+  void delete_ref_from_root_scope(napi_ref ref);
+  napi_ref__ *ref_from_root_scope(napi_ref ref);
   bool is_current_scope(napi_handle_scope scope) const;
   void set_current_scope(napi_handle_scope scope);
   size_t scope_storage_slot_count() const;

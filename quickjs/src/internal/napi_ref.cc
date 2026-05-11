@@ -82,14 +82,18 @@ void napi_ref__::release()
   if (!active_)
     return;
 
-  if (env_ != nullptr && env_->context() != nullptr && ref_count_ > 0)
-    JS_FreeValue(env_->context(), value_);
+  napi_env env = env_;
+  JSValue value = value_;
+  uint32_t ref_count = ref_count_;
+  active_ = false;
   env_ = nullptr;
   scope_index_ = 0;
   value_ = JS_UNDEFINED;
   can_be_weak_ = false;
   ref_count_ = 0;
-  active_ = false;
+
+  if (env != nullptr && env->context() != nullptr && ref_count > 0)
+    JS_FreeValue(env->context(), value);
 }
 
 bool napi_ref__::is_active() const
@@ -114,15 +118,20 @@ uint32_t napi_ref__::rem_ref()
     return ref_count_;
 
   --ref_count_;
-  if (ref_count_ == 0)
+  uint32_t ref_count = ref_count_;
+  if (ref_count == 0)
   {
-    JS_FreeValue(env_->context(), value_);
-    if (!can_be_weak_)
+    napi_env env = env_;
+    JSValue value = value_;
+    bool can_be_weak = can_be_weak_;
+    if (!can_be_weak)
     {
       value_ = JS_UNDEFINED;
     }
+    if (env != nullptr && env->context() != nullptr)
+      JS_FreeValue(env->context(), value);
   }
-  return ref_count_;
+  return ref_count;
 }
 
 uint32_t napi_ref__::ref_count() const
@@ -167,5 +176,5 @@ napi_ref__ *napi_quickjs_ref_slot(napi_env env, napi_ref ref)
 {
   if (env == nullptr || ref == nullptr || env->root_scope() == nullptr)
     return nullptr;
-  return env->scope_from_handle(env->root_scope())->ref_from_handle(ref);
+  return env->ref_from_root_scope(ref);
 }

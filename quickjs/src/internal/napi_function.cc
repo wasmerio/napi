@@ -113,7 +113,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
     {
       JS_FreeValue(ctx, effective_this);
       returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-      env->scope_from_handle(env->current_scope())->delete_value(result);
+      env->delete_value_from_current_scope(result);
     }
     else
     {
@@ -123,7 +123,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
   else if (result != nullptr)
   {
     returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-    env->scope_from_handle(env->current_scope())->delete_value(result);
+    env->delete_value_from_current_scope(result);
   }
 
   return returned;
@@ -175,6 +175,6 @@ napi_status napi_function__::create(napi_env env,
                               JS_PROP_CONFIGURABLE);
   }
 
-  *result = env->scope_from_handle(env->current_scope())->wrap_value(fn, true);
+  *result = env->wrap_value_in_current_scope(fn, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

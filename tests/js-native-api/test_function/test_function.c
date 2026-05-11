@@ -82,6 +82,12 @@ static napi_value TestFunctionName(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+static napi_value parent_scope_value;
+
+static napi_value ReturnParentScopeValue(napi_env env, napi_callback_info info) {
+  return parent_scope_value;
+}
+
 static void finalize_function(napi_env env, void* data, void* hint) {
   napi_ref ref = data;
 
@@ -184,6 +190,14 @@ napi_value Init(napi_env env, napi_value exports) {
           env, "TestBadReturnExceptionPending", NAPI_AUTO_LENGTH,
           TestBadReturnExceptionPending, NULL, &fn6));
 
+  napi_value fn7;
+  NODE_API_CALL(env,
+      napi_create_function(
+          env, "ReturnParentScopeValue", NAPI_AUTO_LENGTH,
+          ReturnParentScopeValue, NULL, &fn7));
+
+  NODE_API_CALL(env, napi_create_object(env, &parent_scope_value));
+
   NODE_API_CALL(env, napi_set_named_property(env, exports, "TestCall", fn1));
   NODE_API_CALL(env, napi_set_named_property(env, exports, "TestName", fn2));
   NODE_API_CALL(env,
@@ -198,6 +212,12 @@ napi_value Init(napi_env env, napi_value exports) {
   NODE_API_CALL(env,
       napi_set_named_property(
           env, exports, "TestBadReturnExceptionPending", fn6));
+  NODE_API_CALL(env,
+      napi_set_named_property(
+          env, exports, "ReturnParentScopeValue", fn7));
+  NODE_API_CALL(env,
+      napi_set_named_property(
+          env, exports, "ParentScopeValue", parent_scope_value));
 
   return exports;
 }

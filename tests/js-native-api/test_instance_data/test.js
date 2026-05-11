@@ -19,6 +19,10 @@ if (module !== require.main) {
   // Test that the instance data can be accessed from a finalizer.
   test_instance_data.objectWithFinalizer(common.mustCall());
   global.gc();
+
+  // Test that cleanup hooks can remove still-pending cleanup hooks while the
+  // environment is tearing down.
+  test_instance_data.registerCleanupHookRemoval();
 } else {
   // When launched as a script, run tests in either a child process or in a
   // worker thread.
