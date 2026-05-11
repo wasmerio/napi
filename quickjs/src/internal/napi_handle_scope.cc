@@ -8,12 +8,10 @@
 napi_handle_scope__::napi_handle_scope__(napi_env env)
     : env_(env)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, handle_scope, this, env);
 }
 
 napi_handle_scope__::~napi_handle_scope__()
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, handle_scope, this, env());
   if (env_ != nullptr && scope_ != nullptr)
     env_->destroy_scope(scope_);
   scope_ = nullptr;

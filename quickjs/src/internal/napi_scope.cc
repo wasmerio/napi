@@ -4,10 +4,6 @@
 #include "internal/napi_lifetime_macros.h"
 
 napi_scope__::napi_scope__()
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-    : values_(quickjs::detail::napi_lifetime_slot_kind::value),
-      refs_(quickjs::detail::napi_lifetime_slot_kind::ref)
-#endif
 {
 }
 
@@ -17,10 +13,6 @@ napi_scope__::~napi_scope__()
 }
 
 napi_scope__::napi_scope__(napi_scope__ &&other) noexcept
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-    : values_(quickjs::detail::napi_lifetime_slot_kind::value),
-      refs_(quickjs::detail::napi_lifetime_slot_kind::ref)
-#endif
 {
   *this = static_cast<napi_scope__ &&>(other);
 }
@@ -58,7 +50,6 @@ void napi_scope__::initialize(napi_env env, napi_scope_handle__ parent)
   napi_scope__ *parent_scope = this->parent();
   if (parent_scope != nullptr)
     values_.reserve_prefix(parent_scope->value_slot_count());
-  NAPI_QUICKJS_LIFETIME_RECORD(create, scope, this, env_);
 }
 
 void napi_scope__::release()
@@ -67,7 +58,6 @@ void napi_scope__::release()
     return;
 
   close();
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, scope, this, env_);
   env_ = nullptr;
   index_ = 0;
   parent_ = nullptr;
@@ -106,6 +96,7 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
   return wrapped;
 }
 
@@ -127,7 +118,10 @@ void napi_scope__::delete_value(napi_value value)
     return;
 
   if (values_.get(value) != nullptr)
+  {
     values_.release(value);
+    NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
+  }
   else if (parent() != nullptr)
     parent()->delete_value(value);
 }
@@ -145,12 +139,15 @@ napi_ref napi_scope__::wrap_ref(JSValueConst value, uint32_t initial_ref_count)
 {
   if (closed_ || env_ == nullptr || env_->context() == nullptr)
     return nullptr;
-  return refs_.allocate(env_, index_, value, initial_ref_count);
+  napi_ref wrapped = refs_.allocate(env_, index_, value, initial_ref_count);
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
+  return wrapped;
 }
 
 void napi_scope__::delete_ref(napi_ref ref)
 {
   refs_.release(ref);
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
 }
 
 napi_ref__ *napi_scope__::ref_from_handle(napi_ref ref)
@@ -166,11 +163,32 @@ void napi_scope__::close()
   refs_.close();
   values_.close();
   closed_ = true;
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
 }
 
 size_t napi_scope__::value_slot_count() const
 {
   return values_.slot_count();
+}
+
+size_t napi_scope__::value_storage_slot_count() const
+{
+  return values_.storage_slot_count();
+}
+
+size_t napi_scope__::active_value_count() const
+{
+  return values_.active_count();
+}
+
+size_t napi_scope__::ref_storage_slot_count() const
+{
+  return refs_.storage_slot_count();
+}
+
+size_t napi_scope__::active_ref_count() const
+{
+  return refs_.active_count();
 }
 
 napi_scope_handle__ napi_scope__::parent_handle() const

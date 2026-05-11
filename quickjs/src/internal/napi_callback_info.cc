@@ -15,12 +15,10 @@ napi_callback_info__::napi_callback_info__(napi_env env,
       argv_(argv),
       data_(data)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, callback_info, this, env_);
 }
 
 napi_callback_info__::~napi_callback_info__()
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, callback_info, this, env_);
 }
 
 napi_env napi_callback_info__::env() const

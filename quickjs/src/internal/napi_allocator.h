@@ -11,14 +11,7 @@ template <typename T>
 class napi_allocator__
 {
 public:
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-  explicit napi_allocator__(quickjs::detail::napi_lifetime_slot_kind slot_kind)
-      : slot_kind_(slot_kind)
-  {
-  }
-#else
   napi_allocator__() = default;
-#endif
 
   template <typename... Args>
   T *allocate(Args &&...args)
@@ -38,9 +31,7 @@ public:
     }
 
     entries_[index].initialize(static_cast<Args &&>(args)...);
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-    record_slot_delta(grew ? 1 : 0, 1);
-#endif
+    (void)grew;
     return handle_from_index(base_index_ + index);
   }
 
@@ -72,30 +63,18 @@ public:
       return;
     entry.release();
     free_indexes_.push_back(index);
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-    record_slot_delta(0, -1);
-#endif
   }
 
   void close()
   {
-    size_t total = entries_.size();
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
     {
       if (it->is_active())
-      {
         it->release();
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-        record_slot_delta(0, -1);
-#endif
-      }
     }
     entries_.clear();
     free_indexes_.clear();
     base_index_ = 0;
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-    record_slot_delta(-static_cast<std::ptrdiff_t>(total), 0);
-#endif
   }
 
   void reserve_prefix(size_t count)
@@ -107,6 +86,32 @@ public:
   size_t slot_count() const
   {
     return base_index_ + entries_.size();
+  }
+
+  size_t storage_slot_count() const
+  {
+    return entries_.size();
+  }
+
+  size_t active_count() const
+  {
+    size_t count = 0;
+    for (const auto &entry : entries_)
+    {
+      if (entry.is_active())
+        ++count;
+    }
+    return count;
+  }
+
+  template <typename Fn>
+  void for_each_active(Fn fn) const
+  {
+    for (const auto &entry : entries_)
+    {
+      if (entry.is_active())
+        fn(entry);
+    }
   }
 
 private:
@@ -140,14 +145,6 @@ private:
     return true;
   }
 
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-  void record_slot_delta(std::ptrdiff_t total_delta, std::ptrdiff_t active_delta)
-  {
-    NAPI_QUICKJS_LIFETIME_SLOT_DELTA(slot_kind_, total_delta, active_delta);
-  }
-
-  quickjs::detail::napi_lifetime_slot_kind slot_kind_;
-#endif
   std::vector<T> entries_;
   std::vector<size_t> free_indexes_;
   size_t base_index_ = 0;

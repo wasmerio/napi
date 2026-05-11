@@ -42,6 +42,19 @@ struct napi_env__
   napi_scope__ *scope_from_handle(napi_scope_handle__ scope) const;
   bool is_current_scope(napi_scope_handle__ scope) const;
   void set_current_scope(napi_scope_handle__ scope);
+  size_t scope_storage_slot_count() const;
+  size_t active_scope_count() const;
+
+  template <typename Fn>
+  void for_each_active_scope(Fn fn) const
+  {
+    scopes_.for_each_active(fn);
+  }
+
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+  bool should_dump_lifetime_stats(int64_t now_ms);
+  bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
+#endif
 
   const napi_extended_error_info *last_error_info() const;
   napi_status set_last_error(napi_status status, const char *message);
@@ -89,10 +102,10 @@ private:
   std::vector<std::pair<void *, napi_external_backing_store_hint__ *>> external_array_buffer_hints_;
   napi_scope_handle__ root_scope_ = nullptr;
   napi_scope_handle__ current_scope_ = nullptr;
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-  napi_allocator__<napi_scope__> scopes_{quickjs::detail::napi_lifetime_slot_kind::scope};
-#else
   napi_allocator__<napi_scope__> scopes_;
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+  int64_t lifetime_last_stats_ms_ = 0;
+  int64_t lifetime_last_string_symbol_values_ms_ = 0;
 #endif
   int64_t external_memory_ = 0;
   napi_promises__ promises_;

@@ -10,12 +10,10 @@ napi_env_cleanup_hook__::napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook
       hook_(hook),
       arg_(arg)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, cleanup_hook, this, env_);
 }
 
 napi_env_cleanup_hook__::~napi_env_cleanup_hook__()
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, cleanup_hook, this, env_);
 }
 
 napi_env_cleanup_hook__ *napi_env_cleanup_hook__::create(napi_env env, napi_cleanup_hook hook, void *arg)

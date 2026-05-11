@@ -14,7 +14,6 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       contextify_(this, context),
       module_wrap_(this, context)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, env, this, this);
   root_scope_ = create_scope(nullptr);
   current_scope_ = root_scope_;
   clear_last_error();
@@ -30,7 +29,7 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
-  NAPI_QUICKJS_LIFETIME_DUMP("napi_env__ teardown begin");
+  NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   for (auto it = env_cleanup_hooks_.rbegin(); it != env_cleanup_hooks_.rend(); ++it)
   {
     auto *entry = *it;
@@ -61,8 +60,7 @@ void napi_env__::prepare_teardown()
   module_wrap_.teardown();
   contextify_.teardown();
   promises_.teardown();
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, env, this, this);
-  NAPI_QUICKJS_LIFETIME_DUMP("napi_env__ teardown end");
+  NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
 }
 
@@ -104,12 +102,14 @@ napi_scope_handle__ napi_env__::create_scope(napi_scope_handle__ parent)
   napi_scope__ *scope = scopes_.get(handle);
   if (scope != nullptr)
     scope->set_index(reinterpret_cast<uintptr_t>(handle) - 1);
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
   return static_cast<napi_scope_handle__>(handle);
 }
 
 void napi_env__::destroy_scope(napi_scope_handle__ scope)
 {
   scopes_.release(static_cast<napi_scope__ *>(scope));
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_scope_handle__ scope) const
@@ -127,6 +127,50 @@ void napi_env__::set_current_scope(napi_scope_handle__ scope)
 {
   current_scope_ = scope;
 }
+
+size_t napi_env__::scope_storage_slot_count() const
+{
+  return scopes_.storage_slot_count();
+}
+
+size_t napi_env__::active_scope_count() const
+{
+  return scopes_.active_count();
+}
+
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+bool napi_env__::should_dump_lifetime_stats(int64_t now_ms)
+{
+  constexpr int64_t interval_ms = 2000;
+  if (lifetime_last_stats_ms_ == 0)
+  {
+    lifetime_last_stats_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_stats_ms_ < interval_ms)
+    return false;
+
+  lifetime_last_stats_ms_ = now_ms;
+  return true;
+}
+
+bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms)
+{
+  constexpr int64_t interval_ms = 10000;
+  if (lifetime_last_string_symbol_values_ms_ == 0)
+  {
+    lifetime_last_string_symbol_values_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_string_symbol_values_ms_ < interval_ms)
+    return false;
+
+  lifetime_last_string_symbol_values_ms_ = now_ms;
+  return true;
+}
+#endif
 
 const napi_extended_error_info *napi_env__::last_error_info() const
 {

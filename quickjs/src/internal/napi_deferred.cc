@@ -11,12 +11,10 @@ napi_deferred__::napi_deferred__(napi_env env, JSValue resolve, JSValue reject)
       resolve_(resolve),
       reject_(reject)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, deferred, this, env_);
 }
 
 napi_deferred__::~napi_deferred__()
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, deferred, this, env_);
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), resolve_);

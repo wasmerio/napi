@@ -33,9 +33,25 @@ struct napi_scope__
   void close();
 
   size_t value_slot_count() const;
+  size_t value_storage_slot_count() const;
+  size_t active_value_count() const;
+  size_t ref_storage_slot_count() const;
+  size_t active_ref_count() const;
   napi_scope_handle__ parent_handle() const;
   napi_scope__ *parent() const;
   napi_env env() const;
+
+  template <typename Fn>
+  void for_each_active_value(Fn fn) const
+  {
+    values_.for_each_active(fn);
+  }
+
+  template <typename Fn>
+  void for_each_active_ref(Fn fn) const
+  {
+    refs_.for_each_active(fn);
+  }
 
   napi_scope__();
   napi_scope__(napi_scope__ &&other) noexcept;

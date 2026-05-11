@@ -1,447 +1,432 @@
 #include "internal/napi_lifetime_tracker.h"
 
-#include <atomic>
+#include "internal/napi_env.h"
+#include "internal/napi_ref.h"
+#include "internal/napi_scope.h"
+#include "internal/napi_value.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace quickjs::detail
 {
-namespace
-{
-struct lifetime_counter
-{
-  const char *name;
-  std::atomic<size_t> created{0};
-  std::atomic<size_t> destroyed{0};
-  std::atomic<size_t> live{0};
-  std::atomic<size_t> peak{0};
-};
-
-lifetime_counter counters[] = {
-    {"napi_env__"},
-    {"napi_scope__"},
-    {"napi_handle_scope__"},
-    {"napi_escapable_handle_scope__"},
-    {"napi_value__"},
-    {"napi_ref__"},
-    {"napi_callback_info__"},
-    {"napi_external_backing_store_hint__"},
-    {"napi_deferred__"},
-    {"napi_env_cleanup_hook__"},
-};
-
-constexpr size_t k_counter_count = sizeof(counters) / sizeof(counters[0]);
-
-bool enabled();
-lifetime_counter &counter_for(napi_lifetime_kind kind);
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
-struct allocator_slot_counter
-{
-  std::atomic<size_t> total_slots{0};
-  std::atomic<size_t> active_slots{0};
-};
-
-allocator_slot_counter value_slots;
-allocator_slot_counter ref_slots;
-allocator_slot_counter scope_slots;
-std::atomic<int64_t> last_periodic_stats_ms{0};
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-constexpr int k_min_known_tag = -9;
-constexpr int k_max_known_tag = 8;
-constexpr size_t k_known_tag_count =
-    static_cast<size_t>(k_max_known_tag - k_min_known_tag + 1);
-constexpr size_t k_unknown_tag_index = k_known_tag_count;
-constexpr size_t k_tag_bucket_count = k_known_tag_count + 1;
-
-struct per_scope_tag_counters
-{
-  size_t scope_index = 0;
-  size_t value_tag_slots[k_tag_bucket_count] = {};
-  size_t ref_tag_slots[k_tag_bucket_count] = {};
-};
-
-std::mutex tag_stats_mutex;
-std::vector<per_scope_tag_counters> tag_stats_by_scope;
-
-size_t tag_bucket_index(int tag)
-{
-  if (tag < k_min_known_tag || tag > k_max_known_tag)
-    return k_unknown_tag_index;
-  return static_cast<size_t>(tag - k_min_known_tag);
-}
-
-const char *tag_bucket_name(size_t index)
-{
-  if (index == k_unknown_tag_index)
-    return "unknown";
-
-  switch (static_cast<int>(index) + k_min_known_tag)
+  namespace
   {
-  case -9:
-    return "big_int";
-  case -8:
-    return "symbol";
-  case -7:
-    return "string";
-  case -6:
-    return "string_rope";
-  case -5:
-    return "tag_-5";
-  case -4:
-    return "tag_-4";
-  case -3:
-    return "module";
-  case -2:
-    return "function_bytecode";
-  case -1:
-    return "object";
-  case 0:
-    return "int";
-  case 1:
-    return "bool";
-  case 2:
-    return "null";
-  case 3:
-    return "undefined";
-  case 4:
-    return "uninitialized";
-  case 5:
-    return "catch_offset";
-  case 6:
-    return "exception";
-  case 7:
-    return "short_big_int";
-  case 8:
-    return "float64";
-  default:
-    return "unknown";
-  }
-}
+    bool enabled()
+    {
+      const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME");
+      return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
 
-per_scope_tag_counters &tag_counters_for_scope(size_t scope_index)
-{
-  for (auto &scope : tag_stats_by_scope)
-  {
-    if (scope.scope_index == scope_index)
-      return scope;
-  }
+    bool periodic_stats_enabled()
+    {
+      const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_STATS");
+      if (value != nullptr && value[0] != '\0')
+        return value[0] != '0';
+      return enabled();
+    }
 
-  tag_stats_by_scope.push_back({});
-  tag_stats_by_scope.back().scope_index = scope_index;
-  return tag_stats_by_scope.back();
-}
+    int64_t monotonic_milliseconds()
+    {
+      using clock = std::chrono::steady_clock;
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+                 clock::now().time_since_epoch())
+          .count();
+    }
 
-size_t *tag_counter_for(per_scope_tag_counters &scope, napi_lifetime_tag_owner_kind kind)
-{
-  return kind == napi_lifetime_tag_owner_kind::ref ? scope.ref_tag_slots : scope.value_tag_slots;
-}
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS) || \
+    defined(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP)
+    constexpr int k_min_known_tag = -9;
+    constexpr int k_max_known_tag = 8;
+    constexpr size_t k_known_tag_count =
+        static_cast<size_t>(k_max_known_tag - k_min_known_tag + 1);
+    constexpr size_t k_unknown_tag_index = k_known_tag_count;
+    constexpr size_t k_tag_bucket_count = k_known_tag_count + 1;
 
-void adjust_tag_counter(size_t &counter, std::ptrdiff_t delta)
-{
-  if (delta > 0)
-  {
-    counter += static_cast<size_t>(delta);
-    return;
-  }
+    size_t tag_bucket_index(int tag)
+    {
+      if (tag < k_min_known_tag || tag > k_max_known_tag)
+        return k_unknown_tag_index;
+      return static_cast<size_t>(tag - k_min_known_tag);
+    }
 
-  if (delta == 0)
-    return;
+    const char *tag_bucket_name(size_t index)
+    {
+      if (index == k_unknown_tag_index)
+        return "unknown";
 
-  size_t decrement = static_cast<size_t>(-delta);
-  counter = decrement >= counter ? 0 : counter - decrement;
-}
+      switch (static_cast<int>(index) + k_min_known_tag)
+      {
+      case -9:
+        return "big_int";
+      case -8:
+        return "symbol";
+      case -7:
+        return "string";
+      case -6:
+        return "string_rope";
+      case -5:
+        return "tag_-5";
+      case -4:
+        return "tag_-4";
+      case -3:
+        return "module";
+      case -2:
+        return "function_bytecode";
+      case -1:
+        return "object";
+      case 0:
+        return "int";
+      case 1:
+        return "bool";
+      case 2:
+        return "null";
+      case 3:
+        return "undefined";
+      case 4:
+        return "uninitialized";
+      case 5:
+        return "catch_offset";
+      case 6:
+        return "exception";
+      case 7:
+        return "short_big_int";
+      case 8:
+        return "float64";
+      default:
+        return "unknown";
+      }
+    }
 
-bool tag_counters_have_values(const size_t *counters)
-{
-  for (size_t i = 0; i < k_tag_bucket_count; ++i)
-  {
-    if (counters[i] != 0)
-      return true;
-  }
-  return false;
-}
+    struct tag_counters
+    {
+      size_t slots[k_tag_bucket_count] = {};
+    };
 
-void dump_scope_tag_line(size_t scope_index, const char *label, const size_t *counters)
-{
-  std::fprintf(stderr, "[napi-lifetime-tags] scope=%zu %s", scope_index, label);
-  bool printed = false;
-  for (size_t i = 0; i < k_tag_bucket_count; ++i)
-  {
-    size_t count = counters[i];
-    if (count == 0)
-      continue;
-    std::fprintf(stderr, " %s=%zu", tag_bucket_name(i), count);
-    printed = true;
-  }
-  if (!printed)
-    std::fprintf(stderr, " none=0");
-  std::fprintf(stderr, "\n");
-}
+    void count_tag(tag_counters &counters, int tag)
+    {
+      ++counters.slots[tag_bucket_index(tag)];
+    }
 
-void dump_scope_tag_lines()
-{
-  std::lock_guard<std::mutex> lock(tag_stats_mutex);
-  for (const auto &scope : tag_stats_by_scope)
-  {
-    if (tag_counters_have_values(scope.value_tag_slots))
-      dump_scope_tag_line(scope.scope_index, "napi_value", scope.value_tag_slots);
-    if (tag_counters_have_values(scope.ref_tag_slots))
-      dump_scope_tag_line(scope.scope_index, "napi_ref", scope.ref_tag_slots);
-  }
-}
+    bool has_tags(const tag_counters &counters)
+    {
+      for (size_t i = 0; i < k_tag_bucket_count; ++i)
+      {
+        if (counters.slots[i] != 0)
+          return true;
+      }
+      return false;
+    }
 #endif
 
-int64_t monotonic_milliseconds()
-{
-  using clock = std::chrono::steady_clock;
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             clock::now().time_since_epoch())
-      .count();
-}
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+    constexpr size_t k_value_dump_max_bytes = 240;
 
-void adjust_counter(std::atomic<size_t> &counter, std::ptrdiff_t delta)
-{
-  if (delta > 0)
+    struct string_symbol_entry
+    {
+      int tag = 0;
+      std::string value;
+      size_t count = 0;
+    };
+
+    void append_hex_escape(std::string &out, unsigned char c)
+    {
+      constexpr char hex[] = "0123456789abcdef";
+      out.push_back('\\');
+      out.push_back('x');
+      out.push_back(hex[(c >> 4) & 0x0f]);
+      out.push_back(hex[c & 0x0f]);
+    }
+
+    std::string escaped_value_fragment(const char *value, size_t value_length)
+    {
+      size_t limit = value_length < k_value_dump_max_bytes ? value_length : k_value_dump_max_bytes;
+      std::string out;
+      out.reserve(limit + 3);
+      for (size_t i = 0; i < limit; ++i)
+      {
+        unsigned char c = static_cast<unsigned char>(value[i]);
+        switch (c)
+        {
+        case '\\':
+          out += "\\\\";
+          break;
+        case '"':
+          out += "\\\"";
+          break;
+        case '\n':
+          out += "\\n";
+          break;
+        case '\r':
+          out += "\\r";
+          break;
+        case '\t':
+          out += "\\t";
+          break;
+        default:
+          if (c >= 0x20 && c <= 0x7e)
+            out.push_back(static_cast<char>(c));
+          else
+            append_hex_escape(out, c);
+          break;
+        }
+      }
+      if (value_length > limit)
+        out += "...";
+      return out;
+    }
+
+    void add_string_symbol_entry(std::vector<string_symbol_entry> &entries,
+                                 int tag,
+                                 std::string value)
+    {
+      for (auto &entry : entries)
+      {
+        if (entry.tag == tag && entry.value == value)
+        {
+          ++entry.count;
+          return;
+        }
+      }
+
+      string_symbol_entry entry;
+      entry.tag = tag;
+      entry.value = std::move(value);
+      entry.count = 1;
+      entries.push_back(std::move(entry));
+    }
+
+    void capture_string_symbol_value(napi_env env,
+                                     JSValueConst value,
+                                     int tag,
+                                     std::vector<string_symbol_entry> &entries)
+    {
+      if (env == nullptr || env->context() == nullptr)
+        return;
+
+      if (tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE)
+        return;
+
+      JSContext *ctx = env->context();
+      size_t text_length = 0;
+      const char *text = JS_ToCStringLen(ctx, &text_length, value);
+
+      if (text != nullptr)
+      {
+        add_string_symbol_entry(entries, tag, escaped_value_fragment(text, text_length));
+        JS_FreeCString(ctx, text);
+      }
+    }
+#endif
+
+    struct scope_scan
+    {
+      size_t scope_index = 0;
+      size_t value_slots_total = 0;
+      size_t active_values = 0;
+      size_t ref_slots_total = 0;
+      size_t active_refs = 0;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+      tag_counters value_tags;
+      tag_counters ref_tags;
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+      std::vector<string_symbol_entry> value_strings_symbols;
+      std::vector<string_symbol_entry> ref_strings_symbols;
+#endif
+    };
+
+    struct env_scan
+    {
+      size_t value_slots_total = 0;
+      size_t active_values = 0;
+      size_t ref_slots_total = 0;
+      size_t active_refs = 0;
+      size_t scope_slots_total = 0;
+      size_t active_scopes = 0;
+      std::vector<scope_scan> scopes;
+    };
+
+    void scan_scope(napi_env env, const napi_scope__ &scope, env_scan &scan)
+    {
+      scope_scan scope_result;
+      scope_result.scope_index = scope.index();
+      scope_result.value_slots_total = scope.value_storage_slot_count();
+      scope_result.active_values = scope.active_value_count();
+      scope_result.ref_slots_total = scope.ref_storage_slot_count();
+      scope_result.active_refs = scope.active_ref_count();
+
+      scan.value_slots_total += scope_result.value_slots_total;
+      scan.active_values += scope_result.active_values;
+      scan.ref_slots_total += scope_result.ref_slots_total;
+      scan.active_refs += scope_result.active_refs;
+
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS) || \
+    defined(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP)
+      scope.for_each_active_value([&](const napi_value__ &slot) {
+        int tag = JS_VALUE_GET_NORM_TAG(slot.get_inner());
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+        count_tag(scope_result.value_tags, tag);
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+        capture_string_symbol_value(env, slot.get_inner(), tag, scope_result.value_strings_symbols);
+#endif
+      });
+
+      scope.for_each_active_ref([&](const napi_ref__ &slot) {
+        int tag = JS_VALUE_GET_NORM_TAG(slot.get_inner());
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+        count_tag(scope_result.ref_tags, tag);
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+        capture_string_symbol_value(env, slot.get_inner(), tag, scope_result.ref_strings_symbols);
+#endif
+      });
+#endif
+
+      scan.scopes.push_back(std::move(scope_result));
+    }
+
+    env_scan scan_env(napi_env env)
+    {
+      env_scan scan;
+      if (env == nullptr)
+        return scan;
+
+      scan.scope_slots_total = env->scope_storage_slot_count();
+      scan.active_scopes = env->active_scope_count();
+      env->for_each_active_scope([&](const napi_scope__ &scope) {
+        scan_scope(env, scope, scan);
+      });
+      return scan;
+    }
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+    void dump_tag_line(size_t scope_index, const char *label, const tag_counters &counters)
+    {
+      if (!has_tags(counters))
+        return;
+
+      std::fprintf(stderr, "[napi-lifetime-tags] scope=%zu %s", scope_index, label);
+      for (size_t i = 0; i < k_tag_bucket_count; ++i)
+      {
+        size_t count = counters.slots[i];
+        if (count != 0)
+          std::fprintf(stderr, " %s=%zu", tag_bucket_name(i), count);
+      }
+      std::fprintf(stderr, "\n");
+    }
+#endif
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+    void dump_string_symbol_entries(size_t scope_index,
+                                    const char *label,
+                                    const std::vector<string_symbol_entry> &entries)
+    {
+      size_t singular_count = 0;
+      for (const auto &entry : entries)
+      {
+        if (entry.count == 1)
+        {
+          ++singular_count;
+          continue;
+        }
+
+        std::fprintf(stderr,
+                     "[napi-lifetime-values] scope=%zu %s tag=%s count=%zu value=\"%s\"\n",
+                     scope_index,
+                     label,
+                     tag_bucket_name(tag_bucket_index(entry.tag)),
+                     entry.count,
+                     entry.value.c_str());
+      }
+      std::fprintf(stderr,
+                   "[napi-lifetime-values] scope=%zu %s singular_string_count=%zu\n",
+                   scope_index,
+                   label,
+                   singular_count);
+    }
+#endif
+
+    void dump_scan(napi_env env, const char *reason, bool include_string_symbol_values)
+    {
+      if (reason != nullptr)
+        std::fprintf(stderr, "[napi-lifetime] dump env=%p reason=%s\n", env, reason);
+
+      env_scan scan = scan_env(env);
+      std::fprintf(stderr,
+                   "[napi-lifetime-stats] napi_value slots_total=%zu active=%zu "
+                   "napi_ref slots_total=%zu active=%zu "
+                   "napi_scope slots_total=%zu active=%zu\n",
+                   scan.value_slots_total,
+                   scan.active_values,
+                   scan.ref_slots_total,
+                   scan.active_refs,
+                   scan.scope_slots_total,
+                   scan.active_scopes);
+
+      for (const auto &scope : scan.scopes)
+      {
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+        dump_tag_line(scope.scope_index, "napi_value", scope.value_tags);
+        dump_tag_line(scope.scope_index, "napi_ref", scope.ref_tags);
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+        if (include_string_symbol_values)
+        {
+          dump_string_symbol_entries(
+              scope.scope_index, "napi_value", scope.value_strings_symbols);
+          dump_string_symbol_entries(
+              scope.scope_index, "napi_ref", scope.ref_strings_symbols);
+        }
+#else
+        (void)include_string_symbol_values;
+#endif
+      }
+    }
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+    void maybe_dump_periodic_stats(napi_env env)
+    {
+      if (env == nullptr || !periodic_stats_enabled())
+        return;
+
+      int64_t now = monotonic_milliseconds();
+      if (!env->should_dump_lifetime_stats(now))
+        return;
+
+      bool include_string_symbol_values = false;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+      include_string_symbol_values = env->should_dump_lifetime_string_symbol_values(now);
+#endif
+      dump_scan(env, nullptr, include_string_symbol_values);
+    }
+#endif
+  } // namespace
+
+  void napi_lifetime_tracker__::maybe_dump(napi_env env)
   {
-    counter.fetch_add(static_cast<size_t>(delta), std::memory_order_relaxed);
-    return;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+    maybe_dump_periodic_stats(env);
+#else
+    (void)env;
+#endif
   }
 
-  if (delta == 0)
-    return;
-
-  size_t decrement = static_cast<size_t>(-delta);
-  size_t current = counter.load(std::memory_order_relaxed);
-  while (current > 0)
+  void napi_lifetime_tracker__::dump(napi_env env, const char *reason)
   {
-    size_t next = decrement >= current ? 0 : current - decrement;
-    if (counter.compare_exchange_weak(
-            current, next, std::memory_order_relaxed, std::memory_order_relaxed))
+    if (env == nullptr || (!enabled() && !periodic_stats_enabled()))
       return;
+
+    dump_scan(env, reason, true);
   }
-}
-
-allocator_slot_counter &slot_counter_for(napi_lifetime_slot_kind kind)
-{
-  switch (kind)
-  {
-  case napi_lifetime_slot_kind::ref:
-    return ref_slots;
-  case napi_lifetime_slot_kind::scope:
-    return scope_slots;
-  case napi_lifetime_slot_kind::value:
-  default:
-    return value_slots;
-  }
-}
-
-void maybe_dump_periodic_stats()
-{
-  constexpr int64_t interval_ms = 10000;
-  int64_t now = monotonic_milliseconds();
-  int64_t last = last_periodic_stats_ms.load(std::memory_order_relaxed);
-  if (last == 0)
-  {
-    last_periodic_stats_ms.compare_exchange_strong(
-        last, now, std::memory_order_relaxed, std::memory_order_relaxed);
-    return;
-  }
-
-  if (now - last < interval_ms)
-    return;
-
-  if (!last_periodic_stats_ms.compare_exchange_strong(
-          last, now, std::memory_order_relaxed, std::memory_order_relaxed))
-    return;
-
-  std::fprintf(stderr,
-               "[napi-lifetime-stats] napi_value slots_total=%zu active=%zu "
-               "napi_ref slots_total=%zu active=%zu "
-               "napi_scope slots_total=%zu active=%zu\n",
-               value_slots.total_slots.load(std::memory_order_relaxed),
-               value_slots.active_slots.load(std::memory_order_relaxed),
-               ref_slots.total_slots.load(std::memory_order_relaxed),
-               ref_slots.active_slots.load(std::memory_order_relaxed),
-               scope_slots.total_slots.load(std::memory_order_relaxed),
-               scope_slots.active_slots.load(std::memory_order_relaxed));
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-  dump_scope_tag_lines();
-#endif
-}
-
-bool periodic_stats_enabled()
-{
-  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_STATS");
-  if (value != nullptr && value[0] != '\0')
-    return value[0] != '0';
-  return enabled();
-}
-#endif
-
-bool enabled()
-{
-  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
-lifetime_counter &counter_for(napi_lifetime_kind kind)
-{
-  size_t index = static_cast<size_t>(kind);
-  if (index >= k_counter_count)
-    index = 0;
-  return counters[index];
-}
-
-void update_peak(lifetime_counter &counter, size_t live)
-{
-  size_t peak = counter.peak.load(std::memory_order_relaxed);
-  while (live > peak &&
-         !counter.peak.compare_exchange_weak(
-             peak, live, std::memory_order_relaxed, std::memory_order_relaxed))
-  {
-  }
-}
-
-size_t decrement_live(lifetime_counter &counter)
-{
-  size_t live = counter.live.load(std::memory_order_relaxed);
-  while (live > 0)
-  {
-    if (counter.live.compare_exchange_weak(
-            live, live - 1, std::memory_order_relaxed, std::memory_order_relaxed))
-      return live - 1;
-  }
-  return 0;
-}
-
-size_t dump_every()
-{
-  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_DUMP_EVERY");
-  if (value == nullptr || value[0] == '\0')
-    return 0;
-
-  char *end = nullptr;
-  unsigned long parsed = std::strtoul(value, &end, 10);
-  if (end == value)
-    return 0;
-  return static_cast<size_t>(parsed);
-}
-} // namespace
-
-void napi_lifetime_tracker__::record_create(napi_lifetime_kind kind, const void *ptr, const void *env)
-{
-  auto &counter = counter_for(kind);
-  size_t created = counter.created.fetch_add(1, std::memory_order_relaxed) + 1;
-  size_t live = counter.live.fetch_add(1, std::memory_order_relaxed) + 1;
-  update_peak(counter, live);
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
-  if (kind == napi_lifetime_kind::scope && periodic_stats_enabled())
-    maybe_dump_periodic_stats();
-#endif
-
-  if (!enabled())
-    return;
-
-  std::fprintf(stderr,
-               "[napi-lifetime] + %-36s ptr=%p env=%p live=%zu created=%zu\n",
-               counter.name,
-               ptr,
-               env,
-               live,
-               created);
-
-  size_t interval = dump_every();
-  if (interval != 0 && created % interval == 0)
-    dump("periodic create interval");
-}
-
-void napi_lifetime_tracker__::record_destroy(napi_lifetime_kind kind, const void *ptr, const void *env)
-{
-  auto &counter = counter_for(kind);
-  size_t destroyed = counter.destroyed.fetch_add(1, std::memory_order_relaxed) + 1;
-  size_t live = decrement_live(counter);
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
-  if (kind == napi_lifetime_kind::scope && periodic_stats_enabled())
-    maybe_dump_periodic_stats();
-#endif
-
-  if (!enabled())
-    return;
-
-  std::fprintf(stderr,
-               "[napi-lifetime] - %-36s ptr=%p env=%p live=%zu destroyed=%zu\n",
-               counter.name,
-               ptr,
-               env,
-               live,
-               destroyed);
-}
-
-void napi_lifetime_tracker__::dump(const char *reason)
-{
-  if (!enabled())
-    return;
-
-  std::fprintf(stderr,
-               "[napi-lifetime] dump reason=%s\n",
-               reason == nullptr ? "(none)" : reason);
-  for (const auto &counter : counters)
-  {
-    std::fprintf(stderr,
-                 "[napi-lifetime]   %-36s live=%zu peak=%zu created=%zu destroyed=%zu\n",
-                 counter.name,
-                 counter.live.load(std::memory_order_relaxed),
-                 counter.peak.load(std::memory_order_relaxed),
-                 counter.created.load(std::memory_order_relaxed),
-                 counter.destroyed.load(std::memory_order_relaxed));
-  }
-}
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
-void napi_lifetime_tracker__::record_allocator_slot_delta(napi_lifetime_slot_kind kind,
-                                                          std::ptrdiff_t total_delta,
-                                                          std::ptrdiff_t active_delta)
-{
-  if (!periodic_stats_enabled())
-    return;
-
-  allocator_slot_counter &counter = slot_counter_for(kind);
-  adjust_counter(counter.total_slots, total_delta);
-  adjust_counter(counter.active_slots, active_delta);
-  maybe_dump_periodic_stats();
-}
-
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-void napi_lifetime_tracker__::record_value_tag_delta(napi_lifetime_tag_owner_kind kind,
-                                                     size_t scope_index,
-                                                     int tag,
-                                                     std::ptrdiff_t active_delta)
-{
-  if (!periodic_stats_enabled())
-    return;
-
-  {
-    std::lock_guard<std::mutex> lock(tag_stats_mutex);
-    per_scope_tag_counters &scope = tag_counters_for_scope(scope_index);
-    size_t *counters = tag_counter_for(scope, kind);
-    adjust_tag_counter(counters[tag_bucket_index(tag)], active_delta);
-  }
-  maybe_dump_periodic_stats();
-}
-#endif
-#endif
-
 } // namespace quickjs::detail
 
-extern "C" void napi_quickjs_lifetime_dump(const char *reason)
+extern "C" void napi_quickjs_lifetime_dump(napi_env env, const char *reason)
 {
-  quickjs::detail::napi_lifetime_tracker__::dump(reason);
+  quickjs::detail::napi_lifetime_tracker__::dump(env, reason);
 }

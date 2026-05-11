@@ -1,7 +1,6 @@
 #include "internal/napi_ref.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_lifetime_macros.h"
 #include "internal/napi_scope.h"
 
 namespace
@@ -74,8 +73,6 @@ void napi_ref__::initialize(napi_env env,
   can_be_weak_ = JS_VALUE_HAS_REF_COUNT(value);
   ref_count_ = initial_ref_count;
   active_ = true;
-  NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), 1);
-  NAPI_QUICKJS_LIFETIME_RECORD(create, ref, this, env_);
   if (ref_count_ > 0)
     JS_DupValue(env_->context(), value_);
 }
@@ -85,8 +82,6 @@ void napi_ref__::release()
   if (!active_)
     return;
 
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, ref, this, env_);
-  NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), -1);
   if (env_ != nullptr && env_->context() != nullptr && ref_count_ > 0)
     JS_FreeValue(env_->context(), value_);
   env_ = nullptr;
@@ -124,9 +119,7 @@ uint32_t napi_ref__::rem_ref()
     JS_FreeValue(env_->context(), value_);
     if (!can_be_weak_)
     {
-      NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), -1);
       value_ = JS_UNDEFINED;
-      NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), 1);
     }
   }
   return ref_count_;
@@ -166,9 +159,7 @@ void napi_ref__::clear_if_matches(JSValueConst value)
 {
   if (is_weak() && SameRefCountedValue(value_, value))
   {
-    NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), -1);
     value_ = JS_UNDEFINED;
-    NAPI_QUICKJS_LIFETIME_TAG_DELTA(ref, scope_index_, JS_VALUE_GET_NORM_TAG(value_), 1);
   }
 }
 

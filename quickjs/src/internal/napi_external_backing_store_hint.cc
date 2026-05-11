@@ -16,12 +16,10 @@ napi_external_backing_store_hint__::napi_external_backing_store_hint__(
       finalize_cb_(finalize_cb),
       finalize_hint_(finalize_hint)
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(create, external_hint, this, env_);
 }
 
 napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
 {
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, external_hint, this, env_);
 }
 
 napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(

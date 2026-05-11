@@ -1,7 +1,6 @@
 #include "internal/napi_value.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_lifetime_macros.h"
 #include "internal/napi_scope.h"
 
 napi_value__::napi_value__(napi_value__ &&other) noexcept
@@ -45,8 +44,6 @@ void napi_value__::initialize(napi_env env, size_t scope_index, JSValue value, b
   scope_index_ = scope_index;
   value_ = owned ? value : JS_DupValue(env->context(), value);
   active_ = true;
-  NAPI_QUICKJS_LIFETIME_TAG_DELTA(value, scope_index_, JS_VALUE_GET_NORM_TAG(value_), 1);
-  NAPI_QUICKJS_LIFETIME_RECORD(create, value, this, env_);
 }
 
 void napi_value__::release()
@@ -54,8 +51,6 @@ void napi_value__::release()
   if (!active_)
     return;
 
-  NAPI_QUICKJS_LIFETIME_RECORD(destroy, value, this, env_);
-  NAPI_QUICKJS_LIFETIME_TAG_DELTA(value, scope_index_, JS_VALUE_GET_NORM_TAG(value_), -1);
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), value_);
