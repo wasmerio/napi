@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 namespace quickjs::detail
 {
@@ -34,6 +36,7 @@ lifetime_counter counters[] = {
 constexpr size_t k_counter_count = sizeof(counters) / sizeof(counters[0]);
 
 bool enabled();
+lifetime_counter &counter_for(napi_lifetime_kind kind);
 
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
 struct allocator_slot_counter
@@ -44,7 +47,154 @@ struct allocator_slot_counter
 
 allocator_slot_counter value_slots;
 allocator_slot_counter ref_slots;
+allocator_slot_counter scope_slots;
 std::atomic<int64_t> last_periodic_stats_ms{0};
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+constexpr int k_min_known_tag = -9;
+constexpr int k_max_known_tag = 8;
+constexpr size_t k_known_tag_count =
+    static_cast<size_t>(k_max_known_tag - k_min_known_tag + 1);
+constexpr size_t k_unknown_tag_index = k_known_tag_count;
+constexpr size_t k_tag_bucket_count = k_known_tag_count + 1;
+
+struct per_scope_tag_counters
+{
+  size_t scope_index = 0;
+  size_t value_tag_slots[k_tag_bucket_count] = {};
+  size_t ref_tag_slots[k_tag_bucket_count] = {};
+};
+
+std::mutex tag_stats_mutex;
+std::vector<per_scope_tag_counters> tag_stats_by_scope;
+
+size_t tag_bucket_index(int tag)
+{
+  if (tag < k_min_known_tag || tag > k_max_known_tag)
+    return k_unknown_tag_index;
+  return static_cast<size_t>(tag - k_min_known_tag);
+}
+
+const char *tag_bucket_name(size_t index)
+{
+  if (index == k_unknown_tag_index)
+    return "unknown";
+
+  switch (static_cast<int>(index) + k_min_known_tag)
+  {
+  case -9:
+    return "big_int";
+  case -8:
+    return "symbol";
+  case -7:
+    return "string";
+  case -6:
+    return "string_rope";
+  case -5:
+    return "tag_-5";
+  case -4:
+    return "tag_-4";
+  case -3:
+    return "module";
+  case -2:
+    return "function_bytecode";
+  case -1:
+    return "object";
+  case 0:
+    return "int";
+  case 1:
+    return "bool";
+  case 2:
+    return "null";
+  case 3:
+    return "undefined";
+  case 4:
+    return "uninitialized";
+  case 5:
+    return "catch_offset";
+  case 6:
+    return "exception";
+  case 7:
+    return "short_big_int";
+  case 8:
+    return "float64";
+  default:
+    return "unknown";
+  }
+}
+
+per_scope_tag_counters &tag_counters_for_scope(size_t scope_index)
+{
+  for (auto &scope : tag_stats_by_scope)
+  {
+    if (scope.scope_index == scope_index)
+      return scope;
+  }
+
+  tag_stats_by_scope.push_back({});
+  tag_stats_by_scope.back().scope_index = scope_index;
+  return tag_stats_by_scope.back();
+}
+
+size_t *tag_counter_for(per_scope_tag_counters &scope, napi_lifetime_tag_owner_kind kind)
+{
+  return kind == napi_lifetime_tag_owner_kind::ref ? scope.ref_tag_slots : scope.value_tag_slots;
+}
+
+void adjust_tag_counter(size_t &counter, std::ptrdiff_t delta)
+{
+  if (delta > 0)
+  {
+    counter += static_cast<size_t>(delta);
+    return;
+  }
+
+  if (delta == 0)
+    return;
+
+  size_t decrement = static_cast<size_t>(-delta);
+  counter = decrement >= counter ? 0 : counter - decrement;
+}
+
+bool tag_counters_have_values(const size_t *counters)
+{
+  for (size_t i = 0; i < k_tag_bucket_count; ++i)
+  {
+    if (counters[i] != 0)
+      return true;
+  }
+  return false;
+}
+
+void dump_scope_tag_line(size_t scope_index, const char *label, const size_t *counters)
+{
+  std::fprintf(stderr, "[napi-lifetime-tags] scope=%zu %s", scope_index, label);
+  bool printed = false;
+  for (size_t i = 0; i < k_tag_bucket_count; ++i)
+  {
+    size_t count = counters[i];
+    if (count == 0)
+      continue;
+    std::fprintf(stderr, " %s=%zu", tag_bucket_name(i), count);
+    printed = true;
+  }
+  if (!printed)
+    std::fprintf(stderr, " none=0");
+  std::fprintf(stderr, "\n");
+}
+
+void dump_scope_tag_lines()
+{
+  std::lock_guard<std::mutex> lock(tag_stats_mutex);
+  for (const auto &scope : tag_stats_by_scope)
+  {
+    if (tag_counters_have_values(scope.value_tag_slots))
+      dump_scope_tag_line(scope.scope_index, "napi_value", scope.value_tag_slots);
+    if (tag_counters_have_values(scope.ref_tag_slots))
+      dump_scope_tag_line(scope.scope_index, "napi_ref", scope.ref_tag_slots);
+  }
+}
+#endif
 
 int64_t monotonic_milliseconds()
 {
@@ -78,12 +228,21 @@ void adjust_counter(std::atomic<size_t> &counter, std::ptrdiff_t delta)
 
 allocator_slot_counter &slot_counter_for(napi_lifetime_slot_kind kind)
 {
-  return kind == napi_lifetime_slot_kind::ref ? ref_slots : value_slots;
+  switch (kind)
+  {
+  case napi_lifetime_slot_kind::ref:
+    return ref_slots;
+  case napi_lifetime_slot_kind::scope:
+    return scope_slots;
+  case napi_lifetime_slot_kind::value:
+  default:
+    return value_slots;
+  }
 }
 
 void maybe_dump_periodic_stats()
 {
-  constexpr int64_t interval_ms = 2000;
+  constexpr int64_t interval_ms = 10000;
   int64_t now = monotonic_milliseconds();
   int64_t last = last_periodic_stats_ms.load(std::memory_order_relaxed);
   if (last == 0)
@@ -102,11 +261,18 @@ void maybe_dump_periodic_stats()
 
   std::fprintf(stderr,
                "[napi-lifetime-stats] napi_value slots_total=%zu active=%zu "
-               "napi_ref slots_total=%zu active=%zu\n",
+               "napi_ref slots_total=%zu active=%zu "
+               "napi_scope slots_total=%zu active=%zu\n",
                value_slots.total_slots.load(std::memory_order_relaxed),
                value_slots.active_slots.load(std::memory_order_relaxed),
                ref_slots.total_slots.load(std::memory_order_relaxed),
-               ref_slots.active_slots.load(std::memory_order_relaxed));
+               ref_slots.active_slots.load(std::memory_order_relaxed),
+               scope_slots.total_slots.load(std::memory_order_relaxed),
+               scope_slots.active_slots.load(std::memory_order_relaxed));
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+  dump_scope_tag_lines();
+#endif
 }
 
 bool periodic_stats_enabled()
@@ -175,6 +341,11 @@ void napi_lifetime_tracker__::record_create(napi_lifetime_kind kind, const void 
   size_t live = counter.live.fetch_add(1, std::memory_order_relaxed) + 1;
   update_peak(counter, live);
 
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+  if (kind == napi_lifetime_kind::scope && periodic_stats_enabled())
+    maybe_dump_periodic_stats();
+#endif
+
   if (!enabled())
     return;
 
@@ -196,6 +367,11 @@ void napi_lifetime_tracker__::record_destroy(napi_lifetime_kind kind, const void
   auto &counter = counter_for(kind);
   size_t destroyed = counter.destroyed.fetch_add(1, std::memory_order_relaxed) + 1;
   size_t live = decrement_live(counter);
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+  if (kind == napi_lifetime_kind::scope && periodic_stats_enabled())
+    maybe_dump_periodic_stats();
+#endif
 
   if (!enabled())
     return;
@@ -242,6 +418,25 @@ void napi_lifetime_tracker__::record_allocator_slot_delta(napi_lifetime_slot_kin
   adjust_counter(counter.active_slots, active_delta);
   maybe_dump_periodic_stats();
 }
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+void napi_lifetime_tracker__::record_value_tag_delta(napi_lifetime_tag_owner_kind kind,
+                                                     size_t scope_index,
+                                                     int tag,
+                                                     std::ptrdiff_t active_delta)
+{
+  if (!periodic_stats_enabled())
+    return;
+
+  {
+    std::lock_guard<std::mutex> lock(tag_stats_mutex);
+    per_scope_tag_counters &scope = tag_counters_for_scope(scope_index);
+    size_t *counters = tag_counter_for(scope, kind);
+    adjust_tag_counter(counters[tag_bucket_index(tag)], active_delta);
+  }
+  maybe_dump_periodic_stats();
+}
+#endif
 #endif
 
 } // namespace quickjs::detail

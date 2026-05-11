@@ -3,6 +3,7 @@
 #include "internal/napi_lifetime_macros.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
@@ -14,7 +15,7 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       module_wrap_(this, context)
 {
   NAPI_QUICKJS_LIFETIME_RECORD(create, env, this, this);
-  root_scope_ = napi_scope__::create(this, nullptr);
+  root_scope_ = create_scope(nullptr);
   current_scope_ = root_scope_;
   clear_last_error();
 }
@@ -46,13 +47,14 @@ void napi_env__::prepare_teardown()
 
   clear_last_exception();
 
-  if (root_scope_ != nullptr)
+  napi_scope__ *root_scope = this->root_scope_value();
+  if (root_scope != nullptr)
   {
-    root_scope_->close();
+    root_scope->close();
     if (context_ != nullptr)
       JS_RunGC(JS_GetRuntime(context_));
   }
-  napi_scope__::destroy(root_scope_);
+  scopes_.close();
   current_scope_ = nullptr;
   root_scope_ = nullptr;
   weak_refs_.clear();
@@ -74,22 +76,54 @@ int32_t napi_env__::module_api_version() const
   return module_api_version_;
 }
 
-napi_scope__ *napi_env__::root_scope() const
+napi_scope_handle__ napi_env__::root_scope() const
 {
   return root_scope_;
 }
 
-napi_scope__ *napi_env__::current_scope() const
+napi_scope_handle__ napi_env__::current_scope() const
 {
   return current_scope_;
 }
 
-bool napi_env__::is_current_scope(napi_scope__ *scope) const
+napi_scope__ *napi_env__::root_scope_value() const
+{
+  return scope_from_handle(root_scope_);
+}
+
+napi_scope__ *napi_env__::current_scope_value() const
+{
+  return scope_from_handle(current_scope_);
+}
+
+napi_scope_handle__ napi_env__::create_scope(napi_scope_handle__ parent)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  auto *handle = scopes_.allocate(this, parent);
+  napi_scope__ *scope = scopes_.get(handle);
+  if (scope != nullptr)
+    scope->set_index(reinterpret_cast<uintptr_t>(handle) - 1);
+  return static_cast<napi_scope_handle__>(handle);
+}
+
+void napi_env__::destroy_scope(napi_scope_handle__ scope)
+{
+  scopes_.release(static_cast<napi_scope__ *>(scope));
+}
+
+napi_scope__ *napi_env__::scope_from_handle(napi_scope_handle__ scope) const
+{
+  return const_cast<napi_allocator__<napi_scope__> &>(scopes_).get(
+      static_cast<napi_scope__ *>(scope));
+}
+
+bool napi_env__::is_current_scope(napi_scope_handle__ scope) const
 {
   return current_scope_ == scope;
 }
 
-void napi_env__::set_current_scope(napi_scope__ *scope)
+void napi_env__::set_current_scope(napi_scope_handle__ scope)
 {
   current_scope_ = scope;
 }

@@ -25,7 +25,16 @@ enum class napi_lifetime_slot_kind
 {
   value,
   ref,
+  scope,
 };
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+enum class napi_lifetime_tag_owner_kind
+{
+  value,
+  ref,
+};
+#endif
 #endif
 
 class napi_lifetime_tracker__
@@ -38,6 +47,12 @@ public:
   static void record_allocator_slot_delta(napi_lifetime_slot_kind kind,
                                           std::ptrdiff_t total_delta,
                                           std::ptrdiff_t active_delta);
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+  static void record_value_tag_delta(napi_lifetime_tag_owner_kind kind,
+                                     size_t scope_index,
+                                     int tag,
+                                     std::ptrdiff_t active_delta);
+#endif
 #endif
 };
 

@@ -20,7 +20,7 @@ public:
         scope_(env != nullptr ? napi_handle_scope__::create(env, parent_) : nullptr)
   {
     if (scope_ != nullptr)
-      env_->set_current_scope(scope_);
+      env_->set_current_scope(scope_->scope_handle());
   }
 
   ~quickjs_callback_handle_scope__()
@@ -28,7 +28,7 @@ public:
     if (scope_ == nullptr || env_ == nullptr)
       return;
 
-    if (env_->is_current_scope(scope_))
+    if (env_->is_current_scope(scope_->scope_handle()))
       env_->set_current_scope(parent_);
     napi_handle_scope__::destroy(scope_);
   }
@@ -40,7 +40,7 @@ public:
 
 private:
   napi_env env_ = nullptr;
-  napi_scope__ *parent_ = nullptr;
+  napi_scope_handle__ parent_ = nullptr;
   napi_handle_scope__ *scope_ = nullptr;
 };
 } // namespace
@@ -114,7 +114,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
     {
       JS_FreeValue(ctx, effective_this);
       returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-      env->current_scope()->delete_value(result);
+      env->current_scope_value()->delete_value(result);
     }
     else
     {
@@ -124,7 +124,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
   else if (result != nullptr)
   {
     returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-    env->current_scope()->delete_value(result);
+    env->current_scope_value()->delete_value(result);
   }
 
   return returned;
@@ -176,6 +176,6 @@ napi_status napi_function__::create(napi_env env,
                               JS_PROP_CONFIGURABLE);
   }
 
-  *result = env->current_scope()->wrap_value(fn, true);
+  *result = env->current_scope_value()->wrap_value(fn, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

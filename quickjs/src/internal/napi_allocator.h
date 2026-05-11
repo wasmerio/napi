@@ -92,6 +92,7 @@ public:
     }
     entries_.clear();
     free_indexes_.clear();
+    base_index_ = 0;
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
     record_slot_delta(-static_cast<std::ptrdiff_t>(total), 0);
 #endif

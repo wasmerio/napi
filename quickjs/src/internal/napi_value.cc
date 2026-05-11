@@ -6,10 +6,12 @@
 
 napi_value__::napi_value__(napi_value__ &&other) noexcept
     : env_(other.env_),
+      scope_index_(other.scope_index_),
       value_(other.value_),
       active_(other.active_)
 {
   other.env_ = nullptr;
+  other.scope_index_ = 0;
   other.value_ = JS_UNDEFINED;
   other.active_ = false;
 }
@@ -21,9 +23,11 @@ napi_value__ &napi_value__::operator=(napi_value__ &&other) noexcept
 
   release();
   env_ = other.env_;
+  scope_index_ = other.scope_index_;
   value_ = other.value_;
   active_ = other.active_;
   other.env_ = nullptr;
+  other.scope_index_ = 0;
   other.value_ = JS_UNDEFINED;
   other.active_ = false;
   return *this;
@@ -34,12 +38,14 @@ napi_value__::~napi_value__()
   release();
 }
 
-void napi_value__::initialize(napi_env env, JSValue value, bool owned)
+void napi_value__::initialize(napi_env env, size_t scope_index, JSValue value, bool owned)
 {
   release();
   env_ = env;
+  scope_index_ = scope_index;
   value_ = owned ? value : JS_DupValue(env->context(), value);
   active_ = true;
+  NAPI_QUICKJS_LIFETIME_TAG_DELTA(value, scope_index_, JS_VALUE_GET_NORM_TAG(value_), 1);
   NAPI_QUICKJS_LIFETIME_RECORD(create, value, this, env_);
 }
 
@@ -49,11 +55,13 @@ void napi_value__::release()
     return;
 
   NAPI_QUICKJS_LIFETIME_RECORD(destroy, value, this, env_);
+  NAPI_QUICKJS_LIFETIME_TAG_DELTA(value, scope_index_, JS_VALUE_GET_NORM_TAG(value_), -1);
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), value_);
   }
   env_ = nullptr;
+  scope_index_ = 0;
   value_ = JS_UNDEFINED;
   active_ = false;
 }
@@ -72,7 +80,7 @@ napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value)
 {
   if (env == nullptr || value == nullptr || env->current_scope() == nullptr)
     return nullptr;
-  return env->current_scope()->value_from_handle(value);
+  return env->current_scope_value()->value_from_handle(value);
 }
 
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)
