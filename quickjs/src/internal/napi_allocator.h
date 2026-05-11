@@ -1,9 +1,7 @@
 #ifndef NAPI_QUICKJS_ALLOCATOR_H_
 #define NAPI_QUICKJS_ALLOCATOR_H_
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "napi_lifetime_tracker.h"
-#endif
+#include "napi_lifetime_macros.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -43,13 +41,13 @@ public:
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
     record_slot_delta(grew ? 1 : 0, 1);
 #endif
-    return handle_from_index(index);
+    return handle_from_index(base_index_ + index);
   }
 
   T *get(T *handle)
   {
     size_t index = 0;
-    if (!index_from_handle(handle, &index) || index >= entries_.size())
+    if (!local_index_from_handle(handle, &index))
       return nullptr;
     T &entry = entries_[index];
     return entry.is_active() ? &entry : nullptr;
@@ -58,7 +56,7 @@ public:
   const T *get(T *handle) const
   {
     size_t index = 0;
-    if (!index_from_handle(handle, &index) || index >= entries_.size())
+    if (!local_index_from_handle(handle, &index))
       return nullptr;
     const T &entry = entries_[index];
     return entry.is_active() ? &entry : nullptr;
@@ -67,7 +65,7 @@ public:
   void release(T *handle)
   {
     size_t index = 0;
-    if (!index_from_handle(handle, &index) || index >= entries_.size())
+    if (!local_index_from_handle(handle, &index))
       return;
     T &entry = entries_[index];
     if (!entry.is_active())
@@ -101,19 +99,13 @@ public:
 
   void reserve_prefix(size_t count)
   {
-    if (entries_.size() < count)
-    {
-      size_t delta = count - entries_.size();
-      entries_.resize(count);
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-      record_slot_delta(static_cast<std::ptrdiff_t>(delta), 0);
-#endif
-    }
+    if (base_index_ < count)
+      base_index_ = count;
   }
 
   size_t slot_count() const
   {
-    return entries_.size();
+    return base_index_ + entries_.size();
   }
 
 private:
@@ -132,17 +124,32 @@ private:
     return true;
   }
 
+  bool local_index_from_handle(T *handle, size_t *index) const
+  {
+    size_t global_index = 0;
+    if (!index_from_handle(handle, &global_index))
+      return false;
+    if (global_index < base_index_)
+      return false;
+    size_t local_index = global_index - base_index_;
+    if (local_index >= entries_.size())
+      return false;
+    if (index != nullptr)
+      *index = local_index;
+    return true;
+  }
+
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   void record_slot_delta(std::ptrdiff_t total_delta, std::ptrdiff_t active_delta)
   {
-    quickjs::detail::napi_lifetime_tracker__::record_allocator_slot_delta(
-        slot_kind_, total_delta, active_delta);
+    NAPI_QUICKJS_LIFETIME_SLOT_DELTA(slot_kind_, total_delta, active_delta);
   }
 
   quickjs::detail::napi_lifetime_slot_kind slot_kind_;
 #endif
   std::vector<T> entries_;
   std::vector<size_t> free_indexes_;
+  size_t base_index_ = 0;
 };
 
 #endif // NAPI_QUICKJS_ALLOCATOR_H_

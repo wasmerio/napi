@@ -1,9 +1,7 @@
 #include "internal/napi_ref.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 #include "internal/napi_scope.h"
 
 namespace
@@ -68,10 +66,7 @@ void napi_ref__::initialize(napi_env env, JSValueConst value, uint32_t initial_r
   can_be_weak_ = JS_VALUE_HAS_REF_COUNT(value);
   ref_count_ = initial_ref_count;
   active_ = true;
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::ref, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, ref, this, env_);
   if (ref_count_ > 0)
     JS_DupValue(env_->context(), value_);
 }
@@ -81,10 +76,7 @@ void napi_ref__::release()
   if (!active_)
     return;
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::ref, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, ref, this, env_);
   if (env_ != nullptr && env_->context() != nullptr && ref_count_ > 0)
     JS_FreeValue(env_->context(), value_);
   env_ = nullptr;

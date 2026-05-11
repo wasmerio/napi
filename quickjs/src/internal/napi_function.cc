@@ -3,10 +3,47 @@
 #include "internal/napi_callback_info.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
+#include "internal/napi_handle_scope.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
 
 #include <cstring>
+
+namespace
+{
+class quickjs_callback_handle_scope__
+{
+public:
+  explicit quickjs_callback_handle_scope__(napi_env env)
+      : env_(env),
+        parent_(env != nullptr ? env->current_scope() : nullptr),
+        scope_(env != nullptr ? napi_handle_scope__::create(env, parent_) : nullptr)
+  {
+    if (scope_ != nullptr)
+      env_->set_current_scope(scope_);
+  }
+
+  ~quickjs_callback_handle_scope__()
+  {
+    if (scope_ == nullptr || env_ == nullptr)
+      return;
+
+    if (env_->is_current_scope(scope_))
+      env_->set_current_scope(parent_);
+    napi_handle_scope__::destroy(scope_);
+  }
+
+  bool is_open() const
+  {
+    return scope_ != nullptr;
+  }
+
+private:
+  napi_env env_ = nullptr;
+  napi_scope__ *parent_ = nullptr;
+  napi_handle_scope__ *scope_ = nullptr;
+};
+} // namespace
 
 JSValue napi_function__::create_internal(napi_env env,
                                          const char *utf8name,
@@ -38,6 +75,9 @@ JSValue napi_function__::trampoline(JSContext *ctx,
 
   auto cb = reinterpret_cast<napi_callback>(cb_ptr);
   auto user_data = napi_external__::get_value(func_data[1]);
+  quickjs_callback_handle_scope__ callback_scope(env);
+  if (!callback_scope.is_open())
+    return JS_ThrowOutOfMemory(ctx);
 
   JSValue effective_this = this_val;
   JSValue new_target = JS_UNDEFINED;

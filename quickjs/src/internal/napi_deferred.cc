@@ -1,9 +1,7 @@
 #include "internal/napi_deferred.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 #include "internal/napi_value.h"
 
 #include <new>
@@ -13,18 +11,12 @@ napi_deferred__::napi_deferred__(napi_env env, JSValue resolve, JSValue reject)
       resolve_(resolve),
       reject_(reject)
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::deferred, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, deferred, this, env_);
 }
 
 napi_deferred__::~napi_deferred__()
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::deferred, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, deferred, this, env_);
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), resolve_);

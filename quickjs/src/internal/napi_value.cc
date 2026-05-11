@@ -1,9 +1,7 @@
 #include "internal/napi_value.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 #include "internal/napi_scope.h"
 
 napi_value__::napi_value__(napi_value__ &&other) noexcept
@@ -42,10 +40,7 @@ void napi_value__::initialize(napi_env env, JSValue value, bool owned)
   env_ = env;
   value_ = owned ? value : JS_DupValue(env->context(), value);
   active_ = true;
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::value, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, value, this, env_);
 }
 
 void napi_value__::release()
@@ -53,10 +48,7 @@ void napi_value__::release()
   if (!active_)
     return;
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::value, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, value, this, env_);
   if (env_ != nullptr && env_->context() != nullptr)
   {
     JS_FreeValue(env_->context(), value_);

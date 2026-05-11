@@ -1,8 +1,6 @@
 #include "internal/napi_env.h"
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 
 #include <algorithm>
 #include <limits>
@@ -15,10 +13,7 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       contextify_(this, context),
       module_wrap_(this, context)
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::env, this, this);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, env, this, this);
   root_scope_ = napi_scope__::create(this, nullptr);
   current_scope_ = root_scope_;
   clear_last_error();
@@ -34,9 +29,7 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::dump("napi_env__ teardown begin");
-#endif
+  NAPI_QUICKJS_LIFETIME_DUMP("napi_env__ teardown begin");
   for (auto it = env_cleanup_hooks_.rbegin(); it != env_cleanup_hooks_.rend(); ++it)
   {
     auto *entry = *it;
@@ -66,11 +59,8 @@ void napi_env__::prepare_teardown()
   module_wrap_.teardown();
   contextify_.teardown();
   promises_.teardown();
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::env, this, this);
-  quickjs::detail::napi_lifetime_tracker__::dump("napi_env__ teardown end");
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, env, this, this);
+  NAPI_QUICKJS_LIFETIME_DUMP("napi_env__ teardown end");
   torn_down_ = true;
 }
 

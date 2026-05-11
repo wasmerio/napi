@@ -1,27 +1,19 @@
 #include "internal/napi_escapable_handle_scope.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 
 #include <new>
 
 napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env, napi_scope__ *parent)
     : napi_scope__(env, parent)
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::escapable_handle_scope, this, env);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, escapable_handle_scope, this, env);
 }
 
 napi_escapable_handle_scope__::~napi_escapable_handle_scope__()
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::escapable_handle_scope, this, env());
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, escapable_handle_scope, this, env());
 }
 
 napi_escapable_handle_scope__ *napi_escapable_handle_scope__::create(napi_env env, napi_scope__ *parent)

@@ -1,9 +1,7 @@
 #include "internal/napi_scope.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 
 #include <new>
 
@@ -18,18 +16,12 @@ napi_scope__::napi_scope__(napi_env env, napi_scope__ *parent)
 {
   if (parent_ != nullptr)
     values_.reserve_prefix(parent_->value_slot_count());
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::scope, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, scope, this, env_);
 }
 
 napi_scope__::~napi_scope__()
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::scope, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, scope, this, env_);
   close();
 }
 

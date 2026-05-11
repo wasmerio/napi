@@ -1,9 +1,7 @@
 #include "internal/napi_external_backing_store_hint.h"
 
 #include "internal/napi_env.h"
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-#include "internal/napi_lifetime_tracker.h"
-#endif
+#include "internal/napi_lifetime_macros.h"
 
 #include <new>
 
@@ -18,18 +16,12 @@ napi_external_backing_store_hint__::napi_external_backing_store_hint__(
       finalize_cb_(finalize_cb),
       finalize_hint_(finalize_hint)
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_create(
-      quickjs::detail::napi_lifetime_kind::external_hint, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(create, external_hint, this, env_);
 }
 
 napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
 {
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  quickjs::detail::napi_lifetime_tracker__::record_destroy(
-      quickjs::detail::napi_lifetime_kind::external_hint, this, env_);
-#endif
+  NAPI_QUICKJS_LIFETIME_RECORD(destroy, external_hint, this, env_);
 }
 
 napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(

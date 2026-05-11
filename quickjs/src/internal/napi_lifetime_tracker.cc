@@ -33,6 +33,8 @@ lifetime_counter counters[] = {
 
 constexpr size_t k_counter_count = sizeof(counters) / sizeof(counters[0]);
 
+bool enabled();
+
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
 struct allocator_slot_counter
 {
@@ -105,6 +107,14 @@ void maybe_dump_periodic_stats()
                value_slots.active_slots.load(std::memory_order_relaxed),
                ref_slots.total_slots.load(std::memory_order_relaxed),
                ref_slots.active_slots.load(std::memory_order_relaxed));
+}
+
+bool periodic_stats_enabled()
+{
+  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_STATS");
+  if (value != nullptr && value[0] != '\0')
+    return value[0] != '0';
+  return enabled();
 }
 #endif
 
@@ -224,6 +234,9 @@ void napi_lifetime_tracker__::record_allocator_slot_delta(napi_lifetime_slot_kin
                                                           std::ptrdiff_t total_delta,
                                                           std::ptrdiff_t active_delta)
 {
+  if (!periodic_stats_enabled())
+    return;
+
   allocator_slot_counter &counter = slot_counter_for(kind);
   adjust_counter(counter.total_slots, total_delta);
   adjust_counter(counter.active_slots, active_delta);
