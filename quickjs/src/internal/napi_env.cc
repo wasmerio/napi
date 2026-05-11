@@ -103,7 +103,7 @@ napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
   auto *handle = scopes_.allocate(this, parent);
   napi_scope__ *scope = scopes_.get(handle);
   if (scope != nullptr)
-    scope->set_index(reinterpret_cast<uintptr_t>(handle) - 1);
+    scope->set_index(next_scope_index_++);
   NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
   return reinterpret_cast<napi_handle_scope>(handle);
 }

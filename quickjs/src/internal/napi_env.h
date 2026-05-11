@@ -106,6 +106,7 @@ private:
   napi_handle_scope root_scope_ = nullptr;
   napi_handle_scope current_scope_ = nullptr;
   napi_allocator__<napi_scope__> scopes_;
+  size_t next_scope_index_ = 0;
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;
