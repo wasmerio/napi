@@ -167,5 +167,5 @@ napi_ref__ *napi_quickjs_ref_slot(napi_env env, napi_ref ref)
 {
   if (env == nullptr || ref == nullptr || env->root_scope() == nullptr)
     return nullptr;
-  return env->root_scope_value()->ref_from_handle(ref);
+  return env->scope_from_handle(env->root_scope())->ref_from_handle(ref);
 }

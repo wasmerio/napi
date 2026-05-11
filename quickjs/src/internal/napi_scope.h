@@ -10,13 +10,11 @@
 #include <vector>
 #include <quickjs.h>
 
-using napi_scope_handle__ = void *;
-
 struct napi_scope__
 {
   ~napi_scope__();
 
-  void initialize(napi_env env, napi_scope_handle__ parent);
+  void initialize(napi_env env, napi_handle_scope parent);
   void release();
   bool is_active() const;
   void set_index(size_t index);
@@ -37,9 +35,11 @@ struct napi_scope__
   size_t active_value_count() const;
   size_t ref_storage_slot_count() const;
   size_t active_ref_count() const;
-  napi_scope_handle__ parent_handle() const;
+  napi_handle_scope parent_handle() const;
   napi_scope__ *parent() const;
   napi_env env() const;
+  bool has_escaped() const;
+  void mark_escaped();
 
   template <typename Fn>
   void for_each_active_value(Fn fn) const
@@ -63,11 +63,12 @@ struct napi_scope__
 private:
   napi_env env_ = nullptr;
   size_t index_ = 0;
-  napi_scope_handle__ parent_ = nullptr;
+  napi_handle_scope parent_ = nullptr;
   napi_allocator__<napi_value__> values_;
   napi_allocator__<napi_ref__> refs_;
   bool closed_ = false;
   bool active_ = false;
+  bool escaped_ = false;
 };
 
 #endif // NAPI_QUICKJS_SCOPE_H_

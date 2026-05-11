@@ -46,7 +46,7 @@ void napi_env__::prepare_teardown()
 
   clear_last_exception();
 
-  napi_scope__ *root_scope = this->root_scope_value();
+  napi_scope__ *root_scope = scope_from_handle(root_scope_);
   if (root_scope != nullptr)
   {
     root_scope->close();
@@ -74,27 +74,17 @@ int32_t napi_env__::module_api_version() const
   return module_api_version_;
 }
 
-napi_scope_handle__ napi_env__::root_scope() const
+napi_handle_scope napi_env__::root_scope() const
 {
   return root_scope_;
 }
 
-napi_scope_handle__ napi_env__::current_scope() const
+napi_handle_scope napi_env__::current_scope() const
 {
   return current_scope_;
 }
 
-napi_scope__ *napi_env__::root_scope_value() const
-{
-  return scope_from_handle(root_scope_);
-}
-
-napi_scope__ *napi_env__::current_scope_value() const
-{
-  return scope_from_handle(current_scope_);
-}
-
-napi_scope_handle__ napi_env__::create_scope(napi_scope_handle__ parent)
+napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 {
   if (context_ == nullptr)
     return nullptr;
@@ -103,27 +93,27 @@ napi_scope_handle__ napi_env__::create_scope(napi_scope_handle__ parent)
   if (scope != nullptr)
     scope->set_index(reinterpret_cast<uintptr_t>(handle) - 1);
   NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
-  return static_cast<napi_scope_handle__>(handle);
+  return reinterpret_cast<napi_handle_scope>(handle);
 }
 
-void napi_env__::destroy_scope(napi_scope_handle__ scope)
+void napi_env__::destroy_scope(napi_handle_scope scope)
 {
-  scopes_.release(static_cast<napi_scope__ *>(scope));
+  scopes_.release(reinterpret_cast<napi_scope__ *>(scope));
   NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
 }
 
-napi_scope__ *napi_env__::scope_from_handle(napi_scope_handle__ scope) const
+napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope) const
 {
   return const_cast<napi_allocator__<napi_scope__> &>(scopes_).get(
-      static_cast<napi_scope__ *>(scope));
+      reinterpret_cast<napi_scope__ *>(scope));
 }
 
-bool napi_env__::is_current_scope(napi_scope_handle__ scope) const
+bool napi_env__::is_current_scope(napi_handle_scope scope) const
 {
   return current_scope_ == scope;
 }
 
-void napi_env__::set_current_scope(napi_scope_handle__ scope)
+void napi_env__::set_current_scope(napi_handle_scope scope)
 {
   current_scope_ = scope;
 }

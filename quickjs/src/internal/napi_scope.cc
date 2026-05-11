@@ -30,15 +30,17 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
   refs_ = static_cast<napi_allocator__<napi_ref__> &&>(other.refs_);
   closed_ = other.closed_;
   active_ = other.active_;
+  escaped_ = other.escaped_;
   other.env_ = nullptr;
   other.index_ = 0;
   other.parent_ = nullptr;
   other.closed_ = true;
   other.active_ = false;
+  other.escaped_ = false;
   return *this;
 }
 
-void napi_scope__::initialize(napi_env env, napi_scope_handle__ parent)
+void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
 {
   release();
   env_ = env;
@@ -46,6 +48,7 @@ void napi_scope__::initialize(napi_env env, napi_scope_handle__ parent)
   parent_ = parent;
   closed_ = false;
   active_ = true;
+  escaped_ = false;
 
   napi_scope__ *parent_scope = this->parent();
   if (parent_scope != nullptr)
@@ -61,6 +64,7 @@ void napi_scope__::release()
   env_ = nullptr;
   index_ = 0;
   parent_ = nullptr;
+  escaped_ = false;
   active_ = false;
 }
 
@@ -191,7 +195,7 @@ size_t napi_scope__::active_ref_count() const
   return refs_.active_count();
 }
 
-napi_scope_handle__ napi_scope__::parent_handle() const
+napi_handle_scope napi_scope__::parent_handle() const
 {
   return parent_;
 }
@@ -204,4 +208,14 @@ napi_scope__ *napi_scope__::parent() const
 napi_env napi_scope__::env() const
 {
   return env_;
+}
+
+bool napi_scope__::has_escaped() const
+{
+  return escaped_;
+}
+
+void napi_scope__::mark_escaped()
+{
+  escaped_ = true;
 }

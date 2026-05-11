@@ -75,7 +75,7 @@ napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value)
 {
   if (env == nullptr || value == nullptr || env->current_scope() == nullptr)
     return nullptr;
-  return env->current_scope_value()->value_from_handle(value);
+  return env->scope_from_handle(env->current_scope())->value_from_handle(value);
 }
 
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)
