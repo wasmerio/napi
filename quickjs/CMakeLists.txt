@@ -62,6 +62,7 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 add_library(napi_quickjs STATIC
   src/js_native_api_quickjs.cc
   src/internal/napi_callback_info.cc
+  src/internal/napi_callsite.cc
   src/internal/napi_contextify.cc
   src/internal/napi_deferred.cc
   src/internal/napi_env.cc
@@ -71,6 +72,7 @@ add_library(napi_quickjs STATIC
   src/internal/napi_external_backing_store_hint.cc
   src/internal/napi_function.cc
   src/internal/napi_handle_scope.cc
+  src/internal/napi_module_wrap.cc
   src/internal/napi_promises.cc
   src/internal/napi_ref.cc
   src/internal/napi_scope.cc

@@ -9,6 +9,7 @@
 #include "napi_env_cleanup_hook.h"
 #include "napi_escapable_handle_scope.h"
 #include "napi_handle_scope.h"
+#include "napi_module_wrap.h"
 #include "napi_promises.h"
 #include "napi_ref.h"
 #include "napi_scope.h"
@@ -57,6 +58,8 @@ struct napi_env__
   const napi_promises__ &promises() const;
   quickjs::detail::napi_contextify__ &contextify();
   const quickjs::detail::napi_contextify__ &contextify() const;
+  quickjs::detail::napi_module_wrap__ &module_wrap();
+  const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
 private:
   JSContext *context_;
@@ -75,6 +78,7 @@ private:
   int64_t external_memory_ = 0;
   napi_promises__ promises_;
   quickjs::detail::napi_contextify__ contextify_;
+  quickjs::detail::napi_module_wrap__ module_wrap_;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,
