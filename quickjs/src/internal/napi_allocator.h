@@ -1,13 +1,14 @@
 #ifndef NAPI_QUICKJS_ALLOCATOR_H_
 #define NAPI_QUICKJS_ALLOCATOR_H_
 
-#include "napi_lifetime_macros.h"
+#include "napi_lifetime_tracker.h"
 
 #include <array>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -18,6 +19,9 @@ concept napi_allocator_payload__ =
       { value.release() } -> std::same_as<void>;
     };
 
+template <typename T>
+concept napi_allocator_owner__ = std::is_class_v<T>;
+
 template <typename T, typename... Args>
 concept napi_allocator_initializable_payload__ =
     napi_allocator_payload__<T> &&
@@ -25,7 +29,7 @@ concept napi_allocator_initializable_payload__ =
       { value.initialize(static_cast<Args &&>(args)...) } -> std::same_as<void>;
     };
 
-template <napi_allocator_payload__ T, size_t N = 256>
+template <napi_allocator_payload__ T, napi_allocator_owner__ Owner_, size_t N = 256>
 class napi_allocator__
 {
   static_assert(N > 0, "N must be greater than zero");
@@ -41,6 +45,7 @@ private:
 
   struct slot__
   {
+    // Stored payload and allocator free-list linkage.
     T data;
     slot__ *next_free = nullptr;
     bool active = false;
@@ -52,9 +57,14 @@ private:
 
   struct block_layout__
   {
+    // Stable storage for payload slots.
     std::array<slot__, N> slots;
+
+    // Block occupancy and free-list state.
     slot__ *first_free = nullptr;
     size_t active_count = 0;
+
+    // Membership flags for allocator side lists.
     bool listed_available = false;
     bool listed_full = false;
   };
@@ -98,13 +108,15 @@ private:
       --this->active_count;
     }
 
-    void close()
+    void close(Owner_ *owner)
     {
       for (size_t i = N; i > 0; --i)
       {
         slot__ &slot = this->slots[i - 1];
         if (slot.active)
         {
+          if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
+            quickjs::detail::napi_lifetime__<T>::record_release(owner, &slot.data);
           slot.data.release();
           slot.active = false;
         }
@@ -142,11 +154,11 @@ private:
                 "napi_allocator__ block must fit exactly in its alignment region");
 
 public:
-  napi_allocator__() = default;
+  explicit napi_allocator__(Owner_ *owner = nullptr) : owner_(owner) {}
   napi_allocator__(const napi_allocator__ &) = delete;
   napi_allocator__ &operator=(const napi_allocator__ &) = delete;
 
-  napi_allocator__(napi_allocator__ &&other) noexcept
+  napi_allocator__(napi_allocator__ &&other) noexcept : owner_(other.owner_)
   {
     *this = static_cast<napi_allocator__ &&>(other);
   }
@@ -157,6 +169,7 @@ public:
       return *this;
 
     close();
+    owner_ = other.owner_;
     blocks_ = static_cast<std::list<block__> &&>(other.blocks_);
     available_blocks_ = static_cast<std::vector<block__ *> &&>(other.available_blocks_);
     full_blocks_ = static_cast<std::vector<block__ *> &&>(other.full_blocks_);
@@ -166,6 +179,11 @@ public:
   ~napi_allocator__()
   {
     close();
+  }
+
+  void set_owner(Owner_ *owner)
+  {
+    owner_ = owner;
   }
 
   template <typename... Args>
@@ -181,6 +199,8 @@ public:
       return nullptr;
 
     slot->data.initialize(static_cast<Args &&>(args)...);
+    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
+      quickjs::detail::napi_lifetime__<T>::record_create(owner_, &slot->data);
 
     if (block->is_full())
     {
@@ -210,6 +230,8 @@ public:
     slot__ *slot = slot_from_handle(handle);
     if (slot == nullptr || !slot->active)
       return;
+    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
+      quickjs::detail::napi_lifetime__<T>::record_release(owner_, &slot->data);
 
     block__ *block = block_from_slot(slot);
     bool was_full = block != nullptr && block->is_full();
@@ -224,7 +246,7 @@ public:
   void close()
   {
     for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
-      it->close();
+      it->close(owner_);
     blocks_.clear();
     available_blocks_.clear();
     full_blocks_.clear();
@@ -384,9 +406,15 @@ private:
     available_blocks_.push_back(block);
   }
 
+  // Stable slot blocks owned by this allocator.
   std::list<block__> blocks_;
+
+  // Cached block lists used to find reusable slots quickly.
   std::vector<block__ *> available_blocks_;
   std::vector<block__ *> full_blocks_;
+
+  // Owner used by lifetime hooks to attribute slot churn.
+  Owner_ *owner_ = nullptr;
 };
 
 #endif // NAPI_QUICKJS_ALLOCATOR_H_

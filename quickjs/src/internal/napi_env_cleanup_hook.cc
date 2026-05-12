@@ -21,6 +21,11 @@ void napi_env_cleanup_hook__::release()
   arg_ = nullptr;
 }
 
+napi_env napi_env_cleanup_hook__::env() const
+{
+  return env_;
+}
+
 napi_env_cleanup_hook__ *napi_env_cleanup_hook__::create(napi_env env, napi_cleanup_hook hook, void *arg)
 {
   if (env == nullptr || env->context() == nullptr || hook == nullptr)

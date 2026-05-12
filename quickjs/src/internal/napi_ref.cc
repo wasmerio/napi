@@ -22,14 +22,12 @@ napi_ref__::napi_ref__(napi_ref__ &&other) noexcept
     : env_(other.env_),
       value_(other.value_),
       can_be_weak_(other.can_be_weak_),
-      ref_count_(other.ref_count_),
-      active_(other.active_)
+      ref_count_(other.ref_count_)
 {
   other.env_ = nullptr;
   other.value_ = JS_UNDEFINED;
   other.can_be_weak_ = false;
   other.ref_count_ = 0;
-  other.active_ = false;
 }
 
 napi_ref__ &napi_ref__::operator=(napi_ref__ &&other) noexcept
@@ -42,12 +40,10 @@ napi_ref__ &napi_ref__::operator=(napi_ref__ &&other) noexcept
   value_ = other.value_;
   can_be_weak_ = other.can_be_weak_;
   ref_count_ = other.ref_count_;
-  active_ = other.active_;
   other.env_ = nullptr;
   other.value_ = JS_UNDEFINED;
   other.can_be_weak_ = false;
   other.ref_count_ = 0;
-  other.active_ = false;
   return *this;
 }
 
@@ -65,20 +61,18 @@ void napi_ref__::initialize(napi_env env,
   value_ = value;
   can_be_weak_ = JS_VALUE_HAS_REF_COUNT(value);
   ref_count_ = initial_ref_count;
-  active_ = true;
   if (ref_count_ > 0)
     JS_DupValue(env_->context(), value_);
 }
 
 void napi_ref__::release()
 {
-  if (!active_)
+  if (env_ == nullptr)
     return;
 
   napi_env env = env_;
   JSValue value = value_;
   uint32_t ref_count = ref_count_;
-  active_ = false;
   env_ = nullptr;
   value_ = JS_UNDEFINED;
   can_be_weak_ = false;
@@ -90,7 +84,7 @@ void napi_ref__::release()
 
 bool napi_ref__::is_active() const
 {
-  return active_;
+  return env_ != nullptr;
 }
 
 uint32_t napi_ref__::add_ref()
@@ -144,6 +138,11 @@ bool napi_ref__::is_empty() const
 bool napi_ref__::is_weak() const
 {
   return can_be_weak_ && ref_count_ == 0 && !is_empty();
+}
+
+napi_env napi_ref__::env() const
+{
+  return env_;
 }
 
 JSValueConst napi_ref__::get_inner() const

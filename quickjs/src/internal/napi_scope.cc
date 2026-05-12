@@ -1,9 +1,9 @@
 #include "internal/napi_scope.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_lifetime_macros.h"
+#include "internal/napi_lifetime_tracker.h"
 
-napi_scope__::napi_scope__()
+napi_scope__::napi_scope__() : values_(this)
 {
 }
 
@@ -26,15 +26,14 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
   env_ = other.env_;
   level_ = other.level_;
   parent_ = other.parent_;
-  values_ = static_cast<napi_allocator__<napi_value__> &&>(other.values_);
+  values_ = static_cast<napi_allocator__<napi_value__, napi_scope__> &&>(other.values_);
+  values_.set_owner(this);
   closed_ = other.closed_;
-  active_ = other.active_;
   escaped_ = other.escaped_;
   other.env_ = nullptr;
   other.level_ = 0;
   other.parent_ = nullptr;
   other.closed_ = true;
-  other.active_ = false;
   other.escaped_ = false;
   return *this;
 }
@@ -43,9 +42,9 @@ void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
 {
   release();
   env_ = env;
+  values_.set_owner(this);
   parent_ = parent;
   closed_ = false;
-  active_ = true;
   escaped_ = false;
 
   napi_scope__ *parent_scope = this->parent();
@@ -56,7 +55,7 @@ void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
 
 void napi_scope__::release()
 {
-  if (!active_)
+  if (env_ == nullptr)
     return;
 
   close();
@@ -64,12 +63,11 @@ void napi_scope__::release()
   level_ = 0;
   parent_ = nullptr;
   escaped_ = false;
-  active_ = false;
 }
 
 bool napi_scope__::is_active() const
 {
-  return active_;
+  return env_ != nullptr;
 }
 
 size_t napi_scope__::level() const
@@ -94,20 +92,24 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
   return wrapped;
 }
 
 napi_value napi_scope__::escape_value(napi_value value)
 {
+  auto record_escape = [this](napi_value escaped) {
+    quickjs::detail::napi_lifetime_tracker__::record_scope_escape(env_, escaped != nullptr);
+    return escaped;
+  };
+
   if (parent_ == nullptr || value == nullptr)
-    return nullptr;
+    return record_escape(nullptr);
 
   napi_value__ *slot = value_from_handle(value);
   if (slot == nullptr)
-    return nullptr;
+    return record_escape(nullptr);
   napi_scope__ *parent_scope = parent();
-  return parent_scope == nullptr ? nullptr : parent_scope->wrap_value(slot->get_inner(), false);
+  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(slot->get_inner(), false));
 }
 
 void napi_scope__::delete_value(napi_value value)
@@ -118,7 +120,6 @@ void napi_scope__::delete_value(napi_value value)
   if (values_.get(value) != nullptr)
   {
     values_.release(value);
-    NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
   }
 }
 
@@ -138,7 +139,6 @@ void napi_scope__::close()
 
   values_.close();
   closed_ = true;
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
 }
 
 size_t napi_scope__::value_slot_count() const

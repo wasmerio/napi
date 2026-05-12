@@ -24,9 +24,12 @@ struct napi_callback_info__
   void *data() const;
 
 private:
+  // Callback invocation context.
   napi_env env_;
   JSValueConst this_val_;
   JSValue new_target_;
+
+  // Callback arguments and addon data.
   int argc_;
   JSValueConst *argv_;
   void *data_;

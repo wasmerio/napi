@@ -4,13 +4,9 @@
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
 #include "internal/napi_lifetime_tracker.h"
 
-#define NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env) \
-  quickjs::detail::napi_lifetime_tracker__::maybe_dump(env)
-
 #define NAPI_QUICKJS_LIFETIME_DUMP(env, reason) \
   quickjs::detail::napi_lifetime_tracker__::dump(env, reason)
 #else
-#define NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env) ((void)0)
 #define NAPI_QUICKJS_LIFETIME_DUMP(env, reason) ((void)0)
 #endif
 

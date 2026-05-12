@@ -53,13 +53,20 @@ private:
   void call_hook(JSValueConst hook, int argc, JSValueConst *argv);
   void clear_pending_exception_if_any();
 
+  // Owning environment and QuickJS context.
   napi_env env_ = nullptr;
   JSContext *context_ = nullptr;
+
+  // Promise reject callback and lifecycle hooks.
   JSValue promise_reject_callback_;
   std::array<JSValue, 4> promise_hooks_;
+
+  // Continuation and async context tracking.
   JSValue continuation_preserved_embedder_data_;
   std::unordered_map<void *, JSValue> promise_context_frames_;
   std::vector<JSValue> promise_context_frame_stack_;
+
+  // Subsystem lifecycle.
   bool torn_down_ = false;
 };
 

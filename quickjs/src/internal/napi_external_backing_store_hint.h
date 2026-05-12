@@ -35,12 +35,17 @@ struct napi_external_backing_store_hint__
   void set_weak_target(JSValue weak_target);
 
 private:
+  // Owning runtime state.
   napi_env env_ = nullptr;
   JSRuntime *rt_ = nullptr;
+
+  // Embedder backing store and finalizer.
   void *external_data_ = nullptr;
   node_api_basic_finalize finalize_cb_ = nullptr;
   void *finalize_hint_ = nullptr;
   bool finalize_invoked_ = false;
+
+  // Detach/finalizer coordination.
   bool detaching_ = false;
   JSValue weak_target_ = JS_UNDEFINED;
 };

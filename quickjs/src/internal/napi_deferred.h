@@ -15,14 +15,15 @@ struct napi_deferred__
 
   void initialize(napi_env env, JSValue resolve, JSValue reject);
   void release();
+  napi_env env() const;
   JSValue call_resolve(napi_value resolution);
   JSValue call_reject(napi_value rejection);
 
 private:
+  // Owning environment and stored promise callbacks.
   napi_env env_ = nullptr;
   JSValue resolve_ = JS_UNDEFINED;
   JSValue reject_ = JS_UNDEFINED;
-  bool active_ = false;
 };
 
 #endif // NAPI_QUICKJS_DEFERRED_H_

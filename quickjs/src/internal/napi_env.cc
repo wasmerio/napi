@@ -8,8 +8,13 @@
 
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
     : context_(context),
-      last_exception_(JS_UNDEFINED),
       module_api_version_(module_api_version),
+      last_exception_(JS_UNDEFINED),
+      scopes_(this),
+      refs_(this),
+      cleanup_hooks_(this),
+      deferreds_(this),
+      external_backing_store_hints_(this),
       promises_(this, context),
       contextify_(this, context),
       module_wrap_(this, context)
@@ -104,19 +109,17 @@ napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
   if (context_ == nullptr)
     return nullptr;
   auto *handle = scopes_.allocate(this, parent);
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
   return reinterpret_cast<napi_handle_scope>(handle);
 }
 
 void napi_env__::destroy_scope(napi_handle_scope scope)
 {
   scopes_.release(reinterpret_cast<napi_scope__ *>(scope));
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope) const
 {
-  return const_cast<napi_allocator__<napi_scope__> &>(scopes_).get(
+  return const_cast<napi_allocator__<napi_scope__, napi_env__> &>(scopes_).get(
       reinterpret_cast<napi_scope__ *>(scope));
 }
 
@@ -145,14 +148,12 @@ napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial
     return nullptr;
 
   napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
   return wrapped;
 }
 
 void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 {
   refs_.release(ref);
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
 }
 
 napi_ref__ *napi_env__::ref_from_root_scope(napi_ref ref)

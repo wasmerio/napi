@@ -5,20 +5,32 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
-option(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+macro(xoption OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
+  option(${OPTION_NAME} ${OPTION_TEXT} ${OPTION_DEFAULT})
+  if(DEFINED ENV{${OPTION_NAME}})
+    # Allow setting the option through an environment variable.
+    set(${OPTION_NAME} $ENV{${OPTION_NAME}})
+  endif()
+  if(${OPTION_NAME})
+    add_definitions(-D${OPTION_NAME})
+  endif()
+  message(STATUS "  ${OPTION_NAME}: ${${OPTION_NAME}}")
+endmacro()
+
+xoption(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
+xoption(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
   "Enable QuickJS N-API lifetime tracking diagnostics"
   OFF
 )
-option(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
+xoption(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
   "Print QuickJS N-API value/ref allocator stats every 10 seconds"
   OFF
 )
-option(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+xoption(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
   "Print QuickJS N-API active value/ref JSValue tag stats with periodic stats"
   OFF
 )
-option(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+xoption(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
   "Print active QuickJS N-API string and symbol values with periodic stats"
   OFF
 )

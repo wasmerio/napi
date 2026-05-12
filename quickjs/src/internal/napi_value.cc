@@ -5,12 +5,10 @@
 
 napi_value__::napi_value__(napi_value__ &&other) noexcept
     : env_(other.env_),
-      value_(other.value_),
-      active_(other.active_)
+      value_(other.value_)
 {
   other.env_ = nullptr;
   other.value_ = JS_UNDEFINED;
-  other.active_ = false;
 }
 
 napi_value__ &napi_value__::operator=(napi_value__ &&other) noexcept
@@ -21,10 +19,8 @@ napi_value__ &napi_value__::operator=(napi_value__ &&other) noexcept
   release();
   env_ = other.env_;
   value_ = other.value_;
-  active_ = other.active_;
   other.env_ = nullptr;
   other.value_ = JS_UNDEFINED;
-  other.active_ = false;
   return *this;
 }
 
@@ -38,17 +34,15 @@ void napi_value__::initialize(napi_env env, JSValue value, bool owned)
   release();
   env_ = env;
   value_ = owned ? value : JS_DupValue(env->context(), value);
-  active_ = true;
 }
 
 void napi_value__::release()
 {
-  if (!active_)
+  if (env_ == nullptr)
     return;
 
   napi_env env = env_;
   JSValue value = value_;
-  active_ = false;
   env_ = nullptr;
   value_ = JS_UNDEFINED;
 
@@ -58,7 +52,12 @@ void napi_value__::release()
 
 bool napi_value__::is_active() const
 {
-  return active_;
+  return env_ != nullptr;
+}
+
+napi_env napi_value__::env() const
+{
+  return env_;
 }
 
 JSValueConst napi_value__::get_inner() const

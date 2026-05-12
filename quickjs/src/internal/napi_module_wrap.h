@@ -117,13 +117,20 @@ private:
                                      JSModuleImportPhaseEnum phase,
                                      void *opaque);
 
+  // Owning environment and QuickJS context.
   napi_env env_;
   JSContext *ctx_;
+
+  // Host module callbacks.
   JSValue import_module_dynamically_callback_;
   JSValue initialize_import_meta_callback_;
+
+  // Module records and referrer metadata.
   std::vector<record *> records_;
   std::vector<script_referrer> script_referrers_;
   uint64_t facade_counter_ = 0;
+
+  // Subsystem lifecycle.
   bool torn_down_ = false;
 };
 

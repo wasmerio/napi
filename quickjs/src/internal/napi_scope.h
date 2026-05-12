@@ -48,12 +48,16 @@ struct napi_scope__
   napi_scope__ &operator=(const napi_scope__ &) = delete;
 
 private:
+  // Scope hierarchy.
   napi_env env_ = nullptr;
   size_t level_ = 0;
   napi_handle_scope parent_ = nullptr;
-  napi_allocator__<napi_value__> values_;
+
+  // Local value storage.
+  napi_allocator__<napi_value__, napi_scope__> values_;
+
+  // Scope lifecycle flags.
   bool closed_ = false;
-  bool active_ = false;
   bool escaped_ = false;
 };
 

@@ -14,12 +14,11 @@ void napi_deferred__::initialize(napi_env env, JSValue resolve, JSValue reject)
   env_ = env;
   resolve_ = resolve;
   reject_ = reject;
-  active_ = true;
 }
 
 void napi_deferred__::release()
 {
-  if (!active_)
+  if (env_ == nullptr)
     return;
 
   napi_env env = env_;
@@ -28,13 +27,17 @@ void napi_deferred__::release()
   env_ = nullptr;
   resolve_ = JS_UNDEFINED;
   reject_ = JS_UNDEFINED;
-  active_ = false;
 
   if (env != nullptr && env->context() != nullptr)
   {
     JS_FreeValue(env->context(), resolve);
     JS_FreeValue(env->context(), reject);
   }
+}
+
+napi_env napi_deferred__::env() const
+{
+  return env_;
 }
 
 napi_deferred__ *napi_deferred__::create(napi_env env, JSValue resolve, JSValue reject)

@@ -110,42 +110,56 @@ struct napi_env__
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
 private:
+  // QuickJS context and API version.
   JSContext *context_;
+  int32_t module_api_version_ = 8;
+
+  // Last native/JS error state.
   napi_extended_error_info last_error_{};
   std::string last_error_message_;
   JSValue last_exception_;
   bool has_last_exception_ = false;
-  int32_t module_api_version_ = 8;
+
+  // Instance data finalizer.
   void *instance_data_ = nullptr;
   napi_finalize instance_data_finalize_cb_ = nullptr;
   void *instance_data_finalize_hint_ = nullptr;
+
+  // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
-  
+
   // Weak refs grouped by referenced QuickJS object identity.
   std::unordered_multimap<void *, napi_ref> weak_refs_;
 
   // External ArrayBuffer hints grouped by QuickJS object identity.
   std::unordered_multimap<void *, napi_external_backing_store_hint__ *> external_array_buffer_hints_;
 
-  // Scopes
+  // Scope stack.
   napi_handle_scope root_scope_ = nullptr;
   napi_handle_scope current_scope_ = nullptr;
 
-  // Allocators
-  napi_allocator__<napi_scope__> scopes_;
-  napi_allocator__<napi_ref__> refs_;
-  napi_allocator__<napi_env_cleanup_hook__> cleanup_hooks_;
-  napi_allocator__<napi_deferred__> deferreds_;
-  napi_allocator__<napi_external_backing_store_hint__> external_backing_store_hints_;
+  // Env-owned slot allocators.
+  napi_allocator__<napi_scope__, napi_env__> scopes_;
+  napi_allocator__<napi_ref__, napi_env__> refs_;
+  napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
+  napi_allocator__<napi_deferred__, napi_env__> deferreds_;
+  napi_allocator__<napi_external_backing_store_hint__, napi_env__> external_backing_store_hints_;
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+  // Periodic lifetime dump scheduling.
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;
 #endif
+
+  // External memory accounting.
   int64_t external_memory_ = 0;
+
+  // Env-owned subsystems.
   napi_promises__ promises_;
   quickjs::detail::napi_contextify__ contextify_;
   quickjs::detail::napi_module_wrap__ module_wrap_;
+
+  // Env teardown state.
   bool torn_down_ = false;
 };
 

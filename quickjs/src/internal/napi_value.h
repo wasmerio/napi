@@ -18,12 +18,13 @@ struct napi_value__
   void initialize(napi_env env, JSValue value, bool owned);
   void release();
   bool is_active() const;
+  napi_env env() const;
   JSValueConst get_inner() const;
 
 private:
-  napi_env env_;
+  // Owning environment and wrapped QuickJS value.
+  napi_env env_ = nullptr;
   JSValue value_ = JS_UNDEFINED;
-  bool active_ = false;
 };
 
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value);

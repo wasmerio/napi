@@ -27,16 +27,19 @@ struct napi_ref__
   bool can_be_weak() const;
   bool is_empty() const;
   bool is_weak() const;
+  napi_env env() const;
   JSValueConst get_inner() const;
   JSValue dup_inner() const;
   void clear_if_matches(JSValueConst value);
 
 private:
-  napi_env env_;
+  // Owning environment and referenced QuickJS value.
+  napi_env env_ = nullptr;
   JSValue value_ = JS_UNDEFINED;
+
+  // Reference strength.
   bool can_be_weak_ = false;
   uint32_t ref_count_ = 0;
-  bool active_ = false;
 };
 
 napi_ref__ *napi_quickjs_ref_slot(napi_env env, napi_ref ref);
