@@ -2698,8 +2698,6 @@ extern "C"
       return napi_invalid_arg;
 
     env->remove_weak_ref(ref);
-    if (env->root_scope() == nullptr)
-      return napi_ok;
     env->delete_ref_from_root_scope(ref);
     return napi_ok;
   }

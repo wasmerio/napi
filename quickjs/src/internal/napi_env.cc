@@ -45,6 +45,7 @@ void napi_env__::prepare_teardown()
   deferreds_.close();
 
   clear_last_exception();
+  refs_.close();
 
   napi_scope__ *root_scope = scope_from_handle(root_scope_);
   if (root_scope != nullptr)
@@ -140,21 +141,33 @@ napi_value__ *napi_env__::value_from_current_scope(napi_value value)
 
 napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
 {
-  napi_scope__ *scope = scope_from_handle(root_scope_);
-  return scope == nullptr ? nullptr : scope->wrap_ref(value, initial_ref_count);
+  if (context_ == nullptr)
+    return nullptr;
+
+  napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
+  return wrapped;
 }
 
 void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 {
-  napi_scope__ *scope = scope_from_handle(root_scope_);
-  if (scope != nullptr)
-    scope->delete_ref(ref);
+  refs_.release(ref);
+  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(this);
 }
 
 napi_ref__ *napi_env__::ref_from_root_scope(napi_ref ref)
 {
-  napi_scope__ *scope = scope_from_handle(root_scope_);
-  return scope == nullptr ? nullptr : scope->ref_from_handle(ref);
+  return refs_.get(ref);
+}
+
+size_t napi_env__::ref_storage_slot_count() const
+{
+  return refs_.storage_slot_count();
+}
+
+size_t napi_env__::active_ref_count() const
+{
+  return refs_.active_count();
 }
 
 bool napi_env__::is_current_scope(napi_handle_scope scope) const
@@ -358,15 +371,48 @@ void napi_env__::track_weak_ref(napi_ref ref)
   if (slot == nullptr || !slot->is_weak())
     return;
 
-  if (std::find(weak_refs_.begin(), weak_refs_.end(), ref) == weak_refs_.end())
-    weak_refs_.push_back(ref);
+  JSValueConst value = slot->get_inner();
+  if (!JS_VALUE_HAS_REF_COUNT(value))
+    return;
+
+  void *identity = JS_VALUE_GET_PTR(value);
+  auto range = weak_refs_.equal_range(identity);
+  for (auto it = range.first; it != range.second; ++it)
+  {
+    if (it->second == ref)
+      return;
+  }
+  weak_refs_.emplace(identity, ref);
 }
 
 void napi_env__::remove_weak_ref(napi_ref ref)
 {
-  auto it = std::find(weak_refs_.begin(), weak_refs_.end(), ref);
-  if (it != weak_refs_.end())
-    weak_refs_.erase(it);
+  napi_ref__ *slot = napi_quickjs_ref_slot(this, ref);
+  if (slot != nullptr)
+  {
+    JSValueConst value = slot->get_inner();
+    if (JS_VALUE_HAS_REF_COUNT(value))
+    {
+      void *identity = JS_VALUE_GET_PTR(value);
+      auto range = weak_refs_.equal_range(identity);
+      for (auto it = range.first; it != range.second;)
+      {
+        if (it->second == ref)
+          it = weak_refs_.erase(it);
+        else
+          ++it;
+      }
+      return;
+    }
+  }
+
+  for (auto it = weak_refs_.begin(); it != weak_refs_.end();)
+  {
+    if (it->second == ref)
+      it = weak_refs_.erase(it);
+    else
+      ++it;
+  }
 }
 
 void napi_env__::clear_weak_refs_for_value(JSValueConst value)
@@ -374,8 +420,11 @@ void napi_env__::clear_weak_refs_for_value(JSValueConst value)
   if (!JS_VALUE_HAS_REF_COUNT(value))
     return;
 
-  for (auto *ref : weak_refs_)
+  void *identity = JS_VALUE_GET_PTR(value);
+  auto range = weak_refs_.equal_range(identity);
+  for (auto it = range.first; it != range.second; ++it)
   {
+    napi_ref ref = it->second;
     napi_ref__ *slot = napi_quickjs_ref_slot(this, ref);
     if (slot != nullptr)
       slot->clear_if_matches(value);
@@ -388,29 +437,27 @@ void napi_env__::track_external_array_buffer_hint(
 {
   if (hint == nullptr)
     return;
-  external_array_buffer_hints_.push_back({JS_VALUE_GET_PTR(arraybuffer), hint});
+  external_array_buffer_hints_.emplace(JS_VALUE_GET_PTR(arraybuffer), hint);
 }
 
 napi_external_backing_store_hint__ *napi_env__::external_array_buffer_hint(JSValueConst arraybuffer) const
 {
   void *identity = JS_VALUE_GET_PTR(arraybuffer);
-  for (auto it = external_array_buffer_hints_.rbegin();
-       it != external_array_buffer_hints_.rend();
-       ++it)
-  {
-    if (it->first == identity)
-      return it->second;
-  }
+  auto range = external_array_buffer_hints_.equal_range(identity);
+  if (range.first != range.second)
+    return range.first->second;
   return nullptr;
 }
 
 void napi_env__::untrack_external_array_buffer_hint(napi_external_backing_store_hint__ *hint)
 {
-  external_array_buffer_hints_.erase(
-      std::remove_if(external_array_buffer_hints_.begin(),
-                     external_array_buffer_hints_.end(),
-                     [hint](const auto &entry) { return entry.second == hint; }),
-      external_array_buffer_hints_.end());
+  for (auto it = external_array_buffer_hints_.begin(); it != external_array_buffer_hints_.end();)
+  {
+    if (it->second == hint)
+      it = external_array_buffer_hints_.erase(it);
+    else
+      ++it;
+  }
 }
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)

@@ -371,6 +371,13 @@ namespace quickjs::detail
       size_t scope_slots_total = 0;
       size_t active_scopes = 0;
       std::vector<scope_scan> scopes;
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+      tag_counters ref_tags;
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+      std::vector<string_symbol_entry> ref_strings_symbols;
+      std::vector<object_type_entry> ref_object_types;
+#endif
     };
 
     void scan_scope(napi_env env, const napi_scope__ &scope, env_scan &scan)
@@ -379,13 +386,9 @@ namespace quickjs::detail
       scope_result.scope_level = scope.level();
       scope_result.value_slots_total = scope.value_storage_slot_count();
       scope_result.active_values = scope.active_value_count();
-      scope_result.ref_slots_total = scope.ref_storage_slot_count();
-      scope_result.active_refs = scope.active_ref_count();
 
       scan.value_slots_total += scope_result.value_slots_total;
       scan.active_values += scope_result.active_values;
-      scan.ref_slots_total += scope_result.ref_slots_total;
-      scan.active_refs += scope_result.active_refs;
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS) || \
     defined(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP)
@@ -399,20 +402,29 @@ namespace quickjs::detail
         capture_object_type_value(env, slot.get_inner(), tag, scope_result.value_object_types);
 #endif
       });
-
-      scope.for_each_active_ref([&](const napi_ref__ &slot) {
-        int tag = JS_VALUE_GET_NORM_TAG(slot.get_inner());
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-        count_tag(scope_result.ref_tags, tag);
-#endif
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-        capture_string_symbol_value(env, slot.get_inner(), tag, scope_result.ref_strings_symbols);
-        capture_object_type_value(env, slot.get_inner(), tag, scope_result.ref_object_types);
-#endif
-      });
 #endif
 
       scan.scopes.push_back(std::move(scope_result));
+    }
+
+    void scan_refs(napi_env env, env_scan &scan)
+    {
+      scan.ref_slots_total = env->ref_storage_slot_count();
+      scan.active_refs = env->active_ref_count();
+
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS) || \
+    defined(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP)
+      env->for_each_active_ref([&](const napi_ref__ &slot) {
+        int tag = JS_VALUE_GET_NORM_TAG(slot.get_inner());
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+        count_tag(scan.ref_tags, tag);
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+        capture_string_symbol_value(env, slot.get_inner(), tag, scan.ref_strings_symbols);
+        capture_object_type_value(env, slot.get_inner(), tag, scan.ref_object_types);
+#endif
+      });
+#endif
     }
 
     env_scan scan_env(napi_env env)
@@ -426,6 +438,7 @@ namespace quickjs::detail
       env->for_each_active_scope([&](const napi_scope__ &scope) {
         scan_scope(env, scope, scan);
       });
+      scan_refs(env, scan);
       return scan;
     }
 
@@ -524,24 +537,30 @@ namespace quickjs::detail
       {
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
         dump_tag_line(scope.scope_level, "napi_value", scope.value_tags);
-        dump_tag_line(scope.scope_level, "napi_ref", scope.ref_tags);
 #endif
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
         if (include_string_symbol_values)
         {
           dump_string_symbol_entries(
               scope.scope_level, "napi_value", scope.value_strings_symbols);
-          dump_string_symbol_entries(
-              scope.scope_level, "napi_ref", scope.ref_strings_symbols);
           dump_object_type_entries(
               scope.scope_level, "napi_value", scope.value_object_types);
-          dump_object_type_entries(
-              scope.scope_level, "napi_ref", scope.ref_object_types);
         }
 #else
         (void)include_string_symbol_values;
 #endif
       }
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
+      dump_tag_line(0, "napi_ref", scan.ref_tags);
+#endif
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+      if (include_string_symbol_values)
+      {
+        dump_string_symbol_entries(0, "napi_ref", scan.ref_strings_symbols);
+        dump_object_type_entries(0, "napi_ref", scan.ref_object_types);
+      }
+#endif
     }
 
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS

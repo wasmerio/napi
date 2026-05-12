@@ -4,13 +4,28 @@
 #include "napi_lifetime_macros.h"
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <list>
 #include <utility>
 #include <vector>
 
-template <typename T, size_t N = 256>
+template <typename T>
+concept napi_allocator_payload__ =
+    std::default_initializable<T> &&
+    requires(T value) {
+      { value.release() } -> std::same_as<void>;
+    };
+
+template <typename T, typename... Args>
+concept napi_allocator_initializable_payload__ =
+    napi_allocator_payload__<T> &&
+    requires(T value, Args &&...args) {
+      { value.initialize(static_cast<Args &&>(args)...) } -> std::same_as<void>;
+    };
+
+template <napi_allocator_payload__ T, size_t N = 256>
 class napi_allocator__
 {
   static_assert(N > 0, "N must be greater than zero");
@@ -154,6 +169,7 @@ public:
   }
 
   template <typename... Args>
+    requires napi_allocator_initializable_payload__<T, Args...>
   T *allocate(Args &&...args)
   {
     block__ *block = first_available_block();

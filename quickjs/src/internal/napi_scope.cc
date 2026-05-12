@@ -27,7 +27,6 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
   level_ = other.level_;
   parent_ = other.parent_;
   values_ = static_cast<napi_allocator__<napi_value__> &&>(other.values_);
-  refs_ = static_cast<napi_allocator__<napi_ref__> &&>(other.refs_);
   closed_ = other.closed_;
   active_ = other.active_;
   escaped_ = other.escaped_;
@@ -132,32 +131,11 @@ napi_value__ *napi_scope__::value_from_handle(napi_value value)
   return parent_scope == nullptr ? nullptr : parent_scope->value_from_handle(value);
 }
 
-napi_ref napi_scope__::wrap_ref(JSValueConst value, uint32_t initial_ref_count)
-{
-  if (closed_ || env_ == nullptr || env_->context() == nullptr)
-    return nullptr;
-  napi_ref wrapped = refs_.allocate(env_, value, initial_ref_count);
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
-  return wrapped;
-}
-
-void napi_scope__::delete_ref(napi_ref ref)
-{
-  refs_.release(ref);
-  NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
-}
-
-napi_ref__ *napi_scope__::ref_from_handle(napi_ref ref)
-{
-  return refs_.get(ref);
-}
-
 void napi_scope__::close()
 {
   if (closed_)
     return;
 
-  refs_.close();
   values_.close();
   closed_ = true;
   NAPI_QUICKJS_LIFETIME_MAYBE_DUMP(env_);
@@ -176,16 +154,6 @@ size_t napi_scope__::value_storage_slot_count() const
 size_t napi_scope__::active_value_count() const
 {
   return values_.active_count();
-}
-
-size_t napi_scope__::ref_storage_slot_count() const
-{
-  return refs_.storage_slot_count();
-}
-
-size_t napi_scope__::active_ref_count() const
-{
-  return refs_.active_count();
 }
 
 napi_handle_scope napi_scope__::parent_handle() const

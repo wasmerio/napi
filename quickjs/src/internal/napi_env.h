@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <quickjs.h>
@@ -44,6 +45,8 @@ struct napi_env__
   napi_ref wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count);
   void delete_ref_from_root_scope(napi_ref ref);
   napi_ref__ *ref_from_root_scope(napi_ref ref);
+  size_t ref_storage_slot_count() const;
+  size_t active_ref_count() const;
   bool is_current_scope(napi_handle_scope scope) const;
   void set_current_scope(napi_handle_scope scope);
   size_t scope_storage_slot_count() const;
@@ -53,6 +56,12 @@ struct napi_env__
   void for_each_active_scope(Fn fn) const
   {
     scopes_.for_each_active(fn);
+  }
+
+  template <typename Fn>
+  void for_each_active_ref(Fn fn) const
+  {
+    refs_.for_each_active(fn);
   }
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -111,14 +120,24 @@ private:
   napi_finalize instance_data_finalize_cb_ = nullptr;
   void *instance_data_finalize_hint_ = nullptr;
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
-  std::vector<napi_ref> weak_refs_;
-  std::vector<std::pair<void *, napi_external_backing_store_hint__ *>> external_array_buffer_hints_;
+  
+  // Weak refs grouped by referenced QuickJS object identity.
+  std::unordered_multimap<void *, napi_ref> weak_refs_;
+
+  // External ArrayBuffer hints grouped by QuickJS object identity.
+  std::unordered_multimap<void *, napi_external_backing_store_hint__ *> external_array_buffer_hints_;
+
+  // Scopes
   napi_handle_scope root_scope_ = nullptr;
   napi_handle_scope current_scope_ = nullptr;
+
+  // Allocators
   napi_allocator__<napi_scope__> scopes_;
+  napi_allocator__<napi_ref__> refs_;
   napi_allocator__<napi_env_cleanup_hook__> cleanup_hooks_;
   napi_allocator__<napi_deferred__> deferreds_;
   napi_allocator__<napi_external_backing_store_hint__> external_backing_store_hints_;
+
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;
