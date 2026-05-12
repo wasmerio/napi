@@ -295,22 +295,6 @@ bool js_value_to_escaped_string(JSContext *ctx, JSValueConst value, std::string 
   return true;
 }
 
-bool symbol_to_escaped_string(JSContext *ctx, JSValueConst value, std::string &out)
-{
-  size_t text_length = 0;
-  JSAtom atom = static_cast<JSAtom>(JS_VALUE_GET_INT(value));
-  const char *text = JS_AtomToCStringLen(ctx, &text_length, atom);
-  if (text == nullptr)
-  {
-    clear_exception(ctx);
-    return false;
-  }
-
-  out = escaped_value_fragment(text, text_length);
-  JS_FreeCString(ctx, text);
-  return true;
-}
-
 std::string class_name_fallback(JSContext *ctx, JSValueConst value)
 {
   JSRuntime *rt = JS_GetRuntime(ctx);
@@ -529,11 +513,6 @@ value_snapshot capture_value_snapshot(napi_env env, JSValueConst value)
     {
       snapshot.has_string_symbol = true;
     }
-    else if (snapshot.tag == JS_TAG_SYMBOL &&
-             symbol_to_escaped_string(ctx, value, snapshot.string_symbol_value))
-    {
-      snapshot.has_string_symbol = true;
-    }
 
     if (snapshot.tag == JS_TAG_OBJECT)
     {
@@ -627,6 +606,7 @@ struct env_slot_scan
   size_t active_refs = 0;
   size_t scope_slots_total = 0;
   size_t active_scopes = 0;
+  std::vector<std::pair<size_t, size_t>> active_values_by_scope_level;
 };
 
 env_slot_scan scan_env_slots(napi_env env)
@@ -639,10 +619,21 @@ env_slot_scan scan_env_slots(napi_env env)
   scan.active_scopes = env->active_scope_count();
   scan.ref_slots_total = env->ref_storage_slot_count();
   scan.active_refs = env->active_ref_count();
+  std::unordered_map<size_t, size_t> active_values_by_scope_level;
   env->for_each_active_scope([&](const napi_scope__ &scope) {
+    size_t active_values = scope.active_value_count();
     scan.value_slots_total += scope.value_storage_slot_count();
-    scan.active_values += scope.active_value_count();
+    scan.active_values += active_values;
+    active_values_by_scope_level[scope.level()] += active_values;
   });
+  scan.active_values_by_scope_level.reserve(active_values_by_scope_level.size());
+  for (const auto &[level, count] : active_values_by_scope_level)
+    scan.active_values_by_scope_level.push_back({level, count});
+  std::sort(scan.active_values_by_scope_level.begin(),
+            scan.active_values_by_scope_level.end(),
+            [](const auto &left, const auto &right) {
+              return left.first < right.first;
+            });
   return scan;
 }
 
@@ -693,64 +684,80 @@ void dump_tag_table(const char *label, const tag_counters &counters)
 }
 #endif
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-void dump_string_symbol_entries(const char *label,
-                                const std::vector<string_symbol_entry> &entries)
+void dump_scope_level_table(const env_slot_scan &scan)
 {
-  size_t singular_count = 0;
-  std::vector<string_symbol_entry> sorted = entries;
-  std::sort(sorted.begin(), sorted.end(), [](const auto &left, const auto &right) {
-    if (left.count != right.count)
-      return left.count > right.count;
-    if (left.tag != right.tag)
-      return left.tag < right.tag;
-    return left.value < right.value;
-  });
+  if (scan.active_values_by_scope_level.empty())
+    return;
 
-  std::fprintf(stderr, "[napi-lifetime-values] owner=%s kind=string-symbol\n", label);
-  std::fprintf(stderr, "  %-14s %10s %10s %10s  %s\n", "tag", "x[i-1]", "speed", "accel", "value");
-  for (const auto &entry : sorted)
+  std::fprintf(stderr, "[napi-lifetime-scopes]\n");
+  std::fprintf(stderr, "  %-16s %10s %10s %10s\n", "level", "x[i-1]", "speed", "accel");
+  for (const auto &[level, count] : scan.active_values_by_scope_level)
   {
-    if (entry.count < 2)
-    {
-      ++singular_count;
-      continue;
-    }
-
-    const char *tag_name = tag_bucket_name(tag_bucket_index(entry.tag));
-    counter_trend trend =
-        observe_counter(std::string("value.") + label + "." + tag_name + "." + entry.value, entry.count);
+    counter_trend trend = observe_counter(std::string("scope.level.") + std::to_string(level), count);
     char current[32];
     char speed[32];
     char acceleration[32];
     format_center_value(current, sizeof(current), trend);
     format_delta_value(speed, sizeof(speed), trend, false);
     format_delta_value(acceleration, sizeof(acceleration), trend, true);
-    std::fprintf(stderr,
-                 "  %-14s %10s %10s %10s  \"%s\"\n",
-                 tag_name,
-                 current,
-                 speed,
-                 acceleration,
-                 entry.value.c_str());
+    std::fprintf(stderr, "  %-16zu %10s %10s %10s\n", level, current, speed, acceleration);
   }
-  if (singular_count != 0)
-    dump_metric_row("count < 2", singular_count, std::string("value.") + label + ".count_lt_2");
 }
 
-void dump_object_type_entries(const char *label,
-                              const std::vector<object_type_entry> &entries)
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
+struct named_count
+{
+  std::string name;
+  size_t count = 0;
+};
+
+struct named_dual_count
+{
+  std::string name;
+  size_t values = 0;
+  size_t refs = 0;
+};
+
+void format_trend_columns(const counter_trend &trend,
+                          char *current,
+                          size_t current_size,
+                          char *speed,
+                          size_t speed_size,
+                          char *acceleration,
+                          size_t acceleration_size)
+{
+  format_center_value(current, current_size, trend);
+  format_delta_value(speed, speed_size, trend, false);
+  format_delta_value(acceleration, acceleration_size, trend, true);
+}
+
+void dump_string_entries(const std::vector<string_symbol_entry> &entries)
 {
   size_t singular_count = 0;
-  std::vector<object_type_entry> sorted = entries;
+  std::unordered_map<std::string, size_t> counts;
+  for (const auto &entry : entries)
+  {
+    if (entry.tag != JS_TAG_STRING && entry.tag != JS_TAG_STRING_ROPE)
+      continue;
+    counts[entry.value] += entry.count;
+  }
+
+  std::vector<named_count> sorted;
+  sorted.reserve(counts.size());
+  for (const auto &[value, count] : counts)
+    sorted.push_back({value, count});
+
   std::sort(sorted.begin(), sorted.end(), [](const auto &left, const auto &right) {
     if (left.count != right.count)
       return left.count > right.count;
-    return left.prototype_name < right.prototype_name;
+    return left.name < right.name;
   });
 
-  std::fprintf(stderr, "[napi-lifetime-objects] owner=%s\n", label);
-  std::fprintf(stderr, "  %-10s %10s %10s  %s\n", "x[i-1]", "speed", "accel", "prototype");
+  if (sorted.empty())
+    return;
+
+  std::fprintf(stderr, "[napi-lifetime-strings]\n");
+  std::fprintf(stderr, "  %-36s %10s %10s %10s\n", "string", "x[i-1]", "speed", "accel");
   for (const auto &entry : sorted)
   {
     if (entry.count < 2)
@@ -760,22 +767,189 @@ void dump_object_type_entries(const char *label,
     }
 
     counter_trend trend =
-        observe_counter(std::string("object.") + label + "." + entry.prototype_name, entry.count);
+        observe_counter(std::string("string.napi_value.") + entry.name, entry.count);
     char current[32];
     char speed[32];
     char acceleration[32];
-    format_center_value(current, sizeof(current), trend);
-    format_delta_value(speed, sizeof(speed), trend, false);
-    format_delta_value(acceleration, sizeof(acceleration), trend, true);
+    format_trend_columns(trend,
+                         current,
+                         sizeof(current),
+                         speed,
+                         sizeof(speed),
+                         acceleration,
+                         sizeof(acceleration));
     std::fprintf(stderr,
-                 "  %10s %10s %10s  %s\n",
+                 "  %-36s %10s %10s %10s\n",
+                 entry.name.c_str(),
                  current,
                  speed,
-                 acceleration,
-                 entry.prototype_name.c_str());
+                 acceleration);
   }
   if (singular_count != 0)
-    dump_metric_row("count < 2", singular_count, std::string("object.") + label + ".count_lt_2");
+    dump_metric_row("count == 1", singular_count, "string.napi_value.count_eq_1");
+}
+
+std::unordered_map<std::string, size_t> object_type_counts(
+    const std::vector<object_type_entry> &entries)
+{
+  std::unordered_map<std::string, size_t> counts;
+  for (const auto &entry : entries)
+    counts[entry.prototype_name] += entry.count;
+  return counts;
+}
+
+void dump_object_type_entries(const std::vector<object_type_entry> &value_entries,
+                              const std::vector<object_type_entry> &ref_entries)
+{
+  size_t singular_value_count = 0;
+  size_t singular_ref_count = 0;
+  std::unordered_map<std::string, size_t> values = object_type_counts(value_entries);
+  std::unordered_map<std::string, size_t> refs = object_type_counts(ref_entries);
+  std::unordered_map<std::string, named_dual_count> combined;
+
+  for (const auto &[name, count] : values)
+  {
+    combined[name].name = name;
+    combined[name].values = count;
+  }
+  for (const auto &[name, count] : refs)
+  {
+    combined[name].name = name;
+    combined[name].refs = count;
+  }
+
+  std::vector<named_dual_count> sorted;
+  sorted.reserve(combined.size());
+  for (const auto &[_, count] : combined)
+    sorted.push_back(count);
+
+  std::sort(sorted.begin(), sorted.end(), [](const auto &left, const auto &right) {
+    size_t left_total = left.values + left.refs;
+    size_t right_total = right.values + right.refs;
+    if (left_total != right_total)
+      return left_total > right_total;
+    if (left.values != right.values)
+      return left.values > right.values;
+    if (left.refs != right.refs)
+      return left.refs > right.refs;
+    return left.name < right.name;
+  });
+
+  if (sorted.empty())
+    return;
+
+  std::fprintf(stderr, "[napi-lifetime-objects]\n");
+  std::fprintf(stderr,
+               "  %-28s  %10s %10s %10s  %10s %10s %10s\n",
+               "type",
+               "values:x",
+               "speed",
+               "accel",
+               "refs:x",
+               "speed",
+               "accel");
+  for (const auto &entry : sorted)
+  {
+    bool has_printable_values = entry.values >= 2;
+    bool has_printable_refs = entry.refs >= 2;
+    if (!has_printable_values && entry.values != 0)
+      ++singular_value_count;
+    if (!has_printable_refs && entry.refs != 0)
+      ++singular_ref_count;
+    if (!has_printable_values && !has_printable_refs)
+      continue;
+
+    counter_trend value_trend =
+        observe_counter(std::string("object.napi_value.") + entry.name, entry.values);
+    counter_trend ref_trend =
+        observe_counter(std::string("object.napi_ref.") + entry.name, entry.refs);
+    char value_current[32];
+    char value_speed[32];
+    char value_acceleration[32];
+    char ref_current[32];
+    char ref_speed[32];
+    char ref_acceleration[32];
+    if (has_printable_values)
+    {
+      format_trend_columns(value_trend,
+                           value_current,
+                           sizeof(value_current),
+                           value_speed,
+                           sizeof(value_speed),
+                           value_acceleration,
+                           sizeof(value_acceleration));
+    }
+    else
+    {
+      std::snprintf(value_current, sizeof(value_current), "%s", "-");
+      std::snprintf(value_speed, sizeof(value_speed), "%s", "-");
+      std::snprintf(value_acceleration, sizeof(value_acceleration), "%s", "-");
+    }
+
+    if (has_printable_refs)
+    {
+      format_trend_columns(ref_trend,
+                           ref_current,
+                           sizeof(ref_current),
+                           ref_speed,
+                           sizeof(ref_speed),
+                           ref_acceleration,
+                           sizeof(ref_acceleration));
+    }
+    else
+    {
+      std::snprintf(ref_current, sizeof(ref_current), "%s", "-");
+      std::snprintf(ref_speed, sizeof(ref_speed), "%s", "-");
+      std::snprintf(ref_acceleration, sizeof(ref_acceleration), "%s", "-");
+    }
+
+    std::fprintf(stderr,
+                 "  %-28s  %10s %10s %10s  %10s %10s %10s\n",
+                 entry.name.c_str(),
+                 value_current,
+                 value_speed,
+                 value_acceleration,
+                 ref_current,
+                 ref_speed,
+                 ref_acceleration);
+  }
+
+  if (singular_value_count != 0 || singular_ref_count != 0)
+  {
+    counter_trend value_trend =
+        observe_counter("object.napi_value.count_eq_1", singular_value_count);
+    counter_trend ref_trend =
+        observe_counter("object.napi_ref.count_eq_1", singular_ref_count);
+    char value_current[32];
+    char value_speed[32];
+    char value_acceleration[32];
+    char ref_current[32];
+    char ref_speed[32];
+    char ref_acceleration[32];
+    format_trend_columns(value_trend,
+                         value_current,
+                         sizeof(value_current),
+                         value_speed,
+                         sizeof(value_speed),
+                         value_acceleration,
+                         sizeof(value_acceleration));
+    format_trend_columns(ref_trend,
+                         ref_current,
+                         sizeof(ref_current),
+                         ref_speed,
+                         sizeof(ref_speed),
+                         ref_acceleration,
+                         sizeof(ref_acceleration));
+    std::fprintf(stderr,
+                 "  %-28s  %10s %10s %10s  %10s %10s %10s\n",
+                 "count == 1",
+                 value_current,
+                 value_speed,
+                 value_acceleration,
+                 ref_current,
+                 ref_speed,
+                 ref_acceleration);
+  }
 }
 #endif
 
@@ -795,6 +969,7 @@ void dump_stats_locked(napi_env env, bool include_string_symbol_values)
   dump_metric_row("napi_scope.escape_value.calls", g_lifetime.scope_escape_calls, "scope.escape.calls");
   dump_metric_row("napi_scope.escape_value.succeeded", g_lifetime.scope_escape_succeeded, "scope.escape.succeeded");
   dump_metric_row("napi_scope.escape_value.failed", g_lifetime.scope_escape_failed, "scope.escape.failed");
+  dump_scope_level_table(scan);
 
   std::fprintf(stderr, "[napi-lifetime-types]\n");
   std::fprintf(stderr,
@@ -819,10 +994,8 @@ void dump_stats_locked(napi_env env, bool include_string_symbol_values)
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
   if (include_string_symbol_values)
   {
-    dump_string_symbol_entries("napi_value", g_lifetime.values.string_symbols);
-    dump_object_type_entries("napi_value", g_lifetime.values.object_types);
-    dump_string_symbol_entries("napi_ref", g_lifetime.refs.string_symbols);
-    dump_object_type_entries("napi_ref", g_lifetime.refs.object_types);
+    dump_string_entries(g_lifetime.values.string_symbols);
+    dump_object_type_entries(g_lifetime.values.object_types, g_lifetime.refs.object_types);
   }
 #else
   (void)include_string_symbol_values;
