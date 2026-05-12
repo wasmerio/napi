@@ -6,6 +6,7 @@
 #include "internal/napi_value.h"
 
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -133,6 +134,12 @@ namespace quickjs::detail
       size_t count = 0;
     };
 
+    struct object_type_entry
+    {
+      std::string prototype_name;
+      size_t count = 0;
+    };
+
     void append_hex_escape(std::string &out, unsigned char c)
     {
       constexpr char hex[] = "0123456789abcdef";
@@ -200,6 +207,108 @@ namespace quickjs::detail
       entries.push_back(std::move(entry));
     }
 
+    void add_object_type_entry(std::vector<object_type_entry> &entries,
+                               std::string prototype_name)
+    {
+      for (auto &entry : entries)
+      {
+        if (entry.prototype_name == prototype_name)
+        {
+          ++entry.count;
+          return;
+        }
+      }
+
+      object_type_entry entry;
+      entry.prototype_name = std::move(prototype_name);
+      entry.count = 1;
+      entries.push_back(std::move(entry));
+    }
+
+    void clear_exception(JSContext *ctx)
+    {
+      if (ctx == nullptr || !JS_HasException(ctx))
+        return;
+      JSValue exception = JS_GetException(ctx);
+      JS_FreeValue(ctx, exception);
+    }
+
+    bool js_value_to_escaped_string(JSContext *ctx, JSValueConst value, std::string &out)
+    {
+      size_t text_length = 0;
+      const char *text = JS_ToCStringLen(ctx, &text_length, value);
+      if (text == nullptr)
+      {
+        clear_exception(ctx);
+        return false;
+      }
+
+      out = escaped_value_fragment(text, text_length);
+      JS_FreeCString(ctx, text);
+      return true;
+    }
+
+    std::string class_name_fallback(JSContext *ctx, JSValueConst value)
+    {
+      JSRuntime *rt = JS_GetRuntime(ctx);
+      JSClassID class_id = JS_GetClassID(value);
+      JSAtom class_name = JS_GetClassName(rt, class_id);
+      if (class_name == JS_ATOM_NULL)
+        return "<object>";
+
+      const char *text = JS_AtomToCString(ctx, class_name);
+      std::string result = text == nullptr ? "<object>" : escaped_value_fragment(text, std::strlen(text));
+      if (text != nullptr)
+        JS_FreeCString(ctx, text);
+      JS_FreeAtomRT(rt, class_name);
+      clear_exception(ctx);
+      return result.empty() ? "<object>" : result;
+    }
+
+    std::string object_prototype_name(napi_env env, JSValueConst value)
+    {
+      JSContext *ctx = env->context();
+      JSValue proto = JS_GetPrototype(ctx, value);
+      if (JS_IsException(proto))
+      {
+        clear_exception(ctx);
+        return class_name_fallback(ctx, value);
+      }
+
+      if (JS_IsNull(proto) || JS_IsUndefined(proto))
+      {
+        JS_FreeValue(ctx, proto);
+        return "<null-prototype>";
+      }
+
+      JSValue ctor = JS_GetPropertyStr(ctx, proto, "constructor");
+      JS_FreeValue(ctx, proto);
+      if (JS_IsException(ctor))
+      {
+        clear_exception(ctx);
+        return class_name_fallback(ctx, value);
+      }
+
+      JSValue name = JS_UNDEFINED;
+      if (JS_IsObject(ctor))
+        name = JS_GetPropertyStr(ctx, ctor, "name");
+      JS_FreeValue(ctx, ctor);
+      if (JS_IsException(name))
+      {
+        clear_exception(ctx);
+        return class_name_fallback(ctx, value);
+      }
+
+      std::string result;
+      bool has_name = !JS_IsUndefined(name) &&
+                      !JS_IsNull(name) &&
+                      js_value_to_escaped_string(ctx, name, result) &&
+                      !result.empty();
+      JS_FreeValue(ctx, name);
+
+      return has_name ? result : class_name_fallback(ctx, value);
+    }
+
     void capture_string_symbol_value(napi_env env,
                                      JSValueConst value,
                                      int tag,
@@ -221,6 +330,17 @@ namespace quickjs::detail
         JS_FreeCString(ctx, text);
       }
     }
+
+    void capture_object_type_value(napi_env env,
+                                   JSValueConst value,
+                                   int tag,
+                                   std::vector<object_type_entry> &entries)
+    {
+      if (env == nullptr || env->context() == nullptr || tag != JS_TAG_OBJECT)
+        return;
+
+      add_object_type_entry(entries, object_prototype_name(env, value));
+    }
 #endif
 
     struct scope_scan
@@ -237,6 +357,8 @@ namespace quickjs::detail
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
       std::vector<string_symbol_entry> value_strings_symbols;
       std::vector<string_symbol_entry> ref_strings_symbols;
+      std::vector<object_type_entry> value_object_types;
+      std::vector<object_type_entry> ref_object_types;
 #endif
     };
 
@@ -274,6 +396,7 @@ namespace quickjs::detail
 #endif
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
         capture_string_symbol_value(env, slot.get_inner(), tag, scope_result.value_strings_symbols);
+        capture_object_type_value(env, slot.get_inner(), tag, scope_result.value_object_types);
 #endif
       });
 
@@ -284,6 +407,7 @@ namespace quickjs::detail
 #endif
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
         capture_string_symbol_value(env, slot.get_inner(), tag, scope_result.ref_strings_symbols);
+        capture_object_type_value(env, slot.get_inner(), tag, scope_result.ref_object_types);
 #endif
       });
 #endif
@@ -350,6 +474,33 @@ namespace quickjs::detail
                    label,
                    singular_count);
     }
+
+    void dump_object_type_entries(size_t scope_level,
+                                  const char *label,
+                                  const std::vector<object_type_entry> &entries)
+    {
+      size_t singular_count = 0;
+      for (const auto &entry : entries)
+      {
+        if (entry.count == 1)
+        {
+          ++singular_count;
+          continue;
+        }
+
+        std::fprintf(stderr,
+                     "[napi-lifetime-objects] scope_level=%zu %s prototype=\"%s\" count=%zu\n",
+                     scope_level,
+                     label,
+                     entry.prototype_name.c_str(),
+                     entry.count);
+      }
+      std::fprintf(stderr,
+                   "[napi-lifetime-objects] scope_level=%zu %s singular_object_type_count=%zu\n",
+                   scope_level,
+                   label,
+                   singular_count);
+    }
 #endif
 
     void dump_scan(napi_env env, const char *reason, bool include_string_symbol_values)
@@ -382,6 +533,10 @@ namespace quickjs::detail
               scope.scope_level, "napi_value", scope.value_strings_symbols);
           dump_string_symbol_entries(
               scope.scope_level, "napi_ref", scope.ref_strings_symbols);
+          dump_object_type_entries(
+              scope.scope_level, "napi_value", scope.value_object_types);
+          dump_object_type_entries(
+              scope.scope_level, "napi_ref", scope.ref_object_types);
         }
 #else
         (void)include_string_symbol_values;
