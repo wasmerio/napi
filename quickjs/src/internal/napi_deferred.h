@@ -7,20 +7,22 @@
 
 struct napi_deferred__
 {
+  napi_deferred__() = default;
   static napi_deferred__ *create(napi_env env, JSValue resolve, JSValue reject);
   static void destroy(napi_deferred__ *deferred);
 
   ~napi_deferred__();
 
+  void initialize(napi_env env, JSValue resolve, JSValue reject);
+  void release();
   JSValue call_resolve(napi_value resolution);
   JSValue call_reject(napi_value rejection);
 
 private:
-  napi_deferred__(napi_env env, JSValue resolve, JSValue reject);
-
-  napi_env env_;
-  JSValue resolve_;
-  JSValue reject_;
+  napi_env env_ = nullptr;
+  JSValue resolve_ = JS_UNDEFINED;
+  JSValue reject_ = JS_UNDEFINED;
+  bool active_ = false;
 };
 
 #endif // NAPI_QUICKJS_DEFERRED_H_

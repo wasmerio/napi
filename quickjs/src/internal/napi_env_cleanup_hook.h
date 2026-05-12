@@ -6,19 +6,20 @@
 
 struct napi_env_cleanup_hook__
 {
+  napi_env_cleanup_hook__() = default;
   static napi_env_cleanup_hook__ *create(napi_env env, napi_cleanup_hook hook, void *arg);
   static void destroy(napi_env_cleanup_hook__ *entry);
+  ~napi_env_cleanup_hook__();
 
+  void initialize(napi_env env, napi_cleanup_hook hook, void *arg);
+  void release();
   void run() const;
   bool matches(napi_cleanup_hook hook, void *arg) const;
 
 private:
-  napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook hook, void *arg);
-  ~napi_env_cleanup_hook__();
-
-  napi_env env_;
-  napi_cleanup_hook hook_;
-  void *arg_;
+  napi_env env_ = nullptr;
+  napi_cleanup_hook hook_ = nullptr;
+  void *arg_ = nullptr;
 };
 
 #endif // NAPI_QUICKJS_ENV_CLEANUP_HOOK_H_

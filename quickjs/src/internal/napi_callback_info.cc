@@ -1,7 +1,5 @@
 #include "internal/napi_callback_info.h"
 
-#include "internal/napi_lifetime_macros.h"
-
 napi_callback_info__::napi_callback_info__(napi_env env,
                                            JSValueConst this_val,
                                            JSValue new_target,

@@ -1,25 +1,39 @@
 #include "internal/napi_external_backing_store_hint.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_lifetime_macros.h"
 
-#include <new>
+napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
+{
+  release();
+}
 
-napi_external_backing_store_hint__::napi_external_backing_store_hint__(
+void napi_external_backing_store_hint__::initialize(
     napi_env env,
     void *external_data,
     node_api_basic_finalize finalize_cb,
     void *finalize_hint)
-    : env_(env),
-      rt_(JS_GetRuntime(env->context())),
-      external_data_(external_data),
-      finalize_cb_(finalize_cb),
-      finalize_hint_(finalize_hint)
 {
+  release();
+  env_ = env;
+  rt_ = JS_GetRuntime(env->context());
+  external_data_ = external_data;
+  finalize_cb_ = finalize_cb;
+  finalize_hint_ = finalize_hint;
+  finalize_invoked_ = false;
+  detaching_ = false;
+  weak_target_ = JS_UNDEFINED;
 }
 
-napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
+void napi_external_backing_store_hint__::release()
 {
+  env_ = nullptr;
+  rt_ = nullptr;
+  external_data_ = nullptr;
+  finalize_cb_ = nullptr;
+  finalize_hint_ = nullptr;
+  finalize_invoked_ = false;
+  detaching_ = false;
+  weak_target_ = JS_UNDEFINED;
 }
 
 napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(
@@ -30,12 +44,7 @@ napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(
 {
   if (env == nullptr || env->context() == nullptr)
     return nullptr;
-
-  void *memory = js_mallocz(env->context(), sizeof(napi_external_backing_store_hint__));
-  if (memory == nullptr)
-    return nullptr;
-
-  return new (memory) napi_external_backing_store_hint__(env, external_data, finalize_cb, finalize_hint);
+  return env->create_external_backing_store_hint(external_data, finalize_cb, finalize_hint);
 }
 
 void napi_external_backing_store_hint__::destroy(napi_external_backing_store_hint__ *hint)
@@ -43,8 +52,7 @@ void napi_external_backing_store_hint__::destroy(napi_external_backing_store_hin
   if (hint == nullptr)
     return;
 
-  JSRuntime *rt = hint->rt_;
-  destroy_with_runtime(rt, hint);
+  destroy_with_runtime(hint->rt_, hint);
 }
 
 void napi_external_backing_store_hint__::destroy_with_runtime(
@@ -54,9 +62,10 @@ void napi_external_backing_store_hint__::destroy_with_runtime(
   if (hint == nullptr)
     return;
 
-  hint->~napi_external_backing_store_hint__();
-  if (rt != nullptr)
-    js_free_rt(rt, hint);
+  (void)rt;
+  napi_env env = hint->env_;
+  if (env != nullptr)
+    env->destroy_external_backing_store_hint(hint);
 }
 
 void napi_external_backing_store_hint__::invoke_finalizer()

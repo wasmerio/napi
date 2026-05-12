@@ -7,6 +7,7 @@
 #include "napi_contextify.h"
 #include "napi_deferred.h"
 #include "napi_env_cleanup_hook.h"
+#include "napi_external_backing_store_hint.h"
 #include "napi_module_wrap.h"
 #include "napi_promises.h"
 #include "napi_ref.h"
@@ -73,6 +74,15 @@ struct napi_env__
 
   napi_status add_cleanup_hook(napi_cleanup_hook hook, void *arg);
   napi_status remove_cleanup_hook(napi_cleanup_hook hook, void *arg);
+  napi_env_cleanup_hook__ *create_cleanup_hook(napi_cleanup_hook hook, void *arg);
+  void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
+  napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
+  void destroy_deferred(napi_deferred__ *deferred);
+  napi_external_backing_store_hint__ *create_external_backing_store_hint(
+      void *external_data,
+      node_api_basic_finalize finalize_cb,
+      void *finalize_hint);
+  void destroy_external_backing_store_hint(napi_external_backing_store_hint__ *hint);
 
   void track_weak_ref(napi_ref ref);
   void remove_weak_ref(napi_ref ref);
@@ -106,6 +116,9 @@ private:
   napi_handle_scope root_scope_ = nullptr;
   napi_handle_scope current_scope_ = nullptr;
   napi_allocator__<napi_scope__> scopes_;
+  napi_allocator__<napi_env_cleanup_hook__> cleanup_hooks_;
+  napi_allocator__<napi_deferred__> deferreds_;
+  napi_allocator__<napi_external_backing_store_hint__> external_backing_store_hints_;
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;

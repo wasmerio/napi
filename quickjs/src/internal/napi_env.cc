@@ -41,6 +41,8 @@ void napi_env__::prepare_teardown()
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
+  cleanup_hooks_.close();
+  deferreds_.close();
 
   clear_last_exception();
 
@@ -309,6 +311,45 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
     }
   }
   return napi_invalid_arg;
+}
+
+napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook, void *arg)
+{
+  if (context_ == nullptr || hook == nullptr)
+    return nullptr;
+  return cleanup_hooks_.allocate(this, hook, arg);
+}
+
+void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
+{
+  cleanup_hooks_.release(entry);
+}
+
+napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  return deferreds_.allocate(this, resolve, reject);
+}
+
+void napi_env__::destroy_deferred(napi_deferred__ *deferred)
+{
+  deferreds_.release(deferred);
+}
+
+napi_external_backing_store_hint__ *napi_env__::create_external_backing_store_hint(
+    void *external_data,
+    node_api_basic_finalize finalize_cb,
+    void *finalize_hint)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  return external_backing_store_hints_.allocate(this, external_data, finalize_cb, finalize_hint);
+}
+
+void napi_env__::destroy_external_backing_store_hint(napi_external_backing_store_hint__ *hint)
+{
+  external_backing_store_hints_.release(hint);
 }
 
 void napi_env__::track_weak_ref(napi_ref ref)

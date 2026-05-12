@@ -8,6 +8,7 @@
 
 struct napi_external_backing_store_hint__
 {
+  napi_external_backing_store_hint__() = default;
   static napi_external_backing_store_hint__ *create(
       napi_env env,
       void *external_data,
@@ -15,7 +16,13 @@ struct napi_external_backing_store_hint__
       void *finalize_hint);
   static void destroy(napi_external_backing_store_hint__ *hint);
   static void destroy_with_runtime(JSRuntime *rt, napi_external_backing_store_hint__ *hint);
+  ~napi_external_backing_store_hint__();
 
+  void initialize(napi_env env,
+                  void *external_data,
+                  node_api_basic_finalize finalize_cb,
+                  void *finalize_hint);
+  void release();
   void invoke_finalizer();
   void begin_detach();
   void end_detach();
@@ -28,17 +35,11 @@ struct napi_external_backing_store_hint__
   void set_weak_target(JSValue weak_target);
 
 private:
-  napi_external_backing_store_hint__(napi_env env,
-                                     void *external_data,
-                                     node_api_basic_finalize finalize_cb,
-                                     void *finalize_hint);
-  ~napi_external_backing_store_hint__();
-
-  napi_env env_;
+  napi_env env_ = nullptr;
   JSRuntime *rt_ = nullptr;
-  void *external_data_;
-  node_api_basic_finalize finalize_cb_;
-  void *finalize_hint_;
+  void *external_data_ = nullptr;
+  node_api_basic_finalize finalize_cb_ = nullptr;
+  void *finalize_hint_ = nullptr;
   bool finalize_invoked_ = false;
   bool detaching_ = false;
   JSValue weak_target_ = JS_UNDEFINED;
