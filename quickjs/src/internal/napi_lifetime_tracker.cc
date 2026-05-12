@@ -1003,6 +1003,21 @@ void dump_stats_locked(napi_env env, bool include_string_symbol_values)
   std::fprintf(stderr, "\n");
 }
 
+void dump_summary_locked(napi_env env)
+{
+  env_slot_scan scan = scan_env_slots(env);
+  std::fprintf(stderr,
+               "[napi-lifetime-stats] napi_value slots_total=%zu active=%zu "
+               "napi_ref slots_total=%zu active=%zu "
+               "napi_scope slots_total=%zu active=%zu\n",
+               scan.value_slots_total,
+               scan.active_values,
+               scan.ref_slots_total,
+               scan.active_refs,
+               scan.scope_slots_total,
+               scan.active_scopes);
+}
+
 void dump_lifetime(napi_env env, const char *reason, bool include_string_symbol_values)
 {
   if (reason != nullptr)
@@ -1012,6 +1027,12 @@ void dump_lifetime(napi_env env, const char *reason, bool include_string_symbol_
   dump_stats_locked(env, include_string_symbol_values);
 }
 
+void dump_lifetime_summary(napi_env env)
+{
+  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  dump_summary_locked(env);
+}
+
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
 void maybe_dump_periodic_stats(napi_env env)
 {
@@ -1019,14 +1040,20 @@ void maybe_dump_periodic_stats(napi_env env)
     return;
 
   int64_t now = monotonic_milliseconds();
-  if (!env->should_dump_lifetime_stats(now))
-    return;
-
-  bool include_string_symbol_values = false;
+  bool should_dump_summary = env->should_dump_lifetime_stats(now);
+  bool should_dump_full = false;
 #ifdef NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-  include_string_symbol_values = env->should_dump_lifetime_string_symbol_values(now);
+  should_dump_full = env->should_dump_lifetime_string_symbol_values(now);
 #endif
-  dump_lifetime(env, nullptr, include_string_symbol_values);
+
+  if (should_dump_full)
+  {
+    dump_lifetime(env, nullptr, true);
+    return;
+  }
+
+  if (should_dump_summary)
+    dump_lifetime_summary(env);
 }
 #else
 void maybe_dump_periodic_stats(napi_env env)

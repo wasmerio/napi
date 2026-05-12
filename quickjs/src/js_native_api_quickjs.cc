@@ -1856,18 +1856,14 @@ extern "C"
     // Since napi_value is usually a typedef for JSValue (or a pointer to it),
     // we can often cast the array if the memory layout matches,
     // but a safe stack allocation is better for compatibility.
-    JSValue *js_argv = nullptr;
-    if (argc > 0)
-    {
-      js_argv = (JSValue *)alloca(sizeof(JSValue) * argc);
-      for (size_t i = 0; i < argc; ++i)
-      {
-        js_argv[i] = napi_quickjs_value_inner(env, argv[i]);
-      }
-    }
+    std::vector<JSValue> js_argv = napi_util__::prepare_call_args(env, argc, argv);
 
     // 4. Call the constructor
-    JSValue instance = JS_CallConstructor(ctx, ctor_val, (int)argc, js_argv);
+    const size_t js_argc = js_argv.size();
+    const bool has_args = js_argc != 0;
+    JSValue instance = has_args
+                           ? JS_CallConstructor(ctx, ctor_val, (int)js_argc, js_argv.data())
+                           : JS_CallConstructor(ctx, ctor_val, 0, nullptr);
 
     // 5. Check for exceptions
     if (JS_IsException(instance))
@@ -1912,20 +1908,14 @@ extern "C"
     JSValue js_recv = (recv != nullptr) ? napi_quickjs_value_inner(env, recv) : JS_UNDEFINED;
 
     // 4. Prepare the arguments array
-    // We use a small stack buffer for performance, falling back to a heap vector for many args.
-    JSValue *js_argv = nullptr;
-    if (argc > 0)
-    {
-      // TODO: Use JSRuntime allocator, and ensure memory is freed afterwards!
-      js_argv = static_cast<JSValue *>(alloca(sizeof(JSValue) * argc));
-      for (size_t i = 0; i < argc; i++)
-      {
-        js_argv[i] = napi_quickjs_value_inner(env, argv[i]);
-      }
-    }
+    std::vector<JSValue> js_argv = napi_util__::prepare_call_args(env, argc, argv);
 
     // 5. Perform the call
-    JSValue js_result = JS_Call(env->context(), js_func, js_recv, (int)argc, js_argv);
+    const size_t js_argc = js_argv.size();
+    const bool has_args = js_argc != 0;
+    JSValue js_result = has_args
+                            ? JS_Call(env->context(), js_func, js_recv, (int)js_argc, js_argv.data())
+                            : JS_Call(env->context(), js_func, js_recv, 0, nullptr);
 
     // 6. Handle Exceptions
     if (JS_IsException(js_result))

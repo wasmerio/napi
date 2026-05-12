@@ -3,6 +3,7 @@
 #include "internal/napi_env.h"
 #include "internal/napi_value.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -339,6 +340,18 @@ napi_value napi_util__::undefined_value(napi_env env)
 bool napi_util__::is_callable(napi_env env, napi_value value)
 {
   return value != nullptr && JS_IsFunction(context(env), napi_quickjs_value_inner(env, value));
+}
+
+std::vector<JSValue> napi_util__::prepare_call_args(napi_env env, size_t argc, const napi_value *argv)
+{
+  std::vector<JSValue> js_argv(argc);
+  if (argc > 0)
+  {
+    std::transform(argv, argv + argc, js_argv.begin(), [env](napi_value value) {
+      return napi_quickjs_value_inner(env, value);
+    });
+  }
+  return js_argv;
 }
 
 napi_status napi_util__::run_pending_jobs(napi_env env)
