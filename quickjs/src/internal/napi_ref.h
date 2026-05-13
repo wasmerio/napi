@@ -26,6 +26,7 @@ struct napi_ref__
   napi_env env() const;
   JSValueConst get_inner() const;
   JSValue dup_inner() const;
+  void clear_for_teardown();
 
 private:
   static void weak_target_finalized(JSRuntime *rt, void *opaque);

@@ -103,6 +103,8 @@ struct napi_env__
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
 private:
+  void clear_refs_for_teardown();
+
   // QuickJS context and API version.
   JSContext *context_;
   int32_t module_api_version_ = 8;

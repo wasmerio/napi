@@ -26,6 +26,11 @@ napi_ref__::napi_ref__(napi_env env,
 
 napi_ref__::~napi_ref__()
 {
+  clear_for_teardown();
+}
+
+void napi_ref__::clear_for_teardown()
+{
   if (env_ == nullptr)
     return;
 

@@ -52,7 +52,7 @@ void napi_env__::prepare_teardown()
   deferreds_.close();
 
   clear_last_exception();
-  refs_.close();
+  clear_refs_for_teardown();
 
   napi_scope__ *root_scope = scope_from_handle(root_scope_);
   if (root_scope != nullptr)
@@ -69,6 +69,13 @@ void napi_env__::prepare_teardown()
   promises_.teardown();
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
+}
+
+void napi_env__::clear_refs_for_teardown()
+{
+  refs_.for_each_active([](const napi_ref__ &ref) {
+    const_cast<napi_ref__ &>(ref).clear_for_teardown();
+  });
 }
 
 void napi_env__::finalize_instance_data()
