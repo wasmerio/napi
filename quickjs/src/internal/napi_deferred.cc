@@ -3,20 +3,14 @@
 #include "internal/napi_env.h"
 #include "internal/napi_value.h"
 
+napi_deferred__::napi_deferred__(napi_env env, JSValue resolve, JSValue reject)
+    : env_(env),
+      resolve_(resolve),
+      reject_(reject)
+{
+}
+
 napi_deferred__::~napi_deferred__()
-{
-  release();
-}
-
-void napi_deferred__::initialize(napi_env env, JSValue resolve, JSValue reject)
-{
-  release();
-  env_ = env;
-  resolve_ = resolve;
-  reject_ = reject;
-}
-
-void napi_deferred__::release()
 {
   if (env_ == nullptr)
     return;

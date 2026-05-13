@@ -7,28 +7,19 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <list>
+#include <new>
 #include <type_traits>
 #include <utility>
 #include <vector>
 #include <cassert>
 
 template <typename T>
-concept napi_allocator_payload__ =
-    std::default_initializable<T> &&
-    requires(T value) {
-      { value.release() } -> std::same_as<void>;
-    };
+concept napi_allocator_payload__ = std::destructible<T>;
 
 template <typename T>
 concept napi_allocator_owner__ = std::is_class_v<T>;
-
-template <typename T, typename... Args>
-concept napi_allocator_initializable_payload__ =
-    napi_allocator_payload__<T> &&
-    requires(T value, Args &&...args) {
-      { value.initialize(static_cast<Args &&>(args)...) } -> std::same_as<void>;
-    };
 
 template <class Handle, napi_allocator_payload__ T, napi_allocator_owner__ Owner, size_t N = 16>
 class napi_allocator__
@@ -50,10 +41,34 @@ private:
 
   struct slot__
   {
-    // Stored payload and allocator free-list linkage.
-    T data;
+    // Raw payload storage and allocator free-list linkage.
+    alignas(T) std::byte storage[sizeof(T)];
     slot__ *next_free = nullptr;
     bool active = false;
+
+    T *data()
+    {
+      return std::launder(reinterpret_cast<T *>(storage));
+    }
+
+    const T *data() const
+    {
+      return std::launder(reinterpret_cast<const T *>(storage));
+    }
+
+    template <typename... Args>
+    T *construct(Args &&...args)
+    {
+      return new (static_cast<void *>(storage)) T(static_cast<Args &&>(args)...);
+    }
+
+    void destroy()
+    {
+      data()->~T();
+#ifndef NDEBUG
+      std::memset(storage, 0, sizeof(storage));
+#endif
+    }
 
     static Handle unsafe_handle_from_data(T *data)
     {
@@ -71,12 +86,12 @@ private:
         return nullptr;
 
       return reinterpret_cast<slot__ *>(
-          reinterpret_cast<char *>(handle) - offsetof(slot__, data));
+          reinterpret_cast<char *>(handle) - offsetof(slot__, storage));
     }
 
     bool owns_handle(Handle handle) const
     {
-      return (unsafe_handle_from_data(const_cast<T *>(&this->data)) == handle) && this->active;
+      return (unsafe_handle_from_data(const_cast<T *>(data())) == handle) && this->active;
     }
 
     slot__() = default;
@@ -171,8 +186,8 @@ private:
         if (slot.active)
         {
           if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-            quickjs::detail::napi_lifetime__<T>::record_release(this->owner_, &slot.data);
-          slot.data.release();
+            quickjs::detail::napi_lifetime__<T>::record_release(this->owner_, slot.data());
+          slot.destroy();
           slot.active = false;
         }
       }
@@ -226,7 +241,7 @@ public:
   }
 
   template <typename... Args>
-    requires napi_allocator_initializable_payload__<T, Args...>
+    requires std::constructible_from<T, Args...>
   T *allocate(Args &&...args)
   {
     block__ *block = first_available_block();
@@ -237,9 +252,9 @@ public:
     if (slot == nullptr)
       return nullptr;
 
-    slot->data.initialize(static_cast<Args &&>(args)...);
+    T *data = slot->construct(static_cast<Args &&>(args)...);
     if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-      quickjs::detail::napi_lifetime__<T>::record_create(owner_, &slot->data);
+      quickjs::detail::napi_lifetime__<T>::record_create(owner_, data);
 
     if (block->is_full())
     {
@@ -249,7 +264,7 @@ public:
       full_blocks_.push_back(block);
     }
 
-    return &slot->data;
+    return data;
   }
 
   static Handle unsafe_handle_from_data(T *data)
@@ -269,7 +284,7 @@ public:
 
     assert(slot->owns_handle(handle));
 
-    return {&slot->data, block->owner()};
+    return {slot->data(), block->owner()};
   }
 
   bool owns_handle(Handle handle) const
@@ -289,14 +304,14 @@ public:
     assert(slot_index(block, slot) < N);
     assert(slot->owns_handle(handle));
 
-    if (!owns_block(block) || slot_index(block, slot) < N || !slot->owns_handle(handle))
+    if (!owns_block(block) || slot_index(block, slot) >= N || !slot->owns_handle(handle))
       return;
 
     if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-      quickjs::detail::napi_lifetime__<T>::record_release(owner_, &slot->data);
+      quickjs::detail::napi_lifetime__<T>::record_release(owner_, slot->data());
 
     bool was_full = block->is_full();
-    slot->data.release();
+    slot->destroy();
     block->release(slot);
 
     if (was_full)
@@ -343,7 +358,7 @@ public:
       for (const auto &slot : block.slots)
       {
         if (slot.active)
-          fn(slot.data);
+          fn(*slot.data());
       }
     }
   }

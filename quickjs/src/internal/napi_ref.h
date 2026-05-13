@@ -9,17 +9,14 @@
 
 struct napi_ref__
 {
-  napi_ref__() = default;
-  napi_ref__(const napi_ref__ &) = delete;
-  napi_ref__ &operator=(const napi_ref__ &) = delete;
-  napi_ref__(napi_ref__ &&other) noexcept;
-  napi_ref__ &operator=(napi_ref__ &&other) noexcept;
+  napi_ref__(napi_env env, JSValueConst value, uint32_t initial_ref_count);
   ~napi_ref__();
 
-  void initialize(napi_env env,
-                  JSValueConst value,
-                  uint32_t initial_ref_count);
-  void release();
+  napi_ref__(const napi_ref__ &) = delete;
+  napi_ref__(napi_ref__ &&other) = delete;
+  napi_ref__ &operator=(const napi_ref__ &) = delete;
+  napi_ref__ &operator=(napi_ref__ &&other) = delete;
+
   bool is_active() const;
   uint32_t add_ref();
   uint32_t rem_ref();

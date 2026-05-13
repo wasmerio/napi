@@ -11,63 +11,20 @@ bool IsEmptyValue(JSValueConst value)
 
 } // namespace
 
-napi_ref__::napi_ref__(napi_ref__ &&other) noexcept
-    : env_(other.env_),
-      value_(other.value_),
-      ref_count_(other.ref_count_)
+napi_ref__::napi_ref__(napi_env env,
+                       JSValueConst value,
+                       uint32_t initial_ref_count)
+    : env_(env),
+      value_(value),
+      ref_count_(initial_ref_count)
 {
-  if (JS_GetNativeWeakRefFromLink(&other.weak_link_) != nullptr)
-  {
-    JS_AddNativeWeakRefLink(
-        other.env_->context(), other.value_, &weak_link_, weak_target_finalized, this);
-    JS_DeleteNativeWeakRefLink(JS_GetRuntime(other.env_->context()), &other.weak_link_);
-  }
-  other.env_ = nullptr;
-  other.value_ = JS_UNDEFINED;
-  other.ref_count_ = 0;
-}
-
-napi_ref__ &napi_ref__::operator=(napi_ref__ &&other) noexcept
-{
-  if (this == &other)
-    return *this;
-
-  release();
-  env_ = other.env_;
-  value_ = other.value_;
-  ref_count_ = other.ref_count_;
-  if (JS_GetNativeWeakRefFromLink(&other.weak_link_) != nullptr)
-  {
-    JS_AddNativeWeakRefLink(
-        other.env_->context(), other.value_, &weak_link_, weak_target_finalized, this);
-    JS_DeleteNativeWeakRefLink(JS_GetRuntime(other.env_->context()), &other.weak_link_);
-  }
-  other.env_ = nullptr;
-  other.value_ = JS_UNDEFINED;
-  other.ref_count_ = 0;
-  return *this;
-}
-
-napi_ref__::~napi_ref__()
-{
-  release();
-}
-
-void napi_ref__::initialize(napi_env env,
-                            JSValueConst value,
-                            uint32_t initial_ref_count)
-{
-  release();
-  env_ = env;
-  value_ = value;
-  ref_count_ = initial_ref_count;
   if (ref_count_ > 0)
     JS_DupValue(env_->context(), value_);
   else if (!make_weak() && JS_VALUE_HAS_REF_COUNT(value_))
     JS_DupValue(env_->context(), value_);
 }
 
-void napi_ref__::release()
+napi_ref__::~napi_ref__()
 {
   if (env_ == nullptr)
     return;

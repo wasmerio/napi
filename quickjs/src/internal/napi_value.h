@@ -8,15 +8,14 @@
 
 struct napi_value__
 {
-  napi_value__() = default;
-  napi_value__(const napi_value__ &) = delete;
-  napi_value__ &operator=(const napi_value__ &) = delete;
-  napi_value__(napi_value__ &&other) noexcept;
-  napi_value__ &operator=(napi_value__ &&other) noexcept;
+  napi_value__(napi_env env, JSValue value, bool owned);
   ~napi_value__();
 
-  void initialize(napi_env env, JSValue value, bool owned);
-  void release();
+  napi_value__(const napi_value__ &) = delete;
+  napi_value__(napi_value__ &&other) = delete;
+  napi_value__ &operator=(const napi_value__ &) = delete;
+  napi_value__ &operator=(napi_value__ &&other) = delete;
+
   bool is_active() const;
   napi_env env() const;
   JSValueConst get_inner() const;

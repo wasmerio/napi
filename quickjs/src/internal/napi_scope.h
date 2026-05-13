@@ -11,10 +11,9 @@
 
 struct napi_scope__
 {
+  napi_scope__(napi_env env, napi_handle_scope parent);
   ~napi_scope__();
 
-  void initialize(napi_env env, napi_handle_scope parent);
-  void release();
   bool is_active() const;
   size_t level() const;
 
@@ -39,7 +38,6 @@ struct napi_scope__
     values_.for_each_active(fn);
   }
 
-  napi_scope__();
   napi_scope__(const napi_scope__ &) = delete;
   napi_scope__(napi_scope__ &&other) = delete;
   napi_scope__ &operator=(const napi_scope__ &) = delete;

@@ -3,40 +3,21 @@
 #include "internal/napi_env.h"
 #include "internal/napi_lifetime_tracker.h"
 
-napi_scope__::napi_scope__() : values_(this)
+napi_scope__::napi_scope__(napi_env env, napi_handle_scope parent)
+    : values_{this}, env_{env}, parent_{parent}
 {
+  napi_scope__ *parent_scope = this->parent();
+  level_ = parent_scope == nullptr ? 0 : parent_scope->level() + 1;
+
+  if (parent_scope != nullptr)
+  {
+    values_.reserve_prefix(parent_scope->value_slot_count());
+  }
 }
 
 napi_scope__::~napi_scope__()
 {
-  release();
-}
-
-void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
-{
-  release();
-  env_ = env;
-  values_.set_owner(this);
-  parent_ = parent;
-  closed_ = false;
-  escaped_ = false;
-
-  napi_scope__ *parent_scope = this->parent();
-  level_ = parent_scope == nullptr ? 0 : parent_scope->level() + 1;
-  if (parent_scope != nullptr)
-    values_.reserve_prefix(parent_scope->value_slot_count());
-}
-
-void napi_scope__::release()
-{
-  if (env_ == nullptr)
-    return;
-
   close();
-  env_ = nullptr;
-  level_ = 0;
-  parent_ = nullptr;
-  escaped_ = false;
 }
 
 bool napi_scope__::is_active() const
@@ -71,7 +52,8 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
 
 napi_value napi_scope__::escape_value(napi_value value)
 {
-  auto record_escape = [this](napi_value escaped) {
+  auto record_escape = [this](napi_value escaped)
+  {
     quickjs::detail::napi_lifetime_tracker__::record_scope_escape(env_, escaped != nullptr);
     return escaped;
   };

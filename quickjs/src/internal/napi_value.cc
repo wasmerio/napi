@@ -3,40 +3,13 @@
 #include "internal/napi_env.h"
 #include "internal/napi_scope.h"
 
-napi_value__::napi_value__(napi_value__ &&other) noexcept
-    : env_(other.env_),
-      value_(other.value_)
+napi_value__::napi_value__(napi_env env, JSValue value, bool owned)
+    : env_(env),
+      value_(owned ? value : JS_DupValue(env->context(), value))
 {
-  other.env_ = nullptr;
-  other.value_ = JS_UNDEFINED;
-}
-
-napi_value__ &napi_value__::operator=(napi_value__ &&other) noexcept
-{
-  if (this == &other)
-    return *this;
-
-  release();
-  env_ = other.env_;
-  value_ = other.value_;
-  other.env_ = nullptr;
-  other.value_ = JS_UNDEFINED;
-  return *this;
 }
 
 napi_value__::~napi_value__()
-{
-  release();
-}
-
-void napi_value__::initialize(napi_env env, JSValue value, bool owned)
-{
-  release();
-  env_ = env;
-  value_ = owned ? value : JS_DupValue(env->context(), value);
-}
-
-void napi_value__::release()
 {
   if (env_ == nullptr)
     return;

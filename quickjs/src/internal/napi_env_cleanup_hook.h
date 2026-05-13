@@ -8,13 +8,15 @@ typedef struct napi_env_cleanup_hook__ *napi_env_cleanup_hook;
 
 struct napi_env_cleanup_hook__
 {
-  napi_env_cleanup_hook__() = default;
+  napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook hook, void *arg);
   static napi_env_cleanup_hook__ *create(napi_env env, napi_cleanup_hook hook, void *arg);
   static void destroy(napi_env_cleanup_hook__ *entry);
   ~napi_env_cleanup_hook__();
+  napi_env_cleanup_hook__(const napi_env_cleanup_hook__ &) = delete;
+  napi_env_cleanup_hook__(napi_env_cleanup_hook__ &&other) = delete;
+  napi_env_cleanup_hook__ &operator=(const napi_env_cleanup_hook__ &) = delete;
+  napi_env_cleanup_hook__ &operator=(napi_env_cleanup_hook__ &&other) = delete;
 
-  void initialize(napi_env env, napi_cleanup_hook hook, void *arg);
-  void release();
   napi_env env() const;
   void run() const;
   bool matches(napi_cleanup_hook hook, void *arg) const;
