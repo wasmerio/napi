@@ -152,13 +152,18 @@ napi_status napi_function__::create(napi_env env,
   if (!napi_util__::check_env(env) || cb == nullptr || result == nullptr)
     return napi_util__::invalid_arg(env);
 
-  napi_value cb_external, data_external;
-  napi_create_external(env, reinterpret_cast<void *>(cb), nullptr, nullptr, &cb_external);
-  napi_create_external(env, data, nullptr, nullptr, &data_external);
-
   JSValue data_values[2];
-  data_values[0] = JS_DupValue(env->context(), napi_quickjs_value_inner(env, cb_external));
-  data_values[1] = JS_DupValue(env->context(), napi_quickjs_value_inner(env, data_external));
+  data_values[0] = env->wrap_external_data(reinterpret_cast<void *>(cb));
+  if (JS_IsException(data_values[0]))
+  {
+    return napi_util__::return_pending_if_caught(env, "Failed to create function data");
+  }
+  data_values[1] = env->wrap_external_data(data);
+  if (JS_IsException(data_values[1]))
+  {
+    JS_FreeValue(env->context(), data_values[0]);
+    return napi_util__::return_pending_if_caught(env, "Failed to create function data");
+  }
 
   JSValue fn = JS_NewCFunctionData(env->context(), trampoline, 0, magic, 2, data_values);
   JS_FreeValue(env->context(), data_values[0]);

@@ -8,6 +8,7 @@
 static int test_value = 1;
 static int finalize_count = 0;
 static napi_ref test_reference = NULL;
+static napi_ref test_reference_2 = NULL;
 
 static napi_value GetFinalizeCount(napi_env env, napi_callback_info info) {
   napi_value result;
@@ -155,12 +156,59 @@ static napi_value DeleteReference(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+static napi_value CreateTwoWeakReferences(napi_env env, napi_callback_info info) {
+  NODE_API_ASSERT(env, test_reference == NULL,
+      "The test allows only one primary reference at a time.");
+  NODE_API_ASSERT(env, test_reference_2 == NULL,
+      "The test allows only one secondary reference at a time.");
+
+  size_t argc = 1;
+  napi_value arg;
+  NODE_API_CALL(env, napi_get_cb_info(env, info, &argc, &arg, NULL, NULL));
+  NODE_API_ASSERT(env, argc == 1, "Expected one argument.");
+
+  NODE_API_CALL(env, napi_create_reference(env, arg, 0, &test_reference));
+  NODE_API_CALL(env, napi_create_reference(env, arg, 0, &test_reference_2));
+
+  NODE_API_ASSERT(env, test_reference != NULL,
+      "A primary reference should have been created.");
+  NODE_API_ASSERT(env, test_reference_2 != NULL,
+      "A secondary reference should have been created.");
+
+  return NULL;
+}
+
+static napi_value DeleteTwoWeakReferences(napi_env env, napi_callback_info info) {
+  NODE_API_ASSERT(env, test_reference != NULL,
+      "A primary reference must have been created.");
+  NODE_API_ASSERT(env, test_reference_2 != NULL,
+      "A secondary reference must have been created.");
+
+  NODE_API_CALL(env, napi_delete_reference(env, test_reference));
+  NODE_API_CALL(env, napi_delete_reference(env, test_reference_2));
+  test_reference = NULL;
+  test_reference_2 = NULL;
+  return NULL;
+}
+
 static napi_value IncrementRefcount(napi_env env, napi_callback_info info) {
   NODE_API_ASSERT(env, test_reference != NULL,
       "A reference must have been created.");
 
   uint32_t refcount;
   NODE_API_CALL(env, napi_reference_ref(env, test_reference, &refcount));
+
+  napi_value result;
+  NODE_API_CALL(env, napi_create_uint32(env, refcount, &result));
+  return result;
+}
+
+static napi_value IncrementSecondRefcount(napi_env env, napi_callback_info info) {
+  NODE_API_ASSERT(env, test_reference_2 != NULL,
+      "A secondary reference must have been created.");
+
+  uint32_t refcount;
+  NODE_API_CALL(env, napi_reference_ref(env, test_reference_2, &refcount));
 
   napi_value result;
   NODE_API_CALL(env, napi_create_uint32(env, refcount, &result));
@@ -185,6 +233,15 @@ static napi_value GetReferenceValue(napi_env env, napi_callback_info info) {
 
   napi_value result;
   NODE_API_CALL(env, napi_get_reference_value(env, test_reference, &result));
+  return result;
+}
+
+static napi_value GetSecondReferenceValue(napi_env env, napi_callback_info info) {
+  NODE_API_ASSERT(env, test_reference_2 != NULL,
+      "A secondary reference must have been created.");
+
+  napi_value result;
+  NODE_API_CALL(env, napi_get_reference_value(env, test_reference_2, &result));
   return result;
 }
 
@@ -237,9 +294,16 @@ napi_value Init(napi_env env, napi_value exports) {
       DECLARE_NODE_API_PROPERTY("createSymbolForIncorrectLength",
                                 CreateSymbolForIncorrectLength),
       DECLARE_NODE_API_PROPERTY("deleteReference", DeleteReference),
+      DECLARE_NODE_API_PROPERTY("createTwoWeakReferences",
+                                CreateTwoWeakReferences),
+      DECLARE_NODE_API_PROPERTY("deleteTwoWeakReferences",
+                                DeleteTwoWeakReferences),
       DECLARE_NODE_API_PROPERTY("incrementRefcount", IncrementRefcount),
+      DECLARE_NODE_API_PROPERTY("incrementSecondRefcount",
+                                IncrementSecondRefcount),
       DECLARE_NODE_API_PROPERTY("decrementRefcount", DecrementRefcount),
       DECLARE_NODE_API_GETTER("referenceValue", GetReferenceValue),
+      DECLARE_NODE_API_GETTER("secondReferenceValue", GetSecondReferenceValue),
       DECLARE_NODE_API_PROPERTY("validateDeleteBeforeFinalize",
                                 ValidateDeleteBeforeFinalize),
   };

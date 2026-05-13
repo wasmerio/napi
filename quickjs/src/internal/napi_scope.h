@@ -21,7 +21,6 @@ struct napi_scope__
   napi_value wrap_value(JSValue value, bool owned);
   napi_value escape_value(napi_value value);
   void delete_value(napi_value value);
-  napi_value__ *value_from_handle(napi_value value);
 
   void close();
 
@@ -54,7 +53,7 @@ private:
   napi_handle_scope parent_ = nullptr;
 
   // Local value storage.
-  napi_allocator__<napi_value__, napi_scope__> values_;
+  napi_allocator__<napi_value, napi_value__, napi_scope__> values_;
 
   // Scope lifecycle flags.
   bool closed_ = false;

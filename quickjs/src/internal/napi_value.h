@@ -28,6 +28,5 @@ private:
 };
 
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value);
-napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value);
 
 #endif // NAPI_QUICKJS_VALUE_H_

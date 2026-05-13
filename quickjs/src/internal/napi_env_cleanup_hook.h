@@ -4,6 +4,8 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 
+typedef struct napi_env_cleanup_hook__ *napi_env_cleanup_hook;
+
 struct napi_env_cleanup_hook__
 {
   napi_env_cleanup_hook__() = default;

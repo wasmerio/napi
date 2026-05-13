@@ -221,26 +221,12 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
 
-    // 1. Create a new QuickJS object using our custom external class
-    // NOTE: Replace `napi_external__::class_id()` with how you access it in your engine.
-    JSValue obj = JS_NewObjectClass(env->context(), napi_external__::class_id());
+    JSValue obj = env->wrap_external_data(data, finalize_cb, finalize_hint);
     if (JS_IsException(obj))
     {
       return napi_util__::return_pending_if_caught(env, "Failed to create external object");
     }
 
-    // 2. Allocate the hint struct to hold the Node-API finalizer info
-    auto *hint = napi_external_backing_store_hint__::create(env, data, finalize_cb, finalize_hint);
-    if (hint == nullptr)
-    {
-      JS_FreeValue(env->context(), obj);
-      return napi_generic_failure;
-    }
-
-    // 3. Attach the struct to the QuickJS object
-    JS_SetOpaque(obj, hint);
-
-    // 4. wrap it in a napi_value and return
     *result = env->wrap_value_in_current_scope(obj, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
@@ -330,7 +316,6 @@ extern "C"
         napi_external_backing_store_hint__::destroy(hint);
         return napi_util__::return_pending_if_caught(env, "Failed to create external array");
       }
-      env->track_external_array_buffer_hint(out, hint);
     }
 
     *result = env->wrap_value_in_current_scope(out, true);
@@ -480,7 +465,14 @@ extern "C"
     if (!JS_IsArrayBuffer(local))
       return napi_arraybuffer_expected;
 
-    napi_external_backing_store_hint__ *hint = env->external_array_buffer_hint(local);
+    JSFreeArrayBufferDataFunc *free_func = nullptr;
+    void *opaque = nullptr;
+    napi_external_backing_store_hint__ *hint = nullptr;
+    if (JS_GetArrayBufferFreeInfo(env->context(), local, &free_func, &opaque) &&
+        free_func == &napi_external__::free_external_array_buffer_data)
+    {
+      hint = static_cast<napi_external_backing_store_hint__ *>(opaque);
+    }
     if (hint != nullptr)
       hint->begin_detach();
     JS_DetachArrayBuffer(env->context(), local);
@@ -2678,7 +2670,6 @@ extern "C"
     if (*result == nullptr)
       return napi_generic_failure;
 
-    env->track_weak_ref(*result);
     return napi_ok;
   }
 
@@ -2687,7 +2678,6 @@ extern "C"
     if (!napi_util__::check_env(env) || ref == nullptr)
       return napi_invalid_arg;
 
-    env->remove_weak_ref(ref);
     env->delete_ref_from_root_scope(ref);
     return napi_ok;
   }
@@ -2702,9 +2692,6 @@ extern "C"
     napi_ref__ *slot = napi_quickjs_ref_slot(env, ref);
     if (slot == nullptr)
       return napi_invalid_arg;
-
-    if (slot->is_weak())
-      env->remove_weak_ref(ref);
 
     uint32_t count = slot->add_ref();
 
@@ -2726,8 +2713,6 @@ extern "C"
       return napi_invalid_arg;
 
     uint32_t count = slot->rem_ref();
-    if (slot->is_weak())
-      env->track_weak_ref(ref);
 
     if (result != nullptr)
       *result = count;

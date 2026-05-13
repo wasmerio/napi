@@ -65,15 +65,11 @@ JSValueConst napi_value__::get_inner() const
   return value_;
 }
 
-napi_value__ *napi_quickjs_value_slot(napi_env env, napi_value value)
-{
-  if (env == nullptr || value == nullptr || env->current_scope() == nullptr)
-    return nullptr;
-  return env->value_from_current_scope(value);
-}
-
 JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)
 {
-  napi_value__ *slot = napi_quickjs_value_slot(env, value);
-  return slot == nullptr ? JS_UNDEFINED : slot->get_inner();
+  assert(env != nullptr);
+  assert(value != nullptr);
+
+  napi_value__ *data = env->value_from_handle(value);
+  return data->get_inner();
 }

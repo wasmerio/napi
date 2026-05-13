@@ -2,6 +2,8 @@
 
 #include "internal/napi_env.h"
 
+#include <new>
+
 napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
 {
   release();
@@ -44,7 +46,11 @@ napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(
 {
   if (env == nullptr || env->context() == nullptr)
     return nullptr;
-  return env->create_external_backing_store_hint(external_data, finalize_cb, finalize_hint);
+  auto *hint = new (std::nothrow) napi_external_backing_store_hint__;
+  if (hint == nullptr)
+    return nullptr;
+  hint->initialize(env, external_data, finalize_cb, finalize_hint);
+  return hint;
 }
 
 void napi_external_backing_store_hint__::destroy(napi_external_backing_store_hint__ *hint)
@@ -63,9 +69,7 @@ void napi_external_backing_store_hint__::destroy_with_runtime(
     return;
 
   (void)rt;
-  napi_env env = hint->env_;
-  if (env != nullptr)
-    env->destroy_external_backing_store_hint(hint);
+  delete hint;
 }
 
 void napi_external_backing_store_hint__::invoke_finalizer()

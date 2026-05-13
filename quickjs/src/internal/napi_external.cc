@@ -135,8 +135,6 @@ void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaqu
   hint->invoke_finalizer();
   if (hint->is_detaching())
     return;
-  if (hint->env() != nullptr)
-    hint->env()->untrack_external_array_buffer_hint(hint);
   napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
 }
 
@@ -146,9 +144,6 @@ void napi_external__::finalizer(JSRuntime *rt, JSValue value)
   if (hint == nullptr)
     return;
 
-  JSValue target = hint->finalizer_target(value);
-  if (hint->env() != nullptr)
-    hint->env()->clear_weak_refs_for_value(target);
   hint->invoke_finalizer();
   napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
 }

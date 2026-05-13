@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <quickjs.h>
@@ -40,11 +39,13 @@ struct napi_env__
   void destroy_scope(napi_handle_scope scope);
   napi_scope__ *scope_from_handle(napi_handle_scope scope) const;
   napi_value wrap_value_in_current_scope(JSValue value, bool owned);
+  JSValue wrap_external_data(void *data);
+  JSValue wrap_external_data(void *data, node_api_basic_finalize finalize_cb, void *finalize_hint);
+  napi_value__ *value_from_handle(napi_value value);
   void delete_value_from_current_scope(napi_value value);
-  napi_value__ *value_from_current_scope(napi_value value);
   napi_ref wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count);
   void delete_ref_from_root_scope(napi_ref ref);
-  napi_ref__ *ref_from_root_scope(napi_ref ref);
+  napi_ref__ *ref_from_handle(napi_ref ref);
   size_t ref_storage_slot_count() const;
   size_t active_ref_count() const;
   bool is_current_scope(napi_handle_scope scope) const;
@@ -87,19 +88,6 @@ struct napi_env__
   void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
   napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
   void destroy_deferred(napi_deferred__ *deferred);
-  napi_external_backing_store_hint__ *create_external_backing_store_hint(
-      void *external_data,
-      node_api_basic_finalize finalize_cb,
-      void *finalize_hint);
-  void destroy_external_backing_store_hint(napi_external_backing_store_hint__ *hint);
-
-  void track_weak_ref(napi_ref ref);
-  void remove_weak_ref(napi_ref ref);
-  void clear_weak_refs_for_value(JSValueConst value);
-  void track_external_array_buffer_hint(JSValueConst arraybuffer, napi_external_backing_store_hint__ *hint);
-  napi_external_backing_store_hint__ *external_array_buffer_hint(JSValueConst arraybuffer) const;
-  void untrack_external_array_buffer_hint(napi_external_backing_store_hint__ *hint);
-
   int64_t adjust_external_memory(int64_t change_in_bytes);
 
   napi_promises__ &promises();
@@ -128,22 +116,15 @@ private:
   // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
 
-  // Weak refs grouped by referenced QuickJS object identity.
-  std::unordered_multimap<void *, napi_ref> weak_refs_;
-
-  // External ArrayBuffer hints grouped by QuickJS object identity.
-  std::unordered_multimap<void *, napi_external_backing_store_hint__ *> external_array_buffer_hints_;
-
   // Scope stack.
   napi_handle_scope root_scope_ = nullptr;
   napi_handle_scope current_scope_ = nullptr;
 
   // Env-owned slot allocators.
-  napi_allocator__<napi_scope__, napi_env__> scopes_;
-  napi_allocator__<napi_ref__, napi_env__> refs_;
-  napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
-  napi_allocator__<napi_deferred__, napi_env__> deferreds_;
-  napi_allocator__<napi_external_backing_store_hint__, napi_env__> external_backing_store_hints_;
+  napi_allocator__<napi_handle_scope, napi_scope__, napi_env__> scopes_;
+  napi_allocator__<napi_ref, napi_ref__, napi_env__> refs_;
+  napi_allocator__<napi_env_cleanup_hook, napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
+  napi_allocator__<napi_deferred, napi_deferred__, napi_env__> deferreds_;
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.

@@ -60,7 +60,7 @@ bool napi_util__::check_env(napi_env env)
 
 bool napi_util__::check_value(napi_env env, napi_value value)
 {
-  return check_env(env) && value != nullptr && napi_quickjs_value_slot(env, value) != nullptr;
+  return (check_env(env) && value != nullptr);
 }
 
 JSContext *napi_util__::context(napi_env env)

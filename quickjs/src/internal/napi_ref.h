@@ -24,21 +24,26 @@ struct napi_ref__
   uint32_t add_ref();
   uint32_t rem_ref();
   uint32_t ref_count() const;
-  bool can_be_weak() const;
   bool is_empty() const;
   bool is_weak() const;
   napi_env env() const;
   JSValueConst get_inner() const;
   JSValue dup_inner() const;
-  void clear_if_matches(JSValueConst value);
 
 private:
+  static void weak_target_finalized(JSRuntime *rt, void *opaque);
+
+  void clear_weak_target();
+  void delete_weak_handle();
+  bool make_weak();
+
   // Owning environment and referenced QuickJS value.
   napi_env env_ = nullptr;
   JSValue value_ = JS_UNDEFINED;
+  JSNativeWeakRefLink weak_link_{};
 
-  // Reference strength.
-  bool can_be_weak_ = false;
+  // N-API logical reference count returned by napi_reference_ref/unref.
+  // This is intentionally separate from QuickJS's total JSValue ref count.
   uint32_t ref_count_ = 0;
 };
 

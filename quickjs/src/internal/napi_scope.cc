@@ -26,7 +26,7 @@ napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
   env_ = other.env_;
   level_ = other.level_;
   parent_ = other.parent_;
-  values_ = static_cast<napi_allocator__<napi_value__, napi_scope__> &&>(other.values_);
+  values_ = static_cast<napi_allocator__<napi_value, napi_value__, napi_scope__> &&>(other.values_);
   values_.set_owner(this);
   closed_ = other.closed_;
   escaped_ = other.escaped_;
@@ -105,9 +105,12 @@ napi_value napi_scope__::escape_value(napi_value value)
   if (parent_ == nullptr || value == nullptr)
     return record_escape(nullptr);
 
-  napi_value__ *slot = value_from_handle(value);
-  if (slot == nullptr)
+  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
+  assert(owner == this);
+
+  if (owner != this)
     return record_escape(nullptr);
+
   napi_scope__ *parent_scope = parent();
   return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(slot->get_inner(), false));
 }
@@ -117,19 +120,13 @@ void napi_scope__::delete_value(napi_value value)
   if (value == nullptr)
     return;
 
-  if (values_.get(value) != nullptr)
+  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
+  assert(owner == this);
+
+  if (owner == this)
   {
     values_.release(value);
   }
-}
-
-napi_value__ *napi_scope__::value_from_handle(napi_value value)
-{
-  napi_value__ *slot = values_.get(value);
-  if (slot != nullptr)
-    return slot;
-  napi_scope__ *parent_scope = parent();
-  return parent_scope == nullptr ? nullptr : parent_scope->value_from_handle(value);
 }
 
 void napi_scope__::close()
