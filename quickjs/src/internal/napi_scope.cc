@@ -12,32 +12,6 @@ napi_scope__::~napi_scope__()
   release();
 }
 
-napi_scope__::napi_scope__(napi_scope__ &&other) noexcept
-{
-  *this = static_cast<napi_scope__ &&>(other);
-}
-
-napi_scope__ &napi_scope__::operator=(napi_scope__ &&other) noexcept
-{
-  if (this == &other)
-    return *this;
-
-  release();
-  env_ = other.env_;
-  level_ = other.level_;
-  parent_ = other.parent_;
-  values_ = static_cast<napi_allocator__<napi_value, napi_value__, napi_scope__> &&>(other.values_);
-  values_.set_owner(this);
-  closed_ = other.closed_;
-  escaped_ = other.escaped_;
-  other.env_ = nullptr;
-  other.level_ = 0;
-  other.parent_ = nullptr;
-  other.closed_ = true;
-  other.escaped_ = false;
-  return *this;
-}
-
 void napi_scope__::initialize(napi_env env, napi_handle_scope parent)
 {
   release();
@@ -121,7 +95,7 @@ void napi_scope__::delete_value(napi_value value)
     return;
 
   auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
-  assert(owner == this);
+  (void)slot;
 
   if (owner == this)
   {
@@ -160,7 +134,7 @@ napi_handle_scope napi_scope__::parent_handle() const
 
 napi_scope__ *napi_scope__::parent() const
 {
-  return env_ == nullptr ? nullptr : env_->scope_from_handle(parent_);
+  return env_ == nullptr || parent_ == nullptr ? nullptr : env_->scope_from_handle(parent_);
 }
 
 napi_env napi_scope__::env() const

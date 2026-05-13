@@ -30,7 +30,7 @@ concept napi_allocator_initializable_payload__ =
       { value.initialize(static_cast<Args &&>(args)...) } -> std::same_as<void>;
     };
 
-template <class Handle, napi_allocator_payload__ T, napi_allocator_owner__ Owner_, size_t N = 16>
+template <class Handle, napi_allocator_payload__ T, napi_allocator_owner__ Owner, size_t N = 16>
 class napi_allocator__
 {
   static_assert(N > 0, "N must be greater than zero");
@@ -39,8 +39,12 @@ private:
   static constexpr size_t next_power_of_two__(size_t value)
   {
     size_t result = 1;
+
     while (result < value)
+    {
       result <<= 1;
+    }
+
     return result;
   }
 
@@ -51,6 +55,16 @@ private:
     slot__ *next_free = nullptr;
     bool active = false;
 
+    static Handle unsafe_handle_from_data(T *data)
+    {
+      return reinterpret_cast<Handle>(data);
+    }
+
+    static T *unsafe_data_from_handle(Handle handle)
+    {
+      return reinterpret_cast<T *>(handle);
+    }
+
     static slot__ *unsafe_slot_from_handle(Handle handle)
     {
       if (handle == nullptr)
@@ -60,31 +74,21 @@ private:
           reinterpret_cast<char *>(handle) - offsetof(slot__, data));
     }
 
-    static const slot__ *unsafe_slot_from_handle(const Handle handle)
+    bool owns_handle(Handle handle) const
     {
-      if (handle == nullptr)
-        return nullptr;
-
-      return reinterpret_cast<const slot__ *>(
-          reinterpret_cast<const char *>(handle) - offsetof(slot__, data));
-    }
-
-    bool owns_value(const Handle handle) const
-    {
-      return handle != nullptr && &data == handle;
+      return (unsafe_handle_from_data(const_cast<T *>(&this->data)) == handle) && this->active;
     }
 
     slot__() = default;
     slot__(const slot__ &) = delete;
+    slot__(slot__ &&) = delete;
     slot__ &operator=(const slot__ &) = delete;
+    slot__ &operator=(slot__ &&) = delete;
   };
 
   struct block_layout__
   {
-    Owner *owner_;
-
-    // Stable storage for payload slots.
-    std::array<slot__, N> slots;
+    Owner *owner_ = nullptr;
 
     // Block occupancy and free-list state.
     slot__ *first_free = nullptr;
@@ -93,16 +97,20 @@ private:
     // Membership flags for allocator side lists.
     bool listed_available = false;
     bool listed_full = false;
+
+    // Stable storage for payload slots.
+    std::array<slot__, N> slots;
   };
 
   static constexpr size_t block_alignment__ =
       next_power_of_two__(sizeof(block_layout__));
+
   static_assert((block_alignment__ & (block_alignment__ - 1)) == 0,
                 "block alignment must be a power of two");
 
   struct alignas(block_alignment__) block__ : block_layout__
   {
-    block__(Owner_ *owner) : owner_{owner}
+    block__(Owner *owner) : block_layout__{owner}
     {
       reset_free_list();
     }
@@ -115,6 +123,9 @@ private:
       if (slot == nullptr)
         return nullptr;
 
+      // regardless of which slot we're in, we can find start of the block__ by zeroing
+      // last few bits of hte address, because we require that block__ are allocated at
+      // memory locations alligned to sizeof block_layout__
       return reinterpret_cast<block__ *>(
           reinterpret_cast<uintptr_t>(slot) & ~(static_cast<uintptr_t>(block_alignment__) - 1));
     }
@@ -159,8 +170,8 @@ private:
         slot__ &slot = this->slots[i - 1];
         if (slot.active)
         {
-          if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
-            quickjs::detail::napi_lifetime__<T>::record_release(owner_, &slot.data);
+          if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
+            quickjs::detail::napi_lifetime__<T>::record_release(this->owner_, &slot.data);
           slot.data.release();
           slot.active = false;
         }
@@ -172,9 +183,9 @@ private:
       reset_free_list();
     }
 
-    Owner_ *owner() const
+    Owner *owner() const
     {
-      return owner_;
+      return this->owner_;
     }
 
     bool is_full() const
@@ -203,36 +214,15 @@ private:
                 "napi_allocator__ block must fit exactly in its alignment region");
 
 public:
-  explicit napi_allocator__(Owner_ *owner = nullptr) : owner_(owner) {}
+  explicit napi_allocator__(Owner *owner) : owner_(owner) {}
   napi_allocator__(const napi_allocator__ &) = delete;
+  napi_allocator__(napi_allocator__ &&other) = delete;
   napi_allocator__ &operator=(const napi_allocator__ &) = delete;
-
-  napi_allocator__(napi_allocator__ &&other) noexcept : owner_(other.owner_)
-  {
-    *this = static_cast<napi_allocator__ &&>(other);
-  }
-
-  napi_allocator__ &operator=(napi_allocator__ &&other) noexcept
-  {
-    if (this == &other)
-      return *this;
-
-    close();
-    owner_ = other.owner_;
-    blocks_ = static_cast<std::list<block__> &&>(other.blocks_);
-    available_blocks_ = static_cast<std::vector<block__ *> &&>(other.available_blocks_);
-    full_blocks_ = static_cast<std::vector<block__ *> &&>(other.full_blocks_);
-    return *this;
-  }
+  napi_allocator__ &operator=(napi_allocator__ &&other) = delete;
 
   ~napi_allocator__()
   {
     close();
-  }
-
-  void set_owner(Owner_ *owner)
-  {
-    owner_ = owner;
   }
 
   template <typename... Args>
@@ -248,7 +238,7 @@ public:
       return nullptr;
 
     slot->data.initialize(static_cast<Args &&>(args)...);
-    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
+    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
       quickjs::detail::napi_lifetime__<T>::record_create(owner_, &slot->data);
 
     if (block->is_full())
@@ -264,46 +254,46 @@ public:
 
   static Handle unsafe_handle_from_data(T *data)
   {
-    return reinterpret_cast<Handle>(data);
+    return slot__::unsafe_handle_from_data(data);
   }
 
   static T *unsafe_data_from_handle(const Handle handle)
   {
-    return reinterpret_cast<T *>(handle);
+    return slot__::unsafe_data_from_handle(handle);
   }
 
-  static std::pair<T *, Owner_ *> unsafe_data_with_owner_from_handle(const Handle handle)
+  static std::pair<T *, Owner *> unsafe_data_with_owner_from_handle(Handle handle)
   {
-    const slot__ *slot = slot__::unsafe_slot_from_handle(handle);
+    slot__ *slot = slot__::unsafe_slot_from_handle(handle);
     const block__ *block = block__::unsafe_block_from_slot(slot);
 
-    assert(slot->owns_value(handle));
-    assert(slot->active);
+    assert(slot->owns_handle(handle));
 
     return {&slot->data, block->owner()};
   }
 
-  bool owns_slot_from_handle(const Handle handle) const
+  bool owns_handle(Handle handle) const
   {
-    const slot__ *slot = slot__::unsafe_slot_from_handle(handle);
-    return owns_slot(slot);
+    slot__ *slot = slot__::unsafe_slot_from_handle(handle);
+    block__ *block = block__::unsafe_block_from_slot(slot);
+
+    return owns_block(block) && (slot_index(block, slot) < N) && slot->owns_handle(handle);
   }
 
   void release(Handle handle)
   {
-    slot__ *slot = slot__::unsafe_value_from_handle(handle);
-    const bool owns = owns_slot(slot);
-    const bool owns_value = owns && slot->owns_value(handle);
-    const bool active = owns_value && slot->active;
-    if (!active)
-      return;
-
-    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner_>)
-      quickjs::detail::napi_lifetime__<T>::record_release(owner_, &slot->data);
-
+    slot__ *slot = slot__::unsafe_slot_from_handle(handle);
     block__ *block = block__::unsafe_block_from_slot(slot);
+
     assert(owns_block(block));
     assert(slot_index(block, slot) < N);
+    assert(slot->owns_handle(handle));
+
+    if (!owns_block(block) || slot_index(block, slot) < N || !slot->owns_handle(handle))
+      return;
+
+    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
+      quickjs::detail::napi_lifetime__<T>::record_release(owner_, &slot->data);
 
     bool was_full = block->is_full();
     slot->data.release();
@@ -316,7 +306,7 @@ public:
   void close()
   {
     for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
-      it->close(owner_);
+      it->close();
     blocks_.clear();
     available_blocks_.clear();
     full_blocks_.clear();
@@ -379,15 +369,6 @@ private:
     return block;
   }
 
-  bool owns_slot(const slot__ *slot) const
-  {
-    if (slot == nullptr)
-      return false;
-
-    const block__ *block = block__::unsafe_block_from_slot(slot);
-    return owns_block(block) && slot_index(block, slot) < N;
-  }
-
   static size_t slot_index(const block__ *block, const slot__ *slot)
   {
     if (block == nullptr || slot == nullptr)
@@ -444,7 +425,7 @@ private:
   std::vector<block__ *> full_blocks_;
 
   // Owner used by lifetime hooks to attribute slot churn.
-  Owner_ *owner_ = nullptr;
+  Owner *owner_ = nullptr;
 };
 
 #endif // NAPI_QUICKJS_ALLOCATOR_H_

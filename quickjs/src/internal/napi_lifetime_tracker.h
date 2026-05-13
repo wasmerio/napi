@@ -19,8 +19,8 @@ namespace quickjs::detail
 template <class T>
 struct napi_lifetime__;
 
-template <typename T, typename Owner_>
-concept napi_lifetime_tracked__ = requires(Owner_ *owner, T *val) {
+template <typename T, typename Owner>
+concept napi_lifetime_tracked__ = requires(Owner *owner, T *val) {
   { napi_lifetime__<T>::record_create(owner, val) } -> std::same_as<void>;
   { napi_lifetime__<T>::record_release(owner, val) } -> std::same_as<void>;
 };
@@ -60,21 +60,21 @@ struct napi_lifetime__<napi_external_backing_store_hint__>
   static void record_release(napi_env__ *owner, napi_external_backing_store_hint__ *val);
 };
 #else
-template <typename T, typename Owner_>
+template <typename T, typename Owner>
 concept napi_lifetime_tracked__ = true;
 
 template <class T>
 struct napi_lifetime__
 {
-  template <typename Owner_>
-  static void record_create(Owner_ *owner, T *val)
+  template <typename Owner>
+  static void record_create(Owner *owner, T *val)
   {
     (void)owner;
     (void)val;
   }
 
-  template <typename Owner_>
-  static void record_release(Owner_ *owner, T *val)
+  template <typename Owner>
+  static void record_release(Owner *owner, T *val)
   {
     (void)owner;
     (void)val;

@@ -40,11 +40,10 @@ struct napi_scope__
   }
 
   napi_scope__();
-  napi_scope__(napi_scope__ &&other) noexcept;
-  napi_scope__ &operator=(napi_scope__ &&other) noexcept;
-
   napi_scope__(const napi_scope__ &) = delete;
+  napi_scope__(napi_scope__ &&other) = delete;
   napi_scope__ &operator=(const napi_scope__ &) = delete;
+  napi_scope__ &operator=(napi_scope__ &&other) = delete;
 
 private:
   // Scope hierarchy.

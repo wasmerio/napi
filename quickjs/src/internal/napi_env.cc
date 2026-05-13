@@ -122,7 +122,7 @@ napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) cons
 #ifdef NDEBUG
   auto scope = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_from_handle(scope_handle);
 #else
-  assert(scopes_.owns_slot_from_handle(scope_handle));
+  assert(scopes_.owns_handle(scope_handle));
   auto [scope, owner] = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_with_owner_from_handle(scope_handle);
   assert(owner == this);
 #endif
@@ -178,7 +178,7 @@ napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 #else
   auto [value, owner] = napi_allocator__<napi_value, napi_value__, napi_scope__>::unsafe_data_with_owner_from_handle(value_handle);
   auto owner_handle = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_handle_from_data(owner);
-  assert(scopes_.owns_slot_from_handle(owner_handle));
+  assert(scopes_.owns_handle(owner_handle));
 #endif
 
   return value;
@@ -201,11 +201,11 @@ void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 napi_ref__ *napi_env__::ref_from_handle(napi_ref ref_handle)
 {
 #ifdef NDEBUG
-  auto ref = napi_allocator__<napi_ref, napi_ref__, napi_scope__>::unsafe_data_from_handle(ref_handle);
+  auto ref = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_from_handle(ref_handle);
 #else
-  auto [ref, owner] = napi_allocator__<napi_ref, napi_ref__, napi_scope__>::unsafe_data_with_owner_from_handle(ref_handle);
-  auto owner_handle = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_handle_from_data(owner);
-  assert(root_scope_ == owner_handle);
+  auto [ref, owner] = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_with_owner_from_handle(ref_handle);
+  assert(owner == this);
+  assert(refs_.owns_handle(ref_handle));
 #endif
 
   return ref;
