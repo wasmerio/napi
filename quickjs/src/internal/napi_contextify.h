@@ -16,6 +16,8 @@ namespace quickjs::detail
         napi_contextify__(napi_env env, JSContext *context);
         ~napi_contextify__();
 
+        void teardown();
+
         napi_contextify__(const napi_contextify__ &) = delete;
         napi_contextify__ &operator=(const napi_contextify__ &) = delete;
 
@@ -88,10 +90,16 @@ namespace quickjs::detail
                                         int32_t line_offset,
                                         int32_t column_offset);
 
+        // Owning environment and QuickJS context.
         napi_env env_;
         JSContext *ctx_;
+
+        // Source-map and error-formatting state.
         bool source_maps_enabled_ = false;
         JSValue source_map_error_source_callback_;
+
+        // Subsystem lifecycle.
+        bool torn_down_ = false;
     };
 }
 

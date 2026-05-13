@@ -41,7 +41,7 @@ namespace quickjs::detail
             return false;
 
         JSContext *ctx = napi_util__::context(env);
-        JSValueConst input = value->get_inner();
+        JSValueConst input = napi_quickjs_value_inner(env, value);
         uint8_t *data = nullptr;
         size_t length = 0;
 
@@ -211,7 +211,7 @@ namespace quickjs::detail
         if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok || this_arg == nullptr)
             return nullptr;
 
-        auto *serializer = new (std::nothrow) napi_serdes__::serializer();
+        auto *serializer = new (std::nothrow) napi_serdes__::serializer{};
         if (serializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Failed to allocate Serializer");
@@ -260,7 +260,7 @@ namespace quickjs::detail
         size_t size = 0;
         uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
                                         &size,
-                                        value->get_inner(),
+                                        napi_quickjs_value_inner(env, value),
                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
         if (bytes == nullptr)
         {
@@ -458,7 +458,7 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        auto *deserializer = new (std::nothrow) napi_serdes__::deserializer();
+        auto *deserializer = new (std::nothrow) napi_serdes__::deserializer{};
         if (deserializer == nullptr)
         {
             napi_throw_error(env, nullptr, "Failed to allocate Deserializer");
@@ -669,7 +669,7 @@ namespace quickjs::detail
         size_t size = 0;
         uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
                                         &size,
-                                        value->get_inner(),
+                                        napi_quickjs_value_inner(env, value),
                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
         if (bytes == nullptr)
             return napi_generic_failure;

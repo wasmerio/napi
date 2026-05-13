@@ -26,19 +26,19 @@ constexpr int32_t kErrored = 5;
 constexpr int32_t kSourcePhase = 1;
 constexpr int32_t kEvaluationPhase = 2;
 
-bool is_nullish(napi_value value)
+bool is_nullish(napi_env env, napi_value value)
 {
   if (value == nullptr)
     return true;
-  JSValueConst inner = value->get_inner();
+  JSValueConst inner = napi_quickjs_value_inner(env, value);
   return JS_IsUndefined(inner) || JS_IsNull(inner);
 }
 
-JSValue js_dup_or_undefined(JSContext *ctx, napi_value value)
+JSValue js_dup_or_undefined(napi_env env, JSContext *ctx, napi_value value)
 {
-  if (is_nullish(value))
+  if (is_nullish(env, value))
     return JS_UNDEFINED;
-  return JS_DupValue(ctx, value->get_inner());
+  return JS_DupValue(ctx, napi_quickjs_value_inner(env, value));
 }
 
 std::string value_to_string(JSContext *ctx, JSValueConst value)
@@ -46,7 +46,7 @@ std::string value_to_string(JSContext *ctx, JSValueConst value)
   const char *str = JS_ToCString(ctx, value);
   if (str == nullptr)
     return {};
-  std::string out(str);
+  std::string out{str};
   JS_FreeCString(ctx, str);
   return out;
 }
@@ -124,10 +124,10 @@ struct napi_module_wrap__::script_referrer
 };
 
 napi_module_wrap__::napi_module_wrap__(napi_env env, JSContext *context)
-    : env_(env),
-      ctx_(context),
-      import_module_dynamically_callback_(JS_UNDEFINED),
-      initialize_import_meta_callback_(JS_UNDEFINED)
+    : env_{env},
+      ctx_{context},
+      import_module_dynamically_callback_{JS_UNDEFINED},
+      initialize_import_meta_callback_{JS_UNDEFINED}
 {
   JSRuntime *rt = JS_GetRuntime(ctx_);
   JS_SetModuleImportMetaInitFunc(rt, host_import_meta_init, this);
@@ -136,6 +136,14 @@ napi_module_wrap__::napi_module_wrap__(napi_env env, JSContext *context)
 
 napi_module_wrap__::~napi_module_wrap__()
 {
+  teardown();
+}
+
+void napi_module_wrap__::teardown()
+{
+  if (torn_down_)
+    return;
+
   JSRuntime *rt = JS_GetRuntime(ctx_);
   JS_SetModuleImportMetaInitFunc(rt, nullptr, nullptr);
   JS_SetModuleDynamicImportFunc(rt, nullptr, nullptr);
@@ -147,7 +155,10 @@ napi_module_wrap__::~napi_module_wrap__()
   script_referrers_.clear();
 
   JS_FreeValue(ctx_, import_module_dynamically_callback_);
+  import_module_dynamically_callback_ = JS_UNDEFINED;
   JS_FreeValue(ctx_, initialize_import_meta_callback_);
+  initialize_import_meta_callback_ = JS_UNDEFINED;
+  torn_down_ = true;
 }
 
 napi_module_wrap__::record *napi_module_wrap__::find(void *handle) const
@@ -282,8 +293,8 @@ JSValue napi_module_wrap__::get_or_create_host_defined_option(napi_value wrapper
                                                               const char *description) const
 {
   JSValue value = JS_UNDEFINED;
-  if (!is_nullish(candidate) && JS_IsSymbol(candidate->get_inner()))
-    value = JS_DupValue(ctx_, candidate->get_inner());
+  if (!is_nullish(env_, candidate) && JS_IsSymbol(napi_quickjs_value_inner(env_, candidate)))
+    value = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, candidate));
   else
     value = JS_NewSymbol(ctx_, description, false);
   set_host_defined_option(wrapper, value);
@@ -292,7 +303,7 @@ JSValue napi_module_wrap__::get_or_create_host_defined_option(napi_value wrapper
 
 void napi_module_wrap__::set_host_defined_option(napi_value wrapper, JSValueConst value) const
 {
-  if (wrapper == nullptr || !JS_IsObject(wrapper->get_inner()))
+  if (wrapper == nullptr || !JS_IsObject(napi_quickjs_value_inner(env_, wrapper)))
     return;
 
   JSValue symbol = get_host_defined_option_symbol();
@@ -301,12 +312,12 @@ void napi_module_wrap__::set_host_defined_option(napi_value wrapper, JSValueCons
     JSAtom atom = JS_ValueToAtom(ctx_, symbol);
     if (atom != JS_ATOM_NULL)
     {
-      JS_SetProperty(ctx_, wrapper->get_inner(), atom, JS_DupValue(ctx_, value));
+      JS_SetProperty(ctx_, napi_quickjs_value_inner(env_, wrapper), atom, JS_DupValue(ctx_, value));
       JS_FreeAtom(ctx_, atom);
     }
   }
   JS_FreeValue(ctx_, symbol);
-  JS_SetPropertyStr(ctx_, wrapper->get_inner(), "contextifyHostDefinedOptionId",
+  JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "contextifyHostDefinedOptionId",
                     JS_DupValue(ctx_, value));
 }
 
@@ -473,7 +484,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return napi_generic_failure;
   }
 
-  auto *entry = new (std::nothrow) record();
+  auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
   {
     JS_FreeValue(ctx_, host_id);
@@ -483,7 +494,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   entry->owner = this;
   entry->module = module;
   entry->module_value = module_value;
-  entry->wrapper = JS_DupValue(ctx_, wrapper->get_inner());
+  entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
   entry->host_defined_option_id = host_id;
   records_.push_back(entry);
 
@@ -494,9 +505,9 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return status;
   }
 
-  JS_SetPropertyStr(ctx_, wrapper->get_inner(), "sourceURL",
+  JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceURL",
                     JS_NewString(ctx_, url_string.c_str()));
-  JS_SetPropertyStr(ctx_, wrapper->get_inner(), "sourceMapURL", JS_UNDEFINED);
+  JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceMapURL", JS_UNDEFINED);
   *handle_out = entry;
   return napi_ok;
 }
@@ -525,11 +536,11 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
     return return_pending_exception("Failed to create synthetic module");
 
   int64_t length = 0;
-  if (JS_GetLength(ctx_, export_names->get_inner(), &length) < 0)
+  if (JS_GetLength(ctx_, napi_quickjs_value_inner(env_, export_names), &length) < 0)
     return return_pending_exception("Failed to read synthetic export names");
   for (int64_t i = 0; i < length; ++i)
   {
-    JSValue name_value = JS_GetPropertyUint32(ctx_, export_names->get_inner(),
+    JSValue name_value = JS_GetPropertyUint32(ctx_, napi_quickjs_value_inner(env_, export_names),
                                               static_cast<uint32_t>(i));
     if (JS_IsException(name_value))
       return return_pending_exception("Failed to read synthetic export name");
@@ -539,15 +550,15 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
       return return_pending_exception("Failed to add synthetic export");
   }
 
-  auto *entry = new (std::nothrow) record();
+  auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
     return napi_generic_failure;
   entry->owner = this;
   entry->module = module;
   entry->module_value = JS_DupModuleValue(ctx_, module);
-  entry->wrapper = JS_DupValue(ctx_, wrapper->get_inner());
+  entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
   entry->host_defined_option_id = JS_UNDEFINED;
-  entry->synthetic_eval_steps = JS_DupValue(ctx_, synthetic_eval_steps->get_inner());
+  entry->synthetic_eval_steps = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, synthetic_eval_steps));
   entry->synthetic = true;
   records_.push_back(entry);
 
@@ -808,14 +819,14 @@ napi_status napi_module_wrap__::set_export(void *handle,
       !napi_util__::check_value(env_, export_name) ||
       !napi_util__::check_value(env_, export_value))
     return napi_util__::invalid_arg(env_);
-  if (!JS_IsString(export_name->get_inner()))
+  if (!JS_IsString(napi_quickjs_value_inner(env_, export_name)))
   {
     env_->set_last_exception(JS_NewTypeError(ctx_, "Synthetic module export name must be a string"));
     return napi_pending_exception;
   }
   std::string name = napi_util__::to_utf8(env_, export_name);
   if (JS_SetModuleExport(ctx_, entry->module, name.c_str(),
-                         JS_DupValue(ctx_, export_value->get_inner())) < 0)
+                         JS_DupValue(ctx_, napi_quickjs_value_inner(env_, export_value))) < 0)
   {
     env_->set_last_exception(JS_NewReferenceError(ctx_, "Synthetic module export is not defined"));
     return napi_pending_exception;
@@ -830,7 +841,7 @@ napi_status napi_module_wrap__::set_module_source_object(void *handle,
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
   JS_FreeValue(ctx_, entry->source_object);
-  entry->source_object = js_dup_or_undefined(ctx_, source_object);
+  entry->source_object = js_dup_or_undefined(env_, ctx_, source_object);
   return napi_ok;
 }
 
@@ -863,8 +874,8 @@ napi_status napi_module_wrap__::set_import_module_dynamically_callback(napi_valu
 {
   JS_FreeValue(ctx_, import_module_dynamically_callback_);
   import_module_dynamically_callback_ =
-      (!is_nullish(callback) && JS_IsFunction(ctx_, callback->get_inner()))
-          ? JS_DupValue(ctx_, callback->get_inner())
+      (!is_nullish(env_, callback) && JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, callback)))
+          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback))
           : JS_UNDEFINED;
   return napi_ok;
 }
@@ -873,8 +884,8 @@ napi_status napi_module_wrap__::set_initialize_import_meta_object_callback(napi_
 {
   JS_FreeValue(ctx_, initialize_import_meta_callback_);
   initialize_import_meta_callback_ =
-      (!is_nullish(callback) && JS_IsFunction(ctx_, callback->get_inner()))
-          ? JS_DupValue(ctx_, callback->get_inner())
+      (!is_nullish(env_, callback) && JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, callback)))
+          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback))
           : JS_UNDEFINED;
   return napi_ok;
 }
@@ -892,15 +903,15 @@ napi_status napi_module_wrap__::import_module_dynamically(size_t argc,
   if (argc >= 5)
   {
     for (size_t i = 0; i < 5; ++i)
-      args[i] = js_dup_or_undefined(ctx_, argv[i]);
+      args[i] = js_dup_or_undefined(env_, ctx_, argv[i]);
   }
   else
   {
     args[0] = get_symbols_binding_property("vm_dynamic_import_default_internal");
-    args[1] = argc >= 1 ? js_dup_or_undefined(ctx_, argv[0]) : JS_UNDEFINED;
+    args[1] = argc >= 1 ? js_dup_or_undefined(env_, ctx_, argv[0]) : JS_UNDEFINED;
     args[2] = JS_NewInt32(ctx_, kEvaluationPhase);
     args[3] = create_frozen_null_proto_object();
-    args[4] = argc >= 2 ? js_dup_or_undefined(ctx_, argv[1]) : JS_UNDEFINED;
+    args[4] = argc >= 2 ? js_dup_or_undefined(env_, ctx_, argv[1]) : JS_UNDEFINED;
   }
 
   JSValue result = call_callback(import_module_dynamically_callback_, 5, args);
@@ -982,8 +993,8 @@ napi_status napi_module_wrap__::create_required_module_facade(void *handle,
 void napi_module_wrap__::register_dynamic_import_referrer(napi_value referrer_name,
                                                           napi_value host_defined_option_id)
 {
-  if (is_nullish(referrer_name) || is_nullish(host_defined_option_id) ||
-      !JS_IsSymbol(host_defined_option_id->get_inner()))
+  if (is_nullish(env_, referrer_name) || is_nullish(env_, host_defined_option_id) ||
+      !JS_IsSymbol(napi_quickjs_value_inner(env_, host_defined_option_id)))
     return;
 
   std::string name = napi_util__::to_utf8(env_, referrer_name);
@@ -995,14 +1006,14 @@ void napi_module_wrap__::register_dynamic_import_referrer(napi_value referrer_na
     if (referrer.name == name)
     {
       JS_FreeValue(ctx_, referrer.host_defined_option_id);
-      referrer.host_defined_option_id = JS_DupValue(ctx_, host_defined_option_id->get_inner());
+      referrer.host_defined_option_id = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, host_defined_option_id));
       return;
     }
   }
 
   script_referrer referrer;
   referrer.name = std::move(name);
-  referrer.host_defined_option_id = JS_DupValue(ctx_, host_defined_option_id->get_inner());
+  referrer.host_defined_option_id = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, host_defined_option_id));
   script_referrers_.push_back(std::move(referrer));
 }
 

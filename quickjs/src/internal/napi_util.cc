@@ -3,6 +3,7 @@
 #include "internal/napi_env.h"
 #include "internal/napi_value.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -59,7 +60,7 @@ bool napi_util__::check_env(napi_env env)
 
 bool napi_util__::check_value(napi_env env, napi_value value)
 {
-  return check_env(env) && value != nullptr;
+  return (check_env(env) && value != nullptr);
 }
 
 JSContext *napi_util__::context(napi_env env)
@@ -115,9 +116,9 @@ std::filesystem::path napi_util__::strip_file_url(std::string_view value)
 {
   constexpr std::string_view kScheme = "file://";
   if (!starts_with(value, kScheme))
-    return std::filesystem::path(std::string(value));
+    return std::filesystem::path{std::string{value}};
 
-  std::string rest(value.substr(kScheme.size()));
+  std::string rest{value.substr(kScheme.size())};
   if (starts_with(rest, "localhost/"))
   {
     rest.erase(0, std::string("localhost").size());
@@ -129,7 +130,7 @@ std::filesystem::path napi_util__::strip_file_url(std::string_view value)
       return {};
     rest.erase(0, slash);
   }
-  return std::filesystem::path(percent_decode(rest));
+  return std::filesystem::path{percent_decode(rest)};
 }
 
 std::filesystem::path napi_util__::resolve_symlink_components(const std::filesystem::path &path)
@@ -178,7 +179,7 @@ std::filesystem::path napi_util__::resolve_symlink_components(const std::filesys
 
 std::string napi_util__::read_text_file(const std::filesystem::path &path)
 {
-  std::ifstream in(path);
+  std::ifstream in{path};
   if (!in.is_open())
   {
     const std::filesystem::path resolved = resolve_symlink_components(path);
@@ -269,7 +270,7 @@ std::string napi_util__::to_utf8(napi_env env, napi_value value)
 {
   if (!check_env(env) || value == nullptr)
     return {};
-  return to_utf8(context(env), value->get_inner());
+  return to_utf8(context(env), napi_quickjs_value_inner(env, value));
 }
 
 std::string napi_util__::to_utf8(JSContext *ctx, JSValueConst value)
@@ -279,7 +280,7 @@ std::string napi_util__::to_utf8(JSContext *ctx, JSValueConst value)
   const char *str = JS_ToCString(ctx, value);
   if (str == nullptr)
     return {};
-  std::string out(str);
+  std::string out{str};
   JS_FreeCString(ctx, str);
   return out;
 }
@@ -295,7 +296,7 @@ void napi_util__::set_string_property(JSContext *ctx,
 bool napi_util__::is_truthy_property(napi_env env, napi_value object, const char *name)
 {
   JSContext *ctx = context(env);
-  JSValue prop = JS_GetPropertyStr(ctx, object->get_inner(), name);
+  JSValue prop = JS_GetPropertyStr(ctx, napi_quickjs_value_inner(env, object), name);
   if (JS_IsException(prop))
     return false;
   bool out = JS_ToBool(ctx, prop);
@@ -310,7 +311,7 @@ napi_status napi_util__::wrap_owned(napi_env env, JSValue value, napi_value *res
     JS_FreeValue(context(env), value);
     return napi_invalid_arg;
   }
-  *result = env->current_scope()->wrap_value(value, true);
+  *result = env->wrap_value_in_current_scope(value, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -338,7 +339,20 @@ napi_value napi_util__::undefined_value(napi_env env)
 
 bool napi_util__::is_callable(napi_env env, napi_value value)
 {
-  return value != nullptr && JS_IsFunction(context(env), value->get_inner());
+  return value != nullptr && JS_IsFunction(context(env), napi_quickjs_value_inner(env, value));
+}
+
+std::vector<JSValue> napi_util__::prepare_call_args(napi_env env, size_t argc, const napi_value *argv)
+{
+  std::vector<JSValue> js_argv;
+  js_argv.resize(argc);
+  if (argc > 0)
+  {
+    std::transform(argv, argv + argc, js_argv.begin(), [env](napi_value value) {
+      return napi_quickjs_value_inner(env, value);
+    });
+  }
+  return js_argv;
 }
 
 napi_status napi_util__::run_pending_jobs(napi_env env)
@@ -604,7 +618,7 @@ napi_status napi_util__::get_property_names(napi_env env,
     return invalid_arg(env);
 
   JSContext *ctx = env->context();
-  JSValue obj = object->get_inner();
+  JSValue obj = napi_quickjs_value_inner(env, object);
   if (!JS_IsObject(obj))
     return napi_object_expected;
 
@@ -710,7 +724,7 @@ napi_status napi_util__::get_property_names(napi_env env,
     JS_FreeValue(ctx, proto);
   }
 
-  *result = env->current_scope()->wrap_value(arr, true);
+  *result = env->wrap_value_in_current_scope(arr, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -734,7 +748,7 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
 
-  JSValue msg_val = msg->get_inner();
+  JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))
     return napi_string_expected;
 
@@ -742,14 +756,14 @@ napi_status napi_util__::create_plain_error_common(napi_env env,
   JSValue error = create_plain_error(env->context(), msg_str);
   JS_FreeCString(env->context(), msg_str);
 
-  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
+  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
   {
-    const char *code_str = JS_ToCString(env->context(), code->get_inner());
+    const char *code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
     JS_SetPropertyStr(env->context(), error, "code", JS_NewString(env->context(), code_str));
     JS_FreeCString(env->context(), code_str);
   }
 
-  *result = env->current_scope()->wrap_value(error, true);
+  *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -774,14 +788,14 @@ napi_status napi_util__::create_error_common(napi_env env,
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
 
-  JSValue msg_val = msg->get_inner();
+  JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))
     return napi_string_expected;
 
   const char *msg_str = JS_ToCString(env->context(), msg_val);
   const char *code_str = nullptr;
-  if (code != nullptr && !JS_IsUndefined(code->get_inner()) && !JS_IsNull(code->get_inner()))
-    code_str = JS_ToCString(env->context(), code->get_inner());
+  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
+    code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
 
   JSValue error = create_error_object(env->context(), factory, code_str, msg_str);
 
@@ -789,6 +803,6 @@ napi_status napi_util__::create_error_common(napi_env env,
   if (code_str != nullptr)
     JS_FreeCString(env->context(), code_str);
 
-  *result = env->current_scope()->wrap_value(error, true);
+  *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

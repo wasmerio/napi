@@ -3,33 +3,48 @@
 
 #include "../../../include/js_native_api.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <quickjs.h>
 
 struct napi_ref__
 {
-  static napi_ref__ *create(napi_env env, JSValueConst value, uint32_t initial_ref_count);
-  static void destroy(napi_ref__ *ref);
-
+  napi_ref__(napi_env env, JSValueConst value, uint32_t initial_ref_count);
   ~napi_ref__();
 
+  napi_ref__(const napi_ref__ &) = delete;
+  napi_ref__(napi_ref__ &&other) = delete;
+  napi_ref__ &operator=(const napi_ref__ &) = delete;
+  napi_ref__ &operator=(napi_ref__ &&other) = delete;
+
+  bool is_active() const;
   uint32_t add_ref();
   uint32_t rem_ref();
   uint32_t ref_count() const;
-  bool can_be_weak() const;
   bool is_empty() const;
   bool is_weak() const;
+  napi_env env() const;
   JSValueConst get_inner() const;
   JSValue dup_inner() const;
-  void clear_if_matches(JSValueConst value);
+  void clear_for_teardown();
 
 private:
-  napi_ref__(napi_env env, JSValueConst value, uint32_t initial_ref_count);
+  static void weak_target_finalized(JSRuntime *rt, void *opaque);
 
-  napi_env env_;
-  JSValue value_;
-  bool can_be_weak_;
-  uint32_t ref_count_;
+  void clear_weak_target();
+  void delete_weak_handle();
+  bool make_weak();
+
+  // Owning environment and referenced QuickJS value.
+  napi_env env_ = nullptr;
+  JSValue value_ = JS_UNDEFINED;
+  JSNativeWeakRefLink weak_link_{};
+
+  // N-API logical reference count returned by napi_reference_ref/unref.
+  // This is intentionally separate from QuickJS's total JSValue ref count.
+  uint32_t ref_count_ = 0;
 };
+
+napi_ref__ *napi_quickjs_ref_slot(napi_env env, napi_ref ref);
 
 #endif // NAPI_QUICKJS_REF_H_

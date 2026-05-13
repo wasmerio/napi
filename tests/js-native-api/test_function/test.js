@@ -31,6 +31,10 @@ assert.strictEqual(test_function.TestCall(func4, 1), 2);
 assert.strictEqual(test_function.TestName.name, 'Name');
 assert.strictEqual(test_function.TestNameShort.name, 'Name_');
 
+const parentScopeValue = test_function.ReturnParentScopeValue();
+assert.strictEqual(parentScopeValue, test_function.ParentScopeValue);
+assert.strictEqual(test_function.ReturnParentScopeValue(), parentScopeValue);
+
 let tracked_function = test_function.MakeTrackedFunction(common.mustCall());
 assert(!!tracked_function);
 tracked_function = null;

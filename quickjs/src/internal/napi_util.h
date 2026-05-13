@@ -45,6 +45,7 @@ public:
   static napi_status create_undefined(napi_env env, napi_value *result);
   static napi_value undefined_value(napi_env env);
   static bool is_callable(napi_env env, napi_value value);
+  static std::vector<JSValue> prepare_call_args(napi_env env, size_t argc, const napi_value *argv);
   static napi_status run_pending_jobs(napi_env env);
   static JSValue get_constructor_name_value(napi_env env, JSValueConst value);
   static napi_status unsupported_if_valid_env(napi_env env);

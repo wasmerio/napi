@@ -6,12 +6,16 @@ napi_callback_info__::napi_callback_info__(napi_env env,
                                            int argc,
                                            JSValueConst *argv,
                                            void *data)
-    : env_(env),
-      this_val_(this_val),
-      new_target_(new_target),
-      argc_(argc),
-      argv_(argv),
-      data_(data)
+    : env_{env},
+      this_val_{this_val},
+      new_target_{new_target},
+      argc_{argc},
+      argv_{argv},
+      data_{data}
+{
+}
+
+napi_callback_info__::~napi_callback_info__()
 {
 }
 

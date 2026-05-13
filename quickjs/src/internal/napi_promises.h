@@ -16,6 +16,8 @@ public:
   napi_promises__(napi_env env, JSContext *context);
   ~napi_promises__();
 
+  void teardown();
+
   napi_status set_reject_callback(napi_value callback);
   bool has_reject_callback() const;
   JSValue dup_reject_callback() const;
@@ -51,13 +53,21 @@ private:
   void call_hook(JSValueConst hook, int argc, JSValueConst *argv);
   void clear_pending_exception_if_any();
 
+  // Owning environment and QuickJS context.
   napi_env env_ = nullptr;
   JSContext *context_ = nullptr;
+
+  // Promise reject callback and lifecycle hooks.
   JSValue promise_reject_callback_;
   std::array<JSValue, 4> promise_hooks_;
+
+  // Continuation and async context tracking.
   JSValue continuation_preserved_embedder_data_;
   std::unordered_map<void *, JSValue> promise_context_frames_;
   std::vector<JSValue> promise_context_frame_stack_;
+
+  // Subsystem lifecycle.
+  bool torn_down_ = false;
 };
 
 #endif // NAPI_QUICKJS_INTERNAL_NAPI_PROMISES_H_

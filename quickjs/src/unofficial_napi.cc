@@ -38,7 +38,7 @@ namespace
         JS_SetPromiseHook(rt, nullptr, nullptr);
         JS_SetHostPromiseRejectionTracker(rt, nullptr, nullptr);
         JS_SetContextOpaque(ctx, nullptr);
-        delete env;
+        env->prepare_teardown();
         return napi_ok;
     }
 
@@ -49,8 +49,10 @@ namespace
 
         auto *scope = static_cast<UnofficialEnvScope *>(scope_ptr);
         napi_status status = napi_ok;
+        napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)
         {
+            env_to_delete = scope->env;
             status = DestroyEnvInstance(scope->env);
             scope->env = nullptr;
         }
@@ -61,9 +63,14 @@ namespace
         }
         if (scope->rt != nullptr)
         {
-            // JS_FreeRuntime(scope->rt);
+            JS_FreeRuntime(scope->rt);
             scope->rt = nullptr;
         }
+        if (env_to_delete != nullptr)
+        {
+            env_to_delete->finalize_instance_data();
+        }
+        delete env_to_delete;
         delete scope;
         return status;
     }
@@ -135,7 +142,7 @@ extern "C"
         if (!EnsureNodeWellKnownSymbols(context))
             return JS_HasException(context) ? napi_pending_exception : napi_generic_failure;
 
-        auto env = new (std::nothrow) napi_env__(context, module_api_version);
+        auto env = new (std::nothrow) napi_env__{context, module_api_version};
         if (env == nullptr)
             return napi_generic_failure;
         if (env->root_scope() == nullptr)
@@ -179,7 +186,7 @@ extern "C"
         auto ctx = JS_NewContext(rt);
         if (ctx == nullptr)
         {
-            // JS_FreeRuntime(rt);
+            JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
 
@@ -187,7 +194,7 @@ extern "C"
         if (scope == nullptr)
         {
             JS_FreeContext(ctx);
-            // JS_FreeRuntime(rt);
+            JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
 
@@ -196,7 +203,7 @@ extern "C"
         {
             delete scope;
             JS_FreeContext(ctx);
-            // JS_FreeRuntime(rt);
+            JS_FreeRuntime(rt);
             return (status == napi_ok) ? napi_generic_failure : status;
         }
 
@@ -349,7 +356,7 @@ extern "C"
         if (!napi_util__::check_env(env) || !napi_util__::is_callable(env, callback))
             return napi_invalid_arg;
         JSContext *ctx = napi_util__::context(env);
-        JSValueConst argv[] = {callback->get_inner()};
+        JSValueConst argv[] = {napi_quickjs_value_inner(env, callback)};
         if (JS_EnqueueJob(ctx, napi_promises__::microtask_job, 1, argv) < 0)
             return JS_HasException(ctx) ? napi_pending_exception : napi_generic_failure;
         return napi_ok;
@@ -436,14 +443,14 @@ extern "C"
         if (!napi_util__::check_env(env) || promise == nullptr || state_out == nullptr || has_result_out == nullptr)
             return napi_invalid_arg;
         JSContext *ctx = napi_util__::context(env);
-        JSPromiseStateEnum state = JS_PromiseState(ctx, promise->get_inner());
+        JSPromiseStateEnum state = JS_PromiseState(ctx, napi_quickjs_value_inner(env, promise));
         if (state == JS_PROMISE_NOT_A_PROMISE)
             return napi_invalid_arg;
         *state_out = static_cast<int32_t>(state);
         *has_result_out = state != JS_PROMISE_PENDING;
         JSValue result = JS_UNDEFINED;
         if (*has_result_out)
-            result = JS_PromiseResult(ctx, promise->get_inner());
+            result = JS_PromiseResult(ctx, napi_quickjs_value_inner(env, promise));
         if (result_out != nullptr)
             return napi_util__::wrap_owned(env, result, result_out);
         JS_FreeValue(ctx, result);
@@ -561,7 +568,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        JSValue buffer = JS_GetTypedArrayBuffer(napi_util__::context(env), value->get_inner(), nullptr, nullptr, nullptr);
+        JSValue buffer = JS_GetTypedArrayBuffer(napi_util__::context(env), napi_quickjs_value_inner(env, value), nullptr, nullptr, nullptr);
         if (JS_IsException(buffer))
         {
             JSValue exc = JS_GetException(napi_util__::context(env));
@@ -580,7 +587,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr || name_out == nullptr)
             return napi_invalid_arg;
-        JSValue name = napi_util__::get_constructor_name_value(env, value->get_inner());
+        JSValue name = napi_util__::get_constructor_name_value(env, napi_quickjs_value_inner(env, value));
         if (JS_IsException(name))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env, name, name_out);
@@ -595,7 +602,7 @@ extern "C"
         if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         JSContext *ctx = napi_util__::context(env);
-        JSValue obj = value->get_inner();
+        JSValue obj = napi_quickjs_value_inner(env, value);
         if (!JS_IsObject(obj))
             return napi_object_expected;
 
@@ -697,8 +704,8 @@ extern "C"
             utf8description == nullptr ? 0
             : length == NAPI_AUTO_LENGTH ? std::strlen(utf8description)
                                          : length;
-        std::string description(utf8description == nullptr ? "" : utf8description,
-                                description_length);
+        std::string description{utf8description == nullptr ? "" : utf8description,
+                                description_length};
         JSValue symbol = JS_NewSymbol(napi_util__::context(env), description.c_str(), false);
         if (JS_IsException(symbol))
             return napi_pending_exception;
@@ -715,7 +722,7 @@ extern "C"
         size_t size = 0;
         uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
                                         &size,
-                                        value->get_inner(),
+                                        napi_quickjs_value_inner(env, value),
                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
         if (bytes == nullptr)
             return napi_generic_failure;
@@ -729,7 +736,7 @@ extern "C"
 
         if (transfer_list_or_null != nullptr)
         {
-            JSValueConst transfer_list = transfer_list_or_null->get_inner();
+            JSValueConst transfer_list = napi_quickjs_value_inner(env, transfer_list_or_null);
             if (!JS_IsUndefined(transfer_list) && !JS_IsNull(transfer_list) &&
                 JS_IsArray(transfer_list))
             {
@@ -968,7 +975,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr)
             return napi_invalid_arg;
-        env->promises().set_continuation_preserved_embedder_data(value->get_inner());
+        env->promises().set_continuation_preserved_embedder_data(napi_quickjs_value_inner(env, value));
         return napi_ok;
     }
 

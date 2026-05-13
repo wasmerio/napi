@@ -1,14 +1,18 @@
 #include "internal/napi_scope.h"
 
 #include "internal/napi_env.h"
-#include "internal/napi_value.h"
+#include "internal/napi_lifetime_tracker.h"
 
-#include <new>
-
-napi_scope__::napi_scope__(napi_env env, napi_scope__ *parent)
-    : env_(env),
-      parent_(parent)
+napi_scope__::napi_scope__(napi_env env, napi_handle_scope parent)
+    : values_{this}, env_{env}, parent_{parent}
 {
+  napi_scope__ *parent_scope = this->parent();
+  level_ = parent_scope == nullptr ? 0 : parent_scope->level() + 1;
+
+  if (parent_scope != nullptr)
+  {
+    values_.reserve_prefix(parent_scope->value_slot_count());
+  }
 }
 
 napi_scope__::~napi_scope__()
@@ -16,29 +20,14 @@ napi_scope__::~napi_scope__()
   close();
 }
 
-napi_scope__ *napi_scope__::create(napi_env env, napi_scope__ *parent)
+bool napi_scope__::is_active() const
 {
-  if (env == nullptr || env->context() == nullptr)
-    return nullptr;
-
-  void *memory = js_mallocz(env->context(), sizeof(napi_scope__));
-  if (memory == nullptr)
-    return nullptr;
-
-  return new (memory) napi_scope__(env, parent);
+  return env_ != nullptr;
 }
 
-void napi_scope__::destroy(napi_scope__ *scope)
+size_t napi_scope__::level() const
 {
-  if (scope == nullptr)
-    return;
-
-  napi_env env = scope->env_;
-  scope->~napi_scope__();
-  if (env != nullptr && env->context() != nullptr)
-  {
-    js_free(env->context(), scope);
-  }
+  return level_;
 }
 
 napi_value napi_scope__::wrap_value(JSValue value, bool owned)
@@ -50,7 +39,7 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  napi_value wrapped = napi_value__::create(env_, value, owned);
+  napi_value wrapped = values_.allocate(env_, value, owned);
   if (wrapped == nullptr)
   {
     if (owned && env_ != nullptr && env_->context() != nullptr)
@@ -58,16 +47,28 @@ napi_value napi_scope__::wrap_value(JSValue value, bool owned)
     return nullptr;
   }
 
-  values_.push_back(wrapped);
   return wrapped;
 }
 
 napi_value napi_scope__::escape_value(napi_value value)
 {
-  if (parent_ == nullptr || value == nullptr)
-    return nullptr;
+  auto record_escape = [this](napi_value escaped)
+  {
+    quickjs::detail::napi_lifetime_tracker__::record_scope_escape(env_, escaped != nullptr);
+    return escaped;
+  };
 
-  return parent_->wrap_value(value->get_inner(), false);
+  if (parent_ == nullptr || value == nullptr)
+    return record_escape(nullptr);
+
+  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
+  assert(owner == this);
+
+  if (owner != this)
+    return record_escape(nullptr);
+
+  napi_scope__ *parent_scope = parent();
+  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(slot->get_inner(), false));
 }
 
 void napi_scope__::delete_value(napi_value value)
@@ -75,14 +76,12 @@ void napi_scope__::delete_value(napi_value value)
   if (value == nullptr)
     return;
 
-  for (auto it = values_.begin(); it != values_.end(); ++it)
+  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
+  (void)slot;
+
+  if (owner == this)
   {
-    if (*it == value)
-    {
-      values_.erase(it);
-      napi_value__::destroy(value);
-      break;
-    }
+    values_.release(value);
   }
 }
 
@@ -91,20 +90,46 @@ void napi_scope__::close()
   if (closed_)
     return;
 
-  for (auto it = values_.rbegin(); it != values_.rend(); ++it)
-  {
-    napi_value__::destroy(*it);
-  }
-  values_.clear();
+  values_.close();
   closed_ = true;
+}
+
+size_t napi_scope__::value_slot_count() const
+{
+  return values_.slot_count();
+}
+
+size_t napi_scope__::value_storage_slot_count() const
+{
+  return values_.storage_slot_count();
+}
+
+size_t napi_scope__::active_value_count() const
+{
+  return values_.active_count();
+}
+
+napi_handle_scope napi_scope__::parent_handle() const
+{
+  return parent_;
 }
 
 napi_scope__ *napi_scope__::parent() const
 {
-  return parent_;
+  return env_ == nullptr || parent_ == nullptr ? nullptr : env_->scope_from_handle(parent_);
 }
 
 napi_env napi_scope__::env() const
 {
   return env_;
+}
+
+bool napi_scope__::has_escaped() const
+{
+  return escaped_;
+}
+
+void napi_scope__::mark_escaped()
+{
+  escaped_ = true;
 }

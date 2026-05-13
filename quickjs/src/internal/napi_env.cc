@@ -1,41 +1,95 @@
 #include "internal/napi_env.h"
 
+#include "internal/napi_external.h"
+#include "internal/napi_lifetime_macros.h"
+
 #include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <cassert>
 
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
-    : context_(context),
-      last_exception_(JS_UNDEFINED),
-      module_api_version_(module_api_version),
-      promises_(this, context),
-      contextify_(this, context),
-      module_wrap_(this, context)
+    : context_{context},
+      module_api_version_{module_api_version},
+      last_exception_{JS_UNDEFINED},
+      scopes_{this},
+      refs_{this},
+      cleanup_hooks_{this},
+      deferreds_{this},
+      external_backing_stores_{this},
+      promises_{this, context},
+      contextify_{this, context},
+      module_wrap_{this, context}
 {
-  root_scope_ = napi_scope__::create(this, nullptr);
+  root_scope_ = create_scope(nullptr);
   current_scope_ = root_scope_;
   clear_last_error();
 }
 
 napi_env__::~napi_env__()
 {
-  for (auto it = env_cleanup_hooks_.rbegin(); it != env_cleanup_hooks_.rend(); ++it)
+  prepare_teardown();
+  finalize_instance_data();
+}
+
+void napi_env__::prepare_teardown()
+{
+  if (torn_down_)
+    return;
+
+  NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
+  while (!env_cleanup_hooks_.empty())
   {
-    auto *entry = *it;
+    auto *entry = env_cleanup_hooks_.back();
+    env_cleanup_hooks_.pop_back();
     if (entry != nullptr)
     {
       entry->run();
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
-  env_cleanup_hooks_.clear();
-
-  if (instance_data_ != nullptr && instance_data_finalize_cb_ != nullptr)
-    instance_data_finalize_cb_(this, instance_data_, instance_data_finalize_hint_);
+  cleanup_hooks_.close();
+  deferreds_.close();
 
   clear_last_exception();
+  clear_refs_for_teardown();
 
-  root_scope_ = nullptr;
+  napi_scope__ *root_scope = scope_from_handle(root_scope_);
+  if (root_scope != nullptr)
+  {
+    root_scope->close();
+    if (context_ != nullptr)
+      JS_RunGC(JS_GetRuntime(context_));
+  }
+  scopes_.close();
   current_scope_ = nullptr;
+  root_scope_ = nullptr;
+  module_wrap_.teardown();
+  contextify_.teardown();
+  promises_.teardown();
+  NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
+  torn_down_ = true;
+}
+
+void napi_env__::clear_refs_for_teardown()
+{
+  refs_.for_each_active([](const napi_ref__ &ref) {
+    const_cast<napi_ref__ &>(ref).clear_for_teardown();
+  });
+}
+
+void napi_env__::finalize_instance_data()
+{
+  void *data = instance_data_;
+  napi_finalize finalize_cb = instance_data_finalize_cb_;
+  void *finalize_hint = instance_data_finalize_hint_;
+
+  instance_data_ = nullptr;
+  instance_data_finalize_cb_ = nullptr;
+  instance_data_finalize_hint_ = nullptr;
+
+  if (data != nullptr && finalize_cb != nullptr)
+    finalize_cb(this, data, finalize_hint);
 }
 
 JSContext *napi_env__::context() const
@@ -48,25 +102,186 @@ int32_t napi_env__::module_api_version() const
   return module_api_version_;
 }
 
-napi_scope__ *napi_env__::root_scope() const
+napi_handle_scope napi_env__::root_scope() const
 {
   return root_scope_;
 }
 
-napi_scope__ *napi_env__::current_scope() const
+napi_handle_scope napi_env__::current_scope() const
 {
   return current_scope_;
 }
 
-bool napi_env__::is_current_scope(napi_scope__ *scope) const
+napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  auto *handle = scopes_.allocate(this, parent);
+  return reinterpret_cast<napi_handle_scope>(handle);
+}
+
+void napi_env__::destroy_scope(napi_handle_scope scope)
+{
+  scopes_.release(scope);
+}
+
+napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) const
+{
+#ifdef NDEBUG
+  auto scope = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_from_handle(scope_handle);
+#else
+  assert(scopes_.owns_handle(scope_handle));
+  auto [scope, owner] = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_with_owner_from_handle(scope_handle);
+  assert(owner == this);
+#endif
+
+  return scope;
+}
+
+JSValue napi_env__::wrap_external_data(void *data)
+{
+  return wrap_external_data(data, nullptr, nullptr);
+}
+
+JSValue napi_env__::wrap_external_data(void *data,
+                                       node_api_basic_finalize finalize_cb,
+                                       void *finalize_hint)
+{
+  if (context_ == nullptr)
+    return JS_EXCEPTION;
+
+  JSValue obj = JS_NewObjectClass(context_, napi_external__::class_id());
+  if (JS_IsException(obj))
+    return obj;
+
+  auto *hint = napi_external_backing_store_hint__::create(this, data, finalize_cb, finalize_hint);
+  if (hint == nullptr)
+  {
+    JS_FreeValue(context_, obj);
+    JS_ThrowOutOfMemory(context_);
+    return JS_EXCEPTION;
+  }
+
+  JS_SetOpaque(obj, hint);
+  return obj;
+}
+
+napi_value napi_env__::wrap_value_in_current_scope(JSValue value, bool owned)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  return scope == nullptr ? nullptr : scope->wrap_value(value, owned);
+}
+
+void napi_env__::delete_value_from_current_scope(napi_value value)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  if (scope != nullptr)
+    scope->delete_value(value);
+}
+
+napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
+{
+#ifdef NDEBUG
+  auto value = napi_allocator__<napi_value, napi_value__, napi_scope__>::unsafe_data_from_handle(value_handle);
+#else
+  auto [value, owner] = napi_allocator__<napi_value, napi_value__, napi_scope__>::unsafe_data_with_owner_from_handle(value_handle);
+  auto owner_handle = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_handle_from_data(owner);
+  assert(scopes_.owns_handle(owner_handle));
+#endif
+
+  return value;
+}
+
+napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
+{
+  if (context_ == nullptr)
+    return nullptr;
+
+  napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
+  return wrapped;
+}
+
+void napi_env__::delete_ref_from_root_scope(napi_ref ref)
+{
+  refs_.release(ref);
+}
+
+napi_ref__ *napi_env__::ref_from_handle(napi_ref ref_handle)
+{
+#ifdef NDEBUG
+  auto ref = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_from_handle(ref_handle);
+#else
+  auto [ref, owner] = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_with_owner_from_handle(ref_handle);
+  assert(owner == this);
+  assert(refs_.owns_handle(ref_handle));
+#endif
+
+  return ref;
+}
+
+size_t napi_env__::ref_storage_slot_count() const
+{
+  return refs_.storage_slot_count();
+}
+
+size_t napi_env__::active_ref_count() const
+{
+  return refs_.active_count();
+}
+
+bool napi_env__::is_current_scope(napi_handle_scope scope) const
 {
   return current_scope_ == scope;
 }
 
-void napi_env__::set_current_scope(napi_scope__ *scope)
+void napi_env__::set_current_scope(napi_handle_scope scope)
 {
   current_scope_ = scope;
 }
+
+size_t napi_env__::scope_storage_slot_count() const
+{
+  return scopes_.storage_slot_count();
+}
+
+size_t napi_env__::active_scope_count() const
+{
+  return scopes_.active_count();
+}
+
+#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+bool napi_env__::should_dump_lifetime_stats(int64_t now_ms)
+{
+  constexpr int64_t interval_ms = 2000;
+  if (lifetime_last_stats_ms_ == 0)
+  {
+    lifetime_last_stats_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_stats_ms_ < interval_ms)
+    return false;
+
+  lifetime_last_stats_ms_ = now_ms;
+  return true;
+}
+
+bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms)
+{
+  constexpr int64_t interval_ms = 10000;
+  if (lifetime_last_string_symbol_values_ms_ == 0)
+  {
+    lifetime_last_string_symbol_values_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_string_symbol_values_ms_ < interval_ms)
+    return false;
+
+  lifetime_last_string_symbol_values_ms_ = now_ms;
+  return true;
+}
+#endif
 
 const napi_extended_error_info *napi_env__::last_error_info() const
 {
@@ -129,8 +344,16 @@ void *napi_env__::instance_data() const
 
 void napi_env__::set_instance_data(void *data, napi_finalize finalize_cb, void *finalize_hint)
 {
-  if (instance_data_ != nullptr && instance_data_finalize_cb_ != nullptr)
-    instance_data_finalize_cb_(this, instance_data_, instance_data_finalize_hint_);
+  void *old_data = instance_data_;
+  napi_finalize old_finalize_cb = instance_data_finalize_cb_;
+  void *old_finalize_hint = instance_data_finalize_hint_;
+
+  instance_data_ = nullptr;
+  instance_data_finalize_cb_ = nullptr;
+  instance_data_finalize_hint_ = nullptr;
+
+  if (old_data != nullptr && old_finalize_cb != nullptr)
+    old_finalize_cb(this, old_data, old_finalize_hint);
 
   instance_data_ = data;
   instance_data_finalize_cb_ = finalize_cb;
@@ -162,32 +385,43 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
   return napi_invalid_arg;
 }
 
-void napi_env__::track_weak_ref(napi_ref ref)
+napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook, void *arg)
 {
-  if (ref == nullptr || !ref->is_weak())
-    return;
-
-  if (std::find(weak_refs_.begin(), weak_refs_.end(), ref) == weak_refs_.end())
-    weak_refs_.push_back(ref);
+  if (context_ == nullptr || hook == nullptr)
+    return nullptr;
+  return cleanup_hooks_.allocate(this, hook, arg);
 }
 
-void napi_env__::remove_weak_ref(napi_ref ref)
+void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
 {
-  auto it = std::find(weak_refs_.begin(), weak_refs_.end(), ref);
-  if (it != weak_refs_.end())
-    weak_refs_.erase(it);
+  cleanup_hooks_.release(entry);
 }
 
-void napi_env__::clear_weak_refs_for_value(JSValueConst value)
+napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 {
-  if (!JS_VALUE_HAS_REF_COUNT(value))
-    return;
+  if (context_ == nullptr)
+    return nullptr;
+  return deferreds_.allocate(this, resolve, reject);
+}
 
-  for (auto *ref : weak_refs_)
-  {
-    if (ref != nullptr)
-      ref->clear_if_matches(value);
-  }
+void napi_env__::destroy_deferred(napi_deferred__ *deferred)
+{
+  deferreds_.release(deferred);
+}
+
+napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
+    void *external_data,
+    node_api_basic_finalize finalize_cb,
+    void *finalize_hint)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+}
+
+void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
+{
+  external_backing_stores_.release(hint);
 }
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)
