@@ -8,12 +8,12 @@ resolver = "2"
 
 [features]
 cli = [
-    "dep:wasmer-wasix",
-    "dep:wasmer-cache",
-    "dep:wasmer-compiler-llvm",
-    "dep:tokio",
-    "dep:virtual-fs",
-    "dep:wasmer-types",
+  "dep:wasmer-wasix",
+  "dep:wasmer-cache",
+  "dep:wasmer-compiler-llvm",
+  "dep:tokio",
+  "dep:virtual-fs",
+  "dep:wasmer-types",
 ]
 
 [dependencies]
@@ -33,7 +33,7 @@ wasmer-compiler-llvm = { version = "=7.2.0-alpha.2", path = "../compiler-llvm", 
 wasmer-types = { version = "=7.2.0-alpha.2", path = "../types", optional = true }
 wasmer-wasix = { version = "=0.702.0-alpha.2", path = "../wasix", optional = true }
 virtual-fs = { version = "=0.702.0-alpha.2", path = "../virtual-fs", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true}
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 
 [build-dependencies]
