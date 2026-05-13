@@ -3,9 +3,9 @@
 #include "internal/napi_env.h"
 
 napi_env_cleanup_hook__::napi_env_cleanup_hook__(napi_env env, napi_cleanup_hook hook, void *arg)
-    : env_(env),
-      hook_(hook),
-      arg_(arg)
+    : env_{env},
+      hook_{hook},
+      arg_{arg}
 {
 }
 

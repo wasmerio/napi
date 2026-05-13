@@ -142,7 +142,7 @@ extern "C"
         if (!EnsureNodeWellKnownSymbols(context))
             return JS_HasException(context) ? napi_pending_exception : napi_generic_failure;
 
-        auto env = new (std::nothrow) napi_env__(context, module_api_version);
+        auto env = new (std::nothrow) napi_env__{context, module_api_version};
         if (env == nullptr)
             return napi_generic_failure;
         if (env->root_scope() == nullptr)
@@ -704,8 +704,8 @@ extern "C"
             utf8description == nullptr ? 0
             : length == NAPI_AUTO_LENGTH ? std::strlen(utf8description)
                                          : length;
-        std::string description(utf8description == nullptr ? "" : utf8description,
-                                description_length);
+        std::string description{utf8description == nullptr ? "" : utf8description,
+                                description_length};
         JSValue symbol = JS_NewSymbol(napi_util__::context(env), description.c_str(), false);
         if (JS_IsException(symbol))
             return napi_pending_exception;

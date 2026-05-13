@@ -116,9 +116,9 @@ std::filesystem::path napi_util__::strip_file_url(std::string_view value)
 {
   constexpr std::string_view kScheme = "file://";
   if (!starts_with(value, kScheme))
-    return std::filesystem::path(std::string(value));
+    return std::filesystem::path{std::string{value}};
 
-  std::string rest(value.substr(kScheme.size()));
+  std::string rest{value.substr(kScheme.size())};
   if (starts_with(rest, "localhost/"))
   {
     rest.erase(0, std::string("localhost").size());
@@ -130,7 +130,7 @@ std::filesystem::path napi_util__::strip_file_url(std::string_view value)
       return {};
     rest.erase(0, slash);
   }
-  return std::filesystem::path(percent_decode(rest));
+  return std::filesystem::path{percent_decode(rest)};
 }
 
 std::filesystem::path napi_util__::resolve_symlink_components(const std::filesystem::path &path)
@@ -179,7 +179,7 @@ std::filesystem::path napi_util__::resolve_symlink_components(const std::filesys
 
 std::string napi_util__::read_text_file(const std::filesystem::path &path)
 {
-  std::ifstream in(path);
+  std::ifstream in{path};
   if (!in.is_open())
   {
     const std::filesystem::path resolved = resolve_symlink_components(path);
@@ -280,7 +280,7 @@ std::string napi_util__::to_utf8(JSContext *ctx, JSValueConst value)
   const char *str = JS_ToCString(ctx, value);
   if (str == nullptr)
     return {};
-  std::string out(str);
+  std::string out{str};
   JS_FreeCString(ctx, str);
   return out;
 }
@@ -344,7 +344,8 @@ bool napi_util__::is_callable(napi_env env, napi_value value)
 
 std::vector<JSValue> napi_util__::prepare_call_args(napi_env env, size_t argc, const napi_value *argv)
 {
-  std::vector<JSValue> js_argv(argc);
+  std::vector<JSValue> js_argv;
+  js_argv.resize(argc);
   if (argc > 0)
   {
     std::transform(argv, argv + argc, js_argv.begin(), [env](napi_value value) {

@@ -1023,13 +1023,13 @@ void dump_lifetime(napi_env env, const char *reason, bool include_string_symbol_
   if (reason != nullptr)
     std::fprintf(stderr, "[napi-lifetime] dump env=%p reason=%s\n", env, reason);
 
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   dump_stats_locked(env, include_string_symbol_values);
 }
 
 void dump_lifetime_summary(napi_env env)
 {
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   dump_summary_locked(env);
 }
 
@@ -1066,13 +1066,13 @@ void record_value_create(value_type_stats &stats,
                          const void *handle,
                          value_snapshot snapshot)
 {
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   record_create_locked(stats, handle, std::move(snapshot), add_value_snapshot);
 }
 
 napi_env record_value_release(value_type_stats &stats, const void *handle)
 {
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   return record_release_locked(stats, handle, remove_value_snapshot);
 }
 
@@ -1080,14 +1080,14 @@ void record_basic_create(tracked_type_stats<basic_snapshot> &stats,
                          const void *handle,
                          basic_snapshot snapshot)
 {
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   record_create_locked(stats, handle, std::move(snapshot), add_basic_snapshot);
 }
 
 napi_env record_basic_release(tracked_type_stats<basic_snapshot> &stats,
                               const void *handle)
 {
-  std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+  std::lock_guard<std::mutex> lock{g_lifetime.mutex};
   return record_release_locked(stats, handle, remove_basic_snapshot);
 }
 } // namespace
@@ -1189,7 +1189,7 @@ void napi_lifetime__<napi_external_backing_store_hint__>::record_release(
 void napi_lifetime_tracker__::record_scope_escape(napi_env env, bool succeeded)
 {
   {
-    std::lock_guard<std::mutex> lock(g_lifetime.mutex);
+    std::lock_guard<std::mutex> lock{g_lifetime.mutex};
     ++g_lifetime.scope_escape_calls;
     if (succeeded)
       ++g_lifetime.scope_escape_succeeded;

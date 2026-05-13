@@ -13,9 +13,9 @@
 namespace quickjs::detail
 {
     napi_contextify__::napi_contextify__(napi_env env, JSContext *context)
-        : env_(env),
-          ctx_(context),
-          source_map_error_source_callback_(JS_UNDEFINED)
+        : env_{env},
+          ctx_{context},
+          source_map_error_source_callback_{JS_UNDEFINED}
     {
     }
 

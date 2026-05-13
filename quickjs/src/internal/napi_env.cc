@@ -9,16 +9,17 @@
 #include <cassert>
 
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
-    : context_(context),
-      module_api_version_(module_api_version),
-      last_exception_(JS_UNDEFINED),
-      scopes_(this),
-      refs_(this),
-      cleanup_hooks_(this),
-      deferreds_(this),
-      promises_(this, context),
-      contextify_(this, context),
-      module_wrap_(this, context)
+    : context_{context},
+      module_api_version_{module_api_version},
+      last_exception_{JS_UNDEFINED},
+      scopes_{this},
+      refs_{this},
+      cleanup_hooks_{this},
+      deferreds_{this},
+      external_backing_stores_{this},
+      promises_{this, context},
+      contextify_{this, context},
+      module_wrap_{this, context}
 {
   root_scope_ = create_scope(nullptr);
   current_scope_ = root_scope_;
@@ -399,6 +400,21 @@ napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 void napi_env__::destroy_deferred(napi_deferred__ *deferred)
 {
   deferreds_.release(deferred);
+}
+
+napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
+    void *external_data,
+    node_api_basic_finalize finalize_cb,
+    void *finalize_hint)
+{
+  if (context_ == nullptr)
+    return nullptr;
+  return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+}
+
+void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
+{
+  external_backing_stores_.release(hint);
 }
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)

@@ -6,9 +6,14 @@
 
 #include <quickjs.h>
 
+typedef struct napi_external_backing_store_hint__ *napi_external_backing_store_hint;
+
 struct napi_external_backing_store_hint__
 {
-  napi_external_backing_store_hint__() = default;
+  napi_external_backing_store_hint__(napi_env env,
+                                     void *external_data,
+                                     node_api_basic_finalize finalize_cb,
+                                     void *finalize_hint);
   static napi_external_backing_store_hint__ *create(
       napi_env env,
       void *external_data,
@@ -17,12 +22,11 @@ struct napi_external_backing_store_hint__
   static void destroy(napi_external_backing_store_hint__ *hint);
   static void destroy_with_runtime(JSRuntime *rt, napi_external_backing_store_hint__ *hint);
   ~napi_external_backing_store_hint__();
+  napi_external_backing_store_hint__(const napi_external_backing_store_hint__ &) = delete;
+  napi_external_backing_store_hint__(napi_external_backing_store_hint__ &&other) = delete;
+  napi_external_backing_store_hint__ &operator=(const napi_external_backing_store_hint__ &) = delete;
+  napi_external_backing_store_hint__ &operator=(napi_external_backing_store_hint__ &&other) = delete;
 
-  void initialize(napi_env env,
-                  void *external_data,
-                  node_api_basic_finalize finalize_cb,
-                  void *finalize_hint);
-  void release();
   void invoke_finalizer();
   void begin_detach();
   void end_detach();
@@ -49,7 +53,5 @@ private:
   bool detaching_ = false;
   JSValue weak_target_ = JS_UNDEFINED;
 };
-
-using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
 #endif // NAPI_QUICKJS_EXTERNAL_BACKING_STORE_HINT_H_

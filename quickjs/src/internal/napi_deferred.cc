@@ -4,9 +4,9 @@
 #include "internal/napi_value.h"
 
 napi_deferred__::napi_deferred__(napi_env env, JSValue resolve, JSValue reject)
-    : env_(env),
-      resolve_(resolve),
-      reject_(reject)
+    : env_{env},
+      resolve_{resolve},
+      reject_{reject}
 {
 }
 

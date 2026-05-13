@@ -14,9 +14,9 @@ bool IsEmptyValue(JSValueConst value)
 napi_ref__::napi_ref__(napi_env env,
                        JSValueConst value,
                        uint32_t initial_ref_count)
-    : env_(env),
-      value_(value),
-      ref_count_(initial_ref_count)
+    : env_{env},
+      value_{value},
+      ref_count_{initial_ref_count}
 {
   if (ref_count_ > 0)
     JS_DupValue(env_->context(), value_);

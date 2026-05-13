@@ -59,7 +59,7 @@ private:
     template <typename... Args>
     T *construct(Args &&...args)
     {
-      return new (static_cast<void *>(storage)) T(static_cast<Args &&>(args)...);
+      return new (static_cast<void *>(storage)) T{static_cast<Args &&>(args)...};
     }
 
     void destroy()
@@ -229,7 +229,7 @@ private:
                 "napi_allocator__ block must fit exactly in its alignment region");
 
 public:
-  explicit napi_allocator__(Owner *owner) : owner_(owner) {}
+  explicit napi_allocator__(Owner *owner) : owner_{owner} {}
   napi_allocator__(const napi_allocator__ &) = delete;
   napi_allocator__(napi_allocator__ &&other) = delete;
   napi_allocator__ &operator=(const napi_allocator__ &) = delete;

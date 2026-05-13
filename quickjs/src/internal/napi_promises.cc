@@ -12,11 +12,11 @@ void *js_identity(JSValueConst value)
 }
 
 napi_promises__::napi_promises__(napi_env env, JSContext *context)
-    : env_(env),
-      context_(context),
-      promise_reject_callback_(JS_UNDEFINED),
+    : env_{env},
+      context_{context},
+      promise_reject_callback_{JS_UNDEFINED},
       promise_hooks_{JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED},
-      continuation_preserved_embedder_data_(JS_UNDEFINED)
+      continuation_preserved_embedder_data_{JS_UNDEFINED}
 {
 }
 

@@ -14,9 +14,9 @@ class quickjs_callback_handle_scope__
 {
 public:
   explicit quickjs_callback_handle_scope__(napi_env env)
-      : env_(env),
-        parent_(env != nullptr ? env->current_scope() : nullptr),
-        scope_(env != nullptr ? env->create_scope(parent_) : nullptr)
+      : env_{env},
+        parent_{env != nullptr ? env->current_scope() : nullptr},
+        scope_{env != nullptr ? env->create_scope(parent_) : nullptr}
   {
     if (scope_ != nullptr)
       env_->set_current_scope(scope_);
@@ -74,7 +74,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
 
   auto cb = reinterpret_cast<napi_callback>(cb_ptr);
   auto user_data = napi_external__::get_value(func_data[1]);
-  quickjs_callback_handle_scope__ callback_scope(env);
+  quickjs_callback_handle_scope__ callback_scope{env};
   if (!callback_scope.is_open())
     return JS_ThrowOutOfMemory(ctx);
 
@@ -96,7 +96,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
     new_target = this_val;
   }
 
-  auto info = napi_callback_info__(env, effective_this, new_target, argc, argv, user_data);
+  auto info = napi_callback_info__{env, effective_this, new_target, argc, argv, user_data};
   auto result = cb(env, reinterpret_cast<napi_callback_info>(&info));
 
   if (napi_util__::rethrow_last_exception(env, ctx))

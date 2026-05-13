@@ -88,6 +88,11 @@ struct napi_env__
   void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
   napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
   void destroy_deferred(napi_deferred__ *deferred);
+  napi_external_backing_store_hint__ *create_external_backing_store(
+      void *external_data,
+      node_api_basic_finalize finalize_cb,
+      void *finalize_hint);
+  void destroy_external_backing_store(napi_external_backing_store_hint__ *hint);
   int64_t adjust_external_memory(int64_t change_in_bytes);
 
   napi_promises__ &promises();
@@ -125,6 +130,7 @@ private:
   napi_allocator__<napi_ref, napi_ref__, napi_env__> refs_;
   napi_allocator__<napi_env_cleanup_hook, napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
   napi_allocator__<napi_deferred, napi_deferred__, napi_env__> deferreds_;
+  napi_allocator__<napi_external_backing_store_hint, napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.

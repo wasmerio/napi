@@ -4,8 +4,8 @@
 #include "internal/napi_scope.h"
 
 napi_value__::napi_value__(napi_env env, JSValue value, bool owned)
-    : env_(env),
-      value_(owned ? value : JS_DupValue(env->context(), value))
+    : env_{env},
+      value_{owned ? value : JS_DupValue(env->context(), value)}
 {
 }
 

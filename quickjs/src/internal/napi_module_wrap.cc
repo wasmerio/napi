@@ -46,7 +46,7 @@ std::string value_to_string(JSContext *ctx, JSValueConst value)
   const char *str = JS_ToCString(ctx, value);
   if (str == nullptr)
     return {};
-  std::string out(str);
+  std::string out{str};
   JS_FreeCString(ctx, str);
   return out;
 }
@@ -124,10 +124,10 @@ struct napi_module_wrap__::script_referrer
 };
 
 napi_module_wrap__::napi_module_wrap__(napi_env env, JSContext *context)
-    : env_(env),
-      ctx_(context),
-      import_module_dynamically_callback_(JS_UNDEFINED),
-      initialize_import_meta_callback_(JS_UNDEFINED)
+    : env_{env},
+      ctx_{context},
+      import_module_dynamically_callback_{JS_UNDEFINED},
+      initialize_import_meta_callback_{JS_UNDEFINED}
 {
   JSRuntime *rt = JS_GetRuntime(ctx_);
   JS_SetModuleImportMetaInitFunc(rt, host_import_meta_init, this);
@@ -484,7 +484,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return napi_generic_failure;
   }
 
-  auto *entry = new (std::nothrow) record();
+  auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
   {
     JS_FreeValue(ctx_, host_id);
@@ -550,7 +550,7 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
       return return_pending_exception("Failed to add synthetic export");
   }
 
-  auto *entry = new (std::nothrow) record();
+  auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
     return napi_generic_failure;
   entry->owner = this;
