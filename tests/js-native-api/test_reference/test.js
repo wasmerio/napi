@@ -88,6 +88,21 @@ async function runTests() {
   (() => {
     const value = test_reference.createExternalWithFinalize();
     assert.strictEqual(test_reference.finalizeCount, 0);
+    test_reference.createTwoWeakReferences(value);
+    assert.strictEqual(test_reference.referenceValue, value);
+    assert.strictEqual(test_reference.secondReferenceValue, value);
+  })();
+  await gcUntil('Two weak references share one collected target',
+                () => (test_reference.referenceValue === undefined &&
+                test_reference.secondReferenceValue === undefined &&
+                test_reference.finalizeCount === 1));
+  assert.strictEqual(test_reference.incrementRefcount(), 0);
+  assert.strictEqual(test_reference.incrementSecondRefcount(), 0);
+  test_reference.deleteTwoWeakReferences();
+
+  (() => {
+    const value = test_reference.createExternalWithFinalize();
+    assert.strictEqual(test_reference.finalizeCount, 0);
     test_reference.createReference(value, 1);
     assert.strictEqual(test_reference.referenceValue, value);
   })();

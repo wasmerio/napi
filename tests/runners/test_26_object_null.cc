@@ -1,6 +1,7 @@
 #include <string>
 
 #include "test_env.h"
+#include "upstream_js_test.h"
 
 extern "C" void init_test_null(napi_env env, napi_value exports);
 
@@ -16,27 +17,8 @@ TEST_F(Test26ObjectNull, PortedCoreFlow) {
   ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, global, "__ton", exports), napi_ok);
 
-  auto run_js = [&](const char* source_text) {
-    v8::TryCatch tc(s.isolate);
-    std::string wrapped = std::string("(() => { ") + source_text + " })();";
-    v8::Local<v8::String> source =
-        v8::String::NewFromUtf8(s.isolate, wrapped.c_str(), v8::NewStringType::kNormal)
-            .ToLocalChecked();
-    v8::Local<v8::Script> script;
-    if (!v8::Script::Compile(s.context, source).ToLocal(&script)) return false;
-    v8::Local<v8::Value> out;
-    if (!script->Run(s.context).ToLocal(&out)) {
-      if (tc.HasCaught()) {
-        v8::String::Utf8Value msg(s.isolate, tc.Exception());
-        ADD_FAILURE() << "JS exception: " << (*msg ? *msg : "<empty>")
-                      << " while running: " << source_text;
-      }
-      return false;
-    }
-    return true;
-  };
-
-  ASSERT_TRUE(run_js(R"JS(
+  ASSERT_TRUE(RunScript(s, R"JS(
+(() => {
 const eProp = { envIsNull:'Invalid argument', objectIsNull:'Invalid argument', keyIsNull:'Invalid argument', valueIsNull:'Invalid argument' };
 const tn = __ton.testNull;
 const eq = (a,b) => JSON.stringify(a) === JSON.stringify(b);
@@ -57,5 +39,6 @@ if (!eq(tn.defineProperties(), { envIsNull:'Invalid argument', objectIsNull:'Inv
 if (!eq(tn.getPropertyNames(), eElem)) throw new Error('getPropertyNames');
 if (!eq(tn.getAllPropertyNames(), eElem)) throw new Error('getAllPropertyNames');
 if (!eq(tn.getPrototype(), eElem)) throw new Error('getPrototype');
-)JS"));
+})();
+)JS", "test_26_object_null"));
 }

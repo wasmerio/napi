@@ -3,9 +3,9 @@
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
-class Test35Promise : public FixtureTestBase {};
+class Test21General : public FixtureTestBase {};
 
-TEST_F(Test35Promise, PortedCoreFlow) {
+TEST_F(Test21General, PortedCoreFlow) {
   EnvScope s(runtime_.get());
   napi_value exports = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &exports), napi_ok);
@@ -13,5 +13,5 @@ TEST_F(Test35Promise, PortedCoreFlow) {
   ASSERT_NE(addon, nullptr);
   ASSERT_TRUE(InstallUpstreamJsShim(s, addon));
   ASSERT_TRUE(
-      RunUpstreamJsFile(s, std::string(NAPI_TESTS_ROOT_PATH) + "/js-native-api/test_promise/test.js"));
+      RunUpstreamJsFile(s, std::string(NAPI_TESTS_ROOT_PATH) + "/js-native-api/test_general/test.js"));
 }

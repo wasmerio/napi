@@ -1,14 +1,39 @@
 #include <js_native_api.h>
+#include <node_api_types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "../common.h"
 #include "../entry_point.h"
+
+NAPI_EXTERN napi_status NAPI_CDECL napi_add_env_cleanup_hook(
+    node_api_basic_env env, napi_cleanup_hook fun, void* arg);
+NAPI_EXTERN napi_status NAPI_CDECL napi_remove_env_cleanup_hook(
+    node_api_basic_env env, napi_cleanup_hook fun, void* arg);
 
 typedef struct {
   size_t value;
   bool print;
   napi_ref js_cb_ref;
 } AddonData;
+
+typedef struct {
+  napi_env env;
+} CleanupHookState;
+
+static CleanupHookState cleanup_hook_state;
+
+static void RemovedCleanupHook(void* arg) {
+  (void)arg;
+  abort();
+}
+
+static void RemovingCleanupHook(void* arg) {
+  CleanupHookState* state = arg;
+  NODE_API_BASIC_CALL_RETURN_VOID(
+      state->env,
+      napi_remove_env_cleanup_hook(
+          state->env, RemovedCleanupHook, state));
+}
 
 static napi_value Increment(napi_env env, napi_callback_info info) {
   AddonData* data;
@@ -72,6 +97,23 @@ static napi_value ObjectWithFinalizer(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static napi_value RegisterCleanupHookRemoval(napi_env env,
+                                             napi_callback_info info) {
+  (void)info;
+
+  cleanup_hook_state.env = env;
+  NODE_API_CALL(
+      env,
+      napi_add_env_cleanup_hook(
+          env, RemovedCleanupHook, &cleanup_hook_state));
+  NODE_API_CALL(
+      env,
+      napi_add_env_cleanup_hook(
+          env, RemovingCleanupHook, &cleanup_hook_state));
+
+  return NULL;
+}
+
 EXTERN_C_START
 napi_value Init(napi_env env, napi_value exports) {
   AddonData* data = malloc(sizeof(*data));
@@ -85,6 +127,8 @@ napi_value Init(napi_env env, napi_value exports) {
     DECLARE_NODE_API_PROPERTY("increment", Increment),
     DECLARE_NODE_API_PROPERTY("setPrintOnDelete", SetPrintOnDelete),
     DECLARE_NODE_API_PROPERTY("objectWithFinalizer", ObjectWithFinalizer),
+    DECLARE_NODE_API_PROPERTY(
+        "registerCleanupHookRemoval", RegisterCleanupHookRemoval),
   };
 
   NODE_API_CALL(env,

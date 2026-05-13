@@ -143,36 +143,139 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EXPECT_TRUE(is_typedarray);
 }
 
-TEST_F(Test65UnofficialContextify, CjsLoaderAndSyntaxDetection) {
+TEST_F(Test65UnofficialContextify, CompileFunctionAcceptsHashbangBody) {
   EnvScope s(runtime_.get());
 
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
   napi_value out = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_compile_function_for_cjs_loader(
-                s.env,
-                Str(s.env, "module.exports = 1;"),
-                Str(s.env, "cjs.js"),
-                false,
-                true,
-                &out),
+  ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "#!/usr/bin/env node\nreturn 42;"),
+                                                        Str(s.env, ""),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        &out),
             napi_ok);
   ASSERT_NE(out, nullptr);
-  napi_value can_parse = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, out, "canParseAsESM", &can_parse), napi_ok);
-  bool can_parse_bool = true;
-  ASSERT_EQ(napi_get_value_bool(s.env, can_parse, &can_parse_bool), napi_ok);
-  EXPECT_FALSE(can_parse_bool);
 
-  ASSERT_EQ(unofficial_napi_contextify_compile_function_for_cjs_loader(
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, out, "function", &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  napi_value fn_result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, global, fn, 0, nullptr, &fn_result), napi_ok);
+
+  int32_t answer = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, fn_result, &answer), napi_ok);
+  EXPECT_EQ(answer, 42);
+}
+
+TEST_F(Test65UnofficialContextify, CompileFunctionRejectsBomBeforeHashbang) {
+  EnvScope s(runtime_.get());
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  napi_value out = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"),
+                                                        Str(s.env, "bom_hashbang.js"),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        &out),
+            napi_pending_exception);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  if (pending) {
+    napi_value error = nullptr;
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+    ASSERT_NE(error, nullptr);
+  }
+}
+
+TEST_F(Test65UnofficialContextify, FunctionPrototypeSourceLocationsDoNotBlockStaticAssignments) {
+  EnvScope s(runtime_.get());
+
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(
                 s.env,
-                Str(s.env, "export const x = 1;"),
-                Str(s.env, "esmish.js"),
-                false,
-                true,
-                &out),
+                Str(s.env,
+                    R"JS(
+"use strict";
+for (const key of ["fileName", "lineNumber", "columnNumber"]) {
+  if (Object.getOwnPropertyDescriptor(Function.prototype, key) !== undefined) {
+    throw new Error(`${key} should not be inherited from Function.prototype`);
+  }
+}
+class Manifest {}
+Manifest.fileName = "package.json";
+Manifest.lineNumber = 1;
+Manifest.columnNumber = 2;
+const fileName = Object.getOwnPropertyDescriptor(Manifest, "fileName");
+const lineNumber = Object.getOwnPropertyDescriptor(Manifest, "lineNumber");
+const columnNumber = Object.getOwnPropertyDescriptor(Manifest, "columnNumber");
+fileName.value === "package.json" && fileName.writable &&
+  lineNumber.value === 1 && lineNumber.writable &&
+  columnNumber.value === 2 && columnNumber.writable ? 1 : 0;
+)JS"),
+                &result),
             napi_ok);
-  ASSERT_EQ(napi_get_named_property(s.env, out, "canParseAsESM", &can_parse), napi_ok);
-  ASSERT_EQ(napi_get_value_bool(s.env, can_parse, &can_parse_bool), napi_ok);
-  EXPECT_TRUE(can_parse_bool);
+  ASSERT_NE(result, nullptr);
+
+  int32_t ok = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, result, &ok), napi_ok);
+  EXPECT_EQ(ok, 1);
+}
+
+TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
+  EnvScope s(runtime_.get());
+
+  napi_value params = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 5, &params), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 0, Str(s.env, "exports")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 1, Str(s.env, "require")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 2, Str(s.env, "module")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 3, Str(s.env, "__filename")), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 4, Str(s.env, "__dirname")), napi_ok);
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  napi_value out = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "module.exports = 1;"),
+                                                        Str(s.env, "cjs.js"),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        params,
+                                                        undef,
+                                                        &out),
+            napi_ok);
+  ASSERT_NE(out, nullptr);
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, out, "function", &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
 
   bool contains = false;
   ASSERT_EQ(unofficial_napi_contextify_contains_module_syntax(s.env,
@@ -192,4 +295,18 @@ TEST_F(Test65UnofficialContextify, CjsLoaderAndSyntaxDetection) {
                                                               &contains),
             napi_ok);
   EXPECT_FALSE(contains);
+}
+
+TEST_F(Test65UnofficialContextify, PrivateSymbolAcceptsAutoLength) {
+  EnvScope s(runtime_.get());
+
+  napi_value symbol = nullptr;
+  ASSERT_EQ(unofficial_napi_create_private_symbol(
+                s.env, "node:arrowMessage", NAPI_AUTO_LENGTH, &symbol),
+            napi_ok);
+  ASSERT_NE(symbol, nullptr);
+
+  napi_valuetype type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, symbol, &type), napi_ok);
+  EXPECT_TRUE(type == napi_symbol || type == napi_object);
 }
