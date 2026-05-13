@@ -2780,7 +2780,7 @@ extern "C"
     }
 
     if (result != nullptr)
-      return napi_create_reference(env, js_object, 1, result);
+      return napi_create_reference(env, js_object, 0, result);
 
     return napi_ok;
   }
