@@ -210,6 +210,40 @@ TEST_F(Test65UnofficialContextify, CompileFunctionRejectsBomBeforeHashbang) {
   }
 }
 
+TEST_F(Test65UnofficialContextify, FunctionPrototypeSourceLocationsDoNotBlockStaticAssignments) {
+  EnvScope s(runtime_.get());
+
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    R"JS(
+"use strict";
+for (const key of ["fileName", "lineNumber", "columnNumber"]) {
+  if (Object.getOwnPropertyDescriptor(Function.prototype, key) !== undefined) {
+    throw new Error(`${key} should not be inherited from Function.prototype`);
+  }
+}
+class Manifest {}
+Manifest.fileName = "package.json";
+Manifest.lineNumber = 1;
+Manifest.columnNumber = 2;
+const fileName = Object.getOwnPropertyDescriptor(Manifest, "fileName");
+const lineNumber = Object.getOwnPropertyDescriptor(Manifest, "lineNumber");
+const columnNumber = Object.getOwnPropertyDescriptor(Manifest, "columnNumber");
+fileName.value === "package.json" && fileName.writable &&
+  lineNumber.value === 1 && lineNumber.writable &&
+  columnNumber.value === 2 && columnNumber.writable ? 1 : 0;
+)JS"),
+                &result),
+            napi_ok);
+  ASSERT_NE(result, nullptr);
+
+  int32_t ok = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, result, &ok), napi_ok);
+  EXPECT_EQ(ok, 1);
+}
+
 TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
   EnvScope s(runtime_.get());
 
