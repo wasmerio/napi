@@ -99,6 +99,23 @@ namespace quickjs::detail
         return line;
     }
 
+    std::string napi_contextify__::prepare_function_body_source(const std::string &source) const
+    {
+        if (source.size() < 2 || source[0] != '#' || source[1] != '!')
+            return source;
+
+        // V8 accepts hashbangs in vm.compileFunction bodies. QuickJS only skips
+        // them for whole-script eval, so preserve lines while hiding the text.
+        std::string prepared = source;
+        for (char &ch : prepared)
+        {
+            if (ch == '\n' || ch == '\r')
+                break;
+            ch = ' ';
+        }
+        return prepared;
+    }
+
     void napi_contextify__::set_int32_property(JSValueConst object,
                                                const char *name,
                                                int32_t value) const
@@ -373,22 +390,38 @@ namespace quickjs::detail
         }
 
         std::string source = napi_util__::to_utf8(env_, code);
+        std::string compile_source = prepare_function_body_source(source);
+        std::string diagnostic_source = source;
         std::string source_url;
         JSValue code_arg = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, code));
+        bool code_arg_replaced = false;
         if (filename != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, filename)) && !JS_IsNull(napi_quickjs_value_inner(env_, filename)))
         {
             source_url = napi_util__::to_utf8(env_, filename);
             if (!source.empty() && !source_url.empty())
             {
-                source += "\n//# sourceURL=";
-                source += source_url;
+                compile_source += "\n//# sourceURL=";
+                compile_source += source_url;
+                diagnostic_source += "\n//# sourceURL=";
+                diagnostic_source += source_url;
                 JSValue with_source_url =
-                    JS_NewStringLen(ctx_, source.c_str(), source.size());
+                    JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
                 if (!JS_IsException(with_source_url))
                 {
                     JS_FreeValue(ctx_, code_arg);
                     code_arg = with_source_url;
+                    code_arg_replaced = true;
                 }
+            }
+        }
+        if (!code_arg_replaced && compile_source != source)
+        {
+            JSValue prepared_code =
+                JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
+            if (!JS_IsException(prepared_code))
+            {
+                JS_FreeValue(ctx_, code_arg);
+                code_arg = prepared_code;
             }
         }
         argv.push_back(code_arg);
@@ -403,7 +436,7 @@ namespace quickjs::detail
         if (JS_IsException(fn))
         {
             JSValue exc = JS_GetException(ctx_);
-            annotate_compile_exception(exc, source, source_url, line_offset, column_offset);
+            annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
             napi_util__::set_last_exception(env_, exc);
             return napi_pending_exception;
         }
