@@ -83,6 +83,7 @@ namespace quickjs::detail
         std::string get_string_property_or_empty(JSValueConst object, const char *name) const;
         std::string builtin_id_from_resource_name(const std::string &resource_name) const;
         std::string source_line_at(const std::string &source, int32_t one_based_line) const;
+        std::string prepare_function_body_source(const std::string &source) const;
         void set_int32_property(JSValueConst object, const char *name, int32_t value) const;
         void annotate_compile_exception(JSValueConst exception,
                                         const std::string &source,

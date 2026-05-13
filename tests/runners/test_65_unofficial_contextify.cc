@@ -143,6 +143,73 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EXPECT_TRUE(is_typedarray);
 }
 
+TEST_F(Test65UnofficialContextify, CompileFunctionAcceptsHashbangBody) {
+  EnvScope s(runtime_.get());
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  napi_value out = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "#!/usr/bin/env node\nreturn 42;"),
+                                                        Str(s.env, ""),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        &out),
+            napi_ok);
+  ASSERT_NE(out, nullptr);
+
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, out, "function", &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  napi_value fn_result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, global, fn, 0, nullptr, &fn_result), napi_ok);
+
+  int32_t answer = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, fn_result, &answer), napi_ok);
+  EXPECT_EQ(answer, 42);
+}
+
+TEST_F(Test65UnofficialContextify, CompileFunctionRejectsBomBeforeHashbang) {
+  EnvScope s(runtime_.get());
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  napi_value out = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"),
+                                                        Str(s.env, "bom_hashbang.js"),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        undef,
+                                                        &out),
+            napi_pending_exception);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  if (pending) {
+    napi_value error = nullptr;
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+    ASSERT_NE(error, nullptr);
+  }
+}
+
 TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
   EnvScope s(runtime_.get());
 
