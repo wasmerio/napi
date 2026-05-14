@@ -1,4 +1,4 @@
-#include "internal/napi_ref_with_finalizer__.h"
+#include "internal/napi_ref_with_finalizer.h"
 
 #include <new>
 

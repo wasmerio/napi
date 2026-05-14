@@ -6,7 +6,7 @@
 #include <v8.h>
 
 #include "js_native_api.h"
-#include "internal/napi_ref_tracker__.h"
+#include "internal/napi_ref_tracker.h"
 
 struct napi_env__;
 

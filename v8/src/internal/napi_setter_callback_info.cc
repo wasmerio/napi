@@ -1,4 +1,4 @@
-#include "internal/napi_setter_callback_info__.h"
+#include "internal/napi_setter_callback_info.h"
 
 napi_setter_callback_info__::napi_setter_callback_info__(
     napi_env env,

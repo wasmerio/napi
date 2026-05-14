@@ -3,7 +3,7 @@
 
 #include <v8.h>
 
-#include "internal/napi_callback_payload__.h"
+#include "internal/napi_callback_payload.h"
 #include "internal/napi_v8_env.h"
 
 struct napi_function_callback_info__ : public napi_callback_info__ {

@@ -11,7 +11,7 @@
 #include <v8.h>
 
 #include "js_native_api.h"
-#include "internal/napi_ref_tracker__.h"
+#include "internal/napi_ref_tracker.h"
 #include "unofficial_napi.h"
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);

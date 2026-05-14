@@ -1,6 +1,6 @@
 #include "internal/napi_lifetime_tracker.h"
 
-#include "internal/napi_ref__.h"
+#include "internal/napi_ref.h"
 #include "internal/napi_v8_env.h"
 
 #include <algorithm>

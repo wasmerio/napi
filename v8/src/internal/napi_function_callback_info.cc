@@ -1,4 +1,4 @@
-#include "internal/napi_function_callback_info__.h"
+#include "internal/napi_function_callback_info.h"
 
 napi_function_callback_info__::napi_function_callback_info__(
     const v8::FunctionCallbackInfo<v8::Value>& info,

@@ -1,7 +1,7 @@
 #ifndef NAPI_V8_REF_WITH_DATA_H_
 #define NAPI_V8_REF_WITH_DATA_H_
 
-#include "internal/napi_ref__.h"
+#include "internal/napi_ref.h"
 
 struct napi_ref_with_data__ final : public napi_ref__ {
   static napi_ref_with_data__* New(napi_env__* env,

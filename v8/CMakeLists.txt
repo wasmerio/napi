@@ -93,17 +93,17 @@ endforeach()
 
 add_library(napi_v8 STATIC
   src/js_native_api_v8.cc
-  src/internal/napi_escapable_handle_scope_wrapper__.cc
-  src/internal/napi_external_wrapper__.cc
-  src/internal/napi_function_callback_info__.cc
-  src/internal/napi_getter_callback_info__.cc
-  src/internal/napi_handle_scope_wrapper__.cc
+  src/internal/napi_escapable_handle_scope_wrapper.cc
+  src/internal/napi_external_wrapper.cc
+  src/internal/napi_function_callback_info.cc
+  src/internal/napi_getter_callback_info.cc
+  src/internal/napi_handle_scope_wrapper.cc
   src/internal/napi_lifetime_tracker.cc
-  src/internal/napi_ref__.cc
-  src/internal/napi_ref_tracker__.cc
-  src/internal/napi_ref_with_data__.cc
-  src/internal/napi_ref_with_finalizer__.cc
-  src/internal/napi_setter_callback_info__.cc
+  src/internal/napi_ref.cc
+  src/internal/napi_ref_tracker.cc
+  src/internal/napi_ref_with_data.cc
+  src/internal/napi_ref_with_finalizer.cc
+  src/internal/napi_setter_callback_info.cc
   src/internal/napi_util.cc
   src/unofficial_napi.cc
   src/unofficial_napi_error_utils.cc

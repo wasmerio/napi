@@ -1,4 +1,4 @@
-#include "internal/napi_ref_tracker__.h"
+#include "internal/napi_ref_tracker.h"
 
 void napi_ref_tracker__::Link(RefList* list) {
   prev_ = list;

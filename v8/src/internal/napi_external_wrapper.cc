@@ -1,4 +1,4 @@
-#include "internal/napi_external_wrapper__.h"
+#include "internal/napi_external_wrapper.h"
 
 #include <new>
 
