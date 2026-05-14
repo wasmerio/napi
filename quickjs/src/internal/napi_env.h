@@ -65,7 +65,7 @@ struct napi_env__
     refs_.for_each_active(fn);
   }
 
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   bool should_dump_lifetime_stats(int64_t now_ms);
   bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
 #endif
@@ -134,7 +134,7 @@ private:
   napi_allocator__<napi_deferred, napi_deferred__, napi_env__> deferreds_;
   napi_allocator__<napi_external_backing_store_hint, napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
 
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;

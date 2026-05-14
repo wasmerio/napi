@@ -550,7 +550,7 @@ v8::Local<v8::Context> napi_env__::context() const {
   return context_ref.Get(isolate);
 }
 
-#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
 bool napi_env__::should_dump_lifetime_stats(int64_t now_ms) {
   constexpr int64_t interval_ms = 2000;
   if (lifetime_last_stats_ms_ == 0) {

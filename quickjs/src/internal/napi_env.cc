@@ -249,7 +249,7 @@ size_t napi_env__::active_scope_count() const
   return scopes_.active_count();
 }
 
-#if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER) && defined(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
 bool napi_env__::should_dump_lifetime_stats(int64_t now_ms)
 {
   constexpr int64_t interval_ms = 2000;

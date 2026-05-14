@@ -26,7 +26,7 @@ namespace v8impl::detail {
 
 class napi_lifetime_tracker__ {
  public:
-#ifdef NAPI_V8_ENABLE_LIFETIME_TRACKER
+#ifdef NAPI_ENABLE_LIFETIME_TRACKER
   static void record_create_raw(napi_env__* owner,
                                 void* value,
                                 const char* type_name);
@@ -147,7 +147,7 @@ struct napi_lifetime__ {
 
 }  // namespace v8impl::detail
 
-#ifdef NAPI_V8_ENABLE_LIFETIME_TRACKER
+#ifdef NAPI_ENABLE_LIFETIME_TRACKER
 template <typename T>
 struct napi_allocator_lifetime__<T, napi_env__> {
   static void record_create(napi_env__* owner, T* val) {

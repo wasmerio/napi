@@ -109,7 +109,7 @@ struct napi_env__ {
     return result->allocator;
   }
 
-#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   bool should_dump_lifetime_stats(int64_t now_ms);
   bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
 #endif
@@ -148,7 +148,7 @@ struct napi_env__ {
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
   void* enqueue_foreground_task_target = nullptr;
 
-#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   int64_t lifetime_last_stats_ms_ = 0;
   int64_t lifetime_last_string_symbol_values_ms_ = 0;
 #endif

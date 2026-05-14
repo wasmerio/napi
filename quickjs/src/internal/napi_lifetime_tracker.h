@@ -18,7 +18,7 @@ struct napi_value__;
 namespace quickjs::detail
 {
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#ifdef NAPI_ENABLE_LIFETIME_TRACKER
 template <class T>
 struct napi_lifetime__;
 
@@ -88,7 +88,7 @@ struct napi_lifetime__
 class napi_lifetime_tracker__
 {
 public:
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#ifdef NAPI_ENABLE_LIFETIME_TRACKER
   static void record_scope_escape(napi_env__ *env, bool succeeded);
 #else
   static void record_scope_escape(napi_env__ *env, bool succeeded)
@@ -102,7 +102,7 @@ public:
 
 } // namespace quickjs::detail
 
-#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+#ifdef NAPI_ENABLE_LIFETIME_TRACKER
 template <>
 struct napi_allocator_lifetime__<napi_value__, napi_scope__>
 {
