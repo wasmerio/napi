@@ -1003,7 +1003,7 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
       return;
     }
 
-    auto* ctx = new SerializerContext(env, args.This());
+    auto* ctx = env->allocate<SerializerContext>(env, args.This());
     args.This()->SetAlignedPointerInInternalField(0, ctx);
   }
 
@@ -1124,7 +1124,10 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
   }
 
   static void WeakCallback(const v8::WeakCallbackInfo<SerializerContext>& info) {
-    delete info.GetParameter();
+    SerializerContext* context = info.GetParameter();
+    if (context != nullptr && context->env_ != nullptr) {
+      context->env_->release(context);
+    }
   }
 
   napi_env env_;
@@ -1214,7 +1217,7 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
           OneByteString(isolate, "Internal deserializer environment missing")));
       return;
     }
-    auto* ctx = new DeserializerContext(env, args.This(), args[0]);
+    auto* ctx = env->allocate<DeserializerContext>(env, args.This(), args[0]);
     args.This()->SetAlignedPointerInInternalField(0, ctx);
   }
 
@@ -1338,7 +1341,10 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
   }
 
   static void WeakCallback(const v8::WeakCallbackInfo<DeserializerContext>& info) {
-    delete info.GetParameter();
+    DeserializerContext* context = info.GetParameter();
+    if (context != nullptr && context->env_ != nullptr) {
+      context->env_->release(context);
+    }
   }
 
   napi_env env_;
@@ -1347,6 +1353,22 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
   std::vector<uint8_t> data_;
   std::unique_ptr<v8::ValueDeserializer> deserializer_;
 };
+
+}  // namespace
+
+namespace v8impl::detail {
+template <>
+struct napi_lifetime_type_name__<SerializerContext> {
+  static constexpr const char* value = "serializer_context";
+};
+
+template <>
+struct napi_lifetime_type_name__<DeserializerContext> {
+  static constexpr const char* value = "deserializer_context";
+};
+}  // namespace v8impl::detail
+
+namespace {
 
 void SetProtoMethod(v8::Isolate* isolate,
                     v8::Local<v8::FunctionTemplate> tmpl,

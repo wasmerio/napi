@@ -4,6 +4,9 @@
 #include <concepts>
 #include <cstddef>
 
+template <typename T, typename Owner>
+struct napi_allocator_lifetime__;
+
 struct napi_deferred__;
 struct napi_env__;
 struct napi_env_cleanup_hook__;
@@ -98,6 +101,78 @@ public:
 };
 
 } // namespace quickjs::detail
+
+#ifdef NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
+template <>
+struct napi_allocator_lifetime__<napi_value__, napi_scope__>
+{
+  static void record_create(napi_scope__ *owner, napi_value__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_value__>::record_create(owner, val);
+  }
+
+  static void record_release(napi_scope__ *owner, napi_value__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_value__>::record_release(owner, val);
+  }
+};
+
+template <>
+struct napi_allocator_lifetime__<napi_ref__, napi_env__>
+{
+  static void record_create(napi_env__ *owner, napi_ref__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_ref__>::record_create(owner, val);
+  }
+
+  static void record_release(napi_env__ *owner, napi_ref__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_ref__>::record_release(owner, val);
+  }
+};
+
+template <>
+struct napi_allocator_lifetime__<napi_env_cleanup_hook__, napi_env__>
+{
+  static void record_create(napi_env__ *owner, napi_env_cleanup_hook__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_create(owner, val);
+  }
+
+  static void record_release(napi_env__ *owner, napi_env_cleanup_hook__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_release(owner, val);
+  }
+};
+
+template <>
+struct napi_allocator_lifetime__<napi_deferred__, napi_env__>
+{
+  static void record_create(napi_env__ *owner, napi_deferred__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_deferred__>::record_create(owner, val);
+  }
+
+  static void record_release(napi_env__ *owner, napi_deferred__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_deferred__>::record_release(owner, val);
+  }
+};
+
+template <>
+struct napi_allocator_lifetime__<napi_external_backing_store_hint__, napi_env__>
+{
+  static void record_create(napi_env__ *owner, napi_external_backing_store_hint__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_external_backing_store_hint__>::record_create(owner, val);
+  }
+
+  static void record_release(napi_env__ *owner, napi_external_backing_store_hint__ *val)
+  {
+    quickjs::detail::napi_lifetime__<napi_external_backing_store_hint__>::record_release(owner, val);
+  }
+};
+#endif
 
 extern "C" void napi_quickjs_lifetime_dump(napi_env__ *env, const char *reason);
 

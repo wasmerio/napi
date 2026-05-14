@@ -12,9 +12,15 @@ napi_ref_with_finalizer__* napi_ref_with_finalizer__::New(
     node_api_basic_finalize finalize_cb,
     void* finalize_data,
     void* finalize_hint) {
-  napi_ref_with_finalizer__* reference = new (std::nothrow)
-      napi_ref_with_finalizer__(
-          env, value, initial_refcount, ownership, finalize_cb, finalize_data, finalize_hint);
+  napi_ref_with_finalizer__* reference =
+      env->allocate<napi_ref_with_finalizer__>(
+          env,
+          value,
+          initial_refcount,
+          ownership,
+          finalize_cb,
+          finalize_data,
+          finalize_hint);
   if (reference != nullptr) {
     reference->Link(&env->finalizing_reflist);
   }
@@ -45,6 +51,13 @@ void napi_ref_with_finalizer__::ResetFinalizer() {
   finalize_cb_ = nullptr;
   finalize_data_ = nullptr;
   finalize_hint_ = nullptr;
+}
+
+void napi_ref_with_finalizer__::Destroy() {
+  napi_env__* env = env_;
+  if (env != nullptr) {
+    env->release(this);
+  }
 }
 
 void napi_ref_with_finalizer__::CallUserFinalizer() {

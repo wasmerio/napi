@@ -7,10 +7,10 @@
 #include "internal/napi_ref.h"
 #include "internal/napi_scope.h"
 #include "internal/napi_value.h"
+#include "../../../lib/napi_lifetime_tracker.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,24 +26,17 @@ namespace
 {
 bool enabled()
 {
-  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
+  return napi::lifetime::env_flag_enabled("EDGE_TRACE_NAPI_LIFETIME");
 }
 
 bool periodic_stats_enabled()
 {
-  const char *value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_STATS");
-  if (value != nullptr && value[0] != '\0')
-    return value[0] != '0';
-  return enabled();
+  return napi::lifetime::env_flag_enabled_or("EDGE_TRACE_NAPI_LIFETIME_STATS", enabled());
 }
 
 int64_t monotonic_milliseconds()
 {
-  using clock = std::chrono::steady_clock;
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             clock::now().time_since_epoch())
-      .count();
+  return napi::lifetime::monotonic_milliseconds();
 }
 
 #if defined(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS) || \
@@ -375,12 +368,8 @@ struct basic_snapshot
 };
 
 template <typename Snapshot>
-struct tracked_type_stats
+struct tracked_type_stats : napi::lifetime::type_stats
 {
-  size_t created = 0;
-  size_t released = 0;
-  size_t active = 0;
-  size_t peak = 0;
   std::unordered_map<const void *, Snapshot> live;
 };
 
@@ -565,9 +554,7 @@ void record_create_locked(Stats &stats,
     stats.live.erase(existing);
   }
 
-  ++stats.created;
-  ++stats.active;
-  stats.peak = std::max(stats.peak, stats.active);
+  napi::lifetime::record_create(stats);
   add_snapshot(stats, snapshot);
   stats.live.emplace(handle, std::move(snapshot));
 }
@@ -584,9 +571,7 @@ napi_env record_release_locked(Stats &stats,
   napi_env env = existing->second.env;
   remove_snapshot(stats, existing->second);
   stats.live.erase(existing);
-  ++stats.released;
-  if (stats.active > 0)
-    --stats.active;
+  napi::lifetime::record_release(stats);
   return env;
 }
 

@@ -6,7 +6,7 @@
 
 v8::Local<v8::External> napi_external_wrapper__::New(napi_env__* env,
                                                      void* data) {
-  auto* wrapper = new (std::nothrow) napi_external_wrapper__(data);
+  auto* wrapper = env->allocate<napi_external_wrapper__>(env, data);
   if (wrapper == nullptr) {
     return v8::Local<v8::External>();
   }
@@ -35,5 +35,8 @@ bool napi_external_wrapper__::CheckTypeTag(const napi_type_tag* tag) const {
 
 void napi_external_wrapper__::WeakCallback(
     const v8::WeakCallbackInfo<napi_external_wrapper__>& info) {
-  delete info.GetParameter();
+  napi_external_wrapper__* wrapper = info.GetParameter();
+  if (wrapper != nullptr && wrapper->env_ != nullptr) {
+    wrapper->env_->release(wrapper);
+  }
 }

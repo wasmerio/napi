@@ -9,8 +9,8 @@ napi_ref_with_data__* napi_ref_with_data__::New(napi_env__* env,
                                                 uint32_t initial_refcount,
                                                 napi_ref_ownership__ ownership,
                                                 void* data) {
-  napi_ref_with_data__* reference = new (std::nothrow)
-      napi_ref_with_data__(env, value, initial_refcount, ownership, data);
+  napi_ref_with_data__* reference = env->allocate<napi_ref_with_data__>(
+      env, value, initial_refcount, ownership, data);
   if (reference != nullptr) {
     reference->Link(&env->reflist);
   }
@@ -23,3 +23,10 @@ napi_ref_with_data__::napi_ref_with_data__(napi_env__* env,
                                            napi_ref_ownership__ ownership,
                                            void* data)
     : napi_ref__(env, value, initial_refcount, ownership), data_(data) {}
+
+void napi_ref_with_data__::Destroy() {
+  napi_env__* env = env_;
+  if (env != nullptr) {
+    env->release(this);
+  }
+}

@@ -78,6 +78,17 @@ struct ModuleWrapRecord {
   std::vector<ModuleWrapRecord*> linked_requests;
 };
 
+}  // namespace
+
+namespace v8impl::detail {
+template <>
+struct napi_lifetime_type_name__<ModuleWrapRecord> {
+  static constexpr const char* value = "module_wrap_record";
+};
+}  // namespace v8impl::detail
+
+namespace {
+
 struct ModuleWrapBindingState {
   napi_ref import_module_dynamically_ref = nullptr;
   napi_ref initialize_import_meta_ref = nullptr;
@@ -595,7 +606,7 @@ void DestroyModuleRecord(ModuleWrapRecord* record) {
   ResetRef(env, &record->host_defined_option_ref);
   record->context.Reset();
   record->module.Reset();
-  delete record;
+  env->release(record);
 }
 
 bool TryGetInternalBindingSymbol(napi_env env,
@@ -840,7 +851,7 @@ void CleanupModuleWrapState(void* arg) {
     ResetRef(env, &record->host_defined_option_ref);
     record->context.Reset();
     record->module.Reset();
-    delete record;
+    env->release(record);
   }
 
   ResetRef(env, &it->second.import_module_dynamically_ref);
@@ -2242,7 +2253,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     return napi_generic_failure;
   }
 
-  auto* record = new ModuleWrapRecord();
+  auto* record = env->allocate<ModuleWrapRecord>();
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);
@@ -2324,7 +2335,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
   v8::Local<v8::Module> module = v8::Module::CreateSyntheticModule(
       isolate, ToV8String(env, url, "vm:synthetic"), names_span, SyntheticModuleEvaluationSteps);
 
-  auto* record = new ModuleWrapRecord();
+  auto* record = env->allocate<ModuleWrapRecord>();
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);

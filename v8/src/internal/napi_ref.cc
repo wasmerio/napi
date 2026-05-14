@@ -22,7 +22,6 @@ napi_ref__::napi_ref__(napi_env__* env,
       refcount_(initial_refcount),
       ownership_(ownership),
       can_be_weak_(CanBeHeldWeakly(value)) {
-  v8impl::detail::napi_lifetime__<napi_ref__>::record_create(env, this);
   if (refcount_ == 0) {
     SetWeak();
   }
@@ -34,19 +33,25 @@ napi_ref__::~napi_ref__() {
   }
   value_.Reset();
   Unlink();
-  v8impl::detail::napi_lifetime__<napi_ref__>::record_release(env_, this);
 }
 
 napi_ref__* napi_ref__::New(napi_env__* env,
                             v8::Local<v8::Value> value,
                             uint32_t initial_refcount,
                             napi_ref_ownership__ ownership) {
-  napi_ref__* reference = new (std::nothrow)
-      napi_ref__(env, value, initial_refcount, ownership);
+  napi_ref__* reference = env->allocate<napi_ref__>(
+      env, value, initial_refcount, ownership);
   if (reference != nullptr) {
     reference->Link(&env->reflist);
   }
   return reference;
+}
+
+void napi_ref__::Destroy() {
+  napi_env__* env = env_;
+  if (env != nullptr) {
+    env->release(this);
+  }
 }
 
 uint32_t napi_ref__::Ref() {
@@ -92,7 +97,7 @@ void napi_ref__::Finalize() {
   Unlink();
   CallUserFinalizer();
   if (deleteMe) {
-    delete this;
+    Destroy();
   }
 }
 

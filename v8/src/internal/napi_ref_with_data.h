@@ -11,14 +11,15 @@ struct napi_ref_with_data__ final : public napi_ref__ {
                                    void* data);
 
   void* Data() const override { return data_; }
+  void Destroy() override;
 
- private:
   napi_ref_with_data__(napi_env__* env,
                        v8::Local<v8::Value> value,
                        uint32_t initial_refcount,
                        napi_ref_ownership__ ownership,
                        void* data);
 
+ private:
   void* data_ = nullptr;
 };
 

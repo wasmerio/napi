@@ -6,14 +6,21 @@
 #include <cstddef>
 #include <v8.h>
 
+template <typename T, typename Owner>
+struct napi_allocator_lifetime__;
+
 struct napi_buffer_record__;
+struct napi_callback_payload__;
 struct napi_deferred__;
 struct napi_env__;
 struct napi_env_cleanup_hook__;
 struct napi_escapable_handle_scope__;
 struct napi_external_backing_store_hint__;
+struct napi_external_wrapper__;
 struct napi_handle_scope__;
 struct napi_ref__;
+struct napi_ref_with_data__;
+struct napi_ref_with_finalizer__;
 
 namespace v8impl::detail {
 
@@ -76,6 +83,26 @@ struct napi_lifetime_type_name__<napi_ref__> {
 };
 
 template <>
+struct napi_lifetime_type_name__<napi_ref_with_data__> {
+  static constexpr const char* value = "napi_ref_with_data";
+};
+
+template <>
+struct napi_lifetime_type_name__<napi_ref_with_finalizer__> {
+  static constexpr const char* value = "napi_ref_with_finalizer";
+};
+
+template <>
+struct napi_lifetime_type_name__<napi_callback_payload__> {
+  static constexpr const char* value = "napi_callback_payload";
+};
+
+template <>
+struct napi_lifetime_type_name__<napi_external_wrapper__> {
+  static constexpr const char* value = "napi_external_wrapper";
+};
+
+template <>
 struct napi_lifetime_type_name__<napi_env_cleanup_hook__> {
   static constexpr const char* value = "napi_env_cleanup_hook";
 };
@@ -119,6 +146,19 @@ struct napi_lifetime__ {
 };
 
 }  // namespace v8impl::detail
+
+#ifdef NAPI_V8_ENABLE_LIFETIME_TRACKER
+template <typename T>
+struct napi_allocator_lifetime__<T, napi_env__> {
+  static void record_create(napi_env__* owner, T* val) {
+    v8impl::detail::napi_lifetime__<T>::record_create(owner, val);
+  }
+
+  static void record_release(napi_env__* owner, T* val) {
+    v8impl::detail::napi_lifetime__<T>::record_release(owner, val);
+  }
+};
+#endif
 
 extern "C" void napi_v8_lifetime_dump(napi_env__* env, const char* reason);
 

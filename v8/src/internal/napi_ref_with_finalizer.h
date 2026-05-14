@@ -15,8 +15,8 @@ struct napi_ref_with_finalizer__ final : public napi_ref__ {
 
   void* Data() const override { return finalize_data_; }
   void ResetFinalizer() override;
+  void Destroy() override;
 
- private:
   napi_ref_with_finalizer__(napi_env__* env,
                             v8::Local<v8::Value> value,
                             uint32_t initial_refcount,
@@ -24,6 +24,8 @@ struct napi_ref_with_finalizer__ final : public napi_ref__ {
                             node_api_basic_finalize finalize_cb,
                             void* finalize_data,
                             void* finalize_hint);
+
+ private:
   void CallUserFinalizer() override;
   void InvokeFinalizerFromGC() override;
 

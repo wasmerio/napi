@@ -1,7 +1,5 @@
-#ifndef NAPI_QUICKJS_ALLOCATOR_H_
-#define NAPI_QUICKJS_ALLOCATOR_H_
-
-#include "napi_lifetime_tracker.h"
+#ifndef NAPI_ALLOCATOR_H_
+#define NAPI_ALLOCATOR_H_
 
 #include <array>
 #include <concepts>
@@ -14,6 +12,22 @@
 #include <utility>
 #include <vector>
 #include <cassert>
+
+template <typename T, typename Owner>
+struct napi_allocator_lifetime__
+{
+  static void record_create(Owner *owner, T *val)
+  {
+    (void)owner;
+    (void)val;
+  }
+
+  static void record_release(Owner *owner, T *val)
+  {
+    (void)owner;
+    (void)val;
+  }
+};
 
 template <typename T>
 concept napi_allocator_payload__ = std::destructible<T>;
@@ -185,8 +199,7 @@ private:
         slot__ &slot = this->slots[i - 1];
         if (slot.active)
         {
-          if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-            quickjs::detail::napi_lifetime__<T>::record_release(this->owner_, slot.data());
+          napi_allocator_lifetime__<T, Owner>::record_release(this->owner_, slot.data());
           slot.destroy();
           slot.active = false;
         }
@@ -253,8 +266,7 @@ public:
       return nullptr;
 
     T *data = slot->construct(static_cast<Args &&>(args)...);
-    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-      quickjs::detail::napi_lifetime__<T>::record_create(owner_, data);
+    napi_allocator_lifetime__<T, Owner>::record_create(owner_, data);
 
     if (block->is_full())
     {
@@ -307,8 +319,7 @@ public:
     if (!owns_block(block) || slot_index(block, slot) >= N || !slot->owns_handle(handle))
       return;
 
-    if constexpr (quickjs::detail::napi_lifetime_tracked__<T, Owner>)
-      quickjs::detail::napi_lifetime__<T>::record_release(owner_, slot->data());
+    napi_allocator_lifetime__<T, Owner>::record_release(owner_, slot->data());
 
     bool was_full = block->is_full();
     slot->destroy();
@@ -443,4 +454,4 @@ private:
   Owner *owner_ = nullptr;
 };
 
-#endif // NAPI_QUICKJS_ALLOCATOR_H_
+#endif // NAPI_ALLOCATOR_H_

@@ -6,18 +6,50 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <v8.h>
 
 #include "js_native_api.h"
+#include "napi_allocator.h"
+#include "internal/napi_lifetime_tracker.h"
 #include "internal/napi_ref_tracker.h"
 #include "unofficial_napi.h"
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
 
 struct napi_buffer_record__;
+struct napi_callback_payload__;
+struct napi_deferred__;
+struct napi_env__;
 struct napi_env_cleanup_hook__;
+struct napi_escapable_handle_scope__;
+struct napi_external_backing_store_hint__;
+struct napi_external_wrapper__;
+struct napi_handle_scope__;
+struct napi_ref__;
+struct napi_ref_with_data__;
+struct napi_ref_with_finalizer__;
+
+struct napi_env_allocator_base__ {
+  virtual ~napi_env_allocator_base__() = default;
+  virtual const void* key() const = 0;
+};
+
+template <typename T>
+struct napi_env_allocator__ final : public napi_env_allocator_base__ {
+  explicit napi_env_allocator__(napi_env__* env) : allocator(env) {}
+
+  static const void* static_key() {
+    static int key;
+    return &key;
+  }
+
+  const void* key() const override { return static_key(); }
+
+  napi_allocator__<T*, T, napi_env__> allocator;
+};
 
 static_assert(sizeof(v8::Local<v8::Value>) == sizeof(napi_value),
               "Cannot convert between v8::Local<v8::Value> and napi_value");
@@ -52,6 +84,31 @@ struct napi_env__ {
   void DequeueFinalizer(napi_ref_tracker__* finalizer);
   void DrainFinalizerQueue();
 
+  template <typename T, typename... Args>
+  T* allocate(Args&&... args) {
+    return allocator_for<T>().allocate(std::forward<Args>(args)...);
+  }
+
+  template <typename T>
+  void release(T* value) {
+    if (value == nullptr) return;
+    allocator_for<T>().release(value);
+  }
+
+  template <typename T>
+  napi_allocator__<T*, T, napi_env__>& allocator_for() {
+    const void* key = napi_env_allocator__<T>::static_key();
+    for (auto& allocator : allocators_) {
+      if (allocator != nullptr && allocator->key() == key) {
+        return static_cast<napi_env_allocator__<T>*>(allocator.get())->allocator;
+      }
+    }
+    auto allocator = std::make_unique<napi_env_allocator__<T>>(this);
+    auto* result = allocator.get();
+    allocators_.push_back(std::move(allocator));
+    return result->allocator;
+  }
+
 #if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
   bool should_dump_lifetime_stats(int64_t now_ms);
   bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
@@ -73,9 +130,10 @@ struct napi_env__ {
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
   void* edge_environment = nullptr;
-  std::vector<std::unique_ptr<napi_env_cleanup_hook__>> env_cleanup_hooks;
+  std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
-  std::vector<std::unique_ptr<napi_buffer_record__>> buffer_records;
+  std::vector<napi_buffer_record__*> buffer_records;
+  std::vector<std::unique_ptr<napi_env_allocator_base__>> allocators_;
   napi_ref_tracker__::RefList reflist;
   napi_ref_tracker__::RefList finalizing_reflist;
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;

@@ -92,6 +92,7 @@ foreach(NAPI_V8_SRC_FILE IN LISTS NAPI_V8_SRC_FILES)
 endforeach()
 
 add_library(napi_v8 STATIC
+  ../lib/napi_lifetime_tracker.cc
   src/js_native_api_v8.cc
   src/internal/napi_escapable_handle_scope_wrapper.cc
   src/internal/napi_external_wrapper.cc
@@ -114,6 +115,7 @@ add_library(napi_v8 STATIC
 target_include_directories(napi_v8
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
+    "${PROJECT_ROOT}/napi/lib"
   PRIVATE
     "${NAPI_V8_ROOT}/src"
     "${NAPI_V8_INCLUDE_DIR}"

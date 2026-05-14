@@ -3,6 +3,7 @@
 
 #include "../../../include/js_native_api.h"
 #include "napi_allocator.h"
+#include "napi_lifetime_tracker.h"
 #include "napi_value.h"
 
 #include <cstdint>

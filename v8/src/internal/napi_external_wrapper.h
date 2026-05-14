@@ -4,6 +4,7 @@
 #include <v8.h>
 
 #include "js_native_api.h"
+#include "napi_allocator.h"
 
 struct napi_env__;
 
@@ -15,12 +16,13 @@ struct napi_external_wrapper__ {
   bool TypeTag(const napi_type_tag* tag);
   bool CheckTypeTag(const napi_type_tag* tag) const;
 
- private:
-  explicit napi_external_wrapper__(void* data) : data_(data) {}
+  napi_external_wrapper__(napi_env__* env, void* data) : env_(env), data_(data) {}
 
+ private:
   static void WeakCallback(
       const v8::WeakCallbackInfo<napi_external_wrapper__>& info);
 
+  napi_env__* env_ = nullptr;
   void* data_ = nullptr;
   napi_type_tag type_tag_{};
   bool has_type_tag_ = false;

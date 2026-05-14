@@ -2,10 +2,10 @@
 
 #include "internal/napi_ref.h"
 #include "internal/napi_v8_env.h"
+#include "../../../lib/napi_lifetime_tracker.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -21,33 +21,21 @@ namespace v8impl::detail {
 namespace {
 
 bool enabled() {
-  const char* value = std::getenv("EDGE_TRACE_NAPI_LIFETIME");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
+  return napi::lifetime::env_flag_enabled("EDGE_TRACE_NAPI_LIFETIME");
 }
 
 bool periodic_stats_enabled() {
-  const char* value = std::getenv("EDGE_TRACE_NAPI_LIFETIME_STATS");
-  if (value != nullptr && value[0] != '\0') {
-    return value[0] != '0';
-  }
-  return enabled();
+  return napi::lifetime::env_flag_enabled_or("EDGE_TRACE_NAPI_LIFETIME_STATS",
+                                             enabled());
 }
 
 int64_t monotonic_milliseconds() {
-  using clock = std::chrono::steady_clock;
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             clock::now().time_since_epoch())
-      .count();
+  return napi::lifetime::monotonic_milliseconds();
 }
 
 #ifdef NAPI_V8_ENABLE_LIFETIME_TRACKER
 
-struct type_stats {
-  std::size_t created = 0;
-  std::size_t released = 0;
-  std::size_t active = 0;
-  std::size_t peak = 0;
-};
+using type_stats = napi::lifetime::type_stats;
 
 #if defined(NAPI_V8_ENABLE_LIFETIME_TAG_STATS) || \
     defined(NAPI_V8_ENABLE_LIFETIME_STRING_SYMBOL_DUMP)
@@ -432,7 +420,10 @@ void dump_counter_header(const char* title) {
 }
 
 bool is_napi_ref_type(const char* type_name) {
-  return type_name != nullptr && std::strcmp(type_name, "napi_ref") == 0;
+  return type_name != nullptr &&
+         (std::strcmp(type_name, "napi_ref") == 0 ||
+          std::strcmp(type_name, "napi_ref_with_data") == 0 ||
+          std::strcmp(type_name, "napi_ref_with_finalizer") == 0);
 }
 
 const void* value_scope_key(napi_env env, std::size_t parent_scope_depth) {
@@ -540,18 +531,13 @@ void remove_value_snapshot(value_type_stats& stats,
 }
 
 void record_ref_create_locked(const value_snapshot& snapshot) {
-  ++g_lifetime.refs.created;
-  ++g_lifetime.refs.active;
-  g_lifetime.refs.peak = std::max(g_lifetime.refs.peak, g_lifetime.refs.active);
+  napi::lifetime::record_create(g_lifetime.refs);
   add_value_snapshot(g_lifetime.refs, snapshot);
 }
 
 void record_ref_release_locked(const value_snapshot& snapshot) {
   remove_value_snapshot(g_lifetime.refs, snapshot);
-  ++g_lifetime.refs.released;
-  if (g_lifetime.refs.active > 0) {
-    --g_lifetime.refs.active;
-  }
+  napi::lifetime::record_release(g_lifetime.refs);
 }
 
 void record_value_create_locked(napi_env env,
@@ -563,10 +549,7 @@ void record_value_create_locked(napi_env env,
 
   value_snapshot snapshot =
       capture_value_snapshot(env, value, parent_scope_depth);
-  ++g_lifetime.values.created;
-  ++g_lifetime.values.active;
-  g_lifetime.values.peak =
-      std::max(g_lifetime.values.peak, g_lifetime.values.active);
+  napi::lifetime::record_create(g_lifetime.values);
   add_value_snapshot(g_lifetime.values, snapshot);
   g_lifetime.scope_values[snapshot.scope_key].push_back(std::move(snapshot));
 }
@@ -580,10 +563,7 @@ void record_scope_values_release_locked(napi_env env, const void* scope) {
 
   for (const auto& snapshot : it->second) {
     remove_value_snapshot(g_lifetime.values, snapshot);
-    ++g_lifetime.values.released;
-    if (g_lifetime.values.active > 0) {
-      --g_lifetime.values.active;
-    }
+    napi::lifetime::record_release(g_lifetime.values);
   }
   g_lifetime.scope_values.erase(it);
 }
@@ -605,9 +585,7 @@ void record_create_locked(napi_env env, void* value, const char* type_name) {
   }
 
   auto& stats = g_lifetime.types[effective_type];
-  ++stats.created;
-  ++stats.active;
-  stats.peak = std::max(stats.peak, stats.active);
+  napi::lifetime::record_create(stats);
 
   live_record record;
   record.env = env;
@@ -635,10 +613,7 @@ void record_release_locked(void* value, const char* type_name) {
   }
 
   auto& stats = g_lifetime.types[effective_type];
-  ++stats.released;
-  if (stats.active > 0) {
-    --stats.active;
-  }
+  napi::lifetime::record_release(stats);
 }
 
 struct env_slot_scan {
@@ -654,6 +629,21 @@ struct env_slot_scan {
 type_stats type_stats_or_empty(const char* type_name) {
   auto it = g_lifetime.types.find(type_name);
   return it == g_lifetime.types.end() ? type_stats{} : it->second;
+}
+
+void add_type_stats(type_stats& total, const type_stats& stats) {
+  total.created += stats.created;
+  total.released += stats.released;
+  total.active += stats.active;
+  total.peak += stats.peak;
+}
+
+type_stats ref_type_stats() {
+  type_stats stats;
+  add_type_stats(stats, type_stats_or_empty("napi_ref"));
+  add_type_stats(stats, type_stats_or_empty("napi_ref_with_data"));
+  add_type_stats(stats, type_stats_or_empty("napi_ref_with_finalizer"));
+  return stats;
 }
 
 env_slot_scan scan_env_slots(napi_env env) {
@@ -682,7 +672,7 @@ env_slot_scan scan_env_slots(napi_env env) {
               return left.first < right.first;
             });
 
-  type_stats ref_stats = type_stats_or_empty("napi_ref");
+  type_stats ref_stats = ref_type_stats();
   type_stats handle_scope_stats = type_stats_or_empty("napi_handle_scope");
   type_stats escapable_scope_stats =
       type_stats_or_empty("napi_escapable_handle_scope");

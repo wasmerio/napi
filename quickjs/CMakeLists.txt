@@ -113,6 +113,7 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 # endforeach()
 
 add_library(napi_quickjs STATIC
+  ../lib/napi_lifetime_tracker.cc
   src/js_native_api_quickjs.cc
   src/internal/napi_callback_info.cc
   src/internal/napi_callsite.cc
@@ -140,6 +141,7 @@ endif()
 target_include_directories(napi_quickjs
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
+    "${PROJECT_ROOT}/napi/lib"
     "${NAPI_QUICKJS_ROOT}/src"
   PRIVATE
     "${NAPI_QUICKJS_INCLUDE_DIR}"
