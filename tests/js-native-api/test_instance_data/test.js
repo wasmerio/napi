@@ -23,6 +23,9 @@ if (module !== require.main) {
   // Test that cleanup hooks can remove still-pending cleanup hooks while the
   // environment is tearing down.
   test_instance_data.registerCleanupHookRemoval();
+
+  // Test that cleanup hooks run in last-in, first-out order.
+  test_instance_data.registerCleanupHookOrdering();
 } else {
   // When launched as a script, run tests in either a child process or in a
   // worker thread.

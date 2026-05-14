@@ -669,6 +669,33 @@ static napi_value TypeTaggedExternal(napi_env env, napi_callback_info info) {
   return instance;
 }
 
+static napi_value TypeTagObjectTwiceStatus(napi_env env,
+                                           napi_callback_info info) {
+  napi_value instance;
+  napi_status status;
+  napi_value result;
+
+  NODE_API_CALL(env, napi_create_object(env, &instance));
+  NODE_API_CALL(env, napi_type_tag_object(env, instance, &type_tags[0]));
+  status = napi_type_tag_object(env, instance, &type_tags[1]);
+  NODE_API_CALL(env, napi_create_int32(env, status, &result));
+  return result;
+}
+
+static napi_value TypeTagExternalTwiceStatus(napi_env env,
+                                             napi_callback_info info) {
+  napi_value instance;
+  napi_status status;
+  napi_value result;
+
+  NODE_API_CALL(
+      env, napi_create_external(env, IN_LIEU_OF_NULL, NULL, NULL, &instance));
+  NODE_API_CALL(env, napi_type_tag_object(env, instance, &type_tags[0]));
+  status = napi_type_tag_object(env, instance, &type_tags[1]);
+  NODE_API_CALL(env, napi_create_int32(env, status, &result));
+  return result;
+}
+
 static napi_value
 CheckTypeTag(napi_env env, napi_callback_info info) {
   size_t argc = 2;
@@ -789,6 +816,10 @@ napi_value Init(napi_env env, napi_value exports) {
       DECLARE_NODE_API_PROPERTY("TestHasProperty", TestHasProperty),
       DECLARE_NODE_API_PROPERTY("TypeTaggedInstance", TypeTaggedInstance),
       DECLARE_NODE_API_PROPERTY("TypeTaggedExternal", TypeTaggedExternal),
+      DECLARE_NODE_API_PROPERTY("TypeTagObjectTwiceStatus",
+                                TypeTagObjectTwiceStatus),
+      DECLARE_NODE_API_PROPERTY("TypeTagExternalTwiceStatus",
+                                TypeTagExternalTwiceStatus),
       DECLARE_NODE_API_PROPERTY("PlainExternal", PlainExternal),
       DECLARE_NODE_API_PROPERTY("CheckTypeTag", CheckTypeTag),
       DECLARE_NODE_API_PROPERTY("TestGetProperty", TestGetProperty),

@@ -101,6 +101,16 @@ async function runTests() {
   test_reference.deleteTwoWeakReferences();
 
   (() => {
+    const value = {};
+    assert.strictEqual(test_reference.finalizeCount, 1);
+    test_reference.createReference(value, 0);
+    assert.strictEqual(test_reference.referenceValue, value);
+  })();
+  await gcUntil('Weak object reference',
+                () => (test_reference.referenceValue === undefined));
+  test_reference.deleteReference();
+
+  (() => {
     const value = test_reference.createExternalWithFinalize();
     assert.strictEqual(test_reference.finalizeCount, 0);
     test_reference.createReference(value, 1);

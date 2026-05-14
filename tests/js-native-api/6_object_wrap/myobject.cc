@@ -6,6 +6,7 @@
 typedef int32_t FinalizerData;
 
 napi_ref MyObject::constructor;
+static int finalizer_wrap_call_count = 0;
 
 MyObject::MyObject(double value)
     : value_(value), env_(nullptr), wrapper_(nullptr) {}
@@ -238,6 +239,80 @@ static napi_value GetFinalizerCallCount(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static void FinalizerWrapFinalizer(node_api_basic_env env,
+                                   void* finalize_data,
+                                   void* finalize_hint) {
+  (void)env;
+  (void)finalize_hint;
+  delete static_cast<int*>(finalize_data);
+  finalizer_wrap_call_count++;
+}
+
+static napi_value WrapFinalizer(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value args[2];
+  int32_t value;
+
+  NODE_API_CALL(env,
+                napi_get_cb_info(env, info, &argc, args, nullptr, nullptr));
+  NODE_API_ASSERT(env, argc == 2, "Expected object and integer arguments.");
+  NODE_API_CALL(env, napi_get_value_int32(env, args[1], &value));
+
+  NODE_API_CALL(env,
+                napi_wrap(env,
+                          args[0],
+                          new int(value),
+                          FinalizerWrapFinalizer,
+                          nullptr,
+                          nullptr));
+
+  return args[0];
+}
+
+static napi_value RemoveFinalizerWrap(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value arg;
+  void* data;
+  int value;
+  napi_value result;
+
+  NODE_API_CALL(env,
+                napi_get_cb_info(env, info, &argc, &arg, nullptr, nullptr));
+  NODE_API_ASSERT(env, argc == 1, "Expected an object argument.");
+  NODE_API_CALL(env, napi_remove_wrap(env, arg, &data));
+  NODE_API_ASSERT(env, data != nullptr, "Expected removed wrap data.");
+
+  value = *static_cast<int*>(data);
+  delete static_cast<int*>(data);
+  NODE_API_CALL(env, napi_create_int32(env, value, &result));
+  return result;
+}
+
+static napi_value HasFinalizerWrap(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value arg;
+  void* data = nullptr;
+  napi_status status;
+  napi_value result;
+
+  NODE_API_CALL(env,
+                napi_get_cb_info(env, info, &argc, &arg, nullptr, nullptr));
+  NODE_API_ASSERT(env, argc == 1, "Expected an object argument.");
+
+  status = napi_unwrap(env, arg, &data);
+  NODE_API_CALL(env, napi_get_boolean(
+      env, status == napi_ok && data != nullptr, &result));
+  return result;
+}
+
+static napi_value GetFinalizerWrapCallCount(napi_env env,
+                                            napi_callback_info info) {
+  napi_value result;
+  NODE_API_CALL(env,
+                napi_create_int32(env, finalizer_wrap_call_count, &result));
+  return result;
+}
+
 static void finalizeData(napi_env env, void* data, void* hint) {
   delete reinterpret_cast<FinalizerData*>(data);
 }
@@ -256,6 +331,11 @@ napi_value Init(napi_env env, napi_value exports) {
       DECLARE_NODE_API_PROPERTY("objectWrapDanglingReferenceTest",
                                 ObjectWrapDanglingReferenceTest),
       DECLARE_NODE_API_PROPERTY("getFinalizerCallCount", GetFinalizerCallCount),
+      DECLARE_NODE_API_PROPERTY("wrapFinalizer", WrapFinalizer),
+      DECLARE_NODE_API_PROPERTY("removeFinalizerWrap", RemoveFinalizerWrap),
+      DECLARE_NODE_API_PROPERTY("hasFinalizerWrap", HasFinalizerWrap),
+      DECLARE_NODE_API_PROPERTY("getFinalizerWrapCallCount",
+                                GetFinalizerWrapCallCount),
   };
 
   NODE_API_CALL(

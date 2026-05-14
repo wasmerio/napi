@@ -46,13 +46,35 @@ static napi_value RunCallbackWithRecv(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+static napi_value RunCallbackReturnArg(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value cb;
+  napi_value global;
+  napi_value arg;
+  napi_value result;
+  bool same;
+
+  NODE_API_CALL(env, napi_get_cb_info(env, info, &argc, &cb, NULL, NULL));
+  NODE_API_ASSERT(env, argc == 1, "Expected a callback argument.");
+
+  NODE_API_CALL(env, napi_create_object(env, &arg));
+  NODE_API_CALL(env, napi_get_global(env, &global));
+  NODE_API_CALL(env, napi_call_function(env, global, cb, 1, &arg, &result));
+  NODE_API_CALL(env, napi_strict_equals(env, arg, result, &same));
+  NODE_API_ASSERT(env, same, "Callback must be able to return its argument.");
+
+  return result;
+}
+
 EXTERN_C_START
 napi_value Init(napi_env env, napi_value exports) {
-  napi_property_descriptor desc[2] = {
+  napi_property_descriptor desc[] = {
     DECLARE_NODE_API_PROPERTY("RunCallback", RunCallback),
     DECLARE_NODE_API_PROPERTY("RunCallbackWithRecv", RunCallbackWithRecv),
+    DECLARE_NODE_API_PROPERTY("RunCallbackReturnArg", RunCallbackReturnArg),
   };
-  NODE_API_CALL(env, napi_define_properties(env, exports, 2, desc));
+  NODE_API_CALL(env, napi_define_properties(
+      env, exports, sizeof(desc) / sizeof(*desc), desc));
   return exports;
 }
 EXTERN_C_END
