@@ -16,6 +16,9 @@
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
 
+struct napi_buffer_record__;
+struct napi_env_cleanup_hook__;
+
 static_assert(sizeof(v8::Local<v8::Value>) == sizeof(napi_value),
               "Cannot convert between v8::Local<v8::Value> and napi_value");
 
@@ -58,33 +61,25 @@ struct napi_env__ {
   v8::Global<v8::Context> context_ref;
   napi_extended_error_info last_error{};
   std::string last_error_message;
-  int open_handle_scopes = 0;
   std::vector<void*> open_handle_scope_stack;
   v8::Global<v8::Value> last_exception;
   v8::Global<v8::Message> last_exception_message;
   std::string last_exception_source_line;
   std::string last_exception_thrown_at;
   v8::Global<v8::Private> wrap_private_key;
-  v8::Global<v8::Private> wrap_ref_private_key;
-  v8::Global<v8::Private> wrap_finalizer_private_key;
   v8::Global<v8::Private> buffer_private_key;
   v8::Global<v8::Private> type_tag_private_key;
-  int32_t module_api_version = 8;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
   void* edge_environment = nullptr;
-  std::vector<void*> threadsafe_functions;
-  std::vector<void*> async_cleanup_hooks;
-  std::vector<void*> env_cleanup_hooks;
+  std::vector<std::unique_ptr<napi_env_cleanup_hook__>> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
-  std::vector<void*> buffer_records;
+  std::vector<std::unique_ptr<napi_buffer_record__>> buffer_records;
   napi_ref_tracker__::RefList reflist;
   napi_ref_tracker__::RefList finalizing_reflist;
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   bool finalization_scheduled = false;
-  bool async_cleanup_hook_registered = false;
-  void (*node_api_cleanup_runner)(napi_env) = nullptr;
   unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
   void* env_cleanup_callback_data = nullptr;
   unofficial_napi_env_destroy_callback env_destroy_callback = nullptr;
