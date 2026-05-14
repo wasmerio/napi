@@ -2,7 +2,7 @@
 
 #include <new>
 
-#include "internal/napi_lifetime_macros.h"
+#include "internal/napi_lifetime_tracker.h"
 #include "internal/napi_v8_env.h"
 
 namespace {
