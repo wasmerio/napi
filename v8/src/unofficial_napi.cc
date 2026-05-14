@@ -2460,7 +2460,7 @@ napi_status GetCallSitesImpl(napi_env env,
   if (frames < 1 || frames > 200) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
   v8::Local<v8::Context> context = env->context();
 
   v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(isolate, frames + skip_frames);
@@ -2511,7 +2511,7 @@ napi_status GetCallSitesImpl(napi_env env,
     }
   }
 
-  *callsites_out = napi_v8_wrap_value(env, out);
+  *callsites_out = napi_v8_wrap_value(env, scope.Escape(out));
   if (*callsites_out == nullptr) return napi_generic_failure;
   return napi_ok;
 }
@@ -2535,7 +2535,7 @@ napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_va
   *location_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
 
   v8::Local<v8::StackTrace> trace = v8::StackTrace::CurrentStackTrace(isolate, 2);
   if (trace->GetFrameCount() != 2) {
@@ -2553,7 +2553,7 @@ napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_va
       file,
   };
   v8::Local<v8::Array> location = v8::Array::New(isolate, values, 3);
-  *location_out = napi_v8_wrap_value(env, location);
+  *location_out = napi_v8_wrap_value(env, scope.Escape(location));
   return *location_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
@@ -2609,7 +2609,7 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
   if (utf8description == nullptr && length > 0) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
   v8::Local<v8::Context> context = env->context();
 
   const char* description = utf8description != nullptr ? utf8description : "";
@@ -2634,7 +2634,7 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
     return napi_generic_failure;
   }
 
-  *result_out = napi_v8_wrap_value(env, symbol_value);
+  *result_out = napi_v8_wrap_value(env, scope.Escape(symbol_value));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 

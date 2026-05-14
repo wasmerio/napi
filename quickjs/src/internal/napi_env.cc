@@ -8,6 +8,44 @@
 #include <limits>
 #include <cassert>
 
+namespace
+{
+void normalize_function_prototype_source_locations(JSContext *ctx)
+{
+  if (ctx == nullptr)
+    return;
+
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue function_ctor = JS_GetPropertyStr(ctx, global, "Function");
+  JS_FreeValue(ctx, global);
+  if (!JS_IsObject(function_ctor))
+  {
+    JS_FreeValue(ctx, function_ctor);
+    return;
+  }
+
+  JSValue prototype = JS_GetPropertyStr(ctx, function_ctor, "prototype");
+  JS_FreeValue(ctx, function_ctor);
+  if (!JS_IsObject(prototype))
+  {
+    JS_FreeValue(ctx, prototype);
+    return;
+  }
+
+  const char *keys[] = {"fileName", "lineNumber", "columnNumber"};
+  for (const char *key : keys)
+  {
+    JSAtom atom = JS_NewAtom(ctx, key);
+    if (atom != JS_ATOM_NULL)
+    {
+      (void)JS_DeleteProperty(ctx, prototype, atom, 0);
+      JS_FreeAtom(ctx, atom);
+    }
+  }
+  JS_FreeValue(ctx, prototype);
+}
+}
+
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
     : context_{context},
       module_api_version_{module_api_version},
@@ -23,6 +61,7 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
 {
   root_scope_ = create_scope(nullptr);
   current_scope_ = root_scope_;
+  normalize_function_prototype_source_locations(context_);
   clear_last_error();
 }
 

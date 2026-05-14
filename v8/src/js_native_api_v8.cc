@@ -1,4 +1,17 @@
 #include "internal/napi_v8_env.h"
+#include "internal/napi_callback_payload__.h"
+#include "internal/napi_escapable_handle_scope_wrapper__.h"
+#include "internal/napi_external_wrapper__.h"
+#include "internal/napi_function_callback_info__.h"
+#include "internal/napi_getter_callback_info__.h"
+#include "internal/napi_handle_scope_wrapper__.h"
+#include "internal/napi_lifetime_macros.h"
+#include "internal/napi_lifetime_tracker.h"
+#include "internal/napi_ref__.h"
+#include "internal/napi_ref_with_data__.h"
+#include "internal/napi_ref_with_finalizer__.h"
+#include "internal/napi_setter_callback_info__.h"
+#include "internal/napi_util.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -32,59 +45,78 @@ struct napi_threadsafe_function__ {
 };
 
 struct napi_env_cleanup_hook__ {
+  explicit napi_env_cleanup_hook__(napi_env env) : env(env) {
+    v8impl::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_create(
+        env, this);
+  }
+
+  ~napi_env_cleanup_hook__() {
+    v8impl::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_release(
+        env, this);
+  }
+
+  napi_env env = nullptr;
   napi_cleanup_hook hook = nullptr;
   void* arg = nullptr;
   uint64_t order = 0;
 };
 
 struct napi_deferred__ {
+  explicit napi_deferred__(napi_env env) : env(env) {
+    v8impl::detail::napi_lifetime__<napi_deferred__>::record_create(env, this);
+  }
+
+  ~napi_deferred__() {
+    v8impl::detail::napi_lifetime__<napi_deferred__>::record_release(env, this);
+  }
+
   napi_env env = nullptr;
   v8::Global<v8::Promise::Resolver> resolver;
 };
 
-class HandleScopeWrapper {
- public:
-  explicit HandleScopeWrapper(v8::Isolate* isolate) : scope_(isolate) {}
-
- private:
-  v8::HandleScope scope_;
-};
-
-class EscapableHandleScopeWrapper {
- public:
-  explicit EscapableHandleScopeWrapper(v8::Isolate* isolate)
-      : scope_(isolate) {}
-
-  bool escape_called() const { return escape_called_; }
-
-  template <typename T>
-  v8::Local<T> Escape(v8::Local<T> handle) {
-    escape_called_ = true;
-    return scope_.Escape(handle);
-  }
-
- private:
-  v8::EscapableHandleScope scope_;
-  bool escape_called_ = false;
-};
-
 struct napi_handle_scope__ {
   explicit napi_handle_scope__(napi_env env)
-      : env(env), wrapper(env->isolate) {}
+      : env(env), wrapper(env->isolate) {
+    v8impl::detail::napi_lifetime__<napi_handle_scope__>::record_create(env,
+                                                                        this);
+  }
+
+  ~napi_handle_scope__() {
+    v8impl::detail::napi_lifetime__<napi_handle_scope__>::record_release(env,
+                                                                         this);
+  }
 
   napi_env env = nullptr;
-  HandleScopeWrapper wrapper;
+  napi_handle_scope_wrapper__ wrapper;
 };
 
 struct napi_escapable_handle_scope__ {
   explicit napi_escapable_handle_scope__(napi_env env)
-      : env(env), wrapper(env->isolate) {}
+      : env(env), wrapper(env->isolate) {
+    v8impl::detail::napi_lifetime__<napi_escapable_handle_scope__>::
+        record_create(env, this);
+  }
+
+  ~napi_escapable_handle_scope__() {
+    v8impl::detail::napi_lifetime__<napi_escapable_handle_scope__>::
+        record_release(env, this);
+  }
 
   napi_env env = nullptr;
-  EscapableHandleScopeWrapper wrapper;
+  napi_escapable_handle_scope_wrapper__ wrapper;
 };
 
 struct napi_buffer_record__ {
+  explicit napi_buffer_record__(napi_env env) : env(env) {
+    v8impl::detail::napi_lifetime__<napi_buffer_record__>::record_create(env,
+                                                                         this);
+  }
+
+  ~napi_buffer_record__() {
+    v8impl::detail::napi_lifetime__<napi_buffer_record__>::record_release(env,
+                                                                          this);
+  }
+
   napi_env env = nullptr;
   v8::Global<v8::Object> holder;
   std::shared_ptr<v8::BackingStore> backing_store;
@@ -96,6 +128,16 @@ struct napi_buffer_record__ {
 using napi_buffer_record = napi_buffer_record__;
 
 struct napi_external_backing_store_hint__ {
+  explicit napi_external_backing_store_hint__(napi_env env) : env(env) {
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_create(env, this);
+  }
+
+  ~napi_external_backing_store_hint__() {
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_release(env, this);
+  }
+
   napi_env env = nullptr;
   void* external_data = nullptr;
   node_api_basic_finalize finalize_cb = nullptr;
@@ -160,183 +202,6 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   resolver->Resolve(context, result).FromMaybe(false);
   return handle_scope.Escape(promise);
 }
-
-inline bool CanBeHeldWeakly(v8::Local<v8::Value> value) {
-  return value->IsObject() || value->IsSymbol();
-}
-
-void InvokeReferenceFinalizerMicrotask(void* data) {
-  auto* ref = static_cast<napi_ref>(data);
-  if (ref != nullptr) {
-    ref->Finalize();
-  }
-}
-
-struct CallbackPayload {
-  napi_env env;
-  napi_callback cb;
-  void* data;
-};
-
-struct AccessorPayload {
-  napi_env env;
-  napi_callback getter_cb;
-  napi_callback setter_cb;
-  void* data;
-};
-
-class ExternalWrapper {
- public:
-  static v8::Local<v8::External> New(napi_env env, void* data) {
-    auto* wrapper = new (std::nothrow) ExternalWrapper(data);
-    if (wrapper == nullptr) {
-      return v8::Local<v8::External>();
-    }
-    v8::Local<v8::External> external = v8::External::New(env->isolate, wrapper);
-    wrapper->handle_.Reset(env->isolate, external);
-    wrapper->handle_.SetWeak(wrapper, WeakCallback, v8::WeakCallbackType::kParameter);
-    return external;
-  }
-
-  static ExternalWrapper* From(v8::Local<v8::External> external) {
-    return static_cast<ExternalWrapper*>(external->Value());
-  }
-
-  void* Data() const { return data_; }
-
-  bool TypeTag(const napi_type_tag* tag) {
-    if (has_type_tag_) return false;
-    type_tag_ = *tag;
-    has_type_tag_ = true;
-    return true;
-  }
-
-  bool CheckTypeTag(const napi_type_tag* tag) const {
-    return has_type_tag_ && tag->lower == type_tag_.lower &&
-           tag->upper == type_tag_.upper;
-  }
-
- private:
-  explicit ExternalWrapper(void* data) : data_(data) {}
-
-  static void WeakCallback(const v8::WeakCallbackInfo<ExternalWrapper>& info) {
-    delete info.GetParameter();
-  }
-
-  void* data_ = nullptr;
-  napi_type_tag type_tag_{};
-  bool has_type_tag_ = false;
-  v8::Global<v8::Value> handle_;
-};
-
-class FunctionCallbackInfoWrapper : public napi_callback_info__ {
- public:
-  explicit FunctionCallbackInfoWrapper(
-      const v8::FunctionCallbackInfo<v8::Value>& info,
-      CallbackPayload* payload)
-      : info_(info), payload_(payload) {}
-
-  size_t argc() const override { return static_cast<size_t>(info_.Length()); }
-
-  void args(napi_value* argv, size_t argc) const override {
-    size_t i = 0;
-    const size_t actual_argc = this->argc();
-    const size_t copied_argc = (argc < actual_argc) ? argc : actual_argc;
-    for (; i < copied_argc; ++i) {
-      argv[i] = JsValueFromV8LocalValue(info_[static_cast<int>(i)]);
-    }
-    if (i < argc) {
-      napi_value undefined =
-          JsValueFromV8LocalValue(v8::Undefined(info_.GetIsolate()));
-      for (; i < argc; ++i) {
-        argv[i] = undefined;
-      }
-    }
-  }
-
-  napi_value this_arg() const override {
-    return JsValueFromV8LocalValue(info_.This());
-  }
-
-  napi_value new_target() const override {
-    if (!info_.IsConstructCall()) {
-      return nullptr;
-    }
-    return JsValueFromV8LocalValue(info_.NewTarget());
-  }
-
-  void* data() const override { return payload_->data; }
-
- private:
-  const v8::FunctionCallbackInfo<v8::Value>& info_;
-  CallbackPayload* payload_;
-};
-
-class GetterCallbackInfoWrapper : public napi_callback_info__ {
- public:
-  GetterCallbackInfoWrapper(napi_env env,
-                            void* data,
-                            const v8::PropertyCallbackInfo<v8::Value>& info)
-      : env_(env), data_(data), info_(info) {}
-
-  size_t argc() const override { return 0; }
-
-  void args(napi_value* argv, size_t argc) const override {
-    napi_value undefined = JsValueFromV8LocalValue(v8::Undefined(env_->isolate));
-    for (size_t i = 0; i < argc; ++i) {
-      argv[i] = undefined;
-    }
-  }
-
-  napi_value this_arg() const override {
-    return JsValueFromV8LocalValue(info_.This());
-  }
-
-  napi_value new_target() const override { return nullptr; }
-
-  void* data() const override { return data_; }
-
- private:
-  napi_env env_ = nullptr;
-  void* data_ = nullptr;
-  const v8::PropertyCallbackInfo<v8::Value>& info_;
-};
-
-class SetterCallbackInfoWrapper : public napi_callback_info__ {
- public:
-  SetterCallbackInfoWrapper(napi_env env,
-                            void* data,
-                            v8::Local<v8::Value> value,
-                            const v8::PropertyCallbackInfo<void>& info)
-      : env_(env), data_(data), value_(value), info_(info) {}
-
-  size_t argc() const override { return 1; }
-
-  void args(napi_value* argv, size_t argc) const override {
-    if (argc == 0) {
-      return;
-    }
-    argv[0] = JsValueFromV8LocalValue(value_);
-    napi_value undefined = JsValueFromV8LocalValue(v8::Undefined(env_->isolate));
-    for (size_t i = 1; i < argc; ++i) {
-      argv[i] = undefined;
-    }
-  }
-
-  napi_value this_arg() const override {
-    return JsValueFromV8LocalValue(info_.This());
-  }
-
-  napi_value new_target() const override { return nullptr; }
-
-  void* data() const override { return data_; }
-
- private:
-  napi_env env_ = nullptr;
-  void* data_ = nullptr;
-  v8::Local<v8::Value> value_;
-  const v8::PropertyCallbackInfo<void>& info_;
-};
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
@@ -613,13 +478,13 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
 
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
-      static_cast<CallbackPayload*>(info.Data().As<v8::External>()->Value());
+      static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
   if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
     return;
   }
 
   napi_env env = payload->env;
-  FunctionCallbackInfoWrapper cbinfo(info, payload);
+  napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
   bool pending_exception = !env->last_exception.IsEmpty();
@@ -635,12 +500,12 @@ void GetterTrampoline(v8::Local<v8::Name> property,
                       const v8::PropertyCallbackInfo<v8::Value>& info) {
   (void)property;
   auto* payload =
-      static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
+      static_cast<napi_accessor_payload__*>(info.Data().As<v8::External>()->Value());
   if (payload == nullptr || payload->env == nullptr || payload->getter_cb == nullptr) {
     return;
   }
   napi_env env = payload->env;
-  GetterCallbackInfoWrapper cbinfo(env, payload->data, info);
+  napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
   if (!env->last_exception.IsEmpty()) {
     info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
@@ -655,12 +520,12 @@ void SetterTrampoline(v8::Local<v8::Name> property,
                       const v8::PropertyCallbackInfo<void>& info) {
   (void)property;
   auto* payload =
-      static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
+      static_cast<napi_accessor_payload__*>(info.Data().As<v8::External>()->Value());
   if (payload == nullptr || payload->env == nullptr || payload->setter_cb == nullptr) {
     return;
   }
   napi_env env = payload->env;
-  SetterCallbackInfoWrapper cbinfo(env, payload->data, value, info);
+  napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
   if (!env->last_exception.IsEmpty()) {
     info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
@@ -670,128 +535,36 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 
 }  // namespace
 
-void RefTracker::Link(RefList* list) {
-  prev_ = list;
-  next_ = list->next_;
-  if (next_ != nullptr) {
-    next_->prev_ = this;
-  }
-  list->next_ = this;
+void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
+  if (cb == nullptr) return;
+  v8::HandleScope handle_scope(isolate);
+  v8::Context::Scope context_scope(context());
+  cb(this, data, hint);
 }
 
-void RefTracker::Unlink() {
-  if (prev_ != nullptr) {
-    prev_->next_ = next_;
-  }
-  if (next_ != nullptr) {
-    next_->prev_ = prev_;
-  }
-  prev_ = nullptr;
-  next_ = nullptr;
+void napi_env__::InvokeFinalizerFromGC(napi_ref_tracker__* finalizer) {
+  EnqueueFinalizer(finalizer);
 }
 
-void RefTracker::FinalizeAll(RefList* list) {
-  while (list->next_ != nullptr) {
-    list->next_->Finalize();
+void napi_env__::EnqueueFinalizer(napi_ref_tracker__* finalizer) {
+  if (finalizer == nullptr) return;
+  pending_finalizers.emplace(finalizer);
+  if (!finalization_scheduled && isolate != nullptr) {
+    finalization_scheduled = true;
+    isolate->EnqueueMicrotask(napi_v8_drain_finalizer_queue_microtask, this);
   }
 }
 
-napi_ref__::napi_ref__(napi_env env,
-                       v8::Local<v8::Value> value,
-                       uint32_t initial_refcount)
-    : env(env), value(env->isolate, value), refcount(initial_refcount), can_be_weak(CanBeHeldWeakly(value)) {
-  Link(&env->reflist);
-  if (refcount == 0) {
-    SetWeak();
-  }
+void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
+  pending_finalizers.erase(finalizer);
 }
 
-napi_ref__::~napi_ref__() {
-  ResetFinalizer();
-  if (!value.IsEmpty() && can_be_weak && refcount == 0) {
-    value.ClearWeak();
-  }
-  value.Reset();
-  Unlink();
-}
-
-uint32_t napi_ref__::Ref() {
-  if (value.IsEmpty()) {
-    return 0;
-  }
-  if (++refcount == 1 && can_be_weak) {
-    value.ClearWeak();
-  }
-  return refcount;
-}
-
-uint32_t napi_ref__::Unref() {
-  if (value.IsEmpty() || refcount == 0) {
-    return 0;
-  }
-  if (--refcount == 0) {
-    SetWeak();
-  }
-  return refcount;
-}
-
-v8::Local<v8::Value> napi_ref__::Get() const {
-  if (env == nullptr || value.IsEmpty()) {
-    return v8::Local<v8::Value>();
-  }
-  return value.Get(env->isolate);
-}
-
-void* napi_ref__::Data() const {
-  return data;
-}
-
-void napi_ref__::ResetFinalizer() {
-  finalize_cb = nullptr;
-  finalize_hint = nullptr;
-}
-
-void napi_ref__::Invalidate() {
-  if (!value.IsEmpty()) {
-    if (can_be_weak && refcount == 0) {
-      value.ClearWeak();
-    }
-    value.Reset();
-  }
-  Unlink();
-}
-
-void napi_ref__::Finalize() {
-  node_api_basic_finalize cb = finalize_cb;
-  void* cb_data = data;
-  void* cb_hint = finalize_hint;
-  ReferenceOwnership saved_ownership = ownership;
-  ResetFinalizer();
-  Invalidate();
-  if (cb != nullptr) {
-    cb(env, cb_data, cb_hint);
-  }
-  if (saved_ownership == ReferenceOwnership::kRuntime) {
-    delete this;
-  }
-}
-
-void napi_ref__::SetWeak() {
-  if (can_be_weak) {
-    value.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
-  } else {
-    value.Reset();
-  }
-}
-
-void napi_ref__::WeakCallback(const v8::WeakCallbackInfo<napi_ref__>& info) {
-  napi_ref__* ref = info.GetParameter();
-  if (ref == nullptr) return;
-  ref->Invalidate();
-  if (ref->finalize_cb != nullptr && ref->env != nullptr && ref->env->isolate != nullptr) {
-    ref->env->isolate->EnqueueMicrotask(InvokeReferenceFinalizerMicrotask, ref);
-  } else if (ref->ownership == ReferenceOwnership::kRuntime) {
-    delete ref;
+void napi_env__::DrainFinalizerQueue() {
+  finalization_scheduled = false;
+  while (!pending_finalizers.empty()) {
+    napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
+    pending_finalizers.erase(ref_tracker);
+    ref_tracker->Finalize();
   }
 }
 
@@ -819,8 +592,12 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 }
 
 napi_env__::~napi_env__() {
+  NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   RunEnvCleanupHooks(this);
-  RefTracker::FinalizeAll(&reflist);
+  napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
+  napi_ref_tracker__::FinalizeAll(&reflist);
+  pending_finalizers.clear();
+  finalization_scheduled = false;
   napi_v8_finalize_buffer_records(this);
 
   for (auto* raw_tsfn : threadsafe_functions) {
@@ -839,11 +616,44 @@ napi_env__::~napi_env__() {
     env_destroy_callback(this, env_destroy_callback_data);
   }
   edge_environment = nullptr;
+  NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 
 v8::Local<v8::Context> napi_env__::context() const {
   return context_ref.Get(isolate);
 }
+
+#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+bool napi_env__::should_dump_lifetime_stats(int64_t now_ms) {
+  constexpr int64_t interval_ms = 2000;
+  if (lifetime_last_stats_ms_ == 0) {
+    lifetime_last_stats_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_stats_ms_ < interval_ms) {
+    return false;
+  }
+
+  lifetime_last_stats_ms_ = now_ms;
+  return true;
+}
+
+bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms) {
+  constexpr int64_t interval_ms = 10000;
+  if (lifetime_last_string_symbol_values_ms_ == 0) {
+    lifetime_last_string_symbol_values_ms_ = now_ms;
+    return false;
+  }
+
+  if (now_ms - lifetime_last_string_symbol_values_ms_ < interval_ms) {
+    return false;
+  }
+
+  lifetime_last_string_symbol_values_ms_ = now_ms;
+  return true;
+}
+#endif
 
 napi_status napi_v8_set_last_error(napi_env env,
                                    napi_status status,
@@ -864,6 +674,7 @@ napi_status napi_v8_clear_last_error(napi_env env) {
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
   if (!CheckEnv(env)) return nullptr;
+  v8impl::detail::napi_lifetime_tracker__::record_value(env, value);
   return JsValueFromV8LocalValue(value);
 }
 
@@ -913,28 +724,29 @@ napi_status NAPI_CDECL napi_get_last_error_info(
 napi_status NAPI_CDECL napi_get_undefined(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Undefined(env->isolate));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_null(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Null(env->isolate));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_global(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   auto context = env->context();
   *result = napi_v8_wrap_value(env, context->Global());
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_boolean(napi_env env,
                                         bool value,
                                         napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::Boolean::New(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  v8::Isolate* isolate = env->isolate;
+  *result = napi_v8_wrap_value(env, value ? v8::True(isolate) : v8::False(isolate));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_double(napi_env env,
@@ -942,31 +754,33 @@ napi_status NAPI_CDECL napi_create_double(napi_env env,
                                           napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Number::New(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_int32(napi_env env,
                                          int32_t value,
                                          napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::Int32::New(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result = napi_v8_wrap_value(env, v8::Integer::New(env->isolate, value));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_int64(napi_env env,
                                          int64_t value,
                                          napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::Number::New(env->isolate, static_cast<double>(value)));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result = napi_v8_wrap_value(env,
+      v8::Number::New(env->isolate, static_cast<double>(value)));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_uint32(napi_env env,
                                           uint32_t value,
                                           napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::Integer::NewFromUnsigned(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result = napi_v8_wrap_value(env,
+      v8::Integer::NewFromUnsigned(env->isolate, value));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_bigint_int64(napi_env env,
@@ -974,15 +788,16 @@ napi_status NAPI_CDECL napi_create_bigint_int64(napi_env env,
                                                 napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::BigInt::New(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_bigint_uint64(napi_env env,
                                                  uint64_t value,
                                                  napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::BigInt::NewFromUnsigned(env->isolate, value));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result =
+      napi_v8_wrap_value(env, v8::BigInt::NewFromUnsigned(env->isolate, value));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
@@ -1014,24 +829,24 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
 
 napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> out;
-  if (!v8::Date::New(env->context(), time).ToLocal(&out)) {
+  v8::MaybeLocal<v8::Value> maybe_date = v8::Date::New(env->context(), time);
+  if (maybe_date.IsEmpty()) {
     return napi_generic_failure;
   }
-  *result = napi_v8_wrap_value(env, out);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result = napi_v8_wrap_value(env, maybe_date.ToLocalChecked());
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Object::New(env->isolate));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_array(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_external(napi_env env,
@@ -1040,15 +855,17 @@ napi_status NAPI_CDECL napi_create_external(napi_env env,
                                             void* finalize_hint,
                                             napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  v8::Local<v8::External> external = ExternalWrapper::New(env, data);
+  v8::Local<v8::External> external = napi_external_wrapper__::New(env, data);
   if (external.IsEmpty()) return napi_generic_failure;
   if (finalize_cb != nullptr) {
-    auto* ref = new (std::nothrow) napi_ref__(env, external, 0);
+    auto* ref = napi_ref_with_finalizer__::New(env,
+                                               external,
+                                               0,
+                                               napi_ref_ownership__::kRuntime,
+                                               finalize_cb,
+                                               data,
+                                               finalize_hint);
     if (ref == nullptr) return napi_generic_failure;
-    ref->ownership = ReferenceOwnership::kRuntime;
-    ref->data = data;
-    ref->finalize_cb = finalize_cb;
-    ref->finalize_hint = finalize_hint;
   }
   *result = napi_v8_wrap_value(env, external);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -1080,9 +897,8 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
   } else {
     if (external_data == nullptr) return napi_invalid_arg;
-    auto* hint = new (std::nothrow) napi_external_backing_store_hint__();
+    auto* hint = new (std::nothrow) napi_external_backing_store_hint__(env);
     if (hint == nullptr) return napi_generic_failure;
-    hint->env = env;
     hint->external_data = external_data;
     hint->finalize_cb = finalize_cb;
     hint->finalize_hint = finalize_hint;
@@ -1192,23 +1008,8 @@ napi_status NAPI_CDECL napi_create_array_with_length(napi_env env,
                                                      size_t length,
                                                      napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  auto context = env->context();
-  uint32_t length32 = static_cast<uint32_t>(
-      length > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-          ? std::numeric_limits<uint32_t>::max()
-          : length);
-  v8::Local<v8::Array> arr = v8::Array::New(env->isolate);
-  if (length32 > 0) {
-    if (!arr
-             ->Set(context,
-                   v8::String::NewFromUtf8Literal(env->isolate, "length"),
-                   v8::Integer::NewFromUnsigned(env->isolate, length32))
-             .FromMaybe(false)) {
-      return napi_generic_failure;
-    }
-  }
-  *result = napi_v8_wrap_value(env, arr);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate, length));
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_string_utf8(napi_env env,
@@ -1415,7 +1216,7 @@ napi_status NAPI_CDECL napi_create_symbol(napi_env env,
   v8::Local<v8::Symbol> sym = v8::Symbol::New(
       env->isolate, desc_value->IsString() ? desc_value.As<v8::String>() : v8::Local<v8::String>());
   *result = napi_v8_wrap_value(env, sym);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
@@ -1434,7 +1235,7 @@ napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
     return napi_generic_failure;
   }
   *result = napi_v8_wrap_value(env, v8::Symbol::For(env->isolate, key));
-  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_typeof(napi_env env,
@@ -1880,6 +1681,8 @@ napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope s
   }
   env->open_handle_scope_stack.pop_back();
   env->open_handle_scopes--;
+  v8impl::detail::napi_lifetime_tracker__::record_scope_values_release(env,
+                                                                       scope);
   delete scope;
   return napi_v8_clear_last_error(env);
 }
@@ -1906,6 +1709,8 @@ napi_status NAPI_CDECL napi_close_escapable_handle_scope(
   }
   env->open_handle_scope_stack.pop_back();
   env->open_handle_scopes--;
+  v8impl::detail::napi_lifetime_tracker__::record_scope_values_release(env,
+                                                                       scope);
   delete scope;
   return napi_v8_clear_last_error(env);
 }
@@ -1922,11 +1727,16 @@ napi_status NAPI_CDECL napi_escape_handle(napi_env env,
         env, napi_handle_scope_mismatch, "Handle scope close mismatch");
   }
   if (scope->wrapper.escape_called()) {
+    v8impl::detail::napi_lifetime_tracker__::record_scope_escape(env, false);
     return napi_v8_set_last_error(
         env, napi_escape_called_twice, "Escapable handle scope already escaped");
   }
-  *result = napi_v8_wrap_value(
-      env, scope->wrapper.Escape(napi_v8_unwrap_value(escapee)));
+  v8::Local<v8::Value> escaped =
+      scope->wrapper.Escape(napi_v8_unwrap_value(escapee));
+  v8impl::detail::napi_lifetime_tracker__::record_value(env, escaped, 1);
+  *result = JsValueFromV8LocalValue(escaped);
+  v8impl::detail::napi_lifetime_tracker__::record_scope_escape(
+      env, *result != nullptr);
   return napi_v8_clear_last_error(env);
 }
 
@@ -1940,7 +1750,7 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (cb == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
-  auto* payload = new (std::nothrow) CallbackPayload{env, cb, data};
+  auto* payload = new (std::nothrow) napi_callback_payload__{env, cb, data};
   if (payload == nullptr) return napi_generic_failure;
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
@@ -1985,7 +1795,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   }
 
   v8::Local<v8::Context> context = env->context();
-  auto* payload = new (std::nothrow) CallbackPayload{env, constructor, data};
+  auto* payload = new (std::nothrow) napi_callback_payload__{env, constructor, data};
   if (payload == nullptr) return napi_generic_failure;
 
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
@@ -2259,9 +2069,8 @@ napi_status NAPI_CDECL napi_create_promise(napi_env env,
   if (!v8::Promise::Resolver::New(env->context()).ToLocal(&resolver)) {
     return ReturnPendingIfCaught(env, tc, "Failed to create Promise resolver");
   }
-  auto* d = new (std::nothrow) napi_deferred__();
+  auto* d = new (std::nothrow) napi_deferred__(env);
   if (d == nullptr) return napi_generic_failure;
-  d->env = env;
   d->resolver.Reset(env->isolate, resolver);
   *deferred = d;
   *promise = napi_v8_wrap_value(env, resolver->GetPromise());
@@ -2743,7 +2552,7 @@ napi_status NAPI_CDECL napi_get_value_external(napi_env env,
   if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
   if (!local->IsExternal()) return napi_invalid_arg;
-  *result = ExternalWrapper::From(local.As<v8::External>())->Data();
+  *result = napi_external_wrapper__::From(local.As<v8::External>())->Data();
   return napi_ok;
 }
 
@@ -2763,8 +2572,10 @@ napi_status NAPI_CDECL napi_create_reference(napi_env env,
                                              uint32_t initial_refcount,
                                              napi_ref* result) {
   if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
-  *result = new (std::nothrow)
-      napi_ref__(env, napi_v8_unwrap_value(value), initial_refcount);
+  *result = napi_ref__::New(env,
+                            napi_v8_unwrap_value(value),
+                            initial_refcount,
+                            napi_ref_ownership__::kUserland);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -2825,13 +2636,28 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
-  auto* ref = new (std::nothrow) napi_ref__(env, object, 0);
+  napi_ref ref = nullptr;
+  if (result != nullptr) {
+    ref = napi_ref_with_finalizer__::New(env,
+                                         object,
+                                         0,
+                                         napi_ref_ownership__::kUserland,
+                                         finalize_cb,
+                                         native_object,
+                                         finalize_hint);
+  } else if (finalize_cb != nullptr) {
+    ref = napi_ref_with_finalizer__::New(env,
+                                         object,
+                                         0,
+                                         napi_ref_ownership__::kRuntime,
+                                         finalize_cb,
+                                         native_object,
+                                         finalize_hint);
+  } else {
+    ref = napi_ref_with_data__::New(
+        env, object, 0, napi_ref_ownership__::kRuntime, native_object);
+  }
   if (ref == nullptr) return napi_generic_failure;
-  ref->data = native_object;
-  ref->finalize_cb = finalize_cb;
-  ref->finalize_hint = finalize_hint;
-  ref->ownership = (result == nullptr) ? ReferenceOwnership::kRuntime
-                                       : ReferenceOwnership::kUserland;
 
   if (!object
            ->SetPrivate(env->context(),
@@ -2886,7 +2712,7 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   if (ref != nullptr) {
     ref->ResetFinalizer();
     ref->Invalidate();
-    if (ref->ownership == ReferenceOwnership::kRuntime) {
+    if (ref->ownership() == napi_ref_ownership__::kRuntime) {
       delete ref;
     }
   }
@@ -3176,7 +3002,7 @@ napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
                                                  void* arg) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
-  auto* entry = new (std::nothrow) napi_env_cleanup_hook__();
+  auto* entry = new (std::nothrow) napi_env_cleanup_hook__(napiEnv);
   if (entry == nullptr) return napi_generic_failure;
   entry->hook = fun;
   entry->arg = arg;
@@ -3214,9 +3040,8 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
   if (!backing) return napi_generic_failure;
   *data = backing->Data();
 
-  auto* record = new (std::nothrow) napi_buffer_record__();
+  auto* record = new (std::nothrow) napi_buffer_record__(env);
   if (record == nullptr) return napi_generic_failure;
-  record->env = env;
   record->backing_store = std::move(backing);
 
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
@@ -3257,9 +3082,8 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
-  auto* hint = new (std::nothrow) napi_external_backing_store_hint__();
+  auto* hint = new (std::nothrow) napi_external_backing_store_hint__(env);
   if (hint == nullptr) return napi_generic_failure;
-  hint->env = env;
   hint->external_data = data;
   hint->finalize_cb = finalize_cb;
   hint->finalize_hint = finalize_hint;
@@ -3271,9 +3095,8 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
     return napi_generic_failure;
   }
 
-  auto* record = new (std::nothrow) napi_buffer_record__();
+  auto* record = new (std::nothrow) napi_buffer_record__(env);
   if (record == nullptr) return napi_generic_failure;
-  record->env = env;
   record->backing_store = std::move(backing);
 
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
@@ -3322,9 +3145,8 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
     return napi_invalid_arg;
   }
 
-  auto* record = new (std::nothrow) napi_buffer_record__();
+  auto* record = new (std::nothrow) napi_buffer_record__(env);
   if (record == nullptr) return napi_generic_failure;
-  record->env = env;
   record->backing_store = ab->GetBackingStore();
 
   v8::Local<v8::Object> buffer_obj =
@@ -3360,13 +3182,16 @@ napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
 
-  auto* ref = new (std::nothrow) napi_ref__(env, value, 0);
+  auto* ref = napi_ref_with_finalizer__::New(
+      env,
+      value,
+      0,
+      (result == nullptr) ? napi_ref_ownership__::kRuntime
+                          : napi_ref_ownership__::kUserland,
+      finalize_cb,
+      finalize_data,
+      finalize_hint);
   if (ref == nullptr) return napi_generic_failure;
-  ref->ownership = (result == nullptr) ? ReferenceOwnership::kRuntime
-                                       : ReferenceOwnership::kUserland;
-  ref->data = finalize_data;
-  ref->finalize_cb = finalize_cb;
-  ref->finalize_hint = finalize_hint;
   if (result != nullptr) {
     *result = ref;
   }
@@ -3411,7 +3236,7 @@ napi_status NAPI_CDECL napi_type_tag_object(
   if (!CheckValue(env, value) || type_tag == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
   if (target->IsExternal()) {
-    ExternalWrapper* wrapper = ExternalWrapper::From(target.As<v8::External>());
+    napi_external_wrapper__* wrapper = napi_external_wrapper__::From(target.As<v8::External>());
     if (wrapper == nullptr || !wrapper->TypeTag(type_tag)) {
       return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
     }
@@ -3443,7 +3268,7 @@ napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
   if (target->IsExternal()) {
-    ExternalWrapper* wrapper = ExternalWrapper::From(target.As<v8::External>());
+    napi_external_wrapper__* wrapper = napi_external_wrapper__::From(target.As<v8::External>());
     *result = wrapper != nullptr && wrapper->CheckTypeTag(type_tag);
     return napi_ok;
   }

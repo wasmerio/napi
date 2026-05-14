@@ -141,6 +141,31 @@ v8::Local<v8::String> ToV8String(napi_env env, napi_value value, const char* fal
   return raw.As<v8::String>();
 }
 
+std::string ToUtf8String(napi_env env, napi_value value, const char* fallback) {
+  v8::Isolate* isolate = env->isolate;
+  napi_value str = nullptr;
+  if (!CoerceToStringValue(env, value, &str)) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(str);
+  if (raw.IsEmpty()) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  v8::String::Utf8Value utf8(isolate, raw);
+  if (*utf8 == nullptr) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  return std::string(*utf8, static_cast<size_t>(utf8.length()));
+}
+
+bool StartsWithBomHashbang(const std::string& source) {
+  return source.size() >= 5 &&
+         static_cast<unsigned char>(source[0]) == 0xef &&
+         static_cast<unsigned char>(source[1]) == 0xbb &&
+         static_cast<unsigned char>(source[2]) == 0xbf &&
+         source[3] == '#' && source[4] == '!';
+}
+
 bool SetNamed(v8::Local<v8::Context> context,
               v8::Local<v8::Object> target,
               const char* key,
@@ -1778,7 +1803,26 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
-  v8::Local<v8::String> code_str = ToV8String(env, code, "");
+  std::string source_text = ToUtf8String(env, code, "");
+  if (StartsWithBomHashbang(source_text)) {
+    v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(
+        isolate, "Invalid or unexpected token");
+    v8::Local<v8::Value> exception = v8::Exception::SyntaxError(message);
+    napi_value wrapped_exception = napi_v8_wrap_value(env, exception);
+    if (wrapped_exception != nullptr) {
+      (void)napi_throw(env, wrapped_exception);
+    } else {
+      isolate->ThrowException(exception);
+    }
+    return napi_pending_exception;
+  }
+
+  v8::Local<v8::String> code_str =
+      v8::String::NewFromUtf8(env->isolate,
+                              source_text.c_str(),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(source_text.size()))
+          .ToLocalChecked();
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
 
   v8::Local<v8::Symbol> host_id_symbol;

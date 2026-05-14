@@ -5,11 +5,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <v8.h>
 
 #include "js_native_api.h"
+#include "internal/napi_ref_tracker__.h"
 #include "unofficial_napi.h"
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
@@ -36,60 +38,21 @@ struct napi_callback_info__ {
   virtual void* data() const = 0;
 };
 
-class RefTracker {
- public:
-  using RefList = RefTracker;
-
-  RefTracker() = default;
-  virtual ~RefTracker() = default;
-
-  void Link(RefList* list);
-  void Unlink();
-  virtual void Finalize() {}
-
-  static void FinalizeAll(RefList* list);
-
- private:
-  RefTracker* next_ = nullptr;
-  RefTracker* prev_ = nullptr;
-};
-
-enum class ReferenceOwnership : uint8_t {
-  kRuntime,
-  kUserland,
-};
-
-struct napi_ref__ : public RefTracker {
-  napi_ref__(napi_env env, v8::Local<v8::Value> value, uint32_t initial_refcount);
-  ~napi_ref__() override;
-
-  uint32_t Ref();
-  uint32_t Unref();
-  v8::Local<v8::Value> Get() const;
-  void* Data() const;
-  void ResetFinalizer();
-  void Invalidate();
-  void Finalize() override;
-
-  napi_env env = nullptr;
-  v8::Global<v8::Value> value;
-  uint32_t refcount = 0;
-  bool can_be_weak = false;
-  ReferenceOwnership ownership = ReferenceOwnership::kUserland;
-  void* data = nullptr;
-  node_api_basic_finalize finalize_cb = nullptr;
-  void* finalize_hint = nullptr;
-
- private:
-  static void WeakCallback(const v8::WeakCallbackInfo<napi_ref__>& info);
-  void SetWeak();
-};
-
 struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
 
   v8::Local<v8::Context> context() const;
+  void CallFinalizer(node_api_basic_finalize cb, void* data, void* hint);
+  void InvokeFinalizerFromGC(napi_ref_tracker__* finalizer);
+  void EnqueueFinalizer(napi_ref_tracker__* finalizer);
+  void DequeueFinalizer(napi_ref_tracker__* finalizer);
+  void DrainFinalizerQueue();
+
+#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+  bool should_dump_lifetime_stats(int64_t now_ms);
+  bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
+#endif
 
   v8::Isolate* isolate = nullptr;
   v8::Global<v8::Context> context_ref;
@@ -116,7 +79,10 @@ struct napi_env__ {
   std::vector<void*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
   std::vector<void*> buffer_records;
-  RefTracker::RefList reflist;
+  napi_ref_tracker__::RefList reflist;
+  napi_ref_tracker__::RefList finalizing_reflist;
+  std::unordered_set<napi_ref_tracker__*> pending_finalizers;
+  bool finalization_scheduled = false;
   bool async_cleanup_hook_registered = false;
   void (*node_api_cleanup_runner)(napi_env) = nullptr;
   unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
@@ -128,6 +94,11 @@ struct napi_env__ {
   void* context_token_callback_data = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
   void* enqueue_foreground_task_target = nullptr;
+
+#if defined(NAPI_V8_ENABLE_LIFETIME_TRACKER) && defined(NAPI_V8_ENABLE_LIFETIME_PERIODIC_STATS)
+  int64_t lifetime_last_stats_ms_ = 0;
+  int64_t lifetime_last_string_symbol_values_ms_ = 0;
+#endif
 };
 
 napi_status napi_v8_set_last_error(napi_env env,
