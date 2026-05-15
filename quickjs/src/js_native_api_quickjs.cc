@@ -7,11 +7,130 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
 using namespace quickjs::detail;
+
+namespace {
+
+JSValue JS_NewStringLenNodeUtf8(JSContext *ctx, const char *str, size_t length)
+{
+  std::vector<uint16_t> utf16;
+  utf16.reserve(length);
+
+  size_t i = 0;
+  auto append_replacement = [&]() {
+    utf16.push_back(static_cast<uint16_t>(0xFFFD));
+  };
+  auto append_code_point = [&](uint32_t cp) {
+    if (cp <= 0xFFFF)
+    {
+      utf16.push_back(static_cast<uint16_t>(cp));
+      return;
+    }
+    cp -= 0x10000;
+    utf16.push_back(static_cast<uint16_t>(0xD800 + ((cp >> 10) & 0x3FF)));
+    utf16.push_back(static_cast<uint16_t>(0xDC00 + (cp & 0x3FF)));
+  };
+
+  while (i < length)
+  {
+    const uint8_t b0 = static_cast<uint8_t>(str[i]);
+    if (b0 < 0x80)
+    {
+      utf16.push_back(static_cast<uint16_t>(b0));
+      ++i;
+      continue;
+    }
+
+    size_t needed = 0;
+    uint32_t cp = 0;
+    uint32_t min_cp = 0;
+    if (b0 >= 0xC2 && b0 <= 0xDF)
+    {
+      needed = 1;
+      cp = b0 & 0x1F;
+      min_cp = 0x80;
+    }
+    else if (b0 >= 0xE0 && b0 <= 0xEF)
+    {
+      needed = 2;
+      cp = b0 & 0x0F;
+      min_cp = 0x800;
+    }
+    else if (b0 >= 0xF0 && b0 <= 0xF4)
+    {
+      needed = 3;
+      cp = b0 & 0x07;
+      min_cp = 0x10000;
+    }
+    else
+    {
+      append_replacement();
+      ++i;
+      continue;
+    }
+
+    size_t j = 1;
+    for (; j <= needed && i + j < length; ++j)
+    {
+      const uint8_t bx = static_cast<uint8_t>(str[i + j]);
+      if ((bx & 0xC0) != 0x80)
+        break;
+      cp = (cp << 6) | (bx & 0x3F);
+    }
+
+    if (j <= needed)
+    {
+      append_replacement();
+      bool prefix_invalid = false;
+      if (j > 1)
+      {
+        const uint8_t b1 = static_cast<uint8_t>(str[i + 1]);
+        if (needed == 2 && b0 == 0xE0 && b1 < 0xA0)
+          prefix_invalid = true;
+        if (needed == 2 && b0 == 0xED && b1 > 0x9F)
+          prefix_invalid = true;
+        if (needed == 3 && b0 == 0xF0 && b1 < 0x90)
+          prefix_invalid = true;
+        if (needed == 3 && b0 == 0xF4 && b1 > 0x8F)
+          prefix_invalid = true;
+      }
+      i += prefix_invalid ? 1 : j;
+      continue;
+    }
+
+    bool valid = true;
+    if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+      valid = false;
+    if (needed == 2 && b0 == 0xE0 && static_cast<uint8_t>(str[i + 1]) < 0xA0)
+      valid = false;
+    if (needed == 2 && b0 == 0xED && static_cast<uint8_t>(str[i + 1]) > 0x9F)
+      valid = false;
+    if (needed == 3 && b0 == 0xF0 && static_cast<uint8_t>(str[i + 1]) < 0x90)
+      valid = false;
+    if (needed == 3 && b0 == 0xF4 && static_cast<uint8_t>(str[i + 1]) > 0x8F)
+      valid = false;
+
+    if (!valid)
+    {
+      append_replacement();
+      ++i;
+      continue;
+    }
+
+    append_code_point(cp);
+    i += needed + 1;
+  }
+
+  return JS_NewStringUTF16(ctx, utf16.data(), utf16.size());
+}
+
+}
 
 extern "C"
 {
@@ -590,7 +709,7 @@ extern "C"
     if (length > static_cast<size_t>(std::numeric_limits<int>::max()))
       return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
 
-    JSValue out = JS_NewStringLen(env->context(), str, length);
+    JSValue out = JS_NewStringLenNodeUtf8(env->context(), str, length);
     if (JS_IsException(out))
     {
       return napi_util__::return_pending_if_caught(env, "Cannot create string");
