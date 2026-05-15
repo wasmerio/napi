@@ -58,13 +58,15 @@ struct napi_env__
   template <typename Fn>
   void for_each_active_scope(Fn fn) const
   {
-    scopes_.for_each_active(fn);
+    for (const auto &scope : scopes_)
+      fn(scope);
   }
 
   template <typename Fn>
   void for_each_active_ref(Fn fn) const
   {
-    refs_.for_each_active(fn);
+    for (const auto &ref : refs_)
+      fn(ref);
   }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -129,11 +131,11 @@ private:
   napi_handle_scope current_scope_ = nullptr;
 
   // Env-owned slot allocators.
-  napi_slab_allocator__<napi_handle_scope, napi_scope__, napi_env__> scopes_;
-  napi_slab_allocator__<napi_ref, napi_ref__, napi_env__> refs_;
-  napi_slab_allocator__<napi_env_cleanup_hook, napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
-  napi_slab_allocator__<napi_deferred, napi_deferred__, napi_env__> deferreds_;
-  napi_slab_allocator__<napi_external_backing_store_hint, napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
+  napi_allocator__<napi_scope__, napi_env__> scopes_;
+  napi_allocator__<napi_ref__, napi_env__> refs_;
+  napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
+  napi_allocator__<napi_deferred__, napi_env__> deferreds_;
+  napi_allocator__<napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.

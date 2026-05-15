@@ -8,11 +8,6 @@ napi_scope__::napi_scope__(napi_env env, napi_handle_scope parent)
 {
   napi_scope__ *parent_scope = this->parent();
   level_ = parent_scope == nullptr ? 0 : parent_scope->level() + 1;
-
-  if (parent_scope != nullptr)
-  {
-    values_.reserve_prefix(parent_scope->value_slot_count());
-  }
 }
 
 napi_scope__::~napi_scope__()
@@ -61,14 +56,14 @@ napi_value napi_scope__::escape_value(napi_value value)
   if (parent_ == nullptr || value == nullptr)
     return record_escape(nullptr);
 
-  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
+  napi_scope__ *owner = ValuesAllocator::unsafe_owner(value);
   assert(owner == this);
 
   if (owner != this)
     return record_escape(nullptr);
 
   napi_scope__ *parent_scope = parent();
-  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(slot->get_inner(), false));
+  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(value->get_inner(), false));
 }
 
 void napi_scope__::delete_value(napi_value value)
@@ -76,12 +71,11 @@ void napi_scope__::delete_value(napi_value value)
   if (value == nullptr)
     return;
 
-  auto [slot, owner] = values_.unsafe_data_with_owner_from_handle(value);
-  (void)slot;
+  napi_scope__ *owner = ValuesAllocator::unsafe_owner(value);
 
   if (owner == this)
   {
-    values_.release_handle(value);
+    values_.destroy(value);
   }
 }
 
@@ -106,7 +100,7 @@ size_t napi_scope__::value_storage_slot_count() const
 
 size_t napi_scope__::active_value_count() const
 {
-  return values_.active_count();
+  return values_.count_active();
 }
 
 napi_handle_scope napi_scope__::parent_handle() const

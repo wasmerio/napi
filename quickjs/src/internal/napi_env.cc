@@ -73,9 +73,11 @@ void napi_env__::prepare_teardown()
 
 void napi_env__::clear_refs_for_teardown()
 {
-  refs_.for_each_active([](const napi_ref__ &ref) {
-    const_cast<napi_ref__ &>(ref).clear_for_teardown();
-  });
+  while (napi_ref__ *ref = refs_.take_next_used())
+  {
+    ref->clear_for_teardown();
+    ref->~napi_ref__();
+  }
 }
 
 void napi_env__::finalize_instance_data()
@@ -122,17 +124,18 @@ napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 
 void napi_env__::destroy_scope(napi_handle_scope scope)
 {
-  scopes_.release_handle(scope);
+  scopes_.destroy(reinterpret_cast<napi_scope__ *>(scope));
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) const
 {
   using Alloc = decltype(scopes_);
 #ifdef NDEBUG
-  auto scope = Alloc::unsafe_data_from_handle(scope_handle);
+  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
 #else
-  assert(scopes_.owns_handle(scope_handle));
-  auto [scope, owner] = Alloc::unsafe_data_with_owner_from_handle(scope_handle);
+  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
+  assert(scopes_.owns(scope));
+  auto owner = Alloc::unsafe_owner(scope);
   assert(owner == this);
 #endif
 
@@ -184,11 +187,11 @@ napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 {
   using Alloc = decltype(scopes_);
 #ifdef NDEBUG
-  auto value = napi_scope__::ValuesAllocator::unsafe_data_from_handle(value_handle);
+  auto value = value_handle;
 #else
-  auto [value, owner] = napi_scope__::ValuesAllocator::unsafe_data_with_owner_from_handle(value_handle);
-  auto owner_handle = Alloc::unsafe_handle_from_data(owner);
-  assert(scopes_.owns_handle(owner_handle));
+  auto value = value_handle;
+  auto owner = napi_scope__::ValuesAllocator::unsafe_owner(value_handle);
+  assert(scopes_.owns(owner));
 #endif
 
   return value;
@@ -205,18 +208,21 @@ napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial
 
 void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 {
-  refs_.release_handle(ref);
+  if (ref == nullptr || !ref->is_active())
+    return;
+  refs_.destroy(ref);
 }
 
 napi_ref__ *napi_env__::ref_from_handle(napi_ref ref_handle)
 {
   using Alloc = decltype(refs_);
 #ifdef NDEBUG
-  auto ref = Alloc::unsafe_data_from_handle(ref_handle);
+  auto ref = ref_handle;
 #else
-  auto [ref, owner] = Alloc::unsafe_data_with_owner_from_handle(ref_handle);
+  auto ref = ref_handle;
+  auto owner = Alloc::unsafe_owner(ref_handle);
   assert(owner == this);
-  assert(refs_.owns_handle(ref_handle));
+  assert(refs_.owns(ref_handle));
 #endif
 
   return ref;
@@ -229,7 +235,7 @@ size_t napi_env__::ref_storage_slot_count() const
 
 size_t napi_env__::active_ref_count() const
 {
-  return refs_.active_count();
+  return refs_.count_active();
 }
 
 bool napi_env__::is_current_scope(napi_handle_scope scope) const
@@ -249,7 +255,7 @@ size_t napi_env__::scope_storage_slot_count() const
 
 size_t napi_env__::active_scope_count() const
 {
-  return scopes_.active_count();
+  return scopes_.count_active();
 }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -369,7 +375,7 @@ napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook,
 
 void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
 {
-  cleanup_hooks_.release(entry);
+  cleanup_hooks_.destroy(entry);
 }
 
 napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
@@ -381,7 +387,7 @@ napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 
 void napi_env__::destroy_deferred(napi_deferred__ *deferred)
 {
-  deferreds_.release(deferred);
+  deferreds_.destroy(deferred);
 }
 
 napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
@@ -396,7 +402,7 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
 {
-  external_backing_stores_.release(hint);
+  external_backing_stores_.destroy(hint);
 }
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)

@@ -54,7 +54,7 @@ namespace v8impl::detail
     {
       if (value == nullptr)
         return;
-      allocator_for<T>().release(value);
+      allocator_for<T>().destroy(value);
     }
 
   private:
@@ -120,12 +120,12 @@ namespace v8impl::detail
       }
     }
 
-    napi_slab_allocator__<napi_ref, napi_ref__, napi_env__> napi_ref_allocator_;
-    napi_slab_allocator__<napi_ref, napi_ref_with_data__, napi_env__> napi_ref_with_data_allocator_;
-    napi_slab_allocator__<napi_ref, napi_ref_with_finalizer__, napi_env__> napi_ref_with_finalizer_allocator_;
-    napi_slab_allocator__<napi_deferred, napi_deferred__, napi_env__> napi_deferred_allocator_;
-    napi_slab_allocator__<napi_handle_scope, napi_handle_scope__, napi_env__> napi_handle_scope_allocator_;
-    napi_slab_allocator__<napi_escapable_handle_scope, napi_escapable_handle_scope__, napi_env__> napi_escapable_handle_scope_allocator_;
+    napi_allocator__<napi_ref__, napi_env__> napi_ref_allocator_;
+    napi_allocator__<napi_ref_with_data__, napi_env__> napi_ref_with_data_allocator_;
+    napi_allocator__<napi_ref_with_finalizer__, napi_env__> napi_ref_with_finalizer_allocator_;
+    napi_allocator__<napi_deferred__, napi_env__> napi_deferred_allocator_;
+    napi_allocator__<napi_handle_scope__, napi_env__> napi_handle_scope_allocator_;
+    napi_allocator__<napi_escapable_handle_scope__, napi_env__> napi_escapable_handle_scope_allocator_;
 
     napi_allocator__<napi_callback_payload__, napi_env__> napi_callback_payload_allocator_;
     napi_allocator__<napi_external_wrapper__, napi_env__> napi_external_wrapper_allocator_;

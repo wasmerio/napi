@@ -20,6 +20,7 @@ NAPI_WASIX_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/wasm32-wasix/releas
 NAPI_V8_PREBUILT_VERSION ?= 11.9.2
 NAPI_V8_PLATFORM :=
 NAPI_V8_DIST_ROOT ?=
+NAPI_V8_CARGO_DIST_ROOT ?=
 NAPI_V8_CMAKE_ARGS ?=
 
 ifeq ($(UNAME_S),Darwin)
@@ -37,7 +38,12 @@ NAPI_V8_PLATFORM := linux-amd64
 endif
 endif
 ifeq ($(NAPI_V8_DIST_ROOT),)
-NAPI_V8_DIST_ROOT := $(EDGEJS_ROOT)/build-v8-napi/_v8_cache/$(NAPI_V8_PREBUILT_VERSION)/$(NAPI_V8_PLATFORM)
+NAPI_V8_CARGO_DIST_ROOT := $(lastword $(sort $(wildcard $(abspath target/debug/build)/wasmer-napi-*/out/v8-prebuilt/$(NAPI_V8_PREBUILT_VERSION)/$(NAPI_V8_PLATFORM))))
+ifneq ($(NAPI_V8_CARGO_DIST_ROOT),)
+NAPI_V8_DIST_ROOT := $(NAPI_V8_CARGO_DIST_ROOT)
+else
+NAPI_V8_DIST_ROOT := $(BUILD_NAPI_DIR)/_v8_cache/$(NAPI_V8_PREBUILT_VERSION)/$(NAPI_V8_PLATFORM)
+endif
 endif
 ifneq ($(NAPI_V8_PLATFORM),)
 ifneq ($(wildcard $(NAPI_V8_DIST_ROOT)/include/v8.h),)

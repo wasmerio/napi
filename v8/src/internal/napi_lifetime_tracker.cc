@@ -151,12 +151,24 @@ value_tag classify_value(v8::Local<v8::Value> value) {
 
 #ifdef NAPI_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
 std::string escaped_v8_string(v8::Isolate* isolate, v8::Local<v8::Value> value) {
-  v8::String::Utf8Value utf8(isolate, value);
-  if (*utf8 == nullptr) {
+  if (isolate == nullptr || value.IsEmpty() || !value->IsString()) {
     return {};
   }
+  v8::Local<v8::String> string = value.As<v8::String>();
+  int length = string->Utf8Length(isolate);
+  if (length <= 0) return {};
+
+  std::string utf8(static_cast<std::size_t>(length), '\0');
+  int written = string->WriteUtf8(isolate,
+                                  utf8.data(),
+                                  length,
+                                  nullptr,
+                                  v8::String::NO_NULL_TERMINATION |
+                                      v8::String::REPLACE_INVALID_UTF8);
+  if (written <= 0) return {};
+  utf8.resize(static_cast<std::size_t>(written));
   return napi::lifetime::escaped_value_fragment(
-      *utf8, static_cast<std::size_t>(utf8.length()));
+      utf8.data(), utf8.size());
 }
 
 std::string object_prototype_name(v8::Isolate* isolate, v8::Local<v8::Value> value) {
