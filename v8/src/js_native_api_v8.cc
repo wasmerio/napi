@@ -12,7 +12,6 @@
 #include "internal/napi_ref_with_data.h"
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_setter_callback_info.h"
-#include "internal/napi_util.h"
 #include "napi_typedarray_metadata.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
@@ -29,6 +28,29 @@
 #include <vector>
 
 namespace {
+
+void DrainFinalizerQueueForegroundTask(napi_env env, void* data) {
+  auto* target_env = static_cast<napi_env>(data);
+  if (target_env == nullptr || target_env != env) return;
+  target_env->DrainFinalizerQueue();
+}
+
+void ScheduleFinalizerQueueDrain(napi_env env) {
+  if (env == nullptr || env->finalization_scheduled) return;
+
+  env->finalization_scheduled = true;
+  if (env->enqueue_foreground_task_callback != nullptr) {
+    napi_status status = env->enqueue_foreground_task_callback(
+        env->enqueue_foreground_task_target,
+        DrainFinalizerQueueForegroundTask,
+        env,
+        nullptr,
+        0);
+    if (status == napi_ok) return;
+  }
+
+  env->finalization_scheduled = false;
+}
 
 v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
     v8::Local<v8::Context> context, v8::Local<v8::Data> /*host_defined_options*/,
@@ -157,29 +179,15 @@ void FinalizeBufferRecord(napi_buffer_record* record) {
   }
 }
 
-void FinalizeBufferRecordMicrotask(void* data) {
-  auto* record = static_cast<napi_buffer_record*>(data);
-  if (record == nullptr) return;
-  napi_env env = record->env;
-  FinalizeBufferRecord(record);
-  if (CheckEnv(env)) {
-    env->release(record);
-  }
-}
-
 void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   napi_buffer_record* record = info.GetParameter();
   if (record == nullptr) return;
   napi_env env = record->env;
   if (CheckEnv(env)) {
-    v8::HandleScope hs(env->isolate);
-    v8::Local<v8::Context> context = env->context();
-    v8::Context::Scope cs(context);
     napi_buffer_record* owned_record = TakeBufferRecord(env, record);
     if (owned_record == nullptr) return;
     owned_record->holder.Reset();
-    env->isolate->EnqueueMicrotask(FinalizeBufferRecordMicrotask,
-                                   owned_record);
+    env->EnqueueBufferFinalizer(owned_record);
   } else {
     record->holder.Reset();
     FinalizeBufferRecord(record);
@@ -452,10 +460,13 @@ void napi_env__::InvokeFinalizerFromGC(napi_ref_tracker__* finalizer) {
 void napi_env__::EnqueueFinalizer(napi_ref_tracker__* finalizer) {
   if (finalizer == nullptr) return;
   pending_finalizers.emplace(finalizer);
-  if (!finalization_scheduled && isolate != nullptr) {
-    finalization_scheduled = true;
-    isolate->EnqueueMicrotask(napi_v8_drain_finalizer_queue_microtask, this);
-  }
+  ScheduleFinalizerQueueDrain(this);
+}
+
+void napi_env__::EnqueueBufferFinalizer(napi_buffer_record__* record) {
+  if (record == nullptr) return;
+  pending_buffer_finalizers.emplace(record);
+  ScheduleFinalizerQueueDrain(this);
 }
 
 void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
@@ -464,10 +475,19 @@ void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
 
 void napi_env__::DrainFinalizerQueue() {
   finalization_scheduled = false;
-  while (!pending_finalizers.empty()) {
-    napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
-    pending_finalizers.erase(ref_tracker);
-    ref_tracker->Finalize();
+  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty()) {
+    while (!pending_finalizers.empty()) {
+      napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
+      pending_finalizers.erase(ref_tracker);
+      ref_tracker->Finalize();
+    }
+
+    while (!pending_buffer_finalizers.empty()) {
+      napi_buffer_record__* record = *pending_buffer_finalizers.begin();
+      pending_buffer_finalizers.erase(record);
+      FinalizeBufferRecord(record);
+      release(record);
+    }
   }
 }
 
@@ -495,6 +515,7 @@ napi_env__::~napi_env__() {
   napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
   napi_ref_tracker__::FinalizeAll(&reflist);
   pending_finalizers.clear();
+  pending_buffer_finalizers.clear();
   finalization_scheduled = false;
   FinalizeExternalBackingStoreHints(this);
   napi_v8_finalize_buffer_records(this);

@@ -2048,15 +2048,18 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 
 void DrainMicrotasksForEnv(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
+  env->DrainFinalizerQueue();
   v8::Local<v8::Context> context = env->context();
   if (!context.IsEmpty()) {
     v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
     if (queue != nullptr) {
       queue->PerformCheckpoint(env->isolate);
+      env->DrainFinalizerQueue();
       return;
     }
   }
   env->isolate->PerformMicrotaskCheckpoint();
+  env->DrainFinalizerQueue();
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {

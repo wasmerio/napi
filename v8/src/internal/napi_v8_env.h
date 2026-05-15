@@ -62,6 +62,7 @@ struct napi_env__ {
   void CallFinalizer(node_api_basic_finalize cb, void* data, void* hint);
   void InvokeFinalizerFromGC(napi_ref_tracker__* finalizer);
   void EnqueueFinalizer(napi_ref_tracker__* finalizer);
+  void EnqueueBufferFinalizer(napi_buffer_record__* record);
   void DequeueFinalizer(napi_ref_tracker__* finalizer);
   void DrainFinalizerQueue();
 
@@ -102,6 +103,7 @@ struct napi_env__ {
   napi_ref_tracker__::RefList reflist;
   napi_ref_tracker__::RefList finalizing_reflist;
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
+  std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
   unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
   void* env_cleanup_callback_data = nullptr;

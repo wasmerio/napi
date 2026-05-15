@@ -59,7 +59,6 @@ add_library(napi_v8 STATIC
   src/internal/napi_ref_with_data.cc
   src/internal/napi_ref_with_finalizer.cc
   src/internal/napi_setter_callback_info.cc
-  src/internal/napi_util.cc
   src/unofficial_napi.cc
   src/unofficial_napi_error_utils.cc
   src/unofficial_napi_contextify.cc
