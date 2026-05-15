@@ -3,7 +3,6 @@
 
 #include <cstring>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -12,7 +11,9 @@
 #include <v8.h>
 
 #include "js_native_api.h"
-#include "napi_allocator.h"
+#include "napi_error_state.h"
+#include "napi_periodic_gate.h"
+#include "internal/napi_factory.h"
 #include "internal/napi_lifetime_tracker.h"
 #include "internal/napi_ref_tracker.h"
 #include "unofficial_napi.h"
@@ -31,26 +32,6 @@ struct napi_handle_scope__;
 struct napi_ref__;
 struct napi_ref_with_data__;
 struct napi_ref_with_finalizer__;
-
-struct napi_env_allocator_base__ {
-  virtual ~napi_env_allocator_base__() = default;
-  virtual const void* key() const = 0;
-};
-
-template <typename T>
-struct napi_env_allocator__ final : public napi_env_allocator_base__ {
-  explicit napi_env_allocator__(napi_env__* env) : allocator(env) {}
-
-  static const void* static_key() {
-    static int key;
-    return &key;
-  }
-
-  const void* key() const override { return static_key(); }
-
-  napi_allocator__<T*, T, napi_env__> allocator;
-};
-
 static_assert(sizeof(v8::Local<v8::Value>) == sizeof(napi_value),
               "Cannot convert between v8::Local<v8::Value> and napi_value");
 
@@ -86,27 +67,12 @@ struct napi_env__ {
 
   template <typename T, typename... Args>
   T* allocate(Args&&... args) {
-    return allocator_for<T>().allocate(std::forward<Args>(args)...);
+    return factory_.allocate<T>(std::forward<Args>(args)...);
   }
 
   template <typename T>
   void release(T* value) {
-    if (value == nullptr) return;
-    allocator_for<T>().release(value);
-  }
-
-  template <typename T>
-  napi_allocator__<T*, T, napi_env__>& allocator_for() {
-    const void* key = napi_env_allocator__<T>::static_key();
-    for (auto& allocator : allocators_) {
-      if (allocator != nullptr && allocator->key() == key) {
-        return static_cast<napi_env_allocator__<T>*>(allocator.get())->allocator;
-      }
-    }
-    auto allocator = std::make_unique<napi_env_allocator__<T>>(this);
-    auto* result = allocator.get();
-    allocators_.push_back(std::move(allocator));
-    return result->allocator;
+    factory_.release<T>(value);
   }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -116,8 +82,7 @@ struct napi_env__ {
 
   v8::Isolate* isolate = nullptr;
   v8::Global<v8::Context> context_ref;
-  napi_extended_error_info last_error{};
-  std::string last_error_message;
+  napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
   v8::Global<v8::Value> last_exception;
   v8::Global<v8::Message> last_exception_message;
@@ -133,7 +98,7 @@ struct napi_env__ {
   std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
   std::vector<napi_buffer_record__*> buffer_records;
-  std::vector<std::unique_ptr<napi_env_allocator_base__>> allocators_;
+  std::unordered_set<napi_external_backing_store_hint__*> external_backing_store_hints;
   napi_ref_tracker__::RefList reflist;
   napi_ref_tracker__::RefList finalizing_reflist;
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
@@ -149,9 +114,12 @@ struct napi_env__ {
   void* enqueue_foreground_task_target = nullptr;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
-  int64_t lifetime_last_stats_ms_ = 0;
-  int64_t lifetime_last_string_symbol_values_ms_ = 0;
+  napi::periodic_gate__ lifetime_stats_gate_{2000};
+  napi::periodic_gate__ lifetime_string_symbol_values_gate_{10000};
 #endif
+
+ private:
+  v8impl::detail::napi_factory__ factory_;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

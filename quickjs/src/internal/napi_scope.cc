@@ -81,7 +81,7 @@ void napi_scope__::delete_value(napi_value value)
 
   if (owner == this)
   {
-    values_.release(value);
+    values_.release_handle(value);
   }
 }
 

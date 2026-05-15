@@ -1,7 +1,7 @@
 #ifndef NAPI_V8_LIFETIME_MACROS_H_
 #define NAPI_V8_LIFETIME_MACROS_H_
 
-#include "../../../lib/napi_lifetime_tracker.h"
+#include <napi_lifetime_tracker.h>
 
 #ifdef NAPI_ENABLE_LIFETIME_TRACKER
 #include "internal/napi_lifetime_tracker.h"

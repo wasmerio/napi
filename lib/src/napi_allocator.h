@@ -35,8 +35,8 @@ concept napi_allocator_payload__ = std::destructible<T>;
 template <typename T>
 concept napi_allocator_owner__ = std::is_class_v<T>;
 
-template <class Handle, napi_allocator_payload__ T, napi_allocator_owner__ Owner, size_t N = 16>
-class napi_allocator__
+template <class Handle, napi_allocator_payload__ T, napi_allocator_owner__ Owner, size_t N = 64>
+class napi_slab_allocator__
 {
   static_assert(N > 0, "N must be greater than zero");
 
@@ -99,13 +99,14 @@ private:
       if (handle == nullptr)
         return nullptr;
 
+      T *data = unsafe_data_from_handle(handle);
       return reinterpret_cast<slot__ *>(
-          reinterpret_cast<char *>(handle) - offsetof(slot__, storage));
+          reinterpret_cast<char *>(data) - offsetof(slot__, storage));
     }
 
     bool owns_handle(Handle handle) const
     {
-      return (unsafe_handle_from_data(const_cast<T *>(data())) == handle) && this->active;
+      return (unsafe_data_from_handle(handle) == const_cast<T *>(data())) && this->active;
     }
 
     slot__() = default;
@@ -239,16 +240,16 @@ private:
     }
   };
   static_assert(sizeof(block__) == block_alignment__,
-                "napi_allocator__ block must fit exactly in its alignment region");
+                "napi_slab_allocator__ block must fit exactly in its alignment region");
 
 public:
-  explicit napi_allocator__(Owner *owner) : owner_{owner} {}
-  napi_allocator__(const napi_allocator__ &) = delete;
-  napi_allocator__(napi_allocator__ &&other) = delete;
-  napi_allocator__ &operator=(const napi_allocator__ &) = delete;
-  napi_allocator__ &operator=(napi_allocator__ &&other) = delete;
+  explicit napi_slab_allocator__(Owner *owner) : owner_{owner} {}
+  napi_slab_allocator__(const napi_slab_allocator__ &) = delete;
+  napi_slab_allocator__(napi_slab_allocator__ &&other) = delete;
+  napi_slab_allocator__ &operator=(const napi_slab_allocator__ &) = delete;
+  napi_slab_allocator__ &operator=(napi_slab_allocator__ &&other) = delete;
 
-  ~napi_allocator__()
+  ~napi_slab_allocator__()
   {
     close();
   }
@@ -307,7 +308,12 @@ public:
     return owns_block(block) && (slot_index(block, slot) < N) && slot->owns_handle(handle);
   }
 
-  void release(Handle handle)
+  void release(T *data)
+  {
+    release_handle(unsafe_handle_from_data(data));
+  }
+
+  void release_handle(Handle handle)
   {
     slot__ *slot = slot__::unsafe_slot_from_handle(handle);
     block__ *block = block__::unsafe_block_from_slot(slot);
@@ -453,5 +459,8 @@ private:
   // Owner used by lifetime hooks to attribute slot churn.
   Owner *owner_ = nullptr;
 };
+
+template <napi_allocator_payload__ T, napi_allocator_owner__ Owner, size_t N = 64>
+using napi_allocator__ = napi_slab_allocator__<T *, T, Owner, N>;
 
 #endif // NAPI_ALLOCATOR_H_

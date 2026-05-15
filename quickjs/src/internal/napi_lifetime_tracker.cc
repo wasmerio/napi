@@ -7,7 +7,7 @@
 #include "internal/napi_ref.h"
 #include "internal/napi_scope.h"
 #include "internal/napi_value.h"
-#include "../../../lib/napi_lifetime_tracker.h"
+#include <napi_lifetime_tracker.h>
 
 #include <algorithm>
 #include <array>

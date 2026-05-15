@@ -25,6 +25,7 @@
 
 #include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
+#include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
@@ -912,76 +913,81 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
   return true;
 }
 
-class SerializerContext : public v8::ValueSerializer::Delegate {
- public:
-  SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
-      : env_(env), isolate_(env->isolate), serializer_(isolate_, this) {
-    wrap_.Reset(isolate_, wrap);
-    wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
+}  // namespace
+
+namespace v8impl::detail {
+
+SerializerContext::SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
+    : env_(env), isolate_(env->isolate), serializer_(isolate_, this) {
+  wrap_.Reset(isolate_, wrap);
+  wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
+}
+
+SerializerContext::~SerializerContext() {
+  wrap_.Reset();
+}
+
+void SerializerContext::ThrowDataCloneError(v8::Local<v8::String> message) {
+  v8::Local<v8::Context> context = env_->context();
+  v8::Local<v8::Object> wrap = wrap_.Get(isolate_);
+
+  v8::Local<v8::Value> get_data_clone_error;
+  if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
+           .ToLocal(&get_data_clone_error) ||
+      !get_data_clone_error->IsFunction()) {
+    isolate_->ThrowException(v8::Exception::Error(message));
+    return;
   }
 
-  ~SerializerContext() { wrap_.Reset(); }
+  v8::Local<v8::Value> argv[1] = {message};
+  v8::Local<v8::Value> error;
+  if (get_data_clone_error.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&error)) {
+    isolate_->ThrowException(error);
+  }
+}
 
-  void ThrowDataCloneError(v8::Local<v8::String> message) override {
-    v8::Local<v8::Context> context = env_->context();
-    v8::Local<v8::Object> wrap = wrap_.Get(isolate_);
+v8::Maybe<uint32_t> SerializerContext::GetSharedArrayBufferId(
+    v8::Isolate* isolate,
+    v8::Local<v8::SharedArrayBuffer> shared_array_buffer) {
+  v8::Local<v8::Context> context = env_->context();
+  v8::Local<v8::Object> wrap = wrap_.Get(isolate);
 
-    v8::Local<v8::Value> get_data_clone_error;
-    if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
-             .ToLocal(&get_data_clone_error) ||
-        !get_data_clone_error->IsFunction()) {
-      isolate_->ThrowException(v8::Exception::Error(message));
-      return;
-    }
-
-    v8::Local<v8::Value> argv[1] = {message};
-    v8::Local<v8::Value> error;
-    if (get_data_clone_error.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&error)) {
-      isolate_->ThrowException(error);
-    }
+  v8::Local<v8::Value> hook;
+  if (!wrap->Get(context, OneByteString(isolate, "_getSharedArrayBufferId")).ToLocal(&hook) ||
+      !hook->IsFunction()) {
+    return v8::ValueSerializer::Delegate::GetSharedArrayBufferId(isolate, shared_array_buffer);
   }
 
-  v8::Maybe<uint32_t> GetSharedArrayBufferId(
-      v8::Isolate* isolate,
-      v8::Local<v8::SharedArrayBuffer> shared_array_buffer) override {
-    v8::Local<v8::Context> context = env_->context();
-    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+  v8::Local<v8::Value> argv[1] = {shared_array_buffer};
+  v8::Local<v8::Value> id;
+  if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&id)) {
+    return v8::Nothing<uint32_t>();
+  }
+  return id->Uint32Value(context);
+}
 
-    v8::Local<v8::Value> hook;
-    if (!wrap->Get(context, OneByteString(isolate, "_getSharedArrayBufferId")).ToLocal(&hook) ||
-        !hook->IsFunction()) {
-      return v8::ValueSerializer::Delegate::GetSharedArrayBufferId(isolate, shared_array_buffer);
-    }
+v8::Maybe<bool> SerializerContext::WriteHostObject(v8::Isolate* isolate,
+                                                   v8::Local<v8::Object> input) {
+  v8::Local<v8::Context> context = env_->context();
+  v8::Local<v8::Object> wrap = wrap_.Get(isolate);
 
-    v8::Local<v8::Value> argv[1] = {shared_array_buffer};
-    v8::Local<v8::Value> id;
-    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&id)) {
-      return v8::Nothing<uint32_t>();
-    }
-    return id->Uint32Value(context);
+  v8::Local<v8::Value> hook;
+  if (!wrap->Get(context, OneByteString(isolate, "_writeHostObject")).ToLocal(&hook)) {
+    return v8::Nothing<bool>();
+  }
+  if (!hook->IsFunction()) {
+    return v8::ValueSerializer::Delegate::WriteHostObject(isolate, input);
   }
 
-  v8::Maybe<bool> WriteHostObject(v8::Isolate* isolate, v8::Local<v8::Object> input) override {
-    v8::Local<v8::Context> context = env_->context();
-    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
-
-    v8::Local<v8::Value> hook;
-    if (!wrap->Get(context, OneByteString(isolate, "_writeHostObject")).ToLocal(&hook)) {
-      return v8::Nothing<bool>();
-    }
-    if (!hook->IsFunction()) {
-      return v8::ValueSerializer::Delegate::WriteHostObject(isolate, input);
-    }
-
-    v8::Local<v8::Value> argv[1] = {input};
-    v8::Local<v8::Value> ret;
-    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&ret)) {
-      return v8::Nothing<bool>();
-    }
-    return v8::Just(true);
+  v8::Local<v8::Value> argv[1] = {input};
+  v8::Local<v8::Value> ret;
+  if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&ret)) {
+    return v8::Nothing<bool>();
   }
+  return v8::Just(true);
+}
 
-  static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
       ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
@@ -1005,15 +1011,15 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
 
     auto* ctx = env->allocate<SerializerContext>(env, args.This());
     args.This()->SetAlignedPointerInInternalField(0, ctx);
-  }
+}
 
-  static void WriteHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
     ctx->serializer_.WriteHeader();
-  }
+}
 
-  static void WriteValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
     v8::Local<v8::Value> value = args.Length() >= 1 ? args[0] : v8::Undefined(ctx->isolate_);
@@ -1021,17 +1027,17 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
     if (ctx->serializer_.WriteValue(ctx->env_->context(), value).To(&ret)) {
       args.GetReturnValue().Set(ret);
     }
-  }
+}
 
-  static void SetTreatArrayBufferViewsAsHostObjects(
-      const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::SetTreatArrayBufferViewsAsHostObjects(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
     const bool value = args.Length() >= 1 && args[0]->BooleanValue(ctx->isolate_);
     ctx->serializer_.SetTreatArrayBufferViewsAsHostObjects(value);
-  }
+}
 
-  static void ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
 
@@ -1052,9 +1058,9 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
     }
     v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
     args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
-  }
+}
 
-  static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
     if (args.Length() < 2) return;
@@ -1070,18 +1076,18 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
       return;
     }
     ctx->serializer_.TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
-  }
+}
 
-  static void WriteUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || args.Length() < 1) return;
     uint32_t value = 0;
     if (args[0]->Uint32Value(ctx->env_->context()).To(&value)) {
       ctx->serializer_.WriteUint32(value);
     }
-  }
+}
 
-  static void WriteUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || args.Length() < 2) return;
     uint32_t hi = 0;
@@ -1091,18 +1097,18 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
       return;
     }
     ctx->serializer_.WriteUint64((static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
-  }
+}
 
-  static void WriteDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || args.Length() < 1) return;
     double value = 0;
     if (args[0]->NumberValue(ctx->env_->context()).To(&value)) {
       ctx->serializer_.WriteDouble(value);
     }
-  }
+}
 
-  static void WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void SerializerContext::WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || args.Length() < 1) return;
     const uint8_t* data = nullptr;
@@ -1115,33 +1121,25 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
       return;
     }
     ctx->serializer_.WriteRawBytes(data, size);
-  }
+}
 
- private:
-  static SerializerContext* Unwrap(const v8::FunctionCallbackInfo<v8::Value>& args) {
+SerializerContext* SerializerContext::Unwrap(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
     if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
     return static_cast<SerializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
-  }
+}
 
-  static void WeakCallback(const v8::WeakCallbackInfo<SerializerContext>& info) {
+void SerializerContext::WeakCallback(const v8::WeakCallbackInfo<SerializerContext>& info) {
     SerializerContext* context = info.GetParameter();
     if (context != nullptr && context->env_ != nullptr) {
       context->env_->release(context);
     }
-  }
+}
 
-  napi_env env_;
-  v8::Isolate* isolate_;
-  v8::Global<v8::Object> wrap_;
-  v8::ValueSerializer serializer_;
-};
-
-class DeserializerContext : public v8::ValueDeserializer::Delegate {
- public:
-  DeserializerContext(napi_env env,
-                      v8::Local<v8::Object> wrap,
-                      v8::Local<v8::Value> buffer)
-      : env_(env), isolate_(env->isolate) {
+DeserializerContext::DeserializerContext(napi_env env,
+                                         v8::Local<v8::Object> wrap,
+                                         v8::Local<v8::Value> buffer)
+    : env_(env), isolate_(env->isolate) {
     const uint8_t* data = nullptr;
     size_t size = 0;
     if (!ReadArrayBufferViewBytes(buffer, &data, &size)) return;
@@ -1157,14 +1155,14 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
     v8::Local<v8::Context> context = env_->context();
     v8::Context::Scope context_scope(context);
     (void)wrap->Set(context, OneByteString(isolate_, "buffer"), buffer);
-  }
+}
 
-  ~DeserializerContext() {
-    wrap_.Reset();
-    deserializer_.reset();
-  }
+DeserializerContext::~DeserializerContext() {
+  wrap_.Reset();
+  deserializer_.reset();
+}
 
-  v8::MaybeLocal<v8::Object> ReadHostObject(v8::Isolate* isolate) override {
+v8::MaybeLocal<v8::Object> DeserializerContext::ReadHostObject(v8::Isolate* isolate) {
     v8::Local<v8::Context> context = env_->context();
     v8::Local<v8::Object> wrap = wrap_.Get(isolate);
 
@@ -1187,9 +1185,9 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
       return {};
     }
     return ret.As<v8::Object>();
-  }
+}
 
-  static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void DeserializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
       ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
@@ -1219,27 +1217,28 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
     }
     auto* ctx = env->allocate<DeserializerContext>(env, args.This(), args[0]);
     args.This()->SetAlignedPointerInInternalField(0, ctx);
-  }
+}
 
-  static void ReadHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void DeserializerContext::ReadHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
     DeserializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || !ctx->deserializer_) return;
     bool ok = false;
     if (ctx->deserializer_->ReadHeader(ctx->env_->context()).To(&ok)) {
       args.GetReturnValue().Set(ok);
     }
-  }
+}
 
-  static void ReadValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void DeserializerContext::ReadValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
     DeserializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || !ctx->deserializer_) return;
     v8::Local<v8::Value> out;
     if (ctx->deserializer_->ReadValue(ctx->env_->context()).ToLocal(&out)) {
       args.GetReturnValue().Set(out);
     }
-  }
+}
 
-  static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void DeserializerContext::TransferArrayBuffer(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
     DeserializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 2) return;
     uint32_t id = 0;
@@ -1256,107 +1255,99 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
                            ctx->isolate_,
                            "ERR_INVALID_ARG_TYPE",
                            "arrayBuffer must be an ArrayBuffer or SharedArrayBuffer");
-  }
+}
 
-  static void GetWireFormatVersion(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void DeserializerContext::GetWireFormatVersion(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
     DeserializerContext* ctx = Unwrap(args);
     if (ctx == nullptr || !ctx->deserializer_) return;
     args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(
         ctx->isolate_, ctx->deserializer_->GetWireFormatVersion()));
+}
+
+void DeserializerContext::ReadUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  DeserializerContext* ctx = Unwrap(args);
+  if (ctx == nullptr || !ctx->deserializer_) return;
+  uint32_t value = 0;
+  if (!ctx->deserializer_->ReadUint32(&value)) {
+    ctx->isolate_->ThrowException(v8::Exception::Error(
+        OneByteString(ctx->isolate_, "ReadUint32() failed")));
+    return;
   }
+  args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, value));
+}
 
-  static void ReadUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    DeserializerContext* ctx = Unwrap(args);
-    if (ctx == nullptr || !ctx->deserializer_) return;
-    uint32_t value = 0;
-    if (!ctx->deserializer_->ReadUint32(&value)) {
-      ctx->isolate_->ThrowException(v8::Exception::Error(
-          OneByteString(ctx->isolate_, "ReadUint32() failed")));
-      return;
-    }
-    args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, value));
+void DeserializerContext::ReadUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  DeserializerContext* ctx = Unwrap(args);
+  if (ctx == nullptr || !ctx->deserializer_) return;
+  uint64_t value = 0;
+  if (!ctx->deserializer_->ReadUint64(&value)) {
+    ctx->isolate_->ThrowException(v8::Exception::Error(
+        OneByteString(ctx->isolate_, "ReadUint64() failed")));
+    return;
   }
+  const uint32_t hi = static_cast<uint32_t>(value >> 32);
+  const uint32_t lo = static_cast<uint32_t>(value);
+  v8::Local<v8::Value> vals[2] = {
+      v8::Integer::NewFromUnsigned(ctx->isolate_, hi),
+      v8::Integer::NewFromUnsigned(ctx->isolate_, lo),
+  };
+  args.GetReturnValue().Set(v8::Array::New(ctx->isolate_, vals, 2));
+}
 
-  static void ReadUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    DeserializerContext* ctx = Unwrap(args);
-    if (ctx == nullptr || !ctx->deserializer_) return;
-    uint64_t value = 0;
-    if (!ctx->deserializer_->ReadUint64(&value)) {
-      ctx->isolate_->ThrowException(v8::Exception::Error(
-          OneByteString(ctx->isolate_, "ReadUint64() failed")));
-      return;
-    }
-    const uint32_t hi = static_cast<uint32_t>(value >> 32);
-    const uint32_t lo = static_cast<uint32_t>(value);
-    v8::Local<v8::Value> vals[2] = {
-        v8::Integer::NewFromUnsigned(ctx->isolate_, hi),
-        v8::Integer::NewFromUnsigned(ctx->isolate_, lo),
-    };
-    args.GetReturnValue().Set(v8::Array::New(ctx->isolate_, vals, 2));
+void DeserializerContext::ReadDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  DeserializerContext* ctx = Unwrap(args);
+  if (ctx == nullptr || !ctx->deserializer_) return;
+  double value = 0;
+  if (!ctx->deserializer_->ReadDouble(&value)) {
+    ctx->isolate_->ThrowException(v8::Exception::Error(
+        OneByteString(ctx->isolate_, "ReadDouble() failed")));
+    return;
   }
+  args.GetReturnValue().Set(value);
+}
 
-  static void ReadDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    DeserializerContext* ctx = Unwrap(args);
-    if (ctx == nullptr || !ctx->deserializer_) return;
-    double value = 0;
-    if (!ctx->deserializer_->ReadDouble(&value)) {
-      ctx->isolate_->ThrowException(v8::Exception::Error(
-          OneByteString(ctx->isolate_, "ReadDouble() failed")));
-      return;
-    }
-    args.GetReturnValue().Set(value);
+void DeserializerContext::ReadRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  DeserializerContext* ctx = Unwrap(args);
+  if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 1) return;
+
+  int64_t requested = 0;
+  if (!args[0]->IntegerValue(ctx->env_->context()).To(&requested) || requested < 0) {
+    return;
   }
+  const size_t length = static_cast<size_t>(requested);
 
-  static void ReadRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    DeserializerContext* ctx = Unwrap(args);
-    if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 1) return;
-
-    int64_t requested = 0;
-    if (!args[0]->IntegerValue(ctx->env_->context()).To(&requested) || requested < 0) {
-      return;
-    }
-    const size_t length = static_cast<size_t>(requested);
-
-    const void* read_ptr = nullptr;
-    if (!ctx->deserializer_->ReadRawBytes(length, &read_ptr)) {
-      ctx->isolate_->ThrowException(v8::Exception::Error(
-          OneByteString(ctx->isolate_, "ReadRawBytes() failed")));
-      return;
-    }
-    const uint8_t* pos = static_cast<const uint8_t*>(read_ptr);
-    const uint8_t* base = ctx->data_.empty() ? nullptr : ctx->data_.data();
-    if (base == nullptr || pos < base || pos + length > base + ctx->data_.size()) {
-      ctx->isolate_->ThrowException(v8::Exception::Error(
-          OneByteString(ctx->isolate_, "ReadRawBytes() returned out-of-range data")));
-      return;
-    }
-    const uint32_t offset = static_cast<uint32_t>(pos - base);
-    args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, offset));
+  const void* read_ptr = nullptr;
+  if (!ctx->deserializer_->ReadRawBytes(length, &read_ptr)) {
+    ctx->isolate_->ThrowException(v8::Exception::Error(
+        OneByteString(ctx->isolate_, "ReadRawBytes() failed")));
+    return;
   }
-
- private:
-  static DeserializerContext* Unwrap(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
-    return static_cast<DeserializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+  const uint8_t* pos = static_cast<const uint8_t*>(read_ptr);
+  const uint8_t* base = ctx->data_.empty() ? nullptr : ctx->data_.data();
+  if (base == nullptr || pos < base || pos + length > base + ctx->data_.size()) {
+    ctx->isolate_->ThrowException(v8::Exception::Error(
+        OneByteString(ctx->isolate_, "ReadRawBytes() returned out-of-range data")));
+    return;
   }
+  const uint32_t offset = static_cast<uint32_t>(pos - base);
+  args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, offset));
+}
 
-  static void WeakCallback(const v8::WeakCallbackInfo<DeserializerContext>& info) {
-    DeserializerContext* context = info.GetParameter();
-    if (context != nullptr && context->env_ != nullptr) {
-      context->env_->release(context);
-    }
+DeserializerContext* DeserializerContext::Unwrap(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
+  return static_cast<DeserializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+}
+
+void DeserializerContext::WeakCallback(
+    const v8::WeakCallbackInfo<DeserializerContext>& info) {
+  DeserializerContext* context = info.GetParameter();
+  if (context != nullptr && context->env_ != nullptr) {
+    context->env_->release(context);
   }
+}
 
-  napi_env env_;
-  v8::Isolate* isolate_;
-  v8::Global<v8::Object> wrap_;
-  std::vector<uint8_t> data_;
-  std::unique_ptr<v8::ValueDeserializer> deserializer_;
-};
-
-}  // namespace
-
-namespace v8impl::detail {
 template <>
 struct napi_lifetime_type_name__<SerializerContext> {
   static constexpr const char* value = "serializer_context";
@@ -1369,6 +1360,9 @@ struct napi_lifetime_type_name__<DeserializerContext> {
 }  // namespace v8impl::detail
 
 namespace {
+
+using v8impl::detail::DeserializerContext;
+using v8impl::detail::SerializerContext;
 
 void SetProtoMethod(v8::Isolate* isolate,
                     v8::Local<v8::FunctionTemplate> tmpl,

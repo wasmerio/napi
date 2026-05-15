@@ -122,16 +122,17 @@ napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 
 void napi_env__::destroy_scope(napi_handle_scope scope)
 {
-  scopes_.release(scope);
+  scopes_.release_handle(scope);
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) const
 {
+  using Alloc = decltype(scopes_);
 #ifdef NDEBUG
-  auto scope = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_from_handle(scope_handle);
+  auto scope = Alloc::unsafe_data_from_handle(scope_handle);
 #else
   assert(scopes_.owns_handle(scope_handle));
-  auto [scope, owner] = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_data_with_owner_from_handle(scope_handle);
+  auto [scope, owner] = Alloc::unsafe_data_with_owner_from_handle(scope_handle);
   assert(owner == this);
 #endif
 
@@ -181,11 +182,12 @@ void napi_env__::delete_value_from_current_scope(napi_value value)
 
 napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 {
+  using Alloc = decltype(scopes_);
 #ifdef NDEBUG
-  auto value = napi_allocator__<napi_value, napi_value__, napi_scope__>::unsafe_data_from_handle(value_handle);
+  auto value = napi_scope__::ValuesAllocator::unsafe_data_from_handle(value_handle);
 #else
-  auto [value, owner] = napi_allocator__<napi_value, napi_value__, napi_scope__>::unsafe_data_with_owner_from_handle(value_handle);
-  auto owner_handle = napi_allocator__<napi_handle_scope, napi_scope__, napi_env__>::unsafe_handle_from_data(owner);
+  auto [value, owner] = napi_scope__::ValuesAllocator::unsafe_data_with_owner_from_handle(value_handle);
+  auto owner_handle = Alloc::unsafe_handle_from_data(owner);
   assert(scopes_.owns_handle(owner_handle));
 #endif
 
@@ -203,15 +205,16 @@ napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial
 
 void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 {
-  refs_.release(ref);
+  refs_.release_handle(ref);
 }
 
 napi_ref__ *napi_env__::ref_from_handle(napi_ref ref_handle)
 {
+  using Alloc = decltype(refs_);
 #ifdef NDEBUG
-  auto ref = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_from_handle(ref_handle);
+  auto ref = Alloc::unsafe_data_from_handle(ref_handle);
 #else
-  auto [ref, owner] = napi_allocator__<napi_ref, napi_ref__, napi_env__>::unsafe_data_with_owner_from_handle(ref_handle);
+  auto [ref, owner] = Alloc::unsafe_data_with_owner_from_handle(ref_handle);
   assert(owner == this);
   assert(refs_.owns_handle(ref_handle));
 #endif
@@ -252,56 +255,28 @@ size_t napi_env__::active_scope_count() const
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
 bool napi_env__::should_dump_lifetime_stats(int64_t now_ms)
 {
-  constexpr int64_t interval_ms = 2000;
-  if (lifetime_last_stats_ms_ == 0)
-  {
-    lifetime_last_stats_ms_ = now_ms;
-    return false;
-  }
-
-  if (now_ms - lifetime_last_stats_ms_ < interval_ms)
-    return false;
-
-  lifetime_last_stats_ms_ = now_ms;
-  return true;
+  return lifetime_stats_gate_.should_fire(now_ms);
 }
 
 bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms)
 {
-  constexpr int64_t interval_ms = 10000;
-  if (lifetime_last_string_symbol_values_ms_ == 0)
-  {
-    lifetime_last_string_symbol_values_ms_ = now_ms;
-    return false;
-  }
-
-  if (now_ms - lifetime_last_string_symbol_values_ms_ < interval_ms)
-    return false;
-
-  lifetime_last_string_symbol_values_ms_ = now_ms;
-  return true;
+  return lifetime_string_symbol_values_gate_.should_fire(now_ms);
 }
 #endif
 
 const napi_extended_error_info *napi_env__::last_error_info() const
 {
-  return &last_error_;
+  return error_state_.info();
 }
 
 napi_status napi_env__::set_last_error(napi_status status, const char *message)
 {
-  last_error_.error_code = status;
-  last_error_.engine_error_code = 0;
-  last_error_.engine_reserved = nullptr;
-  last_error_message_ = (message == nullptr) ? "" : message;
-  last_error_.error_message =
-      last_error_message_.empty() ? nullptr : last_error_message_.c_str();
-  return status;
+  return error_state_.set(status, message);
 }
 
 napi_status napi_env__::clear_last_error()
 {
-  return set_last_error(napi_ok, nullptr);
+  return error_state_.clear();
 }
 
 bool napi_env__::has_last_exception() const

@@ -44,6 +44,8 @@ struct napi_scope__
   napi_scope__ &operator=(const napi_scope__ &) = delete;
   napi_scope__ &operator=(napi_scope__ &&other) = delete;
 
+  typedef napi_slab_allocator__<napi_value, napi_value__, napi_scope__> ValuesAllocator;
+
 private:
   // Scope hierarchy.
   napi_env env_ = nullptr;
@@ -51,7 +53,7 @@ private:
   napi_handle_scope parent_ = nullptr;
 
   // Local value storage.
-  napi_allocator__<napi_value, napi_value__, napi_scope__> values_;
+  ValuesAllocator values_;
 
   // Scope lifecycle flags.
   bool closed_ = false;

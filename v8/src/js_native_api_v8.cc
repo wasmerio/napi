@@ -1,5 +1,6 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_callback_payload.h"
+#include "internal/napi_env_records.h"
 #include "internal/napi_escapable_handle_scope_wrapper.h"
 #include "internal/napi_external_wrapper.h"
 #include "internal/napi_function_callback_info.h"
@@ -12,6 +13,7 @@
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_setter_callback_info.h"
 #include "internal/napi_util.h"
+#include "napi_typedarray_metadata.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -25,61 +27,6 @@
 #include <new>
 #include <string>
 #include <vector>
-
-struct napi_env_cleanup_hook__ {
-  explicit napi_env_cleanup_hook__(napi_env env) : env(env) {}
-
-  napi_env env = nullptr;
-  napi_cleanup_hook hook = nullptr;
-  void* arg = nullptr;
-  uint64_t order = 0;
-};
-
-struct napi_deferred__ {
-  explicit napi_deferred__(napi_env env) : env(env) {}
-
-  napi_env env = nullptr;
-  v8::Global<v8::Promise::Resolver> resolver;
-};
-
-struct napi_handle_scope__ {
-  explicit napi_handle_scope__(napi_env env)
-      : env(env), wrapper(env->isolate) {}
-
-  napi_env env = nullptr;
-  napi_handle_scope_wrapper__ wrapper;
-};
-
-struct napi_escapable_handle_scope__ {
-  explicit napi_escapable_handle_scope__(napi_env env)
-      : env(env), wrapper(env->isolate) {}
-
-  napi_env env = nullptr;
-  napi_escapable_handle_scope_wrapper__ wrapper;
-};
-
-struct napi_buffer_record__ {
-  explicit napi_buffer_record__(napi_env env) : env(env) {}
-
-  napi_env env = nullptr;
-  v8::Global<v8::Object> holder;
-  std::shared_ptr<v8::BackingStore> backing_store;
-  void* external_data = nullptr;
-  node_api_basic_finalize finalize_cb = nullptr;
-  void* finalize_hint = nullptr;
-  bool finalized = false;
-};
-using napi_buffer_record = napi_buffer_record__;
-
-struct napi_external_backing_store_hint__ {
-  explicit napi_external_backing_store_hint__(napi_env env) : env(env) {}
-
-  napi_env env = nullptr;
-  void* external_data = nullptr;
-  node_api_basic_finalize finalize_cb = nullptr;
-  void* finalize_hint = nullptr;
-};
-using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
 namespace {
 
@@ -244,13 +191,35 @@ void ExternalBackingStoreDeleter(void* data,
                                  void* deleter_data) {
   auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
   if (hint == nullptr) return;
+  napi_env env = hint->env;
   if (hint->finalize_cb != nullptr) {
-    hint->finalize_cb(hint->env, hint->external_data != nullptr ? hint->external_data : data,
+    hint->finalize_cb(env, hint->external_data != nullptr ? hint->external_data : data,
                       hint->finalize_hint);
   }
-  if (CheckEnv(hint->env)) {
-    hint->env->release(hint);
+  if (env != nullptr) {
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_release(env, hint);
+    env->external_backing_store_hints.erase(hint);
   }
+  delete hint;
+}
+
+void FinalizeExternalBackingStoreHints(napi_env env) {
+  if (!CheckEnv(env)) return;
+  for (auto* hint : env->external_backing_store_hints) {
+    if (hint == nullptr) continue;
+    if (hint->finalize_cb != nullptr) {
+      hint->finalize_cb(
+          env,
+          hint->external_data != nullptr ? hint->external_data : nullptr,
+          hint->finalize_hint);
+      hint->finalize_cb = nullptr;
+    }
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_release(env, hint);
+    hint->env = nullptr;
+  }
+  env->external_backing_store_hints.clear();
 }
 
 bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* length) {
@@ -370,21 +339,7 @@ inline v8::PropertyAttribute ToV8PropertyAttributes(napi_property_attributes att
 }
 
 inline const char* TypedArrayConstructorName(napi_typedarray_type type) {
-  switch (type) {
-    case napi_int8_array: return "Int8Array";
-    case napi_uint8_array: return "Uint8Array";
-    case napi_uint8_clamped_array: return "Uint8ClampedArray";
-    case napi_int16_array: return "Int16Array";
-    case napi_uint16_array: return "Uint16Array";
-    case napi_int32_array: return "Int32Array";
-    case napi_uint32_array: return "Uint32Array";
-    case napi_float16_array: return "Float16Array";
-    case napi_float32_array: return "Float32Array";
-    case napi_float64_array: return "Float64Array";
-    case napi_bigint64_array: return "BigInt64Array";
-    case napi_biguint64_array: return "BigUint64Array";
-    default: return nullptr;
-  }
+  return napi::typedarray_constructor_name(type);
 }
 
 inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* out_type) {
@@ -477,6 +432,12 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 
 }  // namespace
 
+napi_handle_scope__::napi_handle_scope__(napi_env env)
+    : env(env), wrapper(env->isolate) {}
+
+napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env)
+    : env(env), wrapper(env->isolate) {}
+
 void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
   if (cb == nullptr) return;
   v8::HandleScope handle_scope(isolate);
@@ -512,7 +473,8 @@ void napi_env__::DrainFinalizerQueue() {
 
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
-      context_ref(isolate, context) {
+      context_ref(isolate, context),
+      factory_(this) {
   (void)module_api_version;
   isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
   v8::Local<v8::Private> wrapKey = v8::Private::ForApi(
@@ -534,6 +496,7 @@ napi_env__::~napi_env__() {
   napi_ref_tracker__::FinalizeAll(&reflist);
   pending_finalizers.clear();
   finalization_scheduled = false;
+  FinalizeExternalBackingStoreHints(this);
   napi_v8_finalize_buffer_records(this);
 
   if (instance_data_finalize_cb != nullptr) {
@@ -552,33 +515,11 @@ v8::Local<v8::Context> napi_env__::context() const {
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
 bool napi_env__::should_dump_lifetime_stats(int64_t now_ms) {
-  constexpr int64_t interval_ms = 2000;
-  if (lifetime_last_stats_ms_ == 0) {
-    lifetime_last_stats_ms_ = now_ms;
-    return false;
-  }
-
-  if (now_ms - lifetime_last_stats_ms_ < interval_ms) {
-    return false;
-  }
-
-  lifetime_last_stats_ms_ = now_ms;
-  return true;
+  return lifetime_stats_gate_.should_fire(now_ms);
 }
 
 bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms) {
-  constexpr int64_t interval_ms = 10000;
-  if (lifetime_last_string_symbol_values_ms_ == 0) {
-    lifetime_last_string_symbol_values_ms_ = now_ms;
-    return false;
-  }
-
-  if (now_ms - lifetime_last_string_symbol_values_ms_ < interval_ms) {
-    return false;
-  }
-
-  lifetime_last_string_symbol_values_ms_ = now_ms;
-  return true;
+  return lifetime_string_symbol_values_gate_.should_fire(now_ms);
 }
 #endif
 
@@ -586,17 +527,11 @@ napi_status napi_v8_set_last_error(napi_env env,
                                    napi_status status,
                                    const char* message) {
   if (env == nullptr) return status;
-  env->last_error.error_code = status;
-  env->last_error.engine_error_code = 0;
-  env->last_error.engine_reserved = nullptr;
-  env->last_error_message = (message == nullptr) ? "" : message;
-  env->last_error.error_message =
-      env->last_error_message.empty() ? nullptr : env->last_error_message.c_str();
-  return status;
+  return env->error_state.set(status, message);
 }
 
 napi_status napi_v8_clear_last_error(napi_env env) {
-  return napi_v8_set_last_error(env, napi_ok, nullptr);
+  return env == nullptr ? napi_ok : env->error_state.clear();
 }
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
@@ -643,7 +578,7 @@ napi_status NAPI_CDECL napi_get_last_error_info(
   if (result == nullptr) return napi_invalid_arg;
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv)) return napi_invalid_arg;
-  *result = &napiEnv->last_error;
+  *result = napiEnv->error_state.info();
   return napi_ok;
 }
 
@@ -823,17 +758,19 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
   } else {
     if (external_data == nullptr) return napi_invalid_arg;
-    auto* hint = env->allocate<napi_external_backing_store_hint__>(env);
-    if (hint == nullptr) return napi_generic_failure;
+    auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
     hint->external_data = external_data;
     hint->finalize_cb = finalize_cb;
     hint->finalize_hint = finalize_hint;
+    auto* hint_ptr = hint.get();
     std::unique_ptr<v8::BackingStore> backing = v8::ArrayBuffer::NewBackingStore(
-        external_data, byte_length, ExternalBackingStoreDeleter, hint);
+        external_data, byte_length, ExternalBackingStoreDeleter, hint_ptr);
     if (!backing) {
-      env->release(hint);
       return napi_generic_failure;
     }
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_create(env, hint.get());
+    env->external_backing_store_hints.insert(hint.release());
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
 
@@ -2998,19 +2935,21 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
-  auto* hint = env->allocate<napi_external_backing_store_hint__>(env);
-  if (hint == nullptr) return napi_generic_failure;
+  auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
   hint->external_data = data;
   hint->finalize_cb = finalize_cb;
   hint->finalize_hint = finalize_hint;
+  auto* hint_ptr = hint.get();
 
   std::unique_ptr<v8::BackingStore> backing =
       v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter,
-                                       hint);
+                                       hint_ptr);
   if (!backing) {
-    env->release(hint);
     return napi_generic_failure;
   }
+  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+      record_create(env, hint.get());
+  env->external_backing_store_hints.insert(hint.release());
 
   auto* record = env->allocate<napi_buffer_record__>(env);
   if (record == nullptr) return napi_generic_failure;

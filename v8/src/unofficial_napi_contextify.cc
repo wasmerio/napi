@@ -30,6 +30,7 @@
 #endif
 
 #include "internal/napi_v8_env.h"
+#include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
@@ -54,30 +55,6 @@ struct SavedOwnProperty {
   v8::Global<v8::Value> value;
 };
 
-struct ModuleImportAttributeRecord {
-  std::string key;
-  std::string value;
-};
-
-struct ModuleRequestRecord {
-  std::string specifier;
-  std::vector<ModuleImportAttributeRecord> attributes;
-  int32_t phase = 2;
-};
-
-struct ModuleWrapRecord {
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref synthetic_eval_steps_ref = nullptr;
-  napi_ref source_object_ref = nullptr;
-  napi_ref host_defined_option_ref = nullptr;
-  v8::Global<v8::Context> context;
-  v8::Global<v8::Module> module;
-  std::vector<ModuleRequestRecord> module_requests;
-  std::unordered_map<std::string, uint32_t> resolve_cache;
-  std::vector<ModuleWrapRecord*> linked_requests;
-};
-
 }  // namespace
 
 namespace v8impl::detail {
@@ -88,6 +65,10 @@ struct napi_lifetime_type_name__<ModuleWrapRecord> {
 }  // namespace v8impl::detail
 
 namespace {
+
+using v8impl::detail::ModuleImportAttributeRecord;
+using v8impl::detail::ModuleRequestRecord;
+using v8impl::detail::ModuleWrapRecord;
 
 struct ModuleWrapBindingState {
   napi_ref import_module_dynamically_ref = nullptr;
