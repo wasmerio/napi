@@ -72,6 +72,7 @@ target_include_directories(${_napi_test_prefix}_gtest
     "${NAPI_TESTS_ROOT}/js-native-api"
     "${NAPI_TESTS_ROOT}/node-api"
     "${CMAKE_CURRENT_SOURCE_DIR}/runners"
+    "${NAPI_ROOT}/lib/src"
     "${NAPI_INCLUDE_ROOT}"
     "${${_napi_engine_include_var}}"
 )
@@ -96,6 +97,7 @@ function(add_fixture_test target_name)
       "${NAPI_TESTS_ROOT}/js-native-api"
       "${NAPI_TESTS_ROOT}/node-api"
       "${CMAKE_CURRENT_SOURCE_DIR}/runners"
+      "${NAPI_ROOT}/lib/src"
       "${NAPI_INCLUDE_ROOT}"
       "${${_napi_engine_include_var}}"
   )
@@ -303,4 +305,8 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
 )
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
+)
+
+add_fixture_test(${_napi_test_prefix}_test_allocator
+  src/napi_allocator_test.cc
 )

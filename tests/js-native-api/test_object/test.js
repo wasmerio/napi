@@ -206,6 +206,10 @@ assert.strictEqual(newObject.test_string, 'test string');
   assert.strictEqual(test_object.CheckTypeTag(2, plainExternal), false);
   assert.strictEqual(test_object.CheckTypeTag(3, plainExternal), false);
   assert.strictEqual(test_object.CheckTypeTag(4, plainExternal), false);
+
+  // Type tags are single-assignment metadata.
+  assert.strictEqual(test_object.TypeTagObjectTwiceStatus(), 1);
+  assert.strictEqual(test_object.TypeTagExternalTwiceStatus(), 1);
 }
 
 {

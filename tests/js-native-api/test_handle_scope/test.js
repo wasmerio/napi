@@ -12,6 +12,8 @@ assert.ok(testHandleScope.NewScopeEscape() instanceof Object);
 
 testHandleScope.NewScopeEscapeTwice();
 
+assert.strictEqual(testHandleScope.CloseHandleScopeOutOfOrder(), true);
+
 assert.throws(
   () => {
     testHandleScope.NewScopeWithException(() => { throw new RangeError(); });

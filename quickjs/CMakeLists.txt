@@ -5,60 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-macro(xoption OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
-  option(${OPTION_NAME} ${OPTION_TEXT} ${OPTION_DEFAULT})
-  if(DEFINED ENV{${OPTION_NAME}})
-    # Allow setting the option through an environment variable.
-    set(${OPTION_NAME} $ENV{${OPTION_NAME}})
-  endif()
-  if(${OPTION_NAME})
-    add_definitions(-D${OPTION_NAME})
-  endif()
-  message(STATUS "  ${OPTION_NAME}: ${${OPTION_NAME}}")
-endmacro()
+include("${CMAKE_CURRENT_SOURCE_DIR}/../lib/cmake/NapiLifetimeOptions.cmake")
 
 xoption(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
-xoption(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER
-  "Enable QuickJS N-API lifetime tracking diagnostics"
-  OFF
-)
-xoption(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS
-  "Print QuickJS N-API value/ref allocator stats every 10 seconds"
-  OFF
-)
-xoption(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS
-  "Print QuickJS N-API active value/ref JSValue tag stats with periodic stats"
-  OFF
-)
-xoption(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-  "Print active QuickJS N-API string and symbol values with periodic stats"
-  OFF
-)
-
-if(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS AND NOT NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER)
-  message(STATUS
-    "NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS requires "
-    "NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER; enabling lifetime tracker"
-  )
-  set(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER ON)
-endif()
-if(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS AND NOT NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS)
-  message(STATUS
-    "NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS requires "
-    "NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS; enabling periodic stats"
-  )
-  set(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS ON)
-endif()
-if(NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP AND NOT NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS)
-  message(STATUS
-    "NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP requires "
-    "NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS; enabling tag stats"
-  )
-  set(NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS ON)
-endif()
-if(NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS AND NOT NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER)
-  set(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER ON)
-endif()
+napi_define_lifetime_options("QuickJS")
 
 set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -113,6 +63,11 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 # endforeach()
 
 add_library(napi_quickjs STATIC
+  ../lib/src/napi_error_state.cc
+  ../lib/src/napi_lifetime_tracker.cc
+  ../lib/src/napi_periodic_gate.cc
+  ../lib/src/napi_text.cc
+  ../lib/src/napi_typedarray_metadata.cc
   src/js_native_api_quickjs.cc
   src/internal/napi_callback_info.cc
   src/internal/napi_callsite.cc
@@ -133,13 +88,14 @@ add_library(napi_quickjs STATIC
   src/internal/napi_value.cc
   src/unofficial_napi.cc
 )
-if(NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER)
+if(NAPI_ENABLE_LIFETIME_TRACKER)
   target_sources(napi_quickjs PRIVATE src/internal/napi_lifetime_tracker.cc)
 endif()
 
 target_include_directories(napi_quickjs
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
+    "${PROJECT_ROOT}/napi/lib/src"
     "${NAPI_QUICKJS_ROOT}/src"
   PRIVATE
     "${NAPI_QUICKJS_INCLUDE_DIR}"
@@ -151,10 +107,10 @@ target_compile_definitions(napi_quickjs
     NAPI_BUNDLED_QUICKJS=1
   PRIVATE
     NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
-    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER}>:NAPI_QUICKJS_ENABLE_LIFETIME_TRACKER=1>
-    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS}>:NAPI_QUICKJS_ENABLE_LIFETIME_PERIODIC_STATS=1>
-    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS}>:NAPI_QUICKJS_ENABLE_LIFETIME_TAG_STATS=1>
-    $<$<BOOL:${NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP}>:NAPI_QUICKJS_ENABLE_LIFETIME_STRING_SYMBOL_DUMP=1>
+    $<$<BOOL:${NAPI_ENABLE_LIFETIME_TRACKER}>:NAPI_ENABLE_LIFETIME_TRACKER=1>
+    $<$<BOOL:${NAPI_ENABLE_LIFETIME_PERIODIC_STATS}>:NAPI_ENABLE_LIFETIME_PERIODIC_STATS=1>
+    $<$<BOOL:${NAPI_ENABLE_LIFETIME_TAG_STATS}>:NAPI_ENABLE_LIFETIME_TAG_STATS=1>
+    $<$<BOOL:${NAPI_ENABLE_LIFETIME_STRING_SYMBOL_DUMP}>:NAPI_ENABLE_LIFETIME_STRING_SYMBOL_DUMP=1>
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(napi_quickjs PRIVATE -fno-rtti)

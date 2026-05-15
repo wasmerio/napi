@@ -21,6 +21,7 @@ typedef struct {
 } CleanupHookState;
 
 static CleanupHookState cleanup_hook_state;
+static int cleanup_order_state = 0;
 
 static void RemovedCleanupHook(void* arg) {
   (void)arg;
@@ -33,6 +34,30 @@ static void RemovingCleanupHook(void* arg) {
       state->env,
       napi_remove_env_cleanup_hook(
           state->env, RemovedCleanupHook, state));
+}
+
+static void CleanupHookOrderA(void* arg) {
+  (void)arg;
+  if (cleanup_order_state != 2) {
+    abort();
+  }
+  cleanup_order_state = 3;
+}
+
+static void CleanupHookOrderB(void* arg) {
+  (void)arg;
+  if (cleanup_order_state != 1) {
+    abort();
+  }
+  cleanup_order_state = 2;
+}
+
+static void CleanupHookOrderC(void* arg) {
+  (void)arg;
+  if (cleanup_order_state != 0) {
+    abort();
+  }
+  cleanup_order_state = 1;
 }
 
 static napi_value Increment(napi_env env, napi_callback_info info) {
@@ -114,6 +139,18 @@ static napi_value RegisterCleanupHookRemoval(napi_env env,
   return NULL;
 }
 
+static napi_value RegisterCleanupHookOrdering(napi_env env,
+                                              napi_callback_info info) {
+  (void)info;
+
+  cleanup_order_state = 0;
+  NODE_API_CALL(env, napi_add_env_cleanup_hook(env, CleanupHookOrderA, NULL));
+  NODE_API_CALL(env, napi_add_env_cleanup_hook(env, CleanupHookOrderB, NULL));
+  NODE_API_CALL(env, napi_add_env_cleanup_hook(env, CleanupHookOrderC, NULL));
+
+  return NULL;
+}
+
 EXTERN_C_START
 napi_value Init(napi_env env, napi_value exports) {
   AddonData* data = malloc(sizeof(*data));
@@ -129,6 +166,8 @@ napi_value Init(napi_env env, napi_value exports) {
     DECLARE_NODE_API_PROPERTY("objectWithFinalizer", ObjectWithFinalizer),
     DECLARE_NODE_API_PROPERTY(
         "registerCleanupHookRemoval", RegisterCleanupHookRemoval),
+    DECLARE_NODE_API_PROPERTY(
+        "registerCleanupHookOrdering", RegisterCleanupHookOrdering),
   };
 
   NODE_API_CALL(env,

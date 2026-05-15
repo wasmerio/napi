@@ -3,6 +3,7 @@
 
 #include "../../../include/js_native_api.h"
 #include "napi_allocator.h"
+#include "napi_lifetime_tracker.h"
 #include "napi_value.h"
 
 #include <cstdint>
@@ -35,13 +36,16 @@ struct napi_scope__
   template <typename Fn>
   void for_each_active_value(Fn fn) const
   {
-    values_.for_each_active(fn);
+    for (const auto &value : values_)
+      fn(value);
   }
 
   napi_scope__(const napi_scope__ &) = delete;
   napi_scope__(napi_scope__ &&other) = delete;
   napi_scope__ &operator=(const napi_scope__ &) = delete;
   napi_scope__ &operator=(napi_scope__ &&other) = delete;
+
+  typedef napi_allocator__<napi_value__, napi_scope__> ValuesAllocator;
 
 private:
   // Scope hierarchy.
@@ -50,7 +54,7 @@ private:
   napi_handle_scope parent_ = nullptr;
 
   // Local value storage.
-  napi_allocator__<napi_value, napi_value__, napi_scope__> values_;
+  ValuesAllocator values_;
 
   // Scope lifecycle flags.
   bool closed_ = false;

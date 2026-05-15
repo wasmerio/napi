@@ -30,6 +30,7 @@
 #endif
 
 #include "internal/napi_v8_env.h"
+#include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
@@ -54,29 +55,20 @@ struct SavedOwnProperty {
   v8::Global<v8::Value> value;
 };
 
-struct ModuleImportAttributeRecord {
-  std::string key;
-  std::string value;
-};
+}  // namespace
 
-struct ModuleRequestRecord {
-  std::string specifier;
-  std::vector<ModuleImportAttributeRecord> attributes;
-  int32_t phase = 2;
+namespace v8impl::detail {
+template <>
+struct napi_lifetime_type_name__<ModuleWrapRecord> {
+  static constexpr const char* value = "module_wrap_record";
 };
+}  // namespace v8impl::detail
 
-struct ModuleWrapRecord {
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref synthetic_eval_steps_ref = nullptr;
-  napi_ref source_object_ref = nullptr;
-  napi_ref host_defined_option_ref = nullptr;
-  v8::Global<v8::Context> context;
-  v8::Global<v8::Module> module;
-  std::vector<ModuleRequestRecord> module_requests;
-  std::unordered_map<std::string, uint32_t> resolve_cache;
-  std::vector<ModuleWrapRecord*> linked_requests;
-};
+namespace {
+
+using v8impl::detail::ModuleImportAttributeRecord;
+using v8impl::detail::ModuleRequestRecord;
+using v8impl::detail::ModuleWrapRecord;
 
 struct ModuleWrapBindingState {
   napi_ref import_module_dynamically_ref = nullptr;
@@ -139,6 +131,31 @@ v8::Local<v8::String> ToV8String(napi_env env, napi_value value, const char* fal
     return v8::String::NewFromUtf8(isolate, fallback, v8::NewStringType::kNormal).ToLocalChecked();
   }
   return raw.As<v8::String>();
+}
+
+std::string ToUtf8String(napi_env env, napi_value value, const char* fallback) {
+  v8::Isolate* isolate = env->isolate;
+  napi_value str = nullptr;
+  if (!CoerceToStringValue(env, value, &str)) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(str);
+  if (raw.IsEmpty()) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  v8::String::Utf8Value utf8(isolate, raw);
+  if (*utf8 == nullptr) {
+    return fallback == nullptr ? "" : fallback;
+  }
+  return std::string(*utf8, static_cast<size_t>(utf8.length()));
+}
+
+bool StartsWithBomHashbang(const std::string& source) {
+  return source.size() >= 5 &&
+         static_cast<unsigned char>(source[0]) == 0xef &&
+         static_cast<unsigned char>(source[1]) == 0xbb &&
+         static_cast<unsigned char>(source[2]) == 0xbf &&
+         source[3] == '#' && source[4] == '!';
 }
 
 bool SetNamed(v8::Local<v8::Context> context,
@@ -570,7 +587,7 @@ void DestroyModuleRecord(ModuleWrapRecord* record) {
   ResetRef(env, &record->host_defined_option_ref);
   record->context.Reset();
   record->module.Reset();
-  delete record;
+  env->release(record);
 }
 
 bool TryGetInternalBindingSymbol(napi_env env,
@@ -815,7 +832,7 @@ void CleanupModuleWrapState(void* arg) {
     ResetRef(env, &record->host_defined_option_ref);
     record->context.Reset();
     record->module.Reset();
-    delete record;
+    env->release(record);
   }
 
   ResetRef(env, &it->second.import_module_dynamically_ref);
@@ -1778,7 +1795,26 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
-  v8::Local<v8::String> code_str = ToV8String(env, code, "");
+  std::string source_text = ToUtf8String(env, code, "");
+  if (StartsWithBomHashbang(source_text)) {
+    v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(
+        isolate, "Invalid or unexpected token");
+    v8::Local<v8::Value> exception = v8::Exception::SyntaxError(message);
+    napi_value wrapped_exception = napi_v8_wrap_value(env, exception);
+    if (wrapped_exception != nullptr) {
+      (void)napi_throw(env, wrapped_exception);
+    } else {
+      isolate->ThrowException(exception);
+    }
+    return napi_pending_exception;
+  }
+
+  v8::Local<v8::String> code_str =
+      v8::String::NewFromUtf8(env->isolate,
+                              source_text.c_str(),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(source_text.size()))
+          .ToLocalChecked();
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -2198,7 +2234,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     return napi_generic_failure;
   }
 
-  auto* record = new ModuleWrapRecord();
+  auto* record = env->allocate<ModuleWrapRecord>();
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);
@@ -2280,7 +2316,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
   v8::Local<v8::Module> module = v8::Module::CreateSyntheticModule(
       isolate, ToV8String(env, url, "vm:synthetic"), names_span, SyntheticModuleEvaluationSteps);
 
-  auto* record = new ModuleWrapRecord();
+  auto* record = env->allocate<ModuleWrapRecord>();
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);
