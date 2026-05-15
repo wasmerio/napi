@@ -662,11 +662,7 @@ napi_status napi_module_wrap__::instantiate(void *handle)
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
   if (JS_LinkModule(ctx_, entry->module) < 0)
-  {
-    if (JS_HasException(ctx_))
-      JS_FreeValue(ctx_, JS_GetException(ctx_));
-    return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Module linking failed");
-  }
+    return return_pending_exception("Module linking failed");
   return napi_ok;
 }
 
