@@ -706,7 +706,7 @@ extern "C"
                                          : length;
         std::string description{utf8description == nullptr ? "" : utf8description,
                                 description_length};
-        JSValue symbol = JS_NewSymbol(napi_util__::context(env), description.c_str(), false);
+        JSValue symbol = JS_NewPrivateSymbol(napi_util__::context(env), description.c_str());
         if (JS_IsException(symbol))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env, symbol, result_out);
