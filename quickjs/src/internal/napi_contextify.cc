@@ -141,56 +141,39 @@ namespace quickjs::detail
                                                     const std::vector<std::string> &params,
                                                     std::string *diagnostic_source_out) const
     {
-        std::string compile_source = prepare_function_body_source(source);
+        std::string function_body = prepare_function_body_source(source);
         std::string diagnostic_source = source;
         if (!source.empty() && !source_url.empty())
         {
-            compile_source += "\n//# sourceURL=";
-            compile_source += source_url;
+            function_body += "\n//# sourceURL=";
+            function_body += source_url;
             diagnostic_source += "\n//# sourceURL=";
             diagnostic_source += source_url;
         }
         if (diagnostic_source_out != nullptr)
             *diagnostic_source_out = diagnostic_source;
 
-        std::vector<JSValue> argv;
-        argv.reserve(params.size() + 1);
-        for (const std::string &param : params)
+        std::string compile_source = "(function anonymous(";
+        for (size_t i = 0; i < params.size(); ++i)
         {
-            JSValue value = JS_NewStringLen(ctx_, param.c_str(), param.size());
-            if (JS_IsException(value))
-            {
-                for (JSValue arg : argv)
-                    JS_FreeValue(ctx_, arg);
-                return JS_EXCEPTION;
-            }
-            argv.push_back(value);
+            if (i != 0)
+                compile_source += ',';
+            compile_source += params[i];
         }
+        compile_source += "\n) {\n";
+        compile_source += function_body;
+        compile_source += "\n})";
 
-        JSValue code_arg = JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
-        if (JS_IsException(code_arg))
-        {
-            for (JSValue arg : argv)
-                JS_FreeValue(ctx_, arg);
+        JSEvalOptions options = {
+            .version = JS_EVAL_OPTIONS_VERSION,
+            .eval_flags = JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
+            .filename = source_url.empty() ? "<contextify>" : source_url.c_str(),
+            .line_num = 1,
+        };
+        JSValue bytecode = JS_Eval2(ctx_, compile_source.c_str(), compile_source.size(), &options);
+        if (JS_IsException(bytecode))
             return JS_EXCEPTION;
-        }
-        argv.push_back(code_arg);
-
-        JSValue global = JS_GetGlobalObject(ctx_);
-        JSValue function_ctor = JS_GetPropertyStr(ctx_, global, "Function");
-        JS_FreeValue(ctx_, global);
-        if (JS_IsException(function_ctor))
-        {
-            for (JSValue arg : argv)
-                JS_FreeValue(ctx_, arg);
-            return JS_EXCEPTION;
-        }
-
-        JSValue fn = JS_CallConstructor(ctx_, function_ctor, static_cast<int>(argv.size()), argv.data());
-        JS_FreeValue(ctx_, function_ctor);
-        for (JSValue arg : argv)
-            JS_FreeValue(ctx_, arg);
-        return fn;
+        return JS_EvalFunction(ctx_, bytecode);
     }
 
     bool napi_contextify__::can_parse_as_module(const std::string &source,

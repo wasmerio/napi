@@ -213,6 +213,61 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EXPECT_TRUE(is_typedarray);
 }
 
+TEST_F(Test65UnofficialContextify, CompileFunctionDoesNotUseGlobalFunctionConstructor) {
+  EnvScope s(runtime_.get());
+
+  napi_value patch_result = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    R"JS(
+globalThis.Function = function Function() {
+  throw new Error("global Function constructor should not be called");
+};
+1;
+)JS"),
+                &patch_result),
+            napi_ok);
+
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  napi_value params = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 1, &params), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, params, 0, Str(s.env, "value")), napi_ok);
+
+  napi_value out = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                        Str(s.env, "return value + 1;"),
+                                                        Str(s.env, "no-global-function.js"),
+                                                        0,
+                                                        0,
+                                                        undef,
+                                                        false,
+                                                        undef,
+                                                        undef,
+                                                        params,
+                                                        undef,
+                                                        &out),
+            napi_ok);
+  ASSERT_NE(out, nullptr);
+
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, out, "function", &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  napi_value argv[1] = {nullptr};
+  ASSERT_EQ(napi_create_int32(s.env, 41, &argv[0]), napi_ok);
+
+  napi_value fn_result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, global, fn, 1, argv, &fn_result), napi_ok);
+  int32_t answer = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, fn_result, &answer), napi_ok);
+  EXPECT_EQ(answer, 42);
+}
+
 TEST_F(Test65UnofficialContextify, CompileFunctionAcceptsHashbangBody) {
   EnvScope s(runtime_.get());
 
