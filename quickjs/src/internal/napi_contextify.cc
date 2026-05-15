@@ -136,6 +136,83 @@ namespace quickjs::detail
         return prepared;
     }
 
+    JSValue napi_contextify__::compile_cjs_function(const std::string &source,
+                                                    const std::string &source_url,
+                                                    const std::vector<std::string> &params,
+                                                    std::string *diagnostic_source_out) const
+    {
+        std::string compile_source = prepare_function_body_source(source);
+        std::string diagnostic_source = source;
+        if (!source.empty() && !source_url.empty())
+        {
+            compile_source += "\n//# sourceURL=";
+            compile_source += source_url;
+            diagnostic_source += "\n//# sourceURL=";
+            diagnostic_source += source_url;
+        }
+        if (diagnostic_source_out != nullptr)
+            *diagnostic_source_out = diagnostic_source;
+
+        std::vector<JSValue> argv;
+        argv.reserve(params.size() + 1);
+        for (const std::string &param : params)
+        {
+            JSValue value = JS_NewStringLen(ctx_, param.c_str(), param.size());
+            if (JS_IsException(value))
+            {
+                for (JSValue arg : argv)
+                    JS_FreeValue(ctx_, arg);
+                return JS_EXCEPTION;
+            }
+            argv.push_back(value);
+        }
+
+        JSValue code_arg = JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
+        if (JS_IsException(code_arg))
+        {
+            for (JSValue arg : argv)
+                JS_FreeValue(ctx_, arg);
+            return JS_EXCEPTION;
+        }
+        argv.push_back(code_arg);
+
+        JSValue global = JS_GetGlobalObject(ctx_);
+        JSValue function_ctor = JS_GetPropertyStr(ctx_, global, "Function");
+        JS_FreeValue(ctx_, global);
+        if (JS_IsException(function_ctor))
+        {
+            for (JSValue arg : argv)
+                JS_FreeValue(ctx_, arg);
+            return JS_EXCEPTION;
+        }
+
+        JSValue fn = JS_CallConstructor(ctx_, function_ctor, static_cast<int>(argv.size()), argv.data());
+        JS_FreeValue(ctx_, function_ctor);
+        for (JSValue arg : argv)
+            JS_FreeValue(ctx_, arg);
+        return fn;
+    }
+
+    bool napi_contextify__::can_parse_as_module(const std::string &source,
+                                                const std::string &source_url) const
+    {
+        JSEvalOptions options = {
+            .version = JS_EVAL_OPTIONS_VERSION,
+            .eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+            .filename = source_url.empty() ? "<module>" : source_url.c_str(),
+            .line_num = 1,
+        };
+        JSValue module = JS_Eval2(ctx_, source.c_str(), source.size(), &options);
+        if (JS_IsException(module))
+        {
+            JSValue exception = JS_GetException(ctx_);
+            JS_FreeValue(ctx_, exception);
+            return false;
+        }
+        JS_FreeValue(ctx_, module);
+        return true;
+    }
+
     void napi_contextify__::set_int32_property(JSValueConst object,
                                                const char *name,
                                                int32_t value) const
@@ -410,64 +487,33 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env_) || code == nullptr || result_out == nullptr)
             return napi_invalid_arg;
 
-        std::vector<JSValue> argv;
+        std::vector<std::string> params;
         if (params_or_undefined != nullptr && JS_IsArray(napi_quickjs_value_inner(env_, params_or_undefined)))
         {
             uint32_t length = 0;
             JSValue len_val = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, params_or_undefined), "length");
             JS_ToUint32(ctx_, &length, len_val);
             JS_FreeValue(ctx_, len_val);
+            params.reserve(length);
             for (uint32_t i = 0; i < length; ++i)
             {
                 JSValue param = JS_GetPropertyUint32(ctx_, napi_quickjs_value_inner(env_, params_or_undefined), i);
-                argv.push_back(param);
+                if (JS_IsException(param))
+                    return napi_pending_exception;
+                params.push_back(napi_util__::to_utf8(ctx_, param));
+                JS_FreeValue(ctx_, param);
             }
         }
 
         std::string source = napi_util__::to_utf8(env_, code);
-        std::string compile_source = prepare_function_body_source(source);
-        std::string diagnostic_source = source;
         std::string source_url;
-        JSValue code_arg = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, code));
-        bool code_arg_replaced = false;
         if (filename != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, filename)) && !JS_IsNull(napi_quickjs_value_inner(env_, filename)))
         {
             source_url = napi_util__::to_utf8(env_, filename);
-            if (!source.empty() && !source_url.empty())
-            {
-                compile_source += "\n//# sourceURL=";
-                compile_source += source_url;
-                diagnostic_source += "\n//# sourceURL=";
-                diagnostic_source += source_url;
-                JSValue with_source_url =
-                    JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
-                if (!JS_IsException(with_source_url))
-                {
-                    JS_FreeValue(ctx_, code_arg);
-                    code_arg = with_source_url;
-                    code_arg_replaced = true;
-                }
-            }
         }
-        if (!code_arg_replaced && compile_source != source)
-        {
-            JSValue prepared_code =
-                JS_NewStringLen(ctx_, compile_source.c_str(), compile_source.size());
-            if (!JS_IsException(prepared_code))
-            {
-                JS_FreeValue(ctx_, code_arg);
-                code_arg = prepared_code;
-            }
-        }
-        argv.push_back(code_arg);
 
-        JSValue global = JS_GetGlobalObject(ctx_);
-        JSValue function_ctor = JS_GetPropertyStr(ctx_, global, "Function");
-        JS_FreeValue(ctx_, global);
-        JSValue fn = JS_CallConstructor(ctx_, function_ctor, static_cast<int>(argv.size()), argv.data());
-        JS_FreeValue(ctx_, function_ctor);
-        for (JSValue arg : argv)
-            JS_FreeValue(ctx_, arg);
+        std::string diagnostic_source;
+        JSValue fn = compile_cjs_function(source, source_url, params, &diagnostic_source);
         if (JS_IsException(fn))
         {
             JSValue exc = JS_GetException(ctx_);
@@ -490,15 +536,37 @@ namespace quickjs::detail
                                                           bool cjs_var_in_scope,
                                                           bool *result_out)
     {
-        (void)filename;
-        (void)resource_name_or_undefined;
-        (void)cjs_var_in_scope;
         if (!napi_util__::check_env(env_) || code == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        std::string src = napi_util__::to_utf8(env_, code);
-        *result_out = src.find("export ") != std::string::npos ||
-                      src.find("import ") != std::string::npos ||
-                      src.find("import(") != std::string::npos;
+
+        std::string source = napi_util__::to_utf8(env_, code);
+        std::string filename_string;
+        if (filename != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, filename)) &&
+            !JS_IsNull(napi_quickjs_value_inner(env_, filename)))
+            filename_string = napi_util__::to_utf8(env_, filename);
+
+        std::string resource_name = filename_string;
+        if (resource_name_or_undefined != nullptr &&
+            !JS_IsUndefined(napi_quickjs_value_inner(env_, resource_name_or_undefined)) &&
+            !JS_IsNull(napi_quickjs_value_inner(env_, resource_name_or_undefined)))
+            resource_name = napi_util__::to_utf8(env_, resource_name_or_undefined);
+
+        std::vector<std::string> params;
+        if (cjs_var_in_scope)
+            params = {"exports", "require", "module", "__filename", "__dirname"};
+
+        JSValue fn = compile_cjs_function(source, filename_string, params, nullptr);
+        if (!JS_IsException(fn))
+        {
+            JS_FreeValue(ctx_, fn);
+            *result_out = false;
+            return napi_ok;
+        }
+
+        JSValue cjs_exception = JS_GetException(ctx_);
+        JS_FreeValue(ctx_, cjs_exception);
+
+        *result_out = can_parse_as_module(source, resource_name);
         return napi_ok;
     }
 

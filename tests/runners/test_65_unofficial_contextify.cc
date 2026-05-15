@@ -365,6 +365,37 @@ TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
                                                               &contains),
             napi_ok);
   EXPECT_FALSE(contains);
+
+  ASSERT_EQ(unofficial_napi_contextify_contains_module_syntax(
+                s.env,
+                Str(s.env,
+                    "var __export = (target, all) => target;\n"
+                    "// Annotate the CommonJS export names for ESM import in node:\n"
+                    "0 && (module.exports = { build });\n"),
+                Str(s.env, "esbuild-ish.js"),
+                Str(s.env, "file:///esbuild-ish.js"),
+                true,
+                &contains),
+            napi_ok);
+  EXPECT_FALSE(contains);
+
+  ASSERT_EQ(unofficial_napi_contextify_contains_module_syntax(s.env,
+                                                              Str(s.env, "import('node:fs');"),
+                                                              Str(s.env, "dynamic-import.cjs"),
+                                                              Str(s.env, "file:///dynamic-import.cjs"),
+                                                              true,
+                                                              &contains),
+            napi_ok);
+  EXPECT_FALSE(contains);
+
+  ASSERT_EQ(unofficial_napi_contextify_contains_module_syntax(s.env,
+                                                              Str(s.env, "await 1;"),
+                                                              Str(s.env, "tla.js"),
+                                                              Str(s.env, "file:///tla.js"),
+                                                              true,
+                                                              &contains),
+            napi_ok);
+  EXPECT_TRUE(contains);
 }
 
 TEST_F(Test65UnofficialContextify, PrivateSymbolAcceptsAutoLength) {

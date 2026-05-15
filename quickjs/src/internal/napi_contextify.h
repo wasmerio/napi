@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace quickjs::detail
 {
@@ -84,6 +85,12 @@ namespace quickjs::detail
         std::string builtin_id_from_resource_name(const std::string &resource_name) const;
         std::string source_line_at(const std::string &source, int32_t one_based_line) const;
         std::string prepare_function_body_source(const std::string &source) const;
+        JSValue compile_cjs_function(const std::string &source,
+                                     const std::string &source_url,
+                                     const std::vector<std::string> &params,
+                                     std::string *diagnostic_source_out) const;
+        bool can_parse_as_module(const std::string &source,
+                                 const std::string &source_url) const;
         void set_int32_property(JSValueConst object, const char *name, int32_t value) const;
         void annotate_compile_exception(JSValueConst exception,
                                         const std::string &source,
