@@ -19,10 +19,6 @@ public:
   static const char *wrap_property();
   static const char *finalizer_property();
 
-  static napi_status mark_buffer(napi_env env, JSValue value);
-  static bool is_buffer(napi_env env, JSValueConst value);
-  static napi_status get_buffer_info(napi_env env, JSValueConst value, void **data, size_t *length);
-
   static void free_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr);
 
 private:

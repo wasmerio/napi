@@ -3128,7 +3128,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
-    *result = napi_external__::is_buffer(env, napi_quickjs_value_inner(env, value));
+    *result = env->buffers().is_buffer(napi_quickjs_value_inner(env, value));
     return napi_quickjs_clear_last_error(env);
   }
 
@@ -3139,7 +3139,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, value))
       return napi_util__::invalid_arg(env);
-    return napi_external__::get_buffer_info(env, napi_quickjs_value_inner(env, value), data, length);
+    return env->buffers().get_buffer_info(napi_quickjs_value_inner(env, value), data, length);
   }
 
   napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
@@ -3174,7 +3174,7 @@ extern "C"
     if (JS_IsException(buffer))
       return napi_util__::return_pending_if_caught(env, "Failed to create Buffer");
 
-    napi_status status = napi_external__::mark_buffer(env, buffer);
+    napi_status status = env->buffers().adopt_native_buffer(buffer);
     if (status != napi_ok)
     {
       JS_FreeValue(env->context(), buffer);

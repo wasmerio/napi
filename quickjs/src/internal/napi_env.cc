@@ -17,6 +17,7 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       cleanup_hooks_{this},
       deferreds_{this},
       external_backing_stores_{this},
+      buffers_{this, context},
       promises_{this, context},
       contextify_{this, context},
       module_wrap_{this, context}
@@ -66,6 +67,7 @@ void napi_env__::prepare_teardown()
   root_scope_ = nullptr;
   module_wrap_.teardown();
   contextify_.teardown();
+  buffers_.teardown();
   promises_.teardown();
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
@@ -451,6 +453,16 @@ napi_promises__ &napi_env__::promises()
 const napi_promises__ &napi_env__::promises() const
 {
   return promises_;
+}
+
+napi_buffer__ &napi_env__::buffers()
+{
+  return buffers_;
+}
+
+const napi_buffer__ &napi_env__::buffers() const
+{
+  return buffers_;
 }
 
 quickjs::detail::napi_contextify__ &napi_env__::contextify()

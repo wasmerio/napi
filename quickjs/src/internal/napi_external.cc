@@ -9,7 +9,6 @@ JSClassID external_class_id = 0;
 
 const char k_type_tag_property[] = "__napi_type_tag__";
 const char k_wrap_property[] = "__napi_wrap__";
-const char k_buffer_property[] = "__napi_buffer__";
 const char k_finalizer_property[] = "__napi_finalizer__";
 } // namespace
 
@@ -71,59 +70,6 @@ const char *napi_external__::wrap_property()
 const char *napi_external__::finalizer_property()
 {
   return k_finalizer_property;
-}
-
-napi_status napi_external__::mark_buffer(napi_env env, JSValue value)
-{
-  if (JS_DefinePropertyValueStr(env->context(), value, k_buffer_property,
-                                JS_NewBool(env->context(), true),
-                                JS_PROP_CONFIGURABLE) < 0)
-    return napi_util__::return_pending_if_caught(env, "Failed to mark Buffer");
-  return napi_ok;
-}
-
-bool napi_external__::is_buffer(napi_env env, JSValueConst value)
-{
-  if (!JS_IsObject(value))
-    return false;
-  JSValue marker = JS_GetPropertyStr(env->context(), value, k_buffer_property);
-  if (JS_IsException(marker))
-  {
-    JSValue exc = JS_GetException(env->context());
-    JS_FreeValue(env->context(), exc);
-    return false;
-  }
-  bool is_buffer = JS_ToBool(env->context(), marker) == 1;
-  JS_FreeValue(env->context(), marker);
-  return is_buffer;
-}
-
-napi_status napi_external__::get_buffer_info(napi_env env, JSValueConst value, void **data, size_t *length)
-{
-  if (!is_buffer(env, value))
-    return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
-
-  size_t offset = 0;
-  size_t byte_len = 0;
-  JSValue arraybuffer = JS_GetTypedArrayBuffer(env->context(), value, &offset, &byte_len, nullptr);
-  if (JS_IsException(arraybuffer))
-    return napi_util__::return_pending_if_caught(env, "Failed to get Buffer backing store");
-
-  size_t arraybuffer_len = 0;
-  uint8_t *arraybuffer_data = JS_GetArrayBuffer(env->context(), &arraybuffer_len, arraybuffer);
-  JS_FreeValue(env->context(), arraybuffer);
-  if (arraybuffer_data == nullptr && JS_HasException(env->context()))
-  {
-    JSValue exc = JS_GetException(env->context());
-    JS_FreeValue(env->context(), exc);
-    return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
-  }
-
-  if (data != nullptr)
-    *data = arraybuffer_data == nullptr ? nullptr : arraybuffer_data + offset;
-  if (length != nullptr)
-    *length = byte_len;
-  return napi_quickjs_clear_last_error(env);
 }
 
 void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr)
