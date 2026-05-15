@@ -82,6 +82,76 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
             napi_invalid_arg);
 }
 
+TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze) {
+  EnvScope s(runtime_.get());
+
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "ctx"),
+                                                    Str(s.env, "test://origin"),
+                                                    true,
+                                                    true,
+                                                    true,
+                                                    Sym(s.env, "hdo"),
+                                                    &result),
+            napi_ok);
+  ASSERT_NE(result, nullptr);
+
+  napi_value eval_result = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env,
+                sandbox,
+                Str(s.env,
+                    R"JS(
+const globalThisDescriptor = Object.getOwnPropertyDescriptor(globalThis, "globalThis");
+const markerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__quickjs_contextified");
+if (!globalThisDescriptor || globalThisDescriptor.enumerable ||
+    !globalThisDescriptor.writable || !globalThisDescriptor.configurable) {
+  throw new Error("globalThis should be writable/configurable but non-enumerable");
+}
+if (!markerDescriptor || markerDescriptor.enumerable ||
+    !markerDescriptor.writable || !markerDescriptor.configurable) {
+  throw new Error("contextify marker should be writable/configurable but non-enumerable");
+}
+const keys = Object.keys(globalThis);
+if (keys.includes("globalThis") || keys.includes("__quickjs_contextified")) {
+  throw new Error("contextify internals should not be enumerable");
+}
+globalThis.__RSC_MANIFEST = {};
+globalThis.__RSC_MANIFEST["/x"] = { ok: true };
+function deepFreeze(obj) {
+  if (obj === null || typeof obj !== "object" || Object.isFrozen(obj)) {
+    return obj;
+  }
+  for (const value of Object.values(obj)) {
+    deepFreeze(value);
+  }
+  return Object.freeze(obj);
+}
+deepFreeze(globalThis);
+globalThis.__RSC_MANIFEST["/x"].ok;
+)JS"),
+                Str(s.env, "deep_freeze.js"),
+                0,
+                0,
+                -1,
+                true,
+                false,
+                false,
+                Sym(s.env, "hdo"),
+                &eval_result),
+            napi_ok);
+  ASSERT_NE(eval_result, nullptr);
+
+  bool ok = false;
+  ASSERT_EQ(napi_get_value_bool(s.env, eval_result, &ok), napi_ok);
+  EXPECT_TRUE(ok);
+}
+
 TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EnvScope s(runtime_.get());
 

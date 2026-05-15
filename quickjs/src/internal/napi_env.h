@@ -4,6 +4,7 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 #include "napi_callback_info.h"
+#include "napi_buffer.h"
 #include "napi_contextify.h"
 #include "napi_deferred.h"
 #include "napi_env_cleanup_hook.h"
@@ -101,6 +102,8 @@ struct napi_env__
 
   napi_promises__ &promises();
   const napi_promises__ &promises() const;
+  napi_buffer__ &buffers();
+  const napi_buffer__ &buffers() const;
   quickjs::detail::napi_contextify__ &contextify();
   const quickjs::detail::napi_contextify__ &contextify() const;
   quickjs::detail::napi_module_wrap__ &module_wrap();
@@ -147,6 +150,7 @@ private:
   int64_t external_memory_ = 0;
 
   // Env-owned subsystems.
+  napi_buffer__ buffers_;
   napi_promises__ promises_;
   quickjs::detail::napi_contextify__ contextify_;
   quickjs::detail::napi_module_wrap__ module_wrap_;

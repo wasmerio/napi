@@ -12,6 +12,26 @@
 
 namespace quickjs::detail
 {
+    namespace
+    {
+        constexpr int k_contextify_internal_property_flags =
+            JS_PROP_HAS_VALUE |
+            JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE |
+            JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+            JS_PROP_HAS_ENUMERABLE;
+
+        napi_status define_contextify_internal_property(napi_env env,
+                                                        JSContext *ctx,
+                                                        JSValueConst object,
+                                                        const char *name,
+                                                        JSValue value)
+        {
+            if (JS_DefinePropertyValueStr(ctx, object, name, value, k_contextify_internal_property_flags) < 0)
+                return napi_util__::return_pending_if_caught(env, "Failed to define contextify property");
+            return napi_ok;
+        }
+    } // namespace
+
     napi_contextify__::napi_contextify__(napi_env env, JSContext *context)
         : env_{env},
           ctx_{context},
@@ -288,8 +308,20 @@ namespace quickjs::detail
         JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
-        JS_SetPropertyStr(ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, true));
-        JS_SetPropertyStr(ctx_, sandbox, "globalThis", JS_DupValue(ctx_, sandbox));
+        napi_status status = define_contextify_internal_property(env_,
+                                                                 ctx_,
+                                                                 sandbox,
+                                                                 "__quickjs_contextified",
+                                                                 JS_NewBool(ctx_, true));
+        if (status != napi_ok)
+            return status;
+        status = define_contextify_internal_property(env_,
+                                                     ctx_,
+                                                     sandbox,
+                                                     "globalThis",
+                                                     JS_DupValue(ctx_, sandbox));
+        if (status != napi_ok)
+            return status;
         return napi_util__::wrap_dup(env_, sandbox, result_out);
     }
 
@@ -351,8 +383,11 @@ namespace quickjs::detail
         JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_context_global);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
-        JS_SetPropertyStr(ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
-        return napi_ok;
+        return define_contextify_internal_property(env_,
+                                                   ctx_,
+                                                   sandbox,
+                                                   "__quickjs_contextified",
+                                                   JS_NewBool(ctx_, false));
     }
 
     napi_status napi_contextify__::compile_function(napi_value code,
