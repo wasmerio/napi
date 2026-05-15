@@ -1537,7 +1537,7 @@ napi_status DeserializeTransferredClone(
     const std::vector<std::shared_ptr<v8::BackingStore>>& array_buffers,
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
-    napi_value* result_out) {
+    v8::Local<v8::Value>* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -1568,8 +1568,8 @@ napi_status DeserializeTransferredClone(
     return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
   }
 
-  *result_out = napi_v8_wrap_value(env, output);
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+  *result_out = output;
+  return result_out->IsEmpty() ? napi_generic_failure : napi_ok;
 }
 
 napi_status StructuredCloneImpl(
@@ -1582,7 +1582,7 @@ napi_status StructuredCloneImpl(
   }
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -1613,13 +1613,18 @@ napi_status StructuredCloneImpl(
   std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
 
   std::vector<uint8_t> bytes(buffer.get(), buffer.get() + released.second);
-  return DeserializeTransferredClone(
+  v8::Local<v8::Value> output;
+  napi_status deserialize_status = DeserializeTransferredClone(
       env,
       bytes,
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
-      result_out);
+      &output);
+  if (deserialize_status != napi_ok) return deserialize_status;
+
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(output));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 }  // namespace
@@ -2193,35 +2198,21 @@ napi_status NAPI_CDECL unofficial_napi_deserialize_value(
 
   auto* payload = static_cast<SerializedClonePayload*>(payload_ptr);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
-  StructuredCloneDeserializerDelegate deserializer_delegate(
-      isolate, payload->shared_array_buffers, payload->wasm_modules);
-  v8::ValueDeserializer deserializer(
-      isolate,
-      payload->bytes.data(),
-      payload->bytes.size(),
-      &deserializer_delegate);
-
-  for (uint32_t i = 0; i < payload->array_buffers.size(); ++i) {
-    v8::Local<v8::ArrayBuffer> array_buffer =
-        v8::ArrayBuffer::New(isolate, payload->array_buffers[i]);
-    deserializer.TransferArrayBuffer(i, array_buffer);
-  }
-
-  bool header_ok = false;
-  if (!deserializer.ReadHeader(context).To(&header_ok) || !header_ok) {
-    return napi_pending_exception;
-  }
-
   v8::Local<v8::Value> output;
-  if (!deserializer.ReadValue(context).ToLocal(&output)) {
-    return napi_pending_exception;
-  }
+  napi_status deserialize_status = DeserializeTransferredClone(
+      env,
+      payload->bytes,
+      payload->array_buffers,
+      payload->shared_array_buffers,
+      payload->wasm_modules,
+      &output);
+  if (deserialize_status != napi_ok) return deserialize_status;
 
-  *result_out = napi_v8_wrap_value(env, output);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(output));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
