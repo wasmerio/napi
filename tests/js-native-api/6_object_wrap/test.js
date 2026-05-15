@@ -1,5 +1,6 @@
 'use strict';
 const common = require('../../common');
+const { gcUntil } = require('../../common/gc');
 const assert = require('assert');
 const addon = require(`./build/${common.buildType}/myobject`);
 
@@ -46,3 +47,28 @@ const newobj = obj.multiply(-1);
 assert.strictEqual(newobj.value, -13);
 assert.strictEqual(newobj.valueReadonly, -13);
 assert.notStrictEqual(obj, newobj);
+
+async function runWrapLifetimeTests() {
+  const initialFinalizerCount = addon.getFinalizerWrapCallCount();
+
+  (() => {
+    const wrapped = {};
+    addon.wrapFinalizer(wrapped, 321);
+    assert.strictEqual(addon.hasFinalizerWrap(wrapped), true);
+  })();
+  await gcUntil('object wrap finalizer',
+                () => addon.getFinalizerWrapCallCount() ===
+                initialFinalizerCount + 1);
+
+  const removed = {};
+  addon.wrapFinalizer(removed, 654);
+  assert.strictEqual(addon.hasFinalizerWrap(removed), true);
+  assert.strictEqual(addon.removeFinalizerWrap(removed), 654);
+  assert.strictEqual(addon.hasFinalizerWrap(removed), false);
+  global.gc();
+  await gcUntil('removed object wrap finalizer',
+                () => addon.getFinalizerWrapCallCount() ===
+                initialFinalizerCount + 1);
+}
+
+runWrapLifetimeTests();

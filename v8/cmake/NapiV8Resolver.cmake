@@ -129,6 +129,13 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
 
   file(MAKE_DIRECTORY "${_cache_dir}")
 
+  if(EXISTS "${_archive_path}")
+    file(SIZE "${_archive_path}" _archive_size)
+    if(_archive_size EQUAL 0)
+      file(REMOVE "${_archive_path}")
+    endif()
+  endif()
+
   if(NOT EXISTS "${_archive_path}")
     set(_url "${NAPI_V8_PREBUILT_BASE_URL}/${_asset}")
     message(STATUS "Downloading prebuilt V8 ${NAPI_V8_PREBUILT_VERSION} from ${_url}")

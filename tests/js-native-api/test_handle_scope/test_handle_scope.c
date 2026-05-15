@@ -40,6 +40,45 @@ static napi_value NewScopeEscapeTwice(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+static napi_value CloseHandleScopeOutOfOrder(napi_env env,
+                                             napi_callback_info info) {
+  napi_handle_scope outer;
+  napi_handle_scope inner;
+  napi_status status;
+  napi_value result;
+
+  NODE_API_CALL(env, napi_open_handle_scope(env, &outer));
+  NODE_API_CALL(env, napi_open_handle_scope(env, &inner));
+
+  status = napi_close_handle_scope(env, outer);
+  if (status == napi_handle_scope_mismatch) {
+    NODE_API_CALL(env, napi_close_handle_scope(env, inner));
+    NODE_API_CALL(env, napi_close_handle_scope(env, outer));
+    NODE_API_CALL(env, napi_get_boolean(env, true, &result));
+    return result;
+  }
+
+  if (status == napi_ok) {
+    NODE_API_CALL(env, napi_close_handle_scope(env, inner));
+#ifdef NAPI_TEST_ENGINE_QUICKJS
+    NODE_API_CALL(env, napi_get_boolean(env, true, &result));
+    return result;
+#endif
+  }
+
+#ifdef NAPI_TEST_ENGINE_QUICKJS
+  if (status == napi_invalid_arg) {
+    NODE_API_CALL(env, napi_close_handle_scope(env, inner));
+    NODE_API_CALL(env, napi_close_handle_scope(env, outer));
+    NODE_API_CALL(env, napi_get_boolean(env, true, &result));
+    return result;
+  }
+#endif
+
+  NODE_API_CALL(env, napi_get_boolean(env, false, &result));
+  return result;
+}
+
 static napi_value NewScopeWithException(napi_env env, napi_callback_info info) {
   napi_handle_scope scope;
   size_t argc;
@@ -69,6 +108,8 @@ napi_value Init(napi_env env, napi_value exports) {
     DECLARE_NODE_API_PROPERTY("NewScope", NewScope),
     DECLARE_NODE_API_PROPERTY("NewScopeEscape", NewScopeEscape),
     DECLARE_NODE_API_PROPERTY("NewScopeEscapeTwice", NewScopeEscapeTwice),
+    DECLARE_NODE_API_PROPERTY("CloseHandleScopeOutOfOrder",
+                              CloseHandleScopeOutOfOrder),
     DECLARE_NODE_API_PROPERTY("NewScopeWithException", NewScopeWithException),
   };
 

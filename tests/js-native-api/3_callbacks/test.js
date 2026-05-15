@@ -20,3 +20,9 @@ testRecv(true);
 testRecv('Hello');
 testRecv([]);
 testRecv({});
+
+{
+  const returned = addon.RunCallbackReturnArg(common.mustCall((arg) => arg));
+  assert.strictEqual(typeof returned, 'object');
+  assert.notStrictEqual(returned, null);
+}
