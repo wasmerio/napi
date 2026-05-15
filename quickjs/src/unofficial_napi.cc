@@ -538,8 +538,17 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr || entries_out == nullptr || is_key_value_out == nullptr)
             return napi_invalid_arg;
-        *is_key_value_out = true;
-        return napi_util__::create_empty_array(env, entries_out);
+
+        JSValueConst raw = napi_quickjs_value_inner(env, value);
+        if (!JS_IsObject(raw))
+            return napi_invalid_arg;
+
+        JSValue entries = JS_PreviewEntries(napi_util__::context(env), raw, is_key_value_out);
+        if (JS_IsException(entries))
+            return napi_util__::return_pending_if_caught(env, "Failed to preview entries");
+        if (JS_IsUndefined(entries))
+            return napi_generic_failure;
+        return napi_util__::wrap_owned(env, entries, entries_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_call_sites(napi_env env,
