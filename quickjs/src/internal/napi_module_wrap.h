@@ -68,6 +68,8 @@ public:
   napi_status create_required_module_facade(void *handle, napi_value *result_out);
   void register_dynamic_import_referrer(napi_value referrer_name,
                                         napi_value host_defined_option_id);
+  void unregister_dynamic_import_referrer(napi_value referrer_name,
+                                          napi_value host_defined_option_id);
 
   int initialize_synthetic_module(JSModuleDef *module);
   int initialize_import_meta(JSModuleDef *module, JSValueConst meta);

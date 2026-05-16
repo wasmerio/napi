@@ -34,9 +34,7 @@ namespace
             return napi_invalid_arg;
 
         JSContext *ctx = env->context();
-        JSRuntime *rt = JS_GetRuntime(ctx);
-        JS_SetPromiseHook(rt, nullptr, nullptr);
-        JS_SetHostPromiseRejectionTracker(rt, nullptr, nullptr);
+        env->promises().clear_runtime_hooks();
         JS_SetContextOpaque(ctx, nullptr);
         env->prepare_teardown();
         return napi_ok;
@@ -152,7 +150,7 @@ extern "C"
         }
 
         JS_SetContextOpaque(context, env);
-        JS_SetPromiseHook(rt, napi_promises__::promise_hook, env);
+        env->promises().attach_runtime_hooks();
 
         *result = env;
         return napi_ok;
@@ -370,10 +368,7 @@ extern "C"
         napi_status status = env->promises().set_reject_callback(callback);
         if (status != napi_ok)
             return status;
-        JS_SetHostPromiseRejectionTracker(
-            napi_util__::runtime(env),
-            env->promises().has_reject_callback() ? napi_promises__::rejection_tracker : nullptr,
-            env);
+        env->promises().update_rejection_tracker();
         return napi_ok;
     }
 
@@ -388,7 +383,7 @@ extern "C"
         napi_status status = env->promises().set_hooks(init, before, after, resolve);
         if (status != napi_ok)
             return status;
-        JS_SetPromiseHook(napi_util__::runtime(env), napi_promises__::promise_hook, env);
+        env->promises().attach_runtime_hooks();
         return napi_ok;
     }
 

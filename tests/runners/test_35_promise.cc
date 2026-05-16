@@ -39,6 +39,13 @@ std::string JsonStringify(napi_env env, const char* expression) {
   return ValueToUtf8(env, RunScript(env, source.c_str()));
 }
 
+napi_value CurrentContinuationFrame(napi_env env, napi_callback_info info) {
+  (void)info;
+  napi_value frame = nullptr;
+  EXPECT_EQ(unofficial_napi_get_continuation_preserved_embedder_data(env, &frame), napi_ok);
+  return frame;
+}
+
 }  // namespace
 
 TEST_F(Test35Promise, PortedCoreFlow) {
@@ -116,4 +123,86 @@ TEST_F(Test35Promise, PromiseRejectCallbackUsesV8EventShape) {
   const std::string events = JsonStringify(s.env, "globalThis.promiseRejectEvents");
   EXPECT_NE(events.find("[0,\"bad\"]"), std::string::npos) << events;
   EXPECT_NE(events.find("[1,\"undefined\"]"), std::string::npos) << events;
+}
+
+TEST_F(Test35Promise, PromiseReactionRestoresContinuationPreservedEmbedderData) {
+  EnvScope s(runtime_.get());
+
+  napi_value native_current_frame = nullptr;
+  ASSERT_EQ(napi_create_function(
+                s.env,
+                "nativeCurrentFrame",
+                NAPI_AUTO_LENGTH,
+                CurrentContinuationFrame,
+                nullptr,
+                &native_current_frame),
+            napi_ok);
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "nativeCurrentFrame", native_current_frame), napi_ok);
+
+  napi_value request_frame = RunScript(s.env, "({ name: 'request-store' })");
+  ASSERT_NE(request_frame, nullptr);
+  ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, request_frame), napi_ok);
+
+  RunScript(
+      s.env,
+      "globalThis.reactionFrames = [];"
+      "Promise.resolve('ok').then(() => {"
+      "  reactionFrames.push(nativeCurrentFrame().name);"
+      "});");
+
+  napi_value outside_frame = RunScript(s.env, "({ name: 'outside-store' })");
+  ASSERT_NE(outside_frame, nullptr);
+  ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, outside_frame), napi_ok);
+
+  ASSERT_EQ(unofficial_napi_process_microtasks(s.env), napi_ok);
+
+  EXPECT_EQ(JsonStringify(s.env, "globalThis.reactionFrames"), "[\"request-store\"]");
+
+  napi_value current_frame = nullptr;
+  ASSERT_EQ(unofficial_napi_get_continuation_preserved_embedder_data(s.env, &current_frame), napi_ok);
+  EXPECT_EQ(JsonStringify(s.env, "nativeCurrentFrame().name"), "\"outside-store\"");
+}
+
+TEST_F(Test35Promise, AsyncAwaitRestoresContinuationPreservedEmbedderData) {
+  EnvScope s(runtime_.get());
+
+  napi_value native_current_frame = nullptr;
+  ASSERT_EQ(napi_create_function(
+                s.env,
+                "nativeCurrentFrame",
+                NAPI_AUTO_LENGTH,
+                CurrentContinuationFrame,
+                nullptr,
+                &native_current_frame),
+            napi_ok);
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "nativeCurrentFrame", native_current_frame), napi_ok);
+
+  napi_value request_frame = RunScript(s.env, "({ name: 'request-store' })");
+  ASSERT_NE(request_frame, nullptr);
+  ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, request_frame), napi_ok);
+
+  RunScript(
+      s.env,
+      "globalThis.awaitFrames = [];"
+      "globalThis.awaitPromise = (async function captureAwaitFrame() {"
+      "  await 0;"
+      "  awaitFrames.push(nativeCurrentFrame().name);"
+      "  await 0;"
+      "  awaitFrames.push(nativeCurrentFrame().name);"
+      "})();");
+
+  napi_value outside_frame = RunScript(s.env, "({ name: 'outside-store' })");
+  ASSERT_NE(outside_frame, nullptr);
+  ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, outside_frame), napi_ok);
+
+  ASSERT_EQ(unofficial_napi_process_microtasks(s.env), napi_ok);
+
+  EXPECT_EQ(JsonStringify(s.env, "globalThis.awaitFrames"), "[\"request-store\",\"request-store\"]");
+  EXPECT_EQ(JsonStringify(s.env, "nativeCurrentFrame().name"), "\"outside-store\"");
 }
