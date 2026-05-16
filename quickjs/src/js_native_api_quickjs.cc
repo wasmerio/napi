@@ -2870,6 +2870,9 @@ extern "C"
     if (!JS_IsObject(obj))
       return napi_object_expected;
 
+    if (napi_external__::is_external(obj))
+      return napi_util__::invalid_arg(env);
+
     if (napi_external__::get_wrap_record(env->context(), obj) != nullptr)
       return napi_util__::invalid_arg(env);
 
@@ -2881,7 +2884,7 @@ extern "C"
 
     if (JS_SetOpaque(obj, wrap) != 0)
     {
-      JSValue stored = JS_NewObjectClass(env->context(), napi_external__::class_id());
+      JSValue stored = JS_NewObjectClass(env->context(), napi_external__::record_class_id());
       if (JS_IsException(stored))
       {
         napi_external_backing_store_hint__::destroy(wrap);
@@ -3335,7 +3338,7 @@ extern "C"
       return napi_generic_failure;
     hint->set_weak_target(obj);
 
-    JSValue stored = JS_NewObjectClass(env->context(), napi_external__::class_id());
+    JSValue stored = JS_NewObjectClass(env->context(), napi_external__::record_class_id());
     if (JS_IsException(stored))
     {
       napi_external_backing_store_hint__::destroy(hint);

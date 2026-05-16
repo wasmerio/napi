@@ -6,6 +6,7 @@
 namespace
 {
 JSClassID external_class_id = 0;
+JSClassID external_record_class_id = 0;
 
 const char k_type_tag_property[] = "__napi_type_tag__";
 const char k_wrap_property[] = "__napi_wrap__";
@@ -15,15 +16,28 @@ const char k_finalizer_property[] = "__napi_finalizer__";
 int napi_external__::register_class(JSRuntime *rt)
 {
   JS_NewClassID(rt, &external_class_id);
-  JSClassDef def = {};
-  def.class_name = "NapiExternal";
-  def.finalizer = finalizer;
-  return JS_NewClass(rt, external_class_id, &def);
+  JSClassDef external_def = {};
+  external_def.class_name = "NapiExternal";
+  external_def.finalizer = finalizer;
+  int rc = JS_NewClass(rt, external_class_id, &external_def);
+  if (rc != 0)
+    return rc;
+
+  JS_NewClassID(rt, &external_record_class_id);
+  JSClassDef record_def = {};
+  record_def.class_name = "NapiExternalRecord";
+  record_def.finalizer = finalizer;
+  return JS_NewClass(rt, external_record_class_id, &record_def);
 }
 
 JSClassID napi_external__::class_id()
 {
   return external_class_id;
+}
+
+JSClassID napi_external__::record_class_id()
+{
+  return external_record_class_id;
 }
 
 bool napi_external__::is_external(JSValueConst value)
@@ -43,7 +57,7 @@ void *napi_external__::get_value(JSValueConst value)
 napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *ctx, JSValueConst object)
 {
   auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
-      JS_GetOpaque(object, external_class_id));
+      JS_GetOpaque(object, external_record_class_id));
   if (wrap != nullptr)
     return wrap;
 
@@ -59,7 +73,7 @@ napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *
   }
 
   wrap = static_cast<napi_external_backing_store_hint__ *>(
-      JS_GetOpaque(stored, external_class_id));
+      JS_GetOpaque(stored, external_record_class_id));
   JS_FreeValue(ctx, stored);
   return wrap;
 }
@@ -93,7 +107,11 @@ void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaqu
 
 void napi_external__::finalizer(JSRuntime *rt, JSValue value)
 {
-  auto *hint = static_cast<napi_external_backing_store_hint__ *>(JS_GetOpaque(value, external_class_id));
+  JSClassID class_id = JS_GetClassID(value);
+  if (class_id != external_class_id && class_id != external_record_class_id)
+    return;
+
+  auto *hint = static_cast<napi_external_backing_store_hint__ *>(JS_GetOpaque(value, class_id));
   if (hint == nullptr)
     return;
 
