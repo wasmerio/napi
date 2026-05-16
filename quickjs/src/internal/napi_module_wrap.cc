@@ -1013,6 +1013,29 @@ void napi_module_wrap__::register_dynamic_import_referrer(napi_value referrer_na
   script_referrers_.push_back(std::move(referrer));
 }
 
+void napi_module_wrap__::unregister_dynamic_import_referrer(napi_value referrer_name,
+                                                            napi_value host_defined_option_id)
+{
+  if (is_nullish(env_, referrer_name) || is_nullish(env_, host_defined_option_id) ||
+      !JS_IsSymbol(napi_quickjs_value_inner(env_, host_defined_option_id)))
+    return;
+
+  std::string name = napi_util__::to_utf8(env_, referrer_name);
+  if (name.empty())
+    return;
+
+  JSValueConst expected = napi_quickjs_value_inner(env_, host_defined_option_id);
+  for (auto it = script_referrers_.begin(); it != script_referrers_.end(); ++it)
+  {
+    if (it->name == name && JS_IsStrictEqual(ctx_, it->host_defined_option_id, expected))
+    {
+      JS_FreeValue(ctx_, it->host_defined_option_id);
+      script_referrers_.erase(it);
+      return;
+    }
+  }
+}
+
 int napi_module_wrap__::initialize_synthetic_module(JSModuleDef *module)
 {
   record *entry = find_by_module(module);

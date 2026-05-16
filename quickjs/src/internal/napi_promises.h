@@ -18,6 +18,10 @@ public:
 
   void teardown();
 
+  void attach_runtime_hooks();
+  void clear_runtime_hooks();
+  void update_rejection_tracker();
+
   napi_status set_reject_callback(napi_value callback);
   bool has_reject_callback() const;
   JSValue dup_reject_callback() const;
@@ -33,6 +37,7 @@ public:
   void capture_context_frame(JSValueConst promise);
   void enter_context_frame(JSValueConst promise);
   void leave_context_frame(JSValueConst promise);
+  void release_context_frame(JSValueConst promise);
 
   static JSValue microtask_job(JSContext *ctx, int argc, JSValueConst *argv);
   static void promise_hook(JSContext *ctx,
@@ -52,6 +57,7 @@ private:
   void clear_stored_values();
   void call_hook(JSValueConst hook, int argc, JSValueConst *argv);
   void clear_pending_exception_if_any();
+  bool is_active() const;
 
   // Owning environment and QuickJS context.
   napi_env env_ = nullptr;

@@ -408,7 +408,10 @@ namespace quickjs::detail
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
         if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)) &&
             !napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
+        {
+            env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
             return napi_invalid_arg;
+        }
 
         std::string src = napi_util__::to_utf8(env_, source);
         std::string label = filename == nullptr ? "<contextify>" : napi_util__::to_utf8(env_, filename);
@@ -422,7 +425,10 @@ namespace quickjs::detail
                                       "<contextify-wrapper>",
                                       JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(wrapper))
+            {
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return napi_pending_exception;
+            }
             JSValue argv[] = {napi_quickjs_value_inner(env_, sandbox_or_null), napi_quickjs_value_inner(env_, source)};
             result = JS_Call(ctx_, wrapper, JS_UNDEFINED, 2, argv);
             JS_FreeValue(ctx_, wrapper);
@@ -431,6 +437,7 @@ namespace quickjs::detail
         {
             result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
         }
+        env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
         if (JS_IsException(result))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env_, result, result_out);

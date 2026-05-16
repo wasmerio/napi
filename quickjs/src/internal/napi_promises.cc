@@ -29,8 +29,41 @@ void napi_promises__::teardown()
 {
   if (torn_down_)
     return;
+  clear_runtime_hooks();
   clear_stored_values();
   torn_down_ = true;
+}
+
+bool napi_promises__::is_active() const
+{
+  return !torn_down_ && env_ != nullptr && context_ != nullptr;
+}
+
+void napi_promises__::attach_runtime_hooks()
+{
+  if (!is_active())
+    return;
+  JSRuntime *runtime = JS_GetRuntime(context_);
+  JS_SetPromiseHook(runtime, napi_promises__::promise_hook, env_);
+}
+
+void napi_promises__::clear_runtime_hooks()
+{
+  if (context_ == nullptr)
+    return;
+  JSRuntime *runtime = JS_GetRuntime(context_);
+  JS_SetPromiseHook(runtime, nullptr, nullptr);
+  JS_SetHostPromiseRejectionTracker(runtime, nullptr, nullptr);
+}
+
+void napi_promises__::update_rejection_tracker()
+{
+  if (!is_active())
+    return;
+  JS_SetHostPromiseRejectionTracker(
+      JS_GetRuntime(context_),
+      has_reject_callback() ? napi_promises__::rejection_tracker : nullptr,
+      env_);
 }
 
 napi_status napi_promises__::set_optional_function(napi_value value, JSValue *target)
@@ -223,6 +256,11 @@ void napi_promises__::leave_context_frame(JSValueConst promise)
     continuation_preserved_embedder_data_ = previous;
   }
 
+  (void)promise;
+}
+
+void napi_promises__::release_context_frame(JSValueConst promise)
+{
   void *identity = js_identity(promise);
   if (identity == nullptr)
     return;
@@ -277,6 +315,8 @@ void napi_promises__::promise_hook(JSContext *ctx,
 
   if (type == JS_PROMISE_HOOK_AFTER)
     promises.leave_context_frame(promise);
+  else if (type == JS_PROMISE_HOOK_RESOLVE)
+    promises.release_context_frame(promise);
 }
 
 void napi_promises__::rejection_tracker(JSContext *ctx,
@@ -290,6 +330,8 @@ void napi_promises__::rejection_tracker(JSContext *ctx,
     return;
 
   napi_promises__ &promises = env->promises();
+  promises.release_context_frame(promise);
+
   JSValue callback = promises.dup_reject_callback();
   if (!JS_IsFunction(ctx, callback))
   {
