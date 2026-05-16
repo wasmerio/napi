@@ -61,10 +61,23 @@ napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *
   if (wrap != nullptr)
     return wrap;
 
-  JSValue stored = JS_GetPropertyStr(ctx, object, k_wrap_property);
-  if (JS_IsException(stored) || JS_IsUndefined(stored))
+  JSAtom wrap_atom = JS_NewAtom(ctx, k_wrap_property);
+  if (wrap_atom == JS_ATOM_NULL)
   {
-    if (JS_IsException(stored))
+    if (JS_HasException(ctx))
+    {
+      JSValue exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return nullptr;
+  }
+
+  JSPropertyDescriptor desc;
+  int has = JS_GetOwnProperty(ctx, &desc, object, wrap_atom);
+  JS_FreeAtom(ctx, wrap_atom);
+  if (has <= 0)
+  {
+    if (has < 0)
     {
       JSValue exc = JS_GetException(ctx);
       JS_FreeValue(ctx, exc);
@@ -73,8 +86,10 @@ napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *
   }
 
   wrap = static_cast<napi_external_backing_store_hint__ *>(
-      JS_GetOpaque(stored, external_record_class_id));
-  JS_FreeValue(ctx, stored);
+      JS_GetOpaque(desc.value, external_record_class_id));
+  JS_FreeValue(ctx, desc.value);
+  JS_FreeValue(ctx, desc.getter);
+  JS_FreeValue(ctx, desc.setter);
   return wrap;
 }
 

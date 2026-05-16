@@ -159,6 +159,15 @@ assert.strictEqual(newObject.test_string, 'test string');
 }
 
 {
+  // Verify that napi_unwrap() does not read wrap records from prototypes.
+  const wrapper = {};
+  test_object.Wrap(wrapper);
+  const inheritingWrapper = Object.create(wrapper);
+
+  assert.notStrictEqual(test_object.UnwrapStatus(inheritingWrapper), 0);
+}
+
+{
   // Verify that objects can be type-tagged and type-tag-checked.
   const obj1 = test_object.TypeTaggedInstance(0);
   const obj2 = test_object.TypeTaggedInstance(1);

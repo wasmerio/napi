@@ -471,6 +471,19 @@ static napi_value Unwrap(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static napi_value UnwrapStatus(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value arg;
+  NODE_API_CALL(env, napi_get_cb_info(env, info, &argc, &arg, NULL, NULL));
+
+  void* data;
+  napi_status status = napi_unwrap(env, arg, &data);
+
+  napi_value result;
+  NODE_API_CALL(env, napi_create_int32(env, status, &result));
+  return result;
+}
+
 static napi_value TestSetProperty(napi_env env,
                                   napi_callback_info info) {
   napi_status status;
@@ -812,6 +825,7 @@ napi_value Init(napi_env env, napi_value exports) {
       DECLARE_NODE_API_PROPERTY("Inflate", Inflate),
       DECLARE_NODE_API_PROPERTY("Wrap", Wrap),
       DECLARE_NODE_API_PROPERTY("Unwrap", Unwrap),
+      DECLARE_NODE_API_PROPERTY("UnwrapStatus", UnwrapStatus),
       DECLARE_NODE_API_PROPERTY("TestSetProperty", TestSetProperty),
       DECLARE_NODE_API_PROPERTY("TestHasProperty", TestHasProperty),
       DECLARE_NODE_API_PROPERTY("TypeTaggedInstance", TypeTaggedInstance),
