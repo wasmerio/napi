@@ -87,7 +87,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
   if (called_as_constructor)
   {
     JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
-    effective_this = JS_NewObjectProtoClass(ctx, proto, napi_external__::class_id());
+    effective_this = JS_NewObjectProto(ctx, proto);
     JS_FreeValue(ctx, proto);
 
     if (JS_IsException(effective_this))

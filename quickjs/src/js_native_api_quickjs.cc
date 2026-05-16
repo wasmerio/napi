@@ -357,8 +357,11 @@ extern "C"
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_invalid_arg;
 
-    *result = napi_external__::get_value(napi_quickjs_value_inner(env, value));
+    JSValue local = napi_quickjs_value_inner(env, value);
+    if (!napi_external__::is_external(local))
+      return napi_util__::invalid_arg(env);
 
+    *result = napi_external__::get_value(local);
     return napi_ok;
   }
 
@@ -1025,8 +1028,7 @@ extern "C"
     }
     else if (JS_IsObject(local))
     {
-      // Check if it's our external class
-      if (JS_GetOpaque(local, napi_external__::class_id()) != nullptr)
+      if (napi_external__::is_external(local))
       {
         *result = napi_external;
       }

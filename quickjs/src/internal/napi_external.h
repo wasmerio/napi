@@ -12,6 +12,7 @@ class napi_external__
 public:
   static int register_class(JSRuntime *rt);
   static JSClassID class_id();
+  static bool is_external(JSValueConst value);
   static void *get_value(JSValueConst value);
   static napi_external_backing_store_hint__ *get_wrap_record(JSContext *ctx, JSValueConst object);
 

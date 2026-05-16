@@ -26,8 +26,15 @@ JSClassID napi_external__::class_id()
   return external_class_id;
 }
 
+bool napi_external__::is_external(JSValueConst value)
+{
+  return JS_GetClassID(value) == external_class_id;
+}
+
 void *napi_external__::get_value(JSValueConst value)
 {
+  if (!is_external(value))
+    return nullptr;
   auto *hint = static_cast<napi_external_backing_store_hint__ *>(
       JS_GetOpaque(value, external_class_id));
   return hint == nullptr ? nullptr : hint->external_data();
