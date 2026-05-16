@@ -113,6 +113,22 @@ bool IsNullish(napi_env env, napi_value value) {
   return type == napi_undefined || type == napi_null;
 }
 
+napi_status ThrowTryCatchException(napi_env env, v8::TryCatch& try_catch) {
+  if (env == nullptr || !try_catch.HasCaught() || try_catch.HasTerminated()) {
+    return napi_pending_exception;
+  }
+  v8::Local<v8::Value> exception = try_catch.Exception();
+  if (!exception.IsEmpty()) {
+    napi_value wrapped = napi_v8_wrap_value(env, exception);
+    if (wrapped != nullptr) {
+      napi_status status = napi_throw(env, wrapped);
+      return status == napi_ok ? napi_pending_exception : status;
+    }
+  }
+  try_catch.ReThrow();
+  return napi_pending_exception;
+}
+
 bool CoerceToStringValue(napi_env env, napi_value input, napi_value* out) {
   if (out == nullptr) return false;
   *out = nullptr;
@@ -1501,7 +1517,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   (void)allow_code_gen_wasm;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> current = env->context();
   v8::Context::Scope current_scope(current);
 
@@ -1568,7 +1584,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
     }
   }
 
-  napi_value key_napi = napi_v8_wrap_value(env, key_object);
+  napi_value key_napi = napi_v8_wrap_value(env, handle_scope.Escape(key_object));
   if (key_napi == nullptr) return napi_generic_failure;
 
   {
@@ -1612,7 +1628,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   (void)break_on_first_line;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> current = env->context();
   v8::Context::Scope current_scope(current);
 
@@ -1661,8 +1677,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
         unofficial_napi_internal::AttachSyntaxArrowMessage(
             isolate, target_context, try_catch.Exception(), try_catch.Message());
       }
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -1714,8 +1729,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
           isolate, target_context, try_catch.Exception(), try_catch.Message());
     }
     if (!try_catch.HasTerminated()) {
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_pending_exception;
   }
@@ -1725,7 +1739,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
     return napi_generic_failure;
   }
 
-  *result_out = napi_v8_wrap_value(env, result);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(result));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
@@ -1782,7 +1796,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   }
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> current = env->context();
   v8::Context::Scope current_scope(current);
 
@@ -1898,8 +1912,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
         unofficial_napi_internal::AttachSyntaxArrowMessage(
             isolate, parsing_context, try_catch.Exception(), try_catch.Message());
       }
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -1945,7 +1958,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
-  *result_out = napi_v8_wrap_value(env, out);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
@@ -1960,7 +1973,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function_for_cjs_loade
   (void)is_sea_main;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -2027,7 +2040,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function_for_cjs_loade
     }
   }
 
-  *result_out = napi_v8_wrap_value(env, out);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
@@ -2079,9 +2092,10 @@ napi_status NAPI_CDECL unofficial_napi_contextify_create_cached_data(
   if (env == nullptr || code == nullptr || filename == nullptr || cached_data_buffer_out == nullptr) {
     return napi_invalid_arg;
   }
+  *cached_data_buffer_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -2121,8 +2135,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_create_cached_data(
         unofficial_napi_internal::AttachSyntaxArrowMessage(
             isolate, context, try_catch.Exception(), try_catch.Message());
       }
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -2131,10 +2144,14 @@ napi_status NAPI_CDECL unofficial_napi_contextify_create_cached_data(
   const uint8_t* bytes = cache ? cache->data : nullptr;
   const size_t size = cache ? static_cast<size_t>(cache->length) : 0;
 
-  if (!CreateNodeBufferFromBytes(env, bytes, size, cached_data_buffer_out) || *cached_data_buffer_out == nullptr) {
+  napi_value cache_buffer = nullptr;
+  if (!CreateNodeBufferFromBytes(env, bytes, size, &cache_buffer) || cache_buffer == nullptr) {
     return napi_generic_failure;
   }
-  return napi_ok;
+  v8::Local<v8::Value> cache_buffer_value = napi_v8_unwrap_value(cache_buffer);
+  if (cache_buffer_value.IsEmpty()) return napi_generic_failure;
+  *cached_data_buffer_out = napi_v8_wrap_value(env, handle_scope.Escape(cache_buffer_value));
+  return *cached_data_buffer_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL unofficial_napi_contextify_start_sigint_watchdog(
@@ -2228,8 +2245,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
       unofficial_napi_internal::AttachSyntaxArrowMessage(
           isolate, context, try_catch.Exception(), try_catch.Message());
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -2353,7 +2369,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -2386,7 +2402,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
   }
 
   v8::Local<v8::Array> result = v8::Array::New(isolate, requests.data(), requests.size());
-  *result_out = napi_v8_wrap_value(env, result);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(result));
   return napi_ok;
 }
 
@@ -2436,8 +2452,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, voi
   auto maybe = module->InstantiateModule(context, ModuleResolveCallback, ModuleResolveSourceCallback);
   if (maybe.IsNothing()) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -2453,7 +2468,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
@@ -2472,15 +2487,14 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
       (void)RestoreOwnProperties(isolate, context, context->Global(), hidden_cjs_globals);
     }
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
   if (is_source_text_module) {
     (void)RestoreOwnProperties(isolate, context, context->Global(), hidden_cjs_globals);
   }
-  *result_out = napi_v8_wrap_value(env, result);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(result));
   return napi_ok;
 }
 
@@ -2495,7 +2509,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
@@ -2504,8 +2518,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
   v8::Local<v8::Value> result;
   if (!module->Evaluate(context).ToLocal(&result)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      try_catch.ReThrow();
-      return napi_pending_exception;
+      return ThrowTryCatchException(env, try_catch);
     }
     return napi_generic_failure;
   }
@@ -2546,7 +2559,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
   if (promise_state != 1) return napi_generic_failure;
 
-  *result_out = napi_v8_wrap_value(env, module->GetModuleNamespace());
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(module->GetModuleNamespace()));
   return *result_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
@@ -2557,7 +2570,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
@@ -2565,7 +2578,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
     ThrowCodeError(env, "ERR_MODULE_NOT_INSTANTIATED", "Module is not instantiated");
     return napi_pending_exception;
   }
-  *result_out = napi_v8_wrap_value(env, module->GetModuleNamespace());
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(module->GetModuleNamespace()));
   return napi_ok;
 }
 
@@ -2585,8 +2598,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_error(
     napi_value* result_out) {
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
-  v8::HandleScope handle_scope(env->isolate);
-  *result_out = napi_v8_wrap_value(env, record->module.Get(env->isolate)->GetException());
+  v8::Isolate* isolate = env->isolate;
+  v8::EscapableHandleScope handle_scope(isolate);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(record->module.Get(isolate)->GetException()));
   return napi_ok;
 }
 
@@ -2700,19 +2714,23 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
     napi_value* result_out) {
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
-  v8::HandleScope handle_scope(env->isolate);
-  v8::Local<v8::Module> module = record->module.Get(env->isolate);
+  v8::Isolate* isolate = env->isolate;
+  v8::EscapableHandleScope handle_scope(isolate);
+  v8::Local<v8::Module> module = record->module.Get(isolate);
+  napi_value out = nullptr;
   if (!module->IsSourceTextModule()) {
-    napi_value out = nullptr;
-    CreateNodeBufferFromBytes(env, nullptr, 0, &out);
-    *result_out = out;
-    return napi_ok;
+    if (!CreateNodeBufferFromBytes(env, nullptr, 0, &out) || out == nullptr) return napi_generic_failure;
+  } else {
+    std::unique_ptr<v8::ScriptCompiler::CachedData> cached_data(
+        v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
+    const uint8_t* bytes = cached_data ? cached_data->data : nullptr;
+    const size_t size = cached_data ? static_cast<size_t>(cached_data->length) : 0;
+    if (!CreateNodeBufferFromBytes(env, bytes, size, &out) || out == nullptr) return napi_generic_failure;
   }
-  std::unique_ptr<v8::ScriptCompiler::CachedData> cached_data(
-      v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
-  const uint8_t* bytes = cached_data ? cached_data->data : nullptr;
-  const size_t size = cached_data ? static_cast<size_t>(cached_data->length) : 0;
-  return CreateNodeBufferFromBytes(env, bytes, size, result_out) ? napi_ok : napi_generic_failure;
+  v8::Local<v8::Value> out_value = napi_v8_unwrap_value(out);
+  if (out_value.IsEmpty()) return napi_generic_failure;
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out_value));
+  return *result_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_set_import_module_dynamically_callback(
@@ -2779,7 +2797,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -2813,7 +2831,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 
   v8::Local<v8::Value> evaluated;
   if (!facade->Evaluate(context).ToLocal(&evaluated)) return napi_pending_exception;
-  *result_out = napi_v8_wrap_value(env, facade->GetModuleNamespace());
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(facade->GetModuleNamespace()));
   return napi_ok;
 }
 

@@ -402,7 +402,6 @@ napi_status TakePreservedErrorFormatting(napi_env env,
   if (thrown_at_out != nullptr) *thrown_at_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
   if (raw.IsEmpty()) return napi_invalid_arg;
 
@@ -468,7 +467,6 @@ napi_status GetErrorSourcePositions(napi_env env,
   out->end_column = 0;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
   if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
@@ -509,7 +507,7 @@ napi_status GetErrorSourceLineForStderr(napi_env env,
 
   *result_out = nullptr;
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
   v8::Local<v8::Message> message = GetMessageFromError(env, error);
   if (message.IsEmpty()) return napi_generic_failure;
 
@@ -525,7 +523,7 @@ napi_status GetErrorSourceLineForStderr(napi_env env,
            .ToLocal(&out)) {
     return napi_generic_failure;
   }
-  *result_out = napi_v8_wrap_value(env, out);
+  *result_out = napi_v8_wrap_value(env, scope.Escape(out));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
@@ -539,7 +537,7 @@ napi_status GetErrorThrownAt(napi_env env,
 
   *result_out = nullptr;
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
   v8::Local<v8::Message> message = GetMessageFromError(env, error);
   if (message.IsEmpty()) return napi_generic_failure;
 
@@ -556,7 +554,7 @@ napi_status GetErrorThrownAt(napi_env env,
            .ToLocal(&out)) {
     return napi_generic_failure;
   }
-  *result_out = napi_v8_wrap_value(env, out);
+  *result_out = napi_v8_wrap_value(env, scope.Escape(out));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
