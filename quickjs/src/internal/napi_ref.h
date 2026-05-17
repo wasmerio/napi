@@ -24,6 +24,7 @@ struct napi_ref__
   bool is_empty() const;
   bool is_weak() const;
   napi_env env() const;
+  JSContext *context() const;
   JSValueConst get_inner() const;
   JSValue dup_inner() const;
   void clear_for_teardown();
@@ -37,6 +38,7 @@ private:
 
   // Owning environment and referenced QuickJS value.
   napi_env env_ = nullptr;
+  JSContext *context_ = nullptr;
   JSValue value_ = JS_UNDEFINED;
   JSNativeWeakRefLink weak_link_{};
 

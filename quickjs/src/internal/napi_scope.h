@@ -19,6 +19,7 @@ struct napi_scope__
   size_t level() const;
 
   napi_value wrap_value(JSValue value, bool owned);
+  napi_value wrap_value(JSContext *context, JSValue value, bool owned);
   napi_value escape_value(napi_value value);
   void delete_value(napi_value value);
 

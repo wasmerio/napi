@@ -2787,6 +2787,7 @@ extern "C"
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_invalid_arg;
 
+    napi_env_context_scope__ context_scope{env, napi_quickjs_value_context(env, value)};
     *result = env->wrap_ref_in_root_scope(napi_quickjs_value_inner(env, value), initial_ref_count);
     if (*result == nullptr)
       return napi_generic_failure;
@@ -2855,7 +2856,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = env->wrap_value_in_current_scope(slot->dup_inner(), true);
+    *result = env->wrap_value_in_current_scope(slot->context(), slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 

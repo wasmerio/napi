@@ -6,8 +6,10 @@
 #include "internal/quickjs_trace.h"
 #include "node_api.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace quickjs::detail
@@ -30,7 +32,125 @@ namespace quickjs::detail
                 return napi_util__::return_pending_if_caught(env, "Failed to define contextify property");
             return napi_ok;
         }
+
+        bool is_same_object(JSValueConst a, JSValueConst b)
+        {
+            return JS_IsObject(a) && JS_IsObject(b) && JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
+        }
+
+        bool atom_equals_cstr(JSContext *ctx, JSAtom atom, const char *name)
+        {
+            JSAtom expected = JS_NewAtom(ctx, name);
+            if (expected == JS_ATOM_NULL)
+                return false;
+            bool same = atom == expected;
+            JS_FreeAtom(ctx, expected);
+            return same;
+        }
+
+        bool should_skip_context_property(JSContext *ctx, JSAtom atom)
+        {
+            return atom_equals_cstr(ctx, atom, "globalThis") ||
+                   atom_equals_cstr(ctx, atom, "__quickjs_contextified");
+        }
+
+        void free_property_descriptor(JSContext *ctx, JSPropertyDescriptor *desc)
+        {
+            JS_FreeValue(ctx, desc->value);
+            JS_FreeValue(ctx, desc->getter);
+            JS_FreeValue(ctx, desc->setter);
+        }
+
+        int define_property_from_descriptor(JSContext *source_ctx,
+                                            JSContext *target_ctx,
+                                            JSValueConst target,
+                                            JSAtom atom,
+                                            JSPropertyDescriptor *desc,
+                                            JSValueConst map_from = JS_UNDEFINED,
+                                            JSValueConst map_to = JS_UNDEFINED)
+        {
+            int flags = JS_PROP_HAS_CONFIGURABLE |
+                        JS_PROP_HAS_ENUMERABLE |
+                        (desc->flags & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE));
+            JSValueConst value = is_same_object(desc->value, map_from) ? map_to : desc->value;
+            if (desc->flags & JS_PROP_GETSET)
+            {
+                flags |= JS_PROP_HAS_GET | JS_PROP_HAS_SET;
+            }
+            else
+            {
+                flags |= JS_PROP_HAS_VALUE |
+                         JS_PROP_HAS_WRITABLE |
+                         (desc->flags & JS_PROP_WRITABLE);
+            }
+
+            (void)source_ctx;
+            return JS_DefineProperty(target_ctx, target, atom, value, desc->getter, desc->setter, flags);
+        }
     } // namespace
+
+    struct napi_contextify__::context_record
+    {
+        explicit context_record(napi_env owner,
+                                JSContext *parent_context,
+                                JSValueConst parent_sandbox,
+                                JSContext *child_context,
+                                JSValue child_global,
+                                JSValueConst host_defined_option)
+            : env{owner},
+              parent_ctx{parent_context},
+              ctx{child_context},
+              sandbox{JS_DupValue(parent_context, parent_sandbox)},
+              global{child_global},
+              host_defined_option_id{JS_DupValue(parent_context, host_defined_option)}
+        {
+        }
+
+        ~context_record()
+        {
+            close();
+        }
+
+        void close()
+        {
+            if (disposed)
+                return;
+            disposed = true;
+            if (ctx != nullptr)
+            {
+                for (JSAtom atom : baseline_atoms)
+                    JS_FreeAtom(ctx, atom);
+                baseline_atoms.clear();
+                JS_FreeValue(ctx, global);
+                global = JS_UNDEFINED;
+                JS_SetContextOpaque(ctx, nullptr);
+                JS_FreeContext(ctx);
+                ctx = nullptr;
+            }
+            if (parent_ctx != nullptr)
+            {
+                JS_FreeValue(parent_ctx, sandbox);
+                JS_FreeValue(parent_ctx, host_defined_option_id);
+            }
+            sandbox = JS_UNDEFINED;
+            host_defined_option_id = JS_UNDEFINED;
+            parent_ctx = nullptr;
+        }
+
+        bool has_baseline_atom(JSAtom atom) const
+        {
+            return std::find(baseline_atoms.begin(), baseline_atoms.end(), atom) != baseline_atoms.end();
+        }
+
+        napi_env env = nullptr;
+        JSContext *parent_ctx = nullptr;
+        JSContext *ctx = nullptr;
+        JSValue sandbox = JS_UNDEFINED;
+        JSValue global = JS_UNDEFINED;
+        JSValue host_defined_option_id = JS_UNDEFINED;
+        std::vector<JSAtom> baseline_atoms;
+        bool disposed = false;
+    };
 
     napi_contextify__::napi_contextify__(napi_env env, JSContext *context)
         : env_{env},
@@ -48,9 +168,206 @@ namespace quickjs::detail
     {
         if (torn_down_)
             return;
+        contexts_.clear();
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ = JS_UNDEFINED;
         torn_down_ = true;
+    }
+
+    napi_status copy_own_properties_between_contexts(napi_env env,
+                                                     JSContext *source_ctx,
+                                                     JSValueConst source,
+                                                     JSContext *target_ctx,
+                                                     JSValueConst target,
+                                                     JSValueConst map_from = JS_UNDEFINED,
+                                                     JSValueConst map_to = JS_UNDEFINED)
+    {
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(source_ctx,
+                                   &props,
+                                   &prop_count,
+                                   source,
+                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
+        {
+            return napi_util__::return_pending_if_caught(env, "Failed to enumerate context properties");
+        }
+
+        for (uint32_t i = 0; i < prop_count; ++i)
+        {
+            JSAtom atom = props[i].atom;
+            if (should_skip_context_property(source_ctx, atom))
+                continue;
+
+            JSPropertyDescriptor desc;
+            int has = JS_GetOwnProperty(source_ctx, &desc, source, atom);
+            if (has < 0)
+            {
+                JS_FreePropertyEnum(source_ctx, props, prop_count);
+                return napi_util__::return_pending_if_caught(env, "Failed to read context property");
+            }
+            if (has == 0)
+                continue;
+
+            int rc = define_property_from_descriptor(source_ctx, target_ctx, target, atom, &desc, map_from, map_to);
+            free_property_descriptor(source_ctx, &desc);
+            if (rc < 0)
+            {
+                JS_FreePropertyEnum(source_ctx, props, prop_count);
+                napi_env_context_scope__ target_scope{env, target_ctx};
+                return napi_util__::return_pending_if_caught(env, "Failed to define context property");
+            }
+        }
+
+        JS_FreePropertyEnum(source_ctx, props, prop_count);
+        return napi_ok;
+    }
+
+    napi_status collect_global_baseline(napi_contextify__::context_record *record)
+    {
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(record->ctx,
+                                   &props,
+                                   &prop_count,
+                                   record->global,
+                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
+        {
+            napi_env_context_scope__ child_scope{record->env, record->ctx};
+            return napi_util__::return_pending_if_caught(record->env, "Failed to enumerate context baseline");
+        }
+
+        record->baseline_atoms.reserve(prop_count);
+        for (uint32_t i = 0; i < prop_count; ++i)
+            record->baseline_atoms.push_back(JS_DupAtom(record->ctx, props[i].atom));
+        JS_FreePropertyEnum(record->ctx, props, prop_count);
+        return napi_ok;
+    }
+
+    napi_status sync_sandbox_to_context(napi_contextify__::context_record *record)
+    {
+        return copy_own_properties_between_contexts(record->env,
+                                                    record->parent_ctx,
+                                                    record->sandbox,
+                                                    record->ctx,
+                                                    record->global,
+                                                    record->sandbox,
+                                                    record->global);
+    }
+
+    napi_status sync_context_to_sandbox(napi_contextify__::context_record *record)
+    {
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(record->ctx,
+                                   &props,
+                                   &prop_count,
+                                   record->global,
+                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
+        {
+            napi_env_context_scope__ child_scope{record->env, record->ctx};
+            return napi_util__::return_pending_if_caught(record->env, "Failed to enumerate context globals");
+        }
+
+        for (uint32_t i = 0; i < prop_count; ++i)
+        {
+            JSAtom atom = props[i].atom;
+            if (should_skip_context_property(record->ctx, atom))
+                continue;
+
+            int sandbox_has = JS_GetOwnProperty(record->parent_ctx, nullptr, record->sandbox, atom);
+            if (sandbox_has < 0)
+            {
+                JS_FreePropertyEnum(record->ctx, props, prop_count);
+                napi_env_context_scope__ parent_scope{record->env, record->parent_ctx};
+                return napi_util__::return_pending_if_caught(record->env, "Failed to inspect sandbox property");
+            }
+
+            if (record->has_baseline_atom(atom) && sandbox_has == 0)
+                continue;
+
+            JSPropertyDescriptor desc;
+            int has = JS_GetOwnProperty(record->ctx, &desc, record->global, atom);
+            if (has < 0)
+            {
+                JS_FreePropertyEnum(record->ctx, props, prop_count);
+                napi_env_context_scope__ child_scope{record->env, record->ctx};
+                return napi_util__::return_pending_if_caught(record->env, "Failed to read context global");
+            }
+            if (has == 0)
+                continue;
+
+            int rc = define_property_from_descriptor(record->ctx,
+                                                    record->parent_ctx,
+                                                    record->sandbox,
+                                                    atom,
+                                                    &desc,
+                                                    record->global,
+                                                    record->sandbox);
+            free_property_descriptor(record->ctx, &desc);
+            if (rc < 0)
+            {
+                JS_FreePropertyEnum(record->ctx, props, prop_count);
+                napi_env_context_scope__ parent_scope{record->env, record->parent_ctx};
+                return napi_util__::return_pending_if_caught(record->env, "Failed to write sandbox property");
+            }
+        }
+
+        JS_FreePropertyEnum(record->ctx, props, prop_count);
+        return napi_ok;
+    }
+
+    napi_contextify__::context_record *napi_contextify__::find_context_record(JSValueConst sandbox) const
+    {
+        for (const auto &record : contexts_)
+        {
+            if (record != nullptr && !record->disposed && is_same_object(record->sandbox, sandbox))
+                return record.get();
+        }
+        return nullptr;
+    }
+
+    napi_contextify__::context_record *napi_contextify__::create_context_record(
+        JSValueConst sandbox,
+        JSValueConst host_defined_option_id)
+    {
+        JSRuntime *rt = JS_GetRuntime(ctx_);
+        JSContext *child_ctx = JS_NewContext(rt);
+        if (child_ctx == nullptr)
+            return nullptr;
+        JS_SetContextOpaque(child_ctx, env_);
+        JSValue child_global = JS_GetGlobalObject(child_ctx);
+        if (JS_IsException(child_global))
+        {
+            JS_SetContextOpaque(child_ctx, nullptr);
+            JS_FreeContext(child_ctx);
+            return nullptr;
+        }
+
+        auto record = std::make_unique<context_record>(env_,
+                                                       ctx_,
+                                                       sandbox,
+                                                       child_ctx,
+                                                       child_global,
+                                                       host_defined_option_id);
+        context_record *raw = record.get();
+        contexts_.push_back(std::move(record));
+        if (collect_global_baseline(raw) != napi_ok)
+        {
+            destroy_context_record(raw);
+            return nullptr;
+        }
+        return raw;
+    }
+
+    void napi_contextify__::destroy_context_record(context_record *record)
+    {
+        if (record == nullptr)
+            return;
+        auto it = std::find_if(contexts_.begin(), contexts_.end(), [record](const auto &entry)
+                               { return entry.get() == record; });
+        if (it != contexts_.end())
+            contexts_.erase(it);
     }
 
     bool napi_contextify__::compile_trace_enabled() const
@@ -136,7 +453,8 @@ namespace quickjs::detail
         return prepared;
     }
 
-    JSValue napi_contextify__::compile_cjs_function(const std::string &source,
+    JSValue napi_contextify__::compile_cjs_function(JSContext *ctx,
+                                                    const std::string &source,
                                                     const std::string &source_url,
                                                     const std::vector<std::string> &params,
                                                     std::string *diagnostic_source_out) const
@@ -170,10 +488,10 @@ namespace quickjs::detail
             .filename = source_url.empty() ? "<contextify>" : source_url.c_str(),
             .line_num = 1,
         };
-        JSValue bytecode = JS_Eval2(ctx_, compile_source.c_str(), compile_source.size(), &options);
+        JSValue bytecode = JS_Eval2(ctx, compile_source.c_str(), compile_source.size(), &options);
         if (JS_IsException(bytecode))
             return JS_EXCEPTION;
-        return JS_EvalFunction(ctx_, bytecode);
+        return JS_EvalFunction(ctx, bytecode);
     }
 
     bool napi_contextify__::can_parse_as_module(const std::string &source,
@@ -362,12 +680,19 @@ namespace quickjs::detail
         (void)allow_code_gen_strings;
         (void)allow_code_gen_wasm;
         (void)own_microtask_queue;
-        (void)host_defined_option_id;
         if (!napi_util__::check_env(env_) || sandbox_or_symbol == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
+        context_record *record = find_context_record(sandbox);
+        if (record == nullptr)
+        {
+            JSValue host_id = host_defined_option_id == nullptr ? JS_UNDEFINED : napi_quickjs_value_inner(env_, host_defined_option_id);
+            record = create_context_record(sandbox, host_id);
+            if (record == nullptr)
+                return napi_util__::return_pending_if_caught(env_, "Failed to create QuickJS context");
+        }
         napi_status status = define_contextify_internal_property(env_,
                                                                  ctx_,
                                                                  sandbox,
@@ -397,7 +722,6 @@ namespace quickjs::detail
                                               napi_value host_defined_option_id,
                                               napi_value *result_out)
     {
-        (void)line_offset;
         (void)column_offset;
         (void)timeout;
         (void)display_errors;
@@ -406,40 +730,64 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env_) || source == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
-        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)) &&
-            !napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
+        context_record *record = nullptr;
+        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))
         {
-            env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
-            return napi_invalid_arg;
+            if (!napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
+            {
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                return napi_invalid_arg;
+            }
+            record = find_context_record(napi_quickjs_value_inner(env_, sandbox_or_null));
+            if (record == nullptr || record->disposed)
+            {
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                return napi_invalid_arg;
+            }
         }
 
         std::string src = napi_util__::to_utf8(env_, source);
         std::string label = filename == nullptr ? "<contextify>" : napi_util__::to_utf8(env_, filename);
         JSValue result = JS_UNDEFINED;
-        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))
+        if (record != nullptr)
         {
-            const char *wrapper_source = "(function(__sandbox, __source) { with (__sandbox) { return eval(__source); } })";
-            JSValue wrapper = JS_Eval(ctx_,
-                                      wrapper_source,
-                                      std::strlen(wrapper_source),
-                                      "<contextify-wrapper>",
-                                      JS_EVAL_TYPE_GLOBAL);
-            if (JS_IsException(wrapper))
+            napi_status sync_status = sync_sandbox_to_context(record);
+            if (sync_status != napi_ok)
             {
                 env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
-                return napi_pending_exception;
+                return sync_status;
             }
-            JSValue argv[] = {napi_quickjs_value_inner(env_, sandbox_or_null), napi_quickjs_value_inner(env_, source)};
-            result = JS_Call(ctx_, wrapper, JS_UNDEFINED, 2, argv);
-            JS_FreeValue(ctx_, wrapper);
+            napi_env_context_scope__ child_scope{env_, record->ctx};
+            JSEvalOptions options{
+                .version = JS_EVAL_OPTIONS_VERSION,
+                .filename = label.c_str(),
+                .line_num = std::max<int32_t>(1, line_offset + 1),
+                .eval_flags = JS_EVAL_TYPE_GLOBAL,
+            };
+            result = JS_EvalThis2(record->ctx, record->global, src.c_str(), src.size(), &options);
+            if (JS_IsException(result))
+            {
+                JSValue exc = JS_GetException(record->ctx);
+                napi_util__::set_last_exception(env_, exc);
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                return napi_quickjs_set_last_error(env_, napi_pending_exception, "Exception while running contextify script");
+            }
+            sync_status = sync_context_to_sandbox(record);
+            if (sync_status != napi_ok)
+            {
+                JS_FreeValue(record->ctx, result);
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                return sync_status;
+            }
+            env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+            *result_out = env_->wrap_value_in_current_scope(record->ctx, result, true);
+            return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
         }
-        else
-        {
-            result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
-        }
+
+        result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
         env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
         if (JS_IsException(result))
-            return napi_pending_exception;
+            return napi_util__::return_pending_if_caught(env_, "Exception while running contextify script");
         return napi_util__::wrap_owned(env_, result, result_out);
     }
 
@@ -450,11 +798,10 @@ namespace quickjs::detail
         JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_context_global);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
-        return define_contextify_internal_property(env_,
-                                                   ctx_,
-                                                   sandbox,
-                                                   "__quickjs_contextified",
-                                                   JS_NewBool(ctx_, false));
+        context_record *record = find_context_record(sandbox);
+        if (record != nullptr)
+            destroy_context_record(record);
+        return define_contextify_internal_property(env_, ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
     }
 
     napi_status napi_contextify__::compile_function(napi_value code,
@@ -471,7 +818,6 @@ namespace quickjs::detail
     {
         (void)cached_data_or_undefined;
         (void)produce_cached_data;
-        (void)parsing_context_or_undefined;
         (void)context_extensions_or_undefined;
         (void)host_defined_option_id;
         if (!napi_util__::check_env(env_) || code == nullptr || result_out == nullptr)
@@ -502,22 +848,34 @@ namespace quickjs::detail
             source_url = napi_util__::to_utf8(env_, filename);
         }
 
+        context_record *record = nullptr;
+        if (parsing_context_or_undefined != nullptr &&
+            !JS_IsUndefined(napi_quickjs_value_inner(env_, parsing_context_or_undefined)) &&
+            !JS_IsNull(napi_quickjs_value_inner(env_, parsing_context_or_undefined)))
+        {
+            record = find_context_record(napi_quickjs_value_inner(env_, parsing_context_or_undefined));
+        }
+
+        JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
+        napi_env_context_scope__ compile_scope{env_, compile_ctx};
         std::string diagnostic_source;
-        JSValue fn = compile_cjs_function(source, source_url, params, &diagnostic_source);
+        JSValue fn = compile_cjs_function(compile_ctx, source, source_url, params, &diagnostic_source);
         if (JS_IsException(fn))
         {
-            JSValue exc = JS_GetException(ctx_);
-            annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
+            JSValue exc = JS_GetException(compile_ctx);
+            if (compile_ctx == ctx_)
+                annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
             napi_util__::set_last_exception(env_, exc);
             return napi_pending_exception;
         }
 
-        JSValue out = JS_NewObject(ctx_);
-        JS_SetPropertyStr(ctx_, out, "function", fn);
+        JSValue out = JS_NewObject(compile_ctx);
+        JS_SetPropertyStr(compile_ctx, out, "function", fn);
         if (!source_url.empty())
-            napi_util__::set_string_property(ctx_, out, "sourceURL", source_url);
-        JS_SetPropertyStr(ctx_, out, "sourceMapURL", JS_UNDEFINED);
-        return napi_util__::wrap_owned(env_, out, result_out);
+            napi_util__::set_string_property(compile_ctx, out, "sourceURL", source_url);
+        JS_SetPropertyStr(compile_ctx, out, "sourceMapURL", JS_UNDEFINED);
+        *result_out = env_->wrap_value_in_current_scope(compile_ctx, out, true);
+        return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
     napi_status napi_contextify__::contains_module_syntax(napi_value code,
@@ -545,7 +903,7 @@ namespace quickjs::detail
         if (cjs_var_in_scope)
             params = {"exports", "require", "module", "__filename", "__dirname"};
 
-        JSValue fn = compile_cjs_function(source, filename_string, params, nullptr);
+        JSValue fn = compile_cjs_function(ctx_, source, filename_string, params, nullptr);
         if (!JS_IsException(fn))
         {
             JS_FreeValue(ctx_, fn);

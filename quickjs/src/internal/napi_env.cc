@@ -9,7 +9,8 @@
 #include <cassert>
 
 napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
-    : context_{context},
+    : main_context_{context},
+      current_context_{context},
       module_api_version_{module_api_version},
       last_exception_{JS_UNDEFINED},
       scopes_{this},
@@ -59,8 +60,8 @@ void napi_env__::prepare_teardown()
   if (root_scope != nullptr)
   {
     root_scope->close();
-    if (context_ != nullptr)
-      JS_RunGC(JS_GetRuntime(context_));
+    if (main_context_ != nullptr)
+      JS_RunGC(JS_GetRuntime(main_context_));
   }
   scopes_.close();
   current_scope_ = nullptr;
@@ -98,7 +99,22 @@ void napi_env__::finalize_instance_data()
 
 JSContext *napi_env__::context() const
 {
-  return context_;
+  return current_context_;
+}
+
+JSContext *napi_env__::main_context() const
+{
+  return main_context_;
+}
+
+JSContext *napi_env__::current_context() const
+{
+  return current_context_;
+}
+
+void napi_env__::set_current_context(JSContext *context)
+{
+  current_context_ = context == nullptr ? main_context_ : context;
 }
 
 int32_t napi_env__::module_api_version() const
@@ -118,7 +134,7 @@ napi_handle_scope napi_env__::current_scope() const
 
 napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 {
-  if (context_ == nullptr)
+  if (current_context_ == nullptr)
     return nullptr;
   auto *handle = scopes_.allocate(this, parent);
   return reinterpret_cast<napi_handle_scope>(handle);
@@ -153,18 +169,19 @@ JSValue napi_env__::wrap_external_data(void *data,
                                        node_api_basic_finalize finalize_cb,
                                        void *finalize_hint)
 {
-  if (context_ == nullptr)
+  JSContext *ctx = current_context_;
+  if (ctx == nullptr)
     return JS_EXCEPTION;
 
-  JSValue obj = JS_NewObjectClass(context_, napi_external__::class_id());
+  JSValue obj = JS_NewObjectClass(ctx, napi_external__::class_id());
   if (JS_IsException(obj))
     return obj;
 
   auto *hint = napi_external_backing_store_hint__::create(this, data, finalize_cb, finalize_hint);
   if (hint == nullptr)
   {
-    JS_FreeValue(context_, obj);
-    JS_ThrowOutOfMemory(context_);
+    JS_FreeValue(ctx, obj);
+    JS_ThrowOutOfMemory(ctx);
     return JS_EXCEPTION;
   }
 
@@ -176,6 +193,12 @@ napi_value napi_env__::wrap_value_in_current_scope(JSValue value, bool owned)
 {
   napi_scope__ *scope = scope_from_handle(current_scope_);
   return scope == nullptr ? nullptr : scope->wrap_value(value, owned);
+}
+
+napi_value napi_env__::wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned)
+{
+  napi_scope__ *scope = scope_from_handle(current_scope_);
+  return scope == nullptr ? nullptr : scope->wrap_value(context, value, owned);
 }
 
 void napi_env__::delete_value_from_current_scope(napi_value value)
@@ -201,7 +224,7 @@ napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 
 napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
 {
-  if (context_ == nullptr)
+  if (current_context_ == nullptr)
     return nullptr;
 
   napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
@@ -297,7 +320,8 @@ void napi_env__::clear_last_exception()
   if (!has_last_exception_)
     return;
 
-  JS_FreeValue(context_, last_exception_);
+  JS_FreeValue(last_exception_context_ == nullptr ? main_context_ : last_exception_context_, last_exception_);
+  last_exception_context_ = nullptr;
   last_exception_ = JS_UNDEFINED;
   has_last_exception_ = false;
 }
@@ -305,6 +329,7 @@ void napi_env__::clear_last_exception()
 void napi_env__::set_last_exception(JSValue exception)
 {
   clear_last_exception();
+  last_exception_context_ = current_context_;
   last_exception_ = exception;
   has_last_exception_ = true;
 }
@@ -315,6 +340,7 @@ JSValue napi_env__::take_last_exception()
     return JS_UNDEFINED;
 
   JSValue exception = last_exception_;
+  last_exception_context_ = nullptr;
   last_exception_ = JS_UNDEFINED;
   has_last_exception_ = false;
   return exception;
@@ -370,7 +396,7 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
 
 napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook, void *arg)
 {
-  if (context_ == nullptr || hook == nullptr)
+  if (main_context_ == nullptr || hook == nullptr)
     return nullptr;
   return cleanup_hooks_.allocate(this, hook, arg);
 }
@@ -382,7 +408,7 @@ void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
 
 napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 {
-  if (context_ == nullptr)
+  if (current_context_ == nullptr)
     return nullptr;
   return deferreds_.allocate(this, resolve, reject);
 }
@@ -397,9 +423,23 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
     node_api_basic_finalize finalize_cb,
     void *finalize_hint)
 {
-  if (context_ == nullptr)
+  if (main_context_ == nullptr)
     return nullptr;
   return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+}
+
+napi_env_context_scope__::napi_env_context_scope__(napi_env env, JSContext *context)
+    : env_{env},
+      previous_{env == nullptr ? nullptr : env->current_context()}
+{
+  if (env_ != nullptr && context != nullptr)
+    env_->set_current_context(context);
+}
+
+napi_env_context_scope__::~napi_env_context_scope__()
+{
+  if (env_ != nullptr)
+    env_->set_current_context(previous_);
 }
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)

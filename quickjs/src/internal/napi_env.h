@@ -34,6 +34,9 @@ struct napi_env__
   void finalize_instance_data();
 
   JSContext *context() const;
+  JSContext *main_context() const;
+  JSContext *current_context() const;
+  void set_current_context(JSContext *context);
   int32_t module_api_version() const;
 
   napi_handle_scope root_scope() const;
@@ -42,6 +45,7 @@ struct napi_env__
   void destroy_scope(napi_handle_scope scope);
   napi_scope__ *scope_from_handle(napi_handle_scope scope) const;
   napi_value wrap_value_in_current_scope(JSValue value, bool owned);
+  napi_value wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned);
   JSValue wrap_external_data(void *data);
   JSValue wrap_external_data(void *data, node_api_basic_finalize finalize_cb, void *finalize_hint);
   napi_value__ *value_from_handle(napi_value value);
@@ -112,12 +116,14 @@ struct napi_env__
 private:
   void clear_refs_for_teardown();
 
-  // QuickJS context and API version.
-  JSContext *context_;
+  // QuickJS contexts and API version.
+  JSContext *main_context_;
+  JSContext *current_context_;
   int32_t module_api_version_ = 8;
 
   // Last native/JS error state.
   napi::error_state__ error_state_;
+  JSContext *last_exception_context_ = nullptr;
   JSValue last_exception_;
   bool has_last_exception_ = false;
 
@@ -157,6 +163,20 @@ private:
 
   // Env teardown state.
   bool torn_down_ = false;
+};
+
+class napi_env_context_scope__
+{
+public:
+  napi_env_context_scope__(napi_env env, JSContext *context);
+  ~napi_env_context_scope__();
+
+  napi_env_context_scope__(const napi_env_context_scope__ &) = delete;
+  napi_env_context_scope__ &operator=(const napi_env_context_scope__ &) = delete;
+
+private:
+  napi_env env_ = nullptr;
+  JSContext *previous_ = nullptr;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

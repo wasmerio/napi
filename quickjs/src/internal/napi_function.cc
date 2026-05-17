@@ -74,6 +74,7 @@ JSValue napi_function__::trampoline(JSContext *ctx,
 
   auto cb = reinterpret_cast<napi_callback>(cb_ptr);
   auto user_data = napi_external__::get_value(func_data[1]);
+  napi_env_context_scope__ context_scope{env, ctx};
   quickjs_callback_handle_scope__ callback_scope{env};
   if (!callback_scope.is_open())
     return JS_ThrowOutOfMemory(ctx);

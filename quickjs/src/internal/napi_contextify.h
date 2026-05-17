@@ -6,6 +6,7 @@
 #include <quickjs.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,8 @@ namespace quickjs::detail
     class napi_contextify__ final
     {
     public:
+        struct context_record;
+
         napi_contextify__(napi_env env, JSContext *context);
         ~napi_contextify__();
 
@@ -85,7 +88,8 @@ namespace quickjs::detail
         std::string builtin_id_from_resource_name(const std::string &resource_name) const;
         std::string source_line_at(const std::string &source, int32_t one_based_line) const;
         std::string prepare_function_body_source(const std::string &source) const;
-        JSValue compile_cjs_function(const std::string &source,
+        JSValue compile_cjs_function(JSContext *ctx,
+                                     const std::string &source,
                                      const std::string &source_url,
                                      const std::vector<std::string> &params,
                                      std::string *diagnostic_source_out) const;
@@ -97,6 +101,10 @@ namespace quickjs::detail
                                         const std::string &resource_name,
                                         int32_t line_offset,
                                         int32_t column_offset);
+        context_record *find_context_record(JSValueConst sandbox) const;
+        context_record *create_context_record(JSValueConst sandbox,
+                                              JSValueConst host_defined_option_id);
+        void destroy_context_record(context_record *record);
 
         // Owning environment and QuickJS context.
         napi_env env_;
@@ -105,6 +113,7 @@ namespace quickjs::detail
         // Source-map and error-formatting state.
         bool source_maps_enabled_ = false;
         JSValue source_map_error_source_callback_;
+        std::vector<std::unique_ptr<context_record>> contexts_;
 
         // Subsystem lifecycle.
         bool torn_down_ = false;
