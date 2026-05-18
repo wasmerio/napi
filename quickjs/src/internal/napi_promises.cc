@@ -9,6 +9,14 @@ void *js_identity(JSValueConst value)
 {
   return JS_IsObject(value) ? JS_VALUE_GET_PTR(value) : nullptr;
 }
+
+bool is_same_runtime(napi_env env, JSContext *ctx)
+{
+  return env != nullptr &&
+         ctx != nullptr &&
+         env->main_context() != nullptr &&
+         JS_GetRuntime(ctx) == JS_GetRuntime(env->main_context());
+}
 }
 
 napi_promises__::napi_promises__(napi_env env, JSContext *context)
@@ -287,7 +295,7 @@ void napi_promises__::promise_hook(JSContext *ctx,
                                    void *opaque)
 {
   napi_env env = static_cast<napi_env>(opaque);
-  if (env == nullptr || env->context() != ctx)
+  if (!is_same_runtime(env, ctx))
     return;
 
   napi_promises__ &promises = env->promises();
@@ -298,7 +306,7 @@ void napi_promises__::promise_hook(JSContext *ctx,
 
   size_t hook_index = static_cast<size_t>(type);
   JSValue hook = promises.dup_hook(hook_index);
-  if (JS_IsFunction(ctx, hook))
+  if (JS_IsFunction(promises.context_, hook))
   {
     if (type == JS_PROMISE_HOOK_INIT)
     {
@@ -311,7 +319,7 @@ void napi_promises__::promise_hook(JSContext *ctx,
       promises.call_hook(hook, 1, argv);
     }
   }
-  JS_FreeValue(ctx, hook);
+  JS_FreeValue(promises.context_, hook);
 
   if (type == JS_PROMISE_HOOK_AFTER)
     promises.leave_context_frame(promise);
@@ -326,23 +334,23 @@ void napi_promises__::rejection_tracker(JSContext *ctx,
                                         void *opaque)
 {
   napi_env env = static_cast<napi_env>(opaque);
-  if (env == nullptr || env->context() != ctx)
+  if (!is_same_runtime(env, ctx))
     return;
 
   napi_promises__ &promises = env->promises();
   promises.release_context_frame(promise);
 
   JSValue callback = promises.dup_reject_callback();
-  if (!JS_IsFunction(ctx, callback))
+  if (!JS_IsFunction(promises.context_, callback))
   {
-    JS_FreeValue(ctx, callback);
+    JS_FreeValue(promises.context_, callback);
     return;
   }
 
-  JSValue event_type = JS_NewInt32(ctx, is_handled ? 1 : 0);
+  JSValue event_type = JS_NewInt32(promises.context_, is_handled ? 1 : 0);
   JSValueConst rejection_value = is_handled ? JS_UNDEFINED : reason;
   JSValueConst argv[] = {event_type, promise, rejection_value};
   promises.call_hook(callback, 3, argv);
-  JS_FreeValue(ctx, event_type);
-  JS_FreeValue(ctx, callback);
+  JS_FreeValue(promises.context_, event_type);
+  JS_FreeValue(promises.context_, callback);
 }

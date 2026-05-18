@@ -406,11 +406,11 @@ void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
   cleanup_hooks_.destroy(entry);
 }
 
-napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
+napi_deferred__ *napi_env__::create_deferred(JSContext *context, JSValue resolve, JSValue reject)
 {
-  if (current_context_ == nullptr)
+  if (context == nullptr)
     return nullptr;
-  return deferreds_.allocate(this, resolve, reject);
+  return deferreds_.allocate(this, context, resolve, reject);
 }
 
 void napi_env__::destroy_deferred(napi_deferred__ *deferred)

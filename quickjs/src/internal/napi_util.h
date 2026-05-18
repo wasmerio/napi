@@ -21,6 +21,7 @@ public:
   static void clear_last_exception(napi_env env);
   static void set_last_exception(napi_env env, JSValue exception);
   static bool rethrow_last_exception(napi_env env, JSContext *ctx);
+  static napi_status return_pending_if_caught(napi_env env, JSContext *ctx, const char *message);
   static napi_status return_pending_if_caught(napi_env env, const char *message);
   static napi_status invalid_arg(napi_env env);
 

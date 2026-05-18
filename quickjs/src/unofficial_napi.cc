@@ -175,6 +175,7 @@ extern "C"
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
             return napi_generic_failure;
+        JS_SetCanBlock(rt, true);
         if (options != nullptr)
         {
             if (options->max_old_generation_size_in_bytes > 0)
@@ -518,12 +519,44 @@ extern "C"
                                                              napi_value *target_out,
                                                              napi_value *handler_out)
     {
-        (void)proxy;
-        if (!napi_util__::check_env(env) || target_out == nullptr || handler_out == nullptr)
+        if (!napi_util__::check_env(env) || proxy == nullptr || target_out == nullptr || handler_out == nullptr)
             return napi_invalid_arg;
         *target_out = nullptr;
         *handler_out = nullptr;
-        return napi_generic_failure;
+
+        JSContext *ctx = napi_quickjs_value_context(env, proxy);
+        if (ctx == nullptr)
+            return napi_invalid_arg;
+
+        JSValueConst raw = napi_quickjs_value_inner(env, proxy);
+        if (!JS_IsProxy(raw))
+            return napi_invalid_arg;
+
+        napi_env_context_scope__ context_scope{env, ctx};
+        JSValue target = JS_GetProxyTarget(ctx, raw);
+        if (JS_IsException(target))
+        {
+            JSValue exception = JS_GetException(ctx);
+            JS_FreeValue(ctx, exception);
+            *target_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            *handler_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
+        }
+
+        JSValue handler = JS_GetProxyHandler(ctx, raw);
+        if (JS_IsException(handler))
+        {
+            JS_FreeValue(ctx, target);
+            JSValue exception = JS_GetException(ctx);
+            JS_FreeValue(ctx, exception);
+            *target_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            *handler_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
+        }
+
+        *target_out = env->wrap_value_in_current_scope(ctx, target, true);
+        *handler_out = env->wrap_value_in_current_scope(ctx, handler, true);
+        return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_preview_entries(napi_env env,

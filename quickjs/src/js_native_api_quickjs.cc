@@ -1958,7 +1958,12 @@ extern "C"
       return napi_invalid_arg;
     }
 
-    JSContext *ctx = env->context();
+    JSContext *ctx = napi_quickjs_value_context(env, constructor);
+    if (ctx == nullptr)
+    {
+      return napi_invalid_arg;
+    }
+    napi_env_context_scope__ context_scope{env, ctx};
 
     // 2. Unwrap the constructor JSValue
     // Assuming 'unwrap_value' is your helper to get the JSValue from napi_value
@@ -1981,12 +1986,12 @@ extern "C"
     // 5. Check for exceptions
     if (JS_IsException(instance))
     {
-      return napi_util__::return_pending_if_caught(env, "Exception during constructor call");
+      return napi_util__::return_pending_if_caught(env, ctx, "Exception during constructor call");
     }
 
     // 6. Wrap and return
     // 'wrap_value' converts the JSValue back into the napi_value handle
-    *result = env->wrap_value_in_current_scope(instance, true);
+    *result = env->wrap_value_in_current_scope(ctx, instance, true);
 
     return napi_ok;
   }
@@ -2008,10 +2013,17 @@ extern "C"
       return napi_util__::invalid_arg(env);
     }
 
+    JSContext *ctx = napi_quickjs_value_context(env, func);
+    if (ctx == nullptr)
+    {
+      return napi_util__::invalid_arg(env);
+    }
+    napi_env_context_scope__ context_scope{env, ctx};
+
     JSValue js_func = napi_quickjs_value_inner(env, func);
 
     // 2. Ensure the target is actually a function
-    if (!JS_IsFunction(env->context(), js_func))
+    if (!JS_IsFunction(ctx, js_func))
     {
       return napi_quickjs_set_last_error(env, napi_function_expected, "Target is not a function");
     }
@@ -2027,25 +2039,25 @@ extern "C"
     const size_t js_argc = js_argv.size();
     const bool has_args = js_argc != 0;
     JSValue js_result = has_args
-                            ? JS_Call(env->context(), js_func, js_recv, (int)js_argc, js_argv.data())
-                            : JS_Call(env->context(), js_func, js_recv, 0, nullptr);
+                            ? JS_Call(ctx, js_func, js_recv, (int)js_argc, js_argv.data())
+                            : JS_Call(ctx, js_func, js_recv, 0, nullptr);
 
     // 6. Handle Exceptions
     if (JS_IsException(js_result))
     {
-      return napi_util__::return_pending_if_caught(env, "Exception during function call");
+      return napi_util__::return_pending_if_caught(env, ctx, "Exception during function call");
     }
 
     // 7. Handle the Result
     if (result != nullptr)
     {
       // wrap the result; the current handle scope now owns the returned JSValue
-      *result = env->wrap_value_in_current_scope(js_result, true);
+      *result = env->wrap_value_in_current_scope(ctx, js_result, true);
     }
     else
     {
       // If the caller doesn't want the result, we must free it to avoid leaks
-      JS_FreeValue(env->context(), js_result);
+      JS_FreeValue(ctx, js_result);
     }
 
     return napi_ok;
@@ -2191,22 +2203,23 @@ extern "C"
     if (!napi_util__::check_env(env) || deferred == nullptr || promise == nullptr)
       return napi_invalid_arg;
 
+    JSContext *ctx = env->context();
     JSValue resolving_funcs[2];
-    JSValue p = JS_NewPromiseCapability(env->context(), resolving_funcs);
+    JSValue p = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(p))
-      return napi_util__::return_pending_if_caught(env, "Failed to create Promise");
+      return napi_util__::return_pending_if_caught(env, ctx, "Failed to create Promise");
 
-    auto *d = napi_deferred__::create(env, resolving_funcs[0], resolving_funcs[1]);
+    auto *d = napi_deferred__::create(env, ctx, resolving_funcs[0], resolving_funcs[1]);
     if (d == nullptr)
     {
-      JS_FreeValue(env->context(), resolving_funcs[0]);
-      JS_FreeValue(env->context(), resolving_funcs[1]);
-      JS_FreeValue(env->context(), p);
+      JS_FreeValue(ctx, resolving_funcs[0]);
+      JS_FreeValue(ctx, resolving_funcs[1]);
+      JS_FreeValue(ctx, p);
       return napi_generic_failure;
     }
 
     *deferred = d;
-    *promise = env->wrap_value_in_current_scope(p, true);
+    *promise = env->wrap_value_in_current_scope(ctx, p, true);
     return (*promise == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2217,13 +2230,18 @@ extern "C"
     if (!napi_util__::check_env(env) || deferred == nullptr || resolution == nullptr)
       return napi_invalid_arg;
 
+    JSContext *ctx = deferred->context();
+    if (ctx == nullptr)
+      return napi_invalid_arg;
+
+    napi_env_context_scope__ context_scope{env, ctx};
     JSValue ret = deferred->call_resolve(resolution);
     napi_deferred__::destroy(deferred);
 
     if (JS_IsException(ret))
-      return napi_util__::return_pending_if_caught(env, "Failed to resolve promise");
+      return napi_util__::return_pending_if_caught(env, ctx, "Failed to resolve promise");
 
-    JS_FreeValue(env->context(), ret);
+    JS_FreeValue(ctx, ret);
     return napi_ok;
   }
 
@@ -2234,13 +2252,18 @@ extern "C"
     if (!napi_util__::check_env(env) || deferred == nullptr || rejection == nullptr)
       return napi_invalid_arg;
 
+    JSContext *ctx = deferred->context();
+    if (ctx == nullptr)
+      return napi_invalid_arg;
+
+    napi_env_context_scope__ context_scope{env, ctx};
     JSValue ret = deferred->call_reject(rejection);
     napi_deferred__::destroy(deferred);
 
     if (JS_IsException(ret))
-      return napi_util__::return_pending_if_caught(env, "Failed to reject promise");
+      return napi_util__::return_pending_if_caught(env, ctx, "Failed to reject promise");
 
-    JS_FreeValue(env->context(), ret);
+    JS_FreeValue(ctx, ret);
     return napi_ok;
   }
 

@@ -95,7 +95,7 @@ struct napi_env__
   napi_status remove_cleanup_hook(napi_cleanup_hook hook, void *arg);
   napi_env_cleanup_hook__ *create_cleanup_hook(napi_cleanup_hook hook, void *arg);
   void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
-  napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
+  napi_deferred__ *create_deferred(JSContext *context, JSValue resolve, JSValue reject);
   void destroy_deferred(napi_deferred__ *deferred);
   napi_external_backing_store_hint__ *create_external_backing_store(
       void *external_data,

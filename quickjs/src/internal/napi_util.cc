@@ -95,15 +95,21 @@ bool napi_util__::rethrow_last_exception(napi_env env, JSContext *ctx)
   return true;
 }
 
-napi_status napi_util__::return_pending_if_caught(napi_env env, const char *message)
+napi_status napi_util__::return_pending_if_caught(napi_env env, JSContext *ctx, const char *message)
 {
-  if (JS_HasException(env->context()))
+  if (ctx != nullptr && JS_HasException(ctx))
   {
-    auto exc = JS_GetException(env->context());
+    auto exc = JS_GetException(ctx);
+    napi_env_context_scope__ context_scope{env, ctx};
     set_last_exception(env, exc);
     return napi_quickjs_set_last_error(env, napi_pending_exception, message);
   }
   return napi_quickjs_set_last_error(env, napi_generic_failure, message);
+}
+
+napi_status napi_util__::return_pending_if_caught(napi_env env, const char *message)
+{
+  return return_pending_if_caught(env, env == nullptr ? nullptr : env->context(), message);
 }
 
 napi_status napi_util__::invalid_arg(napi_env env)
