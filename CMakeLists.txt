@@ -10,8 +10,13 @@ if(NAPI_BUILD_QUICKJS OR NAPI_BUILD_V8)
 endif()
 
 set(NAPI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Path to the NAPI repository root")
-set(NAPI_PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
-  "Project root for standalone NAPI builds")
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(_napi_project_root_default "${CMAKE_CURRENT_SOURCE_DIR}")
+else()
+  set(_napi_project_root_default "${CMAKE_SOURCE_DIR}")
+endif()
+set(NAPI_PROJECT_ROOT "${_napi_project_root_default}" CACHE PATH
+  "Project root for standalone or embedded NAPI builds")
 
 
 if(NAPI_BUILD_QUICKJS)
