@@ -9,8 +9,12 @@ on:
 
 jobs:
   v8-native-linux:
-    name: v8-native-linux
+    name: v8-native-linux-${{ matrix.build_type }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
     env:
       SCCACHE_GHA_ENABLED: "true"
       CC: clang
@@ -24,18 +28,22 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build native V8 N-API
-        run: make build-napi CMAKE_BUILD_TYPE=Release JOBS=4
+        run: make build-napi CMAKE_BUILD_TYPE=${{ matrix.build_type }} JOBS=4
 
       - name: Test native V8 N-API
-        run: make test-napi CMAKE_BUILD_TYPE=Release JOBS=4 TEST_JOBS=4
+        run: make test-napi CMAKE_BUILD_TYPE=${{ matrix.build_type }} JOBS=4 TEST_JOBS=4
 
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
 
   v8-native-macos:
-    name: v8-native-macos
+    name: v8-native-macos-${{ matrix.build_type }}
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -47,10 +55,10 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build native V8 N-API
-        run: make build-napi CMAKE_BUILD_TYPE=Release JOBS=4
+        run: make build-napi CMAKE_BUILD_TYPE=${{ matrix.build_type }} JOBS=4
 
       - name: Test native V8 N-API
-        run: make test-napi CMAKE_BUILD_TYPE=Release JOBS=4 TEST_JOBS=4
+        run: make test-napi CMAKE_BUILD_TYPE=${{ matrix.build_type }} JOBS=4 TEST_JOBS=4
 
       - name: sccache stats
         if: always()

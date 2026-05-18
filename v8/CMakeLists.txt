@@ -68,7 +68,7 @@ add_library(napi_v8 STATIC
 target_include_directories(napi_v8
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
-    "${PROJECT_ROOT}/napi/lib/src"
+    "${NAPI_ROOT}/lib/src"
   PRIVATE
     "${NAPI_V8_ROOT}/src"
     "${NAPI_V8_INCLUDE_DIR}"
