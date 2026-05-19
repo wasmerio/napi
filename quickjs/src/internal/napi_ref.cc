@@ -2,6 +2,8 @@
 
 #include "internal/napi_env.h"
 
+#include <cassert>
+
 namespace
 {
 bool IsEmptyValue(JSValueConst value)
@@ -144,9 +146,13 @@ void napi_ref__::clear_weak_target()
 
 void napi_ref__::delete_weak_handle()
 {
-  if (JS_GetNativeWeakRefFromLink(&weak_link_) == nullptr || env_ == nullptr ||
-      context_ == nullptr)
+  JSNativeWeakRef *owner = JS_GetNativeWeakRefFromLink(&weak_link_);
+  if (owner == nullptr || env_ == nullptr || context_ == nullptr)
     return;
+#ifndef NDEBUG
+  assert(owner != reinterpret_cast<JSNativeWeakRef *>(&weak_link_));
+  assert(weak_link_.next != &weak_link_);
+#endif
   JS_DeleteNativeWeakRefLink(JS_GetRuntime(context_), &weak_link_);
 }
 
