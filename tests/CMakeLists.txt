@@ -1,4 +1,5 @@
 include(GoogleTest)
+include(FetchContent)
 
 set(NAPI_TEST_ENGINE "${NAPI_TEST_ENGINE}" CACHE STRING "N-API engine to test: quickjs or v8")
 set_property(CACHE NAPI_TEST_ENGINE PROPERTY STRINGS quickjs v8)
@@ -51,8 +52,18 @@ if(NOT EXISTS "${_napi_gtest_root}/src/gtest-all.cc" AND
 endif()
 if(NOT EXISTS "${_napi_gtest_root}/src/gtest-all.cc")
   message(STATUS
-    "Skipping ${_napi_test_prefix} shared tests: googletest not found at ${_napi_gtest_root}")
-  return()
+    "googletest not found at ${_napi_gtest_root}; fetching googletest for ${_napi_test_prefix} shared tests")
+  FetchContent_Declare(
+    napi_googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
+    URL_HASH SHA256=8ad598c73ad796e0d8280b082cebd82a630d73e73cd3c70057938a6501bba5d7
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  FetchContent_MakeAvailable(napi_googletest)
+  FetchContent_GetProperties(napi_googletest SOURCE_DIR _napi_gtest_root)
+  if(EXISTS "${_napi_gtest_root}/googletest/src/gtest-all.cc")
+    set(_napi_gtest_root "${_napi_gtest_root}/googletest")
+  endif()
 endif()
 
 set(_napi_engine_include_var "NAPI_${_napi_test_engine_upper}_INCLUDE_DIR")

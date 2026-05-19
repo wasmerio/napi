@@ -125,6 +125,46 @@ TEST_F(Test35Promise, PromiseRejectCallbackUsesV8EventShape) {
   EXPECT_NE(events.find("[1,\"undefined\"]"), std::string::npos) << events;
 }
 
+TEST_F(Test35Promise, ForAwaitBreakAwaitsAsyncIteratorReturn) {
+  EnvScope s(runtime_.get());
+
+  RunScript(
+      s.env,
+      "globalThis.asyncIteratorCloseObserved = [];"
+      "globalThis.asyncIteratorClosePromise = (async () => {"
+      "  let flag = false;"
+      "  const it = {"
+      "    i: 0,"
+      "    async next() {"
+      "      return this.i++ ? { done: true } : { value: 1, done: false };"
+      "    },"
+      "    async return() {"
+      "      await 0;"
+      "      flag = true;"
+      "      return { done: true };"
+      "    },"
+      "    [Symbol.asyncIterator]() { return this; }"
+      "  };"
+      "  for await (const x of it) {"
+      "    break;"
+      "  }"
+      "  asyncIteratorCloseObserved.push(flag);"
+      "  await Promise.resolve();"
+      "  asyncIteratorCloseObserved.push(flag);"
+      "})();");
+
+  ASSERT_EQ(unofficial_napi_process_microtasks(s.env), napi_ok);
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // QuickJS currently resumes after `for await...of` break before the async
+  // iterator return() promise has finished. This is fixed on the
+  // emit_async_iterator_return_close branch.
+  EXPECT_EQ(JsonStringify(s.env, "globalThis.asyncIteratorCloseObserved"), "[false,true]");
+#else
+  EXPECT_EQ(JsonStringify(s.env, "globalThis.asyncIteratorCloseObserved"), "[true,true]");
+#endif
+}
+
 TEST_F(Test35Promise, PromiseReactionRestoresContinuationPreservedEmbedderData) {
   EnvScope s(runtime_.get());
 

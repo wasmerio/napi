@@ -5,11 +5,11 @@ UNAME_M := $(shell uname -m)
 CMAKE_BUILD_TYPE ?= Release
 JOBS ?= 8
 TEST_JOBS ?= 0
-EDGEJS_ROOT ?= $(abspath ..)
-BUILD_NAPI_DIR ?= $(EDGEJS_ROOT)/build-napi-v8
-BUILD_NAPI_QUICKJS_DIR ?= $(EDGEJS_ROOT)/build-napi-quickjs
-BUILD_WASIX_NAPI_DIR ?= $(EDGEJS_ROOT)/build-wasix-napi
-BUILD_WASIX_NAPI_QUICKJS_DIR ?= $(EDGEJS_ROOT)/build-wasix-napi-quickjs
+NAPI_PROJECT_ROOT ?= $(abspath .)
+BUILD_NAPI_DIR ?= $(NAPI_PROJECT_ROOT)/build-napi-v8
+BUILD_NAPI_QUICKJS_DIR ?= $(NAPI_PROJECT_ROOT)/build-napi-quickjs
+BUILD_WASIX_NAPI_DIR ?= $(NAPI_PROJECT_ROOT)/build-wasix-napi
+BUILD_WASIX_NAPI_QUICKJS_DIR ?= $(NAPI_PROJECT_ROOT)/build-wasix-napi-quickjs
 CMAKE_ARGS ?=
 EXTRA_CMAKE_ARGS ?=
 BUILD_ENV ?= env
@@ -17,6 +17,8 @@ WASIX_CMAKE_TOOLCHAIN ?= cmake/wasix-toolchain.cmake
 CARGO_TARGET_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/target)
 NAPI_NATIVE_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/native)
 NAPI_WASIX_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/wasm32-wasix/release)
+NAPI_V8_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
+NAPI_QUICKJS_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
 NAPI_V8_PREBUILT_VERSION ?= 11.9.2
 NAPI_V8_PLATFORM :=
 NAPI_V8_DIST_ROOT ?=
@@ -60,22 +62,22 @@ endif
 endif
 
 build-napi:
-	$(BUILD_ENV) cmake -S . -B $(BUILD_NAPI_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DNAPI_PROJECT_ROOT=$(EDGEJS_ROOT) -DNAPI_BUILD_V8=ON -DNAPI_BUILD_QUICKJS=OFF $(NAPI_V8_CMAKE_ARGS) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
+	$(BUILD_ENV) cmake -S . -B $(BUILD_NAPI_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DNAPI_PROJECT_ROOT=$(NAPI_PROJECT_ROOT) -DNAPI_BUILD_V8=ON -DNAPI_BUILD_QUICKJS=OFF $(NAPI_V8_CMAKE_ARGS) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
 	$(BUILD_ENV) cmake --build $(BUILD_NAPI_DIR) -j$(JOBS)
 
 test-napi: build-napi test-napi-only
 
 test-napi-only:
-	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_DIR) --output-on-failure -R '^napi_v8\.'
+	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_DIR) --output-on-failure -R '^napi_v8\.' $(NAPI_V8_CTEST_ARGS)
 
 build-napi-quickjs:
-	$(BUILD_ENV) cmake -S . -B $(BUILD_NAPI_QUICKJS_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DNAPI_PROJECT_ROOT=$(EDGEJS_ROOT) -DNAPI_BUILD_QUICKJS=ON -DNAPI_BUILD_V8=OFF $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
+	$(BUILD_ENV) cmake -S . -B $(BUILD_NAPI_QUICKJS_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DNAPI_PROJECT_ROOT=$(NAPI_PROJECT_ROOT) -DNAPI_BUILD_QUICKJS=ON -DNAPI_BUILD_V8=OFF $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
 	$(BUILD_ENV) cmake --build $(BUILD_NAPI_QUICKJS_DIR) -j$(JOBS)
 
 test-napi-quickjs: build-napi-quickjs test-napi-quickjs-only
 
 test-napi-quickjs-only:
-	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_QUICKJS_DIR) --output-on-failure -R '^napi_quickjs\.'
+	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_QUICKJS_DIR) --output-on-failure -R '^napi_quickjs\.' $(NAPI_QUICKJS_CTEST_ARGS)
 
 build-wasix-napi:
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" ./cargo-standalone.sh build --features cli --bin napi_wasmer

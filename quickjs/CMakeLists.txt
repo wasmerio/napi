@@ -96,7 +96,7 @@ endif()
 target_include_directories(napi_quickjs
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"
-    "${PROJECT_ROOT}/napi/lib/src"
+    "${NAPI_ROOT}/lib/src"
     "${NAPI_QUICKJS_ROOT}/src"
   PRIVATE
     "${NAPI_QUICKJS_INCLUDE_DIR}"
