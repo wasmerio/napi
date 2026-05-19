@@ -76,11 +76,8 @@ void napi_env__::prepare_teardown()
 
 void napi_env__::clear_refs_for_teardown()
 {
-  while (napi_ref__ *ref = refs_.take_next_used())
-  {
-    ref->clear_for_teardown();
-    ref->~napi_ref__();
-  }
+  for (napi_ref__ &ref : refs_)
+    ref.clear_for_teardown();
 }
 
 void napi_env__::finalize_instance_data()
