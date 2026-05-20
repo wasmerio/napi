@@ -76,8 +76,10 @@ void napi_env__::prepare_teardown()
 
 void napi_env__::clear_refs_for_teardown()
 {
+  clearing_refs_for_teardown_ = true;
   for (napi_ref__ &ref : refs_)
     ref.clear_for_teardown();
+  clearing_refs_for_teardown_ = false;
 }
 
 void napi_env__::finalize_instance_data()
@@ -232,6 +234,11 @@ void napi_env__::delete_ref_from_root_scope(napi_ref ref)
 {
   if (ref == nullptr || !ref->is_active())
     return;
+  if (clearing_refs_for_teardown_)
+  {
+    ref->clear_for_teardown();
+    return;
+  }
   refs_.destroy(ref);
 }
 

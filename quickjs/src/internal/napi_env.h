@@ -163,6 +163,7 @@ private:
 
   // Env teardown state.
   bool torn_down_ = false;
+  bool clearing_refs_for_teardown_ = false;
 };
 
 class napi_env_context_scope__
