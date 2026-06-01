@@ -27,7 +27,10 @@ fn cargo_target_dir() -> PathBuf {
 }
 
 fn native_test_dir() -> PathBuf {
-    path_from_env_or("NAPI_NATIVE_TEST_OUT_DIR", cargo_target_dir().join("native"))
+    path_from_env_or(
+        "NAPI_NATIVE_TEST_OUT_DIR",
+        cargo_target_dir().join("native"),
+    )
 }
 
 fn wasix_test_dir() -> PathBuf {
