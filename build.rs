@@ -85,7 +85,6 @@ fn main() {
         .flag_if_supported("-fno-rtti")
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
-        .define("EDGE_BUNDLED_NAPI_V8", Some("1"))
         .include(&v8.include_dir)
         .include(napi_include.to_str().unwrap())
         .include(napi_lib_src.to_str().unwrap())
