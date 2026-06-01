@@ -2044,16 +2044,20 @@ extern "C" int snapi_bridge_get_node_version(SnapiEnvState* env_state, uint32_t*
 // Object wrapping
 // ============================================================
 
+void NAPI_CDECL NoopGuestFinalizer(node_api_nogc_env /*env*/, void* /*data*/, void* /*hint*/) {}
+
 extern "C" int snapi_bridge_wrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t native_data,
-                                 uint32_t* ref_out) {
+                                 int has_finalize_cb, uint32_t* ref_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
+  node_api_basic_finalize finalize_cb =
+      has_finalize_cb ? NoopGuestFinalizer : nullptr;
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void*)(uintptr_t)native_data,
-                            nullptr, nullptr, ref_out ? &ref : nullptr);
+                            finalize_cb, nullptr, ref_out ? &ref : nullptr);
   if (s != napi_ok) return s;
   if (ref_out) *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -2086,16 +2090,16 @@ extern "C" int snapi_bridge_remove_wrap(SnapiEnvState* env_state, uint32_t obj_i
 }
 
 extern "C" int snapi_bridge_add_finalizer(SnapiEnvState* env_state, uint32_t obj_id, uint64_t data_val,
-                                          uint32_t* ref_out) {
+                                          int has_finalize_cb, uint32_t* ref_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
-  // No actual WASM callback for finalizer; just register with nullptr callback
+  if (!has_finalize_cb) return napi_invalid_arg;
   napi_ref ref = nullptr;
   napi_status s = napi_add_finalizer(env, obj, (void*)(uintptr_t)data_val,
-                                     nullptr, nullptr, ref_out ? &ref : nullptr);
+                                     NoopGuestFinalizer, nullptr, ref_out ? &ref : nullptr);
   if (s != napi_ok) return s;
   if (ref_out) *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;

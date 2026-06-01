@@ -876,6 +876,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         native_data: u64,
+        has_finalize_cb: i32,
         ref_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unwrap(env: SnapiEnv, obj_id: u32, data_out: *mut u64) -> i32;
@@ -884,6 +885,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         data_val: u64,
+        has_finalize_cb: i32,
         ref_out: *mut u32,
     ) -> i32;
     // Constructor

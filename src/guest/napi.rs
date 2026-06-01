@@ -4746,17 +4746,19 @@ fn guest_napi_wrap(
     e: i32,
     obj: i32,
     native_data: i32,
-    _finalize_cb: i32,
+    finalize_cb: i32,
     _finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
     let mut ref_out: u32 = 0;
+    let has_finalize_cb = if finalize_cb != 0 { 1 } else { 0 };
     let s = if ref_ptr > 0 {
         unsafe {
             snapi_bridge_wrap(
                 snapi_env(&env, e),
                 obj as u32,
                 native_data as u64,
+                has_finalize_cb,
                 &mut ref_out,
             )
         }
@@ -4766,6 +4768,7 @@ fn guest_napi_wrap(
                 snapi_env(&env, e),
                 obj as u32,
                 native_data as u64,
+                has_finalize_cb,
                 std::ptr::null_mut(),
             )
         }
@@ -4799,14 +4802,21 @@ fn guest_napi_add_finalizer(
     e: i32,
     obj: i32,
     data: i32,
-    _finalize_cb: i32,
+    finalize_cb: i32,
     _finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
     let mut ref_out: u32 = 0;
+    let has_finalize_cb = if finalize_cb != 0 { 1 } else { 0 };
     let s = if ref_ptr > 0 {
         unsafe {
-            snapi_bridge_add_finalizer(snapi_env(&env, e), obj as u32, data as u64, &mut ref_out)
+            snapi_bridge_add_finalizer(
+                snapi_env(&env, e),
+                obj as u32,
+                data as u64,
+                has_finalize_cb,
+                &mut ref_out,
+            )
         }
     } else {
         unsafe {
@@ -4814,6 +4824,7 @@ fn guest_napi_add_finalizer(
                 snapi_env(&env, e),
                 obj as u32,
                 data as u64,
+                has_finalize_cb,
                 std::ptr::null_mut(),
             )
         }
