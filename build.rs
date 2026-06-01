@@ -92,7 +92,12 @@ fn main() {
         .file("src/napi_bridge_init.cc")
         .file("src/edge_napi_embedder_hooks.cc")
         .file(napi_lib_src.join("napi_error_state.cc").to_str().unwrap())
-        .file(napi_lib_src.join("napi_lifetime_tracker.cc").to_str().unwrap())
+        .file(
+            napi_lib_src
+                .join("napi_lifetime_tracker.cc")
+                .to_str()
+                .unwrap(),
+        )
         .file(napi_lib_src.join("napi_periodic_gate.cc").to_str().unwrap())
         .file(napi_lib_src.join("napi_text.cc").to_str().unwrap())
         .file(
@@ -138,12 +143,7 @@ fn main() {
                 .to_str()
                 .unwrap(),
         )
-        .file(
-            napi_v8_src
-                .join("internal/napi_ref.cc")
-                .to_str()
-                .unwrap(),
-        )
+        .file(napi_v8_src.join("internal/napi_ref.cc").to_str().unwrap())
         .file(
             napi_v8_src
                 .join("internal/napi_ref_tracker.cc")
