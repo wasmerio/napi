@@ -39,6 +39,7 @@ enum ExtraLink {
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rerun-if-changed=include");
+    println!("cargo:rerun-if-changed=lib/src");
     println!("cargo:rerun-if-changed=v8/src");
     println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.cc");
     println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.h");
@@ -60,6 +61,7 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
     let napi_include = manifest_dir.join("include");
+    let napi_lib_src = manifest_dir.join("lib/src");
     let napi_v8_src = manifest_dir.join("v8/src");
     let v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
     assert!(
@@ -83,12 +85,90 @@ fn main() {
         .flag_if_supported("-fno-rtti")
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
+        .define("EDGE_BUNDLED_NAPI_V8", Some("1"))
         .include(&v8.include_dir)
         .include(napi_include.to_str().unwrap())
+        .include(napi_lib_src.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
         .file("src/edge_napi_embedder_hooks.cc")
+        .file(napi_lib_src.join("napi_error_state.cc").to_str().unwrap())
+        .file(napi_lib_src.join("napi_lifetime_tracker.cc").to_str().unwrap())
+        .file(napi_lib_src.join("napi_periodic_gate.cc").to_str().unwrap())
+        .file(napi_lib_src.join("napi_text.cc").to_str().unwrap())
+        .file(
+            napi_lib_src
+                .join("napi_typedarray_metadata.cc")
+                .to_str()
+                .unwrap(),
+        )
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
+        .file(
+            napi_v8_src
+                .join("internal/napi_escapable_handle_scope_wrapper.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_external_wrapper.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_function_callback_info.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_getter_callback_info.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_handle_scope_wrapper.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_lifetime_tracker.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_ref.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_ref_tracker.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_ref_with_data.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_ref_with_finalizer.cc")
+                .to_str()
+                .unwrap(),
+        )
+        .file(
+            napi_v8_src
+                .join("internal/napi_setter_callback_info.cc")
+                .to_str()
+                .unwrap(),
+        )
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
         .file(
             napi_v8_src
