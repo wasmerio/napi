@@ -3,6 +3,7 @@
 #include "internal/napi_external_backing_store_hint.h"
 #include "internal/napi_function.h"
 #include "internal/napi_set_property.h"
+#include "internal/napi_shared_array_buffer.h"
 #include "internal/napi_util.h"
 #include <climits>
 #include <cmath>
@@ -1346,15 +1347,15 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
-    auto rt = JS_GetRuntime(env->context());
-    auto buf = static_cast<uint8_t *>(js_malloc_rt(rt, byte_length));
-    if (byte_length > 0 && buf == nullptr)
+    auto buf = static_cast<uint8_t *>(
+        napi_shared_array_buffer__::alloc(nullptr, byte_length > 0 ? byte_length : 1));
+    if (buf == nullptr)
       return napi_generic_failure;
 
-    JSValue sab = JS_NewArrayBuffer(env->context(), buf, byte_length, &napi_util__::free_array_buffer_data, nullptr, true);
+    JSValue sab = JS_NewArrayBuffer(env->context(), buf, byte_length, nullptr, nullptr, true);
     if (JS_IsException(sab))
     {
-      js_free_rt(rt, buf);
+      napi_shared_array_buffer__::free_data(buf);
       return napi_util__::return_pending_if_caught(env, "Failed to create SharedArrayBuffer");
     }
 

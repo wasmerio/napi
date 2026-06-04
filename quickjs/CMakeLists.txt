@@ -85,6 +85,7 @@ add_library(napi_quickjs STATIC
   src/internal/napi_scope.cc
   src/internal/napi_serdes.cc
   src/internal/napi_set_property.cc
+  src/internal/napi_shared_array_buffer.cc
   src/internal/napi_util.cc
   src/internal/napi_value.cc
   src/unofficial_napi.cc

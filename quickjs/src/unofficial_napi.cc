@@ -6,6 +6,7 @@
 #include "internal/napi_external.h"
 #include "internal/napi_promises.h"
 #include "internal/napi_util.h"
+#include "internal/napi_shared_array_buffer.h"
 #include "internal/quickjs_trace.h"
 #include "node_api.h"
 
@@ -175,6 +176,7 @@ extern "C"
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
             return napi_generic_failure;
+        napi_shared_array_buffer__::install(rt);
         JS_SetCanBlock(rt, true);
         if (options != nullptr)
         {
