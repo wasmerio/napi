@@ -1,5 +1,6 @@
 #include "internal/napi_serdes.h"
 
+#include "internal/napi_shared_array_buffer.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
 #include "node_api.h"
@@ -25,7 +26,9 @@ namespace quickjs::detail
     struct napi_serdes__::serialized_value
     {
         size_t length = 0;
-        uint8_t bytes[];
+        size_t sab_tab_len = 0;
+        uint8_t **sab_tab = nullptr;
+        uint8_t *bytes = nullptr;
     };
 
     // Brief: ReadBytesFromArrayBufferLike belongs to the serdes compatibility layer.
@@ -231,8 +234,18 @@ namespace quickjs::detail
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value napi_serdes__::serializer_write_header(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::serializer_write_header(napi_env env, napi_callback_info info)
     {
+        napi_value this_arg = nullptr;
+        size_t argc = 0;
+        if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok)
+            return nullptr;
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
+        if (serializer == nullptr)
+        {
+            napi_throw_error(env, nullptr, "Invalid Serializer state");
+            return nullptr;
+        }
         return napi_util__::undefined_value(env);
     }
 
@@ -258,10 +271,12 @@ namespace quickjs::detail
 
         napi_value value = argc >= 1 && argv[0] != nullptr ? argv[0] : napi_util__::undefined_value(env);
         size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
-                                        &size,
-                                        napi_quickjs_value_inner(env, value),
-                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        uint8_t *bytes = JS_WriteObject2(napi_util__::context(env),
+                                         &size,
+                                         napi_quickjs_value_inner(env, value),
+                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                                         &sab_tab);
         if (bytes == nullptr)
         {
             if (!JS_HasException(napi_util__::context(env)))
@@ -271,6 +286,7 @@ namespace quickjs::detail
 
         serializer->bytes.insert(serializer->bytes.end(), bytes, bytes + size);
         js_free(napi_util__::context(env), bytes);
+        js_free(napi_util__::context(env), sab_tab.tab);
 
         napi_value result = nullptr;
         napi_get_boolean(env, true, &result);
@@ -308,8 +324,31 @@ namespace quickjs::detail
     // Inputs stay as QuickJS or N-API handles owned by the caller.
     // Failures either preserve QuickJS exception state or report N-API status.
     // Keep changes narrow so this compatibility bridge remains easy to remove.
-    napi_value napi_serdes__::serializer_transfer_array_buffer(napi_env env, napi_callback_info /*info*/)
+    napi_value napi_serdes__::serializer_transfer_array_buffer(napi_env env, napi_callback_info info)
     {
+        napi_value this_arg = nullptr;
+        napi_value argv[2] = {nullptr, nullptr};
+        size_t argc = 2;
+        if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok)
+            return nullptr;
+        napi_serdes__::serializer *serializer = napi_serdes__::get_serializer(env, this_arg);
+        if (serializer == nullptr)
+        {
+            napi_throw_error(env, nullptr, "Invalid Serializer state");
+            return nullptr;
+        }
+
+        uint32_t id = 0;
+        if (argc < 2 || napi_get_value_uint32(env, argv[0], &id) != napi_ok)
+            return napi_util__::undefined_value(env);
+        (void)id;
+
+        if (!JS_IsArrayBuffer(napi_quickjs_value_inner(env, argv[1])))
+        {
+            napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "arrayBuffer must be an ArrayBuffer");
+            return nullptr;
+        }
+
         return napi_util__::undefined_value(env);
     }
 
@@ -515,10 +554,13 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        JSValue value = JS_ReadObject(napi_util__::context(env),
-                                      deserializer->bytes.data() + deserializer->offset,
-                                      deserializer->bytes.size() - deserializer->offset,
-                                      JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        JSValue value = JS_ReadObject2(napi_util__::context(env),
+                                       deserializer->bytes.data() + deserializer->offset,
+                                       deserializer->bytes.size() - deserializer->offset,
+                                       JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE,
+                                       &sab_tab);
+        js_free(napi_util__::context(env), sab_tab.tab);
         if (JS_IsException(value))
             return nullptr;
         deserializer->offset = deserializer->bytes.size();
@@ -667,22 +709,55 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env) || value == nullptr || payload_out == nullptr)
             return napi_invalid_arg;
         size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
-                                        &size,
-                                        napi_quickjs_value_inner(env, value),
-                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        uint8_t *bytes = JS_WriteObject2(napi_util__::context(env),
+                                         &size,
+                                         napi_quickjs_value_inner(env, value),
+                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                                         &sab_tab);
         if (bytes == nullptr)
             return napi_generic_failure;
-        auto *payload = static_cast<serialized_value *>(std::malloc(sizeof(serialized_value) + size));
+        auto *payload = new (std::nothrow) serialized_value();
         if (payload == nullptr)
         {
             js_free(napi_util__::context(env), bytes);
+            js_free(napi_util__::context(env), sab_tab.tab);
             return napi_generic_failure;
         }
         payload->length = size;
+        payload->sab_tab_len = 0;
+        payload->sab_tab = nullptr;
+        payload->bytes = nullptr;
         if (size > 0)
+        {
+            payload->bytes = new (std::nothrow) uint8_t[size];
+            if (payload->bytes == nullptr)
+            {
+                delete payload;
+                js_free(napi_util__::context(env), bytes);
+                js_free(napi_util__::context(env), sab_tab.tab);
+                return napi_generic_failure;
+            }
             std::memcpy(payload->bytes, bytes, size);
+        }
+        if (sab_tab.len > 0)
+        {
+            payload->sab_tab = new (std::nothrow) uint8_t *[sab_tab.len];
+            if (payload->sab_tab == nullptr)
+            {
+                delete[] payload->bytes;
+                delete payload;
+                js_free(napi_util__::context(env), bytes);
+                js_free(napi_util__::context(env), sab_tab.tab);
+                return napi_generic_failure;
+            }
+            std::memcpy(payload->sab_tab, sab_tab.tab, sizeof(payload->sab_tab[0]) * sab_tab.len);
+            payload->sab_tab_len = sab_tab.len;
+            for (size_t i = 0; i < payload->sab_tab_len; i++)
+                napi_shared_array_buffer__::dup_data(payload->sab_tab[i]);
+        }
         js_free(napi_util__::context(env), bytes);
+        js_free(napi_util__::context(env), sab_tab.tab);
         *payload_out = payload;
         return napi_ok;
     }
@@ -694,10 +769,13 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env) || payload == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         auto *serialized = static_cast<serialized_value *>(payload);
-        JSValue value = JS_ReadObject(napi_util__::context(env),
-                                      serialized->bytes,
-                                      serialized->length,
-                                      JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        JSValue value = JS_ReadObject2(napi_util__::context(env),
+                                       serialized->bytes,
+                                       serialized->length,
+                                       JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE,
+                                       &sab_tab);
+        js_free(napi_util__::context(env), sab_tab.tab);
         if (JS_IsException(value))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env, value, result_out);
@@ -705,6 +783,14 @@ namespace quickjs::detail
 
     void napi_serdes__::release_serialized_value(void *payload)
     {
-        std::free(payload);
+        auto *serialized = static_cast<serialized_value *>(payload);
+        if (serialized != nullptr)
+        {
+            for (size_t i = 0; i < serialized->sab_tab_len; i++)
+                napi_shared_array_buffer__::free_data(serialized->sab_tab[i]);
+            delete[] serialized->sab_tab;
+            delete[] serialized->bytes;
+        }
+        delete serialized;
     }
 }
