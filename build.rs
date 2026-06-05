@@ -380,7 +380,7 @@ fn prebuilt_asset_name() -> Result<(&'static str, &'static str), String> {
         target_arch.as_str(),
         target_env.as_str(),
     ) {
-        ("macos", "aarch64", _) => Ok(("v8-darwin-arm64.tar.xz", "darwin-arm64")),
+        ("macos", "aarch64", _) => Ok(("v8-darwin-aarch64.tar.xz", "darwin-arm64")),
         ("macos", "x86_64", _) => Ok(("v8-darwin-amd64.tar.xz", "darwin-amd64")),
         ("linux", "x86_64", "gnu") => Ok(("v8-linux-amd64.tar.xz", "linux-amd64")),
         ("linux", "x86_64", "musl") => Ok(("v8-linux-musl-amd64.tar.xz", "linux-musl-amd64")),
