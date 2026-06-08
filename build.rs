@@ -205,6 +205,10 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" || target_os == "ios" {
         println!("cargo:rustc-link-lib=dylib=c++");
+    } else if target_os == "windows" {
+        println!("cargo:rustc-link-lib=winmm");
+        println!("cargo:rustc-link-lib=dbghelp");
+        println!("cargo:rustc-link-lib=shlwapi");
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-lib=dylib=dl");
@@ -427,9 +431,13 @@ fn resolve_primary_library(dir: &Path) -> Option<PathBuf> {
         "libv8.a",
         "libv8.so",
         "libv8.dylib",
+        "libv8.lib",
+        "v8.lib",
         "libv8_monolith.a",
         "libv8_monolith.so",
         "libv8_monolith.dylib",
+        "libv8_monolith.lib",
+        "v8_monolith.lib",
     ] {
         let path = dir.join(candidate);
         if path.exists() {
@@ -511,7 +519,11 @@ fn emit_library_link(path: &Path) {
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or_default();
-    let kind = if extension == "a" { "static" } else { "dylib" };
+    let kind = if extension == "a" || extension == "lib" {
+        "static"
+    } else {
+        "dylib"
+    };
     let name = link_name_from_path(path);
     println!("cargo:rustc-link-lib={kind}={name}");
 }
@@ -546,6 +558,7 @@ fn link_name_from_path(path: &Path) -> String {
         .strip_suffix(".a")
         .or_else(|| without_prefix.strip_suffix(".so"))
         .or_else(|| without_prefix.strip_suffix(".dylib"))
+        .or_else(|| without_prefix.strip_suffix(".lib"))
         .unwrap_or(without_prefix);
     without_suffix.to_string()
 }
