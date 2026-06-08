@@ -79,9 +79,14 @@ fn main() {
         .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
 
     let mut build = cc::Build::new();
+    if cfg!(target_os = "windows") {
+        build
+            .flag("/std:c++20");
+    } else {
+        build.flag("-std=c++20");
+    }
     build
         .cpp(true)
-        .flag_if_supported("-std=c++20")
         .flag_if_supported("-fno-rtti")
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
