@@ -2151,12 +2151,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     return napi_pending_exception;
   }
 
-  v8::Local<v8::String> code_str =
-      v8::String::NewFromUtf8(env->isolate,
-                              source_text.c_str(),
-                              v8::NewStringType::kNormal,
-                              static_cast<int>(source_text.size()))
-          .ToLocalChecked();
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -2165,13 +2159,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     if (!host_raw.IsEmpty() && host_raw->IsSymbol()) {
       host_id_symbol = host_raw.As<v8::Symbol>();
     }
-  }
-
-  v8::ScriptCompiler::CachedData* cached_data = nullptr;
-  if (bytecode_record != nullptr && !bytecode_record->bytes.empty()) {
-    cached_data = new v8::ScriptCompiler::CachedData(
-        bytecode_record->bytes.data(), static_cast<int>(bytecode_record->bytes.size()),
-        v8::ScriptCompiler::CachedData::BufferNotOwned);
   }
 
   std::vector<v8::Local<v8::Object>> context_extensions;
@@ -2187,63 +2174,107 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
-  std::vector<v8::Local<v8::String>> params;
-  if (!IsNullish(env, params_or_undefined)) {
-    v8::Local<v8::Value> value = napi_v8_unwrap_value(params_or_undefined);
-    if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
-    v8::Local<v8::Array> array = value.As<v8::Array>();
-    params.reserve(array->Length());
-    for (uint32_t i = 0; i < array->Length(); ++i) {
-      v8::Local<v8::Value> item;
-      if (!array->Get(current, i).ToLocal(&item) || !item->IsString()) return napi_invalid_arg;
-      params.push_back(item.As<v8::String>());
+  std::vector<std::string> param_strings;
+  if (!ReadParamsArray(env, params_or_undefined, &param_strings)) return napi_invalid_arg;
+
+  // Artifact fast path: bytecode_compile/deserialize already built this exact
+  // function (same context, offsets, params, filename, host symbol) — reuse
+  // it instead of paying a second code-cache consume.
+  v8::Local<v8::Function> fn;
+  v8::Local<v8::Symbol> effective_symbol = host_id_symbol;
+  bool consumed_cached_data = false;
+  bool cached_data_rejected = false;
+  if (bytecode_record != nullptr && !bytecode_record->function.IsEmpty() &&
+      context_extensions.empty() &&
+      bytecode_record->function_context.Get(isolate) == parsing_context &&
+      bytecode_record->line_offset == line_offset &&
+      bytecode_record->column_offset == column_offset &&
+      bytecode_record->params == param_strings &&
+      bytecode_record->filename_utf8 == ToUtf8String(env, filename, "")) {
+    v8::Local<v8::Symbol> record_symbol;
+    if (!bytecode_record->host_symbol.IsEmpty()) {
+      record_symbol = bytecode_record->host_symbol.Get(isolate);
+    }
+    // bytecode_compile/deserialize default CJS-function records to the
+    // loader's dynamic-import symbol; a caller passing no symbol gets the
+    // artifact it asked those APIs to build.
+    const bool host_symbol_matches =
+        record_symbol == host_id_symbol ||
+        (host_id_symbol.IsEmpty() && !record_symbol.IsEmpty() &&
+         record_symbol == DefaultCjsHostSymbol(env));
+    if (host_symbol_matches) {
+      fn = bytecode_record->function.Get(isolate);
+      effective_symbol = record_symbol;
     }
   }
 
-  v8::ScriptOrigin origin(filename_str,
-                          line_offset,
-                          column_offset,
-                          true,
-                          -1,
-                          v8::Local<v8::Value>(),
-                          false,
-                          false,
-                          false,
-                          HostDefinedOptions(isolate, host_id_symbol));
+  if (fn.IsEmpty()) {
+    v8::Local<v8::String> code_str =
+        v8::String::NewFromUtf8(env->isolate,
+                                source_text.c_str(),
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(source_text.size()))
+            .ToLocalChecked();
 
-  v8::ScriptCompiler::Source source_obj(code_str, origin, cached_data);
-  v8::ScriptCompiler::CompileOptions options = source_obj.GetCachedData() != nullptr
-                                                   ? v8::ScriptCompiler::kConsumeCodeCache
-                                                   : v8::ScriptCompiler::kNoCompileOptions;
-
-  v8::TryCatch try_catch(isolate);
-  v8::Context::Scope parsing_scope(parsing_context);
-  v8::MaybeLocal<v8::Function> maybe_fn = v8::ScriptCompiler::CompileFunction(
-      parsing_context,
-      &source_obj,
-      params.size(),
-      params.empty() ? nullptr : params.data(),
-      context_extensions.size(),
-      context_extensions.empty() ? nullptr : context_extensions.data(),
-      options,
-      v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason);
-
-  v8::Local<v8::Function> fn;
-  if (!maybe_fn.ToLocal(&fn)) {
-    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      if (!try_catch.Message().IsEmpty()) {
-        unofficial_napi_internal::AttachSyntaxArrowMessage(
-            isolate, parsing_context, try_catch.Exception(), try_catch.Message());
-      }
-      return ThrowTryCatchException(env, try_catch);
+    v8::ScriptCompiler::CachedData* cached_data = nullptr;
+    if (bytecode_record != nullptr && !bytecode_record->bytes.empty()) {
+      cached_data = new v8::ScriptCompiler::CachedData(
+          bytecode_record->bytes.data(), static_cast<int>(bytecode_record->bytes.size()),
+          v8::ScriptCompiler::CachedData::BufferNotOwned);
     }
-    return napi_generic_failure;
+
+    std::vector<v8::Local<v8::String>> params = ToV8Params(isolate, param_strings);
+
+    v8::ScriptOrigin origin(filename_str,
+                            line_offset,
+                            column_offset,
+                            true,
+                            -1,
+                            v8::Local<v8::Value>(),
+                            false,
+                            false,
+                            false,
+                            HostDefinedOptions(isolate, host_id_symbol));
+
+    v8::ScriptCompiler::Source source_obj(code_str, origin, cached_data);
+    v8::ScriptCompiler::CompileOptions options = source_obj.GetCachedData() != nullptr
+                                                     ? v8::ScriptCompiler::kConsumeCodeCache
+                                                     : v8::ScriptCompiler::kNoCompileOptions;
+
+    v8::TryCatch try_catch(isolate);
+    v8::Context::Scope parsing_scope(parsing_context);
+    v8::MaybeLocal<v8::Function> maybe_fn = v8::ScriptCompiler::CompileFunction(
+        parsing_context,
+        &source_obj,
+        params.size(),
+        params.empty() ? nullptr : params.data(),
+        context_extensions.size(),
+        context_extensions.empty() ? nullptr : context_extensions.data(),
+        options,
+        v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason);
+
+    if (!maybe_fn.ToLocal(&fn)) {
+      if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+        if (!try_catch.Message().IsEmpty()) {
+          unofficial_napi_internal::AttachSyntaxArrowMessage(
+              isolate, parsing_context, try_catch.Exception(), try_catch.Message());
+        }
+        return ThrowTryCatchException(env, try_catch);
+      }
+      return napi_generic_failure;
+    }
+
+    consumed_cached_data =
+        options == v8::ScriptCompiler::kConsumeCodeCache && source_obj.GetCachedData() != nullptr;
+    if (consumed_cached_data) {
+      cached_data_rejected = source_obj.GetCachedData()->rejected;
+    }
   }
 
   SetApiPrivate(current,
                 fn.As<v8::Object>(),
                 "node:host_defined_option_symbol",
-                host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
+                effective_symbol.IsEmpty() ? v8::Undefined(isolate) : effective_symbol.As<v8::Value>());
 
   v8::Local<v8::Object> out = v8::Object::New(isolate);
   if (!SetNamed(current, out, "function", fn)) return napi_generic_failure;
@@ -2252,11 +2283,11 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   if (!SetNamed(current, out, "sourceURL", fn_origin.ResourceName())) return napi_generic_failure;
   if (!SetNamed(current, out, "sourceMapURL", fn_origin.SourceMapUrl())) return napi_generic_failure;
 
-  if (options == v8::ScriptCompiler::kConsumeCodeCache && source_obj.GetCachedData() != nullptr) {
+  if (consumed_cached_data) {
     if (!SetNamed(current,
                   out,
                   "cachedDataRejected",
-                  v8::Boolean::New(isolate, source_obj.GetCachedData()->rejected))) {
+                  v8::Boolean::New(isolate, cached_data_rejected))) {
       return napi_generic_failure;
     }
   }

@@ -3,6 +3,9 @@
 
 #include <quickjs.h>
 
+#define XXH_INLINE_ALL
+#include "internal/xxhash.h"
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -19,13 +22,7 @@ namespace quickjs::detail
 
     inline uint64_t napi_bytecode_source_hash(const std::string &source)
     {
-        uint64_t hash = 0xcbf29ce484222325ull;
-        for (unsigned char ch : source)
-        {
-            hash ^= ch;
-            hash *= 1099511628211ull;
-        }
-        return hash;
+        return XXH3_64bits(source.data(), source.size());
     }
 
     inline void napi_bytecode_append_prefix(std::vector<uint8_t> *out, uint64_t source_hash)
