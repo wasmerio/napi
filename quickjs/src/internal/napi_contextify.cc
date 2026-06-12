@@ -457,8 +457,39 @@ namespace quickjs::detail
                                                     const std::string &source,
                                                     const std::string &source_url,
                                                     const std::vector<std::string> &params,
-                                                    std::string *diagnostic_source_out) const
+                                                    std::string *diagnostic_source_out,
+                                                    const uint8_t *cached_data,
+                                                    size_t cached_data_size,
+                                                    bool produce_cached_data,
+                                                    std::vector<uint8_t> *produced_cache_out,
+                                                    bool *cache_rejected_out) const
     {
+        if (cache_rejected_out != nullptr)
+            *cache_rejected_out = false;
+        if (cached_data != nullptr && cached_data_size > 0)
+        {
+            // Bytecode from a different quickjs build (or corrupted data) makes
+            // JS_ReadObject throw; treat it as a stale cache and recompile.
+            JSValue restored = JS_ReadObject(ctx, cached_data, cached_data_size, JS_READ_OBJ_BYTECODE);
+            if (JS_IsException(restored))
+            {
+                JSValue exc = JS_GetException(ctx);
+                JS_FreeValue(ctx, exc);
+                if (cache_rejected_out != nullptr)
+                    *cache_rejected_out = true;
+            }
+            else
+            {
+                if (diagnostic_source_out != nullptr)
+                    *diagnostic_source_out = source;
+                return JS_EvalFunction(ctx, restored);
+            }
+        }
+
+        // NOTE: this wrapper text, the parameter list, the shebang blanking in
+        // prepare_function_body_source(), and the sourceURL suffix all shape the
+        // bytecode serialized below. Changing any of them requires bumping
+        // edge_bytecode_cache::kFormatVersion so stale sidecars are rejected.
         std::string function_body = prepare_function_body_source(source);
         std::string diagnostic_source = source;
         if (!source.empty() && !source_url.empty())
@@ -491,6 +522,16 @@ namespace quickjs::detail
         JSValue bytecode = JS_Eval2(ctx, compile_source.c_str(), compile_source.size(), &options);
         if (JS_IsException(bytecode))
             return JS_EXCEPTION;
+        if (produce_cached_data && produced_cache_out != nullptr)
+        {
+            size_t serialized_size = 0;
+            uint8_t *serialized = JS_WriteObject(ctx, &serialized_size, bytecode, JS_WRITE_OBJ_BYTECODE);
+            if (serialized != nullptr)
+            {
+                produced_cache_out->assign(serialized, serialized + serialized_size);
+                js_free(ctx, serialized);
+            }
+        }
         return JS_EvalFunction(ctx, bytecode);
     }
 
@@ -816,8 +857,6 @@ namespace quickjs::detail
                                                     napi_value host_defined_option_id,
                                                     napi_value *result_out)
     {
-        (void)cached_data_or_undefined;
-        (void)produce_cached_data;
         (void)context_extensions_or_undefined;
         (void)host_defined_option_id;
         if (!napi_util__::check_env(env_) || code == nullptr || result_out == nullptr)
@@ -858,8 +897,30 @@ namespace quickjs::detail
 
         JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
         napi_env_context_scope__ compile_scope{env_, compile_ctx};
+
+        const uint8_t *cached_bytes = nullptr;
+        size_t cached_size = 0;
+        if (cached_data_or_undefined != nullptr)
+        {
+            JSValue cached_value = napi_quickjs_value_inner(env_, cached_data_or_undefined);
+            if (!JS_IsUndefined(cached_value) && !JS_IsNull(cached_value))
+            {
+                cached_bytes = JS_GetUint8Array(compile_ctx, &cached_size, cached_value);
+                if (cached_bytes == nullptr)
+                {
+                    JSValue exc = JS_GetException(compile_ctx);
+                    JS_FreeValue(compile_ctx, exc);
+                    cached_size = 0;
+                }
+            }
+        }
+
         std::string diagnostic_source;
-        JSValue fn = compile_cjs_function(compile_ctx, source, source_url, params, &diagnostic_source);
+        std::vector<uint8_t> produced_cache;
+        bool cache_rejected = false;
+        JSValue fn = compile_cjs_function(compile_ctx, source, source_url, params, &diagnostic_source,
+                                          cached_bytes, cached_size, produce_cached_data,
+                                          &produced_cache, &cache_rejected);
         if (JS_IsException(fn))
         {
             JSValue exc = JS_GetException(compile_ctx);
@@ -874,6 +935,25 @@ namespace quickjs::detail
         if (!source_url.empty())
             napi_util__::set_string_property(compile_ctx, out, "sourceURL", source_url);
         JS_SetPropertyStr(compile_ctx, out, "sourceMapURL", JS_UNDEFINED);
+        if (cached_bytes != nullptr && cached_size > 0)
+            JS_SetPropertyStr(compile_ctx, out, "cachedDataRejected", JS_NewBool(compile_ctx, cache_rejected));
+        if (produce_cached_data)
+        {
+            JS_SetPropertyStr(compile_ctx, out, "cachedDataProduced",
+                              JS_NewBool(compile_ctx, !produced_cache.empty()));
+            if (!produced_cache.empty())
+            {
+                JSValue cache_array = JS_NewUint8ArrayCopy(compile_ctx, produced_cache.data(),
+                                                           produced_cache.size());
+                if (!JS_IsException(cache_array))
+                    JS_SetPropertyStr(compile_ctx, out, "cachedData", cache_array);
+                else
+                {
+                    JSValue exc = JS_GetException(compile_ctx);
+                    JS_FreeValue(compile_ctx, exc);
+                }
+            }
+        }
         *result_out = env_->wrap_value_in_current_scope(compile_ctx, out, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }

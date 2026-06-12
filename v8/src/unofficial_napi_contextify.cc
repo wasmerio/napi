@@ -1848,9 +1848,12 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
                           HostDefinedOptions(isolate, host_id_symbol));
 
   v8::ScriptCompiler::Source source_obj(code_str, origin, cached_data);
-  v8::ScriptCompiler::CompileOptions options = source_obj.GetCachedData() != nullptr
-                                                   ? v8::ScriptCompiler::kConsumeCodeCache
-                                                   : v8::ScriptCompiler::kNoCompileOptions;
+  // Compile eagerly when producing a code cache so inner functions are
+  // serialized too; a lazily-compiled cache only covers the outer function.
+  v8::ScriptCompiler::CompileOptions options =
+      source_obj.GetCachedData() != nullptr ? v8::ScriptCompiler::kConsumeCodeCache
+      : produce_cached_data                 ? v8::ScriptCompiler::kEagerCompile
+                                            : v8::ScriptCompiler::kNoCompileOptions;
 
   v8::TryCatch try_catch(isolate);
   v8::Context::Scope parsing_scope(parsing_context);

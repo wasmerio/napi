@@ -92,7 +92,12 @@ namespace quickjs::detail
                                      const std::string &source,
                                      const std::string &source_url,
                                      const std::vector<std::string> &params,
-                                     std::string *diagnostic_source_out) const;
+                                     std::string *diagnostic_source_out,
+                                     const uint8_t *cached_data = nullptr,
+                                     size_t cached_data_size = 0,
+                                     bool produce_cached_data = false,
+                                     std::vector<uint8_t> *produced_cache_out = nullptr,
+                                     bool *cache_rejected_out = nullptr) const;
         bool can_parse_as_module(const std::string &source,
                                  const std::string &source_url) const;
         void set_int32_property(JSValueConst object, const char *name, int32_t value) const;
