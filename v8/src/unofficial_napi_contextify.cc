@@ -1440,7 +1440,8 @@ struct BytecodeRecord {
   // Live artifact (one per shape). The function artifact is bound to the
   // context and host-defined-option symbol it was compiled with; consumers
   // re-consume `bytes` when their compile inputs differ. (Script shape keeps
-  // no live artifact: run_script always re-consumes `bytes`.)
+  // no live artifact: run_script always re-consumes `bytes`, and V8's
+  // CompilationCache already deduplicates compiling identical source.)
   v8::Global<v8::Function> function;
   v8::Global<v8::Context> function_context;
   v8::Global<v8::Module> module;
@@ -1948,6 +1949,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
       bytecode_record->shape != unofficial_napi_bytecode_shape_script) {
     return napi_invalid_arg;
   }
+
   v8::Local<v8::String> code =
       bytecode_record != nullptr
           ? v8::String::NewFromUtf8(isolate, bytecode_record->source_utf8.c_str(),
