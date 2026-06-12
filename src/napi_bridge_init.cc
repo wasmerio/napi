@@ -430,6 +430,14 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->next_esc_scope_id = 1;
   state->module_wrap_handles.clear();
   state->next_module_wrap_handle_id = 1;
+  // Bytecode handles own engine resources outside any napi scope (V8
+  // Globals / QuickJS JSValue refcounts), so they must be released
+  // explicitly — env teardown does not reclaim them.
+  for (auto& entry : state->bytecode_handles) {
+    if (entry.second != nullptr) {
+      (void)unofficial_napi_bytecode_release(state->env, entry.second);
+    }
+  }
   state->bytecode_handles.clear();
   state->next_bytecode_handle_id = 1;
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
