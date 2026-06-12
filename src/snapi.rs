@@ -292,7 +292,8 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_contextify_run_script(
         env: SnapiEnv,
         sandbox_or_null_id: u32,
-        source_id: u32,
+        source_text_id: u32,
+        source_bytecode_id: u32,
         filename_id: u32,
         line_offset: i32,
         column_offset: i32,
@@ -309,12 +310,11 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_compile_function(
         env: SnapiEnv,
-        code_id: u32,
+        source_text_id: u32,
+        source_bytecode_id: u32,
         filename_id: u32,
         line_offset: i32,
         column_offset: i32,
-        cached_data_id: u32,
-        produce_cached_data: i32,
         parsing_context_id: u32,
         context_extensions_id: u32,
         params_id: u32,
@@ -323,20 +323,45 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
         env: SnapiEnv,
-        code_id: u32,
+        source_text_id: u32,
+        source_bytecode_id: u32,
         filename_id: u32,
         is_sea_main: i32,
         should_detect_module: i32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_create_cached_data(
+    pub fn snapi_bridge_unofficial_bytecode_compile(
         env: SnapiEnv,
-        code_id: u32,
+        source_text_id: u32,
         filename_id: u32,
+        shape: i32,
+        params_id: u32,
+        host_defined_option_id: u32,
         line_offset: i32,
         column_offset: i32,
+        bytecode_out: *mut u32,
+        can_parse_as_module_out: *mut u8,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_bytecode_deserialize(
+        env: SnapiEnv,
+        bytes: *const u8,
+        byte_length: usize,
+        source_text_id: u32,
+        filename_id: u32,
+        shape: i32,
+        params_id: u32,
         host_defined_option_id: u32,
-        result_out: *mut u32,
+        bytecode_out: *mut u32,
+        rejected_out: *mut u8,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_bytecode_serialize(
+        env: SnapiEnv,
+        bytecode_id: u32,
+        buffer_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_bytecode_release(
+        env: SnapiEnv,
+        bytecode_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
         env: SnapiEnv,
@@ -355,10 +380,11 @@ unsafe extern "C" {
         wrapper_id: u32,
         url_id: u32,
         context_id: u32,
-        source_id: u32,
+        source_text_id: u32,
+        source_bytecode_id: u32,
         line_offset: i32,
         column_offset: i32,
-        cached_data_or_id: u32,
+        host_defined_option_id: u32,
         handle_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_synthetic(
