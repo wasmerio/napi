@@ -47,7 +47,7 @@ namespace quickjs::detail
                                  napi_value host_defined_option_id,
                                  napi_value *result_out);
         napi_status run_script(napi_value sandbox_or_null,
-                               napi_value source,
+                               const unofficial_napi_js_source *source,
                                napi_value filename,
                                int32_t line_offset,
                                int32_t column_offset,
@@ -58,12 +58,10 @@ namespace quickjs::detail
                                napi_value host_defined_option_id,
                                napi_value *result_out);
         napi_status dispose_context(napi_value sandbox_or_context_global);
-        napi_status compile_function(napi_value code,
+        napi_status compile_function(const unofficial_napi_js_source *source,
                                      napi_value filename,
                                      int32_t line_offset,
                                      int32_t column_offset,
-                                     napi_value cached_data_or_undefined,
-                                     bool produce_cached_data,
                                      napi_value parsing_context_or_undefined,
                                      napi_value context_extensions_or_undefined,
                                      napi_value params_or_undefined,
@@ -74,12 +72,26 @@ namespace quickjs::detail
                                            napi_value resource_name_or_undefined,
                                            bool cjs_var_in_scope,
                                            bool *result_out);
-        napi_status create_cached_data(napi_value code,
-                                       napi_value filename,
-                                       int32_t line_offset,
-                                       int32_t column_offset,
-                                       napi_value host_defined_option_id,
-                                       napi_value *cached_data_buffer_out);
+        napi_status bytecode_compile(napi_value source_text,
+                                     napi_value filename,
+                                     int32_t shape,
+                                     napi_value params_or_undefined,
+                                     napi_value host_defined_option_id,
+                                     int32_t line_offset,
+                                     int32_t column_offset,
+                                     void **bytecode_out,
+                                     bool *can_parse_as_module_out);
+        napi_status bytecode_deserialize(const uint8_t *bytes,
+                                         size_t byte_length,
+                                         napi_value source_text,
+                                         napi_value filename,
+                                         int32_t shape,
+                                         napi_value params_or_undefined,
+                                         napi_value host_defined_option_id,
+                                         void **bytecode_out,
+                                         bool *rejected_out);
+        napi_status bytecode_serialize(void *bytecode, napi_value *buffer_out);
+        napi_status bytecode_release(void *bytecode);
 
     private:
         bool compile_trace_enabled() const;

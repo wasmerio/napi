@@ -1,5 +1,6 @@
 #include "internal/napi_contextify.h"
 
+#include "internal/napi_bytecode.h"
 #include "internal/napi_env.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -752,7 +754,7 @@ namespace quickjs::detail
     }
 
     napi_status napi_contextify__::run_script(napi_value sandbox_or_null,
-                                              napi_value source,
+                                              const unofficial_napi_js_source *source,
                                               napi_value filename,
                                               int32_t line_offset,
                                               int32_t column_offset,
@@ -768,7 +770,12 @@ namespace quickjs::detail
         (void)display_errors;
         (void)break_on_sigint;
         (void)break_on_first_line;
-        if (!napi_util__::check_env(env_) || source == nullptr || result_out == nullptr)
+        if (!napi_util__::check_env(env_) || source == nullptr ||
+            (source->text == nullptr && source->bytecode == nullptr) || result_out == nullptr)
+            return napi_invalid_arg;
+        auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+        if (bytecode_record != nullptr &&
+            bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
         context_record *record = nullptr;
@@ -787,7 +794,8 @@ namespace quickjs::detail
             }
         }
 
-        std::string src = napi_util__::to_utf8(env_, source);
+        std::string src = bytecode_record != nullptr ? bytecode_record->source_utf8
+                                                     : napi_util__::to_utf8(env_, source->text);
         std::string label = filename == nullptr ? "<contextify>" : napi_util__::to_utf8(env_, filename);
         JSValue result = JS_UNDEFINED;
         if (record != nullptr)
@@ -825,7 +833,15 @@ namespace quickjs::detail
             return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
-        result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
+        if (bytecode_record != nullptr && !JS_IsUndefined(bytecode_record->artifact))
+        {
+            // JS_EvalFunction consumes its argument; the artifact stays reusable.
+            result = JS_EvalFunction(ctx_, JS_DupValue(ctx_, bytecode_record->artifact));
+        }
+        else
+        {
+            result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
+        }
         env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
         if (JS_IsException(result))
             return napi_util__::return_pending_if_caught(env_, "Exception while running contextify script");
@@ -845,12 +861,10 @@ namespace quickjs::detail
         return define_contextify_internal_property(env_, ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
     }
 
-    napi_status napi_contextify__::compile_function(napi_value code,
+    napi_status napi_contextify__::compile_function(const unofficial_napi_js_source *source,
                                                     napi_value filename,
                                                     int32_t line_offset,
                                                     int32_t column_offset,
-                                                    napi_value cached_data_or_undefined,
-                                                    bool produce_cached_data,
                                                     napi_value parsing_context_or_undefined,
                                                     napi_value context_extensions_or_undefined,
                                                     napi_value params_or_undefined,
@@ -859,7 +873,13 @@ namespace quickjs::detail
     {
         (void)context_extensions_or_undefined;
         (void)host_defined_option_id;
-        if (!napi_util__::check_env(env_) || code == nullptr || result_out == nullptr)
+        if (!napi_util__::check_env(env_) || source == nullptr ||
+            (source->text == nullptr && source->bytecode == nullptr) || result_out == nullptr)
+            return napi_invalid_arg;
+
+        auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+        if (bytecode_record != nullptr &&
+            bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function)
             return napi_invalid_arg;
 
         std::vector<std::string> params;
@@ -880,7 +900,8 @@ namespace quickjs::detail
             }
         }
 
-        std::string source = napi_util__::to_utf8(env_, code);
+        std::string source_text = bytecode_record != nullptr ? bytecode_record->source_utf8
+                                                             : napi_util__::to_utf8(env_, source->text);
         std::string source_url;
         if (filename != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env_, filename)) && !JS_IsNull(napi_quickjs_value_inner(env_, filename)))
         {
@@ -898,36 +919,36 @@ namespace quickjs::detail
         JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
         napi_env_context_scope__ compile_scope{env_, compile_ctx};
 
-        const uint8_t *cached_bytes = nullptr;
-        size_t cached_size = 0;
-        if (cached_data_or_undefined != nullptr)
+        JSValue fn = JS_UNDEFINED;
+        bool have_fn = false;
+        if (bytecode_record != nullptr && compile_ctx == ctx_ &&
+            !JS_IsUndefined(bytecode_record->artifact))
         {
-            JSValue cached_value = napi_quickjs_value_inner(env_, cached_data_or_undefined);
-            if (!JS_IsUndefined(cached_value) && !JS_IsNull(cached_value))
-            {
-                cached_bytes = JS_GetUint8Array(compile_ctx, &cached_size, cached_value);
-                if (cached_bytes == nullptr)
-                {
-                    JSValue exc = JS_GetException(compile_ctx);
-                    JS_FreeValue(compile_ctx, exc);
-                    cached_size = 0;
-                }
-            }
+            // The handle's artifact is the compiled function; reuse it directly.
+            fn = JS_DupValue(ctx_, bytecode_record->artifact);
+            have_fn = true;
         }
 
-        std::string diagnostic_source;
-        std::vector<uint8_t> produced_cache;
-        bool cache_rejected = false;
-        JSValue fn = compile_cjs_function(compile_ctx, source, source_url, params, &diagnostic_source,
-                                          cached_bytes, cached_size, produce_cached_data,
-                                          &produced_cache, &cache_rejected);
-        if (JS_IsException(fn))
+        if (!have_fn)
         {
-            JSValue exc = JS_GetException(compile_ctx);
-            if (compile_ctx == ctx_)
-                annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
-            napi_util__::set_last_exception(env_, exc);
-            return napi_pending_exception;
+            const uint8_t *cached_bytes = nullptr;
+            size_t cached_size = 0;
+            if (bytecode_record != nullptr && !bytecode_record->bytes.empty())
+            {
+                cached_bytes = bytecode_record->bytes.data();
+                cached_size = bytecode_record->bytes.size();
+            }
+            std::string diagnostic_source;
+            fn = compile_cjs_function(compile_ctx, source_text, source_url, params, &diagnostic_source,
+                                      cached_bytes, cached_size, false, nullptr, nullptr);
+            if (JS_IsException(fn))
+            {
+                JSValue exc = JS_GetException(compile_ctx);
+                if (compile_ctx == ctx_)
+                    annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
+                napi_util__::set_last_exception(env_, exc);
+                return napi_pending_exception;
+            }
         }
 
         JSValue out = JS_NewObject(compile_ctx);
@@ -935,25 +956,6 @@ namespace quickjs::detail
         if (!source_url.empty())
             napi_util__::set_string_property(compile_ctx, out, "sourceURL", source_url);
         JS_SetPropertyStr(compile_ctx, out, "sourceMapURL", JS_UNDEFINED);
-        if (cached_bytes != nullptr && cached_size > 0)
-            JS_SetPropertyStr(compile_ctx, out, "cachedDataRejected", JS_NewBool(compile_ctx, cache_rejected));
-        if (produce_cached_data)
-        {
-            JS_SetPropertyStr(compile_ctx, out, "cachedDataProduced",
-                              JS_NewBool(compile_ctx, !produced_cache.empty()));
-            if (!produced_cache.empty())
-            {
-                JSValue cache_array = JS_NewUint8ArrayCopy(compile_ctx, produced_cache.data(),
-                                                           produced_cache.size());
-                if (!JS_IsException(cache_array))
-                    JS_SetPropertyStr(compile_ctx, out, "cachedData", cache_array);
-                else
-                {
-                    JSValue exc = JS_GetException(compile_ctx);
-                    JS_FreeValue(compile_ctx, exc);
-                }
-            }
-        }
         *result_out = env_->wrap_value_in_current_scope(compile_ctx, out, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
@@ -998,25 +1000,259 @@ namespace quickjs::detail
         return napi_ok;
     }
 
-    napi_status napi_contextify__::create_cached_data(napi_value code,
-                                                      napi_value filename,
-                                                      int32_t line_offset,
-                                                      int32_t column_offset,
-                                                      napi_value host_defined_option_id,
-                                                      napi_value *cached_data_buffer_out)
+    namespace
     {
-        (void)code;
-        (void)filename;
-        (void)line_offset;
-        (void)column_offset;
-        (void)host_defined_option_id;
-        if (!napi_util__::check_env(env_) || cached_data_buffer_out == nullptr)
+        int bytecode_stub_module_init(JSContext *, JSModuleDef *)
+        {
+            return 0;
+        }
+
+        // JS_ReadObject resolves a module's import requests eagerly at read
+        // time, but this embedding links modules explicitly afterwards
+        // (JS_SetModuleRequestModule), so any placeholder satisfies the read.
+        // The placeholder must NOT be registered under the requested name:
+        // js_import_meta() resolves the executing module by name through
+        // ctx->loaded_modules, so a stub under a real URL would shadow the
+        // real module and break import.meta. Unique stub names sacrifice the
+        // loaded-modules cache hit (another tiny stub per request) to keep
+        // name lookups pointing at real modules only.
+        JSModuleDef *bytecode_stub_module_loader(JSContext *ctx, const char *module_name, void *opaque)
+        {
+            (void)module_name;
+            (void)opaque;
+            static unsigned long long stub_counter = 0;
+            char stub_name[64];
+            std::snprintf(stub_name, sizeof(stub_name), "edge-bytecode-stub:%llu", ++stub_counter);
+            return JS_NewCModule(ctx, stub_name, bytecode_stub_module_init);
+        }
+
+        struct bytecode_module_loader_guard
+        {
+            explicit bytecode_module_loader_guard(JSRuntime *rt) : rt_(rt)
+            {
+                JS_SetModuleLoaderFunc(rt_, nullptr, bytecode_stub_module_loader, nullptr);
+            }
+            ~bytecode_module_loader_guard()
+            {
+                JS_SetModuleLoaderFunc(rt_, nullptr, nullptr, nullptr);
+            }
+            JSRuntime *rt_;
+        };
+
+        std::vector<std::string> bytecode_params_from_napi(napi_env env, JSContext *ctx,
+                                                           napi_value params_or_undefined)
+        {
+            std::vector<std::string> params;
+            if (params_or_undefined == nullptr || !JS_IsArray(napi_quickjs_value_inner(env, params_or_undefined)))
+                return params;
+            uint32_t length = 0;
+            JSValue len_val = JS_GetPropertyStr(ctx, napi_quickjs_value_inner(env, params_or_undefined), "length");
+            JS_ToUint32(ctx, &length, len_val);
+            JS_FreeValue(ctx, len_val);
+            params.reserve(length);
+            for (uint32_t i = 0; i < length; ++i)
+            {
+                JSValue param = JS_GetPropertyUint32(ctx, napi_quickjs_value_inner(env, params_or_undefined), i);
+                if (JS_IsException(param))
+                    break;
+                params.push_back(napi_util__::to_utf8(ctx, param));
+                JS_FreeValue(ctx, param);
+            }
+            return params;
+        }
+    }
+
+    napi_status napi_contextify__::bytecode_compile(napi_value source_text,
+                                                    napi_value filename,
+                                                    int32_t shape,
+                                                    napi_value params_or_undefined,
+                                                    napi_value host_defined_option_id,
+                                                    int32_t line_offset,
+                                                    int32_t column_offset,
+                                                    void **bytecode_out,
+                                                    bool *can_parse_as_module_out)
+    {
+        (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
+        if (!napi_util__::check_env(env_) || source_text == nullptr || bytecode_out == nullptr)
             return napi_invalid_arg;
+        *bytecode_out = nullptr;
+        if (can_parse_as_module_out != nullptr)
+            *can_parse_as_module_out = false;
+
+        auto record = std::make_unique<napi_bytecode_record__>();
+        record->ctx = ctx_;
+        record->source_utf8 = napi_util__::to_utf8(env_, source_text);
+        record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
+        record->shape = shape;
+        record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
+        record->line_offset = line_offset;
+        record->column_offset = column_offset;
+
+        if (shape == unofficial_napi_bytecode_shape_cjs_function)
+        {
+            std::vector<uint8_t> produced;
+            JSValue fn = compile_cjs_function(ctx_, record->source_utf8, record->filename_utf8,
+                                              record->params, nullptr, nullptr, 0, true, &produced, nullptr);
+            if (JS_IsException(fn))
+            {
+                JSValue exc = JS_GetException(ctx_);
+                if (can_parse_as_module_out != nullptr)
+                    *can_parse_as_module_out = can_parse_as_module(record->source_utf8, record->filename_utf8);
+                napi_util__::set_last_exception(env_, exc);
+                return napi_pending_exception;
+            }
+            record->artifact = fn;
+            record->bytes = std::move(produced);
+        }
+        else if (shape == unofficial_napi_bytecode_shape_script ||
+                 shape == unofficial_napi_bytecode_shape_module)
+        {
+            const bool is_module = shape == unofficial_napi_bytecode_shape_module;
+            JSEvalOptions options = {
+                .version = JS_EVAL_OPTIONS_VERSION,
+                .eval_flags = (is_module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL) |
+                              JS_EVAL_FLAG_COMPILE_ONLY,
+                .filename = record->filename_utf8.empty() ? "<bytecode>" : record->filename_utf8.c_str(),
+                .line_num = std::max<int32_t>(1, line_offset + 1),
+            };
+            JSValue compiled = JS_Eval2(ctx_, record->source_utf8.c_str(), record->source_utf8.size(), &options);
+            if (JS_IsException(compiled))
+            {
+                JSValue exc = JS_GetException(ctx_);
+                if (!is_module && can_parse_as_module_out != nullptr)
+                    *can_parse_as_module_out = can_parse_as_module(record->source_utf8, record->filename_utf8);
+                napi_util__::set_last_exception(env_, exc);
+                return napi_pending_exception;
+            }
+            size_t serialized_size = 0;
+            const int write_flags = is_module ? (JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE)
+                                              : JS_WRITE_OBJ_BYTECODE;
+            uint8_t *serialized = JS_WriteObject(ctx_, &serialized_size, compiled, write_flags);
+            if (serialized != nullptr)
+            {
+                record->bytes.assign(serialized, serialized + serialized_size);
+                js_free(ctx_, serialized);
+            }
+            record->artifact = compiled;
+        }
+        else
+        {
+            return napi_invalid_arg;
+        }
+
+        *bytecode_out = record.release();
+        return napi_ok;
+    }
+
+    napi_status napi_contextify__::bytecode_deserialize(const uint8_t *bytes,
+                                                        size_t byte_length,
+                                                        napi_value source_text,
+                                                        napi_value filename,
+                                                        int32_t shape,
+                                                        napi_value params_or_undefined,
+                                                        napi_value host_defined_option_id,
+                                                        void **bytecode_out,
+                                                        bool *rejected_out)
+    {
+        (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
+        if (!napi_util__::check_env(env_) || bytes == nullptr || byte_length == 0 ||
+            source_text == nullptr || bytecode_out == nullptr)
+            return napi_invalid_arg;
+        *bytecode_out = nullptr;
+        if (rejected_out != nullptr)
+            *rejected_out = false;
+
+        auto record = std::make_unique<napi_bytecode_record__>();
+        record->ctx = ctx_;
+        record->source_utf8 = napi_util__::to_utf8(env_, source_text);
+        record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
+        record->shape = shape;
+        record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
+
+        size_t payload_length = 0;
+        const uint8_t *payload = napi_bytecode_validate_prefix(
+            bytes, byte_length, napi_bytecode_source_hash(record->source_utf8), &payload_length);
+        if (payload == nullptr || payload_length == 0)
+        {
+            if (rejected_out != nullptr)
+                *rejected_out = true;
+            return napi_ok;
+        }
+        record->bytes.assign(payload, payload + payload_length);
+
+        const bool is_module = shape == unofficial_napi_bytecode_shape_module;
+        JSValue restored = JS_UNDEFINED;
+        {
+            std::unique_ptr<bytecode_module_loader_guard> guard;
+            if (is_module)
+                guard = std::make_unique<bytecode_module_loader_guard>(JS_GetRuntime(ctx_));
+            const int read_flags = is_module ? (JS_READ_OBJ_BYTECODE | JS_READ_OBJ_REFERENCE)
+                                             : JS_READ_OBJ_BYTECODE;
+            restored = JS_ReadObject(ctx_, record->bytes.data(), record->bytes.size(), read_flags);
+        }
+        if (JS_IsException(restored))
+        {
+            JSValue exc = JS_GetException(ctx_);
+            JS_FreeValue(ctx_, exc);
+            if (rejected_out != nullptr)
+                *rejected_out = true;
+            return napi_ok;
+        }
+
+        if (shape == unofficial_napi_bytecode_shape_cjs_function)
+        {
+            // Evaluating the serialized wrapper expression yields the function
+            // without running its body.
+            JSValue fn = JS_EvalFunction(ctx_, restored);
+            if (JS_IsException(fn))
+            {
+                JSValue exc = JS_GetException(ctx_);
+                JS_FreeValue(ctx_, exc);
+                if (rejected_out != nullptr)
+                    *rejected_out = true;
+                return napi_ok;
+            }
+            record->artifact = fn;
+        }
+        else
+        {
+            record->artifact = restored;
+        }
+
+        *bytecode_out = record.release();
+        return napi_ok;
+    }
+
+    napi_status napi_contextify__::bytecode_serialize(void *bytecode, napi_value *buffer_out)
+    {
+        if (!napi_util__::check_env(env_) || bytecode == nullptr || buffer_out == nullptr)
+            return napi_invalid_arg;
+        auto *record = static_cast<napi_bytecode_record__ *>(bytecode);
+        std::vector<uint8_t> persisted;
+        if (!record->bytes.empty())
+        {
+            persisted.reserve(k_bytecode_prefix_size + record->bytes.size());
+            napi_bytecode_append_prefix(&persisted, napi_bytecode_source_hash(record->source_utf8));
+            persisted.insert(persisted.end(), record->bytes.begin(), record->bytes.end());
+        }
         napi_value arraybuffer = nullptr;
         void *data = nullptr;
-        napi_status status = napi_create_arraybuffer(env_, 0, &data, &arraybuffer);
+        napi_status status = napi_create_arraybuffer(env_, persisted.size(), &data, &arraybuffer);
         if (status != napi_ok)
             return status;
-        return napi_create_typedarray(env_, napi_uint8_array, 0, arraybuffer, 0, cached_data_buffer_out);
+        if (!persisted.empty() && data != nullptr)
+            std::memcpy(data, persisted.data(), persisted.size());
+        return napi_create_typedarray(env_, napi_uint8_array, persisted.size(), arraybuffer, 0, buffer_out);
+    }
+
+    napi_status napi_contextify__::bytecode_release(void *bytecode)
+    {
+        if (bytecode == nullptr)
+            return napi_invalid_arg;
+        auto *record = static_cast<napi_bytecode_record__ *>(bytecode);
+        if (record->ctx != nullptr && !JS_IsUndefined(record->artifact))
+            JS_FreeValue(record->ctx, record->artifact);
+        delete record;
+        return napi_ok;
     }
 }

@@ -1113,7 +1113,7 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
         napi_env env,
         napi_value sandbox_or_null,
-        napi_value source,
+        const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
         int32_t column_offset,
@@ -1138,6 +1138,69 @@ extern "C"
                              : napi_invalid_arg;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
+        napi_env env,
+        napi_value source_text,
+        napi_value filename,
+        int32_t shape,
+        napi_value params_or_undefined,
+        napi_value host_defined_option_id,
+        int32_t line_offset,
+        int32_t column_offset,
+        void **bytecode_out,
+        bool *can_parse_as_module_out)
+    {
+        return napi_util__::check_env(env) ? env->contextify().bytecode_compile(source_text,
+                                                                  filename,
+                                                                  shape,
+                                                                  params_or_undefined,
+                                                                  host_defined_option_id,
+                                                                  line_offset,
+                                                                  column_offset,
+                                                                  bytecode_out,
+                                                                  can_parse_as_module_out)
+                             : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
+        napi_env env,
+        const uint8_t *bytes,
+        size_t byte_length,
+        napi_value source_text,
+        napi_value filename,
+        int32_t shape,
+        napi_value params_or_undefined,
+        napi_value host_defined_option_id,
+        void **bytecode_out,
+        bool *rejected_out)
+    {
+        return napi_util__::check_env(env) ? env->contextify().bytecode_deserialize(bytes,
+                                                                      byte_length,
+                                                                      source_text,
+                                                                      filename,
+                                                                      shape,
+                                                                      params_or_undefined,
+                                                                      host_defined_option_id,
+                                                                      bytecode_out,
+                                                                      rejected_out)
+                             : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
+        napi_env env,
+        void *bytecode,
+        napi_value *buffer_out)
+    {
+        return napi_util__::check_env(env) ? env->contextify().bytecode_serialize(bytecode, buffer_out)
+                             : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_bytecode_release(napi_env env, void *bytecode)
+    {
+        return napi_util__::check_env(env) ? env->contextify().bytecode_release(bytecode)
+                             : napi_invalid_arg;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_contextify_dispose_context(
         napi_env env,
         napi_value sandbox_or_context_global)
@@ -1147,24 +1210,20 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
         napi_env env,
-        napi_value code,
+        const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
         int32_t column_offset,
-        napi_value cached_data_or_undefined,
-        bool produce_cached_data,
         napi_value parsing_context_or_undefined,
         napi_value context_extensions_or_undefined,
         napi_value params_or_undefined,
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().compile_function(code,
+        return napi_util__::check_env(env) ? env->contextify().compile_function(source,
                                                                   filename,
                                                                   line_offset,
                                                                   column_offset,
-                                                                  cached_data_or_undefined,
-                                                                  produce_cached_data,
                                                                   parsing_context_or_undefined,
                                                                   context_extensions_or_undefined,
                                                                   params_or_undefined,
@@ -1189,33 +1248,15 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_create_cached_data(
-        napi_env env,
-        napi_value code,
-        napi_value filename,
-        int32_t line_offset,
-        int32_t column_offset,
-        napi_value host_defined_option_id,
-        napi_value *cached_data_buffer_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().create_cached_data(code,
-                                                                    filename,
-                                                                    line_offset,
-                                                                    column_offset,
-                                                                    host_defined_option_id,
-                                                                    cached_data_buffer_out)
-                             : napi_invalid_arg;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
         napi_env env,
         napi_value wrapper,
         napi_value url,
         napi_value context_or_undefined,
-        napi_value source,
+        const unofficial_napi_js_source *source,
         int32_t line_offset,
         int32_t column_offset,
-        napi_value cached_data_or_id,
+        napi_value host_defined_option_id,
         void **handle_out)
     {
         if (!napi_util__::check_env(env) || handle_out == nullptr)
@@ -1226,7 +1267,7 @@ extern "C"
                                                      source,
                                                      line_offset,
                                                      column_offset,
-                                                     cached_data_or_id,
+                                                     host_defined_option_id,
                                                      handle_out);
     }
 

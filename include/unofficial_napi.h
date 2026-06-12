@@ -431,10 +431,74 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context
     napi_value host_defined_option_id,
     napi_value* result_out);
 
+// A JS source for compile/eval APIs: exactly one of `text` (a JS string) or
+// `bytecode` (an opaque handle from unofficial_napi_bytecode_compile /
+// unofficial_napi_bytecode_deserialize) is set.
+typedef struct unofficial_napi_js_source {
+  napi_value text;
+  void* bytecode;
+} unofficial_napi_js_source;
+
+// Compile shape of a bytecode artifact; bytecode is only usable by APIs that
+// compile the same shape.
+typedef enum {
+  unofficial_napi_bytecode_shape_script = 0,        // whole-script eval
+  unofficial_napi_bytecode_shape_cjs_function = 1,  // function compiled with params
+  unofficial_napi_bytecode_shape_module = 2,        // ES module
+} unofficial_napi_bytecode_shape;
+
+// Eagerly compiles source text into bytecode. The returned handle holds the
+// live compiled artifact plus serializable engine bytes, and retains the
+// text/filename/shape/params (V8 code caches are consumed against the
+// original source). On compile FAILURE with a non-module shape,
+// *can_parse_as_module_out (nullable) reports whether the source parses as an
+// ES module — the detect-module signal — while the compile exception stays
+// pending.
+// host_defined_option_id (Symbol or nullish) is baked into the compiled
+// artifact's origin so consumers with the same symbol can reuse it directly;
+// a consumer with different options re-consumes the serialized bytes instead.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_compile(
+    napi_env env,
+    napi_value source_text,
+    napi_value filename,
+    int32_t shape,
+    napi_value params_or_undefined,
+    napi_value host_defined_option_id,
+    int32_t line_offset,
+    int32_t column_offset,
+    void** bytecode_out,
+    bool* can_parse_as_module_out);
+
+// Deserializes persisted engine bytes (e.g. a sidecar payload) into a live
+// compiled artifact. source_text is the source the bytes were produced from.
+// On stale/incompatible bytes the call succeeds with *bytecode_out = NULL and
+// *rejected_out = true; the caller falls back to compiling the text.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_deserialize(
+    napi_env env,
+    const uint8_t* bytes,
+    size_t byte_length,
+    napi_value source_text,
+    napi_value filename,
+    int32_t shape,
+    napi_value params_or_undefined,
+    napi_value host_defined_option_id,
+    void** bytecode_out,
+    bool* rejected_out);
+
+// Engine bytes for persistence, as a Uint8Array.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_serialize(
+    napi_env env,
+    void* bytecode,
+    napi_value* buffer_out);
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_release(
+    napi_env env,
+    void* bytecode);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
     napi_env env,
     napi_value sandbox_or_null,
-    napi_value source,
+    const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
     int32_t column_offset,
@@ -451,12 +515,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_dispose_cont
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function(
     napi_env env,
-    napi_value code,
+    const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
     int32_t column_offset,
-    napi_value cached_data_or_undefined,
-    bool produce_cached_data,
     napi_value parsing_context_or_undefined,
     napi_value context_extensions_or_undefined,
     napi_value params_or_undefined,
@@ -465,7 +527,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_func
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function_for_cjs_loader(
     napi_env env,
-    napi_value code,
+    const unofficial_napi_js_source* source,
     napi_value filename,
     bool is_sea_main,
     bool should_detect_module,
@@ -478,15 +540,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_mod
     napi_value resource_name_or_undefined,
     bool cjs_var_in_scope,
     bool* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_create_cached_data(
-    napi_env env,
-    napi_value code,
-    napi_value filename,
-    int32_t line_offset,
-    int32_t column_offset,
-    napi_value host_defined_option_id,
-    napi_value* cached_data_buffer_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_start_sigint_watchdog(
     napi_env env,
@@ -507,10 +560,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_sour
     napi_value wrapper,
     napi_value url,
     napi_value context_or_undefined,
-    napi_value source,
+    const unofficial_napi_js_source* source,
     int32_t line_offset,
     int32_t column_offset,
-    napi_value cached_data_or_id,
+    napi_value host_defined_option_id,
     void** handle_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_synthetic(

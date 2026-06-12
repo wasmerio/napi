@@ -2,6 +2,7 @@
 #define NAPI_QUICKJS_MODULE_WRAP_H_
 
 #include "../../../include/js_native_api.h"
+#include "../../../include/unofficial_napi.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,10 +24,10 @@ public:
   napi_status create_source_text(napi_value wrapper,
                                  napi_value url,
                                  napi_value context_or_undefined,
-                                 napi_value source,
+                                 const unofficial_napi_js_source *source,
                                  int32_t line_offset,
                                  int32_t column_offset,
-                                 napi_value cached_data_or_id,
+                                 napi_value host_defined_option_id,
                                  void **handle_out);
   napi_status create_synthetic(napi_value wrapper,
                                napi_value url,
