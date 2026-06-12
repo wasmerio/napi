@@ -114,7 +114,6 @@ struct napi_module_wrap__::record
   JSValue synthetic_eval_steps = JS_UNDEFINED;
   JSValue source_object = JS_UNDEFINED;
   bool synthetic = false;
-  uint64_t source_hash = 0;  // for bytecode serialization (create_cached_data)
   std::vector<request_record> requests;
   std::vector<record *> linked_records;
   std::vector<JSValue> linked_module_values;
@@ -519,7 +518,6 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   entry->module_value = module_value;
   entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
   entry->host_defined_option_id = host_id;
-  entry->source_hash = napi_bytecode_source_hash(source_string);
   records_.push_back(entry);
 
   napi_status status = cache_module_requests(entry);
@@ -894,8 +892,14 @@ napi_status napi_module_wrap__::create_cached_data(void *handle,
                                          JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE);
     if (serialized != nullptr)
     {
-      bytes.reserve(k_bytecode_prefix_size + serialized_size);
-      napi_bytecode_append_prefix(&bytes, entry->source_hash);
+      // Self-validating payload header. filename_hash is 0 (unenforced):
+      // Node assigns vm modules numbered default identifiers (vm:module(N)),
+      // so a consumer's identifier legitimately differs from the producer's;
+      // V8 does not key CachedData on the name either. Source-identity
+      // wrapping for the user-facing buffer is the caller's (edge.js) job.
+      bytes.reserve(k_bytecode_payload_header_size + serialized_size);
+      napi_bytecode_append_payload_header(
+          &bytes, 0, napi_bytecode_hash64(serialized, serialized_size));
       bytes.insert(bytes.end(), serialized, serialized + serialized_size);
       js_free(ctx_, serialized);
     }

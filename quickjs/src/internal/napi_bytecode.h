@@ -13,45 +13,68 @@
 
 namespace quickjs::detail
 {
-    // QuickJS bytecode is self-contained and carries no source identity, so
-    // serialized handles are prefixed with a hash of the source they were
-    // compiled from; deserialize rejects bytes whose source differs (the
-    // semantics V8 provides natively via CachedData validation).
-    inline constexpr char k_bytecode_prefix_magic[4] = {'Q', 'J', 'S', 'C'};
-    inline constexpr size_t k_bytecode_prefix_size = 12;
+    // QuickJS serialized bytecode is self-validating, mirroring what V8's
+    // CachedData provides natively: every payload this provider emits starts
+    // with a 20-byte header [QJSB magic, filename XXH3-64, payload XXH3-64].
+    // - payload_hash guards corruption/truncation (JS_ReadObject is not
+    //   hardened against bad input).
+    // - filename_hash rejects payloads compiled under another name (QuickJS
+    //   bytecode embeds the compile-time filename/URL — import.meta.url and
+    //   stack traces would silently go stale). A stored hash of 0 means
+    //   "unenforced": vm.SourceTextModule#createCachedData writes 0 because
+    //   Node gives vm modules numbered default identifiers (vm:module(N))
+    //   and V8 does not key its caches on the name either.
+    // Source identity is NOT covered here — containers (sidecars/builtins)
+    // and the edge.js vm cachedData wrapper validate it before bytes reach
+    // this provider.
+    inline constexpr char k_bytecode_payload_magic[4] = {'Q', 'J', 'S', 'B'};
+    inline constexpr size_t k_bytecode_payload_header_size = 20;
 
-    inline uint64_t napi_bytecode_source_hash(const std::string &source)
+    inline uint64_t napi_bytecode_hash64(const void *data, size_t size)
     {
-        return XXH3_64bits(source.data(), source.size());
+        return XXH3_64bits(data, size);
     }
 
-    inline void napi_bytecode_append_prefix(std::vector<uint8_t> *out, uint64_t source_hash)
+    inline void napi_bytecode_append_payload_header(std::vector<uint8_t> *out,
+                                                    uint64_t filename_hash,
+                                                    uint64_t payload_hash)
     {
-        out->insert(out->end(), k_bytecode_prefix_magic, k_bytecode_prefix_magic + 4);
+        out->insert(out->end(), k_bytecode_payload_magic, k_bytecode_payload_magic + 4);
         for (int i = 0; i < 8; ++i)
-            out->push_back(static_cast<uint8_t>(source_hash >> (8 * i)));
+            out->push_back(static_cast<uint8_t>(filename_hash >> (8 * i)));
+        for (int i = 0; i < 8; ++i)
+            out->push_back(static_cast<uint8_t>(payload_hash >> (8 * i)));
     }
 
-    // Returns the payload span past the prefix, or nullptr when the prefix is
-    // absent or the source hash does not match.
-    inline const uint8_t *napi_bytecode_validate_prefix(const uint8_t *bytes,
-                                                        size_t byte_length,
-                                                        uint64_t expected_source_hash,
-                                                        size_t *payload_length_out)
+    // Returns the raw JS_WriteObject span past the header, or nullptr when
+    // the header is absent, the payload hash mismatches (corruption), or the
+    // stored filename hash is non-zero and differs from expected.
+    inline const uint8_t *napi_bytecode_validate_payload_header(const uint8_t *bytes,
+                                                                size_t byte_length,
+                                                                uint64_t expected_filename_hash,
+                                                                size_t *payload_length_out)
     {
         *payload_length_out = 0;
-        if (bytes == nullptr || byte_length <= k_bytecode_prefix_size)
+        if (bytes == nullptr || byte_length <= k_bytecode_payload_header_size)
             return nullptr;
-        if (std::memcmp(bytes, k_bytecode_prefix_magic, 4) != 0)
+        if (std::memcmp(bytes, k_bytecode_payload_magic, 4) != 0)
             return nullptr;
-        uint64_t stored = 0;
+        uint64_t stored_filename = 0;
+        uint64_t stored_payload = 0;
         for (int i = 0; i < 8; ++i)
-            stored |= static_cast<uint64_t>(bytes[4 + i]) << (8 * i);
-        if (stored != expected_source_hash)
+            stored_filename |= static_cast<uint64_t>(bytes[4 + i]) << (8 * i);
+        for (int i = 0; i < 8; ++i)
+            stored_payload |= static_cast<uint64_t>(bytes[12 + i]) << (8 * i);
+        if (stored_filename != 0 && stored_filename != expected_filename_hash)
             return nullptr;
-        *payload_length_out = byte_length - k_bytecode_prefix_size;
-        return bytes + k_bytecode_prefix_size;
+        const uint8_t *payload = bytes + k_bytecode_payload_header_size;
+        const size_t payload_length = byte_length - k_bytecode_payload_header_size;
+        if (stored_payload != napi_bytecode_hash64(payload, payload_length))
+            return nullptr;
+        *payload_length_out = payload_length;
+        return payload;
     }
+
     // Backing store for an unofficial_napi bytecode handle (see
     // unofficial_napi_js_source). Created/owned via the
     // unofficial_napi_bytecode_* APIs implemented by napi_contextify__ and

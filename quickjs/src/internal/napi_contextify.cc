@@ -1169,9 +1169,15 @@ namespace quickjs::detail
         record->shape = shape;
         record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
 
+        // Payloads are self-validating (QJSB header: filename + payload
+        // hashes); reject corruption/relocation before JS_ReadObject ever
+        // sees the bytes — its reader is not hardened. Source identity is
+        // the caller's job (containers / the edge.js vm cachedData wrapper).
         size_t payload_length = 0;
-        const uint8_t *payload = napi_bytecode_validate_prefix(
-            bytes, byte_length, napi_bytecode_source_hash(record->source_utf8), &payload_length);
+        const uint8_t *payload = napi_bytecode_validate_payload_header(
+            bytes, byte_length,
+            napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size()),
+            &payload_length);
         if (payload == nullptr || payload_length == 0)
         {
             if (rejected_out != nullptr)
@@ -1231,8 +1237,11 @@ namespace quickjs::detail
         std::vector<uint8_t> persisted;
         if (!record->bytes.empty())
         {
-            persisted.reserve(k_bytecode_prefix_size + record->bytes.size());
-            napi_bytecode_append_prefix(&persisted, napi_bytecode_source_hash(record->source_utf8));
+            persisted.reserve(k_bytecode_payload_header_size + record->bytes.size());
+            napi_bytecode_append_payload_header(
+                &persisted,
+                napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size()),
+                napi_bytecode_hash64(record->bytes.data(), record->bytes.size()));
             persisted.insert(persisted.end(), record->bytes.begin(), record->bytes.end());
         }
         napi_value arraybuffer = nullptr;
