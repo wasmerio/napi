@@ -1439,8 +1439,8 @@ struct BytecodeRecord {
   int32_t column_offset = 0;
   // Live artifact (one per shape). The function artifact is bound to the
   // context and host-defined-option symbol it was compiled with; consumers
-  // re-consume `bytes` when their compile inputs differ.
-  v8::Global<v8::UnboundScript> unbound_script;
+  // re-consume `bytes` when their compile inputs differ. (Script shape keeps
+  // no live artifact: run_script always re-consumes `bytes`.)
   v8::Global<v8::Function> function;
   v8::Global<v8::Context> function_context;
   v8::Global<v8::Module> module;
@@ -1554,7 +1554,6 @@ bool CompileBytecodeRecord(napi_env env,
         return false;
       }
       if (!consume) produced.reset(v8::ScriptCompiler::CreateCodeCache(unbound));
-      record->unbound_script.Reset(isolate, unbound);
       break;
     }
     case unofficial_napi_bytecode_shape_cjs_function: {

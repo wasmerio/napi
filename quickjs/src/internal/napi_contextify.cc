@@ -1081,6 +1081,7 @@ namespace quickjs::detail
                                                     bool *can_parse_as_module_out)
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
+        (void)column_offset;           // QuickJS JS_Eval2 keys only on line_num.
         if (!napi_util__::check_env(env_) || source_text == nullptr || bytecode_out == nullptr)
             return napi_invalid_arg;
         *bytecode_out = nullptr;
@@ -1093,8 +1094,6 @@ namespace quickjs::detail
         record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
         record->shape = shape;
         record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
-        record->line_offset = line_offset;
-        record->column_offset = column_offset;
 
         if (shape == unofficial_napi_bytecode_shape_cjs_function)
         {

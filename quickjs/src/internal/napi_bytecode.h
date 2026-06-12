@@ -148,8 +148,6 @@ namespace quickjs::detail
         std::string filename_utf8;
         int32_t shape = 0;
         std::vector<std::string> params;
-        int32_t line_offset = 0;
-        int32_t column_offset = 0;
         // Live artifact per shape: script -> the compiled function-bytecode
         // value (dup before JS_EvalFunction, which consumes its argument);
         // cjs_function -> the compiled function; module -> the module value.

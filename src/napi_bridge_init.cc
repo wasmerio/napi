@@ -44,6 +44,31 @@ struct CallbackInvocation {
 
 struct CallbackBinding;
 
+// Maps monotonically-increasing u32 IDs (0 = null) to opaque host handles the
+// guest stores across calls. Used for the engine-owned handle kinds whose
+// lifetime is not tied to a napi scope (module_wrap, bytecode).
+struct HandleTable {
+  std::unordered_map<uint32_t, void*> handles;
+  uint32_t next_id = 1;
+
+  uint32_t Store(void* handle) {
+    if (handle == nullptr) return 0;
+    const uint32_t id = next_id++;
+    handles[id] = handle;
+    return id;
+  }
+  void* Load(uint32_t id) const {
+    if (id == 0) return nullptr;
+    const auto it = handles.find(id);
+    return it != handles.end() ? it->second : nullptr;
+  }
+  void Remove(uint32_t id) { handles.erase(id); }
+  void Reset() {
+    handles.clear();
+    next_id = 1;
+  }
+};
+
 struct SnapiEnvState {
   napi_env env = nullptr;
   void* scope = nullptr;
@@ -69,12 +94,10 @@ struct SnapiEnvState {
   uint32_t next_esc_scope_id = 1;
 
   // Handle table for opaque module_wrap handles.
-  std::unordered_map<uint32_t, void*> module_wrap_handles;
-  uint32_t next_module_wrap_handle_id = 1;
+  HandleTable module_wrap_handles;
 
   // Handle table for opaque bytecode handles (unofficial_napi_bytecode_*).
-  std::unordered_map<uint32_t, void*> bytecode_handles;
-  uint32_t next_bytecode_handle_id = 1;
+  HandleTable bytecode_handles;
 
   // Current guest invocation driving this env. This is only valid while the
   // driving host import remains on the stack.
@@ -372,37 +395,27 @@ void RemoveEscScope(SnapiEnvState& state, uint32_t id) {
 }
 
 uint32_t StoreModuleWrapHandle(SnapiEnvState& state, void* handle) {
-  if (handle == nullptr) return 0;
-  uint32_t id = state.next_module_wrap_handle_id++;
-  state.module_wrap_handles[id] = handle;
-  return id;
+  return state.module_wrap_handles.Store(handle);
 }
 
 void* LoadModuleWrapHandle(SnapiEnvState& state, uint32_t id) {
-  if (id == 0) return nullptr;
-  auto it = state.module_wrap_handles.find(id);
-  return it != state.module_wrap_handles.end() ? it->second : nullptr;
+  return state.module_wrap_handles.Load(id);
 }
 
 void RemoveModuleWrapHandle(SnapiEnvState& state, uint32_t id) {
-  state.module_wrap_handles.erase(id);
+  state.module_wrap_handles.Remove(id);
 }
 
 uint32_t StoreBytecodeHandle(SnapiEnvState& state, void* handle) {
-  if (handle == nullptr) return 0;
-  uint32_t id = state.next_bytecode_handle_id++;
-  state.bytecode_handles[id] = handle;
-  return id;
+  return state.bytecode_handles.Store(handle);
 }
 
 void* LoadBytecodeHandle(SnapiEnvState& state, uint32_t id) {
-  if (id == 0) return nullptr;
-  auto it = state.bytecode_handles.find(id);
-  return it != state.bytecode_handles.end() ? it->second : nullptr;
+  return state.bytecode_handles.Load(id);
 }
 
 void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
-  state.bytecode_handles.erase(id);
+  state.bytecode_handles.Remove(id);
 }
 
 SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
@@ -428,18 +441,16 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->next_deferred_id = 1;
   state->esc_scopes.clear();
   state->next_esc_scope_id = 1;
-  state->module_wrap_handles.clear();
-  state->next_module_wrap_handle_id = 1;
+  state->module_wrap_handles.Reset();
   // Bytecode handles own engine resources outside any napi scope (V8
   // Globals / QuickJS JSValue refcounts), so they must be released
   // explicitly — env teardown does not reclaim them.
-  for (auto& entry : state->bytecode_handles) {
+  for (auto& entry : state->bytecode_handles.handles) {
     if (entry.second != nullptr) {
       (void)unofficial_napi_bytecode_release(state->env, entry.second);
     }
   }
-  state->bytecode_handles.clear();
-  state->next_bytecode_handle_id = 1;
+  state->bytecode_handles.Reset();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->callback_invocations.clear();
   state->next_callback_invocation_id = 1;
