@@ -533,6 +533,14 @@ namespace quickjs::detail
                 produced_cache_out->assign(serialized, serialized + serialized_size);
                 js_free(ctx, serialized);
             }
+            else
+            {
+                // JS_WriteObject raised an exception; clear it so it does not
+                // leak pending into the JS_EvalFunction below (which would see
+                // a stale exception) or out to the caller.
+                JSValue exc = JS_GetException(ctx);
+                JS_FreeValue(ctx, exc);
+            }
         }
         return JS_EvalFunction(ctx, bytecode);
     }
@@ -1073,6 +1081,7 @@ namespace quickjs::detail
                                                     bool *can_parse_as_module_out)
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
+        (void)column_offset;           // QuickJS JS_Eval2 keys only on line_num.
         if (!napi_util__::check_env(env_) || source_text == nullptr || bytecode_out == nullptr)
             return napi_invalid_arg;
         *bytecode_out = nullptr;
@@ -1085,8 +1094,6 @@ namespace quickjs::detail
         record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
         record->shape = shape;
         record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
-        record->line_offset = line_offset;
-        record->column_offset = column_offset;
 
         if (shape == unofficial_napi_bytecode_shape_cjs_function)
         {
@@ -1133,6 +1140,14 @@ namespace quickjs::detail
                 record->bytes.assign(serialized, serialized + serialized_size);
                 js_free(ctx_, serialized);
             }
+            else
+            {
+                // JS_WriteObject raised an exception (e.g. OOM); drop it so it
+                // does not leak pending out of this napi_ok return. The handle
+                // still holds the live artifact; only serialization is lost.
+                JSValue exc = JS_GetException(ctx_);
+                JS_FreeValue(ctx_, exc);
+            }
             record->artifact = compiled;
         }
         else
@@ -1169,15 +1184,19 @@ namespace quickjs::detail
         record->shape = shape;
         record->params = bytecode_params_from_napi(env_, ctx_, params_or_undefined);
 
-        // Payloads are self-validating (QJSB header: filename + payload
-        // hashes); reject corruption/relocation before JS_ReadObject ever
-        // sees the bytes — its reader is not hardened. Source identity is
-        // the caller's job (containers / the edge.js vm cachedData wrapper).
+        // Payloads are fully self-validating (QJSB header pins shape, source,
+        // params, filename, and payload integrity); reject any mismatch before
+        // JS_ReadObject ever sees the bytes — its reader is not hardened, and
+        // wrong-source/shape/params bytes would otherwise be silently accepted
+        // (V8's CachedData rejects all of these natively).
+        napi_bytecode_identity expect;
+        expect.shape = shape;
+        expect.source_hash = napi_bytecode_hash64(record->source_utf8.data(), record->source_utf8.size());
+        expect.params_hash = napi_bytecode_params_hash(record->params);
+        expect.filename_hash = napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size());
         size_t payload_length = 0;
-        const uint8_t *payload = napi_bytecode_validate_payload_header(
-            bytes, byte_length,
-            napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size()),
-            &payload_length);
+        const uint8_t *payload =
+            napi_bytecode_validate_payload(bytes, byte_length, expect, &payload_length);
         if (payload == nullptr || payload_length == 0)
         {
             if (rejected_out != nullptr)
@@ -1237,12 +1256,12 @@ namespace quickjs::detail
         std::vector<uint8_t> persisted;
         if (!record->bytes.empty())
         {
-            persisted.reserve(k_bytecode_payload_header_size + record->bytes.size());
-            napi_bytecode_append_payload_header(
-                &persisted,
-                napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size()),
-                napi_bytecode_hash64(record->bytes.data(), record->bytes.size()));
-            persisted.insert(persisted.end(), record->bytes.begin(), record->bytes.end());
+            napi_bytecode_identity id;
+            id.shape = record->shape;
+            id.source_hash = napi_bytecode_hash64(record->source_utf8.data(), record->source_utf8.size());
+            id.params_hash = napi_bytecode_params_hash(record->params);
+            id.filename_hash = napi_bytecode_hash64(record->filename_utf8.data(), record->filename_utf8.size());
+            persisted = napi_bytecode_serialize_payload(id, record->bytes.data(), record->bytes.size());
         }
         napi_value arraybuffer = nullptr;
         void *data = nullptr;

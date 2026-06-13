@@ -469,18 +469,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_compile(
     void** bytecode_out,
     bool* can_parse_as_module_out);
 
-// Deserializes raw engine bytes (e.g. a sidecar payload) into a live
-// compiled artifact. source_text is the source the bytes were produced from.
-// On stale/incompatible bytes the call succeeds with *bytecode_out = NULL and
+// Deserializes engine bytes (e.g. a sidecar payload) into a live compiled
+// artifact. source_text is the source the bytes were produced from. On
+// stale/incompatible bytes the call succeeds with *bytecode_out = NULL and
 // *rejected_out = true; the caller falls back to compiling the text.
-// Rejection strength is engine-dependent: V8 validates the bytes against the
-// exact source (CachedData); QuickJS payloads are self-validating via a
-// 20-byte header the provider writes at serialize time (payload hash guards
-// corruption -- JS_ReadObject is not hardened -- and a filename hash, 0 =
-// unenforced, guards relocation since the bytecode embeds the compile-time
-// name). Neither covers SOURCE identity on QuickJS: callers accepting
-// untrusted bytes must validate it themselves before calling (edge.js wraps
-// vm-facing cachedData buffers with a source-hash prefix for exactly this).
+// Payloads are fully self-validating against (shape, source_text, params,
+// filename) — V8 natively via CachedData; QuickJS via the provider's QJSB
+// header written at serialize time (which also guards payload integrity,
+// since JS_ReadObject is not hardened). A stored filename hash of 0 is
+// "unenforced" (vm.SourceTextModule#createCachedData writes 0 because Node
+// numbers vm module identifiers). So untrusted cachedData can be handed
+// straight in: a mismatch on any of those dimensions is reported as rejected
+// without the caller needing its own validation wrapper.
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_deserialize(
     napi_env env,
@@ -495,7 +495,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_deserialize(
     bool* rejected_out);
 
 // Engine bytes for persistence, as a Uint8Array (V8: raw CachedData;
-// QuickJS: self-validating header + JS_WriteObject output).
+// QuickJS: self-validating QJSB header [shape, source, params, filename,
+// payload hashes] + JS_WriteObject output).
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_serialize(
     napi_env env,
     void* bytecode,
