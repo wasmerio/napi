@@ -1,5 +1,6 @@
 #include "internal/napi_module_wrap.h"
 
+#include "internal/napi_bytecode.h"
 #include "internal/napi_env.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace quickjs::detail
 {
@@ -112,6 +114,10 @@ struct napi_module_wrap__::record
   JSValue synthetic_eval_steps = JS_UNDEFINED;
   JSValue source_object = JS_UNDEFINED;
   bool synthetic = false;
+  // XXH3 of the module source text; written into the QJSB header by
+  // create_cached_data so the consuming vm.SourceTextModule constructor's
+  // deserialize validates source identity (filename stays unenforced).
+  uint64_t source_hash = 0;
   std::vector<request_record> requests;
   std::vector<record *> linked_records;
   std::vector<JSValue> linked_module_values;
@@ -438,38 +444,58 @@ napi_status napi_module_wrap__::cache_module_requests(record *entry)
 napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
                                                    napi_value url,
                                                    napi_value context_or_undefined,
-                                                   napi_value source,
+                                                   const unofficial_napi_js_source *source,
                                                    int32_t line_offset,
                                                    int32_t column_offset,
-                                                   napi_value cached_data_or_id,
+                                                   napi_value host_defined_option_id,
                                                    void **handle_out)
 {
   (void)context_or_undefined;
   (void)column_offset;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
-      !napi_util__::check_value(env_, source) ||
+      source == nullptr ||
+      (source->text == nullptr && source->bytecode == nullptr) ||
       handle_out == nullptr)
+    return napi_util__::invalid_arg(env_);
+
+  auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+  if (bytecode_record != nullptr &&
+      bytecode_record->shape != unofficial_napi_bytecode_shape_module)
     return napi_util__::invalid_arg(env_);
 
   *handle_out = nullptr;
   std::string url_string = napi_util__::to_utf8(env_, url);
-  std::string source_string = napi_util__::to_utf8(env_, source);
+  std::string source_string = bytecode_record != nullptr
+                                  ? bytecode_record->source_utf8
+                                  : napi_util__::to_utf8(env_, source->text);
 
   JSValue host_id = get_or_create_host_defined_option(wrapper,
-                                                      cached_data_or_id,
+                                                      host_defined_option_id,
                                                       url_string.c_str());
   if (JS_IsException(host_id))
     return return_pending_exception("Failed to create module host option");
 
-  JSEvalOptions options = {
-      .version = JS_EVAL_OPTIONS_VERSION,
-      .eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
-      .filename = url_string.empty() ? "<module>" : url_string.c_str(),
-      .line_num = line_offset + 1,
-  };
-  JSValue module_value = JS_Eval2(ctx_, source_string.c_str(),
-                                  source_string.size(), &options);
+  JSValue module_value = JS_UNDEFINED;
+  if (bytecode_record != nullptr && !JS_IsUndefined(bytecode_record->artifact) &&
+      bytecode_record->ctx == ctx_)
+  {
+    // Reuse the deserialized/compiled module artifact: same JSModuleDef the
+    // bytecode handle registered, so import.meta/dynamic-import records and
+    // linking behave exactly like the text-compiled path.
+    module_value = JS_DupValue(ctx_, bytecode_record->artifact);
+  }
+  else
+  {
+    JSEvalOptions options = {
+        .version = JS_EVAL_OPTIONS_VERSION,
+        .eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+        .filename = url_string.empty() ? "<module>" : url_string.c_str(),
+        .line_num = line_offset + 1,
+    };
+    module_value = JS_Eval2(ctx_, source_string.c_str(),
+                            source_string.size(), &options);
+  }
   if (JS_IsException(module_value))
   {
     JS_FreeValue(ctx_, host_id);
@@ -496,6 +522,8 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   entry->module_value = module_value;
   entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
   entry->host_defined_option_id = host_id;
+  entry->source_hash =
+      quickjs::detail::napi_bytecode_hash64(source_string.data(), source_string.size());
   records_.push_back(entry);
 
   napi_status status = cache_module_requests(entry);
@@ -855,15 +883,50 @@ napi_status napi_module_wrap__::get_module_source_object(void *handle,
 napi_status napi_module_wrap__::create_cached_data(void *handle,
                                                    napi_value *result_out)
 {
-  (void)handle;
   if (result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+
+  // Serialize the already-compiled module (vm.SourceTextModule#createCachedData).
+  // An evaluated module's function bytecode is gone; fall back to an empty
+  // buffer in that case, matching the V8 provider's empty-cache behavior.
+  std::vector<uint8_t> bytes;
+  record *entry = find(handle);
+  if (entry != nullptr && !entry->synthetic && !JS_IsUndefined(entry->module_value))
+  {
+    size_t serialized_size = 0;
+    uint8_t *serialized = JS_WriteObject(ctx_, &serialized_size, entry->module_value,
+                                         JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE);
+    if (serialized != nullptr)
+    {
+      // Self-validating QJSB header. source_hash pins module identity so the
+      // consuming vm.SourceTextModule constructor's deserialize rejects a
+      // different source; filename_hash is 0 (unenforced) because Node assigns
+      // vm modules numbered default identifiers (vm:module(N)), so a
+      // consumer's identifier legitimately differs and V8 does not key
+      // CachedData on the name either. params is empty for modules.
+      napi_bytecode_identity id;
+      id.shape = unofficial_napi_bytecode_shape_module;
+      id.source_hash = entry->source_hash;
+      id.params_hash = napi_bytecode_params_hash({});
+      id.filename_hash = 0;
+      bytes = napi_bytecode_serialize_payload(id, serialized, serialized_size);
+      js_free(ctx_, serialized);
+    }
+    else
+    {
+      JSValue exc = JS_GetException(ctx_);
+      JS_FreeValue(ctx_, exc);
+    }
+  }
+
   napi_value arraybuffer = nullptr;
   void *data = nullptr;
-  napi_status status = napi_create_arraybuffer(env_, 0, &data, &arraybuffer);
+  napi_status status = napi_create_arraybuffer(env_, bytes.size(), &data, &arraybuffer);
   if (status != napi_ok)
     return status;
-  return napi_create_typedarray(env_, napi_uint8_array, 0, arraybuffer, 0, result_out);
+  if (!bytes.empty() && data != nullptr)
+    std::memcpy(data, bytes.data(), bytes.size());
+  return napi_create_typedarray(env_, napi_uint8_array, bytes.size(), arraybuffer, 0, result_out);
 }
 
 napi_status napi_module_wrap__::set_import_module_dynamically_callback(napi_value callback)

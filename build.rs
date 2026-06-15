@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PREBUILT_V8_VERSION: &str = "11.9.2";
+const PREBUILT_V8_VERSION: &str = "11.9.7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V8Method {
@@ -380,11 +380,12 @@ fn prebuilt_asset_name() -> Result<(&'static str, &'static str), String> {
         target_arch.as_str(),
         target_env.as_str(),
     ) {
-        ("macos", "aarch64", _) => Ok(("v8-darwin-arm64.tar.xz", "darwin-arm64")),
+        ("macos", "aarch64", _) => Ok(("v8-darwin-aarch64.tar.xz", "darwin-arm64")),
         ("macos", "x86_64", _) => Ok(("v8-darwin-amd64.tar.xz", "darwin-amd64")),
         ("linux", "x86_64", "gnu") => Ok(("v8-linux-amd64.tar.xz", "linux-amd64")),
         ("linux", "x86_64", "musl") => Ok(("v8-linux-musl-amd64.tar.xz", "linux-musl-amd64")),
         ("android", "aarch64", _) => Ok(("v8-android-arm64.tar.xz", "android-arm64")),
+        ("windows", "x86_64", _) => Ok(("v8-windows-amd64.tar.xz", "windows-amd64")),
         (os, arch, env_kind) => Err(format!(
             "unsupported target for prebuilt V8: os={os}, arch={arch}, env={env_kind}"
         )),

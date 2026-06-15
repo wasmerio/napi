@@ -1403,7 +1403,8 @@ fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     sandbox_or_null: i32,
-    source: i32,
+    source_text: i32,
+    source_bytecode: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
@@ -1424,7 +1425,12 @@ fn guest_unofficial_napi_contextify_run_script(
             } else {
                 0
             },
-            source as u32,
+            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_bytecode > 0 {
+                source_bytecode as u32
+            } else {
+                0
+            },
             filename as u32,
             line_offset,
             column_offset,
@@ -1464,12 +1470,11 @@ fn guest_unofficial_napi_contextify_dispose_context(
 fn guest_unofficial_napi_contextify_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    code: i32,
+    source_text: i32,
+    source_bytecode: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
-    cached_data_or_undefined: i32,
-    produce_cached_data: i32,
     parsing_context_or_undefined: i32,
     context_extensions_or_undefined: i32,
     params_or_undefined: i32,
@@ -1481,16 +1486,15 @@ fn guest_unofficial_napi_contextify_compile_function(
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
-            code as u32,
-            filename as u32,
-            line_offset,
-            column_offset,
-            if cached_data_or_undefined > 0 {
-                cached_data_or_undefined as u32
+            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_bytecode > 0 {
+                source_bytecode as u32
             } else {
                 0
             },
-            produce_cached_data,
+            filename as u32,
+            line_offset,
+            column_offset,
             if parsing_context_or_undefined > 0 {
                 parsing_context_or_undefined as u32
             } else {
@@ -1520,10 +1524,12 @@ fn guest_unofficial_napi_contextify_compile_function(
     status
 }
 
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    code: i32,
+    source_text: i32,
+    source_bytecode: i32,
     filename: i32,
     is_sea_main: i32,
     should_detect_module: i32,
@@ -1534,7 +1540,12 @@ fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
             env_handle,
-            code as u32,
+            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_bytecode > 0 {
+                source_bytecode as u32
+            } else {
+                0
+            },
             filename as u32,
             is_sea_main,
             should_detect_module,
@@ -1548,37 +1559,131 @@ fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn guest_unofficial_napi_contextify_create_cached_data(
+fn guest_unofficial_napi_bytecode_compile(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    code: i32,
+    source_text: i32,
     filename: i32,
+    shape: i32,
+    params_or_undefined: i32,
+    host_defined_option_id: i32,
     line_offset: i32,
     column_offset: i32,
-    host_defined_option_id: i32,
-    result_ptr: i32,
+    bytecode_ptr: i32,
+    can_parse_as_module_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
+    let mut bytecode_id = 0u32;
+    let mut can_parse_as_module = 0u8;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_create_cached_data(
+        snapi_bridge_unofficial_bytecode_compile(
             env_handle,
-            code as u32,
+            source_text as u32,
             filename as u32,
-            line_offset,
-            column_offset,
+            shape,
+            if params_or_undefined > 0 {
+                params_or_undefined as u32
+            } else {
+                0
+            },
             if host_defined_option_id > 0 {
                 host_defined_option_id as u32
             } else {
                 0
             },
-            &mut result_id,
+            line_offset,
+            column_offset,
+            &mut bytecode_id,
+            &mut can_parse_as_module,
         )
     };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    if can_parse_as_module_ptr > 0 {
+        write_guest_u8(&mut env, can_parse_as_module_ptr as u32, can_parse_as_module);
+    }
+    if status == 0 && bytecode_ptr > 0 {
+        write_guest_u32(&mut env, bytecode_ptr as u32, bytecode_id);
     }
     status
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_bytecode_deserialize(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    bytes_ptr: i32,
+    byte_length: i32,
+    source_text: i32,
+    filename: i32,
+    shape: i32,
+    params_or_undefined: i32,
+    host_defined_option_id: i32,
+    bytecode_ptr: i32,
+    rejected_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    if bytes_ptr <= 0 || byte_length <= 0 {
+        return 1; // napi_invalid_arg
+    }
+    let Some(bytes) = read_guest_bytes(&mut env, bytes_ptr, byte_length as usize) else {
+        return 1; // napi_invalid_arg
+    };
+    let mut bytecode_id = 0u32;
+    let mut rejected = 0u8;
+    let status = unsafe {
+        snapi_bridge_unofficial_bytecode_deserialize(
+            env_handle,
+            bytes.as_ptr(),
+            bytes.len(),
+            source_text as u32,
+            filename as u32,
+            shape,
+            if params_or_undefined > 0 {
+                params_or_undefined as u32
+            } else {
+                0
+            },
+            if host_defined_option_id > 0 {
+                host_defined_option_id as u32
+            } else {
+                0
+            },
+            &mut bytecode_id,
+            &mut rejected,
+        )
+    };
+    if rejected_ptr > 0 {
+        write_guest_u8(&mut env, rejected_ptr as u32, rejected);
+    }
+    if status == 0 && bytecode_ptr > 0 {
+        write_guest_u32(&mut env, bytecode_ptr as u32, bytecode_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_bytecode_serialize(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    bytecode: i32,
+    buffer_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut buffer_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode as u32, &mut buffer_id)
+    };
+    if status == 0 && buffer_ptr > 0 {
+        write_guest_u32(&mut env, buffer_ptr as u32, buffer_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_bytecode_release(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    bytecode: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_bytecode_release(env_handle, bytecode as u32) }
 }
 
 fn guest_unofficial_napi_contextify_start_sigint_watchdog(
@@ -1640,10 +1745,11 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
     wrapper: i32,
     url: i32,
     context_or_undefined: i32,
-    source: i32,
+    source_text: i32,
+    source_bytecode: i32,
     line_offset: i32,
     column_offset: i32,
-    cached_data_or_id: i32,
+    host_defined_option_id: i32,
     handle_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
@@ -1658,11 +1764,16 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
             } else {
                 0
             },
-            source as u32,
+            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_bytecode > 0 {
+                source_bytecode as u32
+            } else {
+                0
+            },
             line_offset,
             column_offset,
-            if cached_data_or_id > 0 {
-                cached_data_or_id as u32
+            if host_defined_option_id > 0 {
+                host_defined_option_id as u32
             } else {
                 0
             },
@@ -5249,7 +5360,10 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_dispose_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_dispose_context),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_contextify_compile_function_for_cjs_loader" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function_for_cjs_loader),
-        "unofficial_napi_contextify_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_create_cached_data),
+        "unofficial_napi_bytecode_compile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_compile),
+        "unofficial_napi_bytecode_deserialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_deserialize),
+        "unofficial_napi_bytecode_serialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_serialize),
+        "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),
         "unofficial_napi_contextify_start_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_start_sigint_watchdog),
         "unofficial_napi_contextify_stop_sigint_watchdog" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_stop_sigint_watchdog),
         "unofficial_napi_contextify_watchdog_has_pending_sigint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_watchdog_has_pending_sigint),
