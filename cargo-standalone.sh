@@ -67,7 +67,7 @@ if [[ -f "$repo_root/Cargo.lock" ]]; then
   cp "$repo_root/Cargo.lock" "$standalone_work_dir/Cargo.lock"
 fi
 
-for entry in build.rs include src tests v8; do
+for entry in build.rs include lib src tests v8; do
   ln -s "$repo_root/$entry" "$standalone_work_dir/$entry"
 done
 

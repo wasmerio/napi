@@ -14,7 +14,10 @@ use wasmer_wasix::{
     runtime::task_manager::tokio::TokioTaskManager,
 };
 
-use crate::NapiCtx;
+use crate::{
+    NapiCtx,
+    guest::{napi::register_env_imports, wasmer_c_api::WasmCapiRuntimeHooks},
+};
 
 #[derive(Debug, Clone)]
 pub struct GuestMount {
@@ -179,13 +182,21 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
                 .enable_asynchronous_threading = false;
         }
         let hooks = ctx.runtime_hooks();
+        let wasm_c_api_hooks = WasmCapiRuntimeHooks::new();
         runtime
             .with_additional_imports({
                 let hooks = hooks.clone();
-                move |module, store| hooks.additional_imports(module, store)
+                let wasm_c_api_hooks = wasm_c_api_hooks.clone();
+                move |module, store| {
+                    let mut imports = hooks.additional_imports(module, store)?;
+                    register_env_imports(store, &mut imports);
+                    wasm_c_api_hooks.add_imports(module, store, &mut imports)?;
+                    Ok(imports)
+                }
             })
             .with_instance_setup(move |module, store, instance, imported_memory| {
-                hooks.configure_instance(module, store, instance, imported_memory)
+                hooks.configure_instance(module, store, instance, imported_memory)?;
+                wasm_c_api_hooks.configure_instance(module, store, instance, imported_memory)
             });
 
         match runner.run_wasm(
