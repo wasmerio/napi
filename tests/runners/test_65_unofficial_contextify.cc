@@ -42,9 +42,10 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
   ASSERT_NE(result, nullptr);
 
   napi_value eval_result = nullptr;
+  const unofficial_napi_js_source run_source{Str(s.env, "globalThis.answer = 42; answer"), nullptr};
   ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
                                                   sandbox,
-                                                  Str(s.env, "globalThis.answer = 42; answer"),
+                                                  &run_source,
                                                   Str(s.env, "ctx.js"),
                                                   0,
                                                   0,
@@ -67,9 +68,10 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
   EXPECT_EQ(answer, 42);
 
   ASSERT_EQ(unofficial_napi_contextify_dispose_context(s.env, sandbox), napi_ok);
+  const unofficial_napi_js_source disposed_source{Str(s.env, "1"), nullptr};
   EXPECT_EQ(unofficial_napi_contextify_run_script(s.env,
                                                   sandbox,
-                                                  Str(s.env, "1"),
+                                                  &disposed_source,
                                                   Str(s.env, "after_dispose.js"),
                                                   0,
                                                   0,
@@ -102,11 +104,9 @@ TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableFor
   ASSERT_NE(result, nullptr);
 
   napi_value eval_result = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_run_script(
-                s.env,
-                sandbox,
-                Str(s.env,
-                    R"JS(
+  const unofficial_napi_js_source freeze_source{
+      Str(s.env,
+          R"JS(
 const globalThisDescriptor = Object.getOwnPropertyDescriptor(globalThis, "globalThis");
 const markerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__quickjs_contextified");
 if (!globalThisDescriptor || globalThisDescriptor.enumerable ||
@@ -135,15 +135,19 @@ function deepFreeze(obj) {
 deepFreeze(globalThis);
 globalThis.__RSC_MANIFEST["/x"].ok;
 )JS"),
-                Str(s.env, "deep_freeze.js"),
-                0,
-                0,
-                -1,
-                true,
-                false,
-                false,
-                Sym(s.env, "hdo"),
-                &eval_result),
+      nullptr};
+  ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
+                                                  sandbox,
+                                                  &freeze_source,
+                                                  Str(s.env, "deep_freeze.js"),
+                                                  0,
+                                                  0,
+                                                  -1,
+                                                  true,
+                                                  false,
+                                                  false,
+                                                  Sym(s.env, "hdo"),
+                                                  &eval_result),
             napi_ok);
   ASSERT_NE(eval_result, nullptr);
 
@@ -167,13 +171,12 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
+  const unofficial_napi_js_source fn_source{Str(s.env, "return a + b;"), nullptr};
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
-                                                        Str(s.env, "return a + b;"),
+                                                        &fn_source,
                                                         Str(s.env, "fn.js"),
                                                         0,
                                                         0,
-                                                        undef,
-                                                        true,
                                                         undef,
                                                         context_extensions,
                                                         params,
@@ -198,19 +201,58 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(napi_get_value_int32(s.env, fn_result, &sum), napi_ok);
   EXPECT_EQ(sum, 5);
 
-  napi_value cached_data = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_create_cached_data(s.env,
-                                                          Str(s.env, "1 + 1"),
-                                                          Str(s.env, "script.js"),
-                                                          0,
-                                                          0,
-                                                          Sym(s.env, "hdo"),
-                                                          &cached_data),
+  // Cached data now flows through the bytecode handle APIs: compile eagerly,
+  // serialize the engine bytes, and restore a live artifact from them.
+  void* bytecode = nullptr;
+  ASSERT_EQ(unofficial_napi_bytecode_compile(s.env,
+                                             Str(s.env, "1 + 1"),
+                                             Str(s.env, "script.js"),
+                                             unofficial_napi_bytecode_shape_script,
+                                             undef,
+                                             Sym(s.env, "hdo"),
+                                             0,
+                                             0,
+                                             &bytecode,
+                                             nullptr),
             napi_ok);
+  ASSERT_NE(bytecode, nullptr);
+
+  napi_value cached_data = nullptr;
+  ASSERT_EQ(unofficial_napi_bytecode_serialize(s.env, bytecode, &cached_data), napi_ok);
   ASSERT_NE(cached_data, nullptr);
   bool is_typedarray = false;
   ASSERT_EQ(napi_is_typedarray(s.env, cached_data, &is_typedarray), napi_ok);
   EXPECT_TRUE(is_typedarray);
+  ASSERT_EQ(unofficial_napi_bytecode_release(s.env, bytecode), napi_ok);
+
+  const uint8_t* bytes = nullptr;
+  size_t byte_length = 0;
+  napi_typedarray_type array_type = napi_uint8_array;
+  napi_value arraybuffer = nullptr;
+  size_t byte_offset = 0;
+  void* data = nullptr;
+  ASSERT_EQ(napi_get_typedarray_info(s.env, cached_data, &array_type, &byte_length, &data,
+                                     &arraybuffer, &byte_offset),
+            napi_ok);
+  ASSERT_GT(byte_length, 0u);
+  bytes = static_cast<const uint8_t*>(data);
+
+  void* restored = nullptr;
+  bool rejected = false;
+  ASSERT_EQ(unofficial_napi_bytecode_deserialize(s.env,
+                                                 bytes,
+                                                 byte_length,
+                                                 Str(s.env, "1 + 1"),
+                                                 Str(s.env, "script.js"),
+                                                 unofficial_napi_bytecode_shape_script,
+                                                 undef,
+                                                 Sym(s.env, "hdo"),
+                                                 &restored,
+                                                 &rejected),
+            napi_ok);
+  EXPECT_FALSE(rejected);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_EQ(unofficial_napi_bytecode_release(s.env, restored), napi_ok);
 }
 
 TEST_F(Test65UnofficialContextify, CompileFunctionDoesNotUseGlobalFunctionConstructor) {
@@ -237,13 +279,12 @@ globalThis.Function = function Function() {
   ASSERT_EQ(napi_set_element(s.env, params, 0, Str(s.env, "value")), napi_ok);
 
   napi_value out = nullptr;
+  const unofficial_napi_js_source fn_source{Str(s.env, "return value + 1;"), nullptr};
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
-                                                        Str(s.env, "return value + 1;"),
+                                                        &fn_source,
                                                         Str(s.env, "no-global-function.js"),
                                                         0,
                                                         0,
-                                                        undef,
-                                                        false,
                                                         undef,
                                                         undef,
                                                         params,
@@ -275,13 +316,12 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAcceptsHashbangBody) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
+  const unofficial_napi_js_source hashbang_source{Str(s.env, "#!/usr/bin/env node\nreturn 42;"), nullptr};
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
-                                                        Str(s.env, "#!/usr/bin/env node\nreturn 42;"),
+                                                        &hashbang_source,
                                                         Str(s.env, ""),
                                                         0,
                                                         0,
-                                                        undef,
-                                                        false,
                                                         undef,
                                                         undef,
                                                         undef,
@@ -311,13 +351,13 @@ TEST_F(Test65UnofficialContextify, CompileFunctionRejectsBomBeforeHashbang) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
+  const unofficial_napi_js_source bom_source{
+      Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"), nullptr};
   EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
-                                                        Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"),
+                                                        &bom_source,
                                                         Str(s.env, "bom_hashbang.js"),
                                                         0,
                                                         0,
-                                                        undef,
-                                                        false,
                                                         undef,
                                                         undef,
                                                         undef,
@@ -384,13 +424,12 @@ TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
+  const unofficial_napi_js_source cjs_source{Str(s.env, "module.exports = 1;"), nullptr};
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
-                                                        Str(s.env, "module.exports = 1;"),
+                                                        &cjs_source,
                                                         Str(s.env, "cjs.js"),
                                                         0,
                                                         0,
-                                                        undef,
-                                                        false,
                                                         undef,
                                                         undef,
                                                         params,
