@@ -26,12 +26,12 @@ anyhow = "1"
 wasmer = { version = "=7.1.0" }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { version = "=7.2.0-alpha.3", optional = true }
-wasmer_c_api = { version = "=7.2.0-alpha.3", optional = true, default-features = false, package = "wasmer-c-api" }
-wasmer-compiler-llvm = { version = "=7.2.0-alpha.3", optional = true }
-wasmer-types = { version = "=7.2.0-alpha.3", optional = true }
-wasmer-wasix = { version = "=0.702.0-alpha.3", optional = true }
-virtual-fs = { version = "=0.702.0-alpha.3", optional = true }
+wasmer-cache = { version = "=7.2.0-rc.1", optional = true }
+wasmer_c_api = { version = "=7.2.0-rc.1", optional = true, default-features = false, package = "wasmer-c-api" }
+wasmer-compiler-llvm = { version = "=7.2.0-rc.1", optional = true }
+wasmer-types = { version = "=7.2.0-rc.1", optional = true }
+wasmer-wasix = { version = "=0.702.0-rc.1", optional = true }
+virtual-fs = { version = "=0.702.0-rc.1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 
