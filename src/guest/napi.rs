@@ -1425,7 +1425,11 @@ fn guest_unofficial_napi_contextify_run_script(
             } else {
                 0
             },
-            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_text > 0 {
+                source_text as u32
+            } else {
+                0
+            },
             if source_bytecode > 0 {
                 source_bytecode as u32
             } else {
@@ -1486,7 +1490,11 @@ fn guest_unofficial_napi_contextify_compile_function(
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
-            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_text > 0 {
+                source_text as u32
+            } else {
+                0
+            },
             if source_bytecode > 0 {
                 source_bytecode as u32
             } else {
@@ -1540,7 +1548,11 @@ fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
             env_handle,
-            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_text > 0 {
+                source_text as u32
+            } else {
+                0
+            },
             if source_bytecode > 0 {
                 source_bytecode as u32
             } else {
@@ -1598,7 +1610,11 @@ fn guest_unofficial_napi_bytecode_compile(
         )
     };
     if can_parse_as_module_ptr > 0 {
-        write_guest_u8(&mut env, can_parse_as_module_ptr as u32, can_parse_as_module);
+        write_guest_u8(
+            &mut env,
+            can_parse_as_module_ptr as u32,
+            can_parse_as_module,
+        );
     }
     if status == 0 && bytecode_ptr > 0 {
         write_guest_u32(&mut env, bytecode_ptr as u32, bytecode_id);
@@ -1764,7 +1780,11 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
             } else {
                 0
             },
-            if source_text > 0 { source_text as u32 } else { 0 },
+            if source_text > 0 {
+                source_text as u32
+            } else {
+                0
+            },
             if source_bytecode > 0 {
                 source_bytecode as u32
             } else {
