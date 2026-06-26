@@ -359,10 +359,7 @@ unsafe extern "C" {
         bytecode_id: u32,
         buffer_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_bytecode_release(
-        env: SnapiEnv,
-        bytecode_id: u32,
-    ) -> i32;
+    pub fn snapi_bridge_unofficial_bytecode_release(env: SnapiEnv, bytecode_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
         env: SnapiEnv,
         result_out: *mut i32,
