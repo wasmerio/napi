@@ -14,10 +14,8 @@ use wasmer_wasix::{
     runtime::task_manager::tokio::TokioTaskManager,
 };
 
-use crate::{
-    NapiCtx,
-    guest::{napi::register_env_imports, wasmer_c_api::WasmCapiRuntimeHooks},
-};
+use crate::{NapiCtx, guest::napi::register_env_imports};
+use wasmer_c_api::wasm_c_api::imports::WasmCapiRuntimeHooks;
 
 #[derive(Debug, Clone)]
 pub struct GuestMount {
