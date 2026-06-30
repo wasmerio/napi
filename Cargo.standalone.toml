@@ -1,6 +1,6 @@
 [package]
 name = "wasmer-napi"
-version = "0.701.0"
+version = "0.702.0"
 description = "NAPI library for Wasmer WebAssembly runtime"
 edition = "2024"
 license = "MIT"
@@ -23,15 +23,15 @@ anyhow = "1"
 # Keep the standalone crates.io build on the 0.701 / 7.1 family. The vendored
 # manifest can track local 0.702 / 7.2 path crates, but crates.io 7.2 currently
 # requires rustc 1.92 while this standalone workflow is expected to run on 1.91.
-wasmer = { version = "=7.1.0" }
+wasmer = { version = "=7.2.0" }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { version = "=7.2.0-rc.1", optional = true }
-wasmer-c-api-imports = { version = "=7.2.0-rc.1", optional = true, default-features = false }
-wasmer-compiler-llvm = { version = "=7.2.0-rc.1", optional = true }
-wasmer-types = { version = "=7.2.0-rc.1", optional = true }
-wasmer-wasix = { version = "=0.702.0-rc.1", optional = true }
-virtual-fs = { version = "=0.702.0-rc.1", optional = true }
+wasmer-cache = { version = "=7.2.0", optional = true }
+wasmer-c-api-imports = { version = "=7.2.0", optional = true, default-features = false }
+wasmer-compiler-llvm = { version = "=7.2.0", optional = true }
+wasmer-types = { version = "=7.2.0", optional = true }
+wasmer-wasix = { version = "=0.702.0", optional = true }
+virtual-fs = { version = "=0.702.0", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 
