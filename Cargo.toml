@@ -11,8 +11,8 @@ cli = [
   "dep:wasmer-wasix",
   "dep:wasmer-cache",
   "dep:wasmer-compiler-llvm",
-  "dep:wasmer_c_api",
-  "wasmer_c_api/llvm",
+  "dep:wasmer-c-api-imports",
+  "wasmer-c-api-imports/llvm",
   "dep:tokio",
   "dep:virtual-fs",
   "dep:wasmer-types",
@@ -31,7 +31,7 @@ wasmer = { version = "=7.2.0-rc.1", path = "../api" }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
 wasmer-cache = { version = "=7.2.0-rc.1", path = "../cache", optional = true }
-wasmer_c_api = { version = "=7.2.0-rc.1", path = "../c-api", optional = true, default-features = false, package = "wasmer-c-api" }
+wasmer-c-api-imports = { version = "=7.2.0-rc.1", path = "../c-api-imports", optional = true, default-features = false }
 wasmer-compiler-llvm = { version = "=7.2.0-rc.1", path = "../compiler-llvm", optional = true }
 wasmer-types = { version = "=7.2.0-rc.1", path = "../types", optional = true }
 wasmer-wasix = { version = "=0.702.0-rc.1", path = "../wasix", optional = true }
