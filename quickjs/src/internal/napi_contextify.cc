@@ -817,9 +817,9 @@ namespace quickjs::detail
             napi_env_context_scope__ child_scope{env_, record->ctx};
             JSEvalOptions options{
                 .version = JS_EVAL_OPTIONS_VERSION,
+                .eval_flags = JS_EVAL_TYPE_GLOBAL,
                 .filename = label.c_str(),
                 .line_num = std::max<int32_t>(1, line_offset + 1),
-                .eval_flags = JS_EVAL_TYPE_GLOBAL,
             };
             result = JS_EvalThis2(record->ctx, record->global, src.c_str(), src.size(), &options);
             if (JS_IsException(result))

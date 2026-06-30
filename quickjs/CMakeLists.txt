@@ -17,14 +17,6 @@ set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # include("${NAPI_V8_ROOT}/cmake/NapiEngine.cmake")
 # include("${NAPI_V8_ROOT}/cmake/NapiV8Resolver.cmake")
 # napi_engine_set_layout("${NAPI_V8_ROOT}")
-# set(NAPI_V8_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/node")
-# if(DEFINED ENV{NAPI_V8_NODE_ROOT})
-#   set(NAPI_V8_NODE_ROOT_DEFAULT "$ENV{NAPI_V8_NODE_ROOT}")
-# endif()
-# set(NAPI_V8_NODE_ROOT
-#   "${NAPI_V8_NODE_ROOT_DEFAULT}"
-#   CACHE PATH "Path to Node source root (for raw Node tests/fixtures)"
-# )
 # napi_v8_resolve_configuration()
 
 include("${NAPI_QUICKJS_ROOT}/cmake/NapiEngine.cmake")

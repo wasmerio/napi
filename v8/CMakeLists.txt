@@ -16,14 +16,6 @@ napi_enable_sccache_if_available()
 include("${NAPI_V8_ROOT}/cmake/NapiEngine.cmake")
 include("${NAPI_V8_ROOT}/cmake/NapiV8Resolver.cmake")
 napi_engine_set_layout("${NAPI_V8_ROOT}")
-set(NAPI_V8_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/node")
-if(DEFINED ENV{NAPI_V8_NODE_ROOT})
-  set(NAPI_V8_NODE_ROOT_DEFAULT "$ENV{NAPI_V8_NODE_ROOT}")
-endif()
-set(NAPI_V8_NODE_ROOT
-  "${NAPI_V8_NODE_ROOT_DEFAULT}"
-  CACHE PATH "Path to Node source root (for raw Node tests/fixtures)"
-)
 napi_v8_resolve_configuration()
 
 file(GLOB_RECURSE NAPI_V8_SRC_FILES
