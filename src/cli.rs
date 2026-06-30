@@ -15,7 +15,7 @@ use wasmer_wasix::{
 };
 
 use crate::{NapiCtx, guest::napi::register_env_imports};
-use wasmer_c_api::wasm_c_api::imports::WasmCapiRuntimeHooks;
+use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 
 #[derive(Debug, Clone)]
 pub struct GuestMount {
