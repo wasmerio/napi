@@ -1,5 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
-use std::any::Any;
+use anyhow::{Context, Result, bail};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -39,19 +38,17 @@ pub struct NapiSession {
 /// [`NapiRuntimeHooks::additional_imports`].
 ///
 /// Pass it back, unmodified, to [`NapiRuntimeHooks::configure_instance`] for
-/// the instance created with those imports. The type matches wasmer-wasix's
-/// `InstantiationState`, so the hooks plug directly into a
-/// `PluggableRuntime` instantiation hook.
-pub type NapiInstantiationState = Option<Box<dyn Any + Send>>;
+/// the instance created with those imports.
+pub struct NapiInstantiationState {
+    session: Option<NapiSession>,
+}
 
 /// Runtime hooks that provide N-API imports for WASIX guests.
-///
-/// The import phase creates a per-instantiation [`NapiSession`] (holding the
-/// function env backing the imported host functions) and returns it as
-/// opaque state; the caller hands that state back to
-/// [`Self::configure_instance`] after instantiation. The hooks themselves
-/// are stateless, so concurrent instantiations — same module or not, same
-/// store or not — cannot receive each other's sessions.
+// The import phase creates a per-instantiation session holding the function
+// env backing the imported host functions, and hands it to the caller as
+// opaque state. The hooks themselves are stateless, so concurrent
+// instantiations — same module or not, same store or not — cannot receive
+// each other's sessions.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
     ctx: NapiCtx,
@@ -221,7 +218,7 @@ impl NapiRuntimeHooks {
     ) -> Result<(Imports, NapiInstantiationState)> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
-            return Ok((Imports::new(), None));
+            return Ok((Imports::new(), NapiInstantiationState { session: None }));
         }
 
         if let Some(version) = napi_version
@@ -238,7 +235,12 @@ impl NapiRuntimeHooks {
 
         let session = self.ctx.prepare_module(module)?;
         let imports = session.create_imports(store)?;
-        Ok((imports, Some(Box::new(session))))
+        Ok((
+            imports,
+            NapiInstantiationState {
+                session: Some(session),
+            },
+        ))
     }
 
     /// Completes memory, table, and guest allocation wiring after
@@ -260,10 +262,10 @@ impl NapiRuntimeHooks {
             return Ok(());
         }
 
-        let session = state
-            .context("missing N-API session state for module instance setup")?
-            .downcast::<NapiSession>()
-            .map_err(|_| anyhow!("instance setup state is not an N-API session"))?;
+        let session = state.session.context(
+            "missing N-API session for module instance setup \
+             (the state was not created for this module's imports)",
+        )?;
         session.configure_instance(store, instance, imported_memory)
     }
 }
@@ -404,7 +406,10 @@ mod tests {
         let (imports_a, state_a) = hooks
             .additional_imports(&module, &mut store_a.as_store_mut())
             .expect("imports register for store A");
-        assert!(state_a.is_some(), "session state travels with the caller");
+        assert!(
+            state_a.session.is_some(),
+            "session state travels with the caller"
+        );
         let (imports_b, state_b) = hooks
             .additional_imports(&module, &mut store_b.as_store_mut())
             .expect("imports register for store B");
@@ -454,10 +459,17 @@ mod tests {
             .expect("imports register");
         let instance = Instance::new(&mut store, &module, &imports).expect("instance");
 
+        let empty_state = super::NapiInstantiationState { session: None };
         let err = hooks
-            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, None)
-            .expect_err("configuring an N-API instance without state must fail");
-        assert!(err.to_string().contains("missing N-API session state"));
+            .configure_instance(
+                &module,
+                &mut store.as_store_mut(),
+                &instance,
+                None,
+                empty_state,
+            )
+            .expect_err("configuring an N-API instance without its session must fail");
+        assert!(err.to_string().contains("missing N-API session"));
     }
 
     #[test]
