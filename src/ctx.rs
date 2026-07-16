@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
+use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreId, StoreMut, Table, Value};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
@@ -35,10 +35,35 @@ pub struct NapiSession {
     inner: Arc<NapiSessionInner>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SessionKey {
+    module_id: String,
+    store_id: StoreId,
+}
+
+impl SessionKey {
+    fn new(module: &Module, store: &StoreMut<'_>) -> Self {
+        Self {
+            module_id: module.info().id.id(),
+            store_id: store.id(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
     ctx: NapiCtx,
-    sessions: Arc<Mutex<HashMap<usize, VecDeque<NapiSession>>>>,
+    /// Pending per-instantiation sessions, grouped by compiled module and
+    /// target store.
+    ///
+    /// `additional_imports` creates host functions before instantiation,
+    /// while `configure_instance` can only discover exports like guest
+    /// malloc after instantiation. The queue preserves that pairing when the
+    /// same module is instantiated multiple times. Keying by store keeps
+    /// concurrent instantiations of one module in different stores from
+    /// receiving each other's sessions, whose store-bound function envs
+    /// would panic when used with the wrong store.
+    sessions: Arc<Mutex<HashMap<SessionKey, VecDeque<NapiSession>>>>,
 }
 
 #[derive(Debug)]
@@ -200,10 +225,6 @@ impl NapiCtx {
 }
 
 impl NapiRuntimeHooks {
-    fn module_key(module: &Module) -> usize {
-        module as *const Module as usize
-    }
-
     pub fn additional_imports(&self, module: &Module, store: &mut StoreMut<'_>) -> Result<Imports> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
@@ -229,7 +250,7 @@ impl NapiRuntimeHooks {
             .lock()
             .expect("poisoned NapiRuntimeHooks session queue");
         sessions
-            .entry(Self::module_key(module))
+            .entry(SessionKey::new(module, store))
             .or_default()
             .push_back(session);
         Ok(imports)
@@ -252,7 +273,7 @@ impl NapiRuntimeHooks {
                 .sessions
                 .lock()
                 .expect("poisoned NapiRuntimeHooks session queue");
-            let key = Self::module_key(module);
+            let key = SessionKey::new(module, store);
             let Some(queue) = sessions.get_mut(&key) else {
                 bail!("missing pending N-API session for module instance setup");
             };
@@ -356,7 +377,7 @@ fn napi_wasmer_extension_version_from_namespace(
 mod tests {
     use super::NapiCtx;
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
-    use wasmer::{Module, Store};
+    use wasmer::{AsStoreMut, Instance, Module, Store};
     use wat::parse_str;
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
@@ -385,6 +406,42 @@ mod tests {
     fn compile_wat(store: &Store, wat: &str) -> Module {
         let wasm = parse_str(wat).expect("wat module parses");
         Module::new(store, wasm).expect("wat module compiles")
+    }
+
+    #[test]
+    fn configure_instance_pairs_sessions_by_store() {
+        let mut store_a = Store::default();
+        let mut store_b = Store::new(store_a.engine().clone());
+        let module = compile_wat(
+            &store_a,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "malloc") (param i32) (result i32) i32.const 8)
+            )"#,
+        );
+
+        let ctx = NapiCtx::default();
+        let hooks = ctx.runtime_hooks();
+        let imports_a = hooks
+            .additional_imports(&module, &mut store_a.as_store_mut())
+            .expect("imports register for store A");
+        let imports_b = hooks
+            .additional_imports(&module, &mut store_b.as_store_mut())
+            .expect("imports register for store B");
+
+        // Instance setup completes in the reverse of the additional_imports
+        // order, like two threads racing to cold-start the same module in
+        // separate stores. Each configure_instance call must receive the
+        // session whose function env lives in its own store.
+        let instance_b = Instance::new(&mut store_b, &module, &imports_b).expect("instance B");
+        hooks
+            .configure_instance(&module, &mut store_b.as_store_mut(), &instance_b, None)
+            .expect("configure instance B");
+        let instance_a = Instance::new(&mut store_a, &module, &imports_a).expect("instance A");
+        hooks
+            .configure_instance(&module, &mut store_a.as_store_mut(), &instance_a, None)
+            .expect("configure instance A");
     }
 
     #[test]
