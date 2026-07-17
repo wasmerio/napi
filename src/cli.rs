@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::any::Any;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,8 +15,8 @@ use wasmer_wasix::{
     runtime::task_manager::tokio::TokioTaskManager,
 };
 
-use crate::{NapiCtx, guest::napi::register_env_imports};
-use wasmer_c_api_imports::WasmCapiRuntimeHooks;
+use crate::{NapiCtx, NapiInstantiationState, guest::napi::register_env_imports};
+use wasmer_c_api_imports::{WasmCapiInstantiationState, WasmCapiRuntimeHooks};
 
 #[derive(Debug, Clone)]
 pub struct GuestMount {
@@ -181,21 +182,33 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
         }
         let hooks = ctx.runtime_hooks();
         let wasm_c_api_hooks = WasmCapiRuntimeHooks::new();
-        runtime
-            .with_additional_imports({
+        runtime.with_instantiation_hook(
+            {
                 let hooks = hooks.clone();
                 let wasm_c_api_hooks = wasm_c_api_hooks.clone();
                 move |module, store| {
-                    let mut imports = hooks.additional_imports(module, store)?;
+                    let (mut imports, napi_state) = hooks.additional_imports(module, store)?;
                     register_env_imports(store, &mut imports);
-                    wasm_c_api_hooks.add_imports(module, store, &mut imports)?;
-                    Ok(imports)
+                    let capi_state = wasm_c_api_hooks.add_imports(module, store, &mut imports)?;
+                    let state: Box<dyn Any + Send> = Box::new((napi_state, capi_state));
+                    Ok((imports, Some(state)))
                 }
-            })
-            .with_instance_setup(move |module, store, instance, imported_memory| {
-                hooks.configure_instance(module, store, instance, imported_memory)?;
-                wasm_c_api_hooks.configure_instance(module, store, instance, imported_memory)
-            });
+            },
+            move |module, store, instance, imported_memory, state| {
+                let (napi_state, capi_state) = *state
+                    .context("missing N-API instance setup state")?
+                    .downcast::<(NapiInstantiationState, WasmCapiInstantiationState)>()
+                    .map_err(|_| anyhow::anyhow!("unexpected instance setup state"))?;
+                hooks.configure_instance(module, store, instance, imported_memory, napi_state)?;
+                wasm_c_api_hooks.configure_instance(
+                    module,
+                    store,
+                    instance,
+                    imported_memory,
+                    capi_state,
+                )
+            },
+        );
 
         match runner.run_wasm(
             RuntimeOrEngine::Runtime(Arc::new(runtime)),

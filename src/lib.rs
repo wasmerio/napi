@@ -10,7 +10,9 @@ pub const NAPI_MODULE_NAME: &str = "napi";
 pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
 pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 
-pub use ctx::{NapiCtx, NapiCtxBuilder, NapiLimits, NapiRuntimeHooks, NapiSession};
+pub use ctx::{
+    NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeHooks, NapiSession,
+};
 use enum_iterator::Sequence;
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
 
