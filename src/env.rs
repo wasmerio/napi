@@ -47,6 +47,11 @@ pub(crate) struct NapiEnv {
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
+    /// External memory the guest has declared via `napi_adjust_external_memory`,
+    /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can only
+    /// release what this env declared — never the allocator's charges or more
+    /// than it added — and so teardown releases the remainder.
+    external_declared: u64,
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -79,6 +84,7 @@ impl NapiEnv {
             budget,
             max_envs,
             env_heap_charges: HashMap::new(),
+            external_declared: 0,
             memory: None,
             malloc_fn: None,
             table: None,
@@ -176,6 +182,25 @@ impl NapiEnv {
         self.budget.release_env(reservation.ceiling_bytes);
     }
 
+    /// Charge a positive `napi_adjust_external_memory` delta against the budget.
+    /// Returns `false` (guest sees a failure) when it would exceed the budget.
+    pub(crate) fn charge_declared_external(&mut self, bytes: u64) -> bool {
+        if self.budget.try_charge(Pool::V8External, bytes).is_err() {
+            return false;
+        }
+        self.external_declared = self.external_declared.saturating_add(bytes);
+        true
+    }
+
+    /// Release a negative `napi_adjust_external_memory` delta, clamped to what
+    /// this env actually declared so it can never underflow the pool or release
+    /// the allocator's charges.
+    pub(crate) fn uncharge_declared_external(&mut self, bytes: u64) {
+        let release = bytes.min(self.external_declared);
+        self.external_declared -= release;
+        self.budget.uncharge(Pool::V8External, release);
+    }
+
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         let env_id = self.next_napi_env_id.max(1);
         self.next_napi_env_id = env_id.saturating_add(1);
@@ -239,5 +264,56 @@ impl Drop for NapiEnv {
                 }
             }
         }
+        // Release any external memory the guest declared but did not take back.
+        if self.external_declared > 0 {
+            self.budget
+                .uncharge(Pool::V8External, self.external_declared);
+            self.external_declared = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn declared_external_charges_denies_and_clamps() {
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        let mut env = NapiEnv::new(Arc::clone(&budget), None);
+
+        assert!(env.charge_declared_external(6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // Over budget: denied, nothing charged.
+        assert!(!env.charge_declared_external(6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // A negative delta larger than declared is clamped to what was declared,
+        // so it can never underflow the pool.
+        env.uncharge_declared_external(100 * MIB);
+        assert_eq!(budget.snapshot().v8_external, 0);
+        assert_eq!(env.external_declared, 0);
+
+        // Further release is a no-op.
+        env.uncharge_declared_external(MIB);
+        assert_eq!(budget.snapshot().v8_external, 0);
+    }
+
+    #[test]
+    fn declared_external_released_on_drop() {
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        {
+            let mut env = NapiEnv::new(Arc::clone(&budget), None);
+            assert!(env.charge_declared_external(4 * MIB));
+            assert_eq!(budget.snapshot().v8_external, 4 * MIB);
+        }
+        assert_eq!(
+            budget.snapshot().v8_external,
+            0,
+            "drop releases declared external"
+        );
     }
 }

@@ -4649,12 +4649,27 @@ fn guest_napi_adjust_external_memory(
     change: i64,
     rp: i32,
 ) -> i32 {
+    // Charge a positive delta up front so an over-budget declaration fails
+    // before V8 is told about the memory.
+    if change > 0 && !env.data_mut().charge_declared_external(change as u64) {
+        return 1;
+    }
+
     let mut adjusted: i64 = 0;
     let s =
         unsafe { snapi_bridge_adjust_external_memory(snapi_env(&env, e), change, &mut adjusted) };
-    if s == 0 {
-        write_guest_i64(&mut env, rp as u32, adjusted);
+    if s != 0 {
+        if change > 0 {
+            env.data_mut().uncharge_declared_external(change as u64);
+        }
+        return s;
     }
+
+    if change < 0 {
+        env.data_mut()
+            .uncharge_declared_external(change.unsigned_abs());
+    }
+    write_guest_i64(&mut env, rp as u32, adjusted);
     s
 }
 
