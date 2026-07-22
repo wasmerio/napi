@@ -2563,6 +2563,32 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   return napi_ok;
 }
 
+// Rust-exported grant callback (see budget.rs). Charges a grow-step against
+// the resource budget and returns the raised (or unchanged) heap limit.
+extern "C" size_t napi_host_near_heap_limit_grant(const void* data,
+                                                  size_t current_limit,
+                                                  size_t initial_limit);
+
+namespace {
+// V8-shaped trampoline forwarding to the Rust grant callback. The budget
+// tracker rides in `data`.
+size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void* data,
+                                   size_t current_limit,
+                                   size_t initial_limit) {
+  return napi_host_near_heap_limit_grant(data, current_limit, initial_limit);
+}
+}  // namespace
+
+extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
+    SnapiEnvState* env_state, const void* data) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (env_state == nullptr || env_state->env == nullptr) {
+    return napi_invalid_arg;
+  }
+  return unofficial_napi_set_near_heap_limit_callback(
+      env_state->env, HostNearHeapLimitTrampoline, const_cast<void*>(data));
+}
+
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   return DisposeBridgeStateLocked(env_state);

@@ -22,6 +22,7 @@
 //! (see `cli.rs`) makes `Memory::new` — and therefore the guest's imported
 //! memory — budget-aware with no change to the memory-creation call site.
 
+use std::ffi::c_void;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -393,6 +394,53 @@ impl ResourceBudget {
             ceiling_bytes: fixed + old,
             clamped: true,
         })
+    }
+}
+
+/// Per-V8-env heap-growth tracker shared with the host-owned near-heap-limit
+/// callback.
+///
+/// Boxed at env creation and handed to the callback as an opaque pointer; the
+/// owning [`crate::env::NapiEnv`] reclaims it at env teardown to release the
+/// bytes granted beyond the initial ceiling.
+pub(crate) struct EnvHeapCharge {
+    pub(crate) budget: Arc<ResourceBudget>,
+    /// Bytes granted beyond the initial ceiling by grow-step grants.
+    pub(crate) granted: AtomicU64,
+}
+
+/// Host-owned near-heap-limit callback for a budgeted V8 isolate.
+///
+/// When V8 approaches a heap ceiling it invokes this on the isolate's JS
+/// thread. We charge one [`DEFAULT_HEAP_GROW_STEP`] against the budget and, if
+/// granted, raise the limit by that step; if the budget is exhausted we leave
+/// the limit unchanged, at which point V8 takes its own OOM path (graceful,
+/// abort-free teardown is a later phase). The budget is atomic, so this is safe
+/// to call concurrently with charges on other threads.
+///
+/// # Safety
+/// `data` must be null or a pointer to an [`EnvHeapCharge`] that outlives the
+/// call. The tracker is freed only at env teardown — after the callback is
+/// removed from the isolate and while no JS runs — so a non-null pointer is
+/// valid for every real invocation.
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_near_heap_limit_grant(
+    data: *const c_void,
+    current_limit: usize,
+    _initial_limit: usize,
+) -> usize {
+    if data.is_null() {
+        return current_limit;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let step = DEFAULT_HEAP_GROW_STEP;
+    match tracker.budget.try_charge(Pool::V8HeapReserved, step) {
+        Ok(()) => {
+            tracker.granted.fetch_add(step, Ordering::AcqRel);
+            current_limit.saturating_add(step as usize)
+        }
+        Err(_) => current_limit,
     }
 }
 
@@ -944,5 +992,59 @@ mod tests {
         );
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
         assert_eq!(budget.live_isolates(), 1, "still counted for observability");
+    }
+
+    #[test]
+    fn near_heap_limit_callback_grants_until_budget_exhausted() {
+        let step = DEFAULT_HEAP_GROW_STEP as usize;
+        // Room for exactly two grow-step grants.
+        let budget = ResourceBudget::with_memory_limit(2 * DEFAULT_HEAP_GROW_STEP);
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
+            budget: Arc::clone(&budget),
+            granted: AtomicU64::new(0),
+        }));
+        let data = ptr as *const c_void;
+        let base = 100 * 1024 * 1024usize;
+
+        // Each of the first two grants raises the limit by a step and charges it.
+        assert_eq!(
+            napi_host_near_heap_limit_grant(data, base, base),
+            base + step
+        );
+        assert_eq!(
+            napi_host_near_heap_limit_grant(data, base + step, base),
+            base + 2 * step
+        );
+        assert_eq!(
+            budget.snapshot().v8_heap_reserved,
+            2 * DEFAULT_HEAP_GROW_STEP
+        );
+
+        // Budget exhausted: the limit is left unchanged (V8 then OOMs on its own).
+        assert_eq!(
+            napi_host_near_heap_limit_grant(data, base + 2 * step, base),
+            base + 2 * step
+        );
+        assert_eq!(
+            budget.snapshot().v8_heap_reserved,
+            2 * DEFAULT_HEAP_GROW_STEP
+        );
+
+        // The tracker recorded exactly what was granted, and releasing it (as
+        // env teardown does) returns the pool to zero.
+        let tracker = unsafe { Box::from_raw(ptr) };
+        let granted = tracker.granted.load(Ordering::Acquire);
+        assert_eq!(granted, 2 * DEFAULT_HEAP_GROW_STEP);
+        budget.uncharge(Pool::V8HeapReserved, granted);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+
+    #[test]
+    fn near_heap_limit_callback_ignores_null_data() {
+        assert_eq!(
+            napi_host_near_heap_limit_grant(std::ptr::null(), 42, 7),
+            42,
+            "a null tracker leaves the limit unchanged"
+        );
     }
 }

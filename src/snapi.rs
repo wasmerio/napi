@@ -87,6 +87,13 @@ unsafe extern "C" {
     ) -> i32;
     #[allow(dead_code)]
     pub fn snapi_bridge_unofficial_set_stack_limit(env: SnapiEnv, stack_limit: u32) -> i32;
+    /// Register a host-owned near-heap-limit callback that charges V8 heap
+    /// growth against the resource budget. `data` is an
+    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
+    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
+        env: SnapiEnv,
+        data: *const c_void,
+    ) -> i32;
     #[allow(dead_code)]
     pub fn snapi_bridge_unofficial_set_near_heap_limit_callback(
         env: SnapiEnv,

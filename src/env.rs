@@ -1,10 +1,26 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wasmer::{Memory, Table, TypedFunction};
 
-use crate::budget::{EnvRejected, HeapReservation, RequestedHeap, ResourceBudget};
-use crate::snapi::{SnapiEnv, snapi_bridge_unofficial_release_env};
+use crate::budget::{
+    EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
+};
+use crate::snapi::{
+    SnapiEnv, snapi_bridge_unofficial_release_env,
+    snapi_bridge_unofficial_set_host_near_heap_limit_callback,
+};
+
+/// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
+/// pointer (as `usize`, so [`NapiEnv`] stays `Send`) to the boxed
+/// [`EnvHeapCharge`] the near-heap-limit callback grows. `tracker == 0` means
+/// the env is unbudgeted (unlimited).
+struct EnvHeapChargeHandle {
+    ceiling: u64,
+    tracker: usize,
+}
 
 pub(crate) struct HostBufferCopy {
     pub(crate) handle_id: u32,
@@ -26,9 +42,9 @@ pub(crate) struct NapiEnv {
     pub(crate) budget: Arc<ResourceBudget>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
     pub(crate) max_envs: Option<usize>,
-    /// Heap ceiling (bytes) charged per live V8 env, keyed by guest env id, so
-    /// teardown releases exactly what creation charged.
-    env_heap_charges: HashMap<u32, u64>,
+    /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
+    /// exactly what creation charged plus what the callback later granted.
+    env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -92,16 +108,42 @@ impl NapiEnv {
         self.budget.try_reserve_env(requested, self.max_envs)
     }
 
-    /// Register a successfully-created env and attach its heap charge, so
-    /// teardown releases it.
+    /// Register a successfully-created env, attach its heap charge, and — under
+    /// a limited budget — install the host-owned near-heap-limit callback so V8
+    /// heap growth for this isolate is charged against the budget. Teardown
+    /// releases both the initial ceiling and any granted growth.
     pub(crate) fn commit_isolate(
         &mut self,
         env: SnapiEnv,
         reservation: &HeapReservation,
     ) -> (u32, u32) {
         let (env_id, scope_id) = self.register_napi_env(env);
-        self.env_heap_charges
-            .insert(env_id, reservation.ceiling_bytes);
+
+        let tracker = if reservation.clamped {
+            let boxed = Box::into_raw(Box::new(EnvHeapCharge {
+                budget: Arc::clone(&self.budget),
+                granted: AtomicU64::new(0),
+            }));
+            // SAFETY: `env` is the isolate just created; `boxed` outlives the
+            // callback (freed only at this env's teardown, below).
+            unsafe {
+                snapi_bridge_unofficial_set_host_near_heap_limit_callback(
+                    env,
+                    boxed as *const c_void,
+                );
+            }
+            boxed as usize
+        } else {
+            0
+        };
+
+        self.env_heap_charges.insert(
+            env_id,
+            EnvHeapChargeHandle {
+                ceiling: reservation.ceiling_bytes,
+                tracker,
+            },
+        );
         (env_id, scope_id)
     }
 
@@ -130,9 +172,22 @@ impl NapiEnv {
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
         }
-        // Release the heap ceiling + isolate slot this env reserved at creation.
-        if let Some(ceiling) = self.env_heap_charges.remove(&env_id) {
-            self.budget.release_env(ceiling);
+        // Release the heap ceiling + any callback-granted growth + isolate slot
+        // this env reserved.
+        if let Some(handle) = self.env_heap_charges.remove(&env_id) {
+            let granted = if handle.tracker != 0 {
+                // SAFETY: reclaim the box created in `commit_isolate`. The
+                // near-heap-limit callback holding this pointer only runs during
+                // JS execution, and no JS runs between here and the paired env
+                // release that removes the callback and disposes the isolate, so
+                // freeing it now is safe.
+                let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
+                boxed.granted.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            self.budget.uncharge(Pool::V8HeapReserved, granted);
+            self.budget.release_env(handle.ceiling);
         }
         let env = self.napi_envs.remove(&env_id)?;
         self.napi_state_to_guest_env.remove(&env);
