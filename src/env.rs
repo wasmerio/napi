@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wasmer::{Memory, Table, TypedFunction};
 
+use crate::budget::{EnvRejected, HeapReservation, RequestedHeap, ResourceBudget};
 use crate::snapi::{SnapiEnv, snapi_bridge_unofficial_release_env};
 
 pub(crate) struct HostBufferCopy {
@@ -17,8 +19,16 @@ pub(crate) struct GuestBackingStoreMapping {
     pub(crate) byte_len: usize,
 }
 
-#[derive(Default)]
 pub(crate) struct NapiEnv {
+    /// The app's shared accountant. V8 env (isolate) heap ceilings and the
+    /// `max_envs` isolate count are charged against it; workers share the same
+    /// `Arc` so the app-wide budget stays honest across stores.
+    pub(crate) budget: Arc<ResourceBudget>,
+    /// Per-app cap on live V8 isolates (`None` = unlimited).
+    pub(crate) max_envs: Option<usize>,
+    /// Heap ceiling (bytes) charged per live V8 env, keyed by guest env id, so
+    /// teardown releases exactly what creation charged.
+    env_heap_charges: HashMap<u32, u64>,
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -46,6 +56,62 @@ pub(crate) struct NapiEnv {
 }
 
 impl NapiEnv {
+    pub(crate) fn new(budget: Arc<ResourceBudget>, max_envs: Option<usize>) -> Self {
+        Self {
+            budget,
+            max_envs,
+            env_heap_charges: HashMap::new(),
+            memory: None,
+            malloc_fn: None,
+            table: None,
+            guest_data_ptrs: HashMap::new(),
+            guest_data_backing_stores: HashMap::new(),
+            host_buffer_copies: Vec::new(),
+            host_buffer_copy_frames: Vec::new(),
+            host_buffer_method_frames: Vec::new(),
+            default_napi_env_id: None,
+            next_napi_env_id: 0,
+            next_napi_scope_id: 0,
+            napi_envs: HashMap::new(),
+            napi_state_to_guest_env: HashMap::new(),
+            napi_scopes: HashMap::new(),
+        }
+    }
+
+    /// Reserve budget for a new V8 env before creating it: acquire an isolate
+    /// slot against `max_envs` and charge its (clamped) heap ceiling. The
+    /// returned constraints must be forwarded to V8. Follow with exactly one of
+    /// [`commit_isolate`] (on success) or [`abort_isolate`] (on failure).
+    ///
+    /// [`commit_isolate`]: NapiEnv::commit_isolate
+    /// [`abort_isolate`]: NapiEnv::abort_isolate
+    pub(crate) fn reserve_isolate(
+        &self,
+        requested: RequestedHeap,
+    ) -> Result<HeapReservation, EnvRejected> {
+        self.budget.try_reserve_env(requested, self.max_envs)
+    }
+
+    /// Register a successfully-created env and attach its heap charge, so
+    /// teardown releases it.
+    pub(crate) fn commit_isolate(
+        &mut self,
+        env: SnapiEnv,
+        reservation: &HeapReservation,
+    ) -> (u32, u32) {
+        let (env_id, scope_id) = self.register_napi_env(env);
+        self.env_heap_charges
+            .insert(env_id, reservation.ceiling_bytes);
+        (env_id, scope_id)
+    }
+
+    /// Release a reservation whose env creation failed after [`reserve_isolate`].
+    ///
+    /// [`reserve_isolate`]: NapiEnv::reserve_isolate
+    pub(crate) fn abort_isolate(&self, reservation: &HeapReservation) {
+        self.budget.release_env(reservation.ceiling_bytes);
+    }
+
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         let env_id = self.next_napi_env_id.max(1);
         self.next_napi_env_id = env_id.saturating_add(1);
@@ -63,6 +129,10 @@ impl NapiEnv {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
+        }
+        // Release the heap ceiling + isolate slot this env reserved at creation.
+        if let Some(ceiling) = self.env_heap_charges.remove(&env_id) {
+            self.budget.release_env(ceiling);
         }
         let env = self.napi_envs.remove(&env_id)?;
         self.napi_state_to_guest_env.remove(&env);

@@ -9,7 +9,7 @@ use std::ffi::{CString, c_void};
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 
 use crate::{
-    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv,
+    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN,
         callback::{flush_host_buffer_copies_since, with_callback_state},
@@ -26,13 +26,31 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return env_id as i32;
     }
 
+    let Ok(reservation) = env.data().reserve_isolate(RequestedHeap::default()) else {
+        return 0;
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe { snapi_bridge_unofficial_create_env(8, &mut snapi_env_state) };
+    let status = if reservation.clamped {
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_options(
+                8,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                0,
+                &mut snapi_env_state,
+            )
+        }
+    } else {
+        unsafe { snapi_bridge_unofficial_create_env(8, &mut snapi_env_state) }
+    };
     if status != 0 || snapi_env_state.is_null() {
+        env.data().abort_isolate(&reservation);
         return 0;
     }
 
-    let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -243,13 +261,31 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    let reservation = match env.data().reserve_isolate(RequestedHeap::default()) {
+        Ok(reservation) => reservation,
+        Err(_) => return 1,
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status =
-        unsafe { snapi_bridge_unofficial_create_env(module_api_version, &mut snapi_env_state) };
+    let status = if reservation.clamped {
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_options(
+                module_api_version,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                0,
+                &mut snapi_env_state,
+            )
+        }
+    } else {
+        unsafe { snapi_bridge_unofficial_create_env(module_api_version, &mut snapi_env_state) }
+    };
     if status != 0 {
+        env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     if env_out_ptr > 0 {
         write_guest_u32(&mut env, env_out_ptr as u32, env_id);
     }
@@ -285,21 +321,32 @@ fn guest_unofficial_napi_create_env_with_options(
         (0, 0, 0, 0)
     };
 
+    let requested = RequestedHeap {
+        max_young: max_young_generation_size_in_bytes,
+        max_old: max_old_generation_size_in_bytes,
+        code_range: code_range_size_in_bytes,
+    };
+    let reservation = match env.data().reserve_isolate(requested) {
+        Ok(reservation) => reservation,
+        Err(_) => return 1,
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
             module_api_version,
-            max_young_generation_size_in_bytes,
-            max_old_generation_size_in_bytes,
-            code_range_size_in_bytes,
+            reservation.max_young,
+            reservation.max_old,
+            reservation.code_range,
             stack_limit,
             &mut snapi_env_state,
         )
     };
     if status != 0 {
+        env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     if env_out_ptr > 0 {
         write_guest_u32(&mut env, env_out_ptr as u32, env_id);
     }

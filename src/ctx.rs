@@ -311,7 +311,11 @@ impl NapiSession {
         let mut import_object = Imports::new();
         register_env_imports(store, &mut import_object);
 
-        let func_env = FunctionEnv::new(store, NapiEnv::default());
+        let napi_env = NapiEnv::new(
+            Arc::clone(&self.inner.ctx.budget),
+            self.inner.ctx.limits.max_envs,
+        );
+        let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self
                 .inner

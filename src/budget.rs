@@ -24,7 +24,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -39,6 +39,16 @@ use wasmer::{MemoryStyle, MemoryType, Pages, TableStyle, TableType, WASM_PAGE_SI
 /// charges for observability but never denies one.
 const UNLIMITED: u64 = u64::MAX;
 
+const MIB: u64 = 1024 * 1024;
+
+/// Initial `max_old_generation_size` charged per V8 isolate at env creation.
+pub const DEFAULT_INITIAL_ISOLATE_HEAP: u64 = 64 * MIB;
+/// Increment the near-heap-limit callback reserves per grow grant.
+pub const DEFAULT_HEAP_GROW_STEP: u64 = 32 * MIB;
+/// Fixed per-isolate overhead charged to cover young generation, code range,
+/// and V8's own malloc'd metadata without sampling.
+pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
+
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
 }
@@ -51,12 +61,16 @@ fn round_up_to_page(bytes: u64) -> u64 {
 
 /// A distinct byte pool metered against the budget.
 ///
-/// Phase 1 charges only [`Pool::WasmLinear`]; later phases add the V8 heap,
-/// external memory, and host-transient pools.
+/// Later phases add external-memory and host-transient pools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pool {
     /// Guest wasm linear memory (wasmer `WasmMmap`).
     WasmLinear,
+    /// V8 per-isolate heap *ceiling* (old + young + code range + per-isolate
+    /// overhead), charged by reservation at env creation and raised in
+    /// grow-steps by the near-heap-limit callback. Charged by ceiling, not
+    /// live usage, so the guarantee never races V8's GC.
+    V8HeapReserved,
 }
 
 /// Error returned by [`ResourceBudget::try_charge`] when a charge would push
@@ -94,6 +108,42 @@ pub struct ResourceUsage {
     pub mem_charged: u64,
     /// Currently-charged guest wasm linear memory bytes.
     pub wasm_linear: u64,
+    /// Currently-reserved V8 per-isolate heap ceiling bytes.
+    pub v8_heap_reserved: u64,
+    /// Number of live V8 isolates (envs) counted against `max_envs`.
+    pub live_isolates: usize,
+}
+
+/// The (possibly clamped) heap constraints a guest requested for a new V8 env.
+/// Fields are bytes; `0` means "unset" (V8 picks its default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestedHeap {
+    pub max_young: u32,
+    pub max_old: u32,
+    pub code_range: u32,
+}
+
+/// The outcome of reserving budget for a new V8 env: the constraints to forward
+/// to V8 (clamped to fit the budget) and the ceiling charged for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapReservation {
+    pub max_young: u32,
+    pub max_old: u32,
+    pub code_range: u32,
+    /// Bytes charged to [`Pool::V8HeapReserved`]; `0` under an unlimited budget.
+    pub ceiling_bytes: u64,
+    /// Whether budget clamping was applied (i.e. constraints must be forwarded
+    /// to V8 even if the guest requested none).
+    pub clamped: bool,
+}
+
+/// Why a new V8 env was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvRejected {
+    /// The app is already at its `max_envs` isolate cap.
+    TooManyEnvs,
+    /// The minimum viable heap ceiling does not fit the remaining budget.
+    HeapDoesNotFit,
 }
 
 /// One shared accountant per app, `Arc`-shared into every pool that allocates.
@@ -110,6 +160,9 @@ pub struct ResourceBudget {
     mem_charged: AtomicU64,
     /// Per-pool charge, for observability and reconciliation.
     wasm_linear: AtomicU64,
+    v8_heap_reserved: AtomicU64,
+    /// Live V8 isolates (envs), counted against `max_envs`.
+    live_isolates: AtomicUsize,
 }
 
 impl ResourceBudget {
@@ -128,6 +181,8 @@ impl ResourceBudget {
             mem_total,
             mem_charged: AtomicU64::new(0),
             wasm_linear: AtomicU64::new(0),
+            v8_heap_reserved: AtomicU64::new(0),
+            live_isolates: AtomicUsize::new(0),
         }
     }
 
@@ -207,6 +262,7 @@ impl ResourceBudget {
     fn pool_counter(&self, pool: Pool) -> &AtomicU64 {
         match pool {
             Pool::WasmLinear => &self.wasm_linear,
+            Pool::V8HeapReserved => &self.v8_heap_reserved,
         }
     }
 
@@ -216,7 +272,127 @@ impl ResourceBudget {
             mem_total: self.mem_total,
             mem_charged: self.mem_charged.load(Ordering::Acquire),
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
+            v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
+            live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
+    }
+
+    /// Number of live V8 isolates counted against `max_envs`.
+    pub fn live_isolates(&self) -> usize {
+        self.live_isolates.load(Ordering::Acquire)
+    }
+
+    /// Reserve budget for a new V8 env: acquire an isolate slot against
+    /// `max_envs` and charge the (clamped) heap ceiling. On success the caller
+    /// owns both and must release them with [`release_env`] exactly once — on
+    /// env teardown, or immediately if env creation then fails.
+    ///
+    /// [`release_env`]: ResourceBudget::release_env
+    pub fn try_reserve_env(
+        &self,
+        req: RequestedHeap,
+        max_envs: Option<usize>,
+    ) -> Result<HeapReservation, EnvRejected> {
+        if !self.try_acquire_isolate(max_envs) {
+            return Err(EnvRejected::TooManyEnvs);
+        }
+        let Some(reservation) = self.plan_heap_reservation(req) else {
+            self.release_isolate();
+            return Err(EnvRejected::HeapDoesNotFit);
+        };
+        if self
+            .try_charge(Pool::V8HeapReserved, reservation.ceiling_bytes)
+            .is_err()
+        {
+            self.release_isolate();
+            return Err(EnvRejected::HeapDoesNotFit);
+        }
+        Ok(reservation)
+    }
+
+    /// Release an env reservation: uncharge its heap ceiling and free its
+    /// isolate slot. Pair with exactly one successful [`try_reserve_env`].
+    ///
+    /// [`try_reserve_env`]: ResourceBudget::try_reserve_env
+    pub fn release_env(&self, ceiling_bytes: u64) {
+        self.uncharge(Pool::V8HeapReserved, ceiling_bytes);
+        self.release_isolate();
+    }
+
+    /// Atomically claim an isolate slot if under `max_envs` (always succeeds
+    /// when `max_envs` is `None`).
+    fn try_acquire_isolate(&self, max_envs: Option<usize>) -> bool {
+        let Some(max) = max_envs else {
+            self.live_isolates.fetch_add(1, Ordering::AcqRel);
+            return true;
+        };
+        let mut current = self.live_isolates.load(Ordering::Acquire);
+        loop {
+            if current >= max {
+                return false;
+            }
+            match self.live_isolates.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_isolate(&self) {
+        self.live_isolates.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Clamp requested heap constraints to fit the remaining budget, applying
+    /// the default old-generation ceiling and per-isolate overhead. Returns
+    /// `None` if not even the minimum viable ceiling fits. Under an unlimited
+    /// budget the request passes through unchanged and uncharged.
+    fn plan_heap_reservation(&self, req: RequestedHeap) -> Option<HeapReservation> {
+        if self.is_unlimited() {
+            return Some(HeapReservation {
+                max_young: req.max_young,
+                max_old: req.max_old,
+                code_range: req.code_range,
+                ceiling_bytes: 0,
+                clamped: false,
+            });
+        }
+
+        // Explicit young/code plus a fixed overhead are reserved first; the
+        // overhead also covers V8's own metadata and any unset young/code.
+        let young = u64::from(req.max_young);
+        let code = u64::from(req.code_range);
+        let fixed = DEFAULT_PER_ISOLATE_OVERHEAD
+            .checked_add(young)?
+            .checked_add(code)?;
+
+        let remaining = self.memory_remaining();
+        if remaining <= fixed {
+            return None;
+        }
+
+        let old_available = remaining - fixed;
+        let requested_old = if req.max_old > 0 {
+            u64::from(req.max_old)
+        } else {
+            DEFAULT_INITIAL_ISOLATE_HEAP
+        };
+        let old = requested_old.min(old_available);
+        if old == 0 {
+            return None;
+        }
+
+        Some(HeapReservation {
+            max_young: req.max_young,
+            max_old: u32::try_from(old).unwrap_or(u32::MAX),
+            code_range: req.code_range,
+            ceiling_bytes: fixed + old,
+            clamped: true,
+        })
     }
 }
 
@@ -664,5 +840,109 @@ mod tests {
         // A memory that does fit is accepted.
         let _c = Memory::new(&mut store, MemoryType::new(2, None, false)).expect("2 pages fit");
         assert_eq!(budget.memory_charged(), 6 * PAGE);
+    }
+
+    #[test]
+    fn env_reservation_charges_ceiling_and_releases() {
+        let budget = ResourceBudget::with_memory_limit(100 * MIB);
+        let res = budget
+            .try_reserve_env(RequestedHeap::default(), None)
+            .expect("env fits");
+        assert!(res.clamped);
+        // Default old-gen (64 MiB) fits, plus 8 MiB overhead.
+        assert_eq!(u64::from(res.max_old), DEFAULT_INITIAL_ISOLATE_HEAP);
+        assert_eq!(res.ceiling_bytes, 72 * MIB);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 72 * MIB);
+        assert_eq!(budget.live_isolates(), 1);
+
+        budget.release_env(res.ceiling_bytes);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        assert_eq!(budget.live_isolates(), 0);
+    }
+
+    #[test]
+    fn env_reservation_clamps_old_gen_to_fit() {
+        // Only 20 MiB: overhead (8) leaves 12 MiB for old-gen, below the 64 MiB
+        // default, so old-gen is clamped down and the whole budget is charged.
+        let budget = ResourceBudget::with_memory_limit(20 * MIB);
+        let res = budget
+            .try_reserve_env(RequestedHeap::default(), None)
+            .expect("clamped env fits");
+        assert_eq!(u64::from(res.max_old), 12 * MIB);
+        assert_eq!(res.ceiling_bytes, 20 * MIB);
+    }
+
+    #[test]
+    fn env_reservation_counts_explicit_young_and_code() {
+        let budget = ResourceBudget::with_memory_limit(100 * MIB);
+        let req = RequestedHeap {
+            max_young: (4 * MIB) as u32,
+            max_old: (16 * MIB) as u32,
+            code_range: (2 * MIB) as u32,
+        };
+        let res = budget.try_reserve_env(req, None).expect("fits");
+        // ceiling = overhead(8) + young(4) + code(2) + old(16) = 30 MiB.
+        assert_eq!(res.max_young, (4 * MIB) as u32);
+        assert_eq!(res.max_old, (16 * MIB) as u32);
+        assert_eq!(res.code_range, (2 * MIB) as u32);
+        assert_eq!(res.ceiling_bytes, 30 * MIB);
+    }
+
+    #[test]
+    fn env_reservation_refused_when_heap_cannot_fit() {
+        // Below the per-isolate overhead, so no viable heap exists.
+        let budget = ResourceBudget::with_memory_limit(4 * MIB);
+        let err = budget
+            .try_reserve_env(RequestedHeap::default(), None)
+            .expect_err("too small for any env");
+        assert_eq!(err, EnvRejected::HeapDoesNotFit);
+        // The isolate slot claimed up front was rolled back.
+        assert_eq!(budget.live_isolates(), 0);
+    }
+
+    #[test]
+    fn max_envs_caps_live_isolates() {
+        let budget = ResourceBudget::with_memory_limit(1000 * MIB);
+        let r1 = budget
+            .try_reserve_env(RequestedHeap::default(), Some(2))
+            .expect("first env");
+        let _r2 = budget
+            .try_reserve_env(RequestedHeap::default(), Some(2))
+            .expect("second env");
+        assert_eq!(budget.live_isolates(), 2);
+
+        let err = budget
+            .try_reserve_env(RequestedHeap::default(), Some(2))
+            .expect_err("third env exceeds max_envs");
+        assert_eq!(err, EnvRejected::TooManyEnvs);
+        // A refused env neither counted nor charged.
+        assert_eq!(budget.live_isolates(), 2);
+
+        budget.release_env(r1.ceiling_bytes);
+        assert_eq!(budget.live_isolates(), 1);
+        // A slot freed, so another env fits again.
+        let _r3 = budget
+            .try_reserve_env(RequestedHeap::default(), Some(2))
+            .expect("env fits after release");
+    }
+
+    #[test]
+    fn unlimited_budget_passes_env_request_through() {
+        let budget = ResourceBudget::unlimited();
+        let req = RequestedHeap {
+            max_young: 1,
+            max_old: 2,
+            code_range: 3,
+        };
+        let res = budget.try_reserve_env(req, None).expect("always fits");
+        assert!(!res.clamped);
+        assert_eq!(res.ceiling_bytes, 0);
+        assert_eq!(
+            (res.max_young, res.max_old, res.code_range),
+            (1, 2, 3),
+            "constraints forwarded unchanged"
+        );
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        assert_eq!(budget.live_isolates(), 1, "still counted for observability");
     }
 }
