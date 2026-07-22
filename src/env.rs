@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wasmer::{Memory, Table, TypedFunction};
 
 use crate::budget::{
-    EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
+    EnvExternalCharge, EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap,
+    ResourceBudget,
 };
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
+    snapi_bridge_unofficial_set_host_allocation_budget_callback,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
 };
 
@@ -132,6 +134,26 @@ impl NapiEnv {
                     boxed as *const c_void,
                 );
             }
+
+            // Install the enforcing array-buffer allocator hook. Ownership of
+            // this box transfers to the allocator, which releases it from its
+            // destructor at env teardown; reclaim it only if registration fails.
+            let external = Box::into_raw(Box::new(EnvExternalCharge {
+                budget: Arc::clone(&self.budget),
+            }));
+            // SAFETY: `external` is a fresh box handed to the allocator.
+            let status = unsafe {
+                snapi_bridge_unofficial_set_host_allocation_budget_callback(
+                    env,
+                    external as *const c_void,
+                )
+            };
+            if status != 0 {
+                // SAFETY: registration failed, so the allocator did not take
+                // ownership; reclaim the box we just leaked.
+                drop(unsafe { Box::from_raw(external) });
+            }
+
             boxed as usize
         } else {
             0

@@ -72,6 +72,10 @@ pub enum Pool {
     /// grow-steps by the near-heap-limit callback. Charged by ceiling, not
     /// live usage, so the guarantee never races V8's GC.
     V8HeapReserved,
+    /// V8 external memory: ArrayBuffer/Buffer backing stores, charged exactly
+    /// in the enforcing allocator and via `adjust_external_memory`. Denial is
+    /// graceful — the allocator returns null and V8 throws `RangeError`.
+    V8External,
 }
 
 /// Error returned by [`ResourceBudget::try_charge`] when a charge would push
@@ -111,6 +115,8 @@ pub struct ResourceUsage {
     pub wasm_linear: u64,
     /// Currently-reserved V8 per-isolate heap ceiling bytes.
     pub v8_heap_reserved: u64,
+    /// Currently-charged V8 external memory (ArrayBuffer/Buffer) bytes.
+    pub v8_external: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -162,6 +168,7 @@ pub struct ResourceBudget {
     /// Per-pool charge, for observability and reconciliation.
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
+    v8_external: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -183,6 +190,7 @@ impl ResourceBudget {
             mem_charged: AtomicU64::new(0),
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
+            v8_external: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -264,6 +272,7 @@ impl ResourceBudget {
         match pool {
             Pool::WasmLinear => &self.wasm_linear,
             Pool::V8HeapReserved => &self.v8_heap_reserved,
+            Pool::V8External => &self.v8_external,
         }
     }
 
@@ -274,6 +283,7 @@ impl ResourceBudget {
             mem_charged: self.mem_charged.load(Ordering::Acquire),
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
             v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
+            v8_external: self.v8_external.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -442,6 +452,68 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
         }
         Err(_) => current_limit,
     }
+}
+
+/// Per-V8-env external-memory (ArrayBuffer/Buffer) charge tracker shared with
+/// the enforcing array-buffer allocator.
+///
+/// Boxed at env creation and owned by the allocator, which releases it from its
+/// destructor once all its backing stores are freed — see
+/// [`napi_host_external_release`]. It carries only the shared budget; the live
+/// byte total lives in the C++ allocator.
+pub(crate) struct EnvExternalCharge {
+    pub(crate) budget: Arc<ResourceBudget>,
+}
+
+/// Enforcing array-buffer allocator hook: charge `bytes` of external memory
+/// against the budget before V8 allocates a backing store. Returns `false` when
+/// the budget is exhausted, so the allocator returns null and V8 throws
+/// `RangeError` — the graceful path, with no isolate teardown.
+///
+/// # Safety
+/// `data` must be null or a pointer to an [`EnvExternalCharge`] that outlives
+/// the call (owned by the allocator; freed only via [`napi_host_external_release`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_external_try_charge(data: *const c_void, bytes: u64) -> bool {
+    if data.is_null() {
+        return true;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvExternalCharge) };
+    tracker.budget.try_charge(Pool::V8External, bytes).is_ok()
+}
+
+/// Release `bytes` of external memory previously charged via
+/// [`napi_host_external_try_charge`]; called from the allocator's `Free`.
+///
+/// # Safety
+/// See [`napi_host_external_try_charge`].
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_external_uncharge(data: *const c_void, bytes: u64) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: see the contract on `napi_host_external_try_charge`.
+    let tracker = unsafe { &*(data as *const EnvExternalCharge) };
+    tracker.budget.uncharge(Pool::V8External, bytes);
+}
+
+/// Reclaim the external-charge tracker and release any still-live external
+/// bytes. Called exactly once, from the allocator's destructor, after every
+/// backing store it owned has been freed (so `remaining_bytes` is normally 0).
+///
+/// # Safety
+/// `data` must be null or a pointer returned by `Box::into_raw` for an
+/// [`EnvExternalCharge`] and not previously released. The pointer is dangling
+/// afterward and must not be used again.
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_external_release(data: *mut c_void, remaining_bytes: u64) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: reclaim the box handed to the allocator at env creation.
+    let tracker = unsafe { Box::from_raw(data as *mut EnvExternalCharge) };
+    tracker.budget.uncharge(Pool::V8External, remaining_bytes);
 }
 
 /// The live charge for one physical wasm-memory allocation.
@@ -1046,5 +1118,64 @@ mod tests {
             42,
             "a null tracker leaves the limit unchanged"
         );
+    }
+
+    #[test]
+    fn external_allocator_hook_charges_denies_and_releases() {
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        let ptr = Box::into_raw(Box::new(EnvExternalCharge {
+            budget: Arc::clone(&budget),
+        }));
+        let data = ptr as *const c_void;
+
+        // A charge within budget succeeds and is tracked.
+        assert!(napi_host_external_try_charge(data, 6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // Over budget: denied (allocator returns null → V8 RangeError), no change.
+        assert!(!napi_host_external_try_charge(data, 6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // Freeing a buffer uncharges; the freed room is reusable.
+        napi_host_external_uncharge(data, 4 * MIB);
+        assert_eq!(budget.snapshot().v8_external, 2 * MIB);
+        assert!(napi_host_external_try_charge(data, 4 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // The allocator's destructor releases the tracker and any live bytes.
+        let live = budget.snapshot().v8_external;
+        napi_host_external_release(ptr as *mut c_void, live);
+        assert_eq!(budget.snapshot().v8_external, 0);
+    }
+
+    #[test]
+    fn external_allocator_hook_ignores_null_data() {
+        assert!(napi_host_external_try_charge(std::ptr::null(), 1024));
+        napi_host_external_uncharge(std::ptr::null(), 1024);
+        napi_host_external_release(std::ptr::null_mut(), 0);
+    }
+
+    #[test]
+    fn wasm_and_external_share_one_budget() {
+        // A mixed wasm + ArrayBuffer workload is bounded by the *combined* cap,
+        // not either pool alone.
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        budget
+            .try_charge(Pool::WasmLinear, 7 * MIB)
+            .expect("wasm fits");
+
+        let ptr = Box::into_raw(Box::new(EnvExternalCharge {
+            budget: Arc::clone(&budget),
+        }));
+        let data = ptr as *const c_void;
+
+        // Only 3 MiB remains, so a 4 MiB external allocation is denied...
+        assert!(!napi_host_external_try_charge(data, 4 * MIB));
+        // ...but 3 MiB exactly fits, exhausting the shared budget.
+        assert!(napi_host_external_try_charge(data, 3 * MIB));
+        assert_eq!(budget.memory_charged(), 10 * MIB);
+
+        napi_host_external_release(ptr as *mut c_void, 3 * MIB);
+        assert_eq!(budget.snapshot().v8_external, 0);
     }
 }
