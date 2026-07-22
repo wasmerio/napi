@@ -13,6 +13,7 @@ use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_allocation_budget_callback,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
+    snapi_bridge_unofficial_set_value_limit,
 };
 
 /// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
@@ -163,6 +164,16 @@ impl NapiEnv {
                 // SAFETY: registration failed, so the allocator did not take
                 // ownership; reclaim the box we just leaked.
                 drop(unsafe { Box::from_raw(external) });
+            }
+
+            // Cap per-value host handles / callback registrations so the C++
+            // bookkeeping (invisible to the byte pools) cannot grow host RSS
+            // without bound; derived from the budget.
+            if let Some(limit) = self.budget.value_handle_limit() {
+                // SAFETY: `env` is the isolate just created.
+                unsafe {
+                    snapi_bridge_unofficial_set_value_limit(env, limit);
+                }
             }
 
             boxed as usize

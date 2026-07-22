@@ -50,6 +50,13 @@ pub const DEFAULT_HEAP_GROW_STEP: u64 = 32 * MIB;
 /// and V8's own malloc'd metadata without sampling.
 pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 
+/// Estimated host-side bytes held per N-API value handle crossed to the guest:
+/// the `napi_ref` struct, the handle-map node, and a V8 global-handle slot. The
+/// referenced JS value itself lives in the (separately charged) V8 heap. Used
+/// only to derive a per-env cap on live handles — see
+/// [`ResourceBudget::value_handle_limit`].
+pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
+
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
 }
@@ -291,6 +298,18 @@ impl ResourceBudget {
     /// Number of live V8 isolates counted against `max_envs`.
     pub fn live_isolates(&self) -> usize {
         self.live_isolates.load(Ordering::Acquire)
+    }
+
+    /// Cap on the number of live per-value host handles an env may hold, derived
+    /// from the memory budget so this bookkeeping (which the byte pools don't
+    /// see) cannot grow the host RSS without bound. `None` under an unlimited
+    /// budget.
+    pub fn value_handle_limit(&self) -> Option<u64> {
+        if self.is_unlimited() {
+            None
+        } else {
+            Some((self.mem_total / EST_HOST_BYTES_PER_VALUE).max(1))
+        }
     }
 
     /// Reserve budget for a new V8 env: acquire an isolate slot against
@@ -1146,6 +1165,20 @@ mod tests {
         let live = budget.snapshot().v8_external;
         napi_host_external_release(ptr as *mut c_void, live);
         assert_eq!(budget.snapshot().v8_external, 0);
+    }
+
+    #[test]
+    fn value_handle_limit_scales_with_budget() {
+        // Limit = budget / EST_HOST_BYTES_PER_VALUE.
+        let budget = ResourceBudget::with_memory_limit(1000 * EST_HOST_BYTES_PER_VALUE);
+        assert_eq!(budget.value_handle_limit(), Some(1000));
+        // Unlimited budget imposes no cap.
+        assert_eq!(ResourceBudget::unlimited().value_handle_limit(), None);
+        // A tiny budget still allows at least one handle.
+        assert_eq!(
+            ResourceBudget::with_memory_limit(1).value_handle_limit(),
+            Some(1)
+        );
     }
 
     #[test]

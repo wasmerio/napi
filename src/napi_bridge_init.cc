@@ -107,6 +107,11 @@ struct SnapiEnvState {
   std::unordered_map<uint32_t, CbRegistration> cb_registry;
   uint32_t next_cb_reg_id = 1;
   std::vector<std::unique_ptr<CallbackBinding>> callback_bindings;
+
+  // Cap on live per-value host handles / callback registrations, bounding the
+  // host-side bookkeeping RSS that the byte budget pools do not otherwise see.
+  // 0 means unlimited. Set from the resource budget at env creation.
+  size_t value_limit = 0;
 };
 
 struct CallbackBinding {
@@ -118,6 +123,10 @@ std::unordered_set<SnapiEnvState*> g_envs;
 
 CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) {
   if (state == nullptr || reg_id == 0) return nullptr;
+  if (state->value_limit != 0 &&
+      state->callback_bindings.size() >= state->value_limit) {
+    return nullptr;
+  }
   state->callback_bindings.push_back(
       std::make_unique<CallbackBinding>(CallbackBinding{state, reg_id}));
   return state->callback_bindings.back().get();
@@ -139,6 +148,11 @@ uint32_t RegisterCallbackInvocation(SnapiEnvState* state, napi_callback_info inf
 uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
   if (val == nullptr) return 0;
   if (state.env == nullptr) return 0;
+  // Refuse once the per-env handle cap is reached: returning 0 surfaces as an
+  // N-API failure the guest can handle, instead of leaking host RSS unbounded.
+  if (state.value_limit != 0 && state.values.size() >= state.value_limit) {
+    return 0;
+  }
   napi_ref ref = nullptr;
   if (napi_create_reference(state.env, val, 1, &ref) != napi_ok || ref == nullptr) {
     return 0;
@@ -2457,6 +2471,12 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState* env_state) {
   if (env_state == nullptr) return 0;
+  // Cap callback registrations alongside value handles: 0 signals failure so
+  // the registration chain aborts instead of growing cb_registry unbounded.
+  if (env_state->value_limit != 0 &&
+      env_state->cb_registry.size() >= env_state->value_limit) {
+    return 0;
+  }
   return env_state->next_cb_reg_id++;
 }
 
@@ -2597,6 +2617,16 @@ extern "C" int snapi_bridge_unofficial_set_host_allocation_budget_callback(
   }
   return unofficial_napi_set_allocation_budget_hook(env_state->env,
                                                     const_cast<void*>(data));
+}
+
+extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState* env_state,
+                                                       uint64_t limit) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (env_state == nullptr) {
+    return napi_invalid_arg;
+  }
+  env_state->value_limit = static_cast<size_t>(limit);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {

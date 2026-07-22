@@ -102,6 +102,10 @@ unsafe extern "C" {
         env: SnapiEnv,
         data: *const c_void,
     ) -> i32;
+    /// Cap the number of live per-value host handles (and callback
+    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
+    /// `limit == 0` means unlimited.
+    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
     #[allow(dead_code)]
     pub fn snapi_bridge_unofficial_set_near_heap_limit_callback(
         env: SnapiEnv,
