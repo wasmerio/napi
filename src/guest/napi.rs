@@ -11,7 +11,7 @@ use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespa
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
-        MAX_GUEST_CSTRING_SCAN,
+        MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{flush_host_buffer_copies_since, with_callback_state},
     },
     snapi::*,
@@ -2579,6 +2579,12 @@ fn guest_napi_get_value_string_utf8(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    // The guest's output buffer lives in its own memory, so a claimed size
+    // larger than the whole linear memory is bogus; reject before allocating
+    // the host scratch mirror.
+    if hbs as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -2617,6 +2623,9 @@ fn guest_napi_get_value_string_latin1(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    if hbs as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -3943,6 +3952,11 @@ fn guest_napi_get_cb_info(
         0
     };
 
+    // Reject an absurd requested argc before allocating the argv scratch array.
+    if wanted as usize > MAX_NAPI_CALLBACK_ARGS {
+        return 1;
+    }
+
     // Query the bridge for callback context
     let mut actual_argc: u32 = wanted;
     let mut argv_ids = vec![0u32; wanted as usize];
@@ -4506,6 +4520,14 @@ fn guest_napi_get_value_string_utf16(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    // Each unit is 2 bytes; reject a claimed size that overflows or cannot fit
+    // in the guest's own memory before allocating the host scratch mirror.
+    let Some(byte_len) = hbs.checked_mul(2) else {
+        return 1;
+    };
+    if byte_len as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0u16; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -4596,6 +4618,11 @@ fn guest_napi_get_value_bigint_words(
             write_guest_u32(&mut env, wc_ptr as u32, word_count as u32);
         }
         return s;
+    }
+
+    // Reject an absurd word count before allocating the words scratch buffer.
+    if word_count > MAX_NAPI_BIGINT_WORDS {
+        return 1;
     }
 
     let mut sign: i32 = 0;
