@@ -14,7 +14,9 @@ use wasmer_wasix::{
     runtime::task_manager::tokio::TokioTaskManager,
 };
 
-use crate::{NapiCtx, guest::napi::register_env_imports};
+use crate::{
+    NapiCtx, budget::ResourceBudget, budget::budgeted_tunables, guest::napi::register_env_imports,
+};
 use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 
 #[derive(Debug, Clone)]
@@ -29,16 +31,21 @@ pub struct LoadedWasm {
     pub module_hash: ModuleHash,
 }
 
-fn create_cli_store() -> Store {
+fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
     let mut features = Features::default();
     features.exceptions(true);
 
     let mut compiler = LLVM::default();
     compiler.opt_level(LLVMOptLevel::Less);
 
-    let engine = EngineBuilder::new(compiler)
+    let mut engine = EngineBuilder::new(compiler)
         .set_features(Some(features))
         .engine();
+    // Charge the guest's (imported) wasm linear memory against the app budget.
+    // The runtime instantiates the guest with this engine, so its budgeted
+    // tunables cover the main store and every worker store cloned from it.
+    let tunables = budgeted_tunables(engine.target(), budget);
+    engine.set_tunables(tunables);
     Store::new(engine)
 }
 
@@ -91,10 +98,17 @@ fn spawn_pipe_drain_thread(
 }
 
 pub fn load_wasix_module(wasm_path: &Path) -> Result<LoadedWasm> {
+    load_wasix_module_with_budget(wasm_path, ResourceBudget::unlimited())
+}
+
+pub fn load_wasix_module_with_budget(
+    wasm_path: &Path,
+    budget: Arc<ResourceBudget>,
+) -> Result<LoadedWasm> {
     let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("failed to read wasm file at {}", wasm_path.display()))?;
 
-    let store = create_cli_store();
+    let store = create_cli_store(budget);
 
     let module = load_or_compile_module(&store, &wasm_bytes)?;
 
@@ -156,7 +170,7 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
     let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
     let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
     let exit_code = {
-        let loaded = load_wasix_module(wasm_path)?;
+        let loaded = load_wasix_module_with_budget(wasm_path, ctx.budget())?;
         let engine = loaded.store.engine().clone();
         let module = loaded.module;
         let module_hash = loaded.module_hash;

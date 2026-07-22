@@ -8,6 +8,7 @@ use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
+    budget::ResourceBudget,
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
@@ -15,8 +16,20 @@ use crate::{
 pub struct NapiLimits {
     pub max_sessions: Option<usize>,
     pub max_envs: Option<usize>,
+    /// Unified cross-VM memory budget (bytes): guest wasm linear memory plus,
+    /// in later phases, V8 heap ceilings, external memory, and host transients.
+    /// `None` means unlimited.
+    pub total_memory_bytes: Option<u64>,
     pub max_total_external_memory: Option<u64>,
     pub max_total_heap_bytes: Option<u64>,
+}
+
+impl NapiLimits {
+    /// The effective total memory budget, folding in the deprecated
+    /// `max_total_heap_bytes` alias when the unified field is unset.
+    fn memory_budget_bytes(&self) -> Option<u64> {
+        self.total_memory_bytes.or(self.max_total_heap_bytes)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +71,10 @@ pub struct NapiRuntimeHooks {
 struct NapiCtxInner {
     limits: NapiLimits,
     active_sessions: AtomicUsize,
+    /// One shared accountant per app, `Arc`-shared into the engine's budgeted
+    /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
+    /// external-memory, and CPU paths.
+    budget: Arc<ResourceBudget>,
 }
 
 struct NapiSessionInner {
@@ -90,6 +107,13 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// The unified cross-VM memory budget in bytes (see
+    /// [`NapiLimits::total_memory_bytes`]).
+    pub fn total_memory_bytes(mut self, bytes: u64) -> Self {
+        self.limits.total_memory_bytes = Some(bytes);
+        self
+    }
+
     pub fn max_total_external_memory(mut self, bytes: u64) -> Self {
         self.limits.max_total_external_memory = Some(bytes);
         self
@@ -101,10 +125,15 @@ impl NapiCtxBuilder {
     }
 
     pub fn build(self) -> NapiCtx {
+        let budget = match self.limits.memory_budget_bytes() {
+            Some(bytes) => ResourceBudget::with_memory_limit(bytes),
+            None => ResourceBudget::unlimited(),
+        };
         NapiCtx {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,
                 active_sessions: AtomicUsize::new(0),
+                budget,
             }),
         }
     }
@@ -127,6 +156,13 @@ impl NapiCtx {
 
     pub fn active_sessions(&self) -> usize {
         self.inner.active_sessions.load(Ordering::Acquire)
+    }
+
+    /// The app's shared resource accountant. Install its budgeted tunables on
+    /// the engine backing this app's guest store so guest wasm linear memory is
+    /// charged against it (see [`crate::budget::budgeted_tunables`]).
+    pub fn budget(&self) -> Arc<ResourceBudget> {
+        Arc::clone(&self.inner.budget)
     }
 
     pub fn prepare_module(&self, module: &Module) -> Result<NapiSession> {
