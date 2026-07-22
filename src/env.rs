@@ -52,6 +52,10 @@ pub(crate) struct NapiEnv {
     /// release what this env declared — never the allocator's charges or more
     /// than it added — and so teardown releases the remainder.
     external_declared: u64,
+    /// Depth of nested guest↔host callback crossings on this thread, bounded to
+    /// keep guest→host→guest recursion from overflowing the host native stack
+    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
+    callback_depth: u32,
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -85,6 +89,7 @@ impl NapiEnv {
             max_envs,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
+            callback_depth: 0,
             memory: None,
             malloc_fn: None,
             table: None,
@@ -201,6 +206,28 @@ impl NapiEnv {
         self.budget.uncharge(Pool::V8External, release);
     }
 
+    /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
+    /// callback must be refused) once [`MAX_CALLBACK_DEPTH`] is reached, so a
+    /// runaway recursion across the FFI boundary cannot overflow the host native
+    /// stack. Pair every `true` with exactly one [`leave_callback`].
+    ///
+    /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
+    /// [`leave_callback`]: NapiEnv::leave_callback
+    pub(crate) fn enter_callback(&mut self) -> bool {
+        if self.callback_depth >= crate::guest::MAX_CALLBACK_DEPTH {
+            return false;
+        }
+        self.callback_depth += 1;
+        true
+    }
+
+    /// Release one level claimed by a `true` [`enter_callback`].
+    ///
+    /// [`enter_callback`]: NapiEnv::enter_callback
+    pub(crate) fn leave_callback(&mut self) {
+        self.callback_depth = self.callback_depth.saturating_sub(1);
+    }
+
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         let env_id = self.next_napi_env_id.max(1);
         self.next_napi_env_id = env_id.saturating_add(1);
@@ -315,5 +342,31 @@ mod tests {
             0,
             "drop releases declared external"
         );
+    }
+
+    #[test]
+    fn callback_reentrancy_is_bounded() {
+        let mut env = NapiEnv::new(ResourceBudget::unlimited(), None);
+        let max = crate::guest::MAX_CALLBACK_DEPTH;
+
+        // Reentrancy is allowed up to the limit, then refused.
+        for _ in 0..max {
+            assert!(env.enter_callback());
+        }
+        assert!(
+            !env.enter_callback(),
+            "past the limit the callback is refused"
+        );
+
+        // Unwinding one level frees exactly one slot.
+        env.leave_callback();
+        assert!(env.enter_callback());
+
+        // Fully unwind; an extra leave saturates instead of underflowing.
+        for _ in 0..max {
+            env.leave_callback();
+        }
+        env.leave_callback();
+        assert!(env.enter_callback());
     }
 }
