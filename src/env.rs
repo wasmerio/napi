@@ -30,10 +30,6 @@ pub(crate) struct HostBufferCopy {
     pub(crate) backing_store_token: u64,
     pub(crate) guest_ptr: u32,
     pub(crate) byte_len: usize,
-    /// Bytes at copy-creation time. Write-back is skipped when the guest never
-    /// modified the copy, so a stale copy flushed late cannot clobber newer
-    /// host-side writes (multiple frames can hold copies of the same buffer).
-    pub(crate) pristine: Vec<u8>,
 }
 
 pub(crate) struct GuestBackingStoreMapping {
