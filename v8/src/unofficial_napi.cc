@@ -81,29 +81,43 @@ struct PrepareStackTraceState {
 };
 
 std::mutex g_runtime_mu;
-SharedRuntime g_runtime;
+// Deliberately heap-allocated and never freed: process exit (std::process::exit
+// in the wasmer CLI, or exit() in any embedder) runs static destructors on the
+// main thread while env teardown may still be running on another thread.
+// Destroying the platform / these registries in that window is a use-after-free
+// for the teardown thread (Isolate::Delete touches the platform's page
+// allocator and tracing controller). The OS reclaims everything at _exit.
+SharedRuntime& g_runtime = *new SharedRuntime();
 EmbedderHooksState g_embedder_hooks;
-std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
-std::unordered_map<v8::Isolate*, uint64_t> g_hash_seeds;
-std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
-std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>> g_promise_hooks;
-std::unordered_map<napi_env, PrepareStackTraceState> g_prepare_stack_trace_callbacks;
-std::unordered_map<v8::ArrayBuffer::Allocator*, std::shared_ptr<TrackingArrayBufferAllocator>>
-    g_tracking_allocators;
+std::unordered_map<v8::Isolate*, napi_env>& g_env_by_isolate =
+    *new std::unordered_map<v8::Isolate*, napi_env>();
+std::unordered_map<v8::Isolate*, uint64_t>& g_hash_seeds =
+    *new std::unordered_map<v8::Isolate*, uint64_t>();
+std::unordered_map<v8::Isolate*, v8::Global<v8::Function>>& g_promise_reject_callbacks =
+    *new std::unordered_map<v8::Isolate*, v8::Global<v8::Function>>();
+std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>>& g_promise_hooks =
+    *new std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>>();
+std::unordered_map<napi_env, PrepareStackTraceState>& g_prepare_stack_trace_callbacks =
+    *new std::unordered_map<napi_env, PrepareStackTraceState>();
+std::unordered_map<v8::ArrayBuffer::Allocator*, std::shared_ptr<TrackingArrayBufferAllocator>>&
+    g_tracking_allocators = *new std::unordered_map<v8::ArrayBuffer::Allocator*,
+                                                    std::shared_ptr<TrackingArrayBufferAllocator>>();
 
 struct FatalErrorCallbacks {
   unofficial_napi_fatal_error_callback fatal = nullptr;
   unofficial_napi_oom_error_callback oom = nullptr;
 };
 
-std::unordered_map<v8::Isolate*, FatalErrorCallbacks> g_fatal_error_callbacks;
+std::unordered_map<v8::Isolate*, FatalErrorCallbacks>& g_fatal_error_callbacks =
+    *new std::unordered_map<v8::Isolate*, FatalErrorCallbacks>();
 
 struct NearHeapLimitCallbackState {
   unofficial_napi_near_heap_limit_callback callback = nullptr;
   void* data = nullptr;
 };
 
-std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState> g_near_heap_limit_callbacks;
+std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState>& g_near_heap_limit_callbacks =
+    *new std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState>();
 
 struct InterruptRequest {
   napi_env env = nullptr;
@@ -117,7 +131,8 @@ struct ProfilerState {
   bool heap_profile_started = false;
 };
 
-std::unordered_map<napi_env, ProfilerState> g_profiler_states;
+std::unordered_map<napi_env, ProfilerState>& g_profiler_states =
+    *new std::unordered_map<napi_env, ProfilerState>();
 
 unofficial_napi_embedder_hooks CopyEmbedderHooks() {
   std::lock_guard<std::mutex> lock(g_runtime_mu);
