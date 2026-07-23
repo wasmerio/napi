@@ -813,7 +813,10 @@ unsafe extern "C" {
     pub fn snapi_bridge_reference_ref(env: SnapiEnv, ref_id: u32, result: *mut u32) -> i32;
     pub fn snapi_bridge_reference_unref(env: SnapiEnv, ref_id: u32, result: *mut u32) -> i32;
     pub fn snapi_bridge_get_reference_value(env: SnapiEnv, ref_id: u32, out_id: *mut u32) -> i32;
-    // Handle scopes (escapable)
+    // Handle scopes
+    pub fn snapi_bridge_open_handle_scope(env: SnapiEnv, scope_out: *mut u32) -> i32;
+    pub fn snapi_bridge_close_handle_scope(env: SnapiEnv, scope_id: u32) -> i32;
+    pub fn snapi_bridge_value_id_alive(env: SnapiEnv, id: u32) -> i32;
     pub fn snapi_bridge_open_escapable_handle_scope(env: SnapiEnv, scope_out: *mut u32) -> i32;
     pub fn snapi_bridge_close_escapable_handle_scope(env: SnapiEnv, scope_id: u32) -> i32;
     pub fn snapi_bridge_escape_handle(
