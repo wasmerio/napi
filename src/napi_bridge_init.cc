@@ -69,17 +69,34 @@ struct HandleTable {
   }
 };
 
+// Value IDs are generation-tagged: a u32 id encodes
+// ((slot_index + 1) << kValueIdGenBits) | generation, keeping 0 as the null
+// sentinel. A stale or forged id fails the generation check in LoadValue and
+// resolves to null instead of aliasing whatever value later reuses the slot.
+constexpr uint32_t kValueIdGenBits = 12;
+constexpr uint32_t kValueIdGenMask = (1u << kValueIdGenBits) - 1;
+// (slot_index + 1) must fit in the remaining 20 bits.
+constexpr uint32_t kValueIdMaxSlots = (1u << 20) - 1;
+
+struct ValueSlot {
+  napi_ref ref = nullptr;
+  uint16_t generation = 0;
+  bool in_use = false;
+};
+
 struct SnapiEnvState {
   napi_env env = nullptr;
   void* scope = nullptr;
 
-  // Handle table: maps u32 IDs to persistent napi_value references.
+  // Value slot table: maps generation-tagged u32 IDs to persistent napi_value
+  // references.
   //
   // Raw napi_value handles are only valid within the originating handle scope.
-  // The guest stores these IDs across calls, so we must hold a reference on the
-  // host side and re-resolve it when loading the value again.
-  std::unordered_map<uint32_t, napi_ref> values;
-  uint32_t next_value_id = 1;
+  // The guest stores value IDs across calls, so we must hold a reference on
+  // the host side and re-resolve it when loading the value again.
+  std::vector<ValueSlot> value_slots;
+  std::vector<uint32_t> value_free_slots;
+  size_t live_value_count = 0;
 
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
@@ -133,7 +150,13 @@ CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) 
 }
 
 SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
-  if (env_state == nullptr || env_state->env == nullptr) return nullptr;
+  if (env_state == nullptr) return nullptr;
+  // The pointer originates from the guest (via the Rust env-id layer); gate it
+  // on live-env membership before the first dereference so a stale or forged
+  // env handle fails cleanly instead of touching freed memory.
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (g_envs.find(env_state) == g_envs.end()) return nullptr;
+  if (env_state->env == nullptr) return nullptr;
   return env_state;
 }
 
@@ -150,28 +173,63 @@ uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
   if (state.env == nullptr) return 0;
   // Refuse once the per-env handle cap is reached: returning 0 surfaces as an
   // N-API failure the guest can handle, instead of leaking host RSS unbounded.
-  if (state.value_limit != 0 && state.values.size() >= state.value_limit) {
+  if (state.value_limit != 0 && state.live_value_count >= state.value_limit) {
     return 0;
   }
+  uint32_t index;
+  if (!state.value_free_slots.empty()) {
+    index = state.value_free_slots.back();
+    state.value_free_slots.pop_back();
+  } else {
+    if (state.value_slots.size() >= kValueIdMaxSlots) return 0;
+    index = static_cast<uint32_t>(state.value_slots.size());
+    state.value_slots.emplace_back();
+  }
+  ValueSlot& slot = state.value_slots[index];
   napi_ref ref = nullptr;
   if (napi_create_reference(state.env, val, 1, &ref) != napi_ok || ref == nullptr) {
+    state.value_free_slots.push_back(index);
     return 0;
   }
-  uint32_t id = state.next_value_id++;
-  state.values[id] = ref;
-  return id;
+  slot.ref = ref;
+  slot.in_use = true;
+  ++state.live_value_count;
+  return ((index + 1) << kValueIdGenBits) | slot.generation;
 }
 
 napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
   if (id == 0) return nullptr;
   if (state.env == nullptr) return nullptr;
-  auto it = state.values.find(id);
-  if (it == state.values.end() || it->second == nullptr) return nullptr;
+  const uint32_t index_plus_one = id >> kValueIdGenBits;
+  if (index_plus_one == 0 || index_plus_one > state.value_slots.size()) {
+    return nullptr;
+  }
+  ValueSlot& slot = state.value_slots[index_plus_one - 1];
+  if (!slot.in_use || slot.generation != (id & kValueIdGenMask) ||
+      slot.ref == nullptr) {
+    return nullptr;
+  }
   napi_value value = nullptr;
-  if (napi_get_reference_value(state.env, it->second, &value) != napi_ok || value == nullptr) {
+  if (napi_get_reference_value(state.env, slot.ref, &value) != napi_ok || value == nullptr) {
     return nullptr;
   }
   return value;
+}
+
+// Releases a slot and bumps its generation so any id minted for the old
+// occupant is rejected by LoadValue. Currently used at env teardown; the
+// scope-close path (lifetime rework phase 3) reclaims through this too.
+void FreeValueSlot(SnapiEnvState& state, uint32_t index) {
+  ValueSlot& slot = state.value_slots[index];
+  if (!slot.in_use) return;
+  if (slot.ref != nullptr) {
+    napi_delete_reference(state.env, slot.ref);
+    slot.ref = nullptr;
+  }
+  slot.in_use = false;
+  slot.generation = static_cast<uint16_t>((slot.generation + 1) & kValueIdGenMask);
+  state.value_free_slots.push_back(index);
+  --state.live_value_count;
 }
 
 uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
@@ -442,13 +500,14 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
 
 napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
-  for (auto& entry : state->values) {
-    if (entry.second != nullptr) {
-      napi_delete_reference(state->env, entry.second);
+  for (auto& slot : state->value_slots) {
+    if (slot.in_use && slot.ref != nullptr) {
+      napi_delete_reference(state->env, slot.ref);
     }
   }
-  state->values.clear();
-  state->next_value_id = 1;
+  state->value_slots.clear();
+  state->value_free_slots.clear();
+  state->live_value_count = 0;
   state->refs.clear();
   state->next_ref_id = 1;
   state->deferreds.clear();
