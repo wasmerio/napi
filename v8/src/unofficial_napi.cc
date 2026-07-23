@@ -467,9 +467,17 @@ size_t NearHeapLimitCallback(void* raw_env,
 // Rust-exported external-memory budget hooks (see budget.rs). Charge before an
 // ArrayBuffer backing store is allocated (returns false when over budget),
 // uncharge on free, and release the per-env tracker when the allocator dies.
-extern "C" bool napi_host_external_try_charge(const void* data, size_t bytes);
-extern "C" void napi_host_external_uncharge(const void* data, size_t bytes);
-extern "C" void napi_host_external_release(void* data, size_t remaining_bytes);
+// Weak fallbacks keep embedders without the Rust budget host (e.g. the native
+// edgejs build) linking; the budget hook is never installed there, so these
+// are never called. napi_wasmer's strong Rust exports override them.
+extern "C" __attribute__((weak)) bool napi_host_external_try_charge(
+    const void* /*data*/, size_t /*bytes*/) {
+  return true;
+}
+extern "C" __attribute__((weak)) void napi_host_external_uncharge(
+    const void* /*data*/, size_t /*bytes*/) {}
+extern "C" __attribute__((weak)) void napi_host_external_release(
+    void* /*data*/, size_t /*remaining_bytes*/) {}
 
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
