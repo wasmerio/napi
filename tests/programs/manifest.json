@@ -164,6 +164,11 @@
       "name": "test_unofficial_extension",
       "description": "Wasmer extension import resolves via napi_extension_wasmer_v0",
       "expected_stdout": "TEST_UNOFFICIAL_EXTENSION_OK=1\n"
+    },
+    {
+      "name": "test_handle_scope_lifetime",
+      "description": "Scope-bound value lifetimes: stale-after-close rejection, ref survival, LIFO mismatch error, slot reclamation under churn",
+      "expected_stdout": "TEST_HANDLE_SCOPE_LIFETIME_OK=1\n"
     }
   ]
 }
