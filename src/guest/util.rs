@@ -116,6 +116,44 @@ pub fn resolve_guest_backing_store_mapping(
     mapping.guest_ptr.checked_add(guest_delta)
 }
 
+/// A cached guest copy of a host-allocated buffer was reused by a lookup.
+/// Ensure the current method/callback frame holds a flush entry for it, and
+/// refresh the copy from the live host bytes when this frame sees the copy for
+/// the first time (the host side may have modified the buffer since the copy
+/// was made). Without this, guest mutations through a cache-hit copy are never
+/// written back, and reads can observe stale bytes.
+pub fn adopt_cached_host_buffer_copy(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    handle_id: u32,
+    backing_store_token: u64,
+    guest_ptr: u32,
+    byte_len: usize,
+    host_addr: u64,
+) {
+    if byte_len == 0 || host_addr == 0 || guest_ptr == 0 {
+        return;
+    }
+    if env
+        .data()
+        .host_buffer_copies
+        .iter()
+        .any(|c| c.guest_ptr == guest_ptr)
+    {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) }.to_vec();
+    if !write_guest_bytes(env, guest_ptr, &bytes) {
+        return;
+    }
+    env.data_mut().host_buffer_copies.push(HostBufferCopy {
+        handle_id,
+        backing_store_token,
+        guest_ptr,
+        byte_len,
+        pristine: bytes,
+    });
+}
+
 pub fn resolve_or_copy_host_data_to_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
     handle_id: u32,
@@ -123,6 +161,14 @@ pub fn resolve_or_copy_host_data_to_guest(
     host_addr: u64,
     byte_len: usize,
 ) -> Option<u32> {
+    if host_addr == 0 {
+        return Some(0);
+    }
+    // Exact base-relative translation first — see the ordering note in
+    // resolve_current_host_data_to_guest.
+    if let Some(guest_ptr) = host_ptr_to_guest_ptr(env, host_addr) {
+        return Some(guest_ptr);
+    }
     if backing_store_token != 0
         && let Some(mapping) = env
             .data()
@@ -134,16 +180,26 @@ pub fn resolve_or_copy_host_data_to_guest(
         env.data_mut()
             .guest_data_ptrs
             .insert(handle_id, guest_data_ptr);
+        adopt_cached_host_buffer_copy(
+            env,
+            handle_id,
+            backing_store_token,
+            guest_data_ptr,
+            byte_len,
+            host_addr,
+        );
         return Some(guest_data_ptr);
     }
     if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&handle_id) {
+        adopt_cached_host_buffer_copy(
+            env,
+            handle_id,
+            backing_store_token,
+            guest_data_ptr,
+            byte_len,
+            host_addr,
+        );
         return Some(guest_data_ptr);
-    }
-    if host_addr == 0 {
-        return Some(0);
-    }
-    if let Some(guest_ptr) = host_ptr_to_guest_ptr(env, host_addr) {
-        return Some(guest_ptr);
     }
     if byte_len == 0 {
         return Some(0);
@@ -161,11 +217,13 @@ pub fn resolve_or_copy_host_data_to_guest(
         );
     }
     env.data_mut().guest_data_ptrs.insert(handle_id, guest_ptr);
+    let pristine = read_guest_bytes(env, guest_ptr as i32, byte_len).unwrap_or_default();
     env.data_mut().host_buffer_copies.push(HostBufferCopy {
         handle_id,
         backing_store_token,
         guest_ptr,
         byte_len,
+        pristine,
     });
     Some(guest_ptr)
 }

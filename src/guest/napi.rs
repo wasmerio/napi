@@ -169,27 +169,12 @@ fn copy_host_buffer_to_guest(
     0
 }
 
-fn remember_guest_backing_store(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    handle_id: u32,
-    backing_store_token: u64,
-    host_addr: u64,
-    guest_ptr: u32,
-    byte_len: usize,
-) {
-    let state = env.data_mut();
-    state.guest_data_ptrs.insert(handle_id, guest_ptr);
-    if backing_store_token != 0 {
-        state.guest_data_backing_stores.insert(
-            backing_store_token,
-            crate::GuestBackingStoreMapping {
-                host_addr,
-                guest_ptr,
-                byte_len,
-            },
-        );
-    }
-}
+// Guest-memory-backed buffers are deliberately NOT registered in any
+// long-lived mapping table: backing-store tokens are raw host pointers that the
+// allocator recycles once a buffer dies (and bridge-side finalizers never run),
+// so permanent entries eventually alias unrelated buffers. Base-relative
+// translation in resolve_current_host_data_to_guest resolves these buffers
+// exactly without any state.
 
 // TODO: Route Buffer/ArrayBuffer allocation through guest memory from the start
 // so host-owned buffers do not need snapshot-and-flush fallback synchronization.
@@ -201,6 +186,8 @@ fn remember_host_buffer_copy(
     guest_ptr: u32,
     byte_len: usize,
 ) {
+    let pristine =
+        crate::guest::util::read_guest_bytes(env, guest_ptr as i32, byte_len).unwrap_or_default();
     {
         let state = env.data_mut();
         state.guest_data_ptrs.insert(handle_id, guest_ptr);
@@ -219,6 +206,7 @@ fn remember_host_buffer_copy(
             backing_store_token,
             guest_ptr,
             byte_len,
+            pristine,
         });
     }
 }
@@ -244,6 +232,18 @@ fn resolve_current_host_data_to_guest(
     host_addr: u64,
     byte_len: usize,
 ) -> Option<u32> {
+    if host_addr == 0 {
+        return Some(0);
+    }
+    // Guest-memory-backed buffers (every buffer the WASIX path creates) resolve
+    // exactly by base-relative translation, with no stored state. This must run
+    // before any cached mapping: backing-store tokens are raw host pointers and
+    // both the token and the data address can be recycled by the allocator
+    // after the original buffer dies, so a cache hit can alias a dead buffer's
+    // mapping (host finalizers for bridge-created externals never run).
+    if let Some(guest_ptr) = host_ptr_to_guest_ptr(env, host_addr) {
+        return Some(guest_ptr);
+    }
     if backing_store_token != 0
         && let Some(mapping) = env
             .data()
@@ -255,13 +255,26 @@ fn resolve_current_host_data_to_guest(
         env.data_mut()
             .guest_data_ptrs
             .insert(handle_id, guest_data_ptr);
+        crate::guest::util::adopt_cached_host_buffer_copy(
+            env,
+            handle_id,
+            backing_store_token,
+            guest_data_ptr,
+            byte_len,
+            host_addr,
+        );
         return Some(guest_data_ptr);
     }
     if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&handle_id) {
+        crate::guest::util::adopt_cached_host_buffer_copy(
+            env,
+            handle_id,
+            backing_store_token,
+            guest_data_ptr,
+            byte_len,
+            host_addr,
+        );
         return Some(guest_data_ptr);
-    }
-    if host_addr == 0 {
-        return Some(0);
     }
     if byte_len == 0 {
         return Some(0);
@@ -3341,14 +3354,7 @@ fn guest_napi_create_arraybuffer(
             )
         };
         if s == 0 {
-            remember_guest_backing_store(
-                &mut env,
-                out,
-                backing_store_token,
-                host_addr,
-                guest_ptr as u32,
-                byte_length as usize,
-            );
+            let _ = backing_store_token;
             write_guest_u32(&mut env, rp as u32, out);
             if data_ptr > 0 {
                 write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
@@ -3401,24 +3407,19 @@ fn guest_napi_create_external_arraybuffer(
         )
     };
     if s == 0 {
-        remember_guest_backing_store(
-            &mut env,
-            out,
-            backing_store_token,
-            host_addr,
-            external_data as u32,
-            byte_length as usize,
-        );
+        let _ = backing_store_token;
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
 
+// NOTE: napi_create_external_buffer takes (env, length, data, ...) — unlike
+// napi_create_external_arraybuffer, which takes (env, data, length, ...).
 fn guest_napi_create_external_buffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
-    external_data: i32,
     byte_length: i32,
+    external_data: i32,
     _finalize_cb: i32,
     _finalize_hint: i32,
     rp: i32,
@@ -3447,14 +3448,7 @@ fn guest_napi_create_external_buffer(
         )
     };
     if s == 0 {
-        remember_guest_backing_store(
-            &mut env,
-            out,
-            backing_store_token,
-            host_addr,
-            external_data as u32,
-            byte_length as usize,
-        );
+        let _ = backing_store_token;
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
@@ -4804,15 +4798,7 @@ fn guest_napi_create_buffer(
             return s;
         }
 
-        remember_guest_backing_store(
-            &mut env,
-            buf_id,
-            backing_store_token,
-            host_addr,
-            guest_ptr as u32,
-            length as usize,
-        );
-
+        let _ = backing_store_token;
         write_guest_u32(&mut env, rp as u32, buf_id);
         if data_ptr > 0 {
             write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
@@ -4885,15 +4871,7 @@ fn guest_napi_create_buffer_copy(
             return s;
         }
 
-        remember_guest_backing_store(
-            &mut env,
-            buf_id,
-            backing_store_token,
-            host_addr,
-            guest_ptr as u32,
-            length as usize,
-        );
-
+        let _ = backing_store_token;
         write_guest_u32(&mut env, rp as u32, buf_id);
         if result_data_ptr > 0 {
             write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr as u32);

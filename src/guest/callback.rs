@@ -53,41 +53,42 @@ fn flush_host_buffer_copies(
     env.data_mut().host_buffer_copy_frames.pop();
 }
 
+/// Mid-execution coherency flush: write back guest-modified copies so the host
+/// sees current bytes, but KEEP the entries (re-based on the flushed bytes).
+/// Frames still on the stack hold live pointers into these copies and may
+/// mutate them after this flush; dropping the entries here would orphan those
+/// later mutations so they never reach the host.
 pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
     if snapi_env.is_null() || env.data().host_buffer_copies.is_empty() {
         return;
     }
 
-    let drained = {
-        let state = env.data_mut();
-        state
-            .host_buffer_copy_frames
-            .iter_mut()
-            .for_each(|start| *start = 0);
-        std::mem::take(&mut state.host_buffer_copies)
-    };
-
-    for mapping in drained {
-        if mapping.byte_len > 0
-            && let Some(bytes) = read_guest_bytes(env, mapping.guest_ptr as i32, mapping.byte_len)
-        {
-            unsafe {
-                crate::snapi::snapi_bridge_overwrite_value_bytes(
-                    snapi_env,
-                    mapping.handle_id,
-                    bytes.as_ptr().cast(),
-                    mapping.byte_len as u32,
-                );
-            }
+    for idx in 0..env.data().host_buffer_copies.len() {
+        let (handle_id, guest_ptr, byte_len) = {
+            let c = &env.data().host_buffer_copies[idx];
+            (c.handle_id, c.guest_ptr, c.byte_len)
+        };
+        if byte_len == 0 {
+            continue;
         }
-
-        let state = env.data_mut();
-        state.guest_data_ptrs.remove(&mapping.handle_id);
-        if mapping.backing_store_token != 0 {
-            state
-                .guest_data_backing_stores
-                .remove(&mapping.backing_store_token);
+        let Some(bytes) = read_guest_bytes(env, guest_ptr as i32, byte_len) else {
+            continue;
+        };
+        // Only write back copies the guest actually modified: several frames
+        // can hold copies of the same host buffer, and flushing an untouched
+        // (possibly stale) copy would clobber newer host-side writes.
+        if bytes == env.data().host_buffer_copies[idx].pristine {
+            continue;
         }
+        unsafe {
+            crate::snapi::snapi_bridge_overwrite_value_bytes(
+                snapi_env,
+                handle_id,
+                bytes.as_ptr().cast(),
+                byte_len as u32,
+            );
+        }
+        env.data_mut().host_buffer_copies[idx].pristine = bytes;
     }
 }
 
@@ -105,6 +106,11 @@ pub fn flush_host_buffer_copies_since(
     for mapping in drained {
         if mapping.byte_len > 0
             && let Some(bytes) = read_guest_bytes(env, mapping.guest_ptr as i32, mapping.byte_len)
+            // Only write back copies the guest actually modified: several
+            // frames can hold copies of the same host buffer, and flushing an
+            // untouched (possibly stale) copy would clobber newer host-side
+            // writes with old bytes.
+            && bytes != mapping.pristine
         {
             unsafe {
                 crate::snapi::snapi_bridge_overwrite_value_bytes(
@@ -213,7 +219,17 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] reentrancy depth limit exceeded");
         return 0;
     }
+    let copies_start = env.data().host_buffer_copies.len();
     let result = call_guest_callback(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg);
+    // Write back host-buffer copies created during this callback before the
+    // host pops the callback's handle scope. Without this, guest mutations of
+    // host-allocated buffers (e.g. state structs the guest updates in place)
+    // only flush when the outermost import call unwinds — far too late for JS
+    // code that reads the buffer right after the callback returns.
+    let snapi_env = env.data().resolve_napi_env(guest_env as i32);
+    if !snapi_env.is_null() {
+        flush_host_buffer_copies_since(env, snapi_env, copies_start);
+    }
     env.data_mut().leave_callback();
     result
 }
