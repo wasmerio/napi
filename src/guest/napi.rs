@@ -5022,27 +5022,27 @@ fn guest_napi_wrap(
     _finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
-    let mut ref_out: u32 = 0;
-    let s = if ref_ptr > 0 {
-        unsafe {
-            snapi_bridge_wrap(
-                snapi_env(&env, e),
-                obj as u32,
-                native_data as u64,
-                &mut ref_out,
-            )
-        }
-    } else {
-        unsafe {
-            snapi_bridge_wrap(
-                snapi_env(&env, e),
-                obj as u32,
-                native_data as u64,
-                std::ptr::null_mut(),
-            )
-        }
+    // The guest's finalize_cb is a wasm function pointer the host cannot
+    // invoke, so it is dropped. That also means the host-side napi_wrap can
+    // never be asked for a ref (it requires a finalizer when one is
+    // requested); wrap without a ref and mint the caller's ref separately as
+    // a weak reference, matching the refcount-0 ref napi_wrap would return.
+    let s = unsafe {
+        snapi_bridge_wrap(
+            snapi_env(&env, e),
+            obj as u32,
+            native_data as u64,
+            std::ptr::null_mut(),
+        )
     };
     if s == 0 && ref_ptr > 0 {
+        let mut ref_out: u32 = 0;
+        let rs = unsafe {
+            snapi_bridge_create_reference(snapi_env(&env, e), obj as u32, 0, &mut ref_out)
+        };
+        if rs != 0 {
+            return rs;
+        }
         write_guest_u32(&mut env, ref_ptr as u32, ref_out);
     }
     s
