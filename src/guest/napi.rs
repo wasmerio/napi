@@ -3301,7 +3301,7 @@ fn guest_napi_create_external_arraybuffer(
         let (_, store_ref) = env.data_and_store_mut();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
+        host_base + external_data as u32 as u64
     };
 
     let mut out: u32 = 0;
@@ -3341,7 +3341,7 @@ fn guest_napi_create_external_buffer(
         let (_, store_ref) = env.data_and_store_mut();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
+        host_base + external_data as u32 as u64
     };
 
     let mut out: u32 = 0;
