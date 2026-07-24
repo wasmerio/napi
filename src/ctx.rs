@@ -362,14 +362,14 @@ impl NapiSession {
             func_env.as_mut(&mut *store).memory = Some(memory.clone());
         }
 
-        for export_name in ["unofficial_napi_guest_malloc", "malloc"] {
-            if let Ok(malloc) = instance
-                .exports
-                .get_typed_function::<i32, i32>(&store, export_name)
-            {
-                func_env.as_mut(&mut *store).malloc_fn = Some(malloc);
-                break;
-            }
+        // Stand up the host-side guest-memory allocator now that the memory is
+        // final. All bridge allocations of guest memory go through it; the
+        // guest's own malloc is never called from the host.
+        let memory = func_env.as_ref(&*store).memory.clone();
+        if let Some(memory) = memory {
+            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
+            let heap = crate::guest_heap::GuestHeap::new(&mut *store, &memory, budget);
+            func_env.as_mut(&mut *store).guest_heap = heap;
         }
 
         if let Ok(table) = instance.exports.get_table("__indirect_function_table") {

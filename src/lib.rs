@@ -4,6 +4,7 @@ pub mod cli;
 mod ctx;
 mod env;
 mod guest;
+mod guest_heap;
 mod snapi;
 #[cfg(feature = "wasix")]
 mod wasix;

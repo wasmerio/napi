@@ -3300,33 +3300,12 @@ fn guest_napi_create_arraybuffer(
     data_ptr: i32,
     rp: i32,
 ) -> i32 {
-    // Try to create a guest-memory-backed ArrayBuffer (for WASIX)
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
-
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, byte_length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1, // allocation failed
-            }
+    // Guest-memory-backed ArrayBuffer via the host-side heap (WASIX path).
+    if let Some(heap) = env.data().guest_heap.clone() {
+        let Some(guest_ptr) = heap.alloc(byte_length.max(0) as usize, /* zero = */ true) else {
+            return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
-
-        // Get host pointer corresponding to the guest allocation
-        let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
-            let view = memory.view(&store_ref);
-            let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
-        };
-
-        // Zero-initialize the guest memory region
-        {
-            let zeros = vec![0u8; byte_length as usize];
-            write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
-        }
+        let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
         // Create external arraybuffer backed by guest memory
         let mut out: u32 = 0;
@@ -3346,13 +3325,15 @@ fn guest_napi_create_arraybuffer(
                 out,
                 backing_store_token,
                 host_addr,
-                guest_ptr as u32,
+                guest_ptr,
                 byte_length as usize,
             );
             write_guest_u32(&mut env, rp as u32, out);
             if data_ptr > 0 {
-                write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
+                write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
             }
+        } else {
+            heap.free_offset(guest_ptr);
         }
         s
     } else {
@@ -3995,6 +3976,13 @@ fn guest_napi_get_cb_info(
     this_ptr: i32,
     data_ptr: i32,
 ) -> i32 {
+    // Non-shared memories can only grow where a store is available; top up the
+    // guest heap from this hot per-callback import so store-free allocations
+    // (V8 backing stores) rarely find it empty. No-op for shared memories.
+    if let Some(heap) = env.data().guest_heap.clone() {
+        let (_, mut store_ref) = env.data_and_store_mut();
+        heap.maybe_refill(&mut store_ref);
+    }
     begin_host_buffer_method_frame(&mut env);
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr > 0 {
@@ -4764,32 +4752,11 @@ fn guest_napi_create_buffer(
     rp: i32,
 ) -> i32 {
     // Buffers must be backed by guest linear memory (same pattern as create_arraybuffer)
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
-
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
-            }
+    if let Some(heap) = env.data().guest_heap.clone() {
+        let Some(guest_ptr) = heap.alloc(length.max(0) as usize, /* zero = */ true) else {
+            return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
-
-        // Get host pointer corresponding to the guest allocation
-        let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
-            let view = memory.view(&store_ref);
-            let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
-        };
-
-        // Zero-initialize the guest memory region
-        if length > 0 {
-            let zeros = vec![0u8; length as usize];
-            write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
-        }
+        let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
@@ -4803,6 +4770,7 @@ fn guest_napi_create_buffer(
             )
         };
         if s != 0 {
+            heap.free_offset(guest_ptr);
             return s;
         }
 
@@ -4811,13 +4779,13 @@ fn guest_napi_create_buffer(
             buf_id,
             backing_store_token,
             host_addr,
-            guest_ptr as u32,
+            guest_ptr,
             length as usize,
         );
 
         write_guest_u32(&mut env, rp as u32, buf_id);
         if data_ptr > 0 {
-            write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
+            write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
         }
         0
     } else {
@@ -4848,29 +4816,12 @@ fn guest_napi_create_buffer_copy(
         return 1;
     };
 
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
-
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
-            }
+    if let Some(heap) = env.data().guest_heap.clone() {
+        let Some(guest_ptr) = heap.alloc(length.max(0) as usize, /* zero = */ false) else {
+            return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
-
-        // Copy source data to guest memory
-        write_guest_bytes(&mut env, guest_ptr as u32, &src_data);
-
-        // Get host pointer corresponding to the guest allocation
-        let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
-            let view = memory.view(&store_ref);
-            let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
-        };
+        write_guest_bytes(&mut env, guest_ptr, &src_data);
+        let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
@@ -4884,6 +4835,7 @@ fn guest_napi_create_buffer_copy(
             )
         };
         if s != 0 {
+            heap.free_offset(guest_ptr);
             return s;
         }
 
@@ -4892,13 +4844,13 @@ fn guest_napi_create_buffer_copy(
             buf_id,
             backing_store_token,
             host_addr,
-            guest_ptr as u32,
+            guest_ptr,
             length as usize,
         );
 
         write_guest_u32(&mut env, rp as u32, buf_id);
         if result_data_ptr > 0 {
-            write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr as u32);
+            write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr);
         }
         0
     } else {
@@ -4975,37 +4927,25 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32
     if s != 0 {
         return s;
     }
-    // Write a napi_node_version struct to guest memory:
-    // { uint32_t major, uint32_t minor, uint32_t patch, const char* release }
-    // For WASM: we write the struct (16 bytes) into a static-ish location
-    // But the N-API spec says we return a *pointer* to the version struct.
-    // Actually, the API signature is: napi_get_node_version(env, const napi_node_version** version)
-    // So we need to allocate memory in guest for the struct and write the pointer.
-    // For simplicity, use malloc if available, otherwise just write the pointer to a fixed value.
-    let malloc_fn = env.data().malloc_fn.clone();
-    if let Some(malloc_fn) = malloc_fn {
-        // Allocate 16 bytes for the struct (major, minor, patch, release_ptr)
-        // Then allocate a small buffer for the release string
+    // The N-API signature is napi_get_node_version(env, const napi_node_version**),
+    // so the struct { u32 major, minor, patch; const char* release } must live
+    // in guest memory and outlive the call (the pointer is expected to stay
+    // valid for the env's lifetime, so the allocation is deliberately never
+    // freed).
+    if let Some(heap) = env.data().guest_heap.clone() {
         let release_str = b"napi-external\0";
-        let struct_size = 16i32; // 4 * u32 = 16 (release is a pointer)
-        let total = struct_size + release_str.len() as i32;
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, total) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
-            }
+        let struct_size = 16usize; // 3 * u32 + a wasm32 pointer
+        let Some(guest_ptr) = heap.alloc(struct_size + release_str.len(), false) else {
+            return 9; // napi_generic_failure
         };
-        // Write release string
-        let release_offset = guest_ptr + struct_size;
-        write_guest_bytes(&mut env, release_offset as u32, release_str);
-        // Write struct fields
-        write_guest_u32(&mut env, guest_ptr as u32, major);
-        write_guest_u32(&mut env, (guest_ptr + 4) as u32, minor);
-        write_guest_u32(&mut env, (guest_ptr + 8) as u32, patch);
-        write_guest_u32(&mut env, (guest_ptr + 12) as u32, release_offset as u32);
+        let release_offset = guest_ptr + struct_size as u32;
+        write_guest_bytes(&mut env, release_offset, release_str);
+        write_guest_u32(&mut env, guest_ptr, major);
+        write_guest_u32(&mut env, guest_ptr + 4, minor);
+        write_guest_u32(&mut env, guest_ptr + 8, patch);
+        write_guest_u32(&mut env, guest_ptr + 12, release_offset);
         // Write pointer to struct
-        write_guest_u32(&mut env, rp as u32, guest_ptr as u32);
+        write_guest_u32(&mut env, rp as u32, guest_ptr);
     } else {
         // Fallback: just write major version as a simple value
         write_guest_u32(&mut env, rp as u32, major);

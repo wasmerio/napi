@@ -75,19 +75,13 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
 }
 
 pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
-    let malloc_fn = env.data().malloc_fn.clone()?;
-    let len = i32::try_from(data.len()).ok()?;
-    let guest_ptr: i32 = {
-        let (_, mut store_ref) = env.data_and_store_mut();
-        malloc_fn.call(&mut store_ref, len).ok()?
-    };
-    if guest_ptr <= 0 {
+    let heap = env.data().guest_heap.clone()?;
+    let guest_ptr = heap.alloc(data.len(), false)?;
+    if !write_guest_bytes(env, guest_ptr, data) {
+        heap.free_offset(guest_ptr);
         return None;
     }
-    if !write_guest_bytes(env, guest_ptr as u32, data) {
-        return None;
-    }
-    Some(guest_ptr as u32)
+    Some(guest_ptr)
 }
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {

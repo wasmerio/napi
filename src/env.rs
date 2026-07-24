@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use wasmer::{Memory, Table, TypedFunction};
+use wasmer::{Memory, Table};
 
 use crate::budget::{
     EnvExternalCharge, EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap,
@@ -58,7 +58,10 @@ pub(crate) struct NapiEnv {
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
-    pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
+    /// Host-side allocator over the guest's linear memory; `None` until the
+    /// instance is configured (or when the memory cannot support it, in which
+    /// case guest allocation is unavailable).
+    pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     pub(crate) table: Option<Table>,
     /// Maps value handle IDs to their guest-memory data pointers.
     /// Used for buffers/arraybuffers backed by guest linear memory.
@@ -95,7 +98,7 @@ impl NapiEnv {
             external_declared: 0,
             callback_depth: 0,
             memory: None,
-            malloc_fn: None,
+            guest_heap: None,
             table: None,
             guest_data_ptrs: HashMap::new(),
             guest_data_ptrs_prune_floor: 1024,
