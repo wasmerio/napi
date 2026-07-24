@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -149,11 +149,54 @@ fn integrity_warn(what: &str) {
     }
 }
 
+/// Process-global registry of shared-memory heaps, keyed by the memory's base
+/// address. WASIX worker threads share one linear memory but each instantiates
+/// its own N-API env; without this they would each build a separate heap over
+/// the same memory, giving every heap an identical ownership range and no
+/// serialization between them. Sharing one heap per memory means a single
+/// allocator, live table, and mutex serialize all threads with unambiguous
+/// ownership. Weak refs let a heap drop once its last env releases it.
+fn shared_registry() -> &'static Mutex<HashMap<usize, Weak<GuestHeap>>> {
+    static REG: OnceLock<Mutex<HashMap<usize, Weak<GuestHeap>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl GuestHeap {
-    /// Build a heap over the instance's imported memory. Returns `None` (with
-    /// a log line) when the memory cannot support host-side allocation with a
-    /// stable base, in which case callers must treat guest allocation as
-    /// unavailable.
+    /// Get the shared heap for `memory`, building it on first use. All envs on
+    /// the same shared linear memory receive the same `Arc<GuestHeap>`. Returns
+    /// `None` when the memory cannot support host-side allocation with a stable
+    /// base, in which case callers must treat guest allocation as unavailable.
+    pub(crate) fn get_or_create(
+        store: &mut StoreMut<'_>,
+        memory: &wasmer::Memory,
+        budget: Arc<ResourceBudget>,
+    ) -> Option<Arc<Self>> {
+        let base = memory.view(store).data_ptr() as usize;
+        if base == 0 {
+            return Self::new(store, memory, budget);
+        }
+        // Shared memories: one heap per base, reused across threads/envs.
+        // Non-shared memories are single-threaded (conformance lane) — a fresh
+        // heap each time is fine and avoids cross-instance base-key collisions.
+        if !memory.ty(store).shared {
+            return Self::new(store, memory, budget);
+        }
+        let mut reg = shared_registry()
+            .lock()
+            .expect("guest-heap registry poisoned");
+        if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
+            return Some(existing);
+        }
+        let heap = Self::new(store, memory, budget)?;
+        reg.insert(base, Arc::downgrade(&heap));
+        // Opportunistically drop dead entries so the map cannot grow unbounded
+        // across many short-lived instances that reuse addresses.
+        reg.retain(|_, w| w.strong_count() > 0);
+        Some(heap)
+    }
+
+    /// Build a fresh heap over the instance's imported memory. Prefer
+    /// [`GuestHeap::get_or_create`] so envs sharing a memory share the heap.
     pub(crate) fn new(
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
@@ -538,7 +581,6 @@ impl Drop for GuestHeap {
 // heap is gone.
 
 use std::ffi::c_void;
-use std::sync::Weak;
 
 /// Context installed into a V8 array-buffer allocator
 /// (`unofficial_napi_env_create_options.guest_heap_ctx`).
@@ -560,23 +602,25 @@ impl GuestHeap {
     /// The receiver takes ownership (released via
     /// [`napi_host_guest_heap_release`]).
     pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
-        Box::into_raw(Box::new(GuestHeapCtx {
+        let p = Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
             heap: Arc::downgrade(self),
         }))
-        .cast()
+        .cast();
+        p
     }
 
     /// Box a finalizer context for one allocation. The bridge takes ownership
     /// on success (released via [`napi_host_guest_heap_buffer_finalize`]);
     /// reclaim with [`GuestHeap::reclaim_finalize_ctx`] on failure.
     pub(crate) fn make_finalize_ctx(self: &Arc<Self>, offset: u32) -> *mut c_void {
-        Box::into_raw(Box::new(GuestHeapFinalizeCtx {
+        let p = Box::into_raw(Box::new(GuestHeapFinalizeCtx {
             heap: Arc::downgrade(self),
             offset,
         }))
-        .cast()
+        .cast();
+        p
     }
 
     /// Take back a finalize ctx that was never handed to a live buffer.

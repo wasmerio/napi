@@ -368,7 +368,7 @@ impl NapiSession {
         let memory = func_env.as_ref(&*store).memory.clone();
         if let Some(memory) = memory {
             let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::new(&mut *store, &memory, budget);
+            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget);
             func_env.as_mut(&mut *store).guest_heap = heap;
         }
 
