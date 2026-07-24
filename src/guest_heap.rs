@@ -521,6 +521,147 @@ impl Drop for GuestHeap {
     }
 }
 
+// ============================================================
+// C hooks for the V8 array-buffer allocator and buffer finalizers
+// ============================================================
+//
+// These strong exports override the weak no-op fallbacks in
+// v8/src/unofficial_napi.cc and src/napi_bridge_init.cc (embedders without
+// this Rust host — e.g. the native edgejs build — link the no-ops and never
+// install a context).
+//
+// The contexts hold a `Weak<GuestHeap>` plus copied integers, never an `Arc`:
+// process-lifetime V8 globals are deliberately leaked (see the exit-race fix),
+// and an `Arc` reachable from them would pin the instance's multi-GiB memory
+// reservation forever. Ownership decisions use only the integers so a
+// guest-heap pointer is never misrouted to the host allocator even after the
+// heap is gone.
+
+use std::ffi::c_void;
+use std::sync::Weak;
+
+/// Context installed into a V8 array-buffer allocator
+/// (`unofficial_napi_env_create_options.guest_heap_ctx`).
+pub(crate) struct GuestHeapCtx {
+    base: usize,
+    len: u64,
+    heap: Weak<GuestHeap>,
+}
+
+/// Context handed to the buffer-finalizer trampoline for a single
+/// guest-heap-backed external buffer.
+pub(crate) struct GuestHeapFinalizeCtx {
+    heap: Weak<GuestHeap>,
+    offset: u32,
+}
+
+impl GuestHeap {
+    /// Box an allocator context for [`unofficial_napi_env_create_options`].
+    /// The receiver takes ownership (released via
+    /// [`napi_host_guest_heap_release`]).
+    pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
+        Box::into_raw(Box::new(GuestHeapCtx {
+            base: self.base as usize,
+            len: self.max_bytes,
+            heap: Arc::downgrade(self),
+        }))
+        .cast()
+    }
+
+    /// Box a finalizer context for one allocation. The bridge takes ownership
+    /// on success (released via [`napi_host_guest_heap_buffer_finalize`]);
+    /// reclaim with [`GuestHeap::reclaim_finalize_ctx`] on failure.
+    pub(crate) fn make_finalize_ctx(self: &Arc<Self>, offset: u32) -> *mut c_void {
+        Box::into_raw(Box::new(GuestHeapFinalizeCtx {
+            heap: Arc::downgrade(self),
+            offset,
+        }))
+        .cast()
+    }
+
+    /// Take back a finalize ctx that was never handed to a live buffer.
+    pub(crate) fn reclaim_finalize_ctx(ctx: *mut c_void) {
+        if !ctx.is_null() {
+            // SAFETY: `ctx` came from `make_finalize_ctx` and was not consumed.
+            drop(unsafe { Box::from_raw(ctx.cast::<GuestHeapFinalizeCtx>()) });
+        }
+    }
+}
+
+/// Allocate a V8 backing store inside guest memory. Returns a host pointer,
+/// or null when the heap is exhausted/gone (V8 then throws a RangeError).
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_guest_heap_alloc(
+    ctx: *const c_void,
+    length: usize,
+    zero: i32,
+) -> *mut c_void {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
+    let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
+    let Some(heap) = ctx.heap.upgrade() else {
+        return std::ptr::null_mut();
+    };
+    match heap.alloc(length, zero != 0) {
+        Some(offset) => heap.offset_to_host(offset).cast(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a backing store if it belongs to the guest heap. Returns 1 when the
+/// pointer was guest-heap provenance (handled here — the caller must NOT pass
+/// it to a host allocator), 0 when it predates the context and belongs to the
+/// legacy backing allocator. Ownership is decided by the copied integer range
+/// alone: even after the heap is dropped, in-range pointers are claimed (and
+/// silently discarded — the mapping is gone, there is nothing to free).
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_guest_heap_free(
+    ctx: *const c_void,
+    data: *mut c_void,
+    length: usize,
+) -> i32 {
+    if ctx.is_null() || data.is_null() {
+        return 0;
+    }
+    // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
+    let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
+    let addr = data as usize;
+    if addr < ctx.base || (addr - ctx.base) as u64 >= ctx.len {
+        return 0;
+    }
+    if let Some(heap) = ctx.heap.upgrade() {
+        heap.free_host_ptr(data.cast(), length);
+    }
+    1
+}
+
+/// Release an allocator context (called from the allocator's destructor, or
+/// from env-creation failure paths).
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_guest_heap_release(ctx: *mut c_void) {
+    if !ctx.is_null() {
+        // SAFETY: `ctx` came from `make_alloc_ctx` and is released exactly once.
+        drop(unsafe { Box::from_raw(ctx.cast::<GuestHeapCtx>()) });
+    }
+}
+
+/// Finalizer for guest-heap-backed external buffers: frees the allocation and
+/// drops the boxed context. Runs when V8 collects the buffer (any thread).
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_guest_heap_buffer_finalize(_data: *mut c_void, hint: *mut c_void) {
+    if hint.is_null() {
+        return;
+    }
+    // SAFETY: `hint` came from `make_finalize_ctx`; the bridge calls this
+    // exactly once per successfully created buffer.
+    let ctx = unsafe { Box::from_raw(hint.cast::<GuestHeapFinalizeCtx>()) };
+    if let Some(heap) = ctx.heap.upgrade() {
+        heap.free_offset(ctx.offset);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -51,6 +51,7 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_set_flags_from_string(flags: *const i8, length: u32) -> i32;
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
+        guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_create_env_with_options(
@@ -59,6 +60,7 @@ unsafe extern "C" {
         max_old_generation_size_in_bytes: u32,
         code_range_size_in_bytes: u32,
         stack_limit: u32,
+        guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_set_embedder_hooks(env: SnapiEnv) -> i32;
@@ -727,6 +729,22 @@ unsafe extern "C" {
         env: SnapiEnv,
         data_addr: u64,
         byte_length: u32,
+        backing_store_token_out: *mut u64,
+        out_id: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_create_external_arraybuffer_finalized(
+        env: SnapiEnv,
+        data_addr: u64,
+        byte_length: u32,
+        finalize_hint: *mut core::ffi::c_void,
+        backing_store_token_out: *mut u64,
+        out_id: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_create_external_buffer_finalized(
+        env: SnapiEnv,
+        data_addr: u64,
+        byte_length: u32,
+        finalize_hint: *mut core::ffi::c_void,
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;

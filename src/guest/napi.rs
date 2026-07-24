@@ -30,6 +30,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     };
 
+    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = if reservation.clamped {
         unsafe {
@@ -39,11 +40,12 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
                 reservation.max_old,
                 reservation.code_range,
                 0,
+                guest_heap_ctx,
                 &mut snapi_env_state,
             )
         }
     } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, &mut snapi_env_state) }
+        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
     };
     if status != 0 || snapi_env_state.is_null() {
         env.data().abort_isolate(&reservation);
@@ -53,6 +55,16 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
+}
+
+/// Boxed guest-heap context for env creation, or null when no heap exists.
+/// The bridge takes ownership in all cases (success or failure).
+fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_void {
+    env.data()
+        .guest_heap
+        .as_ref()
+        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
+        .unwrap_or(std::ptr::null())
 }
 
 fn guest_unofficial_napi_set_flags_from_string(
@@ -309,6 +321,7 @@ fn guest_unofficial_napi_create_env(
         Err(_) => return 1,
     };
 
+    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = if reservation.clamped {
         unsafe {
@@ -318,11 +331,18 @@ fn guest_unofficial_napi_create_env(
                 reservation.max_old,
                 reservation.code_range,
                 0,
+                guest_heap_ctx,
                 &mut snapi_env_state,
             )
         }
     } else {
-        unsafe { snapi_bridge_unofficial_create_env(module_api_version, &mut snapi_env_state) }
+        unsafe {
+            snapi_bridge_unofficial_create_env(
+                module_api_version,
+                guest_heap_ctx,
+                &mut snapi_env_state,
+            )
+        }
     };
     if status != 0 {
         env.data().abort_isolate(&reservation);
@@ -374,6 +394,7 @@ fn guest_unofficial_napi_create_env_with_options(
         Err(_) => return 1,
     };
 
+    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
@@ -382,6 +403,7 @@ fn guest_unofficial_napi_create_env_with_options(
             reservation.max_old,
             reservation.code_range,
             stack_limit,
+            guest_heap_ctx,
             &mut snapi_env_state,
         )
     };
@@ -3307,14 +3329,17 @@ fn guest_napi_create_arraybuffer(
         };
         let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
-        // Create external arraybuffer backed by guest memory
+        // Create an external arraybuffer over guest memory; its finalizer
+        // frees the allocation back to the guest heap when V8 collects it.
+        let hint = heap.make_finalize_ctx(guest_ptr);
         let mut out: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_arraybuffer(
+            snapi_bridge_create_external_arraybuffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
+                hint,
                 &mut backing_store_token,
                 &mut out,
             )
@@ -3333,6 +3358,7 @@ fn guest_napi_create_arraybuffer(
                 write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
             }
         } else {
+            crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
             heap.free_offset(guest_ptr);
         }
         s
@@ -4758,18 +4784,21 @@ fn guest_napi_create_buffer(
         };
         let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
+        let hint = heap.make_finalize_ctx(guest_ptr);
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_buffer(
+            snapi_bridge_create_external_buffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 length as u32,
+                hint,
                 &mut backing_store_token,
                 &mut buf_id,
             )
         };
         if s != 0 {
+            crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
             heap.free_offset(guest_ptr);
             return s;
         }
@@ -4823,18 +4852,21 @@ fn guest_napi_create_buffer_copy(
         write_guest_bytes(&mut env, guest_ptr, &src_data);
         let host_addr = heap.offset_to_host(guest_ptr) as u64;
 
+        let hint = heap.make_finalize_ctx(guest_ptr);
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_buffer(
+            snapi_bridge_create_external_buffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 length as u32,
+                hint,
                 &mut backing_store_token,
                 &mut buf_id,
             )
         };
         if s != 0 {
+            crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
             heap.free_offset(guest_ptr);
             return s;
         }
