@@ -25,19 +25,6 @@ struct EnvHeapChargeHandle {
     tracker: usize,
 }
 
-pub(crate) struct HostBufferCopy {
-    pub(crate) handle_id: u32,
-    pub(crate) backing_store_token: u64,
-    pub(crate) guest_ptr: u32,
-    pub(crate) byte_len: usize,
-}
-
-pub(crate) struct GuestBackingStoreMapping {
-    pub(crate) host_addr: u64,
-    pub(crate) guest_ptr: u32,
-    pub(crate) byte_len: usize,
-}
-
 pub(crate) struct NapiEnv {
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
@@ -63,24 +50,6 @@ pub(crate) struct NapiEnv {
     /// case guest allocation is unavailable).
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     pub(crate) table: Option<Table>,
-    /// Maps value handle IDs to their guest-memory data pointers.
-    /// Used for buffers/arraybuffers backed by guest linear memory.
-    pub(crate) guest_data_ptrs: HashMap<u32, u32>,
-    /// Size threshold above which stale (scope-closed) entries are pruned
-    /// from `guest_data_ptrs`; doubled after each prune to stay amortized.
-    pub(crate) guest_data_ptrs_prune_floor: usize,
-    /// Maps stable host backing-store tokens to guest-memory data pointers.
-    /// This keeps external Buffer/ArrayBuffer aliases stable even when V8/N-API
-    /// surfaces the same backing store through a different value handle.
-    pub(crate) guest_data_backing_stores: HashMap<u64, GuestBackingStoreMapping>,
-    /// Host-owned buffer/arraybuffer mappings copied into guest memory for the
-    /// duration of an active callback. These are written back on callback exit.
-    pub(crate) host_buffer_copies: Vec<HostBufferCopy>,
-    pub(crate) host_buffer_copy_frames: Vec<usize>,
-    /// Host-owned buffer copies created while servicing a single guest-side
-    /// native binding invocation (typically bracketed by napi_get_cb_info and a
-    /// return-value creation call).
-    pub(crate) host_buffer_method_frames: Vec<usize>,
     pub(crate) default_napi_env_id: Option<u32>,
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
@@ -100,12 +69,6 @@ impl NapiEnv {
             memory: None,
             guest_heap: None,
             table: None,
-            guest_data_ptrs: HashMap::new(),
-            guest_data_ptrs_prune_floor: 1024,
-            guest_data_backing_stores: HashMap::new(),
-            host_buffer_copies: Vec::new(),
-            host_buffer_copy_frames: Vec::new(),
-            host_buffer_method_frames: Vec::new(),
             default_napi_env_id: None,
             next_napi_env_id: 0,
             next_napi_scope_id: 0,

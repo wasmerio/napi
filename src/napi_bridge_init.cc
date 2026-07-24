@@ -319,142 +319,6 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   return 0;
 }
 
-bool GetValueByteSpan(napi_env env, napi_value value, uint8_t** data_out, size_t* length_out) {
-  if (env == nullptr || value == nullptr || data_out == nullptr || length_out == nullptr) {
-    return false;
-  }
-
-  *data_out = nullptr;
-  *length_out = 0;
-
-  bool is_buffer = false;
-  if (napi_is_buffer(env, value, &is_buffer) != napi_ok) {
-    return false;
-  }
-  if (is_buffer) {
-    void* data = nullptr;
-    size_t length = 0;
-    if (napi_get_buffer_info(env, value, &data, &length) != napi_ok) {
-      return false;
-    }
-    if (length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = length;
-    return true;
-  }
-
-  bool is_arraybuffer = false;
-  if (napi_is_arraybuffer(env, value, &is_arraybuffer) != napi_ok) {
-    return false;
-  }
-  if (is_arraybuffer) {
-    void* data = nullptr;
-    size_t length = 0;
-    if (napi_get_arraybuffer_info(env, value, &data, &length) != napi_ok) {
-      return false;
-    }
-    if (length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = length;
-    return true;
-  }
-
-  bool is_typedarray = false;
-  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok) {
-    return false;
-  }
-  if (is_typedarray) {
-    napi_typedarray_type type;
-    size_t length = 0;
-    void* data = nullptr;
-    if (napi_get_typedarray_info(env, value, &type, &length, &data, nullptr, nullptr) != napi_ok) {
-      return false;
-    }
-
-    size_t elem_size = TypedArrayElementSize(type);
-    if (elem_size == 0 ||
-        length > (std::numeric_limits<size_t>::max)() / elem_size) {
-      return false;
-    }
-
-    size_t byte_length = length * elem_size;
-    if (byte_length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = byte_length;
-    return true;
-  }
-
-  bool is_dataview = false;
-  if (napi_is_dataview(env, value, &is_dataview) != napi_ok) {
-    return false;
-  }
-  if (is_dataview) {
-    size_t byte_length = 0;
-    void* data = nullptr;
-    if (napi_get_dataview_info(env, value, &byte_length, &data, nullptr, nullptr) != napi_ok) {
-      return false;
-    }
-    if (byte_length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = byte_length;
-    return true;
-  }
-
-  return false;
-}
-
-bool SnapshotValueBytes(napi_env env, napi_value value, void** data_out, size_t* length_out) {
-  if (env == nullptr || value == nullptr || data_out == nullptr || length_out == nullptr) {
-    return false;
-  }
-
-  uint8_t* data = nullptr;
-  size_t byte_length = 0;
-  if (!GetValueByteSpan(env, value, &data, &byte_length)) {
-    return false;
-  }
-
-  void* copy = nullptr;
-  if (byte_length > 0) {
-    copy = std::malloc(byte_length);
-    if (copy == nullptr) return false;
-    std::memcpy(copy, data, byte_length);
-  }
-
-  *data_out = copy;
-  *length_out = byte_length;
-  return true;
-}
-
-bool OverwriteValueBytes(napi_env env, napi_value value, const uint8_t* data, size_t byte_length) {
-  if (env == nullptr || value == nullptr) return false;
-
-  uint8_t* target = nullptr;
-  size_t target_length = 0;
-  if (!GetValueByteSpan(env, value, &target, &target_length)) {
-    return false;
-  }
-
-  if (byte_length > target_length) {
-    return false;
-  }
-  if (byte_length > 0) {
-    if (data == nullptr || target == nullptr) {
-      return false;
-    }
-    std::memcpy(target, data, byte_length);
-  }
-  return true;
-}
-
 uint32_t StoreRef(SnapiEnvState& state, napi_ref ref) {
   if (ref == nullptr) return 0;
   uint32_t id = state.next_ref_id++;
@@ -1807,40 +1671,19 @@ extern "C" int snapi_bridge_get_dataview_info(SnapiEnvState* env_state, uint32_t
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_snapshot_value_bytes(SnapiEnvState* env_state, uint32_t id,
-                                                 uint64_t* data_out,
-                                                 uint32_t* byte_length_out) {
+// Attach the guest-heap finalizer to an arbitrary value: `finalize_hint` is
+// handed to the Rust guest-heap finalizer when V8 collects the value. Used to
+// tie the lifetime of a snapshot copy (foreign backing stores) to its value.
+extern "C" int snapi_bridge_attach_guest_heap_finalizer(SnapiEnvState* env_state,
+                                                        uint32_t id,
+                                                        void* finalize_hint) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_value val = LoadValue(*bridge_state, id);
-  if (!val || data_out == nullptr || byte_length_out == nullptr) return napi_invalid_arg;
-
-  void* snapshot = nullptr;
-  size_t byte_length = 0;
-  if (!SnapshotValueBytes(bridge_state->env, val, &snapshot, &byte_length)) {
-    return napi_invalid_arg;
-  }
-
-  *data_out = (uint64_t)(uintptr_t)snapshot;
-  *byte_length_out = (uint32_t)byte_length;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_overwrite_value_bytes(SnapiEnvState* env_state, uint32_t id,
-                                                  const void* data,
-                                                  uint32_t byte_length) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr || (data == nullptr && byte_length != 0)) return napi_invalid_arg;
-  napi_value val = LoadValue(*bridge_state, id);
   if (!val) return napi_invalid_arg;
-
-  return OverwriteValueBytes(
-             bridge_state->env,
-             val,
-             static_cast<const uint8_t*>(data),
-             static_cast<size_t>(byte_length))
-             ? napi_ok
-             : napi_invalid_arg;
+  return napi_add_finalizer(bridge_state->env, val, nullptr,
+                            GuestHeapBufferFinalizeTrampoline, finalize_hint,
+                            nullptr);
 }
 
 // ============================================================

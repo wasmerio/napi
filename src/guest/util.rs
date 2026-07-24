@@ -4,7 +4,7 @@
 
 use wasmer::FunctionEnvMut;
 
-use crate::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
+use crate::NapiEnv;
 
 pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
     let (state, store) = env.data_and_store_mut();
@@ -94,74 +94,6 @@ pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) 
         return None;
     }
     u32::try_from(host_addr - host_base).ok()
-}
-
-pub fn resolve_guest_backing_store_mapping(
-    mapping: &GuestBackingStoreMapping,
-    host_addr: u64,
-    byte_len: usize,
-) -> Option<u32> {
-    let delta = usize::try_from(host_addr.checked_sub(mapping.host_addr)?).ok()?;
-    let end = delta.checked_add(byte_len)?;
-    if end > mapping.byte_len {
-        return None;
-    }
-    let guest_delta = u32::try_from(delta).ok()?;
-    mapping.guest_ptr.checked_add(guest_delta)
-}
-
-pub fn resolve_or_copy_host_data_to_guest(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    handle_id: u32,
-    backing_store_token: u64,
-    host_addr: u64,
-    byte_len: usize,
-) -> Option<u32> {
-    if backing_store_token != 0
-        && let Some(mapping) = env
-            .data()
-            .guest_data_backing_stores
-            .get(&backing_store_token)
-        && let Some(guest_data_ptr) =
-            resolve_guest_backing_store_mapping(mapping, host_addr, byte_len)
-    {
-        env.data_mut()
-            .guest_data_ptrs
-            .insert(handle_id, guest_data_ptr);
-        return Some(guest_data_ptr);
-    }
-    if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&handle_id) {
-        return Some(guest_data_ptr);
-    }
-    if host_addr == 0 {
-        return Some(0);
-    }
-    if let Some(guest_ptr) = host_ptr_to_guest_ptr(env, host_addr) {
-        return Some(guest_ptr);
-    }
-    if byte_len == 0 {
-        return Some(0);
-    }
-    let host_slice = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) };
-    let guest_ptr = allocate_guest_bytes(env, host_slice)?;
-    if backing_store_token != 0 {
-        env.data_mut().guest_data_backing_stores.insert(
-            backing_store_token,
-            GuestBackingStoreMapping {
-                host_addr,
-                guest_ptr,
-                byte_len,
-            },
-        );
-    }
-    env.data_mut().guest_data_ptrs.insert(handle_id, guest_ptr);
-    env.data_mut().host_buffer_copies.push(HostBufferCopy {
-        handle_id,
-        backing_store_token,
-        guest_ptr,
-        byte_len,
-    });
-    Some(guest_ptr)
 }
 
 pub fn read_guest_u32_array(

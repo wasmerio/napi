@@ -805,17 +805,10 @@ unsafe extern "C" {
         byte_offset_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
-    pub fn snapi_bridge_snapshot_value_bytes(
+    pub fn snapi_bridge_attach_guest_heap_finalizer(
         env: SnapiEnv,
         id: u32,
-        data_out: *mut u64,
-        byte_length_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_overwrite_value_bytes(
-        env: SnapiEnv,
-        id: u32,
-        data: *const c_void,
-        byte_length: u32,
+        finalize_hint: *mut c_void,
     ) -> i32;
     // External
     pub fn snapi_bridge_create_external(env: SnapiEnv, data_val: u64, out_id: *mut u32) -> i32;
@@ -834,7 +827,6 @@ unsafe extern "C" {
     // Handle scopes
     pub fn snapi_bridge_open_handle_scope(env: SnapiEnv, scope_out: *mut u32) -> i32;
     pub fn snapi_bridge_close_handle_scope(env: SnapiEnv, scope_id: u32) -> i32;
-    pub fn snapi_bridge_value_id_alive(env: SnapiEnv, id: u32) -> i32;
     pub fn snapi_bridge_open_escapable_handle_scope(env: SnapiEnv, scope_out: *mut u32) -> i32;
     pub fn snapi_bridge_close_escapable_handle_scope(env: SnapiEnv, scope_id: u32) -> i32;
     pub fn snapi_bridge_escape_handle(
