@@ -2330,10 +2330,20 @@ fn guest_napi_create_string_utf8(
     let Some(sb) = sb else {
         return 1;
     };
-    let cs = CString::new(sb).unwrap_or_default();
+    // UTF-8 strings may legitimately contain interior NUL bytes (e.g. a Buffer
+    // decoded as 'ascii'/'latin1' where a source byte masks to 0). Pass the raw
+    // bytes with their true length — never a CString, whose construction fails
+    // on any interior NUL and would leave the host reading `wl` bytes of
+    // uninitialized memory past an empty buffer.
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_utf8(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_utf8(
+            snapi_env(&env, e),
+            sb.as_ptr() as *const i8,
+            sb.len() as u32,
+            &mut out,
+        )
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2356,10 +2366,18 @@ fn guest_napi_create_string_latin1(
     let Some(sb) = sb else {
         return 1;
     };
-    let cs = CString::new(sb).unwrap_or_default();
+    // Latin-1 strings routinely contain interior NUL bytes (byte 0 -> U+0000).
+    // Pass the raw bytes with their true length; a CString would fail to build
+    // and leave the host reading uninitialized memory (see the utf8 twin above).
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_latin1(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_latin1(
+            snapi_env(&env, e),
+            sb.as_ptr() as *const i8,
+            sb.len() as u32,
+            &mut out,
+        )
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
