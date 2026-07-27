@@ -1,10 +1,55 @@
 use std::ffi::c_void;
 
 use wasmer::{FunctionEnvMut, Table, Value};
+use wasmer_wasix::WasiError;
+use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
 type RawFunctionEnvMut = FunctionEnvMut<'static, NapiEnv>;
+
+thread_local! {
+    /// A guest instance exit (`WasiError::Exit`) that trapped out of a guest
+    /// callback and must be re-raised through the N-API import layers.
+    ///
+    /// When the guest calls `_exit`/`proc_exit` — e.g. Node's fatal-exception
+    /// path taking `std::_Exit` on the main thread after an unhandled exception
+    /// — WASI `proc_exit` unwinds the guest and the [`func.call`] that dispatched
+    /// the callback returns a trap carrying [`WasiError::Exit`]. The trampoline
+    /// runs inside host V8 (a native C++ frame that cannot carry a Rust trap), so
+    /// it cannot re-raise directly. Instead it stashes the exit here; the nearest
+    /// enclosing N-API import boundary ([`with_cb_context`]) takes it back out and
+    /// returns it as an `Err`, so wasmer re-raises the same exit through every
+    /// guest→host layer until the runner (`bin_factory`/`thread_spawn`) handles
+    /// it — the standard WASIX process-exit propagation. Swallowing it (the old
+    /// behavior) left the host event loop spinning forever (observed as
+    /// `test-tls-handshake-exception` hanging).
+    ///
+    /// This terminates only the guest instance whose callback exited, never the
+    /// host process.
+    ///
+    /// [`func.call`]: wasmer::Function::call
+    /// [`with_cb_context`]: crate::guest::napi::with_cb_context
+    static PENDING_GUEST_EXIT: std::cell::Cell<Option<ExitCode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// If a guest callback trapped with a WASI process exit, stash the exit code so
+/// the enclosing import boundary can re-raise it, and report whether it did.
+/// Non-exit traps return `false` and are left for the caller to log.
+fn stash_guest_exit(err: &wasmer::RuntimeError) -> bool {
+    if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
+        PENDING_GUEST_EXIT.with(|slot| slot.set(Some(*code)));
+        return true;
+    }
+    false
+}
+
+/// Take a pending guest instance exit stashed by a callback trampoline, if any.
+/// Called at each N-API import boundary to re-raise the exit outward.
+pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
+    PENDING_GUEST_EXIT.with(|slot| slot.take())
+}
 
 #[repr(C)]
 struct CallbackInvocationCtx {
@@ -36,6 +81,9 @@ fn call_guest_callback(
             _ => 0,
         },
         Err(err) => {
+            if stash_guest_exit(&err) {
+                return 0;
+            }
             eprintln!("[callback trampoline] error calling function: {err}");
             0
         }
@@ -75,6 +123,9 @@ fn call_guest_callback2(
             _ => 0,
         },
         Err(err) => {
+            if stash_guest_exit(&err) {
+                return 0;
+            }
             eprintln!("[finalizer trampoline] error calling guest finalizer: {err}");
             0
         }
