@@ -3288,8 +3288,8 @@ fn guest_napi_create_external_arraybuffer(
     e: i32,
     external_data: i32,
     byte_length: i32,
-    _finalize_cb: i32,
-    _finalize_hint: i32,
+    finalize_cb: i32,
+    finalize_hint: i32,
     rp: i32,
 ) -> i32 {
     let memory = env.data().memory.clone();
@@ -3306,14 +3306,33 @@ fn guest_napi_create_external_arraybuffer(
 
     let mut out: u32 = 0;
     let mut backing_store_token: u64 = 0;
-    let s = unsafe {
-        snapi_bridge_create_external_arraybuffer(
-            snapi_env(&env, e),
-            host_addr,
-            byte_length as u32,
-            &mut backing_store_token,
-            &mut out,
-        )
+    // When the guest supplies a finalize callback (its own allocation to free),
+    // route through the guest-finalized variant so the callback is re-run on
+    // the deferred drain. Otherwise the plain path (no finalizer).
+    let s = if finalize_cb != 0 {
+        unsafe {
+            snapi_bridge_create_external_arraybuffer_guest_finalized(
+                snapi_env(&env, e),
+                host_addr,
+                byte_length as u32,
+                e as u32,
+                finalize_cb as u32,
+                external_data as u32,
+                finalize_hint as u32,
+                &mut backing_store_token,
+                &mut out,
+            )
+        }
+    } else {
+        unsafe {
+            snapi_bridge_create_external_arraybuffer(
+                snapi_env(&env, e),
+                host_addr,
+                byte_length as u32,
+                &mut backing_store_token,
+                &mut out,
+            )
+        }
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
@@ -3328,8 +3347,8 @@ fn guest_napi_create_external_buffer(
     e: i32,
     byte_length: i32,
     external_data: i32,
-    _finalize_cb: i32,
-    _finalize_hint: i32,
+    finalize_cb: i32,
+    finalize_hint: i32,
     rp: i32,
 ) -> i32 {
     let memory = env.data().memory.clone();
@@ -3346,14 +3365,30 @@ fn guest_napi_create_external_buffer(
 
     let mut out: u32 = 0;
     let mut backing_store_token: u64 = 0;
-    let s = unsafe {
-        snapi_bridge_create_external_buffer(
-            snapi_env(&env, e),
-            host_addr,
-            byte_length as u32,
-            &mut backing_store_token,
-            &mut out,
-        )
+    let s = if finalize_cb != 0 {
+        unsafe {
+            snapi_bridge_create_external_buffer_guest_finalized(
+                snapi_env(&env, e),
+                host_addr,
+                byte_length as u32,
+                e as u32,
+                finalize_cb as u32,
+                external_data as u32,
+                finalize_hint as u32,
+                &mut backing_store_token,
+                &mut out,
+            )
+        }
+    } else {
+        unsafe {
+            snapi_bridge_create_external_buffer(
+                snapi_env(&env, e),
+                host_addr,
+                byte_length as u32,
+                &mut backing_store_token,
+                &mut out,
+            )
+        }
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
@@ -4840,15 +4875,41 @@ fn guest_napi_wrap(
     e: i32,
     obj: i32,
     native_data: i32,
-    _finalize_cb: i32,
-    _finalize_hint: i32,
+    finalize_cb: i32,
+    finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
-    // The guest's finalize_cb is a wasm function pointer the host cannot
-    // invoke, so it is dropped. That also means the host-side napi_wrap can
-    // never be asked for a ref (it requires a finalizer when one is
-    // requested); wrap without a ref and mint the caller's ref separately as
-    // a weak reference, matching the refcount-0 ref napi_wrap would return.
+    // With a guest finalizer, wrap through the finalized variant: the guest's
+    // finalize_cb is re-run on the deferred drain (which can re-enter the
+    // guest), and napi_wrap can mint the requested ref directly.
+    if finalize_cb != 0 {
+        let mut ref_out: u32 = 0;
+        let s = unsafe {
+            snapi_bridge_wrap_finalized(
+                snapi_env(&env, e),
+                obj as u32,
+                native_data as u64,
+                e as u32,
+                finalize_cb as u32,
+                native_data as u32,
+                finalize_hint as u32,
+                if ref_ptr > 0 {
+                    &mut ref_out
+                } else {
+                    std::ptr::null_mut()
+                },
+            )
+        };
+        if s == 0 && ref_ptr > 0 {
+            write_guest_u32(&mut env, ref_ptr as u32, ref_out);
+        }
+        return s;
+    }
+
+    // No guest finalizer: the host-side napi_wrap can never be asked for a ref
+    // (it requires a finalizer when one is requested); wrap without a ref and
+    // mint the caller's ref separately as a weak reference, matching the
+    // refcount-0 ref napi_wrap would return.
     let s = unsafe {
         snapi_bridge_wrap(
             snapi_env(&env, e),
@@ -4893,23 +4954,32 @@ fn guest_napi_add_finalizer(
     e: i32,
     obj: i32,
     data: i32,
-    _finalize_cb: i32,
-    _finalize_hint: i32,
+    finalize_cb: i32,
+    finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
     let mut ref_out: u32 = 0;
-    let s = if ref_ptr > 0 {
-        unsafe {
-            snapi_bridge_add_finalizer(snapi_env(&env, e), obj as u32, data as u64, &mut ref_out)
-        }
+    let ref_out_ptr = if ref_ptr > 0 {
+        &mut ref_out as *mut u32
     } else {
+        std::ptr::null_mut()
+    };
+    let s = if finalize_cb != 0 {
         unsafe {
-            snapi_bridge_add_finalizer(
+            snapi_bridge_add_finalizer_cb(
                 snapi_env(&env, e),
                 obj as u32,
                 data as u64,
-                std::ptr::null_mut(),
+                e as u32,
+                finalize_cb as u32,
+                data as u32,
+                finalize_hint as u32,
+                ref_out_ptr,
             )
+        }
+    } else {
+        unsafe {
+            snapi_bridge_add_finalizer(snapi_env(&env, e), obj as u32, data as u64, ref_out_ptr)
         }
     };
     if s == 0 && ref_ptr > 0 {

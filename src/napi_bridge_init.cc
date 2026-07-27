@@ -1406,6 +1406,151 @@ void GuestHeapBufferFinalizeTrampoline(node_api_basic_env /*env*/, void* data,
 }
 }  // namespace
 
+// Forward-declare the Rust finalizer trampoline (defined in guest/callback.rs
+// via #[no_mangle]). Re-enters the guest and dispatches the guest's finalize
+// callback through the indirect function table.
+extern "C" uint32_t snapi_host_invoke_wasm_finalizer(void* callback_ctx,
+                                                     uint32_t guest_env,
+                                                     uint32_t wasm_fn_ptr,
+                                                     uint32_t data,
+                                                     uint32_t hint);
+
+namespace {
+// Describes a guest-registered N-API finalizer. Carried as the `finalize_hint`
+// of a host finalizer installed via napi_wrap / napi_add_finalizer, all of
+// which fire on the *deferred* finalizer drain: their RefBase weak callbacks
+// enqueue into pending_finalizers, drained from the guest's
+// process-microtasks import call where an active callback ctx lets us re-enter
+// the guest. (External array buffers/buffers deliberately do NOT use V8's
+// backing-store deleter for the guest finalizer — those run synchronously in
+// GC, with no way back into the guest — they attach via napi_add_finalizer
+// instead.) Allocated on registration, freed exactly once when it fires.
+struct GuestFinalizerRecord {
+  SnapiEnvState* state;
+  uint32_t guest_env;
+  uint32_t wasm_fn_ptr;
+  uint32_t data;
+  uint32_t hint;
+};
+
+void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void* /*data*/,
+                              void* hint) {
+  auto* record = static_cast<GuestFinalizerRecord*>(hint);
+  if (record == nullptr) return;
+  auto* bridge_state = LookupEnvState(record->state);
+  void* callback_ctx =
+      bridge_state != nullptr
+          ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
+          : nullptr;
+  if (callback_ctx != nullptr) {
+    // Own any value ids the guest mints while running its finalizer; there is
+    // no return value to escape, so a plain handle scope suffices (mirrors
+    // WasmInterruptCallback).
+    napi_env env = bridge_state->env;
+    napi_handle_scope fin_scope = nullptr;
+    if (env != nullptr &&
+        napi_open_handle_scope(env, &fin_scope) == napi_ok &&
+        fin_scope != nullptr) {
+      (void)CurrentFrame(*bridge_state);
+      ScopeFrame frame;
+      frame.scope = fin_scope;
+      bridge_state->scope_frames.push_back(std::move(frame));
+    }
+    snapi_host_invoke_wasm_finalizer(callback_ctx, record->guest_env,
+                                     record->wasm_fn_ptr, record->data,
+                                     record->hint);
+    if (fin_scope != nullptr) {
+      while (bridge_state->scope_frames.size() > 1 &&
+             bridge_state->scope_frames.back().scope != fin_scope) {
+        PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+      }
+      if (!bridge_state->scope_frames.empty() &&
+          bridge_state->scope_frames.back().scope == fin_scope) {
+        PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+      }
+    }
+  }
+  delete record;
+}
+
+GuestFinalizerRecord* MakeGuestFinalizerRecord(SnapiEnvState* state,
+                                               uint32_t guest_env,
+                                               uint32_t wasm_fn_ptr,
+                                               uint32_t data, uint32_t hint) {
+  auto* record = new (std::nothrow) GuestFinalizerRecord();
+  if (record != nullptr) {
+    record->state = state;
+    record->guest_env = guest_env;
+    record->wasm_fn_ptr = wasm_fn_ptr;
+    record->data = data;
+    record->hint = hint;
+  }
+  return record;
+}
+}  // namespace
+
+// Like snapi_bridge_create_external_arraybuffer, but re-runs the guest's own
+// finalize callback (a wasm function pointer) when V8 collects the value, so
+// guest-owned external allocations are reclaimed instead of leaked.
+extern "C" int snapi_bridge_create_external_arraybuffer_guest_finalized(
+    SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
+    uint32_t guest_env, uint32_t wasm_fn_ptr, uint32_t finalize_data,
+    uint32_t finalize_hint, uint64_t* backing_store_token_out,
+    uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  void* data = (void*)(uintptr_t)data_addr;
+  napi_value result;
+  napi_status s = napi_create_external_arraybuffer(
+      env, data, (size_t)byte_length, nullptr, nullptr, &result);
+  if (s != napi_ok) return s;
+  auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
+                                          finalize_data, finalize_hint);
+  if (record == nullptr) return napi_generic_failure;
+  s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
+                         nullptr);
+  if (s != napi_ok) {
+    delete record;
+    return s;
+  }
+  if (backing_store_token_out) {
+    *backing_store_token_out = napi_v8_get_arraybuffer_backing_store_token(env, result);
+  }
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
+// Buffer twin of snapi_bridge_create_external_arraybuffer_guest_finalized.
+extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
+    SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
+    uint32_t guest_env, uint32_t wasm_fn_ptr, uint32_t finalize_data,
+    uint32_t finalize_hint, uint64_t* backing_store_token_out,
+    uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  void* data = (void*)(uintptr_t)data_addr;
+  napi_value result;
+  napi_status s = napi_create_external_buffer(
+      env, (size_t)byte_length, data, nullptr, nullptr, &result);
+  if (s != napi_ok) return s;
+  auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
+                                          finalize_data, finalize_hint);
+  if (record == nullptr) return napi_generic_failure;
+  s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
+                         nullptr);
+  if (s != napi_ok) {
+    delete record;
+    return s;
+  }
+  if (backing_store_token_out) {
+    *backing_store_token_out = napi_v8_get_arraybuffer_view_backing_store_token(env, result);
+  }
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
 // Like snapi_bridge_create_external_arraybuffer, but the buffer's lifetime is
 // tied to the JS value: when V8 collects it, `finalize_hint` is handed to the
 // Rust guest-heap finalizer, which frees the guest allocation. Ownership of
@@ -2153,6 +2298,33 @@ extern "C" int snapi_bridge_wrap(SnapiEnvState* env_state, uint32_t obj_id, uint
   return napi_ok;
 }
 
+// Like snapi_bridge_wrap, but runs the guest's finalize callback when the
+// wrapped object is collected (napi_wrap's finalizer goes through the deferred
+// RefBase drain, so the guest can be re-entered safely).
+extern "C" int snapi_bridge_wrap_finalized(SnapiEnvState* env_state, uint32_t obj_id,
+                                           uint64_t native_data, uint32_t guest_env,
+                                           uint32_t wasm_fn_ptr, uint32_t finalize_data,
+                                           uint32_t finalize_hint, uint32_t* ref_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_value obj = LoadValue(*bridge_state, obj_id);
+  if (!obj) return napi_invalid_arg;
+  auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
+                                          finalize_data, finalize_hint);
+  if (record == nullptr) return napi_generic_failure;
+  napi_ref ref = nullptr;
+  napi_status s = napi_wrap(env, obj, (void*)(uintptr_t)native_data,
+                            GuestFinalizerTrampoline, record,
+                            ref_out ? &ref : nullptr);
+  if (s != napi_ok) {
+    delete record;
+    return s;
+  }
+  if (ref_out) *ref_out = StoreRef(*bridge_state, ref);
+  return napi_ok;
+}
+
 extern "C" int snapi_bridge_unwrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t* data_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -2191,6 +2363,32 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState* env_state, uint32_t obj
   napi_status s = napi_add_finalizer(env, obj, (void*)(uintptr_t)data_val,
                                      nullptr, nullptr, ref_out ? &ref : nullptr);
   if (s != napi_ok) return s;
+  if (ref_out) *ref_out = StoreRef(*bridge_state, ref);
+  return napi_ok;
+}
+
+// Like snapi_bridge_add_finalizer, but runs the guest's finalize callback when
+// the object is collected (goes through the deferred RefBase drain).
+extern "C" int snapi_bridge_add_finalizer_cb(SnapiEnvState* env_state, uint32_t obj_id,
+                                             uint64_t data_val, uint32_t guest_env,
+                                             uint32_t wasm_fn_ptr, uint32_t finalize_data,
+                                             uint32_t finalize_hint, uint32_t* ref_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_value obj = LoadValue(*bridge_state, obj_id);
+  if (!obj) return napi_invalid_arg;
+  auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
+                                          finalize_data, finalize_hint);
+  if (record == nullptr) return napi_generic_failure;
+  napi_ref ref = nullptr;
+  napi_status s = napi_add_finalizer(env, obj, (void*)(uintptr_t)data_val,
+                                     GuestFinalizerTrampoline, record,
+                                     ref_out ? &ref : nullptr);
+  if (s != napi_ok) {
+    delete record;
+    return s;
+  }
   if (ref_out) *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
 }
