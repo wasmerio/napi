@@ -4,6 +4,8 @@ mod ctx;
 mod env;
 mod guest;
 mod snapi;
+#[cfg(feature = "wasix")]
+mod wasix;
 use std::fmt::Display;
 
 pub const NAPI_MODULE_NAME: &str = "napi";

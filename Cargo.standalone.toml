@@ -7,12 +7,15 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
+wasix = ["dep:wasmer-wasix"]
 cli = [
-  "dep:wasmer-wasix",
+  "wasix",
   "dep:wasmer-cache",
   "dep:wasmer-compiler-llvm",
   "dep:wasmer-c-api-imports",
   "wasmer-c-api-imports/llvm",
+  "wasmer-c-api-imports/wasix",
   "dep:tokio",
   "dep:virtual-fs",
   "dep:wasmer-types",
