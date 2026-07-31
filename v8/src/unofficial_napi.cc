@@ -2142,6 +2142,32 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
   return napi_ok;
 }
 
+// V8 posts some of its own deferred foreground work (most notably
+// Heap::PostFinalizationRegistryCleanupTaskIfNeeded's cleanup task, run after
+// GC finds a JSFinalizationRegistry with dead targets) via
+// v8::TaskRunner::PostNonNestableTask on the runner EdgeV8Platform hands back
+// for the isolate. That runner forwards to the guest's own enqueue callback
+// when one is bound (see EdgeV8Platform::BindForegroundTaskTarget), but the
+// guest is not required to bind one -- it may drive everything through
+// unofficial_napi_process_microtasks instead. Tasks posted with no guest
+// target bound fall back to the stock default-platform runner, and nothing
+// else ever pumps that runner's queue, so without this they are posted and
+// then never run: V8 correctly collects the dead targets, but their
+// FinalizationRegistry callbacks never fire. Pump it here, at the same point
+// microtasks are already checkpointed, so this deferred work always gets a
+// chance to run regardless of whether the guest wired up its own hook.
+void PumpPlatformForegroundTasks(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return;
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  if (platform != nullptr) {
+    platform->PumpPendingForegroundTasks(env->isolate);
+  }
+}
+
 void DrainMicrotasksForEnv(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   env->DrainFinalizerQueue();
@@ -2151,11 +2177,13 @@ void DrainMicrotasksForEnv(napi_env env) {
     if (queue != nullptr) {
       queue->PerformCheckpoint(env->isolate);
       env->DrainFinalizerQueue();
+      PumpPlatformForegroundTasks(env);
       return;
     }
   }
   env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
+  PumpPlatformForegroundTasks(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {

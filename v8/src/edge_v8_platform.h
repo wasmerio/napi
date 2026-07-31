@@ -33,6 +33,7 @@ class EdgeV8Platform final : public v8::Platform {
   void ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env env);
   void AddPendingForegroundTask(const std::shared_ptr<IsolateState>& state);
   void CompletePendingForegroundTask(const std::shared_ptr<IsolateState>& state);
+  void PumpPendingForegroundTasks(v8::Isolate* isolate);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
