@@ -96,14 +96,6 @@ unsafe extern "C" {
         env: SnapiEnv,
         data: *const c_void,
     ) -> i32;
-    /// Install a host budget hook on this env's array-buffer allocator so
-    /// external (ArrayBuffer/Buffer) memory is charged against the budget.
-    /// `data` is an `*const crate::budget::EnvExternalCharge`, owned by the
-    /// allocator thereafter (released from its destructor).
-    pub fn snapi_bridge_unofficial_set_host_allocation_budget_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
     /// Cap the number of live per-value host handles (and callback
     /// registrations) this env may hold, bounding host-side bookkeeping RSS.
     /// `limit == 0` means unlimited.

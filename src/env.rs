@@ -6,12 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wasmer::{Memory, Table};
 
 use crate::budget::{
-    EnvExternalCharge, EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap,
-    ResourceBudget,
+    EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
-    snapi_bridge_unofficial_set_host_allocation_budget_callback,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
     snapi_bridge_unofficial_set_value_limit,
 };
@@ -36,9 +34,9 @@ pub(crate) struct NapiEnv {
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
     /// External memory the guest has declared via `napi_adjust_external_memory`,
-    /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can only
-    /// release what this env declared — never the allocator's charges or more
-    /// than it added — and so teardown releases the remainder.
+    /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can
+    /// only release what this env actually declared, never more, and so
+    /// teardown releases the remainder.
     external_declared: u64,
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
@@ -117,25 +115,6 @@ impl NapiEnv {
                     env,
                     boxed as *const c_void,
                 );
-            }
-
-            // Install the enforcing array-buffer allocator hook. Ownership of
-            // this box transfers to the allocator, which releases it from its
-            // destructor at env teardown; reclaim it only if registration fails.
-            let external = Box::into_raw(Box::new(EnvExternalCharge {
-                budget: Arc::clone(&self.budget),
-            }));
-            // SAFETY: `external` is a fresh box handed to the allocator.
-            let status = unsafe {
-                snapi_bridge_unofficial_set_host_allocation_budget_callback(
-                    env,
-                    external as *const c_void,
-                )
-            };
-            if status != 0 {
-                // SAFETY: registration failed, so the allocator did not take
-                // ownership; reclaim the box we just leaked.
-                drop(unsafe { Box::from_raw(external) });
             }
 
             // Cap per-value host handles / callback registrations so the C++

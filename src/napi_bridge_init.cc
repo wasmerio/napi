@@ -2912,16 +2912,6 @@ extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
       env_state->env, HostNearHeapLimitTrampoline, const_cast<void*>(data));
 }
 
-extern "C" int snapi_bridge_unofficial_set_host_allocation_budget_callback(
-    SnapiEnvState* env_state, const void* data) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (env_state == nullptr || env_state->env == nullptr) {
-    return napi_invalid_arg;
-  }
-  return unofficial_napi_set_allocation_budget_hook(env_state->env,
-                                                    const_cast<void*>(data));
-}
-
 // Debug/diagnostics: live count of slot-table entries (leak assertions).
 extern "C" uint64_t snapi_bridge_unofficial_get_live_value_count(SnapiEnvState* env_state) {
   auto* bridge_state = LookupEnvState(env_state);
