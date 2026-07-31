@@ -363,14 +363,26 @@ impl NapiSession {
         }
 
         // Stand up the host-side guest-memory allocator now that the memory is
-        // final. All bridge allocations of guest memory go through it; the
-        // guest's own malloc is never called from the host.
-        let memory = func_env.as_ref(&*store).memory.clone();
-        if let Some(memory) = memory {
-            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget);
-            func_env.as_mut(&mut *store).guest_heap = heap;
-        }
+        // final. All bridge allocations of guest memory go through it, AND it
+        // is the only backing store for V8 ArrayBuffers/Buffers/TypedArrays
+        // (see TrackingArrayBufferAllocator in unofficial_napi.cc) — the
+        // guest's own malloc is never called from the host, and host-heap
+        // allocation is never used for guest-visible V8 memory. A module that
+        // requests N-API imports without usable linear memory, or whose
+        // memory can't support a GuestHeap, cannot run under this bridge: we
+        // fail instantiation here rather than let allocation silently fall
+        // back to unbudgeted, non-guest-shared host memory later.
+        let memory = func_env
+            .as_ref(&*store)
+            .memory
+            .clone()
+            .context("N-API imports require the guest to have linear memory")?;
+        let budget = Arc::clone(&func_env.as_ref(&*store).budget);
+        let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget)
+            .context(
+                "failed to initialize the guest-heap allocator over the guest's linear memory",
+            )?;
+        func_env.as_mut(&mut *store).guest_heap = Some(heap);
 
         if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
             func_env.as_mut(&mut *store).table = Some(table.clone());
@@ -436,7 +448,7 @@ mod tests {
             &store_a,
             r#"(module
                 (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
-                (memory (export "memory") 1)
+                (import "env" "memory" (memory 1))
                 (func (export "malloc") (param i32) (result i32) i32.const 8)
             )"#,
         );

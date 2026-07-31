@@ -45,9 +45,11 @@ pub(crate) struct NapiEnv {
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
-    /// Host-side allocator over the guest's linear memory; `None` until the
-    /// instance is configured (or when the memory cannot support it, in which
-    /// case guest allocation is unavailable).
+    /// Host-side allocator over the guest's linear memory. `None` only before
+    /// `NapiSession::configure_instance` runs; that call fails instantiation
+    /// outright if a `GuestHeap` can't be built, so any env reachable from
+    /// guest code is guaranteed to have one — it is the only allocation path
+    /// for guest-visible V8 memory, never a best-effort fallback.
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     pub(crate) table: Option<Table>,
     pub(crate) default_napi_env_id: Option<u32>,
