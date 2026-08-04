@@ -63,13 +63,20 @@ fn call_guest_callback(
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    let Some(elem) = table.get(env, wasm_fn_ptr) else {
-        return 0;
-    };
-    let func = match elem {
-        Value::FuncRef(Some(func)) => func,
-        Value::FuncRef(None) => return 0,
-        _ => return 0,
+    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
+        Some(func) => func,
+        None => {
+            let Some(elem) = table.get(env, wasm_fn_ptr) else {
+                return 0;
+            };
+            let func = match elem {
+                Value::FuncRef(Some(func)) => func,
+                Value::FuncRef(None) => return 0,
+                _ => return 0,
+            };
+            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
+            func
+        }
     };
     match func.call(
         env,
@@ -101,13 +108,20 @@ fn call_guest_callback2(
     arg0: u32,
     arg1: u32,
 ) -> u32 {
-    let Some(elem) = table.get(env, wasm_fn_ptr) else {
-        return 0;
-    };
-    let func = match elem {
-        Value::FuncRef(Some(func)) => func,
-        Value::FuncRef(None) => return 0,
-        _ => return 0,
+    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
+        Some(func) => func,
+        None => {
+            let Some(elem) = table.get(env, wasm_fn_ptr) else {
+                return 0;
+            };
+            let func = match elem {
+                Value::FuncRef(Some(func)) => func,
+                Value::FuncRef(None) => return 0,
+                _ => return 0,
+            };
+            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
+            func
+        }
     };
     match func.call(
         env,

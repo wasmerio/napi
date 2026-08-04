@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use wasmer::{Memory, Table};
+use wasmer::{Function, Memory, Table};
 
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
@@ -50,6 +50,15 @@ pub(crate) struct NapiEnv {
     /// for guest-visible V8 memory, never a best-effort fallback.
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     pub(crate) table: Option<Table>,
+    /// Cache of resolved guest callback functions, keyed by their
+    /// `__indirect_function_table` index. `Function::from_vm_funcref` (invoked
+    /// by `Table::get`) unconditionally appends a new entry to the store's
+    /// function arena on every call with no dedup, so re-resolving the same
+    /// `wasm_fn_ptr` on every guest→host→guest callback invocation leaks
+    /// memory unboundedly. `Function` clones are cheap (a store handle), so
+    /// caching by table index and cloning on repeat hits avoids the
+    /// unconditional store growth. See `guest::callback::call_guest_callback`.
+    pub(crate) func_cache: HashMap<u32, Function>,
     pub(crate) default_napi_env_id: Option<u32>,
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
@@ -69,6 +78,7 @@ impl NapiEnv {
             memory: None,
             guest_heap: None,
             table: None,
+            func_cache: HashMap::new(),
             default_napi_env_id: None,
             next_napi_env_id: 0,
             next_napi_scope_id: 0,
