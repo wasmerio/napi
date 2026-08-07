@@ -494,6 +494,24 @@ extern "C" __attribute__((weak)) void napi_host_external_uncharge(
 extern "C" __attribute__((weak)) void napi_host_external_release(
     void* /*data*/, size_t /*remaining_bytes*/) {}
 
+// Rust-exported guest-heap hooks (see guest_heap.rs). When a guest-heap
+// context is installed, every V8 backing store is allocated inside the guest's
+// linear memory so guest and host share buffer bytes directly. `free` returns
+// nonzero when it owned (and handled) the pointer; zero means the allocation
+// predates the context (mixed provenance) and must go to the legacy backing
+// allocator. Weak fallbacks keep embedders without the Rust host (e.g. the
+// native edgejs build) linking; no context is ever installed there.
+extern "C" __attribute__((weak)) void* napi_host_guest_heap_alloc(
+    const void* /*ctx*/, size_t /*length*/, int /*zero*/) {
+  return nullptr;
+}
+extern "C" __attribute__((weak)) int napi_host_guest_heap_free(
+    const void* /*ctx*/, void* /*data*/, size_t /*length*/) {
+  return 0;
+}
+extern "C" __attribute__((weak)) void napi_host_guest_heap_release(
+    void* /*ctx*/) {}
+
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
   TrackingArrayBufferAllocator()
@@ -507,6 +525,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       napi_host_external_release(
           hook, total_mem_usage_.load(std::memory_order_relaxed));
     }
+    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
+    if (gctx != nullptr) {
+      napi_host_guest_heap_release(gctx);
+    }
     delete backing_;
   }
 
@@ -517,6 +539,14 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   }
 
   void Free(void* data, size_t length) override {
+    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
+    if (gctx != nullptr && data != nullptr &&
+        napi_host_guest_heap_free(gctx, data, length) != 0) {
+      // Guest-heap provenance: no external-budget uncharge (those bytes were
+      // never charged; they are wasm linear memory).
+      total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
+      return;
+    }
     if (data != nullptr) {
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
       void* hook = budget_hook_.load(std::memory_order_acquire);
@@ -530,8 +560,15 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   }
 
   size_t MaxAllocationSize() const override {
-    return backing_ != nullptr ? backing_->MaxAllocationSize()
-                               : v8::ArrayBuffer::Allocator::MaxAllocationSize();
+    size_t backing_max = backing_ != nullptr
+                             ? backing_->MaxAllocationSize()
+                             : v8::ArrayBuffer::Allocator::MaxAllocationSize();
+    if (guest_heap_ctx_.load(std::memory_order_acquire) != nullptr) {
+      // Guest-heap backing stores live in a 32-bit address space.
+      constexpr size_t kGuestHeapMax = 0x7fff0000u;
+      return backing_max < kGuestHeapMax ? backing_max : kGuestHeapMax;
+    }
+    return backing_max;
   }
 
   v8::PageAllocator* GetPageAllocator() override {
@@ -548,8 +585,27 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     budget_hook_.store(hook, std::memory_order_release);
   }
 
+  // Install the guest-heap context: from now on every backing store is
+  // allocated inside the guest's linear memory. Ownership transfers to the
+  // allocator, which releases it in its destructor.
+  void set_guest_heap_ctx(void* ctx) {
+    guest_heap_ctx_.store(ctx, std::memory_order_release);
+  }
+
  private:
   void* AllocateImpl(size_t length, bool zeroed) {
+    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
+    if (gctx != nullptr) {
+      // Guest-heap path. The claimed pages are already charged as wasm linear
+      // memory, so the external budget is deliberately not consulted. On
+      // failure return null (V8 throws RangeError); never fall back to host
+      // memory, which the guest could not address.
+      void* data = napi_host_guest_heap_alloc(gctx, length, zeroed ? 1 : 0);
+      if (data != nullptr) {
+        total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
+      }
+      return data;
+    }
     // Charge the budget first; on denial return null so V8 throws RangeError.
     void* hook = budget_hook_.load(std::memory_order_acquire);
     if (hook != nullptr && !napi_host_external_try_charge(hook, length)) {
@@ -572,6 +628,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
   std::atomic<uint64_t> total_mem_usage_ {0};
   std::atomic<void*> budget_hook_ {nullptr};
+  std::atomic<void*> guest_heap_ctx_ {nullptr};
 };
 
 void ApplyNodeIsolateCreateParams(v8::Isolate::CreateParams* params) {
@@ -1930,16 +1987,34 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     void** scope_out) {
-  if (env_out == nullptr || scope_out == nullptr) return napi_invalid_arg;
+  // This function owns options->guest_heap_ctx from here on: it must be
+  // released exactly once, either by the allocator's destructor or on a
+  // failure before the allocator takes it.
+  void* guest_heap_ctx =
+      options != nullptr ? options->guest_heap_ctx : nullptr;
+  if (env_out == nullptr || scope_out == nullptr) {
+    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    return napi_invalid_arg;
+  }
 
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
-  if (status != napi_ok || platform == nullptr) return status != napi_ok ? status : napi_generic_failure;
+  if (status != napi_ok || platform == nullptr) {
+    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    return status != napi_ok ? status : napi_generic_failure;
+  }
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
+    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
     ReleaseRuntime();
     return napi_generic_failure;
+  }
+  if (guest_heap_ctx != nullptr) {
+    // Armed before the isolate exists, so even bootstrap-time backing stores
+    // are guest-memory-backed. The allocator's destructor releases the ctx on
+    // every later failure path.
+    allocator->set_guest_heap_ctx(guest_heap_ctx);
   }
 
   v8::Isolate::CreateParams params{};

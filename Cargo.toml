@@ -41,6 +41,7 @@ wasmer-wasix = { version = "=0.702.1", path = "../wasix", optional = true }
 virtual-fs = { version = "=0.702.1", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
+offset-allocator = "0.2.0"
 
 [build-dependencies]
 cc = "1"

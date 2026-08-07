@@ -4,6 +4,7 @@ pub mod cli;
 mod ctx;
 mod env;
 mod guest;
+mod guest_heap;
 mod snapi;
 #[cfg(feature = "wasix")]
 mod wasix;
@@ -21,7 +22,7 @@ pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeHooks, NapiSession,
 };
 use enum_iterator::Sequence;
-pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
+pub(crate) use env::NapiEnv;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum NapiVersion {

@@ -319,142 +319,6 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   return 0;
 }
 
-bool GetValueByteSpan(napi_env env, napi_value value, uint8_t** data_out, size_t* length_out) {
-  if (env == nullptr || value == nullptr || data_out == nullptr || length_out == nullptr) {
-    return false;
-  }
-
-  *data_out = nullptr;
-  *length_out = 0;
-
-  bool is_buffer = false;
-  if (napi_is_buffer(env, value, &is_buffer) != napi_ok) {
-    return false;
-  }
-  if (is_buffer) {
-    void* data = nullptr;
-    size_t length = 0;
-    if (napi_get_buffer_info(env, value, &data, &length) != napi_ok) {
-      return false;
-    }
-    if (length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = length;
-    return true;
-  }
-
-  bool is_arraybuffer = false;
-  if (napi_is_arraybuffer(env, value, &is_arraybuffer) != napi_ok) {
-    return false;
-  }
-  if (is_arraybuffer) {
-    void* data = nullptr;
-    size_t length = 0;
-    if (napi_get_arraybuffer_info(env, value, &data, &length) != napi_ok) {
-      return false;
-    }
-    if (length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = length;
-    return true;
-  }
-
-  bool is_typedarray = false;
-  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok) {
-    return false;
-  }
-  if (is_typedarray) {
-    napi_typedarray_type type;
-    size_t length = 0;
-    void* data = nullptr;
-    if (napi_get_typedarray_info(env, value, &type, &length, &data, nullptr, nullptr) != napi_ok) {
-      return false;
-    }
-
-    size_t elem_size = TypedArrayElementSize(type);
-    if (elem_size == 0 ||
-        length > (std::numeric_limits<size_t>::max)() / elem_size) {
-      return false;
-    }
-
-    size_t byte_length = length * elem_size;
-    if (byte_length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = byte_length;
-    return true;
-  }
-
-  bool is_dataview = false;
-  if (napi_is_dataview(env, value, &is_dataview) != napi_ok) {
-    return false;
-  }
-  if (is_dataview) {
-    size_t byte_length = 0;
-    void* data = nullptr;
-    if (napi_get_dataview_info(env, value, &byte_length, &data, nullptr, nullptr) != napi_ok) {
-      return false;
-    }
-    if (byte_length > 0 && data == nullptr) {
-      return false;
-    }
-    *data_out = static_cast<uint8_t*>(data);
-    *length_out = byte_length;
-    return true;
-  }
-
-  return false;
-}
-
-bool SnapshotValueBytes(napi_env env, napi_value value, void** data_out, size_t* length_out) {
-  if (env == nullptr || value == nullptr || data_out == nullptr || length_out == nullptr) {
-    return false;
-  }
-
-  uint8_t* data = nullptr;
-  size_t byte_length = 0;
-  if (!GetValueByteSpan(env, value, &data, &byte_length)) {
-    return false;
-  }
-
-  void* copy = nullptr;
-  if (byte_length > 0) {
-    copy = std::malloc(byte_length);
-    if (copy == nullptr) return false;
-    std::memcpy(copy, data, byte_length);
-  }
-
-  *data_out = copy;
-  *length_out = byte_length;
-  return true;
-}
-
-bool OverwriteValueBytes(napi_env env, napi_value value, const uint8_t* data, size_t byte_length) {
-  if (env == nullptr || value == nullptr) return false;
-
-  uint8_t* target = nullptr;
-  size_t target_length = 0;
-  if (!GetValueByteSpan(env, value, &target, &target_length)) {
-    return false;
-  }
-
-  if (byte_length > target_length) {
-    return false;
-  }
-  if (byte_length > 0) {
-    if (data == nullptr || target == nullptr) {
-      return false;
-    }
-    std::memcpy(target, data, byte_length);
-  }
-  return true;
-}
-
 uint32_t StoreRef(SnapiEnvState& state, napi_ref ref) {
   if (ref == nullptr) return 0;
   uint32_t id = state.next_ref_id++;
@@ -1528,6 +1392,63 @@ extern "C" int snapi_bridge_create_arraybuffer(SnapiEnvState* env_state, uint32_
   return napi_ok;
 }
 
+// Rust-exported finalizer for guest-heap-backed buffers: frees the allocation
+// back to the guest heap and drops the boxed hint. Weak no-op fallback keeps
+// embedders without the Rust host linking (they never create finalized
+// externals).
+extern "C" __attribute__((weak)) void napi_host_guest_heap_buffer_finalize(
+    void* /*data*/, void* /*hint*/) {}
+
+namespace {
+void GuestHeapBufferFinalizeTrampoline(node_api_basic_env /*env*/, void* data,
+                                       void* hint) {
+  napi_host_guest_heap_buffer_finalize(data, hint);
+}
+}  // namespace
+
+// Like snapi_bridge_create_external_arraybuffer, but the buffer's lifetime is
+// tied to the JS value: when V8 collects it, `finalize_hint` is handed to the
+// Rust guest-heap finalizer, which frees the guest allocation. Ownership of
+// `finalize_hint` transfers only on success.
+extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
+    SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
+    void* finalize_hint, uint64_t* backing_store_token_out, uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  void* data = (void*)(uintptr_t)data_addr;
+  napi_value result;
+  napi_status s = napi_create_external_arraybuffer(
+      env, data, (size_t)byte_length, GuestHeapBufferFinalizeTrampoline,
+      finalize_hint, &result);
+  if (s != napi_ok) return s;
+  if (backing_store_token_out) {
+    *backing_store_token_out = napi_v8_get_arraybuffer_backing_store_token(env, result);
+  }
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
+// Buffer twin of snapi_bridge_create_external_arraybuffer_finalized.
+extern "C" int snapi_bridge_create_external_buffer_finalized(
+    SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
+    void* finalize_hint, uint64_t* backing_store_token_out, uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  void* data = (void*)(uintptr_t)data_addr;
+  napi_value result;
+  napi_status s = napi_create_external_buffer(
+      env, (size_t)byte_length, data, GuestHeapBufferFinalizeTrampoline,
+      finalize_hint, &result);
+  if (s != napi_ok) return s;
+  if (backing_store_token_out) {
+    *backing_store_token_out = napi_v8_get_arraybuffer_view_backing_store_token(env, result);
+  }
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
 extern "C" int snapi_bridge_create_external_arraybuffer(SnapiEnvState* env_state, uint64_t data_addr,
                                                         uint32_t byte_length,
                                                         uint64_t* backing_store_token_out,
@@ -1750,40 +1671,19 @@ extern "C" int snapi_bridge_get_dataview_info(SnapiEnvState* env_state, uint32_t
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_snapshot_value_bytes(SnapiEnvState* env_state, uint32_t id,
-                                                 uint64_t* data_out,
-                                                 uint32_t* byte_length_out) {
+// Attach the guest-heap finalizer to an arbitrary value: `finalize_hint` is
+// handed to the Rust guest-heap finalizer when V8 collects the value. Used to
+// tie the lifetime of a snapshot copy (foreign backing stores) to its value.
+extern "C" int snapi_bridge_attach_guest_heap_finalizer(SnapiEnvState* env_state,
+                                                        uint32_t id,
+                                                        void* finalize_hint) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_value val = LoadValue(*bridge_state, id);
-  if (!val || data_out == nullptr || byte_length_out == nullptr) return napi_invalid_arg;
-
-  void* snapshot = nullptr;
-  size_t byte_length = 0;
-  if (!SnapshotValueBytes(bridge_state->env, val, &snapshot, &byte_length)) {
-    return napi_invalid_arg;
-  }
-
-  *data_out = (uint64_t)(uintptr_t)snapshot;
-  *byte_length_out = (uint32_t)byte_length;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_overwrite_value_bytes(SnapiEnvState* env_state, uint32_t id,
-                                                  const void* data,
-                                                  uint32_t byte_length) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr || (data == nullptr && byte_length != 0)) return napi_invalid_arg;
-  napi_value val = LoadValue(*bridge_state, id);
   if (!val) return napi_invalid_arg;
-
-  return OverwriteValueBytes(
-             bridge_state->env,
-             val,
-             static_cast<const uint8_t*>(data),
-             static_cast<size_t>(byte_length))
-             ? napi_ok
-             : napi_invalid_arg;
+  return napi_add_finalizer(bridge_state->env, val, nullptr,
+                            GuestHeapBufferFinalizeTrampoline, finalize_hint,
+                            nullptr);
 }
 
 // ============================================================
@@ -2715,11 +2615,20 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
 }
 
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
+                                                  const void* guest_heap_ctx,
                                                   SnapiEnvState** env_out) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_env env = nullptr;
   void* scope = nullptr;
-  napi_status s = unofficial_napi_create_env(module_api_version, &env, &scope);
+  napi_status s;
+  if (guest_heap_ctx != nullptr) {
+    unofficial_napi_env_create_options options{};
+    options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
+    s = unofficial_napi_create_env_with_options(module_api_version, &options,
+                                                &env, &scope);
+  } else {
+    s = unofficial_napi_create_env(module_api_version, &env, &scope);
+  }
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();
@@ -2741,13 +2650,15 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t max_old_generation_size_in_bytes,
     uint32_t code_range_size_in_bytes,
     uint32_t /*stack_limit*/,
+    const void* guest_heap_ctx,
     SnapiEnvState** env_out) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_env_create_options options{};
-  const bool has_constraints =
+  const bool has_options =
       max_young_generation_size_in_bytes > 0 ||
       max_old_generation_size_in_bytes > 0 ||
-      code_range_size_in_bytes > 0;
+      code_range_size_in_bytes > 0 ||
+      guest_heap_ctx != nullptr;
   options.max_young_generation_size_in_bytes =
       max_young_generation_size_in_bytes;
   options.max_old_generation_size_in_bytes =
@@ -2756,11 +2667,12 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   // The guest-provided stack limit is a Wasm linear-memory address, not a
   // native stack address for the host thread running V8.
   options.stack_limit = nullptr;
+  options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
 
   napi_env env = nullptr;
   void* scope = nullptr;
   napi_status s = unofficial_napi_create_env_with_options(
-      module_api_version, has_constraints ? &options : nullptr, &env, &scope);
+      module_api_version, has_options ? &options : nullptr, &env, &scope);
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();

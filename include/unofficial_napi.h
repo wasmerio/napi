@@ -17,6 +17,12 @@ typedef struct {
   size_t max_old_generation_size_in_bytes;
   size_t code_range_size_in_bytes;
   void* stack_limit;
+  /* Opaque guest-heap context (see napi_host_guest_heap_alloc). When set, the
+   * env's array-buffer allocator places every backing store in the guest's
+   * linear memory from isolate birth. Ownership transfers to the env: it is
+   * released exactly once via napi_host_guest_heap_release (by the allocator
+   * destructor, or on env-creation failure). */
+  void* guest_heap_ctx;
 } unofficial_napi_env_create_options;
 
 typedef struct {
