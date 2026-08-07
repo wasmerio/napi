@@ -9,9 +9,9 @@ use std::ffi::{CString, c_void};
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 
 use crate::{
-    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv,
+    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
-        MAX_GUEST_CSTRING_SCAN,
+        MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{flush_host_buffer_copies_since, with_callback_state},
     },
     snapi::*,
@@ -26,13 +26,31 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return env_id as i32;
     }
 
+    let Ok(reservation) = env.data().reserve_isolate(RequestedHeap::default()) else {
+        return 0;
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe { snapi_bridge_unofficial_create_env(8, &mut snapi_env_state) };
+    let status = if reservation.clamped {
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_options(
+                8,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                0,
+                &mut snapi_env_state,
+            )
+        }
+    } else {
+        unsafe { snapi_bridge_unofficial_create_env(8, &mut snapi_env_state) }
+    };
     if status != 0 || snapi_env_state.is_null() {
+        env.data().abort_isolate(&reservation);
         return 0;
     }
 
-    let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -243,13 +261,31 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    let reservation = match env.data().reserve_isolate(RequestedHeap::default()) {
+        Ok(reservation) => reservation,
+        Err(_) => return 1,
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status =
-        unsafe { snapi_bridge_unofficial_create_env(module_api_version, &mut snapi_env_state) };
+    let status = if reservation.clamped {
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_options(
+                module_api_version,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                0,
+                &mut snapi_env_state,
+            )
+        }
+    } else {
+        unsafe { snapi_bridge_unofficial_create_env(module_api_version, &mut snapi_env_state) }
+    };
     if status != 0 {
+        env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     if env_out_ptr > 0 {
         write_guest_u32(&mut env, env_out_ptr as u32, env_id);
     }
@@ -285,21 +321,32 @@ fn guest_unofficial_napi_create_env_with_options(
         (0, 0, 0, 0)
     };
 
+    let requested = RequestedHeap {
+        max_young: max_young_generation_size_in_bytes,
+        max_old: max_old_generation_size_in_bytes,
+        code_range: code_range_size_in_bytes,
+    };
+    let reservation = match env.data().reserve_isolate(requested) {
+        Ok(reservation) => reservation,
+        Err(_) => return 1,
+    };
+
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
             module_api_version,
-            max_young_generation_size_in_bytes,
-            max_old_generation_size_in_bytes,
-            code_range_size_in_bytes,
+            reservation.max_young,
+            reservation.max_old,
+            reservation.code_range,
             stack_limit,
             &mut snapi_env_state,
         )
     };
     if status != 0 {
+        env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     if env_out_ptr > 0 {
         write_guest_u32(&mut env, env_out_ptr as u32, env_id);
     }
@@ -2532,6 +2579,12 @@ fn guest_napi_get_value_string_utf8(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    // The guest's output buffer lives in its own memory, so a claimed size
+    // larger than the whole linear memory is bogus; reject before allocating
+    // the host scratch mirror.
+    if hbs as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -2570,6 +2623,9 @@ fn guest_napi_get_value_string_latin1(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    if hbs as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -3896,6 +3952,11 @@ fn guest_napi_get_cb_info(
         0
     };
 
+    // Reject an absurd requested argc before allocating the argv scratch array.
+    if wanted as usize > MAX_NAPI_CALLBACK_ARGS {
+        return 1;
+    }
+
     // Query the bridge for callback context
     let mut actual_argc: u32 = wanted;
     let mut argv_ids = vec![0u32; wanted as usize];
@@ -4459,6 +4520,14 @@ fn guest_napi_get_value_string_utf16(
     rp: i32,
 ) -> i32 {
     let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    // Each unit is 2 bytes; reject a claimed size that overflows or cannot fit
+    // in the guest's own memory before allocating the host scratch mirror.
+    let Some(byte_len) = hbs.checked_mul(2) else {
+        return 1;
+    };
+    if byte_len as u64 > guest_data_size(&mut env) {
+        return 1;
+    }
     let mut hb = vec![0u16; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
@@ -4551,6 +4620,11 @@ fn guest_napi_get_value_bigint_words(
         return s;
     }
 
+    // Reject an absurd word count before allocating the words scratch buffer.
+    if word_count > MAX_NAPI_BIGINT_WORDS {
+        return 1;
+    }
+
     let mut sign: i32 = 0;
     let mut words = vec![0u64; word_count];
     let s = unsafe {
@@ -4602,12 +4676,27 @@ fn guest_napi_adjust_external_memory(
     change: i64,
     rp: i32,
 ) -> i32 {
+    // Charge a positive delta up front so an over-budget declaration fails
+    // before V8 is told about the memory.
+    if change > 0 && !env.data_mut().charge_declared_external(change as u64) {
+        return 1;
+    }
+
     let mut adjusted: i64 = 0;
     let s =
         unsafe { snapi_bridge_adjust_external_memory(snapi_env(&env, e), change, &mut adjusted) };
-    if s == 0 {
-        write_guest_i64(&mut env, rp as u32, adjusted);
+    if s != 0 {
+        if change > 0 {
+            env.data_mut().uncharge_declared_external(change as u64);
+        }
+        return s;
     }
+
+    if change < 0 {
+        env.data_mut()
+            .uncharge_declared_external(change.unsigned_abs());
+    }
+    write_guest_i64(&mut env, rp as u32, adjusted);
     s
 }
 

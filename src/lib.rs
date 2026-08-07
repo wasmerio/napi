@@ -1,3 +1,4 @@
+pub mod budget;
 #[cfg(feature = "cli")]
 pub mod cli;
 mod ctx;
@@ -12,6 +13,10 @@ pub const NAPI_MODULE_NAME: &str = "napi";
 pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
 pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 
+pub use budget::{
+    BudgetedMemory, BudgetedTunables, EnvRejected, HeapReservation, OverBudget, Pool,
+    RequestedHeap, ResourceBudget, ResourceUsage, budgeted_tunables,
+};
 pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeHooks, NapiSession,
 };

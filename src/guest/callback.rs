@@ -203,5 +203,17 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     let Some(table) = env.data().table.clone() else {
         return 0;
     };
-    call_guest_callback(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg)
+
+    // Bound guest↔host callback reentrancy so a runaway recursion cannot
+    // overflow the host native stack (an uncatchable SIGSEGV that would take
+    // down every co-tenant). Refuse the callback past the limit rather than
+    // crash. The increment below always pairs with the decrement, since
+    // `call_guest_callback` returns normally on both success and trap.
+    if !env.data_mut().enter_callback() {
+        eprintln!("[callback trampoline] reentrancy depth limit exceeded");
+        return 0;
+    }
+    let result = call_guest_callback(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg);
+    env.data_mut().leave_callback();
+    result
 }

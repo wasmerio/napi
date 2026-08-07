@@ -1,8 +1,29 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wasmer::{Memory, Table, TypedFunction};
 
-use crate::snapi::{SnapiEnv, snapi_bridge_unofficial_release_env};
+use crate::budget::{
+    EnvExternalCharge, EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap,
+    ResourceBudget,
+};
+use crate::snapi::{
+    SnapiEnv, snapi_bridge_unofficial_release_env,
+    snapi_bridge_unofficial_set_host_allocation_budget_callback,
+    snapi_bridge_unofficial_set_host_near_heap_limit_callback,
+    snapi_bridge_unofficial_set_value_limit,
+};
+
+/// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
+/// pointer (as `usize`, so [`NapiEnv`] stays `Send`) to the boxed
+/// [`EnvHeapCharge`] the near-heap-limit callback grows. `tracker == 0` means
+/// the env is unbudgeted (unlimited).
+struct EnvHeapChargeHandle {
+    ceiling: u64,
+    tracker: usize,
+}
 
 pub(crate) struct HostBufferCopy {
     pub(crate) handle_id: u32,
@@ -17,8 +38,25 @@ pub(crate) struct GuestBackingStoreMapping {
     pub(crate) byte_len: usize,
 }
 
-#[derive(Default)]
 pub(crate) struct NapiEnv {
+    /// The app's shared accountant. V8 env (isolate) heap ceilings and the
+    /// `max_envs` isolate count are charged against it; workers share the same
+    /// `Arc` so the app-wide budget stays honest across stores.
+    pub(crate) budget: Arc<ResourceBudget>,
+    /// Per-app cap on live V8 isolates (`None` = unlimited).
+    pub(crate) max_envs: Option<usize>,
+    /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
+    /// exactly what creation charged plus what the callback later granted.
+    env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
+    /// External memory the guest has declared via `napi_adjust_external_memory`,
+    /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can only
+    /// release what this env declared — never the allocator's charges or more
+    /// than it added — and so teardown releases the remainder.
+    external_declared: u64,
+    /// Depth of nested guest↔host callback crossings on this thread, bounded to
+    /// keep guest→host→guest recursion from overflowing the host native stack
+    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
+    callback_depth: u32,
     pub(crate) memory: Option<Memory>,
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -46,6 +84,161 @@ pub(crate) struct NapiEnv {
 }
 
 impl NapiEnv {
+    pub(crate) fn new(budget: Arc<ResourceBudget>, max_envs: Option<usize>) -> Self {
+        Self {
+            budget,
+            max_envs,
+            env_heap_charges: HashMap::new(),
+            external_declared: 0,
+            callback_depth: 0,
+            memory: None,
+            malloc_fn: None,
+            table: None,
+            guest_data_ptrs: HashMap::new(),
+            guest_data_backing_stores: HashMap::new(),
+            host_buffer_copies: Vec::new(),
+            host_buffer_copy_frames: Vec::new(),
+            host_buffer_method_frames: Vec::new(),
+            default_napi_env_id: None,
+            next_napi_env_id: 0,
+            next_napi_scope_id: 0,
+            napi_envs: HashMap::new(),
+            napi_state_to_guest_env: HashMap::new(),
+            napi_scopes: HashMap::new(),
+        }
+    }
+
+    /// Reserve budget for a new V8 env before creating it: acquire an isolate
+    /// slot against `max_envs` and charge its (clamped) heap ceiling. The
+    /// returned constraints must be forwarded to V8. Follow with exactly one of
+    /// [`commit_isolate`] (on success) or [`abort_isolate`] (on failure).
+    ///
+    /// [`commit_isolate`]: NapiEnv::commit_isolate
+    /// [`abort_isolate`]: NapiEnv::abort_isolate
+    pub(crate) fn reserve_isolate(
+        &self,
+        requested: RequestedHeap,
+    ) -> Result<HeapReservation, EnvRejected> {
+        self.budget.try_reserve_env(requested, self.max_envs)
+    }
+
+    /// Register a successfully-created env, attach its heap charge, and — under
+    /// a limited budget — install the host-owned near-heap-limit callback so V8
+    /// heap growth for this isolate is charged against the budget. Teardown
+    /// releases both the initial ceiling and any granted growth.
+    pub(crate) fn commit_isolate(
+        &mut self,
+        env: SnapiEnv,
+        reservation: &HeapReservation,
+    ) -> (u32, u32) {
+        let (env_id, scope_id) = self.register_napi_env(env);
+
+        let tracker = if reservation.clamped {
+            let boxed = Box::into_raw(Box::new(EnvHeapCharge {
+                budget: Arc::clone(&self.budget),
+                granted: AtomicU64::new(0),
+            }));
+            // SAFETY: `env` is the isolate just created; `boxed` outlives the
+            // callback (freed only at this env's teardown, below).
+            unsafe {
+                snapi_bridge_unofficial_set_host_near_heap_limit_callback(
+                    env,
+                    boxed as *const c_void,
+                );
+            }
+
+            // Install the enforcing array-buffer allocator hook. Ownership of
+            // this box transfers to the allocator, which releases it from its
+            // destructor at env teardown; reclaim it only if registration fails.
+            let external = Box::into_raw(Box::new(EnvExternalCharge {
+                budget: Arc::clone(&self.budget),
+            }));
+            // SAFETY: `external` is a fresh box handed to the allocator.
+            let status = unsafe {
+                snapi_bridge_unofficial_set_host_allocation_budget_callback(
+                    env,
+                    external as *const c_void,
+                )
+            };
+            if status != 0 {
+                // SAFETY: registration failed, so the allocator did not take
+                // ownership; reclaim the box we just leaked.
+                drop(unsafe { Box::from_raw(external) });
+            }
+
+            // Cap per-value host handles / callback registrations so the C++
+            // bookkeeping (invisible to the byte pools) cannot grow host RSS
+            // without bound; derived from the budget.
+            if let Some(limit) = self.budget.value_handle_limit() {
+                // SAFETY: `env` is the isolate just created.
+                unsafe {
+                    snapi_bridge_unofficial_set_value_limit(env, limit);
+                }
+            }
+
+            boxed as usize
+        } else {
+            0
+        };
+
+        self.env_heap_charges.insert(
+            env_id,
+            EnvHeapChargeHandle {
+                ceiling: reservation.ceiling_bytes,
+                tracker,
+            },
+        );
+        (env_id, scope_id)
+    }
+
+    /// Release a reservation whose env creation failed after [`reserve_isolate`].
+    ///
+    /// [`reserve_isolate`]: NapiEnv::reserve_isolate
+    pub(crate) fn abort_isolate(&self, reservation: &HeapReservation) {
+        self.budget.release_env(reservation.ceiling_bytes);
+    }
+
+    /// Charge a positive `napi_adjust_external_memory` delta against the budget.
+    /// Returns `false` (guest sees a failure) when it would exceed the budget.
+    pub(crate) fn charge_declared_external(&mut self, bytes: u64) -> bool {
+        if self.budget.try_charge(Pool::V8External, bytes).is_err() {
+            return false;
+        }
+        self.external_declared = self.external_declared.saturating_add(bytes);
+        true
+    }
+
+    /// Release a negative `napi_adjust_external_memory` delta, clamped to what
+    /// this env actually declared so it can never underflow the pool or release
+    /// the allocator's charges.
+    pub(crate) fn uncharge_declared_external(&mut self, bytes: u64) {
+        let release = bytes.min(self.external_declared);
+        self.external_declared -= release;
+        self.budget.uncharge(Pool::V8External, release);
+    }
+
+    /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
+    /// callback must be refused) once [`MAX_CALLBACK_DEPTH`] is reached, so a
+    /// runaway recursion across the FFI boundary cannot overflow the host native
+    /// stack. Pair every `true` with exactly one [`leave_callback`].
+    ///
+    /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
+    /// [`leave_callback`]: NapiEnv::leave_callback
+    pub(crate) fn enter_callback(&mut self) -> bool {
+        if self.callback_depth >= crate::guest::MAX_CALLBACK_DEPTH {
+            return false;
+        }
+        self.callback_depth += 1;
+        true
+    }
+
+    /// Release one level claimed by a `true` [`enter_callback`].
+    ///
+    /// [`enter_callback`]: NapiEnv::enter_callback
+    pub(crate) fn leave_callback(&mut self) {
+        self.callback_depth = self.callback_depth.saturating_sub(1);
+    }
+
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         let env_id = self.next_napi_env_id.max(1);
         self.next_napi_env_id = env_id.saturating_add(1);
@@ -63,6 +256,23 @@ impl NapiEnv {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
+        }
+        // Release the heap ceiling + any callback-granted growth + isolate slot
+        // this env reserved.
+        if let Some(handle) = self.env_heap_charges.remove(&env_id) {
+            let granted = if handle.tracker != 0 {
+                // SAFETY: reclaim the box created in `commit_isolate`. The
+                // near-heap-limit callback holding this pointer only runs during
+                // JS execution, and no JS runs between here and the paired env
+                // release that removes the callback and disposes the isolate, so
+                // freeing it now is safe.
+                let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
+                boxed.granted.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            self.budget.uncharge(Pool::V8HeapReserved, granted);
+            self.budget.release_env(handle.ceiling);
         }
         let env = self.napi_envs.remove(&env_id)?;
         self.napi_state_to_guest_env.remove(&env);
@@ -92,5 +302,82 @@ impl Drop for NapiEnv {
                 }
             }
         }
+        // Release any external memory the guest declared but did not take back.
+        if self.external_declared > 0 {
+            self.budget
+                .uncharge(Pool::V8External, self.external_declared);
+            self.external_declared = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn declared_external_charges_denies_and_clamps() {
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        let mut env = NapiEnv::new(Arc::clone(&budget), None);
+
+        assert!(env.charge_declared_external(6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // Over budget: denied, nothing charged.
+        assert!(!env.charge_declared_external(6 * MIB));
+        assert_eq!(budget.snapshot().v8_external, 6 * MIB);
+
+        // A negative delta larger than declared is clamped to what was declared,
+        // so it can never underflow the pool.
+        env.uncharge_declared_external(100 * MIB);
+        assert_eq!(budget.snapshot().v8_external, 0);
+        assert_eq!(env.external_declared, 0);
+
+        // Further release is a no-op.
+        env.uncharge_declared_external(MIB);
+        assert_eq!(budget.snapshot().v8_external, 0);
+    }
+
+    #[test]
+    fn declared_external_released_on_drop() {
+        let budget = ResourceBudget::with_memory_limit(10 * MIB);
+        {
+            let mut env = NapiEnv::new(Arc::clone(&budget), None);
+            assert!(env.charge_declared_external(4 * MIB));
+            assert_eq!(budget.snapshot().v8_external, 4 * MIB);
+        }
+        assert_eq!(
+            budget.snapshot().v8_external,
+            0,
+            "drop releases declared external"
+        );
+    }
+
+    #[test]
+    fn callback_reentrancy_is_bounded() {
+        let mut env = NapiEnv::new(ResourceBudget::unlimited(), None);
+        let max = crate::guest::MAX_CALLBACK_DEPTH;
+
+        // Reentrancy is allowed up to the limit, then refused.
+        for _ in 0..max {
+            assert!(env.enter_callback());
+        }
+        assert!(
+            !env.enter_callback(),
+            "past the limit the callback is refused"
+        );
+
+        // Unwinding one level frees exactly one slot.
+        env.leave_callback();
+        assert!(env.enter_callback());
+
+        // Fully unwind; an extra leave saturates instead of underflowing.
+        for _ in 0..max {
+            env.leave_callback();
+        }
+        env.leave_callback();
+        assert!(env.enter_callback());
     }
 }

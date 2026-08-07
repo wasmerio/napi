@@ -50,9 +50,28 @@ pub fn read_guest_bytes(
     let (state, store) = env.data_and_store_mut();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
+    // A guest cannot legitimately reference more bytes than its own linear
+    // memory holds, so reject a length that exceeds it before allocating. This
+    // bounds the host copy to memory the guest was already charged for and
+    // stops a bogus guest-supplied length from allocating gigabytes here (the
+    // subsequent bounds-checked read would fail, but only after the `vec!`).
+    if len as u64 > view.data_size() {
+        return None;
+    }
     let mut out = vec![0u8; len];
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
+}
+
+/// Live size of the guest's linear memory in bytes, or 0 if it has none. Used
+/// to bound host allocations sized by a guest-supplied length: a guest can
+/// never reference more than its own memory holds.
+pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
+    let Some(memory) = env.data().memory.clone() else {
+        return 0;
+    };
+    let (_, store) = env.data_and_store_mut();
+    memory.view(&store).data_size()
 }
 
 pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
@@ -156,7 +175,10 @@ pub fn read_guest_u32_array(
     guest_ptr: i32,
     count: usize,
 ) -> Option<Vec<u32>> {
-    let bytes = read_guest_bytes(env, guest_ptr, count * 4)?;
+    // Guard the byte-length multiply against overflow; the read below is then
+    // clamped to the guest's memory size by `read_guest_bytes`.
+    let byte_len = count.checked_mul(4)?;
+    let bytes = read_guest_bytes(env, guest_ptr, byte_len)?;
     let mut result = Vec::with_capacity(count);
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));

@@ -464,32 +464,42 @@ size_t NearHeapLimitCallback(void* raw_env,
   return state.callback(env, state.data, current_heap_limit, initial_heap_limit);
 }
 
+// Rust-exported external-memory budget hooks (see budget.rs). Charge before an
+// ArrayBuffer backing store is allocated (returns false when over budget),
+// uncharge on free, and release the per-env tracker when the allocator dies.
+extern "C" bool napi_host_external_try_charge(const void* data, size_t bytes);
+extern "C" void napi_host_external_uncharge(const void* data, size_t bytes);
+extern "C" void napi_host_external_release(void* data, size_t remaining_bytes);
+
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
   TrackingArrayBufferAllocator()
       : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 
-  ~TrackingArrayBufferAllocator() override { delete backing_; }
-
-  void* Allocate(size_t length) override {
-    void* data = backing_ != nullptr ? backing_->Allocate(length) : nullptr;
-    if (data != nullptr) {
-      total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
+  ~TrackingArrayBufferAllocator() override {
+    // Release the per-env budget tracker (if any) after all backing stores are
+    // freed; normally total_mem_usage_ is 0 by now.
+    void* hook = budget_hook_.load(std::memory_order_acquire);
+    if (hook != nullptr) {
+      napi_host_external_release(
+          hook, total_mem_usage_.load(std::memory_order_relaxed));
     }
-    return data;
+    delete backing_;
   }
 
+  void* Allocate(size_t length) override { return AllocateImpl(length, true); }
+
   void* AllocateUninitialized(size_t length) override {
-    void* data = backing_ != nullptr ? backing_->AllocateUninitialized(length) : nullptr;
-    if (data != nullptr) {
-      total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
-    }
-    return data;
+    return AllocateImpl(length, false);
   }
 
   void Free(void* data, size_t length) override {
     if (data != nullptr) {
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
+      void* hook = budget_hook_.load(std::memory_order_acquire);
+      if (hook != nullptr) {
+        napi_host_external_uncharge(hook, length);
+      }
     }
     if (backing_ != nullptr) {
       backing_->Free(data, length);
@@ -509,9 +519,36 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     return total_mem_usage_.load(std::memory_order_relaxed);
   }
 
+  // Install the per-env budget tracker. Ownership transfers to the allocator,
+  // which releases it in its destructor.
+  void set_budget_hook(void* hook) {
+    budget_hook_.store(hook, std::memory_order_release);
+  }
+
  private:
+  void* AllocateImpl(size_t length, bool zeroed) {
+    // Charge the budget first; on denial return null so V8 throws RangeError.
+    void* hook = budget_hook_.load(std::memory_order_acquire);
+    if (hook != nullptr && !napi_host_external_try_charge(hook, length)) {
+      return nullptr;
+    }
+    void* data = nullptr;
+    if (backing_ != nullptr) {
+      data = zeroed ? backing_->Allocate(length)
+                    : backing_->AllocateUninitialized(length);
+    }
+    if (data != nullptr) {
+      total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
+    } else if (hook != nullptr) {
+      // Charge succeeded but the backing allocation failed; give it back.
+      napi_host_external_uncharge(hook, length);
+    }
+    return data;
+  }
+
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
   std::atomic<uint64_t> total_mem_usage_ {0};
+  std::atomic<void*> budget_hook_ {nullptr};
 };
 
 void ApplyNodeIsolateCreateParams(v8::Isolate::CreateParams* params) {
@@ -1829,6 +1866,18 @@ napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
     g_near_heap_limit_callbacks.erase(env->isolate);
   }
   env->isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, heap_limit);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_allocation_budget_hook(napi_env env,
+                                                                  void* hook) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
+  if (it == g_tracking_allocators.end() || !it->second) {
+    return napi_generic_failure;
+  }
+  it->second->set_budget_hook(hook);
   return napi_ok;
 }
 

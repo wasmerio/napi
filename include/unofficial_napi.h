@@ -161,6 +161,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_near_heap_limit_cal
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_remove_near_heap_limit_callback(
     napi_env env,
     size_t heap_limit);
+// Install a host budget hook on this env's array-buffer allocator so external
+// (ArrayBuffer/Buffer) memory is charged against the resource budget. `hook` is
+// an opaque per-env tracker owned by the allocator thereafter.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_allocation_budget_hook(
+    napi_env env,
+    void* hook);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_stack_limit(napi_env env, void* stack_limit);
 
 // Unofficial helpers used by util/options parity work in edge.
