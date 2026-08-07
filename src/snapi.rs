@@ -748,6 +748,28 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_create_external_arraybuffer_guest_finalized(
+        env: SnapiEnv,
+        data_addr: u64,
+        byte_length: u32,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        finalize_data: u32,
+        finalize_hint: u32,
+        backing_store_token_out: *mut u64,
+        out_id: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_create_external_buffer_guest_finalized(
+        env: SnapiEnv,
+        data_addr: u64,
+        byte_length: u32,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        finalize_data: u32,
+        finalize_hint: u32,
+        backing_store_token_out: *mut u64,
+        out_id: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_get_arraybuffer_info(
         env: SnapiEnv,
         id: u32,
@@ -939,6 +961,26 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         data_val: u64,
+        ref_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_wrap_finalized(
+        env: SnapiEnv,
+        obj_id: u32,
+        native_data: u64,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        finalize_data: u32,
+        finalize_hint: u32,
+        ref_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_add_finalizer_cb(
+        env: SnapiEnv,
+        obj_id: u32,
+        data_val: u64,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        finalize_data: u32,
+        finalize_hint: u32,
         ref_out: *mut u32,
     ) -> i32;
     // Constructor
