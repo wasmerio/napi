@@ -3671,8 +3671,12 @@ extern "C" int snapi_bridge_unofficial_structured_clone_with_transfer(
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
-  napi_value transfer_list = LoadValue(*bridge_state, transfer_list_id);
-  if (value == nullptr || transfer_list == nullptr) return napi_invalid_arg;
+  if (value == nullptr) return napi_invalid_arg;
+  // A zero id means "no transfer list" (the common case: structuredClone with
+  // no transfers). That is valid — StructuredCloneImpl handles a null transfer
+  // list, exactly like the no-transfer entry point. Do NOT reject it.
+  napi_value transfer_list =
+      transfer_list_id == 0 ? nullptr : LoadValue(*bridge_state, transfer_list_id);
   napi_value result = nullptr;
   napi_status s = unofficial_napi_structured_clone_with_transfer(
       env, value, transfer_list, &result);

@@ -254,31 +254,33 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
   v8::Local<v8::Object> global = context->Global();
 
   // Node's napi_create_buffer* APIs produce Buffer instances, not plain
-  // Uint8Array views. Prefer global Buffer.from(arrayBuffer, offset, length)
-  // when available so native bindings observe Node-compatible semantics.
+  // Uint8Array views. Build the view and promote it to a Buffer by setting its
+  // prototype to Buffer.prototype — the way Node constructs Buffers natively.
+  //
+  // We deliberately do NOT call JS `Buffer.from(ab, ...)` here: on the
+  // V8-imports lane, Buffer.from re-enters the guest for its `isAnyArrayBuffer`
+  // type check, which fails when this runs inside a native libuv callback (e.g.
+  // a UDP recv) — the call throws and every such buffer would silently degrade
+  // to a plain Uint8Array (breaking msg.toString(), Buffer.isBuffer, etc.).
+  // Setting the prototype is a pure host-side V8 operation (Buffer and
+  // Buffer.prototype are ordinary JS objects), so it works regardless of the
+  // calling context and on the native-V8 lane alike.
+  v8::Local<v8::Object> view = v8::Uint8Array::New(ab, offset, length);
+
   v8::Local<v8::String> buffer_name = v8::String::NewFromUtf8Literal(env->isolate, "Buffer");
   v8::Local<v8::Value> buffer_ctor_value;
-  if (global->Get(context, buffer_name).ToLocal(&buffer_ctor_value) && buffer_ctor_value->IsObject()) {
-    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
-    v8::Local<v8::String> from_name = v8::String::NewFromUtf8Literal(env->isolate, "from");
-    v8::Local<v8::Value> from_value;
-    if (buffer_ctor->Get(context, from_name).ToLocal(&from_value) && from_value->IsFunction()) {
-      v8::Local<v8::Function> from_fn = from_value.As<v8::Function>();
-      v8::Local<v8::Value> argv[3] = {
-          ab,
-          v8::Number::New(env->isolate, static_cast<double>(offset)),
-          v8::Number::New(env->isolate, static_cast<double>(length)),
-      };
-      v8::Local<v8::Value> maybe_buffer;
-      if (from_fn->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
-          maybe_buffer->IsObject()) {
-        return maybe_buffer.As<v8::Object>();
-      }
+  if (global->Get(context, buffer_name).ToLocal(&buffer_ctor_value) &&
+      buffer_ctor_value->IsObject()) {
+    v8::Local<v8::String> proto_name = v8::String::NewFromUtf8Literal(env->isolate, "prototype");
+    v8::Local<v8::Value> buffer_proto;
+    if (buffer_ctor_value.As<v8::Object>()->Get(context, proto_name).ToLocal(&buffer_proto) &&
+        buffer_proto->IsObject()) {
+      // On failure `view` stays a valid Uint8Array (early-bootstrap fallback).
+      (void)view->SetPrototypeV2(context, buffer_proto);
     }
   }
 
-  // Fallback used during very early bootstrap before Buffer is available.
-  return v8::Uint8Array::New(ab, offset, length);
+  return view;
 }
 
 inline bool CheckValue(napi_env env, napi_value value) {
