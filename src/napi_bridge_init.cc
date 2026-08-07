@@ -152,7 +152,9 @@ struct CallbackBinding {
   uint32_t reg_id = 0;
 };
 
-std::unordered_set<SnapiEnvState*> g_envs;
+// Never destroyed: static destructors race concurrent env teardown at process
+// exit (see the runtime-globals comment in unofficial_napi.cc).
+std::unordered_set<SnapiEnvState*>& g_envs = *new std::unordered_set<SnapiEnvState*>();
 
 CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) {
   if (state == nullptr || reg_id == 0) return nullptr;

@@ -83,6 +83,22 @@ fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
     env.data().resolve_napi_env(guest_env)
 }
 
+/// Reads an `unofficial_napi_js_source` ({ napi_value text; void* bytecode })
+/// from guest memory. The guest ABI passes the struct by pointer; both fields
+/// are 32-bit in wasm32.
+fn read_guest_js_source(env: &mut FunctionEnvMut<NapiEnv>, source_ptr: i32) -> (i32, i32) {
+    if source_ptr <= 0 {
+        return (0, 0);
+    }
+    match read_guest_bytes(env, source_ptr, 8) {
+        Some(bytes) if bytes.len() == 8 => (
+            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        ),
+        _ => (0, 0),
+    }
+}
+
 /// Drops `guest_data_ptrs` entries whose value ids no longer resolve in any
 /// registered env. Value ids are scope-bound; once a handle scope closes its
 /// ids go stale and their data-pointer mappings would otherwise accumulate.
@@ -1477,8 +1493,7 @@ fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     sandbox_or_null: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
@@ -1489,6 +1504,7 @@ fn guest_unofficial_napi_contextify_run_script(
     host_defined_option_id: i32,
     result_ptr: i32,
 ) -> i32 {
+    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
@@ -1548,8 +1564,7 @@ fn guest_unofficial_napi_contextify_dispose_context(
 fn guest_unofficial_napi_contextify_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
@@ -1559,6 +1574,7 @@ fn guest_unofficial_napi_contextify_compile_function(
     host_defined_option_id: i32,
     result_ptr: i32,
 ) -> i32 {
+    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
@@ -1610,13 +1626,13 @@ fn guest_unofficial_napi_contextify_compile_function(
 fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source: i32,
     filename: i32,
     is_sea_main: i32,
     should_detect_module: i32,
     result_ptr: i32,
 ) -> i32 {
+    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
@@ -1835,13 +1851,13 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
     wrapper: i32,
     url: i32,
     context_or_undefined: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source: i32,
     line_offset: i32,
     column_offset: i32,
     host_defined_option_id: i32,
     handle_ptr: i32,
 ) -> i32 {
+    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
     let env_handle = snapi_env(&env, napi_env);
     let mut handle_id = 0u32;
     let status = unsafe {
@@ -3398,11 +3414,13 @@ fn guest_napi_create_external_arraybuffer(
     s
 }
 
+// NOTE: napi_create_external_buffer takes (env, length, data, ...) — unlike
+// napi_create_external_arraybuffer, which takes (env, data, length, ...).
 fn guest_napi_create_external_buffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
-    external_data: i32,
     byte_length: i32,
+    external_data: i32,
     _finalize_cb: i32,
     _finalize_hint: i32,
     rp: i32,
@@ -5006,27 +5024,27 @@ fn guest_napi_wrap(
     _finalize_hint: i32,
     ref_ptr: i32,
 ) -> i32 {
-    let mut ref_out: u32 = 0;
-    let s = if ref_ptr > 0 {
-        unsafe {
-            snapi_bridge_wrap(
-                snapi_env(&env, e),
-                obj as u32,
-                native_data as u64,
-                &mut ref_out,
-            )
-        }
-    } else {
-        unsafe {
-            snapi_bridge_wrap(
-                snapi_env(&env, e),
-                obj as u32,
-                native_data as u64,
-                std::ptr::null_mut(),
-            )
-        }
+    // The guest's finalize_cb is a wasm function pointer the host cannot
+    // invoke, so it is dropped. That also means the host-side napi_wrap can
+    // never be asked for a ref (it requires a finalizer when one is
+    // requested); wrap without a ref and mint the caller's ref separately as
+    // a weak reference, matching the refcount-0 ref napi_wrap would return.
+    let s = unsafe {
+        snapi_bridge_wrap(
+            snapi_env(&env, e),
+            obj as u32,
+            native_data as u64,
+            std::ptr::null_mut(),
+        )
     };
     if s == 0 && ref_ptr > 0 {
+        let mut ref_out: u32 = 0;
+        let rs = unsafe {
+            snapi_bridge_create_reference(snapi_env(&env, e), obj as u32, 0, &mut ref_out)
+        };
+        if rs != 0 {
+            return rs;
+        }
         write_guest_u32(&mut env, ref_ptr as u32, ref_out);
     }
     s

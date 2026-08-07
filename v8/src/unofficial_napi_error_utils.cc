@@ -41,7 +41,10 @@ struct ErrorFormattingState {
 };
 
 std::mutex g_error_formatting_mu;
-std::unordered_map<napi_env, ErrorFormattingState> g_error_formatting_states;
+// Never destroyed: static destructors race concurrent env teardown at process
+// exit (see the runtime-globals comment in unofficial_napi.cc).
+std::unordered_map<napi_env, ErrorFormattingState>& g_error_formatting_states =
+    *new std::unordered_map<napi_env, ErrorFormattingState>();
 
 std::string FormatStackTrace(v8::Isolate* isolate, v8::Local<v8::StackTrace> stack) {
   if (stack.IsEmpty()) return {};
