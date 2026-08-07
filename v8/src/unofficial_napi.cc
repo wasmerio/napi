@@ -479,21 +479,6 @@ size_t NearHeapLimitCallback(void* raw_env,
   return state.callback(env, state.data, current_heap_limit, initial_heap_limit);
 }
 
-// Rust-exported external-memory budget hooks (see budget.rs). Charge before an
-// ArrayBuffer backing store is allocated (returns false when over budget),
-// uncharge on free, and release the per-env tracker when the allocator dies.
-// Weak fallbacks keep embedders without the Rust budget host (e.g. the native
-// edgejs build) linking; the budget hook is never installed there, so these
-// are never called. napi_wasmer's strong Rust exports override them.
-extern "C" __attribute__((weak)) bool napi_host_external_try_charge(
-    const void* /*data*/, size_t /*bytes*/) {
-  return true;
-}
-extern "C" __attribute__((weak)) void napi_host_external_uncharge(
-    const void* /*data*/, size_t /*bytes*/) {}
-extern "C" __attribute__((weak)) void napi_host_external_release(
-    void* /*data*/, size_t /*remaining_bytes*/) {}
-
 // Rust-exported guest-heap hooks (see guest_heap.rs). When a guest-heap
 // context is installed, every V8 backing store is allocated inside the guest's
 // linear memory so guest and host share buffer bytes directly. `free` returns
@@ -518,13 +503,6 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 
   ~TrackingArrayBufferAllocator() override {
-    // Release the per-env budget tracker (if any) after all backing stores are
-    // freed; normally total_mem_usage_ is 0 by now.
-    void* hook = budget_hook_.load(std::memory_order_acquire);
-    if (hook != nullptr) {
-      napi_host_external_release(
-          hook, total_mem_usage_.load(std::memory_order_relaxed));
-    }
     void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
     if (gctx != nullptr) {
       napi_host_guest_heap_release(gctx);
@@ -549,10 +527,6 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     }
     if (data != nullptr) {
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
-      void* hook = budget_hook_.load(std::memory_order_acquire);
-      if (hook != nullptr) {
-        napi_host_external_uncharge(hook, length);
-      }
     }
     if (backing_ != nullptr) {
       backing_->Free(data, length);
@@ -579,12 +553,6 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     return total_mem_usage_.load(std::memory_order_relaxed);
   }
 
-  // Install the per-env budget tracker. Ownership transfers to the allocator,
-  // which releases it in its destructor.
-  void set_budget_hook(void* hook) {
-    budget_hook_.store(hook, std::memory_order_release);
-  }
-
   // Install the guest-heap context: from now on every backing store is
   // allocated inside the guest's linear memory. Ownership transfers to the
   // allocator, which releases it in its destructor.
@@ -606,11 +574,8 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       }
       return data;
     }
-    // Charge the budget first; on denial return null so V8 throws RangeError.
-    void* hook = budget_hook_.load(std::memory_order_acquire);
-    if (hook != nullptr && !napi_host_external_try_charge(hook, length)) {
-      return nullptr;
-    }
+    // No guest-heap context: this is the native (non-guest) embedder, which
+    // has no budget concept for this allocator. Plain host allocation.
     void* data = nullptr;
     if (backing_ != nullptr) {
       data = zeroed ? backing_->Allocate(length)
@@ -618,16 +583,12 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     }
     if (data != nullptr) {
       total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
-    } else if (hook != nullptr) {
-      // Charge succeeded but the backing allocation failed; give it back.
-      napi_host_external_uncharge(hook, length);
     }
     return data;
   }
 
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
   std::atomic<uint64_t> total_mem_usage_ {0};
-  std::atomic<void*> budget_hook_ {nullptr};
   std::atomic<void*> guest_heap_ctx_ {nullptr};
 };
 
@@ -1946,18 +1907,6 @@ napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
     g_near_heap_limit_callbacks.erase(env->isolate);
   }
   env->isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, heap_limit);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_allocation_budget_hook(napi_env env,
-                                                                  void* hook) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
-  if (it == g_tracking_allocators.end() || !it->second) {
-    return napi_generic_failure;
-  }
-  it->second->set_budget_hook(hook);
   return napi_ok;
 }
 
