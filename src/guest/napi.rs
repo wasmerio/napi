@@ -65,6 +65,11 @@ fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
     env.data().resolve_napi_env(guest_env)
 }
 
+fn read_guest_js_source(env: &mut FunctionEnvMut<NapiEnv>, source_ptr: i32) -> Option<(u32, u32)> {
+    let fields = read_guest_u32_array(env, source_ptr, 2)?;
+    Some((fields[0], fields[1]))
+}
+
 fn write_guest_pod<T>(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32, value: &T) -> bool {
     if guest_ptr <= 0 {
         return false;
@@ -569,10 +574,11 @@ fn guest_unofficial_napi_create_private_symbol(
     let Some(desc) = desc else {
         return 1;
     };
+    let desc_len = desc.len() as u32;
     let cs = CString::new(desc).unwrap_or_default();
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
+        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), desc_len, &mut out)
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
@@ -1403,8 +1409,7 @@ fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     sandbox_or_null: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source_ptr: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
@@ -1416,6 +1421,9 @@ fn guest_unofficial_napi_contextify_run_script(
     result_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
+    let Some((source_text, source_bytecode)) = read_guest_js_source(&mut env, source_ptr) else {
+        return 1;
+    };
     let mut result_id = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_contextify_run_script(
@@ -1425,16 +1433,8 @@ fn guest_unofficial_napi_contextify_run_script(
             } else {
                 0
             },
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             filename as u32,
             line_offset,
             column_offset,
@@ -1474,8 +1474,7 @@ fn guest_unofficial_napi_contextify_dispose_context(
 fn guest_unofficial_napi_contextify_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source_ptr: i32,
     filename: i32,
     line_offset: i32,
     column_offset: i32,
@@ -1486,20 +1485,15 @@ fn guest_unofficial_napi_contextify_compile_function(
     result_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
+    let Some((source_text, source_bytecode)) = read_guest_js_source(&mut env, source_ptr) else {
+        return 1;
+    };
     let mut result_id = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             filename as u32,
             line_offset,
             column_offset,
@@ -1536,28 +1530,22 @@ fn guest_unofficial_napi_contextify_compile_function(
 fn guest_unofficial_napi_contextify_compile_function_for_cjs_loader(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source_ptr: i32,
     filename: i32,
     is_sea_main: i32,
     should_detect_module: i32,
     result_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
+    let Some((source_text, source_bytecode)) = read_guest_js_source(&mut env, source_ptr) else {
+        return 1;
+    };
     let mut result_id = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
             env_handle,
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             filename as u32,
             is_sea_main,
             should_detect_module,
@@ -1761,14 +1749,16 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
     wrapper: i32,
     url: i32,
     context_or_undefined: i32,
-    source_text: i32,
-    source_bytecode: i32,
+    source_ptr: i32,
     line_offset: i32,
     column_offset: i32,
     host_defined_option_id: i32,
     handle_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
+    let Some((source_text, source_bytecode)) = read_guest_js_source(&mut env, source_ptr) else {
+        return 1;
+    };
     let mut handle_id = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_module_wrap_create_source_text(
@@ -1780,16 +1770,8 @@ fn guest_unofficial_napi_module_wrap_create_source_text(
             } else {
                 0
             },
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             line_offset,
             column_offset,
             if host_defined_option_id > 0 {
@@ -2301,10 +2283,12 @@ fn guest_napi_create_string_utf8(
     let Some(sb) = sb else {
         return 1;
     };
+    let string_len = sb.len() as u32;
     let cs = CString::new(sb).unwrap_or_default();
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_utf8(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_utf8(snapi_env(&env, e), cs.as_ptr(), string_len, &mut out)
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2327,10 +2311,12 @@ fn guest_napi_create_string_latin1(
     let Some(sb) = sb else {
         return 1;
     };
+    let string_len = sb.len() as u32;
     let cs = CString::new(sb).unwrap_or_default();
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_latin1(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_latin1(snapi_env(&env, e), cs.as_ptr(), string_len, &mut out)
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -3201,35 +3187,164 @@ fn guest_napi_create_arraybuffer(
     data_ptr: i32,
     rp: i32,
 ) -> i32 {
-    // Try to create a guest-memory-backed ArrayBuffer (for WASIX)
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
+    #[cfg(feature = "js")]
+    {
+        if byte_length < 0 {
+            return 1;
+        }
+        let zeros = vec![0u8; byte_length as usize];
+        let Some(guest_ptr) = allocate_guest_bytes(&mut env, &zeros) else {
+            return 1;
+        };
+        let mut out = 0u32;
+        let status = unsafe {
+            snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
+        };
+        if status != 0 {
+            return status;
+        }
+        remember_host_buffer_copy(&mut env, out, 0, 0, guest_ptr, byte_length as usize);
+        write_guest_u32(&mut env, rp as u32, out);
+        if data_ptr > 0 {
+            write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
+        }
+        return 0;
+    }
 
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, byte_length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1, // allocation failed
+    #[cfg(not(feature = "js"))]
+    {
+        // Try to create a guest-memory-backed ArrayBuffer (for WASIX)
+        let malloc_fn = env.data().malloc_fn.clone();
+        let memory = env.data().memory.clone();
+
+        if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
+            // Allocate memory in the guest's linear memory
+            let guest_ptr: i32 = {
+                let (_, mut store_ref) = env.data_and_store_mut();
+                match malloc_fn.call(&mut store_ref, byte_length) {
+                    Ok(ptr) if ptr > 0 => ptr,
+                    _ => return 1, // allocation failed
+                }
+            };
+
+            // Get host pointer corresponding to the guest allocation
+            let host_addr: u64 = {
+                let (_, store_ref) = env.data_and_store_mut();
+                let view = memory.view(&store_ref);
+                let host_base = view.data_ptr() as u64;
+                host_base + guest_ptr as u64
+            };
+
+            // Zero-initialize the guest memory region
+            {
+                let zeros = vec![0u8; byte_length as usize];
+                write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
             }
+
+            // Create external arraybuffer backed by guest memory
+            let mut out: u32 = 0;
+            let mut backing_store_token: u64 = 0;
+            let s = unsafe {
+                snapi_bridge_create_external_arraybuffer(
+                    snapi_env(&env, e),
+                    host_addr,
+                    byte_length as u32,
+                    &mut backing_store_token,
+                    &mut out,
+                )
+            };
+            if s == 0 {
+                remember_guest_backing_store(
+                    &mut env,
+                    out,
+                    backing_store_token,
+                    host_addr,
+                    guest_ptr as u32,
+                    byte_length as usize,
+                );
+                write_guest_u32(&mut env, rp as u32, out);
+                if data_ptr > 0 {
+                    write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
+                }
+            }
+            s
+        } else {
+            // Fallback: host-memory-backed arraybuffer (non-WASIX path)
+            let mut out: u32 = 0;
+            let s = unsafe {
+                snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
+            };
+            if s == 0 {
+                write_guest_u32(&mut env, rp as u32, out);
+            }
+            s
+        }
+    }
+}
+
+fn guest_napi_create_external_arraybuffer(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    external_data: i32,
+    byte_length: i32,
+    _finalize_cb: i32,
+    _finalize_hint: i32,
+    rp: i32,
+) -> i32 {
+    #[cfg(feature = "js")]
+    {
+        if external_data < 0 || byte_length < 0 {
+            return 1;
+        }
+        let Some(source) = read_guest_bytes(&mut env, external_data, byte_length as usize) else {
+            return 1;
+        };
+        let mut out = 0u32;
+        let status = unsafe {
+            snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
+        };
+        if status != 0 {
+            return status;
+        }
+        if byte_length > 0 {
+            let status = unsafe {
+                snapi_bridge_overwrite_value_bytes(
+                    snapi_env(&env, e),
+                    out,
+                    source.as_ptr().cast(),
+                    byte_length as u32,
+                )
+            };
+            if status != 0 {
+                return status;
+            }
+        }
+        remember_host_buffer_copy(
+            &mut env,
+            out,
+            0,
+            0,
+            external_data as u32,
+            byte_length as usize,
+        );
+        write_guest_u32(&mut env, rp as u32, out);
+        return 0;
+    }
+
+    #[cfg(not(feature = "js"))]
+    {
+        let memory = env.data().memory.clone();
+        let Some(memory) = memory else {
+            return 1;
         };
 
-        // Get host pointer corresponding to the guest allocation
         let host_addr: u64 = {
             let (_, store_ref) = env.data_and_store_mut();
             let view = memory.view(&store_ref);
             let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
+            host_base + external_data as u64
         };
 
-        // Zero-initialize the guest memory region
-        {
-            let zeros = vec![0u8; byte_length as usize];
-            write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
-        }
-
-        // Create external arraybuffer backed by guest memory
         let mut out: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
@@ -3247,72 +3362,13 @@ fn guest_napi_create_arraybuffer(
                 out,
                 backing_store_token,
                 host_addr,
-                guest_ptr as u32,
+                external_data as u32,
                 byte_length as usize,
             );
             write_guest_u32(&mut env, rp as u32, out);
-            if data_ptr > 0 {
-                write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
-            }
-        }
-        s
-    } else {
-        // Fallback: host-memory-backed arraybuffer (non-WASIX path)
-        let mut out: u32 = 0;
-        let s = unsafe {
-            snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
-        };
-        if s == 0 {
-            write_guest_u32(&mut env, rp as u32, out);
         }
         s
     }
-}
-
-fn guest_napi_create_external_arraybuffer(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    external_data: i32,
-    byte_length: i32,
-    _finalize_cb: i32,
-    _finalize_hint: i32,
-    rp: i32,
-) -> i32 {
-    let memory = env.data().memory.clone();
-    let Some(memory) = memory else {
-        return 1;
-    };
-
-    let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
-        let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
-    };
-
-    let mut out: u32 = 0;
-    let mut backing_store_token: u64 = 0;
-    let s = unsafe {
-        snapi_bridge_create_external_arraybuffer(
-            snapi_env(&env, e),
-            host_addr,
-            byte_length as u32,
-            &mut backing_store_token,
-            &mut out,
-        )
-    };
-    if s == 0 {
-        remember_guest_backing_store(
-            &mut env,
-            out,
-            backing_store_token,
-            host_addr,
-            external_data as u32,
-            byte_length as usize,
-        );
-        write_guest_u32(&mut env, rp as u32, out);
-    }
-    s
 }
 
 fn guest_napi_create_external_buffer(
@@ -3324,41 +3380,81 @@ fn guest_napi_create_external_buffer(
     _finalize_hint: i32,
     rp: i32,
 ) -> i32 {
-    let memory = env.data().memory.clone();
-    let Some(memory) = memory else {
-        return 1;
-    };
-
-    let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
-        let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
-    };
-
-    let mut out: u32 = 0;
-    let mut backing_store_token: u64 = 0;
-    let s = unsafe {
-        snapi_bridge_create_external_buffer(
-            snapi_env(&env, e),
-            host_addr,
-            byte_length as u32,
-            &mut backing_store_token,
-            &mut out,
-        )
-    };
-    if s == 0 {
-        remember_guest_backing_store(
+    #[cfg(feature = "js")]
+    {
+        if external_data < 0 || byte_length < 0 {
+            return 1;
+        }
+        let Some(source) = read_guest_bytes(&mut env, external_data, byte_length as usize) else {
+            return 1;
+        };
+        let mut host_data = 0u64;
+        let mut out = 0u32;
+        let status = unsafe {
+            snapi_bridge_create_buffer_copy(
+                snapi_env(&env, e),
+                byte_length as u32,
+                source.as_ptr(),
+                &mut host_data,
+                &mut out,
+            )
+        };
+        if host_data != 0 {
+            unsafe { snapi_bridge_unofficial_free_buffer(host_data as *mut c_void) };
+        }
+        if status != 0 {
+            return status;
+        }
+        remember_host_buffer_copy(
             &mut env,
             out,
-            backing_store_token,
-            host_addr,
+            0,
+            0,
             external_data as u32,
             byte_length as usize,
         );
         write_guest_u32(&mut env, rp as u32, out);
+        return 0;
     }
-    s
+
+    #[cfg(not(feature = "js"))]
+    {
+        let memory = env.data().memory.clone();
+        let Some(memory) = memory else {
+            return 1;
+        };
+
+        let host_addr: u64 = {
+            let (_, store_ref) = env.data_and_store_mut();
+            let view = memory.view(&store_ref);
+            let host_base = view.data_ptr() as u64;
+            host_base + external_data as u64
+        };
+
+        let mut out: u32 = 0;
+        let mut backing_store_token: u64 = 0;
+        let s = unsafe {
+            snapi_bridge_create_external_buffer(
+                snapi_env(&env, e),
+                host_addr,
+                byte_length as u32,
+                &mut backing_store_token,
+                &mut out,
+            )
+        };
+        if s == 0 {
+            remember_guest_backing_store(
+                &mut env,
+                out,
+                backing_store_token,
+                host_addr,
+                external_data as u32,
+                byte_length as usize,
+            );
+            write_guest_u32(&mut env, rp as u32, out);
+        }
+        s
+    }
 }
 
 fn guest_napi_get_arraybuffer_info(
@@ -3704,8 +3800,18 @@ fn guest_napi_get_reference_value(
 
 // --- Handle scopes ---
 
-fn guest_napi_open_handle_scope(_env: FunctionEnvMut<NapiEnv>, _e: i32, _rp: i32) -> i32 {
-    0
+fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
+    if snapi_env(&env, e).is_null() || rp <= 0 {
+        return 1;
+    }
+    // Regular handle scopes do not require host-side lifetime tracking in the
+    // JS bridge, but N-API still requires a non-null opaque handle on success.
+    // EdgeJS uses that handle to distinguish an opened scope from a failed one.
+    if write_guest_u32(&mut env, rp as u32, 1) {
+        0
+    } else {
+        1
+    }
 }
 fn guest_napi_close_handle_scope(_env: FunctionEnvMut<NapiEnv>, _e: i32, _scope: i32) -> i32 {
     0
@@ -3863,9 +3969,12 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
+    let actual_name_len = name_bytes.len() as u32;
     let c_name = CString::new(name_bytes).unwrap_or_default();
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_function(snapi, c_name.as_ptr(), actual_name_len, reg_id, &mut out)
+    };
     if s != 0 {
         return s;
     }
@@ -4020,6 +4129,7 @@ fn guest_napi_define_class(
     };
 
     let pc = prop_count as u32;
+    let actual_name_len = name_bytes.len() as u32;
     let c_name = CString::new(name_bytes).unwrap_or_default();
 
     if pc == 0 {
@@ -4029,7 +4139,7 @@ fn guest_napi_define_class(
             snapi_bridge_define_class(
                 snapi_env(&env, e),
                 c_name.as_ptr(),
-                wl,
+                actual_name_len,
                 ctor_reg_id,
                 0,
                 std::ptr::null(),
@@ -4189,7 +4299,7 @@ fn guest_napi_define_class(
         snapi_bridge_define_class(
             snapi_env(&env, e),
             c_name.as_ptr(),
-            wl,
+            actual_name_len,
             ctor_reg_id,
             pc,
             prop_names_ptrs.as_ptr(),
@@ -4620,75 +4730,111 @@ fn guest_napi_create_buffer(
     data_ptr: i32,
     rp: i32,
 ) -> i32 {
-    // Buffers must be backed by guest linear memory (same pattern as create_arraybuffer)
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
-
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
-            }
-        };
-
-        // Get host pointer corresponding to the guest allocation
-        let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
-            let view = memory.view(&store_ref);
-            let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
-        };
-
-        // Zero-initialize the guest memory region
-        if length > 0 {
-            let zeros = vec![0u8; length as usize];
-            write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
+    #[cfg(feature = "js")]
+    {
+        if length < 0 {
+            return 1;
         }
-
-        let mut buf_id: u32 = 0;
-        let mut backing_store_token: u64 = 0;
-        let s = unsafe {
-            snapi_bridge_create_external_buffer(
-                snapi_env(&env, e),
-                host_addr,
-                length as u32,
-                &mut backing_store_token,
-                &mut buf_id,
-            )
+        let zeros = vec![0u8; length as usize];
+        let Some(guest_ptr) = allocate_guest_bytes(&mut env, &zeros) else {
+            return 1;
         };
-        if s != 0 {
-            return s;
-        }
-
-        remember_guest_backing_store(
-            &mut env,
-            buf_id,
-            backing_store_token,
-            host_addr,
-            guest_ptr as u32,
-            length as usize,
-        );
-
-        write_guest_u32(&mut env, rp as u32, buf_id);
-        if data_ptr > 0 {
-            write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
-        }
-        0
-    } else {
-        // Fallback for non-WASIX: use bridge directly
-        let mut host_data: u64 = 0;
-        let mut out: u32 = 0;
-        let s = unsafe {
+        let mut host_data = 0u64;
+        let mut out = 0u32;
+        let status = unsafe {
             snapi_bridge_create_buffer(snapi_env(&env, e), length as u32, &mut host_data, &mut out)
         };
-        if s != 0 {
-            return s;
+        if host_data != 0 {
+            unsafe { snapi_bridge_unofficial_free_buffer(host_data as *mut c_void) };
         }
+        if status != 0 {
+            return status;
+        }
+        remember_host_buffer_copy(&mut env, out, 0, 0, guest_ptr, length as usize);
         write_guest_u32(&mut env, rp as u32, out);
-        0
+        if data_ptr > 0 {
+            write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
+        }
+        return 0;
+    }
+
+    #[cfg(not(feature = "js"))]
+    {
+        // Buffers must be backed by guest linear memory (same pattern as create_arraybuffer)
+        let malloc_fn = env.data().malloc_fn.clone();
+        let memory = env.data().memory.clone();
+
+        if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
+            // Allocate memory in the guest's linear memory
+            let guest_ptr: i32 = {
+                let (_, mut store_ref) = env.data_and_store_mut();
+                match malloc_fn.call(&mut store_ref, length) {
+                    Ok(ptr) if ptr > 0 => ptr,
+                    _ => return 1,
+                }
+            };
+
+            // Get host pointer corresponding to the guest allocation
+            let host_addr: u64 = {
+                let (_, store_ref) = env.data_and_store_mut();
+                let view = memory.view(&store_ref);
+                let host_base = view.data_ptr() as u64;
+                host_base + guest_ptr as u64
+            };
+
+            // Zero-initialize the guest memory region
+            if length > 0 {
+                let zeros = vec![0u8; length as usize];
+                write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
+            }
+
+            let mut buf_id: u32 = 0;
+            let mut backing_store_token: u64 = 0;
+            let s = unsafe {
+                snapi_bridge_create_external_buffer(
+                    snapi_env(&env, e),
+                    host_addr,
+                    length as u32,
+                    &mut backing_store_token,
+                    &mut buf_id,
+                )
+            };
+            if s != 0 {
+                return s;
+            }
+
+            remember_guest_backing_store(
+                &mut env,
+                buf_id,
+                backing_store_token,
+                host_addr,
+                guest_ptr as u32,
+                length as usize,
+            );
+
+            write_guest_u32(&mut env, rp as u32, buf_id);
+            if data_ptr > 0 {
+                write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
+            }
+            0
+        } else {
+            // Fallback for non-WASIX: use bridge directly
+            let mut host_data: u64 = 0;
+            let mut out: u32 = 0;
+            let s = unsafe {
+                snapi_bridge_create_buffer(
+                    snapi_env(&env, e),
+                    length as u32,
+                    &mut host_data,
+                    &mut out,
+                )
+            };
+            if s != 0 {
+                return s;
+            }
+            write_guest_u32(&mut env, rp as u32, out);
+            0
+        }
     }
 }
 
@@ -4705,76 +4851,109 @@ fn guest_napi_create_buffer_copy(
         return 1;
     };
 
-    let malloc_fn = env.data().malloc_fn.clone();
-    let memory = env.data().memory.clone();
-
-    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
-        // Allocate memory in the guest's linear memory
-        let guest_ptr: i32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, length) {
-                Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
-            }
+    #[cfg(feature = "js")]
+    {
+        let Some(guest_ptr) = allocate_guest_bytes(&mut env, &src_data) else {
+            return 1;
         };
-
-        // Copy source data to guest memory
-        write_guest_bytes(&mut env, guest_ptr as u32, &src_data);
-
-        // Get host pointer corresponding to the guest allocation
-        let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
-            let view = memory.view(&store_ref);
-            let host_base = view.data_ptr() as u64;
-            host_base + guest_ptr as u64
-        };
-
-        let mut buf_id: u32 = 0;
-        let mut backing_store_token: u64 = 0;
-        let s = unsafe {
-            snapi_bridge_create_external_buffer(
-                snapi_env(&env, e),
-                host_addr,
-                length as u32,
-                &mut backing_store_token,
-                &mut buf_id,
-            )
-        };
-        if s != 0 {
-            return s;
-        }
-
-        remember_guest_backing_store(
-            &mut env,
-            buf_id,
-            backing_store_token,
-            host_addr,
-            guest_ptr as u32,
-            length as usize,
-        );
-
-        write_guest_u32(&mut env, rp as u32, buf_id);
-        if result_data_ptr > 0 {
-            write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr as u32);
-        }
-        0
-    } else {
-        // Fallback for non-WASIX
-        let mut result_host_data: u64 = 0;
-        let mut out: u32 = 0;
-        let s = unsafe {
+        let mut host_data = 0u64;
+        let mut out = 0u32;
+        let status = unsafe {
             snapi_bridge_create_buffer_copy(
                 snapi_env(&env, e),
                 length as u32,
                 src_data.as_ptr(),
-                &mut result_host_data,
+                &mut host_data,
                 &mut out,
             )
         };
-        if s == 0 {
-            write_guest_u32(&mut env, rp as u32, out);
+        if host_data != 0 {
+            unsafe { snapi_bridge_unofficial_free_buffer(host_data as *mut c_void) };
         }
-        s
+        if status != 0 {
+            return status;
+        }
+        remember_host_buffer_copy(&mut env, out, 0, 0, guest_ptr, length as usize);
+        write_guest_u32(&mut env, rp as u32, out);
+        if result_data_ptr > 0 {
+            write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr);
+        }
+        return 0;
+    }
+
+    #[cfg(not(feature = "js"))]
+    {
+        let malloc_fn = env.data().malloc_fn.clone();
+        let memory = env.data().memory.clone();
+
+        if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
+            // Allocate memory in the guest's linear memory
+            let guest_ptr: i32 = {
+                let (_, mut store_ref) = env.data_and_store_mut();
+                match malloc_fn.call(&mut store_ref, length) {
+                    Ok(ptr) if ptr > 0 => ptr,
+                    _ => return 1,
+                }
+            };
+
+            // Copy source data to guest memory
+            write_guest_bytes(&mut env, guest_ptr as u32, &src_data);
+
+            // Get host pointer corresponding to the guest allocation
+            let host_addr: u64 = {
+                let (_, store_ref) = env.data_and_store_mut();
+                let view = memory.view(&store_ref);
+                let host_base = view.data_ptr() as u64;
+                host_base + guest_ptr as u64
+            };
+
+            let mut buf_id: u32 = 0;
+            let mut backing_store_token: u64 = 0;
+            let s = unsafe {
+                snapi_bridge_create_external_buffer(
+                    snapi_env(&env, e),
+                    host_addr,
+                    length as u32,
+                    &mut backing_store_token,
+                    &mut buf_id,
+                )
+            };
+            if s != 0 {
+                return s;
+            }
+
+            remember_guest_backing_store(
+                &mut env,
+                buf_id,
+                backing_store_token,
+                host_addr,
+                guest_ptr as u32,
+                length as usize,
+            );
+
+            write_guest_u32(&mut env, rp as u32, buf_id);
+            if result_data_ptr > 0 {
+                write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr as u32);
+            }
+            0
+        } else {
+            // Fallback for non-WASIX
+            let mut result_host_data: u64 = 0;
+            let mut out: u32 = 0;
+            let s = unsafe {
+                snapi_bridge_create_buffer_copy(
+                    snapi_env(&env, e),
+                    length as u32,
+                    src_data.as_ptr(),
+                    &mut result_host_data,
+                    &mut out,
+                )
+            };
+            if s == 0 {
+                write_guest_u32(&mut env, rp as u32, out);
+            }
+            s
+        }
     }
 }
 

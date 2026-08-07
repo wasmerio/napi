@@ -7,6 +7,10 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Uses the browser/Node JavaScript realm as the N-API value engine when this
+# crate is compiled as part of a wasm32-unknown-unknown wasm-bindgen module.
+# On native targets this feature is inert and the V8 backend remains active.
+js = ["dep:js-sys", "dep:wasm-bindgen", "wasmer/js-default"]
 # Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
 wasix = ["dep:wasmer-wasix"]
 cli = [
@@ -15,7 +19,7 @@ cli = [
   "dep:wasmer-compiler-llvm",
   "dep:wasmer-c-api-imports",
   "wasmer-c-api-imports/llvm",
-  "wasmer-c-api-imports/wasix",
+  "wasmer-c-api-imports/wasi",
   "dep:tokio",
   "dep:virtual-fs",
   "dep:wasmer-types",
@@ -41,6 +45,10 @@ wasmer-wasix = { version = "=0.702.1", path = "../wasix", optional = true }
 virtual-fs = { version = "=0.702.1", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2.120", optional = true }
 
 [build-dependencies]
 cc = "1"

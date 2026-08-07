@@ -72,15 +72,24 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> O
 }
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
-    let memory = env.data().memory.clone()?;
-    let (_, store_ref) = env.data_and_store_mut();
-    let view = memory.view(&store_ref);
-    let host_base = view.data_ptr() as u64;
-    let memory_len = view.data_size();
-    if host_addr < host_base || host_addr >= host_base + memory_len {
+    #[cfg(feature = "js")]
+    {
+        let _ = (env, host_addr);
         return None;
     }
-    u32::try_from(host_addr - host_base).ok()
+
+    #[cfg(not(feature = "js"))]
+    {
+        let memory = env.data().memory.clone()?;
+        let (_, store_ref) = env.data_and_store_mut();
+        let view = memory.view(&store_ref);
+        let host_base = view.data_ptr() as u64;
+        let memory_len = view.data_size();
+        if host_addr < host_base || host_addr >= host_base + memory_len {
+            return None;
+        }
+        u32::try_from(host_addr - host_base).ok()
+    }
 }
 
 pub fn resolve_guest_backing_store_mapping(
