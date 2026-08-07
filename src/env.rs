@@ -63,6 +63,9 @@ pub(crate) struct NapiEnv {
     /// Maps value handle IDs to their guest-memory data pointers.
     /// Used for buffers/arraybuffers backed by guest linear memory.
     pub(crate) guest_data_ptrs: HashMap<u32, u32>,
+    /// Size threshold above which stale (scope-closed) entries are pruned
+    /// from `guest_data_ptrs`; doubled after each prune to stay amortized.
+    pub(crate) guest_data_ptrs_prune_floor: usize,
     /// Maps stable host backing-store tokens to guest-memory data pointers.
     /// This keeps external Buffer/ArrayBuffer aliases stable even when V8/N-API
     /// surfaces the same backing store through a different value handle.
@@ -95,6 +98,7 @@ impl NapiEnv {
             malloc_fn: None,
             table: None,
             guest_data_ptrs: HashMap::new(),
+            guest_data_ptrs_prune_floor: 1024,
             guest_data_backing_stores: HashMap::new(),
             host_buffer_copies: Vec::new(),
             host_buffer_copy_frames: Vec::new(),

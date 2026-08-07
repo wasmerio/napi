@@ -69,17 +69,54 @@ struct HandleTable {
   }
 };
 
+// Value IDs are generation-tagged: a u32 id encodes
+// ((slot_index + 1) << kValueIdGenBits) | generation, keeping 0 as the null
+// sentinel. A stale or forged id fails the generation check in LoadValue and
+// resolves to null instead of aliasing whatever value later reuses the slot.
+constexpr uint32_t kValueIdGenBits = 12;
+constexpr uint32_t kValueIdGenMask = (1u << kValueIdGenBits) - 1;
+// (slot_index + 1) must fit in the remaining 20 bits.
+constexpr uint32_t kValueIdMaxSlots = (1u << 20) - 1;
+
+struct ValueSlot {
+  // Raw napi_value (a scope-bound Local). Valid only while the owning scope
+  // frame is open; reclaimed (and the slot generation bumped) when it closes.
+  napi_value value = nullptr;
+  uint16_t generation = 0;
+  bool in_use = false;
+};
+
+// One entry per open handle scope. Frame 0 is the root frame backed by the
+// env-wide UnofficialEnvScope handle scope; it owns every value minted outside
+// an explicit or per-callback scope and is reclaimed only at env teardown.
+// Non-root frames own a real (heap) napi handle scope and the slots minted
+// while they were innermost; closing the frame frees those slots so their ids
+// go stale before the Locals die with the underlying scope.
+struct ScopeFrame {
+  napi_handle_scope scope = nullptr;
+  napi_escapable_handle_scope esc_scope = nullptr;
+  std::vector<uint32_t> owned_slots;
+  // Guest-visible id (0 for the root frame and for implicit per-callback
+  // frames, which the guest cannot close).
+  uint32_t id = 0;
+};
+
 struct SnapiEnvState {
   napi_env env = nullptr;
   void* scope = nullptr;
 
-  // Handle table: maps u32 IDs to persistent napi_value references.
-  //
-  // Raw napi_value handles are only valid within the originating handle scope.
-  // The guest stores these IDs across calls, so we must hold a reference on the
-  // host side and re-resolve it when loading the value again.
-  std::unordered_map<uint32_t, napi_ref> values;
-  uint32_t next_value_id = 1;
+  // Value slot table: maps generation-tagged u32 IDs to scope-bound raw
+  // napi_values. A value id is valid until the scope frame that owns its slot
+  // closes; cross-scope retention goes through the `refs` table instead
+  // (napi_create_reference / napi_get_reference_value), matching real N-API.
+  std::vector<ValueSlot> value_slots;
+  std::vector<uint32_t> value_free_slots;
+  size_t live_value_count = 0;
+
+  // Open scope frames, innermost last. Initialized lazily with the root frame
+  // on first use; new values are minted into the innermost frame.
+  std::vector<ScopeFrame> scope_frames;
+  uint32_t next_scope_id = 1;
 
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
@@ -88,10 +125,6 @@ struct SnapiEnvState {
   // Handle table for napi_deferred (promise deferreds).
   std::unordered_map<uint32_t, napi_deferred> deferreds;
   uint32_t next_deferred_id = 1;
-
-  // Handle table for napi_escapable_handle_scope.
-  std::unordered_map<uint32_t, napi_escapable_handle_scope> esc_scopes;
-  uint32_t next_esc_scope_id = 1;
 
   // Handle table for opaque module_wrap handles.
   HandleTable module_wrap_handles;
@@ -133,7 +166,13 @@ CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) 
 }
 
 SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
-  if (env_state == nullptr || env_state->env == nullptr) return nullptr;
+  if (env_state == nullptr) return nullptr;
+  // The pointer originates from the guest (via the Rust env-id layer); gate it
+  // on live-env membership before the first dereference so a stale or forged
+  // env handle fails cleanly instead of touching freed memory.
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (g_envs.find(env_state) == g_envs.end()) return nullptr;
+  if (env_state->env == nullptr) return nullptr;
   return env_state;
 }
 
@@ -145,33 +184,90 @@ uint32_t RegisterCallbackInvocation(SnapiEnvState* state, napi_callback_info inf
   return id;
 }
 
-uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
+// Innermost open frame, creating the root frame on first use.
+ScopeFrame& CurrentFrame(SnapiEnvState& state) {
+  if (state.scope_frames.empty()) {
+    state.scope_frames.emplace_back();
+  }
+  return state.scope_frames.back();
+}
+
+// Mints an id for `val` owned by `frame`. The common path stores into the
+// innermost frame; escape_handle stores into the parent of the escaped scope.
+uint32_t StoreValueInFrame(SnapiEnvState& state, napi_value val, ScopeFrame& frame) {
   if (val == nullptr) return 0;
   if (state.env == nullptr) return 0;
   // Refuse once the per-env handle cap is reached: returning 0 surfaces as an
   // N-API failure the guest can handle, instead of leaking host RSS unbounded.
-  if (state.value_limit != 0 && state.values.size() >= state.value_limit) {
+  if (state.value_limit != 0 && state.live_value_count >= state.value_limit) {
     return 0;
   }
-  napi_ref ref = nullptr;
-  if (napi_create_reference(state.env, val, 1, &ref) != napi_ok || ref == nullptr) {
-    return 0;
+  uint32_t index;
+  if (!state.value_free_slots.empty()) {
+    index = state.value_free_slots.back();
+    state.value_free_slots.pop_back();
+  } else {
+    if (state.value_slots.size() >= kValueIdMaxSlots) return 0;
+    index = static_cast<uint32_t>(state.value_slots.size());
+    state.value_slots.emplace_back();
   }
-  uint32_t id = state.next_value_id++;
-  state.values[id] = ref;
-  return id;
+  ValueSlot& slot = state.value_slots[index];
+  slot.value = val;
+  slot.in_use = true;
+  ++state.live_value_count;
+  frame.owned_slots.push_back(index);
+  return ((index + 1) << kValueIdGenBits) | slot.generation;
+}
+
+uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
+  return StoreValueInFrame(state, val, CurrentFrame(state));
 }
 
 napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
   if (id == 0) return nullptr;
   if (state.env == nullptr) return nullptr;
-  auto it = state.values.find(id);
-  if (it == state.values.end() || it->second == nullptr) return nullptr;
-  napi_value value = nullptr;
-  if (napi_get_reference_value(state.env, it->second, &value) != napi_ok || value == nullptr) {
+  const uint32_t index_plus_one = id >> kValueIdGenBits;
+  if (index_plus_one == 0 || index_plus_one > state.value_slots.size()) {
     return nullptr;
   }
-  return value;
+  ValueSlot& slot = state.value_slots[index_plus_one - 1];
+  if (!slot.in_use || slot.generation != (id & kValueIdGenMask) ||
+      slot.value == nullptr) {
+    return nullptr;
+  }
+  return slot.value;
+}
+
+// Releases a slot and bumps its generation so any id minted for the old
+// occupant is rejected by LoadValue. The Local itself dies when the owning
+// napi scope closes; this only retires the id.
+void FreeValueSlot(SnapiEnvState& state, uint32_t index) {
+  ValueSlot& slot = state.value_slots[index];
+  if (!slot.in_use) return;
+  slot.value = nullptr;
+  slot.in_use = false;
+  slot.generation = static_cast<uint16_t>((slot.generation + 1) & kValueIdGenMask);
+  state.value_free_slots.push_back(index);
+  --state.live_value_count;
+}
+
+// Frees every slot the innermost frame owns and pops it. Closes the frame's
+// napi scope (which kills the backing Locals) unless `close_napi_scope` is
+// false (env-teardown drain, where release_env reclaims the whole env).
+void PopCurrentFrame(SnapiEnvState& state, bool close_napi_scope) {
+  if (state.scope_frames.empty()) return;
+  ScopeFrame frame = std::move(state.scope_frames.back());
+  state.scope_frames.pop_back();
+  for (uint32_t index : frame.owned_slots) {
+    FreeValueSlot(state, index);
+  }
+  if (close_napi_scope && state.env != nullptr) {
+    if (frame.esc_scope != nullptr) {
+      (void)napi_close_escapable_handle_scope(state.env, frame.esc_scope);
+    } else if (frame.scope != nullptr) {
+      (void)napi_close_handle_scope(state.env, frame.scope);
+    }
+  }
 }
 
 uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
@@ -391,21 +487,13 @@ void RemoveDeferred(SnapiEnvState& state, uint32_t id) {
   state.deferreds.erase(id);
 }
 
-uint32_t StoreEscScope(SnapiEnvState& state, napi_escapable_handle_scope s) {
-  if (s == nullptr) return 0;
-  uint32_t id = state.next_esc_scope_id++;
-  state.esc_scopes[id] = s;
-  return id;
-}
-
-napi_escapable_handle_scope LoadEscScope(SnapiEnvState& state, uint32_t id) {
-  if (id == 0) return nullptr;
-  auto it = state.esc_scopes.find(id);
-  return it != state.esc_scopes.end() ? it->second : nullptr;
-}
-
-void RemoveEscScope(SnapiEnvState& state, uint32_t id) {
-  state.esc_scopes.erase(id);
+// Finds the open frame with the given guest-visible id (innermost first).
+int FindFrameById(SnapiEnvState& state, uint32_t scope_id) {
+  if (scope_id == 0) return -1;
+  for (int i = static_cast<int>(state.scope_frames.size()) - 1; i >= 0; --i) {
+    if (state.scope_frames[i].id == scope_id) return i;
+  }
+  return -1;
 }
 
 uint32_t StoreModuleWrapHandle(SnapiEnvState& state, void* handle) {
@@ -442,19 +530,19 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
 
 napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
-  for (auto& entry : state->values) {
-    if (entry.second != nullptr) {
-      napi_delete_reference(state->env, entry.second);
-    }
+  // Slots hold raw Locals; they die with the env's scopes when release_env
+  // tears everything down, so draining the frames is pure bookkeeping.
+  while (!state->scope_frames.empty()) {
+    PopCurrentFrame(*state, /*close_napi_scope=*/true);
   }
-  state->values.clear();
-  state->next_value_id = 1;
+  state->value_slots.clear();
+  state->value_free_slots.clear();
+  state->live_value_count = 0;
+  state->next_scope_id = 1;
   state->refs.clear();
   state->next_ref_id = 1;
   state->deferreds.clear();
   state->next_deferred_id = 1;
-  state->esc_scopes.clear();
-  state->next_esc_scope_id = 1;
   state->module_wrap_handles.Reset();
   // Bytecode handles own engine resources outside any napi scope (V8
   // Globals / QuickJS JSValue refcounts), so they must be released
@@ -1791,29 +1879,71 @@ extern "C" int snapi_bridge_get_reference_value(SnapiEnvState* env_state, uint32
 }
 
 // ============================================================
-// Handle scopes (escapable)
+// Handle scopes
 // ============================================================
+
+extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  (void)CurrentFrame(*bridge_state);  // materialize the root frame first
+  napi_handle_scope scope = nullptr;
+  napi_status s = napi_open_handle_scope(env, &scope);
+  if (s != napi_ok) return s;
+  ScopeFrame frame;
+  frame.scope = scope;
+  frame.id = bridge_state->next_scope_id++;
+  if (frame.id == 0) frame.id = bridge_state->next_scope_id++;
+  bridge_state->scope_frames.push_back(std::move(frame));
+  *scope_out = bridge_state->scope_frames.back().id;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_close_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  const int idx = FindFrameById(*bridge_state, scope_id);
+  if (idx < 0 || bridge_state->scope_frames[idx].scope == nullptr) {
+    return napi_invalid_arg;
+  }
+  // LIFO discipline: only the innermost frame may close. Implicit callback
+  // frames have id 0 and can never match, so a guest cannot close past them.
+  if (static_cast<size_t>(idx) != bridge_state->scope_frames.size() - 1) {
+    return napi_handle_scope_mismatch;
+  }
+  PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+  return napi_ok;
+}
 
 extern "C" int snapi_bridge_open_escapable_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  napi_escapable_handle_scope scope;
+  (void)CurrentFrame(*bridge_state);  // materialize the root frame first
+  napi_escapable_handle_scope scope = nullptr;
   napi_status s = napi_open_escapable_handle_scope(env, &scope);
   if (s != napi_ok) return s;
-  *scope_out = StoreEscScope(*bridge_state, scope);
+  ScopeFrame frame;
+  frame.esc_scope = scope;
+  frame.id = bridge_state->next_scope_id++;
+  if (frame.id == 0) frame.id = bridge_state->next_scope_id++;
+  bridge_state->scope_frames.push_back(std::move(frame));
+  *scope_out = bridge_state->scope_frames.back().id;
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_close_escapable_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  napi_escapable_handle_scope scope = LoadEscScope(*bridge_state, scope_id);
-  if (!scope) return napi_invalid_arg;
-  napi_status s = napi_close_escapable_handle_scope(env, scope);
-  if (s == napi_ok) RemoveEscScope(*bridge_state, scope_id);
-  return s;
+  const int idx = FindFrameById(*bridge_state, scope_id);
+  if (idx < 0 || bridge_state->scope_frames[idx].esc_scope == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (static_cast<size_t>(idx) != bridge_state->scope_frames.size() - 1) {
+    return napi_handle_scope_mismatch;
+  }
+  PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t scope_id,
@@ -1822,13 +1952,19 @@ extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t sco
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  napi_escapable_handle_scope scope = LoadEscScope(*bridge_state, scope_id);
+  const int idx = FindFrameById(*bridge_state, scope_id);
+  // The escaped Local is created in the scope enclosing the escapable one, so
+  // its id must be owned by the parent frame; require one to exist.
+  if (idx <= 0 || bridge_state->scope_frames[idx].esc_scope == nullptr) {
+    return napi_invalid_arg;
+  }
   napi_value escapee = LoadValue(*bridge_state, escapee_id);
-  if (!scope || !escapee) return napi_invalid_arg;
-  napi_value result;
-  napi_status s = napi_escape_handle(env, scope, escapee, &result);
+  if (!escapee) return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status s =
+      napi_escape_handle(env, bridge_state->scope_frames[idx].esc_scope, escapee, &result);
   if (s != napi_ok) return s;
-  *out_id = StoreValue(*bridge_state, result);
+  *out_id = StoreValueInFrame(*bridge_state, result, bridge_state->scope_frames[idx - 1]);
   return napi_ok;
 }
 
@@ -2394,16 +2530,38 @@ struct WasmInterruptRequest {
   uint32_t callback_arg;
 };
 
-void WasmInterruptCallback(napi_env /*env*/, void* raw) {
+void WasmInterruptCallback(napi_env env, void* raw) {
   auto* request = static_cast<WasmInterruptRequest*>(raw);
   if (request == nullptr) return;
+  auto* bridge_state = LookupEnvState(request->state);
   void* callback_ctx =
-      request->state != nullptr
-          ? request->state->active_callback_ctx.load(std::memory_order_acquire)
+      bridge_state != nullptr
+          ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
           : nullptr;
   if (callback_ctx != nullptr) {
+    // Own the ids the guest mints while servicing the interrupt (no return
+    // value to escape, so a plain frame suffices).
+    napi_handle_scope interrupt_scope = nullptr;
+    if (env != nullptr &&
+        napi_open_handle_scope(env, &interrupt_scope) == napi_ok &&
+        interrupt_scope != nullptr) {
+      (void)CurrentFrame(*bridge_state);
+      ScopeFrame frame;
+      frame.scope = interrupt_scope;
+      bridge_state->scope_frames.push_back(std::move(frame));
+    }
     snapi_host_invoke_wasm_callback(
         callback_ctx, request->guest_env, request->wasm_fn_ptr, request->callback_arg);
+    if (interrupt_scope != nullptr) {
+      while (bridge_state->scope_frames.size() > 1 &&
+             bridge_state->scope_frames.back().scope != interrupt_scope) {
+        PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+      }
+      if (!bridge_state->scope_frames.empty() &&
+          bridge_state->scope_frames.back().scope == interrupt_scope) {
+        PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+      }
+    }
   }
   delete request;
 }
@@ -2450,6 +2608,18 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
     return undef;
   }
 
+  // Implicit per-callback scope: ids minted while the guest services this
+  // callback (arguments, intermediates, the return id) die when it returns,
+  // matching N-API semantics. Escapable so the return value can be handed
+  // back to V8's trampoline in the enclosing scope.
+  (void)CurrentFrame(*bridge_state);
+  napi_escapable_handle_scope cb_scope = nullptr;
+  if (napi_open_escapable_handle_scope(env, &cb_scope) == napi_ok && cb_scope != nullptr) {
+    ScopeFrame frame;
+    frame.esc_scope = cb_scope;
+    bridge_state->scope_frames.push_back(std::move(frame));
+  }
+
   // Call Rust trampoline → WASM callback
   const uint32_t wasm_fn_ptr =
       (it->second.wasm_setter_fn_ptr != 0 && argc > 0)
@@ -2462,6 +2632,27 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
   bridge_state->callback_invocations.erase(cbinfo_id);
 
   napi_value result = LoadValue(*bridge_state, result_id);
+  if (cb_scope != nullptr) {
+    // Force-close any scopes the guest left unbalanced so LIFO holds, then
+    // escape the return value into the enclosing scope and pop our frame.
+    while (bridge_state->scope_frames.size() > 1 &&
+           bridge_state->scope_frames.back().esc_scope != cb_scope) {
+      PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+    }
+    if (!bridge_state->scope_frames.empty() &&
+        bridge_state->scope_frames.back().esc_scope == cb_scope) {
+      if (result != nullptr) {
+        napi_value escaped = nullptr;
+        if (napi_escape_handle(env, cb_scope, result, &escaped) == napi_ok &&
+            escaped != nullptr) {
+          result = escaped;
+        } else {
+          result = nullptr;
+        }
+      }
+      PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+    }
+  }
   if (!result) {
     napi_get_undefined(env, &result);
   }
@@ -2617,6 +2808,22 @@ extern "C" int snapi_bridge_unofficial_set_host_allocation_budget_callback(
   }
   return unofficial_napi_set_allocation_budget_hook(env_state->env,
                                                     const_cast<void*>(data));
+}
+
+// Debug/diagnostics: live count of slot-table entries (leak assertions).
+extern "C" uint64_t snapi_bridge_unofficial_get_live_value_count(SnapiEnvState* env_state) {
+  auto* bridge_state = LookupEnvState(env_state);
+  return bridge_state != nullptr
+             ? static_cast<uint64_t>(bridge_state->live_value_count)
+             : 0;
+}
+
+// True if `id` still resolves. Used by the Rust layer to prune stale
+// guest-memory data-pointer mappings keyed by value id.
+extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id) {
+  auto* bridge_state = LookupEnvState(env_state);
+  if (bridge_state == nullptr) return 0;
+  return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState* env_state,

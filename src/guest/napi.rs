@@ -83,6 +83,33 @@ fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
     env.data().resolve_napi_env(guest_env)
 }
 
+/// Drops `guest_data_ptrs` entries whose value ids no longer resolve in any
+/// registered env. Value ids are scope-bound; once a handle scope closes its
+/// ids go stale and their data-pointer mappings would otherwise accumulate.
+/// Amortized: runs only when the map has grown past a floor since last prune.
+fn prune_stale_guest_data_ptrs(env: &mut FunctionEnvMut<NapiEnv>, _guest_env: i32) {
+    const PRUNE_MIN: usize = 1024;
+    let state = env.data();
+    if state.guest_data_ptrs.len() < state.guest_data_ptrs_prune_floor {
+        return;
+    }
+    let envs: Vec<SnapiEnv> = state.napi_envs.values().map(|&p| p as SnapiEnv).collect();
+    let stale: Vec<u32> = state
+        .guest_data_ptrs
+        .keys()
+        .copied()
+        .filter(|&id| {
+            envs.iter()
+                .all(|&se| unsafe { snapi_bridge_value_id_alive(se, id) } == 0)
+        })
+        .collect();
+    let state = env.data_mut();
+    for id in stale {
+        state.guest_data_ptrs.remove(&id);
+    }
+    state.guest_data_ptrs_prune_floor = PRUNE_MIN.max(state.guest_data_ptrs.len() * 2);
+}
+
 fn write_guest_pod<T>(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32, value: &T) -> bool {
     if guest_ptr <= 0 {
         return false;
@@ -3760,11 +3787,20 @@ fn guest_napi_get_reference_value(
 
 // --- Handle scopes ---
 
-fn guest_napi_open_handle_scope(_env: FunctionEnvMut<NapiEnv>, _e: i32, _rp: i32) -> i32 {
-    0
+fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
+    let mut scope_id: u32 = 0;
+    let s = unsafe { snapi_bridge_open_handle_scope(snapi_env(&env, e), &mut scope_id) };
+    if s == 0 {
+        write_guest_u32(&mut env, rp as u32, scope_id);
+    }
+    s
 }
-fn guest_napi_close_handle_scope(_env: FunctionEnvMut<NapiEnv>, _e: i32, _scope: i32) -> i32 {
-    0
+fn guest_napi_close_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
+    let s = unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) };
+    if s == 0 {
+        prune_stale_guest_data_ptrs(&mut env, e);
+    }
+    s
 }
 
 fn guest_napi_open_escapable_handle_scope(
