@@ -8,7 +8,10 @@ resolver = "2"
 
 [features]
 # Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
-wasix = ["dep:wasmer-wasix"]
+# `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
+# trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
+# not activate the dependency.
+wasix = []
 cli = [
   "wasix",
   "dep:wasmer-cache",
@@ -37,7 +40,10 @@ wasmer-cache = { version = "=7.2.1", path = "../cache", optional = true }
 wasmer-c-api-imports = { version = "=7.2.1", path = "../c-api-imports", optional = true, default-features = false }
 wasmer-compiler-llvm = { version = "=7.2.1", path = "../compiler-llvm", optional = true }
 wasmer-types = { version = "=7.2.1", path = "../types", optional = true }
-wasmer-wasix = { version = "=0.702.1", path = "../wasix", optional = true }
+# Non-optional: the guest callback trampoline re-raises guest WASI process
+# exits (`WasiError::Exit`) through the N-API import layers, so `mod guest`
+# (always compiled) needs the WASIX error type in every build.
+wasmer-wasix = { version = "=0.702.1", path = "../wasix" }
 virtual-fs = { version = "=0.702.1", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
