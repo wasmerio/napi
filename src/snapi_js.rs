@@ -80,6 +80,10 @@ const wasmerNapiHostTurnChannel =
   typeof globalThis.MessageChannel === 'function' ? new globalThis.MessageChannel() : undefined;
 if (wasmerNapiHostTurnChannel !== undefined) {
   wasmerNapiHostTurnChannel.port1.onmessage = () => wasmerNapiHostTurnQueue.shift()?.();
+  // Node MessagePorts keep their worker alive by default. The SDK worker pool
+  // owns that lifetime; this scheduling channel must not outlive the pool.
+  wasmerNapiHostTurnChannel.port1.unref?.();
+  wasmerNapiHostTurnChannel.port2.unref?.();
 }
 export function wasmer_napi_yield_to_host_event_loop() {
   return new Promise((resolve) => {
