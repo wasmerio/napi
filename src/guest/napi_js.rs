@@ -3799,6 +3799,16 @@ fn guest_node_api_set_prototype(
 
 // --- TypedArray ---
 
+fn typedarray_element_size(typ: i32) -> usize {
+    match typ {
+        0..=2 => 1,
+        3 | 4 | 13 | 14 => 2,
+        5 | 6 | 15 | 16 => 4,
+        7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => 8,
+        _ => 1,
+    }
+}
+
 fn guest_napi_create_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3820,6 +3830,34 @@ fn guest_napi_create_typedarray(
         )
     };
     if s == 0 {
+        // A TypedArray view shares its ArrayBuffer's guest-side copy. Record
+        // that alias immediately so a reference to the view keeps the backing
+        // copy coherent for later native writes. Without this, long-lived
+        // native pointers (for example Node's streamBaseState) are dropped at
+        // the first JS callback boundary and JavaScript observes stale bytes.
+        let byte_len = (length.max(0) as usize).saturating_mul(typedarray_element_size(typ));
+        let backing_store_token = host_backing_store_token(&env, e, out);
+        let guest_ptr = if backing_store_token != 0 {
+            resolve_guest_backing_store_token(
+                env.data(),
+                e as u32,
+                out,
+                backing_store_token,
+                0,
+                byte_len,
+            )
+        } else {
+            env.data()
+                .guest_data_ptrs
+                .get(&(e as u32, ab as u32))
+                .copied()
+                .and_then(|base| base.checked_add(offset.max(0) as u32))
+        };
+        if let Some(guest_ptr) = guest_ptr {
+            env.data_mut()
+                .guest_data_ptrs
+                .insert((e as u32, out), guest_ptr);
+        }
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
@@ -3862,13 +3900,7 @@ fn guest_napi_get_typedarray_info(
             write_guest_u32(&mut env, lp as u32, len);
         }
         if dp > 0 {
-            let elem_size = match typ {
-                0..=2 => 1usize,
-                3 | 4 | 13 | 14 => 2usize,
-                5 | 6 | 15 | 16 => 4usize,
-                7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => 8usize,
-                _ => 1usize,
-            };
+            let elem_size = typedarray_element_size(typ);
             let byte_len = len as usize * elem_size;
             if let Some(guest_data_ptr) = resolve_current_host_data_to_guest(
                 &mut env,
@@ -3998,12 +4030,18 @@ fn guest_napi_create_reference(
                 .data_mut()
                 .host_buffer_copies
                 .iter_mut()
-                .find(|mapping| mapping.guest_env == e as u32 && mapping.guest_ptr == guest_ptr)
+                .find(|mapping| {
+                    let mapping_end = mapping.guest_ptr.saturating_add(mapping.byte_len as u32);
+                    mapping.guest_env == e as u32
+                        && guest_ptr >= mapping.guest_ptr
+                        && guest_ptr < mapping_end
+                })
         {
             mapping.reference_holds = mapping.reference_holds.saturating_add(1);
+            let backing_guest_ptr = mapping.guest_ptr;
             env.data_mut()
                 .host_buffer_reference_holds
-                .insert((e as u32, ref_id), guest_ptr);
+                .insert((e as u32, ref_id), backing_guest_ptr);
         }
         write_guest_u32(&mut env, rp as u32, ref_id);
     }
