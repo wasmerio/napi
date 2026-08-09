@@ -144,12 +144,21 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
   const target = context.scopeTarget;
   for (const key of Reflect.ownKeys(target)) {
     if (key === 'global' || key === 'globalThis') continue;
+    // Host scheduling primitives intentionally stay local to each N-API
+    // context. Edge replaces some of them (notably setTimeout and
+    // queueMicrotask) with Node-compatible implementations, while the worker
+    // global must retain the originals for JSPI and wasm-bindgen scheduling.
+    if (wasmerNapiHostSchedulingGlobals.has(key)) continue;
     if (!Object.prototype.hasOwnProperty.call(snapshot, key)) {
       try { delete target[key]; } catch {}
     }
   }
   for (const key of Reflect.ownKeys(snapshot)) {
     if (key === 'global' || key === 'globalThis') continue;
+    if (wasmerNapiHostSchedulingGlobals.has(key) &&
+        Object.prototype.hasOwnProperty.call(target, key)) {
+      continue;
+    }
     try {
       const descriptor = snapshot[key];
       const targetDescriptor = {
