@@ -1,5 +1,17 @@
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub mod callback;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+#[path = "callback_js.rs"]
+pub mod callback;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub mod napi;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+#[path = "napi_js.rs"]
+pub mod napi;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub mod util;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+#[path = "util_js.rs"]
 pub mod util;
 
 pub const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;

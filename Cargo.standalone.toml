@@ -7,6 +7,7 @@ license = "MIT"
 resolver = "2"
 
 [features]
+js = ["dep:js-sys", "dep:wasm-bindgen", "wasmer/js-default"]
 # Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
 # `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
 # trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
@@ -18,7 +19,7 @@ cli = [
   "dep:wasmer-compiler-llvm",
   "dep:wasmer-c-api-imports",
   "wasmer-c-api-imports/llvm",
-  "wasmer-c-api-imports/wasix",
+  "wasmer-c-api-imports/wasi",
   "dep:tokio",
   "dep:virtual-fs",
   "dep:wasmer-types",
@@ -26,22 +27,28 @@ cli = [
 
 [dependencies]
 anyhow = "1"
-# Keep the standalone crates.io build on the 0.701 / 7.1 family. The vendored
-# manifest can track local 0.702 / 7.2 path crates, but crates.io 7.2 currently
-# requires rustc 1.92 while this standalone workflow is expected to run on 1.91.
-wasmer = { version = "=7.2.1" }
+# Keep standalone builds on the same active Wasmer checkout as the SDK build.
+wasmer = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/api", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { version = "=7.2.1", optional = true }
-wasmer-c-api-imports = { version = "=7.2.1", optional = true, default-features = false }
-wasmer-compiler-llvm = { version = "=7.2.1", optional = true }
-wasmer-types = { version = "=7.2.1", optional = true }
+wasmer-cache = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/cache", optional = true }
+wasmer-c-api-imports = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/c-api-imports", optional = true, default-features = false }
+wasmer-compiler-llvm = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/compiler-llvm", optional = true }
+wasmer-types = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/types", optional = true }
 # Non-optional: `mod guest` (always compiled) re-raises guest WASI process
 # exits through the N-API import layers and needs the WASIX error type.
-wasmer-wasix = { version = "=0.702.1" }
-virtual-fs = { version = "=0.702.1", optional = true }
+virtual-fs = { version = "=0.702.1", path = "/Users/syrusakbary/Development/wasmer/lib/virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2.120", optional = true }
+wasmer-wasix = { version = "=0.702.1", path = "/Users/syrusakbary/Development/wasmer/lib/wasix", default-features = false, features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmer = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasmer/lib/api", default-features = false, features = ["sys-default"] }
+wasmer-wasix = { version = "=0.702.1", path = "/Users/syrusakbary/Development/wasmer/lib/wasix", default-features = false, features = ["sys"] }
 
 [build-dependencies]
 cc = "1"

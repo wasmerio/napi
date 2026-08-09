@@ -91,6 +91,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(
 // Unofficial/test-only helper. Runs a checkpoint on the current context's
 // microtask queue.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
+// Yield one host event-loop turn. The host-JavaScript backend suspends through
+// JSPI and drains callbacks that arrived while the guest was suspended.
+// Embedded engines may implement this as an ordinary task checkpoint.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_yield_to_host_event_loop(napi_env env);
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must

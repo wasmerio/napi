@@ -68,6 +68,7 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_process_microtasks(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
         env: SnapiEnv,
@@ -281,6 +282,17 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_serialize_value(
+        env: SnapiEnv,
+        value_id: u32,
+        payload_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_deserialize_value(
+        env: SnapiEnv,
+        payload: u32,
+        value_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_release_serialized_value(payload: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(
@@ -932,6 +944,14 @@ unsafe extern "C" {
         data_out: *mut u64,
         length_out: *mut u32,
         backing_store_token_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
+    -> i32;
+    pub fn snapi_bridge_overwrite_value_bytes(
+        env: SnapiEnv,
+        id: u32,
+        data: *const core::ffi::c_void,
+        len: u32,
     ) -> i32;
     // Node version
     pub fn snapi_bridge_get_node_version(

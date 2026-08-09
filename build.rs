@@ -37,6 +37,16 @@ enum ExtraLink {
 }
 
 fn main() {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "wasm32" {
+        if env::var_os("CARGO_FEATURE_JS").is_none() {
+            panic!("wasmer-napi on wasm32 requires the `js` feature");
+        }
+        // The wasm32 backend is implemented in Rust with wasm-bindgen and must
+        // not download, build, or link the native V8 bridge.
+        return;
+    }
+
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=lib/src");
