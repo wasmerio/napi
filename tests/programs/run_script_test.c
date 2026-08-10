@@ -132,5 +132,36 @@ int main(void) {
   CHECK_OR_FAIL(marker == 2131,
                 "buffer lease did not publish writes after scope closure");
 
+  // Environment teardown owns the failure/cancellation path for outstanding
+  // leases. It must discard the snapshot and host reference without requiring
+  // a scope-bound value or an explicit release from already-destroyed Edge
+  // state.
+  napi_env lease_env = NULL;
+  void* lease_env_scope = NULL;
+  NAPI_CALL(env, unofficial_napi_create_env(8, &lease_env, &lease_env_scope));
+  napi_value abandoned_script;
+  napi_value abandoned_value;
+  NAPI_CALL(lease_env,
+            napi_create_string_utf8(lease_env,
+                                    "new Uint8Array([1, 2, 3, 4])",
+                                    NAPI_AUTO_LENGTH,
+                                    &abandoned_script));
+  NAPI_CALL(lease_env,
+            napi_run_script(lease_env, abandoned_script, &abandoned_value));
+  unofficial_napi_buffer_lease abandoned_lease = NULL;
+  void* abandoned_data = NULL;
+  NAPI_CALL(lease_env,
+            unofficial_napi_acquire_buffer_lease(
+                lease_env,
+                abandoned_value,
+                0,
+                4,
+                unofficial_napi_buffer_access_read,
+                &abandoned_lease,
+                &abandoned_data));
+  CHECK_OR_FAIL(abandoned_lease != NULL && abandoned_data != NULL,
+                "failed to acquire teardown lease");
+  NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope));
+
   return PrintSuccess("RUN_SCRIPT_TEST");
 }

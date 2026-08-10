@@ -36,13 +36,6 @@ pub(crate) struct HostBufferCopy {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-pub(crate) struct ManagedBufferAccess {
-    pub(crate) byte_offset: u32,
-    pub(crate) byte_len: u32,
-    pub(crate) writable: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) struct HostBufferLease {
     pub(crate) guest_ptr: u32,
     pub(crate) byte_offset: u32,
@@ -156,8 +149,6 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_reference_holds: HashMap<(u32, u32), u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    pub(crate) managed_buffer_accesses: HashMap<(u32, u32), ManagedBufferAccess>,
-    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) next_buffer_lease_id: u32,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_leases: HashMap<(u32, u32), HostBufferLease>,
@@ -206,8 +197,6 @@ impl NapiEnv {
             host_buffer_handle_scopes: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_reference_holds: HashMap::new(),
-            #[cfg(all(target_arch = "wasm32", feature = "js"))]
-            managed_buffer_accesses: HashMap::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             next_buffer_lease_id: 1,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -350,11 +339,57 @@ impl NapiEnv {
         (env_id, scope_id)
     }
 
+    fn discard_buffer_leases_for_env(&mut self, env_id: u32) {
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        {
+            let lease_ids: Vec<(u32, u32)> = self
+                .host_buffer_leases
+                .keys()
+                .filter(|(lease_env_id, _)| *lease_env_id == env_id)
+                .copied()
+                .collect();
+            for lease_id in lease_ids {
+                let Some(lease) = self.host_buffer_leases.remove(&lease_id) else {
+                    continue;
+                };
+                if lease.guest_ptr != 0
+                    && let Some(capacity) = self.guest_buffer_capacities.remove(&lease.guest_ptr)
+                {
+                    self.guest_buffer_pool.push((lease.guest_ptr, capacity));
+                }
+            }
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            let lease_ids: Vec<(u32, u32)> = self
+                .native_buffer_leases
+                .keys()
+                .filter(|(lease_env_id, _)| *lease_env_id == env_id)
+                .copied()
+                .collect();
+            for lease_id in lease_ids {
+                let Some(lease) = self.native_buffer_leases.remove(&lease_id) else {
+                    continue;
+                };
+                if lease.copied
+                    && let Some(heap) = self.guest_heap.as_ref()
+                {
+                    heap.free_offset(lease.guest_ptr);
+                }
+            }
+        }
+    }
+
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
         }
+        // Leases are environment-owned resources. Explicit release publishes
+        // writes; environment teardown only discards snapshots and returns any
+        // guest allocations because the JavaScript value is being destroyed.
+        self.discard_buffer_leases_for_env(env_id);
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {

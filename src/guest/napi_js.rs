@@ -5594,63 +5594,6 @@ fn guest_napi_get_buffer_info(
     0
 }
 
-fn guest_unofficial_napi_acquire_buffer_access(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    byte_offset: i32,
-    byte_length: i32,
-    mode: i32,
-    data_out: i32,
-) -> i32 {
-    if byte_offset < 0 || byte_length < 0 || data_out <= 0 || mode & !3 != 0 || mode == 0 {
-        return 1;
-    }
-    let snapi = snapi_env(&env, e);
-    let (value_len, _) = match crate::snapi_js::get_value_byte_length_and_token(snapi, vh as u32) {
-        Ok(info) => info,
-        Err(status) => return status,
-    };
-    let offset = byte_offset as u32;
-    let len = byte_length as u32;
-    if offset > value_len || len > value_len - offset {
-        return 1;
-    }
-
-    let Some(guest_ptr) = allocate_guest_buffer(&mut env, len as usize) else {
-        return 9;
-    };
-    if mode & 1 != 0 && len > 0 {
-        let Some(memory) = env.data().memory.clone() else {
-            recycle_guest_allocation(&mut env, guest_ptr);
-            return 9;
-        };
-        let memory_buffer = memory.as_js().js_buffer();
-        let status = crate::snapi_js::copy_value_range_to_memory(
-            snapi,
-            vh as u32,
-            &memory_buffer,
-            guest_ptr,
-            offset,
-            len,
-        );
-        if status != 0 {
-            recycle_guest_allocation(&mut env, guest_ptr);
-            return status;
-        }
-    }
-    env.data_mut().managed_buffer_accesses.insert(
-        (e as u32, guest_ptr),
-        crate::env::ManagedBufferAccess {
-            byte_offset: offset,
-            byte_len: len,
-            writable: mode & 2 != 0,
-        },
-    );
-    write_guest_u32(&mut env, data_out as u32, guest_ptr);
-    0
-}
-
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -5773,44 +5716,6 @@ fn guest_unofficial_napi_release_buffer_lease(
     let delete_status = unsafe { snapi_bridge_delete_reference(snapi, lease.host_reference_id) };
     recycle_guest_allocation(&mut env, lease.guest_ptr);
     if status != 0 { status } else { delete_status }
-}
-
-fn guest_unofficial_napi_release_buffer_access(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    vh: i32,
-    guest_ptr: i32,
-    modified: i32,
-) -> i32 {
-    if guest_ptr <= 0 {
-        return 1;
-    }
-    let Some(access) = env
-        .data_mut()
-        .managed_buffer_accesses
-        .remove(&(e as u32, guest_ptr as u32))
-    else {
-        return 1;
-    };
-
-    let mut status = 0;
-    if access.writable && modified != 0 && access.byte_len > 0 {
-        let Some(memory) = env.data().memory.clone() else {
-            recycle_guest_allocation(&mut env, guest_ptr as u32);
-            return 9;
-        };
-        let memory_buffer = memory.as_js().js_buffer();
-        status = crate::snapi_js::copy_memory_range_to_value(
-            snapi_env(&env, e),
-            vh as u32,
-            &memory_buffer,
-            guest_ptr as u32,
-            access.byte_offset,
-            access.byte_len,
-        );
-    }
-    recycle_guest_allocation(&mut env, guest_ptr as u32);
-    status
 }
 
 fn guest_unofficial_napi_create_guest_backed_typedarray(
@@ -6375,8 +6280,6 @@ pub fn register_napi_imports(
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_process_microtasks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_process_microtasks_sync),
         "unofficial_napi_yield_to_host_event_loop" => yield_to_host_import(store, fe),
-        "unofficial_napi_acquire_buffer_access" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_access),
-        "unofficial_napi_release_buffer_access" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_access),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),

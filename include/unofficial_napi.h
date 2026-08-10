@@ -122,18 +122,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_lease(
     void** data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_buffer_lease(
     napi_env env, unofficial_napi_buffer_lease lease, bool modified);
-// Compatibility API. New retained-pointer users should use the opaque lease
-// above so value lifetime and copy-back do not depend on reconstructing a
-// scope-bound napi_value at release time.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_access(
-    napi_env env,
-    napi_value value,
-    size_t byte_offset,
-    size_t byte_length,
-    unofficial_napi_buffer_access_mode mode,
-    void** data);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_buffer_access(
-    napi_env env, napi_value value, void* data, bool modified);
 // Creates a TypedArray whose backing store is guest WebAssembly memory. This
 // is for native/JavaScript control blocks that require true shared visibility;
 // bulk host-owned data should use scoped buffer access instead.
