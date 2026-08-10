@@ -5651,6 +5651,130 @@ fn guest_unofficial_napi_acquire_buffer_access(
     0
 }
 
+fn guest_unofficial_napi_acquire_buffer_lease(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    vh: i32,
+    byte_offset: i32,
+    byte_length: i32,
+    mode: i32,
+    lease_out: i32,
+    data_out: i32,
+) -> i32 {
+    if byte_offset < 0
+        || byte_length < 0
+        || lease_out <= 0
+        || data_out <= 0
+        || mode & !3 != 0
+        || mode == 0
+    {
+        return 1;
+    }
+    let snapi = snapi_env(&env, e);
+    let (value_len, _) = match crate::snapi_js::get_value_byte_length_and_token(snapi, vh as u32) {
+        Ok(info) => info,
+        Err(status) => return status,
+    };
+    let offset = byte_offset as u32;
+    let len = byte_length as u32;
+    if offset > value_len || len > value_len - offset {
+        return 1;
+    }
+
+    let Some(guest_ptr) = allocate_guest_buffer(&mut env, len as usize) else {
+        return 9;
+    };
+    if mode & 1 != 0 && len > 0 {
+        let Some(memory) = env.data().memory.clone() else {
+            recycle_guest_allocation(&mut env, guest_ptr);
+            return 9;
+        };
+        let status = crate::snapi_js::copy_value_range_to_memory(
+            snapi,
+            vh as u32,
+            &memory.as_js().js_buffer(),
+            guest_ptr,
+            offset,
+            len,
+        );
+        if status != 0 {
+            recycle_guest_allocation(&mut env, guest_ptr);
+            return status;
+        }
+    }
+
+    let mut host_reference_id = 0u32;
+    let status =
+        unsafe { snapi_bridge_create_reference(snapi, vh as u32, 1, &mut host_reference_id) };
+    if status != 0 {
+        recycle_guest_allocation(&mut env, guest_ptr);
+        return status;
+    }
+
+    let lease_id = env.data().next_buffer_lease_id.max(1);
+    env.data_mut().next_buffer_lease_id = lease_id.wrapping_add(1).max(1);
+    if env
+        .data_mut()
+        .host_buffer_leases
+        .insert(
+            (e as u32, lease_id),
+            crate::env::HostBufferLease {
+                guest_ptr,
+                byte_offset: offset,
+                byte_len: len,
+                writable: mode & 2 != 0,
+                host_reference_id,
+            },
+        )
+        .is_some()
+    {
+        let _ = unsafe { snapi_bridge_delete_reference(snapi, host_reference_id) };
+        recycle_guest_allocation(&mut env, guest_ptr);
+        return 9;
+    }
+    write_guest_u32(&mut env, lease_out as u32, lease_id);
+    write_guest_u32(&mut env, data_out as u32, guest_ptr);
+    0
+}
+
+fn guest_unofficial_napi_release_buffer_lease(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    lease_id: i32,
+    modified: i32,
+) -> i32 {
+    if lease_id <= 0 {
+        return 1;
+    }
+    let Some(lease) = env
+        .data_mut()
+        .host_buffer_leases
+        .remove(&(e as u32, lease_id as u32))
+    else {
+        return 1;
+    };
+    let snapi = snapi_env(&env, e);
+    let mut status = 0;
+    if lease.writable && modified != 0 && lease.byte_len > 0 {
+        let Some(memory) = env.data().memory.clone() else {
+            recycle_guest_allocation(&mut env, lease.guest_ptr);
+            let _ = unsafe { snapi_bridge_delete_reference(snapi, lease.host_reference_id) };
+            return 9;
+        };
+        status = crate::snapi_js::copy_memory_range_to_reference(
+            snapi,
+            lease.host_reference_id,
+            &memory.as_js().js_buffer(),
+            lease.guest_ptr,
+            lease.byte_offset,
+            lease.byte_len,
+        );
+    }
+    let delete_status = unsafe { snapi_bridge_delete_reference(snapi, lease.host_reference_id) };
+    recycle_guest_allocation(&mut env, lease.guest_ptr);
+    if status != 0 { status } else { delete_status }
+}
+
 fn guest_unofficial_napi_release_buffer_access(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -6253,6 +6377,8 @@ pub fn register_napi_imports(
         "unofficial_napi_yield_to_host_event_loop" => yield_to_host_import(store, fe),
         "unofficial_napi_acquire_buffer_access" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_access),
         "unofficial_napi_release_buffer_access" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_access),
+        "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
+        "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
         "unofficial_napi_request_gc_for_testing" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_gc_for_testing),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),

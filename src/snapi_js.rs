@@ -1525,6 +1525,37 @@ pub(crate) fn copy_memory_range_to_value(
     NAPI_OK
 }
 
+pub(crate) fn copy_memory_range_to_reference(
+    env: SnapiEnv,
+    reference_id: u32,
+    memory_buffer: &JsValue,
+    guest_ptr: u32,
+    byte_offset: u32,
+    byte_len: u32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(reference) = state.references.get(&reference_id) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = reference.strong.as_ref() else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(destination) = value_byte_view(value) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(end) = byte_offset.checked_add(byte_len) else {
+        return NAPI_INVALID_ARG;
+    };
+    if end > destination.length() {
+        return NAPI_INVALID_ARG;
+    }
+    let source = Uint8Array::new_with_byte_offset_and_length(memory_buffer, guest_ptr, byte_len);
+    destination.subarray(byte_offset, end).set(&source, 0);
+    NAPI_OK
+}
+
 unsafe fn put_value(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;

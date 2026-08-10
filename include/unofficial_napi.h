@@ -108,6 +108,23 @@ typedef enum unofficial_napi_buffer_access_mode {
   unofficial_napi_buffer_access_write = 2,
   unofficial_napi_buffer_access_readwrite = 3,
 } unofficial_napi_buffer_access_mode;
+// Opaque ownership token for an exact native byte range. The token retains the
+// JavaScript value and any provider-owned snapshot until release; callers must
+// not derive the token from the returned data pointer or inspect its contents.
+typedef struct unofficial_napi_buffer_lease__* unofficial_napi_buffer_lease;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_lease(
+    napi_env env,
+    napi_value value,
+    size_t byte_offset,
+    size_t byte_length,
+    unofficial_napi_buffer_access_mode mode,
+    unofficial_napi_buffer_lease* lease,
+    void** data);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_buffer_lease(
+    napi_env env, unofficial_napi_buffer_lease lease, bool modified);
+// Compatibility API. New retained-pointer users should use the opaque lease
+// above so value lifetime and copy-back do not depend on reconstructing a
+// scope-bound napi_value at release time.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_access(
     napi_env env,
     napi_value value,

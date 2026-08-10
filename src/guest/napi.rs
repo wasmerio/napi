@@ -4872,6 +4872,173 @@ fn guest_napi_get_buffer_info(
     0
 }
 
+fn guest_unofficial_napi_acquire_buffer_lease(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    value: i32,
+    byte_offset: i32,
+    byte_length: i32,
+    mode: i32,
+    lease_out: i32,
+    data_out: i32,
+) -> i32 {
+    if value <= 0
+        || byte_offset < 0
+        || byte_length < 0
+        || lease_out <= 0
+        || data_out <= 0
+        || mode & !3 != 0
+        || mode == 0
+    {
+        return 1;
+    }
+    let mut lease_id = 0u32;
+    let mut host_ptr = 0u64;
+    let status = unsafe {
+        snapi_bridge_unofficial_acquire_buffer_lease(
+            snapi_env(&env, e),
+            value as u32,
+            byte_offset as u32,
+            byte_length as u32,
+            mode,
+            &mut lease_id,
+            &mut host_ptr,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+
+    let byte_len = byte_length as usize;
+    let direct_guest_ptr = if byte_len == 0 {
+        Some(0)
+    } else {
+        host_ptr_to_guest_ptr(&mut env, host_ptr)
+    };
+    let (guest_ptr, copied) = if let Some(ptr) = direct_guest_ptr {
+        (ptr, false)
+    } else {
+        let Some(heap) = env.data().guest_heap.clone() else {
+            let _ = unsafe {
+                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+            };
+            return 9;
+        };
+        let Some(ptr) = heap.alloc(byte_len, false) else {
+            let _ = unsafe {
+                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+            };
+            return 9;
+        };
+        if mode & 1 != 0 {
+            let source = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, byte_len) };
+            if !write_guest_bytes(&mut env, ptr, source) {
+                heap.free_offset(ptr);
+                let _ = unsafe {
+                    snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+                };
+                return 9;
+            }
+        }
+        (ptr, true)
+    };
+
+    env.data_mut().native_buffer_leases.insert(
+        (e as u32, lease_id),
+        crate::env::NativeBufferLease {
+            guest_ptr,
+            host_ptr,
+            byte_len,
+            writable: mode & 2 != 0,
+            copied,
+        },
+    );
+    write_guest_u32(&mut env, lease_out as u32, lease_id);
+    write_guest_u32(&mut env, data_out as u32, guest_ptr);
+    0
+}
+
+fn guest_unofficial_napi_release_buffer_lease(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    lease_id: i32,
+    modified: i32,
+) -> i32 {
+    if lease_id <= 0 {
+        return 1;
+    }
+    let Some(lease) = env
+        .data_mut()
+        .native_buffer_leases
+        .remove(&(e as u32, lease_id as u32))
+    else {
+        return 1;
+    };
+    if lease.copied && lease.writable && modified != 0 && lease.byte_len > 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, lease.guest_ptr as i32, lease.byte_len) else {
+            if let Some(heap) = env.data().guest_heap.as_ref() {
+                heap.free_offset(lease.guest_ptr);
+            }
+            let _ = unsafe {
+                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, 0)
+            };
+            return 9;
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                lease.host_ptr as *mut u8,
+                lease.byte_len,
+            );
+        }
+    }
+    if lease.copied
+        && let Some(heap) = env.data().guest_heap.as_ref()
+    {
+        heap.free_offset(lease.guest_ptr);
+    }
+    unsafe {
+        snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, modified)
+    }
+}
+
+fn guest_unofficial_napi_create_guest_backed_typedarray(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: i32,
+    type_: i32,
+    length: i32,
+    data_out: i32,
+    result_out: i32,
+) -> i32 {
+    if length < 0 || data_out <= 0 || result_out <= 0 {
+        return 1;
+    }
+    let mut host_ptr = 0u64;
+    let mut value_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_create_guest_backed_typedarray(
+            snapi_env(&env, e),
+            type_,
+            length as u32,
+            &mut host_ptr,
+            &mut value_id,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    let guest_ptr = if length == 0 {
+        0
+    } else if let Some(ptr) = host_ptr_to_guest_ptr(&mut env, host_ptr) {
+        ptr
+    } else {
+        return 9;
+    };
+    write_guest_u32(&mut env, data_out as u32, guest_ptr);
+    write_guest_u32(&mut env, result_out as u32, value_id);
+    0
+}
+
 // --- Node version ---
 
 fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
@@ -5397,6 +5564,9 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env_with_loop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env_with_loop),
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_process_microtasks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_process_microtasks),
+        "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
+        "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
+        "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
         "unofficial_napi_request_gc_for_testing" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_gc_for_testing),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),

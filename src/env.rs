@@ -43,11 +43,29 @@ pub(crate) struct ManagedBufferAccess {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct HostBufferLease {
+    pub(crate) guest_ptr: u32,
+    pub(crate) byte_offset: u32,
+    pub(crate) byte_len: u32,
+    pub(crate) writable: bool,
+    pub(crate) host_reference_id: u32,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) struct GuestBackingStoreMapping {
     pub(crate) host_addr: u64,
     pub(crate) guest_ptr: u32,
     pub(crate) byte_len: usize,
     pub(crate) covers_full_backing_store: bool,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct NativeBufferLease {
+    pub(crate) guest_ptr: u32,
+    pub(crate) host_ptr: u64,
+    pub(crate) byte_len: usize,
+    pub(crate) writable: bool,
+    pub(crate) copied: bool,
 }
 
 // FunctionEnv is cloned for WASIX workers, while Edge's guest-side native
@@ -140,7 +158,13 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) managed_buffer_accesses: HashMap<(u32, u32), ManagedBufferAccess>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) next_buffer_lease_id: u32,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_leases: HashMap<(u32, u32), HostBufferLease>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) persistent_callback_contexts: HashMap<u32, Box<CallbackInvocationCtx>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) native_buffer_leases: HashMap<(u32, u32), NativeBufferLease>,
 }
 
 impl NapiEnv {
@@ -185,7 +209,13 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             managed_buffer_accesses: HashMap::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            next_buffer_lease_id: 1,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_leases: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
             persistent_callback_contexts: HashMap::new(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            native_buffer_leases: HashMap::new(),
         }
     }
 

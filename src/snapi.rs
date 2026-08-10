@@ -945,6 +945,27 @@ unsafe extern "C" {
         length_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_acquire_buffer_lease(
+        env: SnapiEnv,
+        value_id: u32,
+        byte_offset: u32,
+        byte_length: u32,
+        mode: i32,
+        lease_out: *mut u32,
+        data_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_release_buffer_lease(
+        env: SnapiEnv,
+        lease_id: u32,
+        modified: i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_create_guest_backed_typedarray(
+        env: SnapiEnv,
+        type_: i32,
+        length: u32,
+        data_out: *mut u64,
+        value_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
     -> i32;
     pub fn snapi_bridge_overwrite_value_bytes(

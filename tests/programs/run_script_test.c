@@ -90,5 +90,47 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope));
 
+  // A memory lease, rather than a scope-bound napi_value or its data pointer,
+  // owns the value and copy-back. Releasing after the handle scope closes is
+  // the contract retained native users such as zlib and async fs require.
+  napi_handle_scope lease_scope = NULL;
+  NAPI_CALL(env, napi_open_handle_scope(env, &lease_scope));
+  napi_value lease_script;
+  napi_value lease_value;
+  NAPI_CALL(env,
+            napi_create_string_utf8(
+                env,
+                "globalThis.__napi_lease_value = new Uint8Array([10, 20, 30, 40])",
+                NAPI_AUTO_LENGTH,
+                &lease_script));
+  NAPI_CALL(env, napi_run_script(env, lease_script, &lease_value));
+
+  unofficial_napi_buffer_lease lease = NULL;
+  uint8_t* lease_data = NULL;
+  NAPI_CALL(env,
+            unofficial_napi_acquire_buffer_lease(
+                env,
+                lease_value,
+                1,
+                2,
+                unofficial_napi_buffer_access_readwrite,
+                &lease,
+                (void**)&lease_data));
+  CHECK_OR_FAIL(lease != NULL && lease_data != NULL,
+                "buffer lease did not return ownership and data");
+  CHECK_OR_FAIL(lease_data[0] == 20 && lease_data[1] == 30,
+                "buffer lease copied the wrong range");
+  lease_data[0] = 21;
+  lease_data[1] = 31;
+  NAPI_CALL(env, napi_close_handle_scope(env, lease_scope));
+  NAPI_CALL(env, unofficial_napi_release_buffer_lease(env, lease, true));
+
+  NAPI_CALL(env,
+            RunInt32Script(env,
+                           "__napi_lease_value[1] * 100 + __napi_lease_value[2]",
+                           &marker));
+  CHECK_OR_FAIL(marker == 2131,
+                "buffer lease did not publish writes after scope closure");
+
   return PrintSuccess("RUN_SCRIPT_TEST");
 }
