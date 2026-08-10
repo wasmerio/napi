@@ -22,7 +22,7 @@
     },
     {
       "name": "run_script_test",
-      "description": "Run JavaScript via napi_run_script and verify results",
+      "description": "Run JavaScript via napi_run_script and verify per-environment global isolation",
       "expected_stdout": "RUN_SCRIPT_TEST_OK=1\n"
     },
     {

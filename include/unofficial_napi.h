@@ -56,17 +56,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_embedder_hooks(
     const unofficial_napi_embedder_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_edge_environment(napi_env env, void* environment);
 NAPI_EXTENSION_WASMER_EXTERN void* unofficial_napi_get_edge_environment(napi_env env);
-using unofficial_napi_env_cleanup_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
     napi_env env,
     unofficial_napi_env_cleanup_callback callback,
     void* data);
-using unofficial_napi_env_destroy_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_env_destroy_callback)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_destroy_callback(
     napi_env env,
     unofficial_napi_env_destroy_callback callback,
     void* data);
-using unofficial_napi_context_token_callback = void (*)(napi_env env, void* token, void* data);
+typedef void (*unofficial_napi_context_token_callback)(napi_env env,
+                                                       void* token,
+                                                       void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_context_token_callbacks(
     napi_env env,
     unofficial_napi_context_token_callback assign_callback,
@@ -136,7 +138,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execut
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_pending_exception(napi_env env,
                                                               napi_value error);
 
-using unofficial_napi_interrupt_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
 // Unofficial helper. Requests execution of a callback on the target env's
 // engine thread at the next interrupt point. The callback runs entered into
@@ -146,14 +148,16 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
     unofficial_napi_interrupt_callback callback,
     void* data);
 
-using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
-using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
-using unofficial_napi_enqueue_foreground_task_callback =
-    napi_status (*)(void* target,
-                    unofficial_napi_foreground_task_callback callback,
-                    void* data,
-                    unofficial_napi_foreground_task_cleanup cleanup,
-                    uint64_t delay_millis);
+typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
+                                                         void* data);
+typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
+                                                        void* data);
+typedef napi_status (*unofficial_napi_enqueue_foreground_task_callback)(
+    void* target,
+    unofficial_napi_foreground_task_callback callback,
+    void* data,
+    unofficial_napi_foreground_task_cleanup cleanup,
+    uint64_t delay_millis);
 
 // Installs the embedder-owned foreground task queue hook for a single env.
 // Engine backends use this to forward engine-originated foreground work into
@@ -180,12 +184,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_promise_hooks(napi_
                                                           napi_value after,
                                                           napi_value resolve);
 
-using unofficial_napi_fatal_error_callback =
-    void (*)(napi_env env, const char* location, const char* message);
-using unofficial_napi_oom_error_callback =
-    void (*)(napi_env env, const char* location, bool is_heap_oom, const char* detail);
-using unofficial_napi_near_heap_limit_callback =
-    size_t (*)(napi_env env, void* data, size_t current_heap_limit, size_t initial_heap_limit);
+typedef void (*unofficial_napi_fatal_error_callback)(napi_env env,
+                                                     const char* location,
+                                                     const char* message);
+typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
+                                                   const char* location,
+                                                   bool is_heap_oom,
+                                                   const char* detail);
+typedef size_t (*unofficial_napi_near_heap_limit_callback)(
+    napi_env env,
+    void* data,
+    size_t current_heap_limit,
+    size_t initial_heap_limit);
 
 // Unofficial helpers for embedder-native fatal/OOM handling.
 // These callbacks run from the engine's fatal error hooks.

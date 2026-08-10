@@ -2302,7 +2302,13 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
     let Some(source) = state.get(script).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
-    match js_sys::eval(&source) {
+    // napi_run_script executes in the environment's context. Evaluating with
+    // js_sys::eval here would instead target the Wasmer worker's real global
+    // realm, allowing Node bootstrap code from one N-API environment to mutate
+    // the SDK scheduler and leak state into every other environment hosted by
+    // that worker.
+    let global = wasmer_napi_global_context_scope(&state.global_context);
+    match wasmer_napi_context_eval(&global, &source) {
         Ok(value) => {
             let id = state.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
