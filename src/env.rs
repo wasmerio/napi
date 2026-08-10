@@ -26,11 +26,20 @@ use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_act
 pub(crate) struct HostBufferCopy {
     pub(crate) guest_env: u32,
     pub(crate) handle_id: u32,
+    pub(crate) host_reference_id: u32,
     pub(crate) backing_store_token: u64,
     pub(crate) guest_ptr: u32,
     pub(crate) byte_len: usize,
     pub(crate) guest_allocation_recyclable: bool,
     pub(crate) reference_holds: u32,
+    pub(crate) needs_flush: bool,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct ManagedBufferAccess {
+    pub(crate) byte_offset: u32,
+    pub(crate) byte_len: u32,
+    pub(crate) writable: bool,
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -125,9 +134,11 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_copy_frames: Vec<usize>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    pub(crate) host_buffer_method_frames: Vec<usize>,
+    pub(crate) host_buffer_handle_scopes: Vec<(u32, u32, usize)>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_reference_holds: HashMap<(u32, u32), u32>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) managed_buffer_accesses: HashMap<(u32, u32), ManagedBufferAccess>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) persistent_callback_contexts: HashMap<u32, Box<CallbackInvocationCtx>>,
 }
@@ -168,9 +179,11 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_copy_frames: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
-            host_buffer_method_frames: Vec::new(),
+            host_buffer_handle_scopes: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_reference_holds: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            managed_buffer_accesses: HashMap::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             persistent_callback_contexts: HashMap::new(),
         }

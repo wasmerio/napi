@@ -36,6 +36,21 @@ int main(void) {
                   "auto length: string mismatch");
   }
 
+  // ---- Explicit lengths preserve embedded NUL bytes ----
+  {
+    const char input[] = {'a', '\0', 'b'};
+    napi_value str;
+    NAPI_CALL(env, napi_create_string_utf8(env, input, sizeof(input), &str));
+    char buf[4] = {0};
+    size_t len;
+    NAPI_CALL(env,
+              napi_get_value_string_utf8(env, str, buf, sizeof(buf), &len));
+    CHECK_OR_FAIL(len == sizeof(input),
+                  "embedded NUL UTF-8: expected len 3");
+    CHECK_OR_FAIL(memcmp(buf, input, sizeof(input)) == 0,
+                  "embedded NUL UTF-8: bytes were not preserved");
+  }
+
   // ---- Test napi_create_string_utf8 with zero length (empty string) ----
   {
     napi_value str;
@@ -103,6 +118,21 @@ int main(void) {
     CHECK_OR_FAIL(len == 3, "latin1 explicit: expected len 3");
     CHECK_OR_FAIL(strcmp(buf, "abc") == 0,
                   "latin1 explicit: expected 'abc'");
+  }
+
+  {
+    const char input[] = {'x', '\0', (char)0xff};
+    napi_value str;
+    NAPI_CALL(env,
+              napi_create_string_latin1(env, input, sizeof(input), &str));
+    char buf[4] = {0};
+    size_t len;
+    NAPI_CALL(env,
+              napi_get_value_string_latin1(env, str, buf, sizeof(buf), &len));
+    CHECK_OR_FAIL(len == sizeof(input),
+                  "embedded NUL Latin-1: expected len 3");
+    CHECK_OR_FAIL(memcmp(buf, input, sizeof(input)) == 0,
+                  "embedded NUL Latin-1: bytes were not preserved");
   }
 
   // ---- Test typeof string value ----

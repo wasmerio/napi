@@ -94,7 +94,36 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(napi
 // Yield one host event-loop turn. The host-JavaScript backend suspends through
 // JSPI and drains callbacks that arrived while the guest was suspended.
 // Embedded engines may implement this as an ordinary task checkpoint.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_yield_to_host_event_loop(napi_env env);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_yield_to_host_event_loop(
+    napi_env env, bool has_runnable_work);
+// Acquires an exact byte range for native access. The returned pointer remains
+// valid until release, including across asynchronous native work. Readable
+// ranges are copied from JavaScript on acquire; writable ranges are published
+// back to JavaScript on release. This avoids treating every raw N-API pointer
+// as a dirty copy of the value's entire backing store.
+typedef enum unofficial_napi_buffer_access_mode {
+  unofficial_napi_buffer_access_read = 1,
+  unofficial_napi_buffer_access_write = 2,
+  unofficial_napi_buffer_access_readwrite = 3,
+} unofficial_napi_buffer_access_mode;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_access(
+    napi_env env,
+    napi_value value,
+    size_t byte_offset,
+    size_t byte_length,
+    unofficial_napi_buffer_access_mode mode,
+    void** data);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_buffer_access(
+    napi_env env, napi_value value, void* data, bool modified);
+// Creates a TypedArray whose backing store is guest WebAssembly memory. This
+// is for native/JavaScript control blocks that require true shared visibility;
+// bulk host-owned data should use scoped buffer access instead.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_guest_backed_typedarray(
+    napi_env env,
+    napi_typedarray_type type,
+    size_t length,
+    void** data,
+    napi_value* result);
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must

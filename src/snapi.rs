@@ -953,6 +953,12 @@ unsafe extern "C" {
         data: *const core::ffi::c_void,
         len: u32,
     ) -> i32;
+    pub fn snapi_bridge_overwrite_reference_bytes(
+        env: SnapiEnv,
+        reference_id: u32,
+        data: *const core::ffi::c_void,
+        len: u32,
+    ) -> i32;
     // Node version
     pub fn snapi_bridge_get_node_version(
         env: SnapiEnv,

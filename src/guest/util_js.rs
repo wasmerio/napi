@@ -4,7 +4,9 @@
 
 use wasmer::FunctionEnvMut;
 
-use crate::{GuestBackingStoreMapping, HostBufferCopy, NapiEnv};
+use crate::{
+    GuestBackingStoreMapping, HostBufferCopy, NapiEnv, snapi::snapi_bridge_create_reference,
+};
 
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
@@ -58,11 +60,11 @@ pub fn read_guest_bytes(
     Some(out)
 }
 
-pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
+pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
     // Exact-size large transfers avoid doubling peak memory for package
     // archives and Wasm binaries while retaining cheap pooled size classes for
     // the small buffers used by ordinary Node I/O.
-    let requested = data.len().max(1);
+    let requested = byte_len.max(1);
     let required_capacity = if requested >= 16 * 1024 * 1024 {
         requested
     } else {
@@ -101,16 +103,22 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> O
             );
             return None;
         }
-        env.data_mut().guest_buffer_allocated_bytes = env
+        let allocated = env
             .data()
             .guest_buffer_allocated_bytes
             .saturating_add(required_capacity);
+        env.data_mut().guest_buffer_allocated_bytes = allocated;
         (guest_ptr as u32, required_capacity)
     };
     env.data_mut()
         .guest_buffer_capacities
         .insert(guest_ptr, capacity);
-    if !write_guest_bytes(env, guest_ptr, data) {
+    Some(guest_ptr)
+}
+
+pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
+    let guest_ptr = allocate_guest_buffer(env, data.len())?;
+    if !data.is_empty() && !write_guest_bytes(env, guest_ptr, data) {
         recycle_guest_allocation(env, guest_ptr);
         return None;
     }
@@ -244,6 +252,18 @@ pub fn resolve_or_copy_host_data_to_guest(
     }
     let host_slice = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) };
     let guest_ptr = allocate_guest_bytes(env, host_slice)?;
+    let snapi_env = env.data().resolve_napi_env(guest_env as i32);
+    if snapi_env.is_null() {
+        forget_guest_allocation(env, guest_ptr);
+        return None;
+    }
+    let mut host_reference_id = 0u32;
+    if unsafe { snapi_bridge_create_reference(snapi_env, handle_id, 1, &mut host_reference_id) }
+        != 0
+    {
+        forget_guest_allocation(env, guest_ptr);
+        return None;
+    }
     if backing_store_token != 0 {
         env.data_mut().guest_data_backing_stores.insert(
             (guest_env, backing_store_token),
@@ -261,11 +281,15 @@ pub fn resolve_or_copy_host_data_to_guest(
     env.data_mut().host_buffer_copies.push(HostBufferCopy {
         guest_env,
         handle_id,
+        host_reference_id,
         backing_store_token,
         guest_ptr,
         byte_len,
         guest_allocation_recyclable: true,
         reference_holds: 0,
+        // Standard N-API pointers are writable. Synchronization is phase based:
+        // publish before host JS runs, refresh before native code resumes.
+        needs_flush: true,
     });
     Some(guest_ptr)
 }

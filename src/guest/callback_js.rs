@@ -9,7 +9,7 @@ use wasmer::AsyncFunctionEnvMut;
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
-use super::util::{forget_guest_allocation, read_guest_bytes, recycle_guest_allocation};
+use super::util::{forget_guest_allocation, recycle_guest_allocation};
 
 type RawFunctionEnvMut = FunctionEnvMut<'static, NapiEnv>;
 
@@ -59,19 +59,17 @@ struct CallbackStateGuard {
     prev: *mut c_void,
     env: *mut RawFunctionEnvMut,
     frame_start: usize,
-    method_frame_depth: usize,
 }
 
 impl Drop for CallbackStateGuard {
     fn drop(&mut self) {
         if !self.env.is_null() {
             let env = unsafe { &mut *self.env.cast::<FunctionEnvMut<'_, NapiEnv>>() };
-            flush_host_buffer_copies(env, self.snapi_env, self.frame_start);
-            env.data_mut()
-                .host_buffer_method_frames
-                .truncate(self.method_frame_depth);
-            if self.frame_start > 0 {
+            flush_host_buffer_copies(env, self.frame_start);
+            if env.data().host_buffer_copy_frames.is_empty() {
                 flush_pending_host_buffer_copies(env, self.snapi_env);
+            } else {
+                publish_pending_host_buffer_copies(env, self.snapi_env);
             }
         }
         unsafe {
@@ -93,7 +91,6 @@ fn install_callback_state(
         env: CallbackEnv::Sync(env_ptr),
     });
     let frame_start = env.data().host_buffer_copies.len();
-    let method_frame_depth = env.data().host_buffer_method_frames.len();
     env.data_mut().host_buffer_copy_frames.push(frame_start);
     let prev = unsafe {
         crate::snapi::snapi_bridge_swap_active_callback_ctx(
@@ -107,7 +104,6 @@ fn install_callback_state(
         snapi_env,
         prev,
         frame_start,
-        method_frame_depth,
     })
 }
 
@@ -122,21 +118,31 @@ fn call_guest_callback(
         Some(func) => func,
         None => {
             let Some(elem) = table.get(env, wasm_fn_ptr) else {
+                eprintln!("[callback trampoline] table entry missing for function {wasm_fn_ptr}");
                 return 0;
             };
             let func = match elem {
                 Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => return 0,
-                _ => return 0,
+                Value::FuncRef(None) => {
+                    eprintln!("[callback trampoline] null function reference at {wasm_fn_ptr}");
+                    return 0;
+                }
+                other => {
+                    eprintln!(
+                        "[callback trampoline] non-function table value at {wasm_fn_ptr}: {other:?}"
+                    );
+                    return 0;
+                }
             };
             env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
             func
         }
     };
-    match func.call(
+    let result = func.call(
         env,
         &[Value::I32(guest_env), Value::I32(callback_arg as i32)],
-    ) {
+    );
+    match result {
         Ok(ret_vals) => match ret_vals.first() {
             Some(Value::I32(v)) => *v as u32,
             Some(Value::I64(v)) => *v as u32,
@@ -156,30 +162,29 @@ fn call_guest_callback_and_flush(
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    let frame_start = env.data().host_buffer_copies.len();
-    let method_frame_depth = env.data().host_buffer_method_frames.len();
-    let result = call_guest_callback(env, table, guest_env, wasm_fn_ptr, callback_arg);
     let snapi_env = env.data().resolve_napi_env(guest_env);
-    let flush_start = env.data().host_buffer_method_frames[method_frame_depth..]
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(frame_start)
-        .min(frame_start);
-    flush_host_buffer_copies_since(env, snapi_env, flush_start);
-    env.data_mut()
-        .host_buffer_method_frames
-        .truncate(method_frame_depth);
+    refresh_host_buffer_copies(env, snapi_env);
+    let frame_start = env.data().host_buffer_copies.len();
+    env.data_mut().host_buffer_copy_frames.push(frame_start);
+    let result = call_guest_callback(env, table, guest_env, wasm_fn_ptr, callback_arg);
+    flush_host_buffer_copies(env, frame_start);
+    // Nested JavaScript callbacks must not end pointer lifetimes owned by their
+    // caller. Only the outermost callback frame may release pending mappings.
+    if env.data().host_buffer_copy_frames.is_empty() {
+        flush_pending_host_buffer_copies(env, snapi_env);
+    } else {
+        publish_pending_host_buffer_copies(env, snapi_env);
+    }
     result
 }
 
-fn flush_host_buffer_copies(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    snapi_env: SnapiEnv,
-    frame_start: usize,
-) {
-    flush_host_buffer_copies_since(env, snapi_env, frame_start);
-    env.data_mut().host_buffer_copy_frames.pop();
+fn flush_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, frame_start: usize) {
+    let frame_start = env
+        .data_mut()
+        .host_buffer_copy_frames
+        .pop()
+        .unwrap_or(frame_start);
+    flush_host_buffer_copies_since(env, frame_start);
 }
 
 pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
@@ -197,24 +202,34 @@ pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi
     };
 
     let mut held = Vec::new();
-    for mapping in drained {
+    for mut mapping in drained {
         let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env as i32);
-        if mapping.byte_len > 0
-            && !mapping_snapi.is_null()
-            && let Some(bytes) = read_guest_bytes(env, mapping.guest_ptr as i32, mapping.byte_len)
-        {
-            unsafe {
-                crate::snapi::snapi_bridge_overwrite_value_bytes(
+        if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
+            if let Some(memory) = env.data().memory.clone() {
+                let memory_buffer = memory.as_js().js_buffer();
+                let _ = crate::snapi_js::copy_memory_bytes_to_reference(
                     mapping_snapi,
-                    mapping.handle_id,
-                    bytes.as_ptr().cast(),
+                    mapping.host_reference_id,
+                    &memory_buffer,
+                    mapping.guest_ptr,
                     mapping.byte_len as u32,
                 );
             }
+            // The guest snapshot is now coherent with JavaScript. Retained
+            // mappings stay allocated and are refreshed before guest re-entry.
+            mapping.needs_flush = false;
         }
         if mapping.reference_holds > 0 {
             held.push(mapping);
             continue;
+        }
+        if mapping.host_reference_id != 0 && !mapping_snapi.is_null() {
+            unsafe {
+                crate::snapi::snapi_bridge_delete_reference(
+                    mapping_snapi,
+                    mapping.host_reference_id,
+                );
+            }
         }
 
         let state = env.data_mut();
@@ -244,11 +259,95 @@ pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi
     env.data_mut().host_buffer_copies.extend(held);
 }
 
-pub fn flush_host_buffer_copies_since(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    snapi_env: SnapiEnv,
-    frame_start: usize,
-) {
+/// Publish native writes before entering JavaScript without ending any native
+/// pointer lifetime. A guest callback may call JavaScript and then continue to
+/// use a pointer returned earlier by N-API (llhttp does this after its headers
+/// callback). Recycling that mapping at the nested handoff turns the live
+/// pointer into a use-after-release. Frame teardown remains the sole owner of
+/// releasing unreferenced mappings.
+pub fn publish_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
+    if snapi_env.is_null() || env.data().host_buffer_copies.is_empty() {
+        return;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return;
+    };
+    let memory_buffer = memory.as_js().js_buffer();
+    for index in 0..env.data().host_buffer_copies.len() {
+        let (mapping_guest_env, host_reference_id, guest_ptr, byte_len, needs_flush) = {
+            let mapping = &env.data().host_buffer_copies[index];
+            (
+                mapping.guest_env,
+                mapping.host_reference_id,
+                mapping.guest_ptr,
+                mapping.byte_len,
+                mapping.needs_flush,
+            )
+        };
+        if !needs_flush || byte_len == 0 {
+            continue;
+        }
+        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env as i32);
+        if mapping_snapi.is_null() {
+            continue;
+        }
+        if crate::snapi_js::copy_memory_bytes_to_reference(
+            mapping_snapi,
+            host_reference_id,
+            &memory_buffer,
+            guest_ptr,
+            byte_len as u32,
+        ) == 0
+        {
+            env.data_mut().host_buffer_copies[index].needs_flush = false;
+        }
+    }
+}
+
+/// Restore host-side mutations into stable guest allocations before native
+/// code resumes. This is the inverse half of `publish_pending_host_buffer_copies`:
+/// mappings stay allocated across the JavaScript phase, so retained and
+/// interior native pointers remain valid across nested callbacks.
+pub fn refresh_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
+    if snapi_env.is_null() || env.data().host_buffer_copies.is_empty() {
+        return;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return;
+    };
+    let memory_buffer = memory.as_js().js_buffer();
+    for index in 0..env.data().host_buffer_copies.len() {
+        let (mapping_guest_env, host_reference_id, guest_ptr, byte_len, needs_flush) = {
+            let mapping = &env.data().host_buffer_copies[index];
+            (
+                mapping.guest_env,
+                mapping.host_reference_id,
+                mapping.guest_ptr,
+                mapping.byte_len,
+                mapping.needs_flush,
+            )
+        };
+        if needs_flush || byte_len == 0 {
+            continue;
+        }
+        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env as i32);
+        if mapping_snapi.is_null() {
+            continue;
+        }
+        if crate::snapi_js::copy_reference_bytes_to_memory(
+            mapping_snapi,
+            host_reference_id,
+            &memory_buffer,
+            guest_ptr,
+            byte_len as u32,
+        ) == 0
+        {
+            env.data_mut().host_buffer_copies[index].needs_flush = true;
+        }
+    }
+}
+
+pub fn flush_host_buffer_copies_since(env: &mut FunctionEnvMut<NapiEnv>, frame_start: usize) {
     let start = frame_start.min(env.data().host_buffer_copies.len());
     let drained = {
         let state = env.data_mut();
@@ -256,24 +355,32 @@ pub fn flush_host_buffer_copies_since(
     };
 
     let mut held = Vec::new();
-    for mapping in drained {
+    for mut mapping in drained {
         let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env as i32);
-        if mapping.byte_len > 0
-            && !mapping_snapi.is_null()
-            && let Some(bytes) = read_guest_bytes(env, mapping.guest_ptr as i32, mapping.byte_len)
-        {
-            unsafe {
-                crate::snapi::snapi_bridge_overwrite_value_bytes(
+        if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
+            if let Some(memory) = env.data().memory.clone() {
+                let memory_buffer = memory.as_js().js_buffer();
+                let _ = crate::snapi_js::copy_memory_bytes_to_reference(
                     mapping_snapi,
-                    mapping.handle_id,
-                    bytes.as_ptr().cast(),
+                    mapping.host_reference_id,
+                    &memory_buffer,
+                    mapping.guest_ptr,
                     mapping.byte_len as u32,
                 );
             }
+            mapping.needs_flush = mapping.reference_holds > 0;
         }
         if mapping.reference_holds > 0 {
             held.push(mapping);
             continue;
+        }
+        if mapping.host_reference_id != 0 && !mapping_snapi.is_null() {
+            unsafe {
+                crate::snapi::snapi_bridge_delete_reference(
+                    mapping_snapi,
+                    mapping.host_reference_id,
+                );
+            }
         }
 
         let state = env.data_mut();
@@ -316,7 +423,7 @@ pub fn with_callback_state<R>(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub async fn with_callback_state_async<R, F>(
-    mut env: AsyncFunctionEnvMut<NapiEnv>,
+    env: AsyncFunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     future: F,
 ) -> R
@@ -327,26 +434,18 @@ where
         return future.await;
     }
 
-    let (frame_start, method_frame_depth) = {
+    let frame_start = {
         let mut locked = env.write().await;
         let frame_start = locked.data_mut().host_buffer_copies.len();
-        let method_frame_depth = locked.data_mut().host_buffer_method_frames.len();
         locked.data_mut().host_buffer_copy_frames.push(frame_start);
-        (frame_start, method_frame_depth)
+        frame_start
     };
-    let mut ctx = Box::new(CallbackInvocationCtx {
-        env: CallbackEnv::Async(env.as_mut()),
-    });
-    let prev = unsafe {
-        crate::snapi::snapi_bridge_swap_active_callback_ctx(
-            snapi_env,
-            (&mut *ctx as *mut CallbackInvocationCtx).cast::<c_void>(),
-        )
-    };
+    // The environment's persistent Async callback context is the owner of
+    // host-to-guest re-entry while a JSPI import is suspended. Do not replace
+    // it with a future-local context: multiple suspended imports can overlap
+    // and complete out of order, so stack-style save/restore would eventually
+    // restore a pointer to a context owned by an already-completed future.
     let result = future.await;
-    unsafe {
-        crate::snapi::snapi_bridge_swap_active_callback_ctx(snapi_env, prev);
-    }
     {
         // Keep this guard in an explicit scope. A completed Rust future may
         // remain owned by its JavaScript Promise until a later GC cycle; if the
@@ -354,13 +453,11 @@ where
         // shared after the guest entrypoint has returned.
         let mut locked = env.write().await;
         let mut sync_env = locked.as_function_env_mut();
-        flush_host_buffer_copies(&mut sync_env, snapi_env, frame_start);
-        sync_env
-            .data_mut()
-            .host_buffer_method_frames
-            .truncate(method_frame_depth);
-        if frame_start > 0 {
+        flush_host_buffer_copies(&mut sync_env, frame_start);
+        if sync_env.data().host_buffer_copy_frames.is_empty() {
             flush_pending_host_buffer_copies(&mut sync_env, snapi_env);
+        } else {
+            publish_pending_host_buffer_copies(&mut sync_env, snapi_env);
         }
     }
     result
@@ -388,6 +485,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
             }
             let env = unsafe { &mut *env.cast::<FunctionEnvMut<'_, NapiEnv>>() };
             let Some(table) = env.data().table.clone() else {
+                eprintln!("[callback trampoline] guest function table is not installed");
                 return 0;
             };
             call_guest_callback_and_flush(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg)
@@ -396,6 +494,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         CallbackEnv::Async(env) => {
             if let Some(result) = env.with_current_mut(|mut sync_env| {
                 let Some(table) = sync_env.data().table.clone() else {
+                    eprintln!("[callback trampoline] guest function table is not installed");
                     return 0;
                 };
                 call_guest_callback_and_flush(
