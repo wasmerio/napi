@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -194,40 +195,92 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   }
 }
 
+// Guards `napi_env__::external_backing_store_hints` and the `hint->env` back
+// pointer.
+//
+// V8 destroys backing stores from its ArrayBufferSweeper, which runs on
+// background threads, so `ExternalBackingStoreDeleter` executes concurrently
+// with the main thread creating new hints. The set was being mutated from both
+// without synchronization, which corrupts the host heap — glibc aborts with
+// "malloc_consolidate(): unaligned fastbin chunk detected" a few hundred
+// requests into a payload-heavy workload. (`GuestHeap` already takes its own
+// mutex for exactly this reason; this container was missed.)
+//
+// Process-global rather than a member because a deleter has to read
+// `hint->env` before it can know which env to lock, and that read races
+// teardown. Never destroyed, matching the other process-lifetime globals here
+// (see the runtime-globals comment in unofficial_napi.cc).
+std::mutex& ExternalHintsMutex() {
+  static std::mutex& mutex = *new std::mutex();
+  return mutex;
+}
+
+
 void ExternalBackingStoreDeleter(void* data,
                                  size_t /*length*/,
                                  void* deleter_data) {
   auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
   if (hint == nullptr) return;
-  napi_env env = hint->env;
-  if (hint->finalize_cb != nullptr) {
-    hint->finalize_cb(env, hint->external_data != nullptr ? hint->external_data : data,
-                      hint->finalize_hint);
+  // Read the env and unlink in one critical section: the pointer is cleared by
+  // FinalizeExternalBackingStoreHints under the same lock, so reading it
+  // outside would race teardown.
+  napi_env env = nullptr;
+  napi_finalize finalize_cb = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+    env = hint->env;
+    if (env != nullptr) {
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_release(env, hint);
+      env->external_backing_store_hints.erase(hint);
+      hint->env = nullptr;
+    }
+    // Claim the callback under the lock so a concurrent teardown sweep cannot
+    // also run it.
+    finalize_cb = hint->finalize_cb;
+    hint->finalize_cb = nullptr;
   }
-  if (env != nullptr) {
-    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-        record_release(env, hint);
-    env->external_backing_store_hints.erase(hint);
+  // Outside the lock: a finalizer may re-enter N-API and create or destroy
+  // further hints.
+  if (finalize_cb != nullptr) {
+    finalize_cb(env, hint->external_data != nullptr ? hint->external_data : data,
+                hint->finalize_hint);
   }
   delete hint;
 }
 
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
-  for (auto* hint : env->external_backing_store_hints) {
-    if (hint == nullptr) continue;
-    if (hint->finalize_cb != nullptr) {
-      hint->finalize_cb(
-          env,
-          hint->external_data != nullptr ? hint->external_data : nullptr,
-          hint->finalize_hint);
-      hint->finalize_cb = nullptr;
+
+  // Detach the whole set under the lock, then run the finalizers outside it.
+  // A backing store can still outlive the env, so each hint is unlinked from
+  // the dying env rather than deleted here — its deleter frees it later and,
+  // seeing a null env, skips the env-side bookkeeping.
+  // Each entry is the callback claimed from one hint, plus its arguments. The
+  // hints themselves are not touched after the lock is dropped: a concurrent
+  // deleter may already be freeing them.
+  std::vector<std::tuple<napi_finalize, void*, void*>> pending;
+  {
+    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+    std::unordered_set<napi_external_backing_store_hint__*> hints;
+    hints.swap(env->external_backing_store_hints);
+    pending.reserve(hints.size());
+    for (auto* hint : hints) {
+      if (hint == nullptr) continue;
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_release(env, hint);
+      hint->env = nullptr;
+      if (hint->finalize_cb != nullptr) {
+        pending.emplace_back(hint->finalize_cb, hint->external_data,
+                             hint->finalize_hint);
+        hint->finalize_cb = nullptr;
+      }
     }
-    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-        record_release(env, hint);
-    hint->env = nullptr;
   }
-  env->external_backing_store_hints.clear();
+
+  for (auto& [finalize_cb, external_data, finalize_hint] : pending) {
+    finalize_cb(env, external_data, finalize_hint);
+  }
 }
 
 bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* length) {
@@ -793,7 +846,11 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     }
     v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
         record_create(env, hint.get());
-    env->external_backing_store_hints.insert(hint.release());
+    {
+      // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
+      std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+      env->external_backing_store_hints.insert(hint.release());
+    }
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
 
@@ -2972,7 +3029,11 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   }
   v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
       record_create(env, hint.get());
-  env->external_backing_store_hints.insert(hint.release());
+  {
+    // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
+    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+    env->external_backing_store_hints.insert(hint.release());
+  }
 
   auto* record = env->allocate<napi_buffer_record__>(env);
   if (record == nullptr) return napi_generic_failure;

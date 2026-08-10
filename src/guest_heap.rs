@@ -35,7 +35,7 @@
 //! ## Concurrency
 //!
 //! `alloc`/`free` take the internal mutex only. For shared memories the grow
-//! handle is a cloned [`VMSharedMemory`], so growth needs no store and is safe
+//! handle is a cloned [`SharedMemory`], so growth needs no store and is safe
 //! from any thread (V8 GC threads free backing stores off the JS thread). Lock
 //! order is the `inner` mutex → budget atomics → the memory's own grow lock;
 //! nothing else is acquired while the mutex is held. Non-shared memories can
@@ -49,8 +49,7 @@ use std::sync::{
 };
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
-use wasmer::sys::vm::{LinearMemory, VMSharedMemory};
-use wasmer::{MemoryStyle, Pages, StoreMut};
+use wasmer::{MemoryStyle, Pages, SharedMemory, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -74,7 +73,7 @@ const OWNED_LOW_WATER_BYTES: u64 = 4 * 1024 * 1024;
 
 enum GrowHandle {
     /// Shared memory: growable from any thread without a store.
-    Shared(VMSharedMemory),
+    Shared(SharedMemory),
     /// Non-shared memory: growable only where a store is available. The
     /// handle is used solely by [`GuestHeap::maybe_refill`].
     Owned(wasmer::Memory),
@@ -139,6 +138,34 @@ fn chunk_size_for(min_bytes: u32) -> u32 {
         .saturating_add(min_bytes / 8)
         .saturating_add(WASM_PAGE)
         .max(MIN_CHUNK_BYTES)
+}
+
+/// Average bytes per allocation a chunk's node budget is sized for. The
+/// allocator needs a node per live allocation plus one per free region between
+/// them, so budgeting one node per 256 bytes leaves roughly 2x headroom for the
+/// ~10 KiB buffers this heap actually serves.
+const BYTES_PER_NODE: u32 = 256;
+/// Node-budget floor/ceiling. The floor keeps a small chunk usable; the ceiling
+/// stops a very large chunk from re-introducing the cost this bounds.
+const MIN_CHUNK_ALLOCS: u32 = 1024;
+const MAX_CHUNK_ALLOCS: u32 = 32 * 1024;
+
+/// Node budget for a chunk of `len` bytes.
+///
+/// [`OffsetAllocator::new`] sizes every chunk for 128Ki allocations no matter
+/// how small the chunk is, and its `reset` eagerly allocates that many `Node`s
+/// (28 bytes each) plus a `u32` free-list entry — about **2 MiB of host
+/// metadata per 1 MiB guest chunk**. Chunks are claimed as the workload's peak
+/// grows and are never released, so that overhead accumulated on the host heap
+/// for the life of the process: RSS grew roughly 3x the guest memory actually
+/// being managed, which is what made large request bodies look like a leak.
+///
+/// Running out of nodes is graceful, not fatal: [`OffsetAllocator::allocate`]
+/// returns `None`, and [`GuestHeap::try_chunks`] simply moves on to another
+/// chunk (claiming one if needed), so an under-estimate costs a little
+/// fragmentation rather than correctness.
+fn chunk_max_allocs(len: u32) -> u32 {
+    (len / BYTES_PER_NODE).clamp(MIN_CHUNK_ALLOCS, MAX_CHUNK_ALLOCS)
 }
 
 /// Log a heap-integrity complaint, at most a handful of times per process.
@@ -217,11 +244,10 @@ impl GuestHeap {
                 integrity_warn("shared memory without a shared handle; guest heap disabled");
                 return None;
             };
-            let vm = shared.vm_shared_memory().unwrap_sys_ref().clone();
             // The base can only be stable if the whole range is reserved up
             // front. On 64-bit hosts this is always the case for wasm32.
-            match vm.style() {
-                MemoryStyle::Static { bound, .. } if bound.0 >= max_pages => {}
+            match shared.style() {
+                Some(MemoryStyle::Static { bound, .. }) if bound.0 >= max_pages => {}
                 style => {
                     integrity_warn(&format!(
                         "memory style {style:?} does not guarantee a stable base; \
@@ -230,7 +256,7 @@ impl GuestHeap {
                     return None;
                 }
             }
-            GrowHandle::Shared(vm)
+            GrowHandle::Shared(shared)
         } else {
             GrowHandle::Owned(memory.clone())
         };
@@ -385,19 +411,21 @@ impl GuestHeap {
             return None;
         }
 
-        let GrowHandle::Shared(vm) = &mut inner.grow else {
+        let GrowHandle::Shared(shared) = &inner.grow else {
             self.budget.uncharge(Pool::WasmLinear, delta_bytes);
             return None;
         };
-        let prev = match vm.grow(Pages(delta_pages)) {
+        let prev = match shared.grow(Pages(delta_pages)) {
             Ok(prev) => prev,
             Err(_) => {
                 self.budget.uncharge(Pool::WasmLinear, delta_bytes);
                 return None;
             }
         };
-        // SAFETY: the definition pointer is valid for the life of the memory.
-        let base_now = unsafe { vm.vmmemory().as_ref().base };
+        let Some(base_now) = shared.data_ptr() else {
+            self.budget.uncharge(Pool::WasmLinear, delta_bytes);
+            return None;
+        };
         self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
     }
 
@@ -486,7 +514,7 @@ impl GuestHeap {
         inner.chunks.push(Chunk {
             start,
             len,
-            alloc: OffsetAllocator::new(len / UNIT),
+            alloc: OffsetAllocator::with_max_allocs(len / UNIT, chunk_max_allocs(len)),
         });
         inner.free_bytes += u64::from(len);
         Some(())
@@ -722,6 +750,46 @@ mod tests {
             GuestHeap::new(&mut store_mut, &memory, budget).expect("guest heap")
         };
         (memory, heap)
+    }
+
+    #[test]
+    fn chunk_node_budget_scales_with_chunk_size() {
+        // What this pins: `OffsetAllocator::new` sizes every chunk for 128Ki
+        // allocations regardless of size, costing ~2 MiB of host metadata per
+        // 1 MiB guest chunk and retaining it for the process's life.
+        const DEFAULT_MAX_ALLOCS: u32 = 128 * 1024;
+        assert!(chunk_max_allocs(MIN_CHUNK_BYTES) < DEFAULT_MAX_ALLOCS / 16);
+
+        // Proportional through the normal range, clamped at both ends.
+        assert_eq!(chunk_max_allocs(MIN_CHUNK_BYTES), MIN_CHUNK_BYTES / 256);
+        assert_eq!(chunk_max_allocs(64 * 1024 * 1024), MAX_CHUNK_ALLOCS);
+        assert_eq!(chunk_max_allocs(0), MIN_CHUNK_ALLOCS);
+
+        // A chunk must still comfortably hold the buffers this heap actually
+        // serves: request bodies arrive as ~10 KiB pieces, ~102 to a 1 MiB chunk.
+        let per_chunk = MIN_CHUNK_BYTES as usize / 10240;
+        assert!(chunk_max_allocs(MIN_CHUNK_BYTES) as usize > 2 * per_chunk);
+    }
+
+    /// A chunk's node budget must not cap it below the allocations it can
+    /// physically hold at the sizes this heap serves.
+    #[test]
+    fn chunk_serves_its_capacity_in_realistic_buffers() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+
+        // Fill well past a single 1 MiB chunk with 10 KiB buffers.
+        let mut offsets = Vec::new();
+        for _ in 0..512 {
+            let offset = heap.alloc(10 * 1024, false).expect("10 KiB alloc");
+            offsets.push(offset);
+        }
+        assert_eq!(heap.live_count(), offsets.len());
+
+        for offset in offsets {
+            assert!(heap.free_offset(offset));
+        }
+        assert_eq!(heap.live_count(), 0);
     }
 
     #[test]
