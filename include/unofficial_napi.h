@@ -90,13 +90,20 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 
-// Complete one provider-owned event-loop checkpoint. The host-JavaScript
-// backend suspends through JSPI and drains callbacks that arrived while the
-// guest was suspended. Embedded engines process their engine checkpoint and
-// briefly wait when no native work is runnable. Edge's outer loop calls this
-// operation unconditionally; target selection belongs to the provider.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_yield_to_host_event_loop(
-    napi_env env, bool has_runnable_work);
+typedef enum unofficial_napi_event_loop_checkpoint_mode {
+  // Drain promise/microtask work without admitting a host task turn.
+  unofficial_napi_event_loop_checkpoint_microtasks = 0,
+  // Admit a host task turn as well as draining engine work. Host-JavaScript
+  // providers suspend through JSPI; embedded providers may wait synchronously.
+  unofficial_napi_event_loop_checkpoint_host_tasks = 1,
+} unofficial_napi_event_loop_checkpoint_mode;
+
+// Complete one provider-owned event-loop checkpoint. The mode describes Node
+// semantics, while the provider owns how those semantics are implemented.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
+    napi_env env,
+    unofficial_napi_event_loop_checkpoint_mode mode,
+    bool has_runnable_work);
 // Acquires an exact byte range for native access. The returned pointer remains
 // valid until release, including across asynchronous native work. Readable
 // ranges are copied from JavaScript on acquire; writable ranges are published

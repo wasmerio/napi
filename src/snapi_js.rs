@@ -116,7 +116,14 @@ if (wasmerNapiYieldChannel !== undefined) {
   }
 }
 const wasmerNapiPromiseDetails = new WeakMap();
-export function wasmer_napi_yield_to_host_event_loop(hasRunnableWork) {
+export function wasmer_napi_event_loop_checkpoint(allowHostTasks, hasRunnableWork) {
+  // A Node microtask checkpoint must not admit timers, I/O, or messages. JSPI
+  // still needs one suspension so the host engine can drain its Promise queue.
+  if (!allowHostTasks) {
+    return new wasmerNapiHostPromise((resolve) => {
+      wasmerNapiHostQueueMicrotask(resolve);
+    });
+  }
   // Runnable libuv work only needs a host task boundary; MessageChannel
   // provides one without imposing a timer delay on every turn. Bound each
   // burst so a continuously-ready or stale native handle cannot monopolize
@@ -855,7 +862,10 @@ export function wasmer_napi_create_serdes_binding() {
 extern "C" {
     fn wasmer_napi_make_callback(dispatch: &Function) -> Function;
     fn wasmer_napi_enqueue_microtask(callback: &Function);
-    fn wasmer_napi_yield_to_host_event_loop(has_runnable_work: bool) -> Promise;
+    fn wasmer_napi_event_loop_checkpoint(
+        allow_host_tasks: bool,
+        has_runnable_work: bool,
+    ) -> Promise;
     fn wasmer_napi_get_promise_details(promise: &JsValue) -> Array;
     fn wasmer_napi_has_jspi() -> bool;
     fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> bool;
@@ -929,8 +939,15 @@ pub(crate) fn has_jspi() -> bool {
     wasmer_napi_has_jspi()
 }
 
-pub(crate) async fn yield_to_host_event_loop(has_runnable_work: bool) -> Result<JsValue, JsValue> {
-    JsFuture::from(wasmer_napi_yield_to_host_event_loop(has_runnable_work)).await
+pub(crate) async fn event_loop_checkpoint(
+    allow_host_tasks: bool,
+    has_runnable_work: bool,
+) -> Result<JsValue, JsValue> {
+    JsFuture::from(wasmer_napi_event_loop_checkpoint(
+        allow_host_tasks,
+        has_runnable_work,
+    ))
+    .await
 }
 
 pub(crate) async fn wait_for_message(handle: u32) -> Result<JsValue, JsValue> {
@@ -3041,6 +3058,7 @@ pub unsafe extern "C" fn snapi_bridge_check_object_type_tag(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
     _env: SnapiEnv,
+    _mode: i32,
     _has_runnable_work: i32,
 ) -> i32 {
     if has_jspi() {

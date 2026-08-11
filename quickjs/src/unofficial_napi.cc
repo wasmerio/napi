@@ -455,16 +455,21 @@ extern "C"
         return unofficial_napi_low_memory_notification(env);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_yield_to_host_event_loop(
+    napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
         napi_env env,
+        unofficial_napi_event_loop_checkpoint_mode mode,
         bool has_runnable_work)
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
+        if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
+            mode != unofficial_napi_event_loop_checkpoint_host_tasks)
+            return napi_invalid_arg;
         napi_status status = napi_util__::run_pending_jobs(env);
         if (status != napi_ok)
             return status;
-        if (!has_runnable_work)
+        if (mode == unofficial_napi_event_loop_checkpoint_host_tasks &&
+            !has_runnable_work)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return napi_ok;
     }

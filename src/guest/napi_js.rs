@@ -570,6 +570,7 @@ fn guest_unofficial_napi_low_memory_notification(
 fn provider_event_loop_checkpoint_sync(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
+    mode: i32,
     has_runnable_work: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
@@ -578,19 +579,23 @@ fn provider_event_loop_checkpoint_sync(
         if status != 0 {
             return status;
         }
-        snapi_bridge_unofficial_event_loop_checkpoint(env_handle, has_runnable_work)
+        snapi_bridge_unofficial_event_loop_checkpoint(env_handle, mode, has_runnable_work)
     })
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-async fn yield_to_host_event_loop(has_runnable_work: bool) -> Result<JsValue, JsValue> {
-    crate::snapi_js::yield_to_host_event_loop(has_runnable_work).await
+async fn event_loop_checkpoint(
+    allow_host_tasks: bool,
+    has_runnable_work: bool,
+) -> Result<JsValue, JsValue> {
+    crate::snapi_js::event_loop_checkpoint(allow_host_tasks, has_runnable_work).await
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-async fn guest_unofficial_napi_yield_to_host_event_loop(
+async fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: AsyncFunctionEnvMut<NapiEnv>,
     napi_env: i32,
+    mode: i32,
     has_runnable_work: i32,
 ) -> i32 {
     // The host JavaScript realm owns its Promise and task queues. One explicit
@@ -600,7 +605,10 @@ async fn guest_unofficial_napi_yield_to_host_event_loop(
         env.data().resolve_napi_env(napi_env)
     };
     with_callback_state_async(env.as_mut(), env_handle, async move {
-        if yield_to_host_event_loop(has_runnable_work != 0)
+        if mode != 0 && mode != 1 {
+            return 1;
+        }
+        if event_loop_checkpoint(mode == 1, has_runnable_work != 0)
             .await
             .is_err()
         {
@@ -610,23 +618,29 @@ async fn guest_unofficial_napi_yield_to_host_event_loop(
         if status != 0 {
             return status;
         }
-        unsafe { snapi_bridge_unofficial_event_loop_checkpoint(env_handle, has_runnable_work) }
+        unsafe {
+            snapi_bridge_unofficial_event_loop_checkpoint(env_handle, mode, has_runnable_work)
+        }
     })
     .await
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn yield_to_host_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -> Function {
-    Function::new_typed_with_env_async(store, fe, guest_unofficial_napi_yield_to_host_event_loop)
+fn event_loop_checkpoint_import(
+    store: &mut impl AsStoreMut,
+    fe: &FunctionEnv<NapiEnv>,
+) -> Function {
+    Function::new_typed_with_env_async(store, fe, guest_unofficial_napi_event_loop_checkpoint)
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-fn guest_unofficial_napi_yield_to_host_event_loop_sync(
+fn guest_unofficial_napi_event_loop_checkpoint_sync(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
+    mode: i32,
     has_runnable_work: i32,
 ) -> i32 {
-    provider_event_loop_checkpoint_sync(env, napi_env, has_runnable_work)
+    provider_event_loop_checkpoint_sync(env, napi_env, mode, has_runnable_work)
 }
 
 fn guest_unofficial_napi_create_uninitialized_arraybuffer(
@@ -645,12 +659,11 @@ fn guest_unofficial_napi_create_uninitialized_arraybuffer(
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-fn yield_to_host_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -> Function {
-    Function::new_typed_with_env(
-        store,
-        fe,
-        guest_unofficial_napi_yield_to_host_event_loop_sync,
-    )
+fn event_loop_checkpoint_import(
+    store: &mut impl AsStoreMut,
+    fe: &FunctionEnv<NapiEnv>,
+) -> Function {
+    Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint_sync)
 }
 
 fn guest_unofficial_napi_request_gc_for_testing(
@@ -6294,7 +6307,7 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_release_env_with_loop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env_with_loop),
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
-        "unofficial_napi_yield_to_host_event_loop" => yield_to_host_import(store, fe),
+        "unofficial_napi_event_loop_checkpoint" => event_loop_checkpoint_import(store, fe),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
