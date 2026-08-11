@@ -132,6 +132,43 @@ int main(void) {
   CHECK_OR_FAIL(marker == 2131,
                 "buffer lease did not publish writes after scope closure");
 
+  napi_value shared_script;
+  napi_value shared_value;
+  NAPI_CALL(env,
+            napi_create_string_utf8(
+                env,
+                "globalThis.__napi_shared_lease = new SharedArrayBuffer(4); "
+                "new Uint8Array(__napi_shared_lease).set([5, 6, 7, 8]); "
+                "__napi_shared_lease",
+                NAPI_AUTO_LENGTH,
+                &shared_script));
+  NAPI_CALL(env, napi_run_script(env, shared_script, &shared_value));
+  unofficial_napi_buffer_lease shared_lease = NULL;
+  uint8_t* shared_data = NULL;
+  NAPI_CALL(env,
+            unofficial_napi_acquire_buffer_lease(
+                env,
+                shared_value,
+                1,
+                2,
+                unofficial_napi_buffer_access_readwrite,
+                &shared_lease,
+                (void**)&shared_data));
+  CHECK_OR_FAIL(shared_lease != NULL && shared_data != NULL &&
+                    shared_data[0] == 6 && shared_data[1] == 7,
+                "buffer lease did not expose a SharedArrayBuffer range");
+  shared_data[0] = 16;
+  shared_data[1] = 17;
+  NAPI_CALL(env,
+            unofficial_napi_release_buffer_lease(env, shared_lease, true));
+  NAPI_CALL(env,
+            RunInt32Script(env,
+                           "new Uint8Array(__napi_shared_lease)[1] * 100 + "
+                           "new Uint8Array(__napi_shared_lease)[2]",
+                           &marker));
+  CHECK_OR_FAIL(marker == 1617,
+                "buffer lease did not publish SharedArrayBuffer writes");
+
   // Environment teardown owns the failure/cancellation path for outstanding
   // leases. It must discard the snapshot and host reference without requiring
   // a scope-bound value or an explicit release from already-destroyed Edge

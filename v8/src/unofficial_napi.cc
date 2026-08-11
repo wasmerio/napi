@@ -1771,7 +1771,10 @@ static napi_status GetLeaseByteView(napi_env env,
   }
 
   status = napi_is_arraybuffer(env, value, &matches);
-  if (status != napi_ok || !matches) return status == napi_ok ? napi_invalid_arg : status;
+  if (status != napi_ok) return status;
+  // napi_get_arraybuffer_info also accepts SharedArrayBuffer. Standard N-API
+  // has no non-experimental SharedArrayBuffer predicate, so let the byte-view
+  // operation perform the final validation.
   return napi_get_arraybuffer_info(env, value, reinterpret_cast<void**>(data), length);
 }
 
