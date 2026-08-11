@@ -93,6 +93,7 @@ const wasmerNapiHostQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const wasmerNapiHostPromise = globalThis.Promise;
 const wasmerNapiHostPromiseThen = globalThis.Promise.prototype.then;
 let wasmerNapiPendingProviderWork = 0;
+let wasmerNapiSettledProviderWork = false;
 function wasmerNapiTrackHostPromise(value) {
   wasmerNapiPendingProviderWork += 1;
   const promise = wasmerNapiHostPromise.resolve(value);
@@ -100,16 +101,21 @@ function wasmerNapiTrackHostPromise(value) {
     promise,
     (result) => {
       wasmerNapiPendingProviderWork -= 1;
+      wasmerNapiSettledProviderWork = true;
       return result;
     },
     (error) => {
       wasmerNapiPendingProviderWork -= 1;
+      wasmerNapiSettledProviderWork = true;
       throw error;
     },
   );
 }
 export function wasmer_napi_has_pending_provider_work() {
-  return wasmerNapiPendingProviderWork !== 0;
+  if (wasmerNapiPendingProviderWork !== 0) return true;
+  if (!wasmerNapiSettledProviderWork) return false;
+  wasmerNapiSettledProviderWork = false;
+  return true;
 }
 const wasmerNapiYieldChannel = typeof globalThis.MessageChannel === 'function'
   ? new globalThis.MessageChannel()

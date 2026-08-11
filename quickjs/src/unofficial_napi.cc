@@ -471,11 +471,11 @@ extern "C"
         if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
             mode != unofficial_napi_event_loop_checkpoint_host_tasks)
             return napi_invalid_arg;
-        if (has_pending_provider_work != nullptr)
-            *has_pending_provider_work = false;
         napi_status status = napi_util__::run_pending_jobs(env);
         if (status != napi_ok)
             return status;
+        if (has_pending_provider_work != nullptr)
+            *has_pending_provider_work = env->module_wrap().has_pending_provider_work();
         if (mode == unofficial_napi_event_loop_checkpoint_host_tasks &&
             !has_runnable_work)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
