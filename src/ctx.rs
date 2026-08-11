@@ -3,7 +3,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
+use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
@@ -48,7 +48,7 @@ pub struct NapiSession {
 }
 
 /// Opaque per-instantiation state returned by
-/// [`NapiRuntimeHooks::additional_imports`].
+/// [`NapiRuntimeHooks::additional_imports`] or [`NapiRuntimeHooks::add_imports`].
 ///
 /// Pass it back, unmodified, to [`NapiRuntimeHooks::configure_instance`] for
 /// the instance created with those imports.
@@ -252,9 +252,26 @@ impl NapiRuntimeHooks {
         module: &Module,
         store: &mut StoreMut<'_>,
     ) -> Result<(Imports, NapiInstantiationState)> {
+        let mut imports = Imports::new();
+        let state = self.add_imports(module, store, &mut imports)?;
+        Ok((imports, state))
+    }
+
+    /// Merges N-API imports into an existing import object when needed.
+    ///
+    /// Embedders that create shared imports such as `env.memory` before their
+    /// extension hooks run should use this entry point. N-API reuses those
+    /// objects so the host functions and guest instance always observe the
+    /// same memory and table.
+    pub fn add_imports(
+        &self,
+        module: &Module,
+        store: &mut StoreMut<'_>,
+        imports: &mut Imports,
+    ) -> Result<NapiInstantiationState> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
-            return Ok((Imports::new(), NapiInstantiationState { session: None }));
+            return Ok(NapiInstantiationState { session: None });
         }
 
         if let Some(version) = napi_version
@@ -270,13 +287,10 @@ impl NapiRuntimeHooks {
         }
 
         let session = self.ctx.prepare_module(module)?;
-        let imports = session.create_imports(store)?;
-        Ok((
-            imports,
-            NapiInstantiationState {
-                session: Some(session),
-            },
-        ))
+        session.add_imports(store, imports)?;
+        Ok(NapiInstantiationState {
+            session: Some(session),
+        })
     }
 
     /// Completes memory, table, and guest allocation wiring after
@@ -309,7 +323,12 @@ impl NapiRuntimeHooks {
 impl NapiSession {
     pub fn create_imports(&self, store: &mut StoreMut<'_>) -> Result<Imports> {
         let mut import_object = Imports::new();
-        register_env_imports(store, &mut import_object);
+        self.add_imports(store, &mut import_object)?;
+        Ok(import_object)
+    }
+
+    fn add_imports(&self, store: &mut StoreMut<'_>, import_object: &mut Imports) -> Result<()> {
+        register_env_imports(store, import_object);
 
         let napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
@@ -324,21 +343,39 @@ impl NapiSession {
                 .expect("poisoned NapiSession mutex");
             *guard = Some(func_env.clone());
         }
-        register_napi_imports(store, &func_env, &mut import_object);
+        register_napi_imports(store, &func_env, import_object);
 
         if let Some(memory_type) = self.inner.imported_memory_type {
-            let memory = wasmer::Memory::new(&mut *store, memory_type)?;
-            import_object.define("env", "memory", memory.clone());
+            let memory = if let Some(existing) = import_object.get_export("env", "memory") {
+                let Extern::Memory(memory) = existing else {
+                    bail!("env.memory import for N-API module is not a memory");
+                };
+                memory
+            } else {
+                let memory = wasmer::Memory::new(&mut *store, memory_type)?;
+                import_object.define("env", "memory", memory.clone());
+                memory
+            };
             func_env.as_mut(&mut *store).memory = Some(memory);
         }
 
         if let Some(table_type) = self.inner.imported_table_type {
-            let table = Table::new(&mut *store, table_type, Value::FuncRef(None))?;
-            import_object.define("env", "__indirect_function_table", table.clone());
+            let table = if let Some(existing) =
+                import_object.get_export("env", "__indirect_function_table")
+            {
+                let Extern::Table(table) = existing else {
+                    bail!("env.__indirect_function_table import for N-API module is not a table");
+                };
+                table
+            } else {
+                let table = Table::new(&mut *store, table_type, Value::FuncRef(None))?;
+                import_object.define("env", "__indirect_function_table", table.clone());
+                table
+            };
             func_env.as_mut(&mut *store).table = Some(table);
         }
 
-        Ok(import_object)
+        Ok(())
     }
 
     pub fn configure_instance(
