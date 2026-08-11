@@ -103,7 +103,8 @@ typedef enum unofficial_napi_event_loop_checkpoint_mode {
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
-    bool has_runnable_work);
+    bool has_runnable_work,
+    bool* has_pending_provider_work);
 // Acquires an exact byte range for native access. The returned pointer remains
 // valid until release, including across asynchronous native work. Readable
 // ranges are copied from JavaScript on acquire; writable ranges are published

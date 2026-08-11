@@ -50,7 +50,7 @@ inline std::string NapiExceptionMessage(napi_env env, napi_value exception) {
 inline bool RunProviderCheckpoints(napi_env env) {
   for (int i = 0; i < 64; ++i) {
     napi_status status = unofficial_napi_event_loop_checkpoint(
-        env, unofficial_napi_event_loop_checkpoint_microtasks, true);
+        env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr);
     if (status != napi_ok) {
       ADD_FAILURE() << "Failed to process microtasks: " << status;
       return false;
@@ -92,7 +92,7 @@ inline napi_value ForceGcCallback(napi_env env, napi_callback_info info) {
   (void)info;
   (void)unofficial_napi_request_gc_for_testing(env);
   (void)unofficial_napi_event_loop_checkpoint(
-      env, unofficial_napi_event_loop_checkpoint_microtasks, true);
+      env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr);
 
   napi_value result = nullptr;
   (void)napi_get_undefined(env, &result);

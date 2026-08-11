@@ -2317,11 +2317,15 @@ napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
-    bool has_runnable_work) {
+    bool has_runnable_work,
+    bool* has_pending_provider_work) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
+  }
+  if (has_pending_provider_work != nullptr) {
+    *has_pending_provider_work = false;
   }
   DrainMicrotasksForEnv(env);
   if (mode == unofficial_napi_event_loop_checkpoint_host_tasks &&

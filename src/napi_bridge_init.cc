@@ -3032,15 +3032,22 @@ extern "C" int snapi_bridge_unofficial_low_memory_notification(SnapiEnvState* en
 extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     SnapiEnvState* env_state,
     int mode,
-    int has_runnable_work) {
+    int has_runnable_work,
+    int* has_pending_provider_work) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_event_loop_checkpoint(
+  bool pending_provider_work = false;
+  const int status = unofficial_napi_event_loop_checkpoint(
       env,
       static_cast<unofficial_napi_event_loop_checkpoint_mode>(mode),
-      has_runnable_work != 0);
+      has_runnable_work != 0,
+      &pending_provider_work);
+  if (has_pending_provider_work != nullptr) {
+    *has_pending_provider_work = pending_provider_work ? 1 : 0;
+  }
+  return status;
 }
 
 extern "C" int snapi_bridge_unofficial_request_gc_for_testing(SnapiEnvState* env_state) {

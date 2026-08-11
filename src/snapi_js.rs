@@ -92,6 +92,25 @@ const wasmerNapiHostSetTimeout = globalThis.setTimeout.bind(globalThis);
 const wasmerNapiHostQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const wasmerNapiHostPromise = globalThis.Promise;
 const wasmerNapiHostPromiseThen = globalThis.Promise.prototype.then;
+let wasmerNapiPendingProviderWork = 0;
+function wasmerNapiTrackHostPromise(value) {
+  wasmerNapiPendingProviderWork += 1;
+  const promise = wasmerNapiHostPromise.resolve(value);
+  return wasmerNapiHostPromiseThen.call(
+    promise,
+    (result) => {
+      wasmerNapiPendingProviderWork -= 1;
+      return result;
+    },
+    (error) => {
+      wasmerNapiPendingProviderWork -= 1;
+      throw error;
+    },
+  );
+}
+export function wasmer_napi_has_pending_provider_work() {
+  return wasmerNapiPendingProviderWork !== 0;
+}
 const wasmerNapiYieldChannel = typeof globalThis.MessageChannel === 'function'
   ? new globalThis.MessageChannel()
   : undefined;
@@ -364,7 +383,7 @@ function wasmerNapiLowerDynamicImports(params, source, filename) {
     return {
       start,
       end,
-      text: `globalThis.process.__napi_dynamic_import(${specifier}, ${referrer}${options})`,
+      text: `__wasmerNapiTrackHostPromise(globalThis.process.__napi_dynamic_import(${specifier}, ${referrer}${options}))`,
     };
   }).sort((left, right) => right.start - left.start);
 
@@ -384,8 +403,9 @@ export function wasmer_napi_compile_function(scope, contextExtensions, params, s
   const scopes = [scope, ...Array.from(contextExtensions ?? [])];
   const prefix = scopes.map((_, index) => `with (scopes[${index}]) {`).join('');
   const suffix = '}'.repeat(scopes.length);
-  return Function('scopes',
-    `${prefix} return function(${names.join(',')}) {\n${source}\n}; ${suffix}`)(scopes);
+  return Function('scopes', '__wasmerNapiTrackHostPromise',
+    `${prefix} return function(${names.join(',')}) {\n${source}\n}; ${suffix}`)(
+      scopes, wasmerNapiTrackHostPromise);
 }
 function wasmerNapiCollectBindingNames(pattern, names) {
   if (pattern == null) return;
@@ -531,7 +551,7 @@ export function wasmer_napi_compile_module(scope, source, filename) {
       syntaxReplacements.push({
         start: node.start,
         end: node.end,
-        text: `globalThis.process.__napi_dynamic_import(${text(node.source)},${JSON.stringify(String(filename ?? ''))}${options})`,
+        text: `__wasmerNapiTrackHostPromise(globalThis.process.__napi_dynamic_import(${text(node.source)},${JSON.stringify(String(filename ?? ''))}${options}))`,
       });
     } else if (node.type === 'MetaProperty' && node.meta?.name === 'import' && node.property?.name === 'meta') {
       syntaxReplacements.push({ start: node.start, end: node.end, text: '__importMeta' });
@@ -580,7 +600,8 @@ export function wasmer_napi_compile_module(scope, source, filename) {
     replacedStart = replacement.start;
   }
   const constructorBody = `${hasTopLevelAwait ? 'return async function' : 'return function'}(__imports,__exports,__importMeta){'use strict';\n${body}\n}`;
-  const execute = Function('scope', `with(scope){${constructorBody}}`)(scope);
+  const execute = Function('scope', '__wasmerNapiTrackHostPromise',
+    `with(scope){${constructorBody}}`)(scope, wasmerNapiTrackHostPromise);
   return { requests, exportNames, hasTopLevelAwait, execute };
 }
 export function wasmer_napi_create_module_evaluation() {
@@ -860,6 +881,7 @@ extern "C" {
         allow_host_tasks: bool,
         has_runnable_work: bool,
     ) -> Promise;
+    fn wasmer_napi_has_pending_provider_work() -> bool;
     fn wasmer_napi_get_promise_details(promise: &JsValue) -> Array;
     fn wasmer_napi_has_jspi() -> bool;
     fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> bool;
@@ -3074,8 +3096,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
     _env: SnapiEnv,
     _mode: i32,
     _has_runnable_work: i32,
+    has_pending_provider_work: *mut i32,
 ) -> i32 {
     if has_jspi() {
+        let _ = unsafe {
+            write(
+                has_pending_provider_work,
+                i32::from(wasmer_napi_has_pending_provider_work()),
+            )
+        };
         NAPI_OK
     } else {
         NAPI_GENERIC_FAILURE

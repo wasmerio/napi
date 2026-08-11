@@ -93,7 +93,7 @@ TEST_F(Test35Promise, PromiseHooksObserveLifecycleEvents) {
       "Promise.resolve({ then(resolve) { resolve('ok'); } })"
       "  .then(() => { globalThis.promiseHookDone = true; })");
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
   const std::string events = JsonStringify(s.env, "globalThis.promiseHookEvents");
@@ -112,7 +112,7 @@ TEST_F(Test35Promise, ProviderEventLoopCheckpointProcessesMicrotasks) {
       "Promise.resolve().then(() => { providerCheckpointObserved = true; });");
 
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, nullptr),
             napi_ok);
   EXPECT_EQ(JsonStringify(s.env, "globalThis.providerCheckpointObserved"), "true");
 }
@@ -133,11 +133,11 @@ TEST_F(Test35Promise, PromiseRejectCallbackUsesV8EventShape) {
 
   RunScript(s.env, "globalThis.rejectedForHook = Promise.reject('bad')");
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
   RunScript(s.env, "globalThis.rejectedForHook.catch(() => {})");
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
   const std::string events = JsonStringify(s.env, "globalThis.promiseRejectEvents");
@@ -174,7 +174,7 @@ TEST_F(Test35Promise, ForAwaitBreakAwaitsAsyncIteratorReturn) {
       "})();");
 
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
@@ -220,7 +220,7 @@ TEST_F(Test35Promise, PromiseReactionRestoresContinuationPreservedEmbedderData) 
   ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, outside_frame), napi_ok);
 
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
   EXPECT_EQ(JsonStringify(s.env, "globalThis.reactionFrames"), "[\"request-store\"]");
@@ -266,7 +266,7 @@ TEST_F(Test35Promise, AsyncAwaitRestoresContinuationPreservedEmbedderData) {
   ASSERT_EQ(unofficial_napi_set_continuation_preserved_embedder_data(s.env, outside_frame), napi_ok);
 
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true),
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
   EXPECT_EQ(JsonStringify(s.env, "globalThis.awaitFrames"), "[\"request-store\",\"request-store\"]");
