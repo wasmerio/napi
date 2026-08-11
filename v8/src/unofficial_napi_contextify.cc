@@ -1201,13 +1201,20 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> id = v8::Undefined(isolate);
+  bool have_host_defined_options = false;
   if (!host_defined_options.IsEmpty() && host_defined_options->IsFixedArray()) {
     v8::Local<v8::FixedArray> options = host_defined_options.As<v8::FixedArray>();
     if (options->Length() == kHostDefinedOptionsLength) {
       id = options->Get(context, kHostDefinedOptionsId).As<v8::Value>();
+      have_host_defined_options = true;
     }
   }
-  if (id->IsUndefined()) {
+  // Match Node's referrer selection exactly: a full host-options block owns
+  // the ID slot even when its value is undefined. Only an actually empty
+  // block (used by realm-level imports such as ShadowRealm) may consult the
+  // realm global. Treating an undefined slot as an empty block lets indirect
+  // eval escape into the realm's default loader.
+  if (!have_host_defined_options) {
     v8::Local<v8::Value> global_id;
     if (context->Global()
             ->GetPrivate(context, ApiPrivate(isolate, "node:host_defined_option_symbol"))
@@ -1804,12 +1811,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
       host_id_symbol = host_raw.As<v8::Symbol>();
     }
   }
-  // The CJS-function shape defaults to the loader's dynamic-import host
-  // symbol so the compiled artifact is directly usable by the CJS loader.
-  if (host_id_symbol.IsEmpty() && shape == unofficial_napi_bytecode_shape_cjs_function) {
-    host_id_symbol = DefaultCjsHostSymbol(env);
-  }
-
   v8::TryCatch try_catch(isolate);
   if (!CompileBytecodeRecord(env, record.get(), host_id_symbol, /*consume=*/false, nullptr)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
@@ -1876,10 +1877,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
       host_id_symbol = host_raw.As<v8::Symbol>();
     }
   }
-  if (host_id_symbol.IsEmpty() && shape == unofficial_napi_bytecode_shape_cjs_function) {
-    host_id_symbol = DefaultCjsHostSymbol(env);
-  }
-
   bool rejected = false;
   v8::TryCatch try_catch(isolate);
   if (!CompileBytecodeRecord(env, record.get(), host_id_symbol, /*consume=*/true, &rejected)) {
@@ -2212,13 +2209,9 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     if (!bytecode_record->host_symbol.IsEmpty()) {
       record_symbol = bytecode_record->host_symbol.Get(isolate);
     }
-    // bytecode_compile/deserialize default CJS-function records to the
-    // loader's dynamic-import symbol; a caller passing no symbol gets the
-    // artifact it asked those APIs to build.
-    const bool host_symbol_matches =
-        record_symbol == host_id_symbol ||
-        (host_id_symbol.IsEmpty() && !record_symbol.IsEmpty() &&
-         record_symbol == DefaultCjsHostSymbol(env));
+    // Host metadata is part of the artifact identity. Function shape alone
+    // cannot decide whether code is user CJS or an internal builtin.
+    const bool host_symbol_matches = record_symbol == host_id_symbol;
     if (host_symbol_matches) {
       fn = bytecode_record->function.Get(isolate);
       effective_symbol = record_symbol;

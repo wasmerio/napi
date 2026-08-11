@@ -20,6 +20,31 @@ napi_value Sym(napi_env env, const char* value) {
   return out;
 }
 
+napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_set_named_property(env, global, "__captured_dynamic_import_id", argv[0]) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_deferred deferred = nullptr;
+  napi_value promise = nullptr;
+  napi_value undefined = nullptr;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok ||
+      napi_get_undefined(env, &undefined) != napi_ok ||
+      napi_resolve_deferred(env, deferred, undefined) != napi_ok) {
+    return nullptr;
+  }
+  return promise;
+}
+
 }  // namespace
 
 TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
@@ -253,6 +278,108 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   EXPECT_FALSE(rejected);
   ASSERT_NE(restored, nullptr);
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, restored), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify,
+       FunctionBytecodePreservesExplicitHostDefinedOptionIdentity) {
+  EnvScope s(runtime_.get());
+
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_create_function(s.env,
+                                 "captureDynamicImportId",
+                                 NAPI_AUTO_LENGTH,
+                                 CaptureDynamicImportId,
+                                 nullptr,
+                                 &callback),
+            napi_ok);
+  ASSERT_EQ(
+      unofficial_napi_module_wrap_set_import_module_dynamically_callback(s.env, callback),
+      napi_ok);
+
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value explicit_id = Sym(s.env, "explicit-cjs-host-id");
+  ASSERT_NE(explicit_id, nullptr);
+
+  auto compile_invoke_and_capture = [&](napi_value host_id) -> napi_value {
+    void* bytecode = nullptr;
+    EXPECT_EQ(unofficial_napi_bytecode_compile(
+                  s.env,
+                  Str(s.env, "return import('node:test');"),
+                  Str(s.env, "host-id.js"),
+                  unofficial_napi_bytecode_shape_cjs_function,
+                  undefined,
+                  host_id,
+                  0,
+                  0,
+                  &bytecode,
+                  nullptr),
+              napi_ok);
+    EXPECT_NE(bytecode, nullptr);
+    if (bytecode == nullptr) return nullptr;
+
+    const unofficial_napi_js_source source{nullptr, bytecode};
+    napi_value compiled = nullptr;
+    EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
+                                                          &source,
+                                                          Str(s.env, "host-id.js"),
+                                                          0,
+                                                          0,
+                                                          undefined,
+                                                          undefined,
+                                                          undefined,
+                                                          host_id,
+                                                          &compiled),
+              napi_ok);
+    EXPECT_NE(compiled, nullptr);
+
+    napi_value fn = nullptr;
+    napi_value global = nullptr;
+    napi_value import_result = nullptr;
+    if (compiled != nullptr) {
+      EXPECT_EQ(napi_get_named_property(s.env, compiled, "function", &fn), napi_ok);
+      EXPECT_EQ(napi_get_global(s.env, &global), napi_ok);
+      EXPECT_EQ(napi_call_function(s.env, global, fn, 0, nullptr, &import_result), napi_ok);
+    }
+
+    napi_value captured = nullptr;
+    if (global != nullptr) {
+      EXPECT_EQ(napi_get_named_property(
+                    s.env, global, "__captured_dynamic_import_id", &captured),
+                napi_ok);
+      if (import_result != nullptr) {
+        EXPECT_EQ(napi_set_named_property(s.env, global, "__host_id_import_result", import_result),
+                  napi_ok);
+        napi_value ignored = nullptr;
+        EXPECT_EQ(napi_run_script(
+                      s.env,
+                      Str(s.env, "__host_id_import_result.catch(() => {});"),
+                      &ignored),
+                  napi_ok);
+      }
+    }
+    EXPECT_EQ(unofficial_napi_bytecode_release(s.env, bytecode), napi_ok);
+    return captured;
+  };
+
+  napi_value captured_without_id = compile_invoke_and_capture(undefined);
+  ASSERT_NE(captured_without_id, nullptr);
+  bool equal = false;
+  ASSERT_EQ(napi_strict_equals(s.env, captured_without_id, undefined, &equal), napi_ok);
+  EXPECT_TRUE(equal);
+
+  napi_value captured_with_id = compile_invoke_and_capture(explicit_id);
+  ASSERT_NE(captured_with_id, nullptr);
+  ASSERT_EQ(napi_strict_equals(s.env, captured_with_id, explicit_id, &equal), napi_ok);
+  EXPECT_TRUE(equal);
+
+  bool pending_provider_work = false;
+  EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env,
+                unofficial_napi_event_loop_checkpoint_microtasks,
+                true,
+                &pending_provider_work),
+            napi_ok);
 }
 
 TEST_F(Test65UnofficialContextify, CompileFunctionDoesNotUseGlobalFunctionConstructor) {
