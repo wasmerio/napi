@@ -33,6 +33,7 @@ const NAPI_INVALID_ARG: i32 = 1;
 const NAPI_OBJECT_EXPECTED: i32 = 2;
 const NAPI_STRING_EXPECTED: i32 = 3;
 const NAPI_FUNCTION_EXPECTED: i32 = 5;
+const NAPI_ARRAY_EXPECTED: i32 = 8;
 const NAPI_GENERIC_FAILURE: i32 = 9;
 const NAPI_PENDING_EXCEPTION: i32 = 10;
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
@@ -373,19 +374,18 @@ function wasmerNapiLowerDynamicImports(params, source, filename) {
   }
   return source;
 }
-export function wasmer_napi_compile_function(params, source, filename) {
+export function wasmer_napi_compile_function(scope, contextExtensions, params, source, filename) {
   // V8's compile-function path accepts a hashbang for CommonJS entry files,
   // while the JavaScript Function constructor does not. Preserve byte and
   // line offsets by replacing only the hashbang marker with a line comment.
   if (source.startsWith('#!')) source = '//' + source.slice(2);
   source = wasmerNapiLowerDynamicImports(params, source, filename);
-  if (wasmerNapiActiveGlobalContext === undefined) {
-    return Function(...params, source);
-  }
-  const context = wasmerNapiActiveGlobalContext;
   const names = Array.from(params, String);
-  return Function('scope',
-    `with (scope) { return function(${names.join(',')}) {\n${source}\n}; }`)(context.scope);
+  const scopes = [scope, ...Array.from(contextExtensions ?? [])];
+  const prefix = scopes.map((_, index) => `with (scopes[${index}]) {`).join('');
+  const suffix = '}'.repeat(scopes.length);
+  return Function('scopes',
+    `${prefix} return function(${names.join(',')}) {\n${source}\n}; ${suffix}`)(scopes);
 }
 function wasmerNapiCollectBindingNames(pattern, names) {
   if (pattern == null) return;
@@ -403,7 +403,7 @@ function wasmerNapiCollectBindingNames(pattern, names) {
     wasmerNapiCollectBindingNames(pattern.argument, names);
   }
 }
-export function wasmer_napi_compile_module(source, filename) {
+export function wasmer_napi_compile_module(scope, source, filename) {
   const program = wasmerNapiParse(source, {
     ecmaVersion: 'latest',
     sourceType: 'module',
@@ -580,13 +580,7 @@ export function wasmer_napi_compile_module(source, filename) {
     replacedStart = replacement.start;
   }
   const constructorBody = `${hasTopLevelAwait ? 'return async function' : 'return function'}(__imports,__exports,__importMeta){'use strict';\n${body}\n}`;
-  let execute;
-  if (wasmerNapiActiveGlobalContext === undefined) {
-    execute = Function(constructorBody)();
-  } else {
-    const context = wasmerNapiActiveGlobalContext;
-    execute = Function('scope', `with(scope){${constructorBody}}`)(context.scope);
-  }
+  const execute = Function('scope', `with(scope){${constructorBody}}`)(scope);
   return { requests, exportNames, hasTopLevelAwait, execute };
 }
 export function wasmer_napi_create_module_evaluation() {
@@ -884,12 +878,18 @@ extern "C" {
     fn wasmer_napi_context_eval(sandbox: &JsValue, source: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_compile_function(
+        scope: &JsValue,
+        context_extensions: &Array,
         params: &Array,
         source: &str,
         filename: &str,
     ) -> Result<Function, JsValue>;
     #[wasm_bindgen(catch)]
-    fn wasmer_napi_compile_module(source: &str, filename: &str) -> Result<JsValue, JsValue>;
+    fn wasmer_napi_compile_module(
+        scope: &JsValue,
+        source: &str,
+        filename: &str,
+    ) -> Result<JsValue, JsValue>;
     fn wasmer_napi_create_module_evaluation() -> Object;
     fn wasmer_napi_finish_module_evaluation(
         evaluation: &Object,
@@ -1310,6 +1310,20 @@ unsafe fn env_mut<'a>(env: SnapiEnv) -> Result<&'a mut HostJsEnv, i32> {
         }
     });
     Ok(state)
+}
+
+fn evaluation_scope(state: &HostJsEnv, context_id: u32) -> Result<JsValue, i32> {
+    if context_id == 0 {
+        return Ok(wasmer_napi_global_context_scope(&state.global_context));
+    }
+    let Some(context) = state.get(context_id) else {
+        return Err(NAPI_INVALID_ARG);
+    };
+    if context.is_null() || context.is_undefined() {
+        Ok(wasmer_napi_global_context_scope(&state.global_context))
+    } else {
+        Ok(context.clone())
+    }
 }
 
 unsafe fn write<T>(out: *mut T, value: T) -> Result<(), i32> {
@@ -3766,7 +3780,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_contains_module_synt
             params.push(&JsValue::from_str(name));
         }
     }
-    let is_module = wasmer_napi_compile_function(&params, &source, "").is_err()
+    let scope = wasmer_napi_global_context_scope(&state.global_context);
+    let context_extensions = Array::new();
+    let is_module = wasmer_napi_compile_function(&scope, &context_extensions, &params, &source, "")
+        .is_err()
         && source.lines().any(|line| {
             let line = line.trim_start();
             line.starts_with("import ")
@@ -3886,13 +3903,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
     host_defined_option_id: u32,
     result_out: *mut u32,
 ) -> i32 {
-    let _ = (
-        line_offset,
-        column_offset,
-        parsing_context_id,
-        context_extensions_id,
-        host_defined_option_id,
-    );
+    let _ = (line_offset, column_offset, host_defined_option_id);
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -3921,7 +3932,24 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
         .get(filename_id)
         .and_then(JsValue::as_string)
         .unwrap_or_default();
-    match wasmer_napi_compile_function(&params, &source, &filename) {
+    let scope = match evaluation_scope(state, parsing_context_id) {
+        Ok(scope) => scope,
+        Err(status) => return status,
+    };
+    let context_extensions = if context_extensions_id == 0 {
+        Array::new()
+    } else if let Some(value) = state.get(context_extensions_id) {
+        if value.is_null() || value.is_undefined() {
+            Array::new()
+        } else if Array::is_array(value) {
+            Array::from(value)
+        } else {
+            return NAPI_ARRAY_EXPECTED;
+        }
+    } else {
+        return NAPI_INVALID_ARG;
+    };
+    match wasmer_napi_compile_function(&scope, &context_extensions, &params, &source, &filename) {
         Ok(function) => {
             let result = Object::new();
             let _ = Reflect::set(
@@ -3983,7 +4011,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function_for
         .get(filename_id)
         .and_then(JsValue::as_string)
         .unwrap_or_default();
-    match wasmer_napi_compile_function(&params, &source, &filename) {
+    let scope = wasmer_napi_global_context_scope(&state.global_context);
+    let context_extensions = Array::new();
+    match wasmer_napi_compile_function(&scope, &context_extensions, &params, &source, &filename) {
         Ok(function) => {
             let result = Object::new();
             let _ = Reflect::set(
@@ -4124,12 +4154,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
     host_defined_option_id: u32,
     handle_out: *mut u32,
 ) -> i32 {
-    let _ = (
-        context_id,
-        line_offset,
-        column_offset,
-        host_defined_option_id,
-    );
+    let _ = (line_offset, column_offset, host_defined_option_id);
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -4146,7 +4171,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
         return NAPI_STRING_EXPECTED;
     };
 
-    let compiled = match wasmer_napi_compile_module(&source, &url) {
+    let scope = match evaluation_scope(state, context_id) {
+        Ok(scope) => scope,
+        Err(status) => return status,
+    };
+    let compiled = match wasmer_napi_compile_module(&scope, &source, &url) {
         Ok(value) => value,
         Err(error) => {
             state.last_exception = Some(error);

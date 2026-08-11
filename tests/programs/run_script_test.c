@@ -90,6 +90,159 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope));
 
+  // Every code-generation path must select its execution scope explicitly.
+  // In particular, vm compile-function and module compilation must honor the
+  // supplied context rather than falling back to the active environment or
+  // the Wasmer worker's control-plane global.
+  napi_value undefined_value;
+  NAPI_CALL(env, napi_get_undefined(env, &undefined_value));
+  napi_value sandbox;
+  NAPI_CALL(env, napi_create_object(env, &sandbox));
+  napi_value context_marker;
+  NAPI_CALL(env, napi_create_int32(env, 73, &context_marker));
+  NAPI_CALL(env, napi_set_named_property(
+                     env, sandbox, "__napi_context_marker", context_marker));
+  napi_value context;
+  NAPI_CALL(env, unofficial_napi_contextify_make_context(
+                     env,
+                     sandbox,
+                     undefined_value,
+                     undefined_value,
+                     true,
+                     true,
+                     true,
+                     undefined_value,
+                     &context));
+
+  napi_value context_source_text;
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "globalThis.__napi_context_marker",
+                     NAPI_AUTO_LENGTH,
+                     &context_source_text));
+  const unofficial_napi_js_source context_source = {
+      context_source_text, NULL};
+  napi_value context_result;
+  NAPI_CALL(env, unofficial_napi_contextify_run_script(
+                     env,
+                     context,
+                     &context_source,
+                     undefined_value,
+                     0,
+                     0,
+                     -1,
+                     true,
+                     false,
+                     false,
+                     undefined_value,
+                     &context_result));
+  NAPI_CALL(env, napi_get_value_int32(env, context_result, &marker));
+  CHECK_OR_FAIL(marker == 73,
+                "contextify_run_script escaped its explicit context");
+
+  napi_value parameters;
+  napi_value context_extensions;
+  NAPI_CALL(env, napi_create_array_with_length(env, 0, &parameters));
+  NAPI_CALL(env, napi_create_array_with_length(env, 1, &context_extensions));
+  napi_value context_extension;
+  napi_value extension_marker;
+  NAPI_CALL(env, napi_create_object(env, &context_extension));
+  NAPI_CALL(env, napi_create_int32(env, 74, &extension_marker));
+  NAPI_CALL(env, napi_set_named_property(
+                     env,
+                     context_extension,
+                     "__napi_context_extension_marker",
+                     extension_marker));
+  NAPI_CALL(env, napi_set_element(
+                     env, context_extensions, 0, context_extension));
+  napi_value function_source_text;
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "return globalThis.__napi_context_marker + "
+                     "__napi_context_extension_marker;",
+                     NAPI_AUTO_LENGTH,
+                     &function_source_text));
+  const unofficial_napi_js_source function_source = {
+      function_source_text, NULL};
+  napi_value compiled;
+  NAPI_CALL(env, unofficial_napi_contextify_compile_function(
+                     env,
+                     &function_source,
+                     undefined_value,
+                     0,
+                     0,
+                     context,
+                     context_extensions,
+                     parameters,
+                     undefined_value,
+                     &compiled));
+  napi_value compiled_function;
+  NAPI_CALL(env, napi_get_named_property(
+                     env, compiled, "function", &compiled_function));
+  napi_value env_global;
+  NAPI_CALL(env, napi_get_global(env, &env_global));
+  napi_value function_result;
+  NAPI_CALL(env, napi_call_function(
+                     env,
+                     env_global,
+                     compiled_function,
+                     0,
+                     NULL,
+                     &function_result));
+  NAPI_CALL(env, napi_get_value_int32(env, function_result, &marker));
+  CHECK_OR_FAIL(marker == 147,
+                "compile_function escaped its parsing context");
+
+  napi_value module_wrapper;
+  napi_value module_url;
+  napi_value module_source_text;
+  NAPI_CALL(env, napi_create_object(env, &module_wrapper));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "file:///context-module.mjs",
+                     NAPI_AUTO_LENGTH,
+                     &module_url));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "export const observed = "
+                     "globalThis.__napi_context_marker;",
+                     NAPI_AUTO_LENGTH,
+                     &module_source_text));
+  const unofficial_napi_js_source module_source = {module_source_text, NULL};
+  void* module_handle = NULL;
+  NAPI_CALL(env, unofficial_napi_module_wrap_create_source_text(
+                     env,
+                     module_wrapper,
+                     module_url,
+                     context,
+                     &module_source,
+                     0,
+                     0,
+                     undefined_value,
+                     &module_handle));
+  CHECK_OR_FAIL(module_handle != NULL,
+                "module compilation did not return a handle");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(
+                     env, module_handle, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module_handle));
+  napi_value module_result;
+  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
+                     env,
+                     module_handle,
+                     module_url,
+                     module_url,
+                     &module_result));
+  napi_value module_namespace;
+  napi_value module_observed;
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_namespace(
+                     env, module_handle, &module_namespace));
+  NAPI_CALL(env, napi_get_named_property(
+                     env, module_namespace, "observed", &module_observed));
+  NAPI_CALL(env, napi_get_value_int32(env, module_observed, &marker));
+  CHECK_OR_FAIL(marker == 73,
+                "module evaluation escaped its explicit context");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module_handle));
+
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
   // owns the value and copy-back. Releasing after the handle scope closes is
   // the contract retained native users such as zlib and async fs require.
