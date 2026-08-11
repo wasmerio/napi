@@ -403,6 +403,22 @@ fn guest_unofficial_napi_yield_to_host_event_loop(
     Ok(status)
 }
 
+fn guest_unofficial_napi_create_uninitialized_arraybuffer(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    length: i32,
+    _zero_fill: i32,
+    result_ptr: i32,
+) -> i32 {
+    if length < 0 {
+        return 1;
+    }
+    // Imported providers cannot adopt a guest allocation as host engine
+    // storage. Allocate directly in the provider without requesting a guest
+    // pointer; engines which mandate zero initialization may return zeros.
+    guest_napi_create_arraybuffer(env, napi_env, length, 0, result_ptr)
+}
+
 fn guest_unofficial_napi_request_gc_for_testing(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -5580,6 +5596,7 @@ pub fn register_napi_imports(
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_process_microtasks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_process_microtasks),
         "unofficial_napi_yield_to_host_event_loop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_yield_to_host_event_loop),
+        "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),

@@ -2328,6 +2328,31 @@ napi_status NAPI_CDECL unofficial_napi_yield_to_host_event_loop(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
+    napi_env env,
+    size_t length,
+    bool zero_fill,
+    napi_value* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (length == 0) {
+    return napi_create_arraybuffer(env, 0, nullptr, result);
+  }
+
+  void* data = zero_fill ? std::calloc(length, 1) : std::malloc(length);
+  if (data == nullptr) return napi_generic_failure;
+  napi_status status = napi_create_external_arraybuffer(
+      env,
+      data,
+      length,
+      [](napi_env, void* bytes, void*) { std::free(bytes); },
+      nullptr,
+      result);
+  if (status != napi_ok) std::free(data);
+  return status;
+}
+
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   env->isolate->TerminateExecution();

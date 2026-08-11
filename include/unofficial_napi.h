@@ -133,6 +133,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_guest_backed_typ
     size_t length,
     void** data,
     napi_value* result);
+// Creates an ArrayBuffer using the provider's native ownership policy without
+// exposing a raw pointer to Edge. Embedded providers may adopt an uninitialized
+// native allocation; host-JavaScript providers allocate in the host engine and
+// therefore may return zeroed storage when the engine has no unsafe allocator.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_arraybuffer(
+    napi_env env,
+    size_t length,
+    bool zero_fill,
+    napi_value* result);
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must

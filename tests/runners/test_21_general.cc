@@ -24,6 +24,38 @@ TEST_F(Test21General, PortedCoreFlow) {
       RunUpstreamJsFile(s, std::string(NAPI_TESTS_ROOT_PATH) + "/js-native-api/test_general/test.js"));
 }
 
+TEST_F(Test21General, ProviderOwnsUninitializedArrayBufferAllocation) {
+  EnvScope s(runtime_.get());
+
+  napi_value arraybuffer = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uninitialized_arraybuffer(
+                s.env, 32, true, &arraybuffer),
+            napi_ok);
+  ASSERT_NE(arraybuffer, nullptr);
+
+  bool is_arraybuffer = false;
+  ASSERT_EQ(napi_is_arraybuffer(s.env, arraybuffer, &is_arraybuffer), napi_ok);
+  ASSERT_TRUE(is_arraybuffer);
+
+  void* data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(napi_get_arraybuffer_info(s.env, arraybuffer, &data, &length), napi_ok);
+  ASSERT_EQ(length, 32u);
+  ASSERT_NE(data, nullptr);
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t index = 0; index < length; ++index) {
+    EXPECT_EQ(bytes[index], 0u) << "byte " << index;
+  }
+
+  napi_value empty = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uninitialized_arraybuffer(
+                s.env, 0, false, &empty),
+            napi_ok);
+  ASSERT_NE(empty, nullptr);
+  ASSERT_EQ(napi_get_arraybuffer_info(s.env, empty, &data, &length), napi_ok);
+  EXPECT_EQ(length, 0u);
+}
+
 #ifdef NAPI_TEST_ENGINE_QUICKJS
 TEST_F(Test21General, GlobalBufferPrototypeDetection) {
   EnvScope s(runtime_.get());

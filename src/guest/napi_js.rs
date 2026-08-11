@@ -628,6 +628,21 @@ fn guest_unofficial_napi_yield_to_host_event_loop_sync(
     guest_unofficial_napi_process_microtasks_sync(env, napi_env)
 }
 
+fn guest_unofficial_napi_create_uninitialized_arraybuffer(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    length: i32,
+    _zero_fill: i32,
+    result_ptr: i32,
+) -> i32 {
+    if length < 0 {
+        return 1;
+    }
+    // JavaScript ArrayBuffers are engine-owned and zero-initialized. Avoid a
+    // guest snapshot entirely when Edge does not request a native pointer.
+    guest_napi_create_arraybuffer(env, napi_env, length, 0, result_ptr)
+}
+
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 fn yield_to_host_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -> Function {
     Function::new_typed_with_env(
@@ -6280,6 +6295,7 @@ pub fn register_napi_imports(
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_process_microtasks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_process_microtasks_sync),
         "unofficial_napi_yield_to_host_event_loop" => yield_to_host_import(store, fe),
+        "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
