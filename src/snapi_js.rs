@@ -3039,7 +3039,10 @@ pub unsafe extern "C" fn snapi_bridge_check_object_type_tag(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_process_microtasks(_env: SnapiEnv) -> i32 {
+pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
+    _env: SnapiEnv,
+    _has_runnable_work: i32,
+) -> i32 {
     if has_jspi() {
         NAPI_OK
     } else {

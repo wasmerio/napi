@@ -90,9 +90,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 
-// Unofficial/test-only helper. Runs a checkpoint on the current context's
-// microtask queue.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
 // Complete one provider-owned event-loop checkpoint. The host-JavaScript
 // backend suspends through JSPI and drains callbacks that arrived while the
 // guest was suspended. Embedded engines process their engine checkpoint and

@@ -455,13 +455,6 @@ extern "C"
         return unofficial_napi_low_memory_notification(env);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env)
-    {
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_util__::run_pending_jobs(env);
-    }
-
     napi_status NAPI_CDECL unofficial_napi_yield_to_host_event_loop(
         napi_env env,
         bool has_runnable_work)

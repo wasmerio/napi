@@ -67,7 +67,10 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
-    pub fn snapi_bridge_unofficial_process_microtasks(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_event_loop_checkpoint(
+        env: SnapiEnv,
+        has_runnable_work: i32,
+    ) -> i32;
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(

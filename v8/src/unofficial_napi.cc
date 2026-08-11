@@ -2263,7 +2263,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 // for the isolate. That runner forwards to the guest's own enqueue callback
 // when one is bound (see EdgeV8Platform::BindForegroundTaskTarget), but the
 // guest is not required to bind one -- it may drive everything through
-// unofficial_napi_process_microtasks instead. Tasks posted with no guest
+// the provider-owned event-loop checkpoint instead. Tasks posted with no guest
 // target bound fall back to the stock default-platform runner, and nothing
 // else ever pumps that runner's queue, so without this they are posted and
 // then never run: V8 correctly collects the dead targets, but their
@@ -2306,14 +2306,6 @@ napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
   // cycle rather than only hinting memory pressure.
   env->isolate->RequestGarbageCollectionForTesting(
       v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Keep this helper scoped to the current context's microtask queue.
-  // Foreground task pumping is owned by higher-level runtime loop policy.
-  DrainMicrotasksForEnv(env);
   return napi_ok;
 }
 

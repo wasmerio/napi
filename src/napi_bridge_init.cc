@@ -3029,12 +3029,14 @@ extern "C" int snapi_bridge_unofficial_low_memory_notification(SnapiEnvState* en
   return unofficial_napi_low_memory_notification(env);
 }
 
-extern "C" int snapi_bridge_unofficial_process_microtasks(SnapiEnvState* env_state) {
+extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
+    SnapiEnvState* env_state,
+    int has_runnable_work) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_process_microtasks(env);
+  return unofficial_napi_yield_to_host_event_loop(env, has_runnable_work != 0);
 }
 
 extern "C" int snapi_bridge_unofficial_request_gc_for_testing(SnapiEnvState* env_state) {
@@ -3250,7 +3252,7 @@ extern "C" int snapi_bridge_unofficial_set_enqueue_foreground_task_callback(
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   // Keep parity with the previous bridge behavior (no custom foreground task hook).
-  // The runtime still drives microtasks via unofficial_napi_process_microtasks.
+  // The runtime drives provider work through the event-loop checkpoint.
   return napi_ok;
 }
 
