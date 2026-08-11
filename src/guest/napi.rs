@@ -388,6 +388,21 @@ fn guest_unofficial_napi_process_microtasks(
     })
 }
 
+fn guest_unofficial_napi_yield_to_host_event_loop(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    has_runnable_work: i32,
+) -> Result<i32, WasiError> {
+    let env_handle = snapi_env(&env, napi_env);
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_process_microtasks(env_handle)
+    })?;
+    if status == 0 && has_runnable_work == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(status)
+}
+
 fn guest_unofficial_napi_request_gc_for_testing(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -5564,6 +5579,7 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env_with_loop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env_with_loop),
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_process_microtasks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_process_microtasks),
+        "unofficial_napi_yield_to_host_event_loop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_yield_to_host_event_loop),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),

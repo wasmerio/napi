@@ -2317,6 +2317,17 @@ napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_yield_to_host_event_loop(
+    napi_env env,
+    bool has_runnable_work) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  DrainMicrotasksForEnv(env);
+  if (!has_runnable_work) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   env->isolate->TerminateExecution();

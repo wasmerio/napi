@@ -93,9 +93,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(
 // Unofficial/test-only helper. Runs a checkpoint on the current context's
 // microtask queue.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
-// Yield one host event-loop turn. The host-JavaScript backend suspends through
-// JSPI and drains callbacks that arrived while the guest was suspended.
-// Embedded engines may implement this as an ordinary task checkpoint.
+// Complete one provider-owned event-loop checkpoint. The host-JavaScript
+// backend suspends through JSPI and drains callbacks that arrived while the
+// guest was suspended. Embedded engines process their engine checkpoint and
+// briefly wait when no native work is runnable. Edge's outer loop calls this
+// operation unconditionally; target selection belongs to the provider.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_yield_to_host_event_loop(
     napi_env env, bool has_runnable_work);
 // Acquires an exact byte range for native access. The returned pointer remains

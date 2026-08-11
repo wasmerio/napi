@@ -101,6 +101,18 @@ TEST_F(Test35Promise, PromiseHooksObserveLifecycleEvents) {
   EXPECT_NE(events.find("\"resolve\""), std::string::npos) << events;
 }
 
+TEST_F(Test35Promise, ProviderEventLoopCheckpointProcessesMicrotasks) {
+  EnvScope s(runtime_.get());
+
+  RunScript(
+      s.env,
+      "globalThis.providerCheckpointObserved = false;"
+      "Promise.resolve().then(() => { providerCheckpointObserved = true; });");
+
+  ASSERT_EQ(unofficial_napi_yield_to_host_event_loop(s.env, true), napi_ok);
+  EXPECT_EQ(JsonStringify(s.env, "globalThis.providerCheckpointObserved"), "true");
+}
+
 TEST_F(Test35Promise, PromiseRejectCallbackUsesV8EventShape) {
   EnvScope s(runtime_.get());
 

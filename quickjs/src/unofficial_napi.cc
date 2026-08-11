@@ -11,11 +11,13 @@
 #include "node_api.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace quickjs::detail;
@@ -458,6 +460,20 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return napi_util__::run_pending_jobs(env);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_yield_to_host_event_loop(
+        napi_env env,
+        bool has_runnable_work)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        napi_status status = napi_util__::run_pending_jobs(env);
+        if (status != napi_ok)
+            return status;
+        if (!has_runnable_work)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env)
