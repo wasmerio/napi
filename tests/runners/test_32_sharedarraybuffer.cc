@@ -63,3 +63,31 @@ TEST_F(Test32SharedArrayBuffer, BufferLeaseSupportsExactSharedRange) {
   ASSERT_EQ(napi_get_value_int32(s.env, verification, &result), napi_ok);
   EXPECT_EQ(result, 1617);
 }
+
+TEST_F(Test32SharedArrayBuffer, BufferLeaseUsesFloat16ByteLength) {
+  EnvScope s(runtime_.get());
+  napi_value arraybuffer = nullptr;
+  void* storage = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 8, &storage, &arraybuffer), napi_ok);
+  ASSERT_NE(storage, nullptr);
+
+  napi_value view = nullptr;
+  ASSERT_EQ(napi_create_typedarray(
+                s.env, napi_float16_array, 4, arraybuffer, 0, &view),
+            napi_ok);
+
+  unofficial_napi_buffer_lease lease = nullptr;
+  void* data = nullptr;
+  ASSERT_EQ(unofficial_napi_acquire_buffer_lease(
+                s.env,
+                view,
+                0,
+                8,
+                unofficial_napi_buffer_access_readwrite,
+                &lease,
+                &data),
+            napi_ok);
+  ASSERT_NE(lease, nullptr);
+  EXPECT_EQ(data, storage);
+  ASSERT_EQ(unofficial_napi_release_buffer_lease(s.env, lease, false), napi_ok);
+}

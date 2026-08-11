@@ -153,6 +153,7 @@ static napi_status GetLeaseByteView(napi_env env, napi_value value, uint8_t **da
         size_t element_size = 1;
         switch (type)
         {
+        case napi_float16_array:
         case napi_int16_array:
         case napi_uint16_array:
             element_size = 2;
@@ -249,6 +250,7 @@ extern "C"
         size_t element_size = 1;
         switch (type)
         {
+        case napi_float16_array:
         case napi_int16_array:
         case napi_uint16_array:
             element_size = 2;

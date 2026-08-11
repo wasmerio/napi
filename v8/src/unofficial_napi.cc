@@ -1742,6 +1742,7 @@ static napi_status GetLeaseByteView(napi_env env,
     if (status != napi_ok) return status;
     size_t element_size = 1;
     switch (type) {
+      case napi_float16_array:
       case napi_int16_array:
       case napi_uint16_array: element_size = 2; break;
       case napi_int32_array:
@@ -1822,6 +1823,7 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
   if (env == nullptr || data == nullptr || result == nullptr) return napi_invalid_arg;
   size_t element_size = 1;
   switch (type) {
+    case napi_float16_array:
     case napi_int16_array:
     case napi_uint16_array: element_size = 2; break;
     case napi_int32_array:
