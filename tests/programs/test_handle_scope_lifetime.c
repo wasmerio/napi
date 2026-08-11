@@ -1,5 +1,5 @@
-// Scope-bound value lifetime semantics: values die (safely) when their handle
-// scope closes, refs survive, and slot reclamation keeps id churn bounded.
+// Provider-neutral handle-scope semantics: refs survive scope closure,
+// scopes close in LIFO order, and repeated scope churn remains bounded.
 #include <stdio.h>
 #include <string.h>
 
@@ -9,18 +9,13 @@ int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
 
-  // 1. A value from a closed scope must be safely rejected, not crash.
+  // N-API values are invalid after their owning scope closes. Using one after
+  // close is outside the N-API contract, so a cross-provider test must not
+  // require either rejection or continued validity from that invalid handle.
   napi_handle_scope scope;
-  NAPI_CALL(env, napi_open_handle_scope(env, &scope));
-  napi_value inner;
-  NAPI_CALL(env, napi_create_string_utf8(env, "dies-with-scope", NAPI_AUTO_LENGTH, &inner));
-  NAPI_CALL(env, napi_close_handle_scope(env, scope));
   napi_valuetype vtype;
-  napi_status stale_status = napi_typeof(env, inner, &vtype);
-  CHECK_OR_FAIL(stale_status != napi_ok,
-                "stale value from closed scope should be rejected");
 
-  // 2. A ref taken inside the scope must survive the close.
+  // 1. A ref taken inside the scope must survive the close.
   NAPI_CALL(env, napi_open_handle_scope(env, &scope));
   napi_value obj;
   NAPI_CALL(env, napi_create_object(env, &obj));
@@ -34,7 +29,7 @@ int main(void) {
   CHECK_OR_FAIL(vtype == napi_object, "ref-resolved value should be an object");
   NAPI_CALL(env, napi_delete_reference(env, ref));
 
-  // 3. Out-of-order close is a safe mismatch error, and recovery works.
+  // 2. Out-of-order close is a safe mismatch error, and recovery works.
   napi_handle_scope outer_scope, inner_scope;
   NAPI_CALL(env, napi_open_handle_scope(env, &outer_scope));
   NAPI_CALL(env, napi_open_handle_scope(env, &inner_scope));
@@ -43,7 +38,7 @@ int main(void) {
   NAPI_CALL(env, napi_close_handle_scope(env, inner_scope));
   NAPI_CALL(env, napi_close_handle_scope(env, outer_scope));
 
-  // 4. Leak check: churn far more values than the 2^20 slot-table capacity.
+  // 3. Leak check: churn far more values than the 2^20 slot-table capacity.
   // If closing a scope failed to reclaim slots, minting would start failing
   // partway through this loop.
   for (int turn = 0; turn < 20000; turn++) {

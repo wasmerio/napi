@@ -7,7 +7,13 @@ license = "MIT"
 resolver = "2"
 
 [features]
-js = ["dep:js-sys", "dep:wasm-bindgen", "wasmer/js-default"]
+js = [
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "wasmer/experimental-async",
+  "wasmer/js-default",
+]
 # Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
 # `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
 # trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
@@ -40,10 +46,12 @@ wasmer-types = { version = "=7.2.1", path = "/Users/syrusakbary/Development/wasm
 virtual-fs = { version = "=0.702.1", path = "/Users/syrusakbary/Development/wasmer/lib/virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
+offset-allocator = "0.2.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 wasmer-wasix = { version = "=0.702.1", path = "/Users/syrusakbary/Development/wasmer/lib/wasix", default-features = false, features = ["js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -68,3 +76,7 @@ rustc-args = ["--cfg", "docsrs"]
 name = "napi_wasmer"
 path = "src/bin/napi_wasmer.rs"
 required-features = ["cli"]
+
+# Keep this manifest independent when cargo-standalone.sh materializes it in a
+# temporary directory below a larger checkout that also has a Cargo workspace.
+[workspace]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREBUILT_V8_VERSION="11.9.2"
+PREBUILT_V8_VERSION="11.9.7"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <test-name>" >&2
@@ -26,6 +26,7 @@ NATIVE_INIT_SRC="$ROOT_DIR/tests/napi_native_init.cc"
 NAPI_V8_DIR="$ROOT_DIR/v8"
 NAPI_V8_INCLUDE="$ROOT_DIR/include"
 NAPI_V8_SRC="$NAPI_V8_DIR/src"
+NAPI_LIB_SRC="$ROOT_DIR/lib/src"
 EDGE_SRC="$PROJECT_ROOT/src"
 
 resolve_primary_library() {
@@ -191,7 +192,24 @@ while IFS= read -r dep; do
 done < <(find "$NAPI_INCLUDE_DIR" "$TEST_INCLUDE_DIR" -type f \( -name '*.h' -o -name '*.hpp' \) | sort)
 
 NAPI_V8_SOURCES=(
+  "$ROOT_DIR/src/edge_napi_embedder_hooks.cc"
+  "$NAPI_LIB_SRC/napi_error_state.cc"
+  "$NAPI_LIB_SRC/napi_lifetime_tracker.cc"
+  "$NAPI_LIB_SRC/napi_periodic_gate.cc"
+  "$NAPI_LIB_SRC/napi_text.cc"
+  "$NAPI_LIB_SRC/napi_typedarray_metadata.cc"
   "$NAPI_V8_SRC/js_native_api_v8.cc"
+  "$NAPI_V8_SRC/internal/napi_escapable_handle_scope_wrapper.cc"
+  "$NAPI_V8_SRC/internal/napi_external_wrapper.cc"
+  "$NAPI_V8_SRC/internal/napi_function_callback_info.cc"
+  "$NAPI_V8_SRC/internal/napi_getter_callback_info.cc"
+  "$NAPI_V8_SRC/internal/napi_handle_scope_wrapper.cc"
+  "$NAPI_V8_SRC/internal/napi_lifetime_tracker.cc"
+  "$NAPI_V8_SRC/internal/napi_ref.cc"
+  "$NAPI_V8_SRC/internal/napi_ref_tracker.cc"
+  "$NAPI_V8_SRC/internal/napi_ref_with_data.cc"
+  "$NAPI_V8_SRC/internal/napi_ref_with_finalizer.cc"
+  "$NAPI_V8_SRC/internal/napi_setter_callback_info.cc"
   "$NAPI_V8_SRC/unofficial_napi.cc"
   "$NAPI_V8_SRC/unofficial_napi_error_utils.cc"
   "$NAPI_V8_SRC/unofficial_napi_contextify.cc"
@@ -248,6 +266,7 @@ esac
   -DNAPI_VERSION=8 \
   $(echo "$V8_DEFINES" | tr ';,' '\n' | sed '/^[[:space:]]*$/d; s/^[[:space:]]*/-D/; s/[[:space:]]*$//' | tr '\n' ' ') \
   -I"$NAPI_INCLUDE_DIR" \
+  -I"$NAPI_LIB_SRC" \
   -I"$NAPI_V8_INCLUDE" \
   -I"$NAPI_V8_SRC" \
   -I"$EDGE_SRC" \
