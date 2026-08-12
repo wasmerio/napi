@@ -11,7 +11,6 @@
 #include "node_api.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -465,8 +464,9 @@ extern "C"
         napi_env env,
         unofficial_napi_event_loop_checkpoint_mode mode,
         bool has_runnable_work,
-        bool *has_pending_provider_work)
+        uint32_t *state_out)
     {
+        (void)has_runnable_work;
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
@@ -475,11 +475,10 @@ extern "C"
         napi_status status = napi_util__::run_pending_jobs(env);
         if (status != napi_ok)
             return status;
-        if (has_pending_provider_work != nullptr)
-            *has_pending_provider_work = env->module_wrap().has_pending_provider_work();
-        if (mode == unofficial_napi_event_loop_checkpoint_host_tasks &&
-            !has_runnable_work)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (state_out != nullptr)
+            *state_out = env->module_wrap().has_pending_provider_work()
+                             ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
+                             : unofficial_napi_event_loop_checkpoint_state_none;
         return napi_ok;
     }
 

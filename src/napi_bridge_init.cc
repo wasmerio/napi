@@ -3033,19 +3033,19 @@ extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     SnapiEnvState* env_state,
     int mode,
     int has_runnable_work,
-    int* has_pending_provider_work) {
+    uint32_t* checkpoint_state) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  bool pending_provider_work = false;
+  uint32_t state = unofficial_napi_event_loop_checkpoint_state_none;
   const int status = unofficial_napi_event_loop_checkpoint(
       env,
       static_cast<unofficial_napi_event_loop_checkpoint_mode>(mode),
       has_runnable_work != 0,
-      &pending_provider_work);
-  if (has_pending_provider_work != nullptr) {
-    *has_pending_provider_work = pending_provider_work ? 1 : 0;
+      &state);
+  if (checkpoint_state != nullptr) {
+    *checkpoint_state = state;
   }
   return status;
 }

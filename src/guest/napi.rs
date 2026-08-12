@@ -383,24 +383,20 @@ fn guest_unofficial_napi_event_loop_checkpoint(
     napi_env: i32,
     mode: i32,
     has_runnable_work: i32,
-    has_pending_provider_work_ptr: i32,
+    checkpoint_state_ptr: i32,
 ) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    let mut has_pending_provider_work = 0;
+    let mut checkpoint_state = 0;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_event_loop_checkpoint(
             env_handle,
             mode,
             has_runnable_work,
-            &mut has_pending_provider_work,
+            &mut checkpoint_state,
         )
     })?;
-    if has_pending_provider_work_ptr > 0 {
-        write_guest_u8(
-            &mut env,
-            has_pending_provider_work_ptr as u32,
-            (has_pending_provider_work != 0) as u8,
-        );
+    if checkpoint_state_ptr > 0 {
+        write_guest_u32(&mut env, checkpoint_state_ptr as u32, checkpoint_state);
     }
     Ok(status)
 }

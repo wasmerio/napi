@@ -2318,20 +2318,18 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
     bool has_runnable_work,
-    bool* has_pending_provider_work) {
+    uint32_t* state_out) {
+  (void)has_runnable_work;
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
   }
   DrainMicrotasksForEnv(env);
-  if (has_pending_provider_work != nullptr) {
-    *has_pending_provider_work =
-        NapiV8HasPendingProviderWork(env);
-  }
-  if (mode == unofficial_napi_event_loop_checkpoint_host_tasks &&
-      !has_runnable_work) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  if (state_out != nullptr) {
+    *state_out = NapiV8HasPendingProviderWork(env)
+                     ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
+                     : unofficial_napi_event_loop_checkpoint_state_none;
   }
   return napi_ok;
 }

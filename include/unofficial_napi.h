@@ -94,17 +94,29 @@ typedef enum unofficial_napi_event_loop_checkpoint_mode {
   // Drain promise/microtask work without admitting a host task turn.
   unofficial_napi_event_loop_checkpoint_microtasks = 0,
   // Admit a host task turn as well as draining engine work. Host-JavaScript
-  // providers suspend through JSPI; embedded providers may wait synchronously.
+  // providers suspend through JSPI. Synchronous providers report that no host
+  // task was admitted so the runtime can wait on its native event source.
   unofficial_napi_event_loop_checkpoint_host_tasks = 1,
 } unofficial_napi_event_loop_checkpoint_mode;
 
+typedef enum unofficial_napi_event_loop_checkpoint_state {
+  unofficial_napi_event_loop_checkpoint_state_none = 0,
+  // The provider still owns work which can make JavaScript runnable.
+  unofficial_napi_event_loop_checkpoint_state_pending_provider_work = 1 << 0,
+  // The checkpoint admitted a host task turn. When this bit is absent, the
+  // runtime remains responsible for waiting on its native event source.
+  unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted = 1 << 1,
+} unofficial_napi_event_loop_checkpoint_state;
+
 // Complete one provider-owned event-loop checkpoint. The mode describes Node
-// semantics, while the provider owns how those semantics are implemented.
+// semantics, while the provider owns how those semantics are implemented. The
+// returned state distinguishes an asynchronous host turn from a synchronous
+// engine checkpoint without requiring a separate provider-kind query.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
     bool has_runnable_work,
-    bool* has_pending_provider_work);
+    uint32_t* state_out);
 // Acquires an exact byte range for native access. The returned pointer remains
 // valid until release, including across asynchronous native work. Readable
 // ranges are copied from JavaScript on acquire; writable ranges are published

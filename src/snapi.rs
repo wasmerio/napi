@@ -71,7 +71,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         mode: i32,
         has_runnable_work: i32,
-        has_pending_provider_work: *mut i32,
+        checkpoint_state: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;

@@ -3102,13 +3102,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
     _env: SnapiEnv,
     _mode: i32,
     _has_runnable_work: i32,
-    has_pending_provider_work: *mut i32,
+    checkpoint_state: *mut u32,
 ) -> i32 {
     if has_jspi() {
         let _ = unsafe {
             write(
-                has_pending_provider_work,
-                i32::from(wasmer_napi_has_pending_provider_work()),
+                checkpoint_state,
+                u32::from(wasmer_napi_has_pending_provider_work()),
             )
         };
         NAPI_OK

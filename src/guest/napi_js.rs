@@ -572,10 +572,10 @@ fn provider_event_loop_checkpoint_sync(
     napi_env: i32,
     mode: i32,
     has_runnable_work: i32,
-    has_pending_provider_work_ptr: i32,
+    checkpoint_state_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let mut has_pending_provider_work = 0;
+    let mut checkpoint_state = 0;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
         let status = snapi_bridge_drain_pending_callbacks(env_handle);
         if status != 0 {
@@ -585,15 +585,11 @@ fn provider_event_loop_checkpoint_sync(
             env_handle,
             mode,
             has_runnable_work,
-            &mut has_pending_provider_work,
+            &mut checkpoint_state,
         )
     });
-    if has_pending_provider_work_ptr > 0 {
-        write_guest_u8(
-            &mut env,
-            has_pending_provider_work_ptr as u32,
-            (has_pending_provider_work != 0) as u8,
-        );
+    if checkpoint_state_ptr > 0 {
+        write_guest_u32(&mut env, checkpoint_state_ptr as u32, checkpoint_state);
     }
     status
 }
@@ -612,7 +608,7 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
     napi_env: i32,
     mode: i32,
     has_runnable_work: i32,
-    has_pending_provider_work_ptr: i32,
+    checkpoint_state_ptr: i32,
 ) -> i32 {
     // The host JavaScript realm owns its Promise and task queues. One explicit
     // JSPI suspension is the only async scheduling primitive exposed to Edge.
@@ -620,7 +616,7 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
         let env = env.read().await;
         env.data().resolve_napi_env(napi_env)
     };
-    let (status, has_pending_provider_work) =
+    let (status, checkpoint_state) =
         with_callback_state_async(env.as_mut(), env_handle, async move {
             if mode != 0 && mode != 1 {
                 return (1, 0);
@@ -635,26 +631,25 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
             if status != 0 {
                 return (status, 0);
             }
-            let mut has_pending_provider_work = 0;
+            let mut checkpoint_state = 0;
             let status = unsafe {
                 snapi_bridge_unofficial_event_loop_checkpoint(
                     env_handle,
                     mode,
                     has_runnable_work,
-                    &mut has_pending_provider_work,
+                    &mut checkpoint_state,
                 )
             };
-            (status, has_pending_provider_work)
+            if status == 0 && mode == 1 {
+                checkpoint_state |= 1 << 1;
+            }
+            (status, checkpoint_state)
         })
         .await;
-    if has_pending_provider_work_ptr > 0 {
+    if checkpoint_state_ptr > 0 {
         let mut locked = env.write().await;
         let mut sync_env = locked.as_function_env_mut();
-        write_guest_u8(
-            &mut sync_env,
-            has_pending_provider_work_ptr as u32,
-            (has_pending_provider_work != 0) as u8,
-        );
+        write_guest_u32(&mut sync_env, checkpoint_state_ptr as u32, checkpoint_state);
     }
     status
 }
@@ -673,14 +668,14 @@ fn guest_unofficial_napi_event_loop_checkpoint_sync(
     napi_env: i32,
     mode: i32,
     has_runnable_work: i32,
-    has_pending_provider_work_ptr: i32,
+    checkpoint_state_ptr: i32,
 ) -> i32 {
     provider_event_loop_checkpoint_sync(
         env,
         napi_env,
         mode,
         has_runnable_work,
-        has_pending_provider_work_ptr,
+        checkpoint_state_ptr,
     )
 }
 

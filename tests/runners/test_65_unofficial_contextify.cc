@@ -380,12 +380,12 @@ TEST_F(Test65UnofficialContextify,
   ASSERT_EQ(napi_strict_equals(s.env, captured_with_id, explicit_id, &equal), napi_ok);
   EXPECT_TRUE(equal);
 
-  bool pending_provider_work = false;
+  uint32_t checkpoint_state = unofficial_napi_event_loop_checkpoint_state_none;
   EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
                 s.env,
                 unofficial_napi_event_loop_checkpoint_microtasks,
                 true,
-                &pending_provider_work),
+                &checkpoint_state),
             napi_ok);
 }
 #endif

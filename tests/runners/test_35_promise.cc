@@ -111,9 +111,13 @@ TEST_F(Test35Promise, ProviderEventLoopCheckpointProcessesMicrotasks) {
       "globalThis.providerCheckpointObserved = false;"
       "Promise.resolve().then(() => { providerCheckpointObserved = true; });");
 
+  uint32_t checkpoint_state = unofficial_napi_event_loop_checkpoint_state_none;
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
-                s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, nullptr),
+                s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, &checkpoint_state),
             napi_ok);
+  EXPECT_EQ(checkpoint_state &
+                unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted,
+            0u);
   EXPECT_EQ(JsonStringify(s.env, "globalThis.providerCheckpointObserved"), "true");
 }
 
