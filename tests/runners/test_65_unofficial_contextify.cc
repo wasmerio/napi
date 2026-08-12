@@ -20,6 +20,7 @@ napi_value Sym(napi_env env, const char* value) {
   return out;
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -44,6 +45,7 @@ napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
   }
   return promise;
 }
+#endif
 
 }  // namespace
 
@@ -280,6 +282,11 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, restored), napi_ok);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+// V8 stores the host-defined-options block in each compiled function's
+// ScriptOrigin. This regression covers the V8 bytecode fast path changed in
+// v8/src/unofficial_napi_contextify.cc. QuickJS resolves dynamic imports by
+// referrer name instead and has no equivalent per-function ScriptOrigin.
 TEST_F(Test65UnofficialContextify,
        FunctionBytecodePreservesExplicitHostDefinedOptionIdentity) {
   EnvScope s(runtime_.get());
@@ -381,6 +388,7 @@ TEST_F(Test65UnofficialContextify,
                 &pending_provider_work),
             napi_ok);
 }
+#endif
 
 TEST_F(Test65UnofficialContextify, CompileFunctionDoesNotUseGlobalFunctionConstructor) {
   EnvScope s(runtime_.get());
