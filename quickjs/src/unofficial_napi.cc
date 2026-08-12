@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1068,6 +1069,25 @@ extern "C"
         stats_out->malloced_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
         stats_out->peak_malloced_memory = stats_out->malloced_memory;
         stats_out->external_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.binary_object_size));
+
+        // heap_size_limit must never be reported as zero. Consumers read it as
+        // "the ceiling this heap can grow to" and divide by it: Next.js uses
+        // used/limit to decide whether a worker is near its heap limit, so a
+        // zero makes its memory watchdog exit eagerly. QuickJS spells an absent
+        // limit as malloc_limit == 0 (see the `malloc_limit - 1` overflow trick
+        // in js_alloc_rt), which is the opposite convention, so translate it:
+        // an unset limit means the heap is bounded only by the address space.
+        // On wasm32 SIZE_MAX is 4 GiB - 1, i.e. exactly the linear-memory
+        // ceiling, which is the honest answer there.
+        const int64_t malloc_limit = usage.malloc_limit;
+        stats_out->heap_size_limit = malloc_limit > 0
+                                         ? static_cast<uint64_t>(malloc_limit)
+                                         : static_cast<uint64_t>(SIZE_MAX);
+        // Same reasoning: 0 here reads as "no memory left" rather than "unknown".
+        stats_out->total_available_size =
+            stats_out->heap_size_limit > stats_out->used_heap_size
+                ? stats_out->heap_size_limit - stats_out->used_heap_size
+                : 0;
         return napi_ok;
     }
 
