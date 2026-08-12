@@ -24,6 +24,7 @@ use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_act
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) struct HostBufferCopy {
+    pub(crate) owner_id: u64,
     pub(crate) guest_env: u32,
     pub(crate) handle_id: u32,
     pub(crate) host_reference_id: u32,
@@ -31,6 +32,7 @@ pub(crate) struct HostBufferCopy {
     pub(crate) guest_ptr: u32,
     pub(crate) byte_len: usize,
     pub(crate) guest_allocation_recyclable: bool,
+    pub(crate) persistent: bool,
     pub(crate) reference_holds: u32,
     pub(crate) needs_flush: bool,
 }
@@ -143,9 +145,11 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_copies: Vec<HostBufferCopy>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    pub(crate) host_buffer_copy_frames: Vec<usize>,
+    pub(crate) host_buffer_copy_frames: Vec<u64>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    pub(crate) host_buffer_handle_scopes: Vec<(u32, u32, usize)>,
+    pub(crate) next_host_buffer_owner_id: u64,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_handle_scopes: Vec<(u32, u32, u64)>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) host_buffer_reference_holds: HashMap<(u32, u32), u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -194,6 +198,8 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_copy_frames: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            next_host_buffer_owner_id: 1,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_handle_scopes: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             host_buffer_reference_holds: HashMap::new(),
@@ -206,6 +212,31 @@ impl NapiEnv {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_buffer_leases: HashMap::new(),
         }
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) fn next_host_buffer_owner(&mut self) -> u64 {
+        loop {
+            let id = self.next_host_buffer_owner_id.max(1);
+            self.next_host_buffer_owner_id = id.wrapping_add(1).max(1);
+            if !self.host_buffer_copy_frames.contains(&id)
+                && !self
+                    .host_buffer_handle_scopes
+                    .iter()
+                    .any(|(_, _, owner_id)| *owner_id == id)
+            {
+                return id;
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) fn current_host_buffer_owner(&self) -> u64 {
+        self.host_buffer_handle_scopes
+            .last()
+            .map(|(_, _, owner_id)| *owner_id)
+            .or_else(|| self.host_buffer_copy_frames.last().copied())
+            .unwrap_or(0)
     }
 
     /// Reserve budget for a new V8 env before creating it: acquire an isolate

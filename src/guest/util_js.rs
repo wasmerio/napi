@@ -55,9 +55,23 @@ pub fn read_guest_bytes(
     let (state, store) = env.data_and_store_mut();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
+    // Reject an impossible guest range before allocating the host snapshot.
+    // The bounds-checked read below is too late: `vec![0; len]` may otherwise
+    // abort the host on a forged multi-gigabyte length.
+    if (guest_ptr as u64).checked_add(len as u64)? > view.data_size() {
+        return None;
+    }
     let mut out = vec![0u8; len];
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
+}
+
+pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
+    let Some(memory) = env.data().memory.clone() else {
+        return 0;
+    };
+    let (_, store) = env.data_and_store_mut();
+    memory.view(&store).data_size()
 }
 
 pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
@@ -278,7 +292,9 @@ pub fn resolve_or_copy_host_data_to_guest(
     env.data_mut()
         .guest_data_ptrs
         .insert((guest_env, handle_id), guest_ptr);
+    let owner_id = env.data().current_host_buffer_owner();
     env.data_mut().host_buffer_copies.push(HostBufferCopy {
+        owner_id,
         guest_env,
         handle_id,
         host_reference_id,
@@ -286,6 +302,7 @@ pub fn resolve_or_copy_host_data_to_guest(
         guest_ptr,
         byte_len,
         guest_allocation_recyclable: true,
+        persistent: false,
         reference_holds: 0,
         // Standard N-API pointers are writable. Synchronization is phase based:
         // publish before host JS runs, refresh before native code resumes.
@@ -299,7 +316,7 @@ pub fn read_guest_u32_array(
     guest_ptr: i32,
     count: usize,
 ) -> Option<Vec<u32>> {
-    let bytes = read_guest_bytes(env, guest_ptr, count * 4)?;
+    let bytes = read_guest_bytes(env, guest_ptr, count.checked_mul(4)?)?;
     let mut result = Vec::with_capacity(count);
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));

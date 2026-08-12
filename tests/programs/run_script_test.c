@@ -1,8 +1,31 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "napi_test_helpers.h"
+#include "node_api.h"
 #include "unofficial_napi.h"
+
+static int wrap_finalizer_count = 0;
+static int add_finalizer_count = 0;
+
+static void NAPI_CDECL CountWrapFinalizer(napi_env env,
+                                          void* data,
+                                          void* hint) {
+  (void)env;
+  if ((uintptr_t)data == 0x11 && (uintptr_t)hint == 0x12) {
+    wrap_finalizer_count++;
+  }
+}
+
+static void NAPI_CDECL CountAddedFinalizer(napi_env env,
+                                           void* data,
+                                           void* hint) {
+  (void)env;
+  if ((uintptr_t)data == 0x21 && (uintptr_t)hint == 0x22) {
+    add_finalizer_count++;
+  }
+}
 
 static int RunInt32Script(napi_env env, const char* source, int32_t* result_out) {
   napi_value script;
@@ -321,6 +344,143 @@ int main(void) {
                            &marker));
   CHECK_OR_FAIL(marker == 1617,
                 "buffer lease did not publish SharedArrayBuffer writes");
+
+  // The host-JS bridge must preserve the public typed-array enum and exact
+  // byte width. Float32 used to be treated as an 8-byte element, over-reading
+  // the backing store when a guest requested its data pointer.
+  napi_value typed_backing;
+  void* typed_backing_data = NULL;
+  NAPI_CALL(env,
+            napi_create_arraybuffer(
+                env, 16, &typed_backing_data, &typed_backing));
+  CHECK_OR_FAIL(typed_backing_data != NULL,
+                "typed-array backing did not expose guest memory");
+  napi_value float32_view;
+  NAPI_CALL(env,
+            napi_create_typedarray(
+                env, napi_float32_array, 2, typed_backing, 4, &float32_view));
+  napi_typedarray_type float32_kind;
+  size_t float32_length = 0;
+  size_t float32_offset = 0;
+  void* float32_data = NULL;
+  NAPI_CALL(env,
+            napi_get_typedarray_info(env,
+                                     float32_view,
+                                     &float32_kind,
+                                     &float32_length,
+                                     &float32_data,
+                                     NULL,
+                                     &float32_offset));
+  CHECK_OR_FAIL(float32_kind == napi_float32_array &&
+                    float32_length == 2 &&
+                    float32_offset == 4 &&
+                    float32_data == (uint8_t*)typed_backing_data + 4,
+                "Float32Array guest range used the wrong element width");
+
+  // External-buffer ABI order is length before data. Swapping the two makes
+  // the bridge interpret a byte count as a guest pointer.
+  uint8_t external_bytes[4] = {9, 8, 7, 6};
+  napi_value external_buffer;
+  NAPI_CALL(env,
+            napi_create_external_buffer(env,
+                                        sizeof(external_bytes),
+                                        external_bytes,
+                                        NULL,
+                                        NULL,
+                                        &external_buffer));
+  void* external_buffer_data = NULL;
+  size_t external_buffer_length = 0;
+  NAPI_CALL(env,
+            napi_get_buffer_info(env,
+                                 external_buffer,
+                                 &external_buffer_data,
+                                 &external_buffer_length));
+  CHECK_OR_FAIL(external_buffer_length == sizeof(external_bytes) &&
+                    external_buffer_data != NULL &&
+                    memcmp(external_buffer_data,
+                           external_bytes,
+                           sizeof(external_bytes)) == 0,
+                "external buffer ABI order corrupted its guest range");
+
+  napi_value external_value;
+  napi_valuetype external_type = napi_undefined;
+  NAPI_CALL(env,
+            napi_create_external(env,
+                                 (void*)(uintptr_t)0x1234,
+                                 NULL,
+                                 NULL,
+                                 &external_value));
+  NAPI_CALL(env, napi_typeof(env, external_value, &external_type));
+  CHECK_OR_FAIL(external_type == napi_external,
+                "napi_typeof classified an external as an object");
+
+  // Escaping the first explicit scope transfers ownership into the env's root
+  // frame. It must not remove the value from every frame and leak an unowned
+  // handle.
+  napi_escapable_handle_scope escape_scope = NULL;
+  NAPI_CALL(env, napi_open_escapable_handle_scope(env, &escape_scope));
+  napi_value scoped_value;
+  napi_value escaped_value;
+  NAPI_CALL(env, napi_create_object(env, &scoped_value));
+  NAPI_CALL(env,
+            napi_escape_handle(env,
+                               escape_scope,
+                               scoped_value,
+                               &escaped_value));
+  NAPI_CALL(env, napi_close_escapable_handle_scope(env, escape_scope));
+  napi_value escaped_marker;
+  NAPI_CALL(env, napi_create_int32(env, 55, &escaped_marker));
+  NAPI_CALL(env,
+            napi_set_named_property(
+                env, escaped_value, "marker", escaped_marker));
+  NAPI_CALL(env,
+            napi_get_named_property(
+                env, escaped_value, "marker", &escaped_marker));
+  NAPI_CALL(env, napi_get_value_int32(env, escaped_marker, &marker));
+  CHECK_OR_FAIL(marker == 55,
+                "outermost escaped handle lost root-frame ownership");
+
+  // Forged guest lengths are rejected before allocating a host scratch
+  // buffer. This call must return an error rather than aborting the host.
+  napi_status oversized_string_status =
+      napi_get_value_string_utf8(env,
+                                 result,
+                                 buf,
+                                 (size_t)INT32_MAX,
+                                 &len);
+  CHECK_OR_FAIL(oversized_string_status != napi_ok,
+                "oversized guest string length was not rejected");
+
+  // Guest wrap/add-finalizer callbacks are dispatched at an explicit provider
+  // checkpoint; environment teardown force-drains remaining live records.
+  napi_env finalizer_env = NULL;
+  void* finalizer_env_scope = NULL;
+  NAPI_CALL(env,
+            unofficial_napi_create_env(
+                8, &finalizer_env, &finalizer_env_scope));
+  napi_value wrapped_object;
+  napi_value finalized_object;
+  NAPI_CALL(finalizer_env,
+            napi_create_object(finalizer_env, &wrapped_object));
+  NAPI_CALL(finalizer_env,
+            napi_wrap(finalizer_env,
+                      wrapped_object,
+                      (void*)(uintptr_t)0x11,
+                      CountWrapFinalizer,
+                      (void*)(uintptr_t)0x12,
+                      NULL));
+  NAPI_CALL(finalizer_env,
+            napi_create_object(finalizer_env, &finalized_object));
+  NAPI_CALL(finalizer_env,
+            napi_add_finalizer(finalizer_env,
+                               finalized_object,
+                               (void*)(uintptr_t)0x21,
+                               CountAddedFinalizer,
+                               (void*)(uintptr_t)0x22,
+                               NULL));
+  NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope));
+  CHECK_OR_FAIL(wrap_finalizer_count == 1 && add_finalizer_count == 1,
+                "guest finalizers were not dispatched exactly once");
 
   // Environment teardown owns the failure/cancellation path for outstanding
   // leases. It must discard the snapshot and host reference without requiring

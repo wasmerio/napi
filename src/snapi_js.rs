@@ -631,7 +631,7 @@ export function wasmer_napi_reject_module_evaluation(evaluation, error) {
 export function wasmer_napi_typed_array(kind, buffer, offset, length) {
   const names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
     'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
-    'BigInt64Array', 'BigUint64Array'];
+    'BigInt64Array', 'BigUint64Array', 'Float16Array'];
   const Ctor = globalThis[names[kind]];
   if (typeof Ctor !== 'function') throw new TypeError('unsupported typed array kind');
   return new Ctor(buffer, offset, length);
@@ -639,7 +639,7 @@ export function wasmer_napi_typed_array(kind, buffer, offset, length) {
 export function wasmer_napi_typed_array_kind(value) {
   const names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
     'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
-    'BigInt64Array', 'BigUint64Array'];
+    'BigInt64Array', 'BigUint64Array', 'Float16Array'];
   // `instanceof globalThis.Uint8Array` rejects genuine views created through
   // Edge's virtual global (and any other same-origin realm). ArrayBuffer's
   // intrinsic brand check is realm-independent; the intrinsic tag then gives
@@ -1019,6 +1019,22 @@ struct ValueFrame {
     handles: Vec<u32>,
 }
 
+struct GuestFinalizer {
+    target: WeakRef<Object>,
+    guest_env: u32,
+    wasm_fn_ptr: u32,
+    data: u32,
+    hint: u32,
+    wrap_id: Option<u32>,
+}
+
+struct GuestBufferFinalizer {
+    target: WeakRef<Object>,
+    handle_id: u32,
+    guest_ptr: u32,
+    recyclable: bool,
+}
+
 struct SyntheticModule {
     wrapper: JsValue,
     export_names: Vec<String>,
@@ -1071,6 +1087,8 @@ struct HostJsEnv {
     closures: Vec<Closure<dyn Fn(JsValue, Array) -> JsValue>>,
     instance_data: u64,
     wraps: HashMap<u32, u64>,
+    guest_finalizers: Vec<GuestFinalizer>,
+    guest_buffer_finalizers: Vec<GuestBufferFinalizer>,
     externals: HashMap<u32, u64>,
     backing_tokens: HashMap<u32, u64>,
     type_tags: HashMap<u32, (u64, u64)>,
@@ -1088,8 +1106,13 @@ impl HostJsEnv {
             value_free_slots: Vec::new(),
             value_handles: HashMap::new(),
             next_value_handle: 1,
-            value_frames: Vec::new(),
-            next_value_frame: 1,
+            // The root frame owns values created outside an explicit handle
+            // scope and receives values escaped from the outermost scope.
+            value_frames: vec![ValueFrame {
+                id: 1,
+                handles: Vec::new(),
+            }],
+            next_value_frame: 2,
             object_ids: WeakMap::new(),
             wrap_ids: WeakMap::new(),
             next_wrap_id: 1,
@@ -1111,6 +1134,8 @@ impl HostJsEnv {
             closures: Vec::new(),
             instance_data: 0,
             wraps: HashMap::new(),
+            guest_finalizers: Vec::new(),
+            guest_buffer_finalizers: Vec::new(),
             externals: HashMap::new(),
             backing_tokens: HashMap::new(),
             type_tags: HashMap::new(),
@@ -1204,6 +1229,49 @@ impl HostJsEnv {
         self.next_wrap_id = id.saturating_add(1);
         self.wrap_ids.set(&object, &JsValue::from_f64(id as f64));
         Some(id)
+    }
+
+    fn register_guest_finalizer(
+        &mut self,
+        value_id: u32,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        data: u32,
+        hint: u32,
+        wrap_id: Option<u32>,
+    ) -> bool {
+        let Some(value) = self.get(value_id).cloned() else {
+            return false;
+        };
+        if !value.is_object() && !value.is_function() {
+            return false;
+        }
+        let target = WeakRef::new(&value.unchecked_into::<Object>());
+        self.guest_finalizers.push(GuestFinalizer {
+            target,
+            guest_env,
+            wasm_fn_ptr,
+            data,
+            hint,
+            wrap_id,
+        });
+        true
+    }
+
+    fn take_ready_guest_finalizer(&mut self, force: bool) -> Option<GuestFinalizer> {
+        let index = self
+            .guest_finalizers
+            .iter()
+            .position(|record| force || record.target.deref().is_none())?;
+        Some(self.guest_finalizers.swap_remove(index))
+    }
+
+    fn take_ready_guest_buffer_finalizer(&mut self, force: bool) -> Option<GuestBufferFinalizer> {
+        let index = self
+            .guest_buffer_finalizers
+            .iter()
+            .position(|record| force || record.target.deref().is_none())?;
+        Some(self.guest_buffer_finalizers.swap_remove(index))
     }
 
     fn backing_store_token(&mut self, id: u32) -> Option<u64> {
@@ -1309,9 +1377,10 @@ impl HostJsEnv {
             return false;
         };
         self.value_frames[index].handles.swap_remove(position);
-        if index > 0 {
-            self.value_frames[index - 1].handles.push(value_id);
+        if index == 0 {
+            return false;
         }
+        self.value_frames[index - 1].handles.push(value_id);
         true
     }
 }
@@ -1955,7 +2024,12 @@ pub unsafe extern "C" fn snapi_bridge_typeof(env: SnapiEnv, id: u32, out: *mut i
     let Some(value) = state.get(id) else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { write(out, napi_typeof(value)) }.map_or_else(|e| e, |_| NAPI_OK)
+    let typ = if state.externals.contains_key(&id) {
+        8 // napi_external
+    } else {
+        napi_typeof(value)
+    };
+    unsafe { write(out, typ) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
 macro_rules! type_test {
@@ -2757,6 +2831,48 @@ unsafe extern "C" {
         wasm_fn: u32,
         arg: u32,
     ) -> u32;
+    fn snapi_host_invoke_wasm_finalizer(
+        ctx: *mut c_void,
+        guest_env: u32,
+        wasm_fn: u32,
+        data: u32,
+        hint: u32,
+    ) -> u32;
+}
+
+unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
+    loop {
+        let (record, callback_ctx, value_frame) = {
+            let Ok(state) = (unsafe { env_mut(env) }) else {
+                return NAPI_INVALID_ARG;
+            };
+            let Some(record) = state.take_ready_guest_finalizer(force) else {
+                return NAPI_OK;
+            };
+            let value_frame = state.open_value_frame();
+            (record, state.active_callback_ctx, value_frame)
+        };
+        let result = unsafe {
+            snapi_host_invoke_wasm_finalizer(
+                callback_ctx,
+                record.guest_env,
+                record.wasm_fn_ptr,
+                record.data,
+                record.hint,
+            )
+        };
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        state.close_value_frame(value_frame);
+        if result == CALLBACK_DEFERRED {
+            state.guest_finalizers.push(record);
+            return NAPI_OK;
+        }
+        if let Some(wrap_id) = record.wrap_id {
+            state.wraps.remove(&wrap_id);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2935,7 +3051,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
                 return NAPI_INVALID_ARG;
             };
             let Some(pending) = state.pending_callbacks.pop_front() else {
-                return NAPI_OK;
+                return unsafe { drain_guest_finalizers(env, false) };
             };
             (pending, state.active_callback_ctx)
         };
@@ -2979,6 +3095,59 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
             return NAPI_PENDING_EXCEPTION;
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32 {
+    unsafe { drain_guest_finalizers(env, true) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_register_guest_buffer_finalizer(
+    env: SnapiEnv,
+    value_id: u32,
+    guest_ptr: u32,
+    recyclable: i32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.get(value_id).cloned() else {
+        return NAPI_INVALID_ARG;
+    };
+    if !value.is_object() && !value.is_function() {
+        return NAPI_INVALID_ARG;
+    }
+    state.guest_buffer_finalizers.push(GuestBufferFinalizer {
+        target: WeakRef::new(&value.unchecked_into::<Object>()),
+        handle_id: value_id,
+        guest_ptr,
+        recyclable: recyclable != 0,
+    });
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_take_ready_guest_buffer_finalizer(
+    env: SnapiEnv,
+    force: i32,
+    handle_id_out: *mut u32,
+    guest_ptr_out: *mut u32,
+    recyclable_out: *mut i32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(record) = state.take_ready_guest_buffer_finalizer(force != 0) else {
+        return 1;
+    };
+    if unsafe { write(handle_id_out, record.handle_id) }.is_err()
+        || unsafe { write(guest_ptr_out, record.guest_ptr) }.is_err()
+        || unsafe { write(recyclable_out, i32::from(record.recyclable)) }.is_err()
+    {
+        return NAPI_INVALID_ARG;
+    }
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -3072,6 +3241,8 @@ pub unsafe extern "C" fn snapi_bridge_remove_wrap(e: SnapiEnv, o: u32, d: *mut u
     let Some(v) = s.wraps.remove(&wrap_id) else {
         return NAPI_INVALID_ARG;
     };
+    s.guest_finalizers
+        .retain(|record| record.wrap_id != Some(wrap_id));
     unsafe { write(d, v) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -5766,6 +5937,110 @@ pub unsafe extern "C" fn snapi_bridge_add_finalizer(
 ) -> i32 {
     let _ = (env, obj_id, data_val, ref_out);
     NAPI_GENERIC_FAILURE
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_wrap_finalized(
+    env: SnapiEnv,
+    obj_id: u32,
+    native_data: u64,
+    guest_env: u32,
+    wasm_fn_ptr: u32,
+    finalize_data: u32,
+    finalize_hint: u32,
+    ref_out: *mut u32,
+) -> i32 {
+    let mut reference_id = 0u32;
+    if !ref_out.is_null() {
+        let status = unsafe { snapi_bridge_create_reference(env, obj_id, 0, &mut reference_id) };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+
+    let registered = {
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            if reference_id != 0 {
+                let _ = unsafe { snapi_bridge_delete_reference(env, reference_id) };
+            }
+            return NAPI_INVALID_ARG;
+        };
+        let Some(wrap_id) = state.wrap_id(obj_id, true) else {
+            if reference_id != 0 {
+                let _ = unsafe { snapi_bridge_delete_reference(env, reference_id) };
+            }
+            return NAPI_INVALID_ARG;
+        };
+        if state.wraps.contains_key(&wrap_id)
+            || !state.register_guest_finalizer(
+                obj_id,
+                guest_env,
+                wasm_fn_ptr,
+                finalize_data,
+                finalize_hint,
+                Some(wrap_id),
+            )
+        {
+            false
+        } else {
+            state.wraps.insert(wrap_id, native_data);
+            true
+        }
+    };
+    if !registered {
+        if reference_id != 0 {
+            let _ = unsafe { snapi_bridge_delete_reference(env, reference_id) };
+        }
+        return NAPI_INVALID_ARG;
+    }
+    if !ref_out.is_null() {
+        if unsafe { write(ref_out, reference_id) }.is_err() {
+            return NAPI_INVALID_ARG;
+        }
+    }
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_add_finalizer_cb(
+    env: SnapiEnv,
+    obj_id: u32,
+    _data_val: u64,
+    guest_env: u32,
+    wasm_fn_ptr: u32,
+    finalize_data: u32,
+    finalize_hint: u32,
+    ref_out: *mut u32,
+) -> i32 {
+    let mut reference_id = 0u32;
+    if !ref_out.is_null() {
+        let status = unsafe { snapi_bridge_create_reference(env, obj_id, 0, &mut reference_id) };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+    let registered = unsafe { env_mut(env) }.is_ok_and(|state| {
+        state.register_guest_finalizer(
+            obj_id,
+            guest_env,
+            wasm_fn_ptr,
+            finalize_data,
+            finalize_hint,
+            None,
+        )
+    });
+    if !registered {
+        if reference_id != 0 {
+            let _ = unsafe { snapi_bridge_delete_reference(env, reference_id) };
+        }
+        return NAPI_INVALID_ARG;
+    }
+    if !ref_out.is_null() {
+        if unsafe { write(ref_out, reference_id) }.is_err() {
+            return NAPI_INVALID_ARG;
+        }
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_register_callback_pair(

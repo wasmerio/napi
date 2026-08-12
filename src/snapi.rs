@@ -74,6 +74,20 @@ unsafe extern "C" {
         checkpoint_state: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_register_guest_buffer_finalizer(
+        env: SnapiEnv,
+        value_id: u32,
+        guest_ptr: u32,
+        recyclable: i32,
+    ) -> i32;
+    pub fn snapi_bridge_take_ready_guest_buffer_finalizer(
+        env: SnapiEnv,
+        force: i32,
+        handle_id_out: *mut u32,
+        guest_ptr_out: *mut u32,
+        recyclable_out: *mut i32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
         env: SnapiEnv,

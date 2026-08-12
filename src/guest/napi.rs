@@ -3636,12 +3636,8 @@ fn guest_napi_get_typedarray_info(
             write_guest_u32(&mut env, lp as u32, len);
         }
         if dp > 0 {
-            let elem_size = match typ {
-                0..=2 => 1usize,
-                3 | 4 | 13 | 14 => 2usize,
-                5 | 6 | 15 | 16 => 4usize,
-                7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => 8usize,
-                _ => 1usize,
+            let Some(elem_size) = super::typedarray_element_size(typ) else {
+                return 1;
             };
             let byte_len = len as usize * elem_size;
             if let Some(guest_data_ptr) =
