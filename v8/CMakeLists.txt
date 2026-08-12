@@ -34,6 +34,7 @@ foreach(NAPI_V8_SRC_FILE IN LISTS NAPI_V8_SRC_FILES)
 endforeach()
 
 add_library(napi_v8 STATIC
+  ../lib/src/napi_buffer_lease.cc
   ../lib/src/napi_error_state.cc
   ../lib/src/napi_lifetime_tracker.cc
   ../lib/src/napi_periodic_gate.cc

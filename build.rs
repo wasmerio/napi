@@ -108,6 +108,7 @@ fn main() {
                 .to_str()
                 .unwrap(),
         )
+        .file(napi_lib_src.join("napi_buffer_lease.cc").to_str().unwrap())
         .file(napi_lib_src.join("napi_periodic_gate.cc").to_str().unwrap())
         .file(napi_lib_src.join("napi_text.cc").to_str().unwrap())
         .file(

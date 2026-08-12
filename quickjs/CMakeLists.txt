@@ -55,6 +55,7 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 # endforeach()
 
 add_library(napi_quickjs STATIC
+  ../lib/src/napi_buffer_lease.cc
   ../lib/src/napi_error_state.cc
   ../lib/src/napi_lifetime_tracker.cc
   ../lib/src/napi_periodic_gate.cc
