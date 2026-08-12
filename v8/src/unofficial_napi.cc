@@ -1722,6 +1722,30 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 
 extern "C" {
 
+napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
+    napi_env env, napi_typedarray_type type, size_t length, void** data,
+    napi_value* result) {
+  if (env == nullptr || data == nullptr || result == nullptr) return napi_invalid_arg;
+  size_t element_size = 1;
+  switch (type) {
+    case napi_float16_array:
+    case napi_int16_array:
+    case napi_uint16_array: element_size = 2; break;
+    case napi_int32_array:
+    case napi_uint32_array:
+    case napi_float32_array: element_size = 4; break;
+    case napi_float64_array:
+    case napi_bigint64_array:
+    case napi_biguint64_array: element_size = 8; break;
+    default: break;
+  }
+  if (length > SIZE_MAX / element_size) return napi_invalid_arg;
+  napi_value arraybuffer;
+  napi_status status = napi_create_arraybuffer(env, length * element_size, data, &arraybuffer);
+  if (status != napi_ok) return status;
+  return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
+}
+
 napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
     const unofficial_napi_embedder_hooks* hooks) {
   std::lock_guard<std::mutex> lock(g_runtime_mu);
@@ -2149,7 +2173,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 // for the isolate. That runner forwards to the guest's own enqueue callback
 // when one is bound (see EdgeV8Platform::BindForegroundTaskTarget), but the
 // guest is not required to bind one -- it may drive everything through
-// unofficial_napi_process_microtasks instead. Tasks posted with no guest
+// the provider-owned event-loop checkpoint instead. Tasks posted with no guest
 // target bound fall back to the stock default-platform runner, and nothing
 // else ever pumps that runner's queue, so without this they are posted and
 // then never run: V8 correctly collects the dead targets, but their
@@ -2195,12 +2219,49 @@ napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
+napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
+    napi_env env,
+    unofficial_napi_event_loop_checkpoint_mode mode,
+    bool has_runnable_work,
+    uint32_t* state_out) {
+  (void)has_runnable_work;
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Keep this helper scoped to the current context's microtask queue.
-  // Foreground task pumping is owned by higher-level runtime loop policy.
+  if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
+      mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
+    return napi_invalid_arg;
+  }
   DrainMicrotasksForEnv(env);
+  if (state_out != nullptr) {
+    *state_out = NapiV8HasPendingProviderWork(env)
+                     ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
+                     : unofficial_napi_event_loop_checkpoint_state_none;
+  }
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
+    napi_env env,
+    size_t length,
+    bool zero_fill,
+    napi_value* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (length == 0) {
+    return napi_create_arraybuffer(env, 0, nullptr, result);
+  }
+
+  void* data = zero_fill ? std::calloc(length, 1) : std::malloc(length);
+  if (data == nullptr) return napi_generic_failure;
+  napi_status status = napi_create_external_arraybuffer(
+      env,
+      data,
+      length,
+      [](napi_env, void* bytes, void*) { std::free(bytes); },
+      nullptr,
+      result);
+  if (status != napi_ok) std::free(data);
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {

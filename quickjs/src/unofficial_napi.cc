@@ -17,6 +17,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace quickjs::detail;
@@ -129,6 +130,40 @@ namespace
 
 extern "C"
 {
+    napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
+        napi_env env, napi_typedarray_type type, size_t length, void **data, napi_value *result)
+    {
+        if (env == nullptr || data == nullptr || result == nullptr)
+            return napi_invalid_arg;
+        size_t element_size = 1;
+        switch (type)
+        {
+        case napi_float16_array:
+        case napi_int16_array:
+        case napi_uint16_array:
+            element_size = 2;
+            break;
+        case napi_int32_array:
+        case napi_uint32_array:
+        case napi_float32_array:
+            element_size = 4;
+            break;
+        case napi_float64_array:
+        case napi_bigint64_array:
+        case napi_biguint64_array:
+            element_size = 8;
+            break;
+        default:
+            break;
+        }
+        if (length > SIZE_MAX / element_size)
+            return napi_invalid_arg;
+        napi_value arraybuffer;
+        napi_status status = napi_create_arraybuffer(env, length * element_size, data, &arraybuffer);
+        if (status != napi_ok)
+            return status;
+        return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
+    }
 
     napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
         JSContext *context, int32_t module_api_version, napi_env *result)
@@ -313,11 +348,52 @@ extern "C"
         return unofficial_napi_low_memory_notification(env);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env)
+    napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
+        napi_env env,
+        unofficial_napi_event_loop_checkpoint_mode mode,
+        bool has_runnable_work,
+        uint32_t *state_out)
     {
+        (void)has_runnable_work;
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        return napi_util__::run_pending_jobs(env);
+        if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
+            mode != unofficial_napi_event_loop_checkpoint_host_tasks)
+            return napi_invalid_arg;
+        napi_status status = napi_util__::run_pending_jobs(env);
+        if (status != napi_ok)
+            return status;
+        if (state_out != nullptr)
+            *state_out = env->module_wrap().has_pending_provider_work()
+                             ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
+                             : unofficial_napi_event_loop_checkpoint_state_none;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
+        napi_env env,
+        size_t length,
+        bool zero_fill,
+        napi_value *result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr)
+            return napi_invalid_arg;
+        if (length == 0)
+            return napi_create_arraybuffer(env, 0, nullptr, result);
+
+        void *data = zero_fill ? std::calloc(length, 1) : std::malloc(length);
+        if (data == nullptr)
+            return napi_generic_failure;
+        napi_status status = napi_create_external_arraybuffer(
+            env,
+            data,
+            length,
+            [](napi_env, void *bytes, void *) { std::free(bytes); },
+            nullptr,
+            result);
+        if (status != napi_ok)
+            std::free(data);
+        return status;
     }
 
     napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env)

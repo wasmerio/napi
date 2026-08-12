@@ -3,6 +3,11 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use wasmer::TypedFunction;
 use wasmer::{Function, Memory, Table};
 
 use crate::budget::{
@@ -13,6 +18,65 @@ use crate::snapi::{
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
     snapi_bridge_unofficial_set_value_limit,
 };
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_active_callback_ctx};
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct HostBufferCopy {
+    pub(crate) owner_id: u64,
+    pub(crate) guest_env: u32,
+    pub(crate) handle_id: u32,
+    pub(crate) host_reference_id: u32,
+    pub(crate) backing_store_token: u64,
+    pub(crate) guest_ptr: u32,
+    pub(crate) byte_len: usize,
+    pub(crate) guest_allocation_recyclable: bool,
+    pub(crate) persistent: bool,
+    pub(crate) reference_holds: u32,
+    pub(crate) needs_flush: bool,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct HostBufferLease {
+    pub(crate) guest_ptr: u32,
+    pub(crate) byte_offset: u32,
+    pub(crate) byte_len: u32,
+    pub(crate) writable: bool,
+    pub(crate) host_reference_id: u32,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct GuestBackingStoreMapping {
+    pub(crate) host_addr: u64,
+    pub(crate) guest_ptr: u32,
+    pub(crate) byte_len: usize,
+    pub(crate) covers_full_backing_store: bool,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct NativeBufferLease {
+    pub(crate) guest_ptr: u32,
+    pub(crate) host_ptr: u64,
+    pub(crate) byte_len: usize,
+    pub(crate) writable: bool,
+    pub(crate) copied: bool,
+}
+
+// FunctionEnv is cloned for WASIX workers, while Edge's guest-side native
+// globals are shared. Keep JS-backend env IDs unique across those clones.
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+static NEXT_NAPI_ENV_ID: AtomicU32 = AtomicU32::new(1);
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn next_js_napi_env_id() -> u32 {
+    loop {
+        let id = NEXT_NAPI_ENV_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
 
 /// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
 /// pointer (as `usize`, so [`NapiEnv`] stays `Send`) to the boxed
@@ -48,7 +112,10 @@ pub(crate) struct NapiEnv {
     /// outright if a `GuestHeap` can't be built, so any env reachable from
     /// guest code is guaranteed to have one — it is the only allocation path
     /// for guest-visible V8 memory, never a best-effort fallback.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
     /// Cache of resolved guest callback functions, keyed by their
     /// `__indirect_function_table` index. `Function::from_vm_funcref` (invoked
@@ -65,6 +132,34 @@ pub(crate) struct NapiEnv {
     pub(crate) napi_envs: HashMap<u32, usize>,
     pub(crate) napi_state_to_guest_env: HashMap<usize, u32>,
     pub(crate) napi_scopes: HashMap<u32, u32>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) guest_buffer_pool: Vec<(u32, usize)>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) guest_buffer_capacities: HashMap<u32, usize>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) guest_buffer_allocated_bytes: usize,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) guest_data_ptrs: HashMap<(u32, u32), u32>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) guest_data_backing_stores: HashMap<(u32, u64), GuestBackingStoreMapping>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_copies: Vec<HostBufferCopy>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_copy_frames: Vec<u64>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) next_host_buffer_owner_id: u64,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_handle_scopes: Vec<(u32, u32, u64)>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_reference_holds: HashMap<(u32, u32), u32>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) next_buffer_lease_id: u32,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) host_buffer_leases: HashMap<(u32, u32), HostBufferLease>,
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) persistent_callback_contexts: HashMap<u32, Box<CallbackInvocationCtx>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) native_buffer_leases: HashMap<(u32, u32), NativeBufferLease>,
 }
 
 impl NapiEnv {
@@ -76,7 +171,10 @@ impl NapiEnv {
             external_declared: 0,
             callback_depth: 0,
             memory: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             guest_heap: None,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            malloc_fn: None,
             table: None,
             func_cache: HashMap::new(),
             default_napi_env_id: None,
@@ -85,7 +183,60 @@ impl NapiEnv {
             napi_envs: HashMap::new(),
             napi_state_to_guest_env: HashMap::new(),
             napi_scopes: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            guest_buffer_pool: Vec::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            guest_buffer_capacities: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            guest_buffer_allocated_bytes: 0,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            guest_data_ptrs: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            guest_data_backing_stores: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_copies: Vec::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_copy_frames: Vec::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            next_host_buffer_owner_id: 1,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_handle_scopes: Vec::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_reference_holds: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            next_buffer_lease_id: 1,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            host_buffer_leases: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            persistent_callback_contexts: HashMap::new(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            native_buffer_leases: HashMap::new(),
         }
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) fn next_host_buffer_owner(&mut self) -> u64 {
+        loop {
+            let id = self.next_host_buffer_owner_id.max(1);
+            self.next_host_buffer_owner_id = id.wrapping_add(1).max(1);
+            if !self.host_buffer_copy_frames.contains(&id)
+                && !self
+                    .host_buffer_handle_scopes
+                    .iter()
+                    .any(|(_, _, owner_id)| *owner_id == id)
+            {
+                return id;
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) fn current_host_buffer_owner(&self) -> u64 {
+        self.host_buffer_handle_scopes
+            .last()
+            .map(|(_, _, owner_id)| *owner_id)
+            .or_else(|| self.host_buffer_copy_frames.last().copied())
+            .unwrap_or(0)
     }
 
     /// Reserve budget for a new V8 env before creating it: acquire an isolate
@@ -201,8 +352,14 @@ impl NapiEnv {
     }
 
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
-        let env_id = self.next_napi_env_id.max(1);
-        self.next_napi_env_id = env_id.saturating_add(1);
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let env_id = {
+            let env_id = self.next_napi_env_id.max(1);
+            self.next_napi_env_id = env_id.saturating_add(1);
+            env_id
+        };
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        let env_id = next_js_napi_env_id();
 
         let scope_id = self.next_napi_scope_id.max(1);
         self.next_napi_scope_id = scope_id.saturating_add(1);
@@ -213,11 +370,57 @@ impl NapiEnv {
         (env_id, scope_id)
     }
 
+    fn discard_buffer_leases_for_env(&mut self, env_id: u32) {
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        {
+            let lease_ids: Vec<(u32, u32)> = self
+                .host_buffer_leases
+                .keys()
+                .filter(|(lease_env_id, _)| *lease_env_id == env_id)
+                .copied()
+                .collect();
+            for lease_id in lease_ids {
+                let Some(lease) = self.host_buffer_leases.remove(&lease_id) else {
+                    continue;
+                };
+                if lease.guest_ptr != 0
+                    && let Some(capacity) = self.guest_buffer_capacities.remove(&lease.guest_ptr)
+                {
+                    self.guest_buffer_pool.push((lease.guest_ptr, capacity));
+                }
+            }
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            let lease_ids: Vec<(u32, u32)> = self
+                .native_buffer_leases
+                .keys()
+                .filter(|(lease_env_id, _)| *lease_env_id == env_id)
+                .copied()
+                .collect();
+            for lease_id in lease_ids {
+                let Some(lease) = self.native_buffer_leases.remove(&lease_id) else {
+                    continue;
+                };
+                if lease.copied
+                    && let Some(heap) = self.guest_heap.as_ref()
+                {
+                    heap.free_offset(lease.guest_ptr);
+                }
+            }
+        }
+    }
+
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
         }
+        // Leases are environment-owned resources. Explicit release publishes
+        // writes; environment teardown only discards snapshots and returns any
+        // guest allocations because the JavaScript value is being destroyed.
+        self.discard_buffer_leases_for_env(env_id);
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
@@ -236,6 +439,11 @@ impl NapiEnv {
             self.budget.release_env(handle.ceiling);
         }
         let env = self.napi_envs.remove(&env_id)?;
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        unsafe {
+            snapi_bridge_swap_active_callback_ctx(env as SnapiEnv, std::ptr::null_mut());
+            self.persistent_callback_contexts.remove(&env_id);
+        }
         self.napi_state_to_guest_env.remove(&env);
         Some(env as SnapiEnv)
     }

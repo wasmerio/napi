@@ -11,6 +11,9 @@ bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
+void NapiV8TrackProviderPromise(v8::Isolate* isolate,
+                                v8::Local<v8::Promise> promise);
+bool NapiV8HasPendingProviderWork(napi_env env);
 void* NapiV8GetCurrentEdgeEnvironment(v8::Isolate* isolate);
 void* NapiV8GetCurrentEdgeEnvironment(v8::Local<v8::Context> context);
 

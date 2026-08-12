@@ -132,6 +132,10 @@ struct SnapiEnvState {
   // Handle table for opaque bytecode handles (unofficial_napi_bytecode_*).
   HandleTable bytecode_handles;
 
+  // Opaque provider-owned memory leases. Unlike value slots, these survive
+  // handle-scope closure and retain their JavaScript values until released.
+  HandleTable buffer_lease_handles;
+
   // Current guest invocation driving this env. This is only valid while the
   // driving host import remains on the stack.
   std::atomic<void*> active_callback_ctx{nullptr};
@@ -396,6 +400,11 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
 
 napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
+  for (const auto& entry : state->buffer_lease_handles.handles) {
+    (void)unofficial_napi_release_buffer_lease(
+        state->env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
+  }
+  state->buffer_lease_handles.Reset();
   // Slots hold raw Locals; they die with the env's scopes when release_env
   // tears everything down, so draining the frames is pure bookkeeping.
   while (!state->scope_frames.empty()) {
@@ -2262,6 +2271,62 @@ extern "C" int snapi_bridge_get_buffer_info(SnapiEnvState* env_state, uint32_t i
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_acquire_buffer_lease(
+    SnapiEnvState* env_state, uint32_t value_id, uint32_t byte_offset,
+    uint32_t byte_length, int mode, uint32_t* lease_out, uint64_t* data_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || lease_out == nullptr || data_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  napi_value value = LoadValue(*bridge_state, value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  unofficial_napi_buffer_lease lease = nullptr;
+  void* data = nullptr;
+  napi_status status = unofficial_napi_acquire_buffer_lease(
+      bridge_state->env, value, byte_offset, byte_length,
+      static_cast<unofficial_napi_buffer_access_mode>(mode), &lease, &data);
+  if (status != napi_ok) return status;
+  const uint32_t lease_id = bridge_state->buffer_lease_handles.Store(lease);
+  if (lease_id == 0) {
+    (void)unofficial_napi_release_buffer_lease(bridge_state->env, lease, false);
+    return napi_generic_failure;
+  }
+  *lease_out = lease_id;
+  *data_out = reinterpret_cast<uint64_t>(data);
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_release_buffer_lease(
+    SnapiEnvState* env_state, uint32_t lease_id, int modified) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  auto lease = static_cast<unofficial_napi_buffer_lease>(
+      bridge_state->buffer_lease_handles.Load(lease_id));
+  if (lease == nullptr) return napi_invalid_arg;
+  napi_status status = unofficial_napi_release_buffer_lease(
+      bridge_state->env, lease, modified != 0);
+  bridge_state->buffer_lease_handles.Remove(lease_id);
+  return status;
+}
+
+extern "C" int snapi_bridge_unofficial_create_guest_backed_typedarray(
+    SnapiEnvState* env_state, int type, uint32_t length, uint64_t* data_out,
+    uint32_t* value_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || data_out == nullptr || value_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  void* data = nullptr;
+  napi_value value = nullptr;
+  napi_status status = unofficial_napi_create_guest_backed_typedarray(
+      bridge_state->env, static_cast<napi_typedarray_type>(type), length, &data,
+      &value);
+  if (status != napi_ok) return status;
+  *data_out = reinterpret_cast<uint64_t>(data);
+  *value_out = StoreValue(*bridge_state, value);
+  return *value_out == 0 ? napi_generic_failure : napi_ok;
+}
+
 // ============================================================
 // Node version (stub — we're not running in Node, return fake version)
 // ============================================================
@@ -2964,12 +3029,25 @@ extern "C" int snapi_bridge_unofficial_low_memory_notification(SnapiEnvState* en
   return unofficial_napi_low_memory_notification(env);
 }
 
-extern "C" int snapi_bridge_unofficial_process_microtasks(SnapiEnvState* env_state) {
+extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
+    SnapiEnvState* env_state,
+    int mode,
+    int has_runnable_work,
+    uint32_t* checkpoint_state) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_process_microtasks(env);
+  uint32_t state = unofficial_napi_event_loop_checkpoint_state_none;
+  const int status = unofficial_napi_event_loop_checkpoint(
+      env,
+      static_cast<unofficial_napi_event_loop_checkpoint_mode>(mode),
+      has_runnable_work != 0,
+      &state);
+  if (checkpoint_state != nullptr) {
+    *checkpoint_state = state;
+  }
+  return status;
 }
 
 extern "C" int snapi_bridge_unofficial_request_gc_for_testing(SnapiEnvState* env_state) {
@@ -3185,7 +3263,7 @@ extern "C" int snapi_bridge_unofficial_set_enqueue_foreground_task_callback(
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   // Keep parity with the previous bridge behavior (no custom foreground task hook).
-  // The runtime still drives microtasks via unofficial_napi_process_microtasks.
+  // The runtime drives provider work through the event-loop checkpoint.
   return napi_ok;
 }
 

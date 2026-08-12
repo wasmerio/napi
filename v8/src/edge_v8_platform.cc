@@ -494,7 +494,7 @@ void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   // ForegroundTaskRunner::PostTaskCommon forwards to the guest's bound
   // enqueue callback when one is set, but falls back to fallback_'s own
   // GetForegroundTaskRunner() when no guest target is bound (e.g. the guest
-  // drives everything through unofficial_napi_process_microtasks and never
+  // drives everything through the provider event-loop checkpoint and never
   // calls BindForegroundTaskTarget). Nothing else pumps that fallback
   // runner's queue, so tasks routed there -- including V8-internal work like
   // Heap::PostFinalizationRegistryCleanupTaskIfNeeded's cleanup task -- would

@@ -66,6 +66,7 @@ public:
   napi_status import_module_dynamically(size_t argc,
                                         napi_value const *argv,
                                         napi_value *result_out);
+  bool has_pending_provider_work();
   napi_status create_required_module_facade(void *handle, napi_value *result_out);
   void register_dynamic_import_referrer(napi_value referrer_name,
                                         napi_value host_defined_option_id);
@@ -81,6 +82,11 @@ public:
                                     JSModuleImportPhaseEnum phase);
 
 private:
+  struct pending_provider_promise {
+    JSValue value = JS_UNDEFINED;
+    bool settlement_observed = false;
+  };
+
   struct request_record;
   struct record;
   struct script_referrer;
@@ -131,6 +137,7 @@ private:
   // Module records and referrer metadata.
   std::vector<record *> records_;
   std::vector<script_referrer> script_referrers_;
+  std::vector<pending_provider_promise> pending_dynamic_imports_;
   uint64_t facade_counter_ = 0;
 
   // Subsystem lifecycle.

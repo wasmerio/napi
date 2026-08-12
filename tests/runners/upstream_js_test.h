@@ -47,9 +47,10 @@ inline std::string NapiExceptionMessage(napi_env env, napi_value exception) {
   return "<empty>";
 }
 
-inline bool DrainMicrotasks(napi_env env) {
+inline bool RunProviderCheckpoints(napi_env env) {
   for (int i = 0; i < 64; ++i) {
-    napi_status status = unofficial_napi_process_microtasks(env);
+    napi_status status = unofficial_napi_event_loop_checkpoint(
+        env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr);
     if (status != napi_ok) {
       ADD_FAILURE() << "Failed to process microtasks: " << status;
       return false;
@@ -84,13 +85,14 @@ inline bool RunScript(EnvScope& s, const std::string& source_text, const char* l
     return false;
   }
 
-  return DrainMicrotasks(s.env);
+  return RunProviderCheckpoints(s.env);
 }
 
 inline napi_value ForceGcCallback(napi_env env, napi_callback_info info) {
   (void)info;
   (void)unofficial_napi_request_gc_for_testing(env);
-  (void)unofficial_napi_process_microtasks(env);
+  (void)unofficial_napi_event_loop_checkpoint(
+      env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr);
 
   napi_value result = nullptr;
   (void)napi_get_undefined(env, &result);

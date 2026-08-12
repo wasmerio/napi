@@ -159,6 +159,9 @@ void napi_module_wrap__::teardown()
   for (auto &referrer : script_referrers_)
     JS_FreeValue(ctx_, referrer.host_defined_option_id);
   script_referrers_.clear();
+  for (const auto &promise : pending_dynamic_imports_)
+    JS_FreeValue(ctx_, promise.value);
+  pending_dynamic_imports_.clear();
 
   JS_FreeValue(ctx_, import_module_dynamically_callback_);
   import_module_dynamically_callback_ = JS_UNDEFINED;
@@ -978,7 +981,33 @@ napi_status napi_module_wrap__::import_module_dynamically(size_t argc,
     JS_FreeValue(ctx_, arg);
   if (JS_IsException(result))
     return return_pending_exception("Dynamic import callback failed");
+  if (JS_PromiseState(ctx_, result) != JS_PROMISE_NOT_A_PROMISE)
+    pending_dynamic_imports_.push_back({JS_DupValue(ctx_, result), false});
   return wrap_owned(result, result_out);
+}
+
+bool napi_module_wrap__::has_pending_provider_work()
+{
+  size_t write_index = 0;
+  for (size_t index = 0; index < pending_dynamic_imports_.size(); ++index)
+  {
+    auto &tracked = pending_dynamic_imports_[index];
+    const bool pending =
+        JS_PromiseState(ctx_, tracked.value) == JS_PROMISE_PENDING;
+    const bool keep = pending || !tracked.settlement_observed;
+    if (keep)
+    {
+      if (!pending)
+        tracked.settlement_observed = true;
+      pending_dynamic_imports_[write_index++] = tracked;
+    }
+    else
+    {
+      JS_FreeValue(ctx_, tracked.value);
+    }
+  }
+  pending_dynamic_imports_.resize(write_index);
+  return !pending_dynamic_imports_.empty();
 }
 
 napi_status napi_module_wrap__::create_required_module_facade(void *handle,
@@ -1194,6 +1223,8 @@ JSValue napi_module_wrap__::import_module_dynamically(JSModuleDef *referrer,
   JSValue result = call_callback(import_module_dynamically_callback_, 5, args);
   for (JSValue arg : args)
     JS_FreeValue(ctx_, arg);
+  if (JS_PromiseState(ctx_, result) != JS_PROMISE_NOT_A_PROMISE)
+    pending_dynamic_imports_.push_back({JS_DupValue(ctx_, result), false});
   return result;
 }
 

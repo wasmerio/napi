@@ -71,9 +71,21 @@ using v8impl::detail::ModuleRequestRecord;
 using v8impl::detail::ModuleWrapRecord;
 
 struct ModuleWrapBindingState {
+  struct PendingProviderPromise {
+    PendingProviderPromise(v8::Isolate* isolate,
+                           v8::Local<v8::Promise> promise)
+        : value(isolate, promise) {}
+    PendingProviderPromise(PendingProviderPromise&&) = default;
+    PendingProviderPromise& operator=(PendingProviderPromise&&) = default;
+
+    v8::Global<v8::Promise> value;
+    bool settlement_observed = false;
+  };
+
   napi_ref import_module_dynamically_ref = nullptr;
   napi_ref initialize_import_meta_ref = nullptr;
   std::vector<ModuleWrapRecord*> modules;
+  std::vector<PendingProviderPromise> pending_dynamic_imports;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
 };
 
@@ -812,6 +824,8 @@ void CleanupModuleWrapState(void* arg) {
 
   ResetRef(env, &it->second.import_module_dynamically_ref);
   ResetRef(env, &it->second.initialize_import_meta_ref);
+  for (auto& promise : it->second.pending_dynamic_imports) promise.value.Reset();
+  it->second.pending_dynamic_imports.clear();
   g_module_wrap_states.erase(it);
 }
 
@@ -1187,13 +1201,20 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> id = v8::Undefined(isolate);
+  bool have_host_defined_options = false;
   if (!host_defined_options.IsEmpty() && host_defined_options->IsFixedArray()) {
     v8::Local<v8::FixedArray> options = host_defined_options.As<v8::FixedArray>();
     if (options->Length() == kHostDefinedOptionsLength) {
       id = options->Get(context, kHostDefinedOptionsId).As<v8::Value>();
+      have_host_defined_options = true;
     }
   }
-  if (id->IsUndefined()) {
+  // Match Node's referrer selection exactly: a full host-options block owns
+  // the ID slot even when its value is undefined. Only an actually empty
+  // block (used by realm-level imports such as ShadowRealm) may consult the
+  // realm global. Treating an undefined slot as an empty block lets indirect
+  // eval escape into the realm's default loader.
+  if (!have_host_defined_options) {
     v8::Local<v8::Value> global_id;
     if (context->Global()
             ->GetPrivate(context, ApiPrivate(isolate, "node:host_defined_option_symbol"))
@@ -1233,7 +1254,9 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   if (resolver->Resolve(context, napi_v8_unwrap_value(result)).IsNothing()) {
     return v8::MaybeLocal<v8::Promise>();
   }
-  return handle_scope.Escape(resolver->GetPromise());
+  v8::Local<v8::Promise> promise = resolver->GetPromise();
+  NapiV8TrackProviderPromise(isolate, promise);
+  return handle_scope.Escape(promise);
 }
 
 v8::MaybeLocal<v8::Promise> ImportModuleDynamically(
@@ -1788,12 +1811,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
       host_id_symbol = host_raw.As<v8::Symbol>();
     }
   }
-  // The CJS-function shape defaults to the loader's dynamic-import host
-  // symbol so the compiled artifact is directly usable by the CJS loader.
-  if (host_id_symbol.IsEmpty() && shape == unofficial_napi_bytecode_shape_cjs_function) {
-    host_id_symbol = DefaultCjsHostSymbol(env);
-  }
-
   v8::TryCatch try_catch(isolate);
   if (!CompileBytecodeRecord(env, record.get(), host_id_symbol, /*consume=*/false, nullptr)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
@@ -1860,10 +1877,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
       host_id_symbol = host_raw.As<v8::Symbol>();
     }
   }
-  if (host_id_symbol.IsEmpty() && shape == unofficial_napi_bytecode_shape_cjs_function) {
-    host_id_symbol = DefaultCjsHostSymbol(env);
-  }
-
   bool rejected = false;
   v8::TryCatch try_catch(isolate);
   if (!CompileBytecodeRecord(env, record.get(), host_id_symbol, /*consume=*/true, &rejected)) {
@@ -2196,13 +2209,9 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     if (!bytecode_record->host_symbol.IsEmpty()) {
       record_symbol = bytecode_record->host_symbol.Get(isolate);
     }
-    // bytecode_compile/deserialize default CJS-function records to the
-    // loader's dynamic-import symbol; a caller passing no symbol gets the
-    // artifact it asked those APIs to build.
-    const bool host_symbol_matches =
-        record_symbol == host_id_symbol ||
-        (host_id_symbol.IsEmpty() && !record_symbol.IsEmpty() &&
-         record_symbol == DefaultCjsHostSymbol(env));
+    // Host metadata is part of the artifact identity. Function shape alone
+    // cannot decide whether code is user CJS or an internal builtin.
+    const bool host_symbol_matches = record_symbol == host_id_symbol;
     if (host_symbol_matches) {
       fn = bytecode_record->function.Get(isolate);
       effective_symbol = record_symbol;
@@ -3151,3 +3160,44 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 }
 
 }  // extern "C"
+
+void NapiV8TrackProviderPromise(v8::Isolate* isolate,
+                                v8::Local<v8::Promise> promise) {
+  if (isolate == nullptr || promise.IsEmpty()) return;
+  napi_env env = GetModuleWrapEnvForIsolate(isolate);
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  auto it = g_module_wrap_states.find(env);
+  if (it != g_module_wrap_states.end()) {
+    it->second.pending_dynamic_imports.emplace_back(isolate, promise);
+  }
+}
+
+bool NapiV8HasPendingProviderWork(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  auto it = g_module_wrap_states.find(env);
+  if (it == g_module_wrap_states.end()) return false;
+
+  auto& imports = it->second.pending_dynamic_imports;
+  size_t write_index = 0;
+  for (size_t index = 0; index < imports.size(); ++index) {
+    auto& tracked = imports[index];
+    const bool pending = !tracked.value.IsEmpty() &&
+                         tracked.value.Get(env->isolate)->State() ==
+                             v8::Promise::kPending;
+    // A dynamic import may settle while its host callback is returning from
+    // the engine's current microtask checkpoint. Keep it alive for one more
+    // checkpoint so reactions queued by that return are also observed.
+    const bool keep = pending || !tracked.settlement_observed;
+    if (keep) {
+      if (!pending) tracked.settlement_observed = true;
+      if (write_index != index) imports[write_index] = std::move(tracked);
+      ++write_index;
+    } else {
+      tracked.value.Reset();
+    }
+  }
+  imports.erase(imports.begin() + write_index, imports.end());
+  return !imports.empty();
+}

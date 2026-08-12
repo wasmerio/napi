@@ -27,13 +27,17 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use std::time::Duration;
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use wasmer::sys::vm::{
     ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
     VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use wasmer::sys::{BaseTunables, Tunables};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use wasmer::{MemoryStyle, MemoryType, Pages, TableStyle, TableType, WASM_PAGE_SIZE};
 
 /// Sentinel meaning "no memory limit". A budget built with this total tracks
@@ -57,11 +61,13 @@ pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 /// [`ResourceBudget::value_handle_limit`].
 pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
 }
 
 /// Round `bytes` up to a whole number of wasm pages, saturating.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 fn round_up_to_page(bytes: u64) -> u64 {
     let page = WASM_PAGE_SIZE as u64;
     bytes.div_ceil(page).saturating_mul(page)
@@ -512,11 +518,13 @@ impl Drop for MemoryCharge {
 /// `memory.grow` returning `-1`, i.e. an ordinary allocation failure — when the
 /// budget is exhausted. The initial (minimum) size is charged at construction.
 #[derive(Debug)]
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub struct BudgetedMemory {
     inner: VMMemory,
     charge: Arc<MemoryCharge>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl BudgetedMemory {
     /// Wrap an already-allocated backend memory, charging its current size.
     ///
@@ -535,10 +543,12 @@ impl BudgetedMemory {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
     MemoryError::Generic(err.to_string())
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl LinearMemory for BudgetedMemory {
     fn ty(&self) -> MemoryType {
         self.inner.ty()
@@ -683,11 +693,13 @@ impl LinearMemory for BudgetedMemory {
 /// Phase 1; the edgejs guest *imports* its memory, so it flows through
 /// `create_host_memory` and is charged. The max-pages clamp still bounds the
 /// defined case cheaply.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub struct BudgetedTunables<T: Tunables> {
     base: T,
     budget: Arc<ResourceBudget>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl<T: Tunables> BudgetedTunables<T> {
     /// Wrap `base`, charging every host memory against `budget`.
     pub fn new(base: T, budget: Arc<ResourceBudget>) -> Self {
@@ -729,6 +741,7 @@ impl<T: Tunables> BudgetedTunables<T> {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl<T: Tunables> Tunables for BudgetedTunables<T> {
     fn memory_style(&self, memory: &MemoryType) -> MemoryStyle {
         self.base.memory_style(&self.adjust_memory(memory))
@@ -784,6 +797,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
 }
 
 /// Build [`BudgetedTunables`] over the platform default base tunables.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub fn budgeted_tunables(
     target: &wasmer::sys::Target,
     budget: Arc<ResourceBudget>,

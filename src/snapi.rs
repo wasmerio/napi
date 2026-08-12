@@ -67,7 +67,27 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
-    pub fn snapi_bridge_unofficial_process_microtasks(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_event_loop_checkpoint(
+        env: SnapiEnv,
+        mode: i32,
+        has_runnable_work: i32,
+        checkpoint_state: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_register_guest_buffer_finalizer(
+        env: SnapiEnv,
+        value_id: u32,
+        guest_ptr: u32,
+        recyclable: i32,
+    ) -> i32;
+    pub fn snapi_bridge_take_ready_guest_buffer_finalizer(
+        env: SnapiEnv,
+        force: i32,
+        handle_id_out: *mut u32,
+        guest_ptr_out: *mut u32,
+        recyclable_out: *mut i32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
         env: SnapiEnv,
@@ -281,6 +301,17 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_serialize_value(
+        env: SnapiEnv,
+        value_id: u32,
+        payload_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_deserialize_value(
+        env: SnapiEnv,
+        payload: u32,
+        value_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_release_serialized_value(payload: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(
@@ -932,6 +963,41 @@ unsafe extern "C" {
         data_out: *mut u64,
         length_out: *mut u32,
         backing_store_token_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_acquire_buffer_lease(
+        env: SnapiEnv,
+        value_id: u32,
+        byte_offset: u32,
+        byte_length: u32,
+        mode: i32,
+        lease_out: *mut u32,
+        data_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_release_buffer_lease(
+        env: SnapiEnv,
+        lease_id: u32,
+        modified: i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_create_guest_backed_typedarray(
+        env: SnapiEnv,
+        type_: i32,
+        length: u32,
+        data_out: *mut u64,
+        value_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
+    -> i32;
+    pub fn snapi_bridge_overwrite_value_bytes(
+        env: SnapiEnv,
+        id: u32,
+        data: *const core::ffi::c_void,
+        len: u32,
+    ) -> i32;
+    pub fn snapi_bridge_overwrite_reference_bytes(
+        env: SnapiEnv,
+        reference_id: u32,
+        data: *const core::ffi::c_void,
+        len: u32,
     ) -> i32;
     // Node version
     pub fn snapi_bridge_get_node_version(

@@ -4,8 +4,11 @@ pub mod cli;
 mod ctx;
 mod env;
 mod guest;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod guest_heap;
 mod snapi;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+mod snapi_js;
 #[cfg(feature = "wasix")]
 mod wasix;
 use std::fmt::Display;
@@ -14,15 +17,42 @@ pub const NAPI_MODULE_NAME: &str = "napi";
 pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
 pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub use budget::{BudgetedMemory, BudgetedTunables, budgeted_tunables};
 pub use budget::{
-    BudgetedMemory, BudgetedTunables, EnvRejected, HeapReservation, OverBudget, Pool,
-    RequestedHeap, ResourceBudget, ResourceUsage, budgeted_tunables,
+    EnvRejected, HeapReservation, OverBudget, Pool, RequestedHeap, ResourceBudget, ResourceUsage,
 };
 pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeHooks, NapiSession,
 };
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy};
+
+/// Host capabilities required by the JavaScript-backed N-API implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostJsCapabilities {
+    /// Whether the JavaScript engine exposes the JS Promise Integration API.
+    pub jspi: bool,
+}
+
+/// Reports capabilities of the JavaScript host backend.
+///
+/// Returns `None` when the crate is not compiled for wasm32 with the `js`
+/// feature. Promise-aware EdgeJS entry points must require `jspi == true`.
+pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    {
+        return Some(HostJsCapabilities {
+            jspi: snapi_js::has_jspi(),
+        });
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum NapiVersion {

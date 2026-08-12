@@ -7,6 +7,16 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Uses the browser/Node JavaScript realm as the N-API value engine when this
+# crate is compiled as part of a wasm32-unknown-unknown wasm-bindgen module.
+# On native targets this feature is inert and the V8 backend remains active.
+js = [
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "wasmer/experimental-async",
+  "wasmer/js-default",
+]
 # Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
 # `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
 # trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
@@ -18,7 +28,7 @@ cli = [
   "dep:wasmer-compiler-llvm",
   "dep:wasmer-c-api-imports",
   "wasmer-c-api-imports/llvm",
-  "wasmer-c-api-imports/wasix",
+  "wasmer-c-api-imports/wasi",
   "dep:tokio",
   "dep:virtual-fs",
   "dep:wasmer-types",
@@ -26,14 +36,9 @@ cli = [
 
 [dependencies]
 anyhow = "1"
-# Vendored-in-Wasmer default: when this crate lives at `lib/napi`, resolve the
-# sibling Wasmer crates from the repo checkout.
-#
-# Cargo cannot override a direct `path = ...` dependency back to crates.io via
-# `[patch]`, so standalone builds of this repo should use
-# `./cargo-standalone.sh`, which selects `Cargo.standalone.toml` when the
-# sibling `../api`, `../wasix`, etc. tree is not present.
-wasmer = { version = "=7.2.1", path = "../api" }
+# This manifest is consumed as `wasmer/lib/napi`, so Wasmer dependencies must
+# stay relative to that checkout. Standalone builds use Cargo.standalone.toml.
+wasmer = { version = "=7.2.1", path = "../api", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
 wasmer-cache = { version = "=7.2.1", path = "../cache", optional = true }
@@ -43,11 +48,20 @@ wasmer-types = { version = "=7.2.1", path = "../types", optional = true }
 # Non-optional: the guest callback trampoline re-raises guest WASI process
 # exits (`WasiError::Exit`) through the N-API import layers, so `mod guest`
 # (always compiled) needs the WASIX error type in every build.
-wasmer-wasix = { version = "=0.702.1", path = "../wasix" }
 virtual-fs = { version = "=0.702.1", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2.120", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+wasmer-wasix = { version = "=0.702.1", path = "../wasix", default-features = false, features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmer = { version = "=7.2.1", path = "../api", default-features = false, features = ["sys-default"] }
+wasmer-wasix = { version = "=0.702.1", path = "../wasix", default-features = false, features = ["sys"] }
 
 [build-dependencies]
 cc = "1"

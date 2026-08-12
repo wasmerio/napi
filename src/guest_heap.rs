@@ -35,7 +35,7 @@
 //! ## Concurrency
 //!
 //! `alloc`/`free` take the internal mutex only. For shared memories the grow
-//! handle is a cloned [`SharedMemory`], so growth needs no store and is safe
+//! handle is a cloned [`VMSharedMemory`], so growth needs no store and is safe
 //! from any thread (V8 GC threads free backing stores off the JS thread). Lock
 //! order is the `inner` mutex → budget atomics → the memory's own grow lock;
 //! nothing else is acquired while the mutex is held. Non-shared memories can
@@ -49,7 +49,8 @@ use std::sync::{
 };
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
-use wasmer::{MemoryStyle, Pages, SharedMemory, StoreMut};
+use wasmer::sys::vm::{LinearMemory, VMSharedMemory};
+use wasmer::{MemoryStyle, Pages, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -73,7 +74,7 @@ const OWNED_LOW_WATER_BYTES: u64 = 4 * 1024 * 1024;
 
 enum GrowHandle {
     /// Shared memory: growable from any thread without a store.
-    Shared(SharedMemory),
+    Shared(VMSharedMemory),
     /// Non-shared memory: growable only where a store is available. The
     /// handle is used solely by [`GuestHeap::maybe_refill`].
     Owned(wasmer::Memory),
@@ -244,10 +245,11 @@ impl GuestHeap {
                 integrity_warn("shared memory without a shared handle; guest heap disabled");
                 return None;
             };
+            let vm = shared.vm_shared_memory().unwrap_sys_ref().clone();
             // The base can only be stable if the whole range is reserved up
             // front. On 64-bit hosts this is always the case for wasm32.
-            match shared.style() {
-                Some(MemoryStyle::Static { bound, .. }) if bound.0 >= max_pages => {}
+            match vm.style() {
+                MemoryStyle::Static { bound, .. } if bound.0 >= max_pages => {}
                 style => {
                     integrity_warn(&format!(
                         "memory style {style:?} does not guarantee a stable base; \
@@ -256,7 +258,7 @@ impl GuestHeap {
                     return None;
                 }
             }
-            GrowHandle::Shared(shared)
+            GrowHandle::Shared(vm)
         } else {
             GrowHandle::Owned(memory.clone())
         };
@@ -411,21 +413,19 @@ impl GuestHeap {
             return None;
         }
 
-        let GrowHandle::Shared(shared) = &inner.grow else {
+        let GrowHandle::Shared(vm) = &mut inner.grow else {
             self.budget.uncharge(Pool::WasmLinear, delta_bytes);
             return None;
         };
-        let prev = match shared.grow(Pages(delta_pages)) {
+        let prev = match vm.grow(Pages(delta_pages)) {
             Ok(prev) => prev,
             Err(_) => {
                 self.budget.uncharge(Pool::WasmLinear, delta_bytes);
                 return None;
             }
         };
-        let Some(base_now) = shared.data_ptr() else {
-            self.budget.uncharge(Pool::WasmLinear, delta_bytes);
-            return None;
-        };
+        // SAFETY: the definition pointer is valid for the life of the memory.
+        let base_now = unsafe { vm.vmmemory().as_ref().base };
         self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
     }
 

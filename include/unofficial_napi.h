@@ -56,17 +56,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_embedder_hooks(
     const unofficial_napi_embedder_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_edge_environment(napi_env env, void* environment);
 NAPI_EXTENSION_WASMER_EXTERN void* unofficial_napi_get_edge_environment(napi_env env);
-using unofficial_napi_env_cleanup_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
     napi_env env,
     unofficial_napi_env_cleanup_callback callback,
     void* data);
-using unofficial_napi_env_destroy_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_env_destroy_callback)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_destroy_callback(
     napi_env env,
     unofficial_napi_env_destroy_callback callback,
     void* data);
-using unofficial_napi_context_token_callback = void (*)(napi_env env, void* token, void* data);
+typedef void (*unofficial_napi_context_token_callback)(napi_env env,
+                                                       void* token,
+                                                       void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_context_token_callbacks(
     napi_env env,
     unofficial_napi_context_token_callback assign_callback,
@@ -88,9 +90,75 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 
-// Unofficial/test-only helper. Runs a checkpoint on the current context's
-// microtask queue.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
+typedef enum unofficial_napi_event_loop_checkpoint_mode {
+  // Drain promise/microtask work without admitting a host task turn.
+  unofficial_napi_event_loop_checkpoint_microtasks = 0,
+  // Admit a host task turn as well as draining engine work. Host-JavaScript
+  // providers suspend through JSPI. Synchronous providers report that no host
+  // task was admitted so the runtime can wait on its native event source.
+  unofficial_napi_event_loop_checkpoint_host_tasks = 1,
+} unofficial_napi_event_loop_checkpoint_mode;
+
+typedef enum unofficial_napi_event_loop_checkpoint_state {
+  unofficial_napi_event_loop_checkpoint_state_none = 0,
+  // The provider still owns work which can make JavaScript runnable.
+  unofficial_napi_event_loop_checkpoint_state_pending_provider_work = 1 << 0,
+  // The checkpoint admitted a host task turn. When this bit is absent, the
+  // runtime remains responsible for waiting on its native event source.
+  unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted = 1 << 1,
+} unofficial_napi_event_loop_checkpoint_state;
+
+// Complete one provider-owned event-loop checkpoint. The mode describes Node
+// semantics, while the provider owns how those semantics are implemented. The
+// returned state distinguishes an asynchronous host turn from a synchronous
+// engine checkpoint without requiring a separate provider-kind query.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
+    napi_env env,
+    unofficial_napi_event_loop_checkpoint_mode mode,
+    bool has_runnable_work,
+    uint32_t* state_out);
+// Acquires an exact byte range for native access. The returned pointer remains
+// valid until release, including across asynchronous native work. Readable
+// ranges are copied from JavaScript on acquire; writable ranges are published
+// back to JavaScript on release. This avoids treating every raw N-API pointer
+// as a dirty copy of the value's entire backing store.
+typedef enum unofficial_napi_buffer_access_mode {
+  unofficial_napi_buffer_access_read = 1,
+  unofficial_napi_buffer_access_write = 2,
+  unofficial_napi_buffer_access_readwrite = 3,
+} unofficial_napi_buffer_access_mode;
+// Opaque ownership token for an exact native byte range. The token retains the
+// JavaScript value and any provider-owned snapshot until release; callers must
+// not derive the token from the returned data pointer or inspect its contents.
+typedef struct unofficial_napi_buffer_lease__* unofficial_napi_buffer_lease;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_acquire_buffer_lease(
+    napi_env env,
+    napi_value value,
+    size_t byte_offset,
+    size_t byte_length,
+    unofficial_napi_buffer_access_mode mode,
+    unofficial_napi_buffer_lease* lease,
+    void** data);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_buffer_lease(
+    napi_env env, unofficial_napi_buffer_lease lease, bool modified);
+// Creates a TypedArray whose backing store is guest WebAssembly memory. This
+// is for native/JavaScript control blocks that require true shared visibility;
+// bulk host-owned data should use scoped buffer access instead.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_guest_backed_typedarray(
+    napi_env env,
+    napi_typedarray_type type,
+    size_t length,
+    void** data,
+    napi_value* result);
+// Creates an ArrayBuffer using the provider's native ownership policy without
+// exposing a raw pointer to Edge. Embedded providers may adopt an uninitialized
+// native allocation; host-JavaScript providers allocate in the host engine and
+// therefore may return zeroed storage when the engine has no unsafe allocator.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_arraybuffer(
+    napi_env env,
+    size_t length,
+    bool zero_fill,
+    napi_value* result);
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must
@@ -103,7 +171,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execut
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_pending_exception(napi_env env,
                                                               napi_value error);
 
-using unofficial_napi_interrupt_callback = void (*)(napi_env env, void* data);
+typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
 // Unofficial helper. Requests execution of a callback on the target env's
 // engine thread at the next interrupt point. The callback runs entered into
@@ -113,14 +181,16 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
     unofficial_napi_interrupt_callback callback,
     void* data);
 
-using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
-using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
-using unofficial_napi_enqueue_foreground_task_callback =
-    napi_status (*)(void* target,
-                    unofficial_napi_foreground_task_callback callback,
-                    void* data,
-                    unofficial_napi_foreground_task_cleanup cleanup,
-                    uint64_t delay_millis);
+typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
+                                                         void* data);
+typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
+                                                        void* data);
+typedef napi_status (*unofficial_napi_enqueue_foreground_task_callback)(
+    void* target,
+    unofficial_napi_foreground_task_callback callback,
+    void* data,
+    unofficial_napi_foreground_task_cleanup cleanup,
+    uint64_t delay_millis);
 
 // Installs the embedder-owned foreground task queue hook for a single env.
 // Engine backends use this to forward engine-originated foreground work into
@@ -147,12 +217,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_promise_hooks(napi_
                                                           napi_value after,
                                                           napi_value resolve);
 
-using unofficial_napi_fatal_error_callback =
-    void (*)(napi_env env, const char* location, const char* message);
-using unofficial_napi_oom_error_callback =
-    void (*)(napi_env env, const char* location, bool is_heap_oom, const char* detail);
-using unofficial_napi_near_heap_limit_callback =
-    size_t (*)(napi_env env, void* data, size_t current_heap_limit, size_t initial_heap_limit);
+typedef void (*unofficial_napi_fatal_error_callback)(napi_env env,
+                                                     const char* location,
+                                                     const char* message);
+typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
+                                                   const char* location,
+                                                   bool is_heap_oom,
+                                                   const char* detail);
+typedef size_t (*unofficial_napi_near_heap_limit_callback)(
+    napi_env env,
+    void* data,
+    size_t current_heap_limit,
+    size_t initial_heap_limit);
 
 // Unofficial helpers for embedder-native fatal/OOM handling.
 // These callbacks run from the engine's fatal error hooks.

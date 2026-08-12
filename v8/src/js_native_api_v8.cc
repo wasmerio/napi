@@ -12,6 +12,7 @@
 #include "internal/napi_ref_with_data.h"
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_setter_callback_info.h"
+#include "internal/unofficial_napi_bridge.h"
 #include "napi_typedarray_metadata.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
@@ -84,6 +85,7 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
+    NapiV8TrackProviderPromise(isolate, promise);
     return handle_scope.Escape(promise);
   }
 
@@ -98,14 +100,18 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
       resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     }
+    NapiV8TrackProviderPromise(isolate, promise);
     return handle_scope.Escape(promise);
   }
 
   if (result->IsPromise()) {
-    return handle_scope.Escape(result.As<v8::Promise>());
+    v8::Local<v8::Promise> result_promise = result.As<v8::Promise>();
+    NapiV8TrackProviderPromise(isolate, result_promise);
+    return handle_scope.Escape(result_promise);
   }
 
   resolver->Resolve(context, result).FromMaybe(false);
+  NapiV8TrackProviderPromise(isolate, promise);
   return handle_scope.Escape(promise);
 }
 
