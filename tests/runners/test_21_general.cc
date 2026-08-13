@@ -376,8 +376,23 @@ TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
             napi_invalid_arg);
 }
 
+TEST_F(Test21General, HeapStatisticsDeclareMeasuredFields) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_heap_statistics statistics{};
+  unofficial_napi_heap_statistics_init(&statistics);
+  ASSERT_EQ(unofficial_napi_get_heap_statistics(s.env, &statistics), napi_ok);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_total_heap_size, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_used_heap_size, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_heap_size_limit, 0u);
 #if defined(NAPI_TEST_ENGINE_V8)
-TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
+  EXPECT_EQ(statistics.valid_fields, unofficial_napi_heap_stat_all);
+#elif defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(statistics.valid_fields & unofficial_napi_heap_stat_array_buffer_memory, 0u);
+#endif
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test21General, CpuProfileResultUsesExternalUtf8Bytes) {
   EnvScope s(runtime_.get());
 
   unofficial_napi_profile_start_result start_result =
@@ -398,12 +413,19 @@ TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
             napi_ok);
   ASSERT_NE(json, nullptr);
 
-  napi_valuetype type = napi_undefined;
-  ASSERT_EQ(napi_typeof(s.env, json, &type), napi_ok);
-  ASSERT_EQ(type, napi_string);
+  bool is_typedarray = false;
+  ASSERT_EQ(napi_is_typedarray(s.env, json, &is_typedarray), napi_ok);
+  ASSERT_TRUE(is_typedarray);
+  napi_typedarray_type type = napi_int8_array;
   size_t length = 0;
-  ASSERT_EQ(napi_get_value_string_utf8(s.env, json, nullptr, 0, &length), napi_ok);
+  void* data = nullptr;
+  ASSERT_EQ(napi_get_typedarray_info(
+                s.env, json, &type, &length, &data, nullptr, nullptr),
+            napi_ok);
+  EXPECT_EQ(type, napi_uint8_array);
   EXPECT_GT(length, 0u);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<const char*>(data)[0], '{');
 
   napi_value second_json = nullptr;
   EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &second_json),

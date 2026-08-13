@@ -3683,7 +3683,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_mark_promise_as_handled(
     NAPI_GENERIC_FAILURE
 }
 
-fn host_heap_sizes() -> (u64, u64, u64) {
+fn host_heap_sizes() -> (u64, u64, u64, bool) {
     fn metric(memory: &JsValue, name: &str) -> u64 {
         Reflect::get(memory, &JsValue::from_str(name))
             .ok()
@@ -3706,7 +3706,12 @@ fn host_heap_sizes() -> (u64, u64, u64) {
     let limit = metric(&memory, "jsHeapSizeLimit")
         .max(total)
         .max(u64::from(u32::MAX));
-    (total, used, limit)
+    (
+        total,
+        used,
+        limit,
+        !memory.is_undefined() && !memory.is_null(),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -3717,21 +3722,35 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_statistics(
     if stats_out.is_null() || (unsafe { env_mut(env) }).is_err() {
         return NAPI_INVALID_ARG;
     }
-    let (total, used, limit) = host_heap_sizes();
+    let requested = unsafe { &*stats_out };
+    if requested.size < std::mem::size_of::<SnapiUnofficialHeapStatistics>() as u32
+        || requested.version != 1
+    {
+        return NAPI_INVALID_ARG;
+    }
+    let output_size = requested.size;
+    let (total, used, limit, measured) = host_heap_sizes();
     unsafe {
         ptr::write(
             stats_out,
             SnapiUnofficialHeapStatistics {
+                size: output_size,
+                version: 1,
+                valid_fields: if measured {
+                    (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5)
+                } else {
+                    0
+                },
                 total_heap_size: total,
                 total_heap_size_executable: 0,
-                total_physical_size: total,
+                total_physical_size: 0,
                 total_available_size: limit.saturating_sub(used),
                 used_heap_size: used,
                 heap_size_limit: limit,
                 does_zap_garbage: 0,
-                malloced_memory: used,
-                peak_malloced_memory: used,
-                number_of_native_contexts: 1,
+                malloced_memory: 0,
+                peak_malloced_memory: 0,
+                number_of_native_contexts: 0,
                 number_of_detached_contexts: 0,
                 total_global_handles_size: 0,
                 used_global_handles_size: 0,
@@ -3760,7 +3779,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_space_statistics(
         return NAPI_OK;
     }
 
-    let (total, used, limit) = host_heap_sizes();
+    let (total, used, limit, _) = host_heap_sizes();
     let mut space_name = [0; 64];
     space_name[.."host_js".len()].copy_from_slice(b"host_js");
     unsafe {
@@ -4167,6 +4186,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
     cache_bytes: *const u8,
     cache_byte_length: usize,
     has_cache: u8,
+    cache_policy: u8,
     bytecode_out: *mut u32,
     cache_rejected_out: *mut u8,
     can_parse_as_module_out: *mut u8,
@@ -4182,6 +4202,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
     let Some(source) = source_value.as_string() else {
         return NAPI_STRING_EXPECTED;
     };
+    if cache_policy > 1 {
+        return NAPI_INVALID_ARG;
+    }
+    if has_cache != 0 && cache_policy == 1 {
+        let _ = unsafe { write(bytecode_out, 0) };
+        let _ = unsafe { write(cache_rejected_out, 1) };
+        let _ = unsafe { write(can_parse_as_module_out, 0) };
+        return NAPI_OK;
+    }
     let filename = state
         .get(filename_id)
         .and_then(JsValue::as_string)

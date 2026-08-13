@@ -22,6 +22,12 @@
 
 using namespace quickjs::detail;
 
+// QuickJS does not allocate ArrayBuffer backing stores from the guest heap,
+// but create_env still owns a supplied context according to the common
+// provider contract. The weak fallback keeps native embedders linkable.
+extern "C" __attribute__((weak)) void napi_host_guest_heap_release(
+    void * /*ctx*/) {}
+
 namespace
 {
     struct UnofficialEnvScope
@@ -199,6 +205,10 @@ extern "C"
         napi_env *env_out,
         void **scope_out)
     {
+        void *guest_heap_ctx = options != nullptr ? options->guest_heap_ctx : nullptr;
+        if (guest_heap_ctx != nullptr)
+            napi_host_guest_heap_release(guest_heap_ctx);
+
         if (env_out == nullptr || scope_out == nullptr ||
             (options != nullptr &&
              (options->size < sizeof(unofficial_napi_env_create_options) ||
@@ -797,17 +807,20 @@ extern "C"
         napi_env env,
         unofficial_napi_heap_statistics *stats_out)
     {
-        if (!napi_util__::check_env(env) || stats_out == nullptr)
+        if (!napi_util__::check_env(env) || stats_out == nullptr ||
+            stats_out->size < sizeof(*stats_out) ||
+            stats_out->version != UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION)
             return napi_invalid_arg;
+        const uint32_t output_size = stats_out->size;
         std::memset(stats_out, 0, sizeof(*stats_out));
+        stats_out->size = output_size;
+        stats_out->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
         JSMemoryUsage usage{};
         JS_ComputeMemoryUsage(napi_util__::runtime(env), &usage);
         stats_out->total_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
         stats_out->used_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.memory_used_size));
         stats_out->malloced_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
-        stats_out->peak_malloced_memory = stats_out->malloced_memory;
         stats_out->external_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.binary_object_size));
-        stats_out->array_buffer_memory = stats_out->external_memory;
 
         // heap_size_limit must never be reported as zero. Consumers read it as
         // "the ceiling this heap can grow to" and divide by it: Next.js uses
@@ -827,6 +840,13 @@ extern "C"
             stats_out->heap_size_limit > stats_out->used_heap_size
                 ? stats_out->heap_size_limit - stats_out->used_heap_size
                 : 0;
+        stats_out->valid_fields =
+            unofficial_napi_heap_stat_total_heap_size |
+            unofficial_napi_heap_stat_total_available_size |
+            unofficial_napi_heap_stat_used_heap_size |
+            unofficial_napi_heap_stat_heap_size_limit |
+            unofficial_napi_heap_stat_malloced_memory |
+            unofficial_napi_heap_stat_external_memory;
         return napi_ok;
     }
 
@@ -1055,7 +1075,9 @@ extern "C"
         if (!napi_util__::check_env(env) || options == nullptr || result == nullptr ||
             options->size < sizeof(*options) ||
             options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
-            options->source_text == nullptr || options->filename == nullptr)
+            options->source_text == nullptr || options->filename == nullptr ||
+            (options->cache_policy != unofficial_napi_bytecode_cache_compile_on_reject &&
+             options->cache_policy != unofficial_napi_bytecode_cache_validate_only))
             return napi_invalid_arg;
 
         *result = {};
@@ -1084,6 +1106,9 @@ extern "C"
             result->cache_rejected = 1;
         }
 
+        if (result->cache_rejected != 0 &&
+            options->cache_policy == unofficial_napi_bytecode_cache_validate_only)
+            return napi_ok;
         bool can_parse_as_module = false;
         napi_status status = env->contextify().bytecode_compile(options->source_text,
                                                                 options->filename,

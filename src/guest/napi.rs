@@ -18,7 +18,7 @@ use crate::{
     snapi::*,
 };
 
-use super::util::*;
+use super::{abi, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let _ = unsafe { snapi_bridge_init() };
@@ -97,27 +97,6 @@ fn with_cb_context<R>(
 
 fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
     env.data().resolve_napi_env(guest_env)
-}
-
-/// Reads a tagged `unofficial_napi_js_source` from guest memory. The guest ABI
-/// passes the struct by pointer; kind, text, and bytecode are 32-bit in wasm32.
-fn read_guest_js_source(env: &mut FunctionEnvMut<NapiEnv>, source_ptr: i32) -> (i32, i32) {
-    if source_ptr <= 0 {
-        return (0, 0);
-    }
-    match read_guest_bytes(env, source_ptr, 12) {
-        Some(bytes) if bytes.len() == 12 => {
-            let kind = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let text = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-            let bytecode = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-            match (kind, text, bytecode) {
-                (0, text, 0) if text > 0 => (text, 0),
-                (1, 0, bytecode) if bytecode > 0 => (0, bytecode),
-                _ => (0, 0),
-            }
-        }
-        _ => (0, 0),
-    }
 }
 
 fn write_guest_pod<T>(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32, value: &T) -> bool {
@@ -917,8 +896,19 @@ fn guest_unofficial_napi_get_heap_statistics(
     napi_env: i32,
     stats_ptr: i32,
 ) -> i32 {
+    let Some(size) = abi::read_output_header(
+        &mut env,
+        stats_ptr,
+        std::mem::size_of::<SnapiUnofficialHeapStatistics>(),
+        1,
+    ) else {
+        return 1;
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut stats = SnapiUnofficialHeapStatistics {
+        size,
+        version: 1,
+        valid_fields: 0,
         total_heap_size: 0,
         total_heap_size_executable: 0,
         total_physical_size: 0,
@@ -1224,7 +1214,9 @@ fn guest_unofficial_napi_contextify_run_script(
     host_defined_option_id: i32,
     result_ptr: i32,
 ) -> i32 {
-    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
+    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
+        return 1;
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
@@ -1235,16 +1227,8 @@ fn guest_unofficial_napi_contextify_run_script(
             } else {
                 0
             },
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             filename as u32,
             line_offset,
             column_offset,
@@ -1280,22 +1264,16 @@ fn guest_unofficial_napi_contextify_compile_function(
     host_defined_option_id: i32,
     result_ptr: i32,
 ) -> i32 {
-    let (source_text, source_bytecode) = read_guest_js_source(&mut env, source);
+    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
+        return 1;
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
-            if source_text > 0 {
-                source_text as u32
-            } else {
-                0
-            },
-            if source_bytecode > 0 {
-                source_bytecode as u32
-            } else {
-                0
-            },
+            source_text,
+            source_bytecode,
             filename as u32,
             line_offset,
             column_offset,
@@ -1334,36 +1312,12 @@ fn guest_unofficial_napi_bytecode_open(
     options_ptr: i32,
     result_ptr: i32,
 ) -> i32 {
-    let Some(fields) = read_guest_bytes(&mut env, options_ptr, 48) else {
+    let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
         return 1;
     };
-    let u32_at = |offset: usize| {
-        u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    if u32_at(0) < 48 || u32_at(4) != 1 || result_ptr <= 0 {
+    if result_ptr <= 0 {
         return 1;
     }
-    let source_text = u32_at(8);
-    let filename = u32_at(12);
-    let shape = u32_at(16) as i32;
-    let params_or_undefined = u32_at(20);
-    let host_defined_option_id = u32_at(24);
-    let line_offset = u32_at(28) as i32;
-    let column_offset = u32_at(32) as i32;
-    let cache_ptr = u32_at(36) as i32;
-    let cache_length = u32_at(40) as usize;
-    let has_cache = fields[44];
-    let cache = if has_cache != 0 && cache_length > 0 {
-        if cache_ptr <= 0 {
-            return 1;
-        }
-        let Some(cache) = read_guest_bytes(&mut env, cache_ptr, cache_length) else {
-            return 1;
-        };
-        cache
-    } else {
-        Vec::new()
-    };
     let env_handle = snapi_env(&env, napi_env);
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
@@ -1371,20 +1325,21 @@ fn guest_unofficial_napi_bytecode_open(
     let status = unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
-            source_text,
-            filename,
-            shape,
-            params_or_undefined,
-            host_defined_option_id,
-            line_offset,
-            column_offset,
-            if has_cache != 0 {
-                cache.as_ptr()
+            options.source_text,
+            options.filename,
+            options.shape,
+            options.params_or_undefined,
+            options.host_defined_option_id,
+            options.line_offset,
+            options.column_offset,
+            if options.has_cache != 0 {
+                options.cache.as_ptr()
             } else {
                 std::ptr::null()
             },
-            cache.len(),
-            has_cache,
+            options.cache.len(),
+            options.has_cache,
+            options.cache_policy,
             &mut bytecode_id,
             &mut cache_rejected,
             &mut can_parse_as_module,
@@ -1428,48 +1383,12 @@ fn guest_unofficial_napi_module_wrap_create(
     options_ptr: i32,
     result_ptr: i32,
 ) -> i32 {
-    const OPTIONS_PREFIX_SIZE: usize = 40;
-    let Some(fields) = read_guest_bytes(&mut env, options_ptr, OPTIONS_PREFIX_SIZE) else {
+    let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
         return 1;
     };
-    let u32_at = |offset: usize| {
-        u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    if u32_at(0) < OPTIONS_PREFIX_SIZE as u32 || u32_at(4) != 1 || result_ptr <= 0 {
+    if result_ptr <= 0 {
         return 1;
     }
-
-    let kind = u32_at(8) as i32;
-    let wrapper = u32_at(12);
-    let url = u32_at(16);
-    let context_or_undefined = u32_at(20);
-    let (
-        source_text,
-        source_bytecode,
-        line_offset,
-        column_offset,
-        host_defined_option_id,
-        export_names,
-        synthetic_eval_steps,
-    ) = match kind {
-        1 => {
-            let (source_text, source_bytecode) = read_guest_js_source(&mut env, u32_at(24) as i32);
-            if source_text <= 0 && source_bytecode <= 0 {
-                return 1;
-            }
-            (
-                source_text as u32,
-                source_bytecode as u32,
-                u32_at(28) as i32,
-                u32_at(32) as i32,
-                u32_at(36),
-                0,
-                0,
-            )
-        }
-        2 => (0, 0, 0, 0, 0, u32_at(24), u32_at(28)),
-        _ => return 1,
-    };
     let env_handle = snapi_env(&env, napi_env);
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
@@ -1477,17 +1396,17 @@ fn guest_unofficial_napi_module_wrap_create(
     let status = unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
-            kind,
-            wrapper,
-            url,
-            context_or_undefined,
-            source_text,
-            source_bytecode,
-            line_offset,
-            column_offset,
-            host_defined_option_id,
-            export_names,
-            synthetic_eval_steps,
+            options.kind,
+            options.wrapper,
+            options.url,
+            options.context_or_undefined,
+            options.source_text,
+            options.source_bytecode,
+            options.line_offset,
+            options.column_offset,
+            options.host_defined_option_id,
+            options.export_names,
+            options.synthetic_eval_steps,
             &mut handle_id,
             &mut requests_id,
             &mut has_top_level_await,
@@ -1761,17 +1680,19 @@ fn guest_unofficial_napi_module_wrap_set_hooks(
     napi_env: i32,
     hooks_ptr: i32,
 ) -> i32 {
-    let Some(fields) = read_guest_bytes(&mut env, hooks_ptr, 16) else {
+    let Some((dynamic_import, initialize_import_meta)) =
+        abi::read_module_hooks(&mut env, hooks_ptr)
+    else {
         return 1;
     };
-    let u32_at = |offset: usize| {
-        u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    if u32_at(0) < 16 || u32_at(4) != 1 {
-        return 1;
-    }
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_module_wrap_set_hooks(env_handle, u32_at(8), u32_at(12)) }
+    unsafe {
+        snapi_bridge_unofficial_module_wrap_set_hooks(
+            env_handle,
+            dynamic_import,
+            initialize_import_meta,
+        )
+    }
 }
 
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(

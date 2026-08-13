@@ -3856,6 +3856,7 @@ extern "C" int snapi_bridge_unofficial_bytecode_open(
     const uint8_t* cache_bytes,
     size_t cache_byte_length,
     uint8_t has_cache,
+    uint8_t cache_policy,
     uint32_t* bytecode_out,
     uint8_t* cache_rejected_out,
     uint8_t* can_parse_as_module_out) {
@@ -3884,6 +3885,7 @@ extern "C" int snapi_bridge_unofficial_bytecode_open(
   options.cache_bytes = cache_bytes;
   options.cache_byte_length = cache_byte_length;
   options.has_cache = has_cache;
+  options.cache_policy = cache_policy;
   unofficial_napi_bytecode_open_result result{};
   napi_status s = unofficial_napi_bytecode_open(env, &options, &result);
   if (cache_rejected_out != nullptr) *cache_rejected_out = result.cache_rejected;

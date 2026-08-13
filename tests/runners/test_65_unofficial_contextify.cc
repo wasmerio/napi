@@ -254,12 +254,20 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_NE(restored, nullptr);
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, restored), napi_ok);
 
+  open_options.source_text = Str(s.env, "1000 + 2000 + 3000");
+  open_options.cache_policy = unofficial_napi_bytecode_cache_validate_only;
+  open_result = {};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+  EXPECT_EQ(open_result.cache_rejected, 1);
+  EXPECT_EQ(open_result.bytecode, nullptr);
+
   // A present-but-empty cache is a cache miss, not a malformed transaction.
   // The provider reports the rejection and atomically prepares the fallback
   // artifact from source so callers never need a deserialize/compile branch.
   open_options.cache_bytes = nullptr;
   open_options.cache_byte_length = 0;
   open_options.has_cache = 1;
+  open_options.cache_policy = unofficial_napi_bytecode_cache_compile_on_reject;
   open_result = {};
   ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
   EXPECT_EQ(open_result.cache_rejected, 1);

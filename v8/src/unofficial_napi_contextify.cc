@@ -1906,7 +1906,9 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
   if (env == nullptr || options == nullptr || result == nullptr ||
       options->size < sizeof(*options) ||
       options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
-      options->source_text == nullptr || options->filename == nullptr) {
+      options->source_text == nullptr || options->filename == nullptr ||
+      (options->cache_policy != unofficial_napi_bytecode_cache_compile_on_reject &&
+       options->cache_policy != unofficial_napi_bytecode_cache_validate_only)) {
     return napi_invalid_arg;
   }
   *result = {};
@@ -1932,6 +1934,10 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
     result->cache_rejected = 1;
   }
 
+  if (result->cache_rejected != 0 &&
+      options->cache_policy == unofficial_napi_bytecode_cache_validate_only) {
+    return napi_ok;
+  }
   bool can_parse_as_module = false;
   const napi_status status = BytecodeCompile(env,
                                              options->source_text,

@@ -144,11 +144,43 @@ class StringOutputStream final : public v8::OutputStream {
 
   void EndOfStream() override {}
 
-  const std::string& output() const { return output_; }
+  std::string TakeOutput() { return std::move(output_); }
 
  private:
   std::string output_;
 };
+
+napi_status CreateExternalUtf8Bytes(napi_env env,
+                                    std::string&& bytes,
+                                    napi_value* result) {
+  if (env == nullptr || result == nullptr) return napi_invalid_arg;
+  auto* owner = new (std::nothrow) std::string(std::move(bytes));
+  if (owner == nullptr) return napi_generic_failure;
+  if (owner->empty()) {
+    delete owner;
+    napi_value arraybuffer = nullptr;
+    napi_status status = napi_create_arraybuffer(env, 0, nullptr, &arraybuffer);
+    if (status != napi_ok) return status;
+    return napi_create_typedarray(
+        env, napi_uint8_array, 0, arraybuffer, 0, result);
+  }
+  napi_value arraybuffer = nullptr;
+  napi_status status = napi_create_external_arraybuffer(
+      env,
+      owner->data(),
+      owner->size(),
+      [](napi_env, void*, void* hint) {
+        delete static_cast<std::string*>(hint);
+      },
+      owner,
+      &arraybuffer);
+  if (status != napi_ok) {
+    delete owner;
+    return status;
+  }
+  return napi_create_typedarray(
+      env, napi_uint8_array, owner->size(), arraybuffer, 0, result);
+}
 
 void DisposeProfilerState(napi_env env, ProfilerState* state) {
   if (env == nullptr || env->isolate == nullptr || state == nullptr) return;
@@ -2711,13 +2743,20 @@ napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
 napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
     napi_env env,
     unofficial_napi_heap_statistics* stats_out) {
-  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr) {
+  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr ||
+      stats_out->size < sizeof(*stats_out) ||
+      stats_out->version != UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION) {
     return napi_invalid_arg;
   }
 
   v8::HeapStatistics stats;
   env->isolate->GetHeapStatistics(&stats);
 
+  const uint32_t output_size = stats_out->size;
+  std::memset(stats_out, 0, sizeof(*stats_out));
+  stats_out->size = output_size;
+  stats_out->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
+  stats_out->valid_fields = unofficial_napi_heap_stat_all;
   stats_out->total_heap_size = stats.total_heap_size();
   stats_out->total_heap_size_executable = stats.total_heap_size_executable();
   stats_out->total_physical_size = stats.total_physical_size();
@@ -2914,7 +2953,7 @@ napi_status NAPI_CDECL unofficial_napi_profile_stop(
     env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
     delete profile;
     if (!serialized) return napi_generic_failure;
-    return napi_create_string_utf8(env, json.data(), json.size(), json_out);
+    return CreateExternalUtf8Bytes(env, std::move(json), json_out);
   }
 
   if (cpu_profiler == nullptr) {
@@ -2927,8 +2966,7 @@ napi_status NAPI_CDECL unofficial_napi_profile_stop(
   StringOutputStream stream;
   cpu_profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
   cpu_profile->Delete();
-  return napi_create_string_utf8(
-      env, stream.output().data(), stream.output().size(), json_out);
+  return CreateExternalUtf8Bytes(env, stream.TakeOutput(), json_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
@@ -2958,8 +2996,7 @@ napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
   StringOutputStream stream;
   snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
   const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
-  return napi_create_string_utf8(
-      env, stream.output().data(), stream.output().size(), json_out);
+  return CreateExternalUtf8Bytes(env, stream.TakeOutput(), json_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(

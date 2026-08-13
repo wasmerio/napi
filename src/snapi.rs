@@ -13,6 +13,9 @@ pub type SnapiEnv = *mut SnapiEnvState;
 
 #[repr(C)]
 pub struct SnapiUnofficialHeapStatistics {
+    pub size: u32,
+    pub version: u32,
+    pub valid_fields: u64,
     pub total_heap_size: u64,
     pub total_heap_size_executable: u64,
     pub total_physical_size: u64,
@@ -320,6 +323,7 @@ unsafe extern "C" {
         cache_bytes: *const u8,
         cache_byte_length: usize,
         has_cache: u8,
+        cache_policy: u8,
         bytecode_out: *mut u32,
         cache_rejected_out: *mut u8,
         can_parse_as_module_out: *mut u8,

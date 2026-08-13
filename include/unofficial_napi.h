@@ -338,7 +338,31 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_hash_seed(napi_env 
 
 #define UNOFFICIAL_NAPI_HEAP_SPACE_NAME_MAX_LENGTH 64
 
+typedef enum {
+  unofficial_napi_heap_stat_total_heap_size = 1u << 0,
+  unofficial_napi_heap_stat_total_heap_size_executable = 1u << 1,
+  unofficial_napi_heap_stat_total_physical_size = 1u << 2,
+  unofficial_napi_heap_stat_total_available_size = 1u << 3,
+  unofficial_napi_heap_stat_used_heap_size = 1u << 4,
+  unofficial_napi_heap_stat_heap_size_limit = 1u << 5,
+  unofficial_napi_heap_stat_does_zap_garbage = 1u << 6,
+  unofficial_napi_heap_stat_malloced_memory = 1u << 7,
+  unofficial_napi_heap_stat_peak_malloced_memory = 1u << 8,
+  unofficial_napi_heap_stat_number_of_native_contexts = 1u << 9,
+  unofficial_napi_heap_stat_number_of_detached_contexts = 1u << 10,
+  unofficial_napi_heap_stat_total_global_handles_size = 1u << 11,
+  unofficial_napi_heap_stat_used_global_handles_size = 1u << 12,
+  unofficial_napi_heap_stat_external_memory = 1u << 13,
+  unofficial_napi_heap_stat_array_buffer_memory = 1u << 14,
+  unofficial_napi_heap_stat_all = (1u << 15) - 1,
+} unofficial_napi_heap_stat_field;
+
+enum { UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION = 1 };
+
 typedef struct {
+  uint32_t size;
+  uint32_t version;
+  uint64_t valid_fields;
   uint64_t total_heap_size;
   uint64_t total_heap_size_executable;
   uint64_t total_physical_size;
@@ -355,6 +379,18 @@ typedef struct {
   uint64_t external_memory;
   uint64_t array_buffer_memory;
 } unofficial_napi_heap_statistics;
+
+static inline void unofficial_napi_heap_statistics_init(
+    unofficial_napi_heap_statistics* stats) {
+  if (stats == NULL) return;
+#ifdef __cplusplus
+  *stats = {};
+#else
+  *stats = (unofficial_napi_heap_statistics){0};
+#endif
+  stats->size = sizeof(*stats);
+  stats->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
+}
 
 typedef struct {
   char space_name[UNOFFICIAL_NAPI_HEAP_SPACE_NAME_MAX_LENGTH];
@@ -411,8 +447,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_code_statistic
 // env-owned session. Stop leaves the session active when it returns
 // napi_cannot_run_js, so the caller can retry from the target engine thread.
 // Once stop accepts the thread/env preconditions it consumes the session even
-// if producing the final result fails. Sessions still active at env teardown
-// are stopped and released by the provider.
+// if producing the final result fails. Diagnostic JSON is returned as UTF-8
+// bytes in a Uint8Array whose backing store is outside the inspected heap.
+// Sessions still active at env teardown are stopped and released by the
+// provider.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_start(
     napi_env env,
     unofficial_napi_profile_kind kind,
@@ -422,12 +460,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_start(
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_stop(
     napi_env env,
     unofficial_napi_profile profile,
-    napi_value* json_out);
+    napi_value* utf8_json_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_take_heap_snapshot(
     napi_env env,
     const unofficial_napi_heap_snapshot_options* options,
-    napi_value* json_out);
+    napi_value* utf8_json_out);
 
 // Unofficial helpers for Node's async_context_frame parity. These expose the
 // engine continuation-preserved embedder data used by AsyncContextFrame.
@@ -510,9 +548,13 @@ typedef enum {
 
 // Versioned input for opening a compiled artifact. When `has_cache` is nonzero,
 // the provider first validates the supplied bytes against every compile input.
-// A rejected cache is atomically replaced by compiling `source_text`; callers
-// never implement a second provider-dependent fallback path.
-#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 1u
+// `cache_policy` determines whether a rejected cache is atomically replaced
+// by compiling source or reported without the discarded fallback compile.
+typedef enum {
+  unofficial_napi_bytecode_cache_compile_on_reject = 0,
+  unofficial_napi_bytecode_cache_validate_only = 1,
+} unofficial_napi_bytecode_cache_policy;
+#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 2u
 typedef struct unofficial_napi_bytecode_open_options {
   uint32_t size;
   uint32_t version;
@@ -526,6 +568,7 @@ typedef struct unofficial_napi_bytecode_open_options {
   const uint8_t* cache_bytes;
   size_t cache_byte_length;
   uint8_t has_cache;
+  uint8_t cache_policy;
 } unofficial_napi_bytecode_open_options;
 
 typedef struct unofficial_napi_bytecode_open_result {
