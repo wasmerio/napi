@@ -1003,17 +1003,18 @@ fn guest_unofficial_napi_remove_near_heap_limit_callback(
     0
 }
 
-fn guest_unofficial_napi_start_cpu_profile(
+fn guest_unofficial_napi_profile_start(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
+    kind: i32,
     result_ptr: i32,
-    profile_id_ptr: i32,
+    profile_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut result = 0i32;
-    let mut profile_id = 0u32;
+    let mut profile = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_start_cpu_profile(env_handle, &mut result, &mut profile_id)
+        snapi_bridge_unofficial_profile_start(env_handle, kind, &mut result, &mut profile)
     };
     if status != 0 {
         return status;
@@ -1021,72 +1022,25 @@ fn guest_unofficial_napi_start_cpu_profile(
     if result_ptr > 0 {
         write_guest_i32(&mut env, result_ptr as u32, result);
     }
-    if profile_id_ptr > 0 {
-        write_guest_u32(&mut env, profile_id_ptr as u32, profile_id);
+    if profile_ptr > 0 {
+        write_guest_u32(&mut env, profile_ptr as u32, profile);
     }
     0
 }
 
-fn guest_unofficial_napi_stop_cpu_profile(
+fn guest_unofficial_napi_profile_stop(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    profile_id: i32,
-    found_ptr: i32,
+    profile: i32,
     json_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let mut found = 0i32;
     let mut json = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_stop_cpu_profile(
-            env_handle,
-            profile_id.max(0) as u32,
-            &mut found,
-            &mut json,
-        )
+        snapi_bridge_unofficial_profile_stop(env_handle, profile.max(0) as u32, &mut json)
     };
     if status != 0 {
         return status;
-    }
-    if found_ptr > 0 {
-        write_guest_u8(&mut env, found_ptr as u32, (found != 0) as u8);
-    }
-    if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
-        return 1;
-    }
-    0
-}
-
-fn guest_unofficial_napi_start_heap_profile(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    started_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut started = 0i32;
-    let status = unsafe { snapi_bridge_unofficial_start_heap_profile(env_handle, &mut started) };
-    if status == 0 && started_ptr > 0 {
-        write_guest_u8(&mut env, started_ptr as u32, (started != 0) as u8);
-    }
-    status
-}
-
-fn guest_unofficial_napi_stop_heap_profile(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    found_ptr: i32,
-    json_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut found = 0i32;
-    let mut json = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_stop_heap_profile(env_handle, &mut found, &mut json) };
-    if status != 0 {
-        return status;
-    }
-    if found_ptr > 0 {
-        write_guest_u8(&mut env, found_ptr as u32, (found != 0) as u8);
     }
     if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
         return 1;
@@ -5127,10 +5081,8 @@ pub fn register_napi_imports(
         "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
         "unofficial_napi_set_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_near_heap_limit_callback),
         "unofficial_napi_remove_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_remove_near_heap_limit_callback),
-        "unofficial_napi_start_cpu_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_start_cpu_profile),
-        "unofficial_napi_stop_cpu_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_stop_cpu_profile),
-        "unofficial_napi_start_heap_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_start_heap_profile),
-        "unofficial_napi_stop_heap_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_stop_heap_profile),
+        "unofficial_napi_profile_start" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_start),
+        "unofficial_napi_profile_stop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_stop),
         "unofficial_napi_take_heap_snapshot" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_heap_snapshot),
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),

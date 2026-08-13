@@ -359,10 +359,17 @@ typedef struct {
   uint64_t cpu_profiler_metadata_size;
 } unofficial_napi_heap_code_statistics;
 
+typedef struct unofficial_napi_profile__* unofficial_napi_profile;
+
 typedef enum {
-  unofficial_napi_cpu_profile_start_ok = 0,
-  unofficial_napi_cpu_profile_start_too_many = 1,
-} unofficial_napi_cpu_profile_start_result;
+  unofficial_napi_profile_cpu = 1,
+  unofficial_napi_profile_heap = 2,
+} unofficial_napi_profile_kind;
+
+typedef enum {
+  unofficial_napi_profile_start_ok = 0,
+  unofficial_napi_profile_start_busy = 1,
+} unofficial_napi_profile_start_result;
 
 typedef struct {
   bool expose_internals;
@@ -386,27 +393,20 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_code_statistic
     napi_env env,
     unofficial_napi_heap_code_statistics* stats_out);
 
-// Unofficial helpers for worker-thread profiling/snapshot support.
-// These must be called on the target env's engine thread, typically from
-// unofficial_napi_request_interrupt().
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_start_cpu_profile(
+// Unofficial helpers for worker-thread profiling/snapshot support. These must
+// be called on the target env's engine thread, typically from
+// unofficial_napi_request_interrupt(). A successful start returns one opaque,
+// env-owned session. Stop consumes that session; any sessions still active at
+// env teardown are stopped and released by the provider.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_start(
     napi_env env,
-    unofficial_napi_cpu_profile_start_result* result_out,
-    uint32_t* profile_id_out);
+    unofficial_napi_profile_kind kind,
+    unofficial_napi_profile_start_result* result_out,
+    unofficial_napi_profile* profile_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_stop_cpu_profile(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_stop(
     napi_env env,
-    uint32_t profile_id,
-    bool* found_out,
-    napi_value* json_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_start_heap_profile(
-    napi_env env,
-    bool* started_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_stop_heap_profile(
-    napi_env env,
-    bool* found_out,
+    unofficial_napi_profile profile,
     napi_value* json_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_take_heap_snapshot(

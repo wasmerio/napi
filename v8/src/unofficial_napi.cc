@@ -31,6 +31,11 @@
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
+struct unofficial_napi_profile__ {
+  unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
+  uint32_t provider_id = 0;
+};
+
 namespace {
 
 struct SharedRuntime {
@@ -123,8 +128,7 @@ struct InterruptRequest {
 
 struct ProfilerState {
   v8::CpuProfiler* cpu_profiler = nullptr;
-  std::vector<uint32_t> active_cpu_profiles;
-  bool heap_profile_started = false;
+  std::vector<unofficial_napi_profile> active_profiles;
 };
 
 std::unordered_map<napi_env, ProfilerState>& g_profiler_states =
@@ -147,17 +151,25 @@ class StringOutputStream final : public v8::OutputStream {
 
 void DisposeProfilerState(napi_env env, ProfilerState* state) {
   if (env == nullptr || env->isolate == nullptr || state == nullptr) return;
-  if (state->heap_profile_started) {
-    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
-    state->heap_profile_started = false;
-  }
-  if (state->cpu_profiler != nullptr) {
-    for (uint32_t profile_id : state->active_cpu_profiles) {
-      if (v8::CpuProfile* profile = state->cpu_profiler->Stop(profile_id)) {
+  bool heap_profile_started = false;
+  for (unofficial_napi_profile profile_session : state->active_profiles) {
+    if (profile_session == nullptr) continue;
+    if (profile_session->kind == unofficial_napi_profile_cpu &&
+        state->cpu_profiler != nullptr) {
+      if (v8::CpuProfile* profile =
+              state->cpu_profiler->Stop(profile_session->provider_id)) {
         profile->Delete();
       }
+    } else if (profile_session->kind == unofficial_napi_profile_heap) {
+      heap_profile_started = true;
     }
-    state->active_cpu_profiles.clear();
+    delete profile_session;
+  }
+  state->active_profiles.clear();
+  if (heap_profile_started) {
+    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+  }
+  if (state->cpu_profiler != nullptr) {
     state->cpu_profiler->Dispose();
     state->cpu_profiler = nullptr;
   }
@@ -2726,150 +2738,144 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_code_statistics(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_start_cpu_profile(
+napi_status NAPI_CDECL unofficial_napi_profile_start(
     napi_env env,
-    unofficial_napi_cpu_profile_start_result* result_out,
-    uint32_t* profile_id_out) {
+    unofficial_napi_profile_kind kind,
+    unofficial_napi_profile_start_result* result_out,
+    unofficial_napi_profile* profile_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr ||
-      profile_id_out == nullptr) {
+      profile_out == nullptr ||
+      (kind != unofficial_napi_profile_cpu &&
+       kind != unofficial_napi_profile_heap)) {
     return napi_invalid_arg;
   }
-  *result_out = unofficial_napi_cpu_profile_start_ok;
-  *profile_id_out = 0;
+  *result_out = unofficial_napi_profile_start_ok;
+  *profile_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
-  ProfilerState* state = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    state = &EnsureProfilerState(env);
-    if (state->cpu_profiler == nullptr) {
-      state->cpu_profiler = v8::CpuProfiler::New(env->isolate);
-      if (state->cpu_profiler == nullptr) return napi_generic_failure;
+  if (kind == unofficial_napi_profile_heap) {
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      auto it = g_profiler_states.find(env);
+      if (it != g_profiler_states.end() &&
+          std::any_of(it->second.active_profiles.begin(),
+                      it->second.active_profiles.end(),
+                      [](unofficial_napi_profile profile) {
+                        return profile != nullptr &&
+                               profile->kind == unofficial_napi_profile_heap;
+                      })) {
+        *result_out = unofficial_napi_profile_start_busy;
+        return napi_ok;
+      }
     }
+    if (!env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler()) {
+      *result_out = unofficial_napi_profile_start_busy;
+      return napi_ok;
+    }
+    auto* profile = new (std::nothrow) unofficial_napi_profile__;
+    if (profile == nullptr) {
+      env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+      return napi_generic_failure;
+    }
+    profile->kind = kind;
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      EnsureProfilerState(env).active_profiles.push_back(profile);
+    }
+    *profile_out = profile;
+    return napi_ok;
   }
 
-  v8::CpuProfilingResult result = state->cpu_profiler->Start(
+  v8::CpuProfiler* cpu_profiler = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    ProfilerState& state = EnsureProfilerState(env);
+    if (state.cpu_profiler == nullptr) {
+      state.cpu_profiler = v8::CpuProfiler::New(env->isolate);
+      if (state.cpu_profiler == nullptr) return napi_generic_failure;
+    }
+    cpu_profiler = state.cpu_profiler;
+  }
+
+  v8::CpuProfilingResult result = cpu_profiler->Start(
       v8::CpuProfilingOptions{v8::CpuProfilingMode::kLeafNodeLineNumbers,
                               v8::CpuProfilingOptions::kNoSampleLimit});
   if (result.status == v8::CpuProfilingStatus::kErrorTooManyProfilers) {
-    *result_out = unofficial_napi_cpu_profile_start_too_many;
+    *result_out = unofficial_napi_profile_start_busy;
     return napi_ok;
   }
   if (result.status != v8::CpuProfilingStatus::kStarted) {
     return napi_generic_failure;
   }
 
-  *profile_id_out = static_cast<uint32_t>(result.id);
+  auto* profile = new (std::nothrow) unofficial_napi_profile__;
+  if (profile == nullptr) {
+    if (v8::CpuProfile* stopped = cpu_profiler->Stop(result.id)) {
+      stopped->Delete();
+    }
+    return napi_generic_failure;
+  }
+  profile->kind = kind;
+  profile->provider_id = static_cast<uint32_t>(result.id);
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     auto it = g_profiler_states.find(env);
     if (it != g_profiler_states.end()) {
-      it->second.active_cpu_profiles.push_back(*profile_id_out);
+      it->second.active_profiles.push_back(profile);
     }
   }
+  *profile_out = profile;
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
+napi_status NAPI_CDECL unofficial_napi_profile_stop(
     napi_env env,
-    uint32_t profile_id,
-    bool* found_out,
+    unofficial_napi_profile profile,
     napi_value* json_out) {
-  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
+  if (env == nullptr || env->isolate == nullptr || profile == nullptr ||
       json_out == nullptr) {
     return napi_invalid_arg;
   }
-  *found_out = false;
   *json_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   v8::CpuProfiler* cpu_profiler = nullptr;
+  unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
+  uint32_t provider_id = 0;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     auto it = g_profiler_states.find(env);
-    if (it == g_profiler_states.end() || it->second.cpu_profiler == nullptr) {
-      return napi_ok;
-    }
-    auto active_it = std::find(
-        it->second.active_cpu_profiles.begin(),
-        it->second.active_cpu_profiles.end(),
-        profile_id);
-    if (active_it == it->second.active_cpu_profiles.end()) {
-      return napi_ok;
-    }
-    it->second.active_cpu_profiles.erase(active_it);
+    if (it == g_profiler_states.end()) return napi_invalid_arg;
+    auto active_it = std::find(it->second.active_profiles.begin(),
+                               it->second.active_profiles.end(), profile);
+    if (active_it == it->second.active_profiles.end()) return napi_invalid_arg;
+    kind = profile->kind;
+    provider_id = profile->provider_id;
+    it->second.active_profiles.erase(active_it);
     cpu_profiler = it->second.cpu_profiler;
   }
 
-  v8::CpuProfile* profile = cpu_profiler->Stop(profile_id);
-  if (profile == nullptr) {
-    return napi_ok;
+  if (kind == unofficial_napi_profile_heap) {
+    std::string json;
+    const bool serialized = SerializeHeapProfile(env->isolate, &json);
+    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+    delete profile;
+    if (!serialized) return napi_generic_failure;
+    return napi_create_string_utf8(env, json.data(), json.size(), json_out);
   }
 
+  if (cpu_profiler == nullptr) {
+    delete profile;
+    return napi_generic_failure;
+  }
+  v8::CpuProfile* cpu_profile = cpu_profiler->Stop(provider_id);
+  delete profile;
+  if (cpu_profile == nullptr) return napi_generic_failure;
   StringOutputStream stream;
-  profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
-  profile->Delete();
-  napi_status status = napi_create_string_utf8(
+  cpu_profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
+  cpu_profile->Delete();
+  return napi_create_string_utf8(
       env, stream.output().data(), stream.output().size(), json_out);
-  if (status != napi_ok) return status;
-  *found_out = true;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
-    napi_env env,
-    bool* started_out) {
-  if (env == nullptr || env->isolate == nullptr || started_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  *started_out = false;
-  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
-
-  const bool started = env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler();
-  if (started) {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    EnsureProfilerState(env).heap_profile_started = true;
-  }
-  *started_out = started;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
-    napi_env env,
-    bool* found_out,
-    napi_value* json_out) {
-  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
-      json_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  *found_out = false;
-  *json_out = nullptr;
-  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
-
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it == g_profiler_states.end() || !it->second.heap_profile_started) {
-      return napi_ok;
-    }
-  }
-
-  std::string json;
-  if (!SerializeHeapProfile(env->isolate, &json)) {
-    return napi_ok;
-  }
-  env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it != g_profiler_states.end()) {
-      it->second.heap_profile_started = false;
-    }
-  }
-  napi_status status = napi_create_string_utf8(env, json.data(), json.size(), json_out);
-  if (status != napi_ok) return status;
-  *found_out = true;
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(

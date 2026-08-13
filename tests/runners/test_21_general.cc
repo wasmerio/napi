@@ -251,24 +251,22 @@ TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
 TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
   EnvScope s(runtime_.get());
 
-  unofficial_napi_cpu_profile_start_result start_result =
-      unofficial_napi_cpu_profile_start_too_many;
-  uint32_t profile_id = 0;
-  ASSERT_EQ(unofficial_napi_start_cpu_profile(
-                s.env, &start_result, &profile_id),
+  unofficial_napi_profile_start_result start_result =
+      unofficial_napi_profile_start_busy;
+  unofficial_napi_profile profile = nullptr;
+  ASSERT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &start_result, &profile),
             napi_ok);
-  ASSERT_EQ(start_result, unofficial_napi_cpu_profile_start_ok);
+  ASSERT_EQ(start_result, unofficial_napi_profile_start_ok);
+  ASSERT_NE(profile, nullptr);
 
   ASSERT_TRUE(RunScript(s,
                         "let total = 0; for (let i = 0; i < 10000; ++i) total += i;",
                         "cpu-profile-work.js"));
 
-  bool found = false;
   napi_value json = nullptr;
-  ASSERT_EQ(unofficial_napi_stop_cpu_profile(
-                s.env, profile_id, &found, &json),
+  ASSERT_EQ(unofficial_napi_profile_stop(s.env, profile, &json),
             napi_ok);
-  ASSERT_TRUE(found);
   ASSERT_NE(json, nullptr);
 
   napi_valuetype type = napi_undefined;
@@ -277,6 +275,10 @@ TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
   size_t length = 0;
   ASSERT_EQ(napi_get_value_string_utf8(s.env, json, nullptr, 0, &length), napi_ok);
   EXPECT_GT(length, 0u);
+
+  napi_value second_json = nullptr;
+  EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &second_json),
+            napi_invalid_arg);
 }
 #endif
 

@@ -146,6 +146,11 @@ struct SnapiEnvState {
   // Handle table for opaque bytecode handles (unofficial_napi_bytecode_*).
   HandleTable bytecode_handles;
 
+  // Provider-owned profiler sessions. The provider stops any sessions still
+  // active when its env is released; this table only translates pointer-sized
+  // host handles to the wasm32 IDs visible to the guest.
+  HandleTable profile_handles;
+
   // Opaque provider-owned memory leases. Unlike value slots, these survive
   // handle-scope closure and retain their JavaScript values until released.
   HandleTable buffer_lease_handles;
@@ -447,6 +452,7 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
     }
   }
   state->bytecode_handles.Reset();
+  state->profile_handles.Reset();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->callback_invocations.clear();
   state->next_callback_invocation_id = 1;
@@ -3486,78 +3492,42 @@ extern "C" int snapi_bridge_unofficial_get_heap_code_statistics(
   return unofficial_napi_get_heap_code_statistics(env, stats_out);
 }
 
-extern "C" int snapi_bridge_unofficial_start_cpu_profile(SnapiEnvState* env_state,
-                                                         int32_t* result_out,
-                                                         uint32_t* profile_id_out) {
+extern "C" int snapi_bridge_unofficial_profile_start(SnapiEnvState* env_state,
+                                                      int32_t kind,
+                                                      int32_t* result_out,
+                                                      uint32_t* profile_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      result_out == nullptr || profile_id_out == nullptr) {
+  if (result_out == nullptr || profile_out == nullptr) {
     return napi_invalid_arg;
   }
-  unofficial_napi_cpu_profile_start_result result =
-      unofficial_napi_cpu_profile_start_ok;
-  napi_status s =
-      unofficial_napi_start_cpu_profile(env, &result, profile_id_out);
+  unofficial_napi_profile_start_result result = unofficial_napi_profile_start_ok;
+  unofficial_napi_profile profile = nullptr;
+  napi_status s = unofficial_napi_profile_start(
+      env, static_cast<unofficial_napi_profile_kind>(kind), &result, &profile);
   if (s != napi_ok) return s;
   *result_out = static_cast<int32_t>(result);
+  *profile_out = bridge_state->profile_handles.Store(
+      reinterpret_cast<void*>(profile));
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_stop_cpu_profile(SnapiEnvState* env_state,
-                                                        uint32_t profile_id,
-                                                        int* found_out,
-                                                        uint32_t* json_out) {
+extern "C" int snapi_bridge_unofficial_profile_stop(SnapiEnvState* env_state,
+                                                     uint32_t profile_id,
+                                                     uint32_t* json_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (found_out == nullptr || json_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  bool found = false;
+  if (json_out == nullptr) return napi_invalid_arg;
+  auto profile = reinterpret_cast<unofficial_napi_profile>(
+      bridge_state->profile_handles.Take(profile_id));
+  if (profile == nullptr) return napi_invalid_arg;
   napi_value json = nullptr;
-  napi_status s = unofficial_napi_stop_cpu_profile(env, profile_id, &found, &json);
+  napi_status s = unofficial_napi_profile_stop(env, profile, &json);
   if (s != napi_ok) return s;
-  *found_out = found ? 1 : 0;
-  *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_start_heap_profile(SnapiEnvState* env_state,
-                                                          int* started_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      started_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  bool started = false;
-  napi_status s = unofficial_napi_start_heap_profile(env, &started);
-  if (s != napi_ok) return s;
-  *started_out = started ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_stop_heap_profile(SnapiEnvState* env_state,
-                                                         int* found_out,
-                                                         uint32_t* json_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (found_out == nullptr || json_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  bool found = false;
-  napi_value json = nullptr;
-  napi_status s = unofficial_napi_stop_heap_profile(env, &found, &json);
-  if (s != napi_ok) return s;
-  *found_out = found ? 1 : 0;
   *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
   return napi_ok;
 }

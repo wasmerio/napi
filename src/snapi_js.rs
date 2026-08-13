@@ -3623,39 +3623,22 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_code_statistics(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_start_cpu_profile(
+pub unsafe extern "C" fn snapi_bridge_unofficial_profile_start(
     env: SnapiEnv,
+    kind: i32,
     result_out: *mut i32,
-    profile_id_out: *mut u32,
+    profile_out: *mut u32,
 ) -> i32 {
-    let _ = (env, result_out, profile_id_out);
+    let _ = (env, kind, result_out, profile_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_stop_cpu_profile(
+pub unsafe extern "C" fn snapi_bridge_unofficial_profile_stop(
     env: SnapiEnv,
-    profile_id: u32,
-    found_out: *mut i32,
+    profile: u32,
     json_out: *mut u32,
 ) -> i32 {
-    let _ = (env, profile_id, found_out, json_out);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_start_heap_profile(
-    env: SnapiEnv,
-    started_out: *mut i32,
-) -> i32 {
-    let _ = (env, started_out);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_stop_heap_profile(
-    env: SnapiEnv,
-    found_out: *mut i32,
-    json_out: *mut u32,
-) -> i32 {
-    let _ = (env, found_out, json_out);
+    let _ = (env, profile, json_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]

@@ -229,21 +229,15 @@ unsafe extern "C" {
         env: SnapiEnv,
         stats_out: *mut SnapiUnofficialHeapCodeStatistics,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_start_cpu_profile(
+    pub fn snapi_bridge_unofficial_profile_start(
         env: SnapiEnv,
+        kind: i32,
         result_out: *mut i32,
-        profile_id_out: *mut u32,
+        profile_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_stop_cpu_profile(
+    pub fn snapi_bridge_unofficial_profile_stop(
         env: SnapiEnv,
-        profile_id: u32,
-        found_out: *mut i32,
-        json_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_start_heap_profile(env: SnapiEnv, started_out: *mut i32) -> i32;
-    pub fn snapi_bridge_unofficial_stop_heap_profile(
-        env: SnapiEnv,
-        found_out: *mut i32,
+        profile: u32,
         json_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_take_heap_snapshot(

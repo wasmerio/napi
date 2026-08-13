@@ -762,52 +762,29 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_start_cpu_profile(
+    napi_status NAPI_CDECL unofficial_napi_profile_start(
         napi_env env,
-        unofficial_napi_cpu_profile_start_result *result_out,
-        uint32_t *profile_id_out)
+        unofficial_napi_profile_kind kind,
+        unofficial_napi_profile_start_result *result_out,
+        unofficial_napi_profile *profile_out)
     {
-        if (!napi_util__::check_env(env) || result_out == nullptr || profile_id_out == nullptr)
+        if (!napi_util__::check_env(env) || result_out == nullptr || profile_out == nullptr ||
+            (kind != unofficial_napi_profile_cpu && kind != unofficial_napi_profile_heap))
             return napi_invalid_arg;
-        *result_out = unofficial_napi_cpu_profile_start_ok;
-        *profile_id_out = 1;
+        *result_out = unofficial_napi_profile_start_ok;
+        *profile_out = nullptr;
         return napi_generic_failure;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
+    napi_status NAPI_CDECL unofficial_napi_profile_stop(
         napi_env env,
-        uint32_t profile_id,
-        bool *found_out,
+        unofficial_napi_profile profile,
         napi_value *json_out)
     {
-        (void)profile_id;
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr)
+        if (!napi_util__::check_env(env) || profile == nullptr || json_out == nullptr)
             return napi_invalid_arg;
-        *found_out = false;
         *json_out = nullptr;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
-        napi_env env,
-        bool *started_out)
-    {
-        if (!napi_util__::check_env(env) || started_out == nullptr)
-            return napi_invalid_arg;
-        *started_out = false;
         return napi_generic_failure;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
-        napi_env env,
-        bool *found_out,
-        napi_value *json_out)
-    {
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr)
-            return napi_invalid_arg;
-        *found_out = false;
-        *json_out = nullptr;
-        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
