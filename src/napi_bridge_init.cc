@@ -3339,34 +3339,50 @@ extern "C" int snapi_bridge_unofficial_get_hash_seed(SnapiEnvState* env_state,
   return unofficial_napi_get_hash_seed(env, hash_seed_out);
 }
 
-extern "C" int snapi_bridge_unofficial_get_error_source_positions(
+extern "C" int snapi_bridge_unofficial_get_error_metadata(
     SnapiEnvState* env_state,
     uint32_t error_id,
+    int mode,
     uint32_t* source_line_out,
     uint32_t* script_resource_name_out,
+    uint32_t* stderr_line_out,
+    uint32_t* thrown_at_out,
     int32_t* line_number_out,
     int32_t* start_column_out,
-    int32_t* end_column_out) {
+    int32_t* end_column_out,
+    int* was_preserved_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value error = LoadValue(*bridge_state, error_id);
   if (error == nullptr) return napi_invalid_arg;
-  unofficial_napi_error_source_positions positions{};
-  napi_status s =
-      unofficial_napi_get_error_source_positions(env, error, &positions);
+  unofficial_napi_error_metadata metadata{};
+  napi_status s = unofficial_napi_get_error_metadata(
+      env,
+      error,
+      static_cast<unofficial_napi_error_metadata_mode>(mode),
+      &metadata);
   if (s != napi_ok) return s;
   if (source_line_out != nullptr) {
-    *source_line_out = StoreValue(*bridge_state, positions.source_line);
+    *source_line_out = StoreValue(*bridge_state, metadata.source_line);
   }
   if (script_resource_name_out != nullptr) {
     *script_resource_name_out =
-        StoreValue(*bridge_state, positions.script_resource_name);
+        StoreValue(*bridge_state, metadata.script_resource_name);
   }
-  if (line_number_out != nullptr) *line_number_out = positions.line_number;
-  if (start_column_out != nullptr) *start_column_out = positions.start_column;
-  if (end_column_out != nullptr) *end_column_out = positions.end_column;
+  if (stderr_line_out != nullptr) {
+    *stderr_line_out = StoreValue(*bridge_state, metadata.stderr_line);
+  }
+  if (thrown_at_out != nullptr) {
+    *thrown_at_out = StoreValue(*bridge_state, metadata.thrown_at);
+  }
+  if (line_number_out != nullptr) *line_number_out = metadata.line_number;
+  if (start_column_out != nullptr) *start_column_out = metadata.start_column;
+  if (end_column_out != nullptr) *end_column_out = metadata.end_column;
+  if (was_preserved_out != nullptr) {
+    *was_preserved_out = metadata.was_preserved ? 1 : 0;
+  }
   return napi_ok;
 }
 
@@ -3381,61 +3397,6 @@ extern "C" int snapi_bridge_unofficial_configure_source_maps(
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_configure_source_maps(env, enabled != 0, callback);
-}
-
-extern "C" int snapi_bridge_unofficial_get_error_source_line_for_stderr(
-    SnapiEnvState* env_state,
-    uint32_t error_id,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value error = LoadValue(*bridge_state, error_id);
-  if (error == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_get_error_source_line_for_stderr(env, error, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_get_error_thrown_at(
-    SnapiEnvState* env_state,
-    uint32_t error_id,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value error = LoadValue(*bridge_state, error_id);
-  if (error == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_get_error_thrown_at(env, error, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_take_preserved_error_formatting(
-    SnapiEnvState* env_state,
-    uint32_t error_id,
-    uint32_t* source_line_out,
-    uint32_t* thrown_at_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value error = LoadValue(*bridge_state, error_id);
-  if (error == nullptr) return napi_invalid_arg;
-  napi_value source_line = nullptr;
-  napi_value thrown_at = nullptr;
-  napi_status s = unofficial_napi_take_preserved_error_formatting(
-      env, error, &source_line, &thrown_at);
-  if (s != napi_ok) return s;
-  if (source_line_out != nullptr) *source_line_out = StoreValue(*bridge_state, source_line);
-  if (thrown_at_out != nullptr) *thrown_at_out = StoreValue(*bridge_state, thrown_at);
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_preserve_error_source_message(

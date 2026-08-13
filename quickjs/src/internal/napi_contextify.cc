@@ -629,13 +629,19 @@ namespace quickjs::detail
             napi_util__::set_string_property(ctx_, exception, "stack", summary + "\n" + stack_text);
     }
 
-    napi_status napi_contextify__::get_error_source_positions(
+    napi_status napi_contextify__::get_error_metadata(
         napi_value error,
-        unofficial_napi_error_source_positions *out)
+        unofficial_napi_error_metadata_mode mode,
+        unofficial_napi_error_metadata *out)
     {
         if (!napi_util__::check_env(env_) || error == nullptr || out == nullptr)
             return napi_invalid_arg;
         std::memset(out, 0, sizeof(*out));
+        if (mode == unofficial_napi_error_metadata_take_preserved)
+            return napi_ok;
+        if (mode != unofficial_napi_error_metadata_current)
+            return napi_invalid_arg;
+
         out->line_number = -1;
         out->start_column = -1;
         out->end_column = -1;
@@ -645,7 +651,16 @@ namespace quickjs::detail
             return status;
         out->source_line = empty;
         out->script_resource_name = empty;
-        return napi_ok;
+
+        JSValue value = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, error), "node:arrowMessage");
+        if (JS_IsException(value))
+            return napi_pending_exception;
+        if (JS_IsUndefined(value))
+        {
+            JS_FreeValue(ctx_, value);
+            return napi_util__::create_undefined(env_, &out->stderr_line);
+        }
+        return napi_util__::wrap_owned(env_, value, &out->stderr_line);
     }
 
     napi_status napi_contextify__::preserve_error_source_message(napi_value error)
@@ -671,43 +686,6 @@ namespace quickjs::detail
         source_map_error_source_callback_ =
             callback == nullptr ? JS_UNDEFINED : JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback));
         return napi_ok;
-    }
-
-    napi_status napi_contextify__::get_error_source_line_for_stderr(napi_value error,
-                                                                    napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env_) || error == nullptr || result_out == nullptr)
-            return napi_invalid_arg;
-        JSValue value = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, error), "node:arrowMessage");
-        if (JS_IsException(value))
-            return napi_pending_exception;
-        if (JS_IsUndefined(value))
-        {
-            JS_FreeValue(ctx_, value);
-            return napi_util__::create_undefined(env_, result_out);
-        }
-        return napi_util__::wrap_owned(env_, value, result_out);
-    }
-
-    napi_status napi_contextify__::get_error_thrown_at(napi_value error,
-                                                       napi_value *result_out)
-    {
-        (void)error;
-        if (!napi_util__::check_env(env_) || result_out == nullptr)
-            return napi_invalid_arg;
-        return napi_util__::create_undefined(env_, result_out);
-    }
-
-    napi_status napi_contextify__::take_preserved_error_formatting(napi_value error,
-                                                                   napi_value *source_line_out,
-                                                                   napi_value *thrown_at_out)
-    {
-        if (!napi_util__::check_env(env_) || error == nullptr || source_line_out == nullptr || thrown_at_out == nullptr)
-            return napi_invalid_arg;
-        napi_status status = get_error_source_line_for_stderr(error, source_line_out);
-        if (status != napi_ok)
-            return status;
-        return napi_util__::create_undefined(env_, thrown_at_out);
     }
 
     napi_status napi_contextify__::make_context(napi_value sandbox_or_symbol,

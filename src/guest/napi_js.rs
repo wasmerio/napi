@@ -1236,39 +1236,54 @@ fn guest_unofficial_napi_get_hash_seed(
     status
 }
 
-fn guest_unofficial_napi_get_error_source_positions(
+fn guest_unofficial_napi_get_error_metadata(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     error: i32,
-    positions_ptr: i32,
+    mode: i32,
+    metadata_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let error_id = if error > 0 { error as u32 } else { 0 };
     let mut source_line_id = 0u32;
     let mut script_resource_name_id = 0u32;
+    let mut stderr_line_id = 0u32;
+    let mut thrown_at_id = 0u32;
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
+    let mut was_preserved = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_error_source_positions(
+        snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
+            mode,
             &mut source_line_id,
             &mut script_resource_name_id,
+            &mut stderr_line_id,
+            &mut thrown_at_id,
             &mut line_number,
             &mut start_column,
             &mut end_column,
+            &mut was_preserved,
         )
     };
     if status != 0 {
         return status;
     }
-    if positions_ptr > 0 {
-        write_guest_u32(&mut env, positions_ptr as u32, source_line_id);
-        write_guest_u32(&mut env, positions_ptr as u32 + 4, script_resource_name_id);
-        write_guest_i32(&mut env, positions_ptr as u32 + 8, line_number);
-        write_guest_i32(&mut env, positions_ptr as u32 + 12, start_column);
-        write_guest_i32(&mut env, positions_ptr as u32 + 16, end_column);
+    if metadata_ptr > 0 {
+        write_guest_u32(&mut env, metadata_ptr as u32, source_line_id);
+        write_guest_u32(&mut env, metadata_ptr as u32 + 4, script_resource_name_id);
+        write_guest_u32(&mut env, metadata_ptr as u32 + 8, stderr_line_id);
+        write_guest_u32(&mut env, metadata_ptr as u32 + 12, thrown_at_id);
+        write_guest_i32(&mut env, metadata_ptr as u32 + 16, line_number);
+        write_guest_i32(&mut env, metadata_ptr as u32 + 20, start_column);
+        write_guest_i32(&mut env, metadata_ptr as u32 + 24, end_column);
+        write_guest_u8(
+            &mut env,
+            metadata_ptr as u32 + 28,
+            (was_preserved != 0) as u8,
+        );
     }
     0
 }
@@ -1282,76 +1297,6 @@ fn guest_unofficial_napi_configure_source_maps(
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
     unsafe { snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id) }
-}
-
-fn guest_unofficial_napi_get_error_source_line_for_stderr(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    error: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let error_id = if error > 0 { error as u32 } else { 0 };
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_error_source_line_for_stderr(
-            env_handle,
-            error_id,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
-fn guest_unofficial_napi_get_error_thrown_at(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    error: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let error_id = if error > 0 { error as u32 } else { 0 };
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_error_thrown_at(env_handle, error_id, &mut result_id)
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
-fn guest_unofficial_napi_take_preserved_error_formatting(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    error: i32,
-    source_line_ptr: i32,
-    thrown_at_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let error_id = if error > 0 { error as u32 } else { 0 };
-    let mut source_line_id = 0u32;
-    let mut thrown_at_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_take_preserved_error_formatting(
-            env_handle,
-            error_id,
-            &mut source_line_id,
-            &mut thrown_at_id,
-        )
-    };
-    if status == 0 {
-        if source_line_ptr > 0 {
-            write_guest_u32(&mut env, source_line_ptr as u32, source_line_id);
-        }
-        if thrown_at_ptr > 0 {
-            write_guest_u32(&mut env, thrown_at_ptr as u32, thrown_at_id);
-        }
-    }
-    status
 }
 
 fn guest_unofficial_napi_preserve_error_source_message(
@@ -6230,11 +6175,8 @@ pub fn register_napi_imports(
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
-        "unofficial_napi_get_error_source_positions" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_source_positions),
+        "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
         "unofficial_napi_configure_source_maps" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_source_maps),
-        "unofficial_napi_get_error_source_line_for_stderr" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_source_line_for_stderr),
-        "unofficial_napi_get_error_thrown_at" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_thrown_at),
-        "unofficial_napi_take_preserved_error_formatting" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_preserved_error_formatting),
         "unofficial_napi_preserve_error_source_message" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preserve_error_source_message),
         "unofficial_napi_mark_promise_as_handled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_mark_promise_as_handled),
         "unofficial_napi_get_heap_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_statistics),

@@ -25,17 +25,11 @@ namespace quickjs::detail
         napi_contextify__(const napi_contextify__ &) = delete;
         napi_contextify__ &operator=(const napi_contextify__ &) = delete;
 
-        napi_status get_error_source_positions(napi_value error,
-                                               unofficial_napi_error_source_positions *out);
+        napi_status get_error_metadata(napi_value error,
+                                       unofficial_napi_error_metadata_mode mode,
+                                       unofficial_napi_error_metadata *out);
         napi_status preserve_error_source_message(napi_value error);
         napi_status configure_source_maps(bool enabled, napi_value callback);
-        napi_status get_error_source_line_for_stderr(napi_value error,
-                                                     napi_value *result_out);
-        napi_status get_error_thrown_at(napi_value error,
-                                        napi_value *result_out);
-        napi_status take_preserved_error_formatting(napi_value error,
-                                                    napi_value *source_line_out,
-                                                    napi_value *thrown_at_out);
 
         napi_status make_context(napi_value sandbox_or_symbol,
                                  napi_value name,

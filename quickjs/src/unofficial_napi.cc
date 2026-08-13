@@ -442,12 +442,13 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
+    napi_status NAPI_CDECL unofficial_napi_get_error_metadata(
         napi_env env,
         napi_value error,
-        unofficial_napi_error_source_positions *out)
+        unofficial_napi_error_metadata_mode mode,
+        unofficial_napi_error_metadata *out)
     {
-        return napi_util__::check_env(env) ? env->contextify().get_error_source_positions(error, out) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->contextify().get_error_metadata(error, mode, out) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
@@ -463,31 +464,6 @@ extern "C"
         napi_value callback)
     {
         return napi_util__::check_env(env) ? env->contextify().configure_source_maps(enabled, callback) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
-        napi_env env,
-        napi_value error,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().get_error_source_line_for_stderr(error, result_out) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_error_thrown_at(
-        napi_env env,
-        napi_value error,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().get_error_thrown_at(error, result_out) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_take_preserved_error_formatting(
-        napi_env env,
-        napi_value error,
-        napi_value *source_line_out,
-        napi_value *thrown_at_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().take_preserved_error_formatting(error, source_line_out, thrown_at_out) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(

@@ -27,18 +27,23 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 std::string GetArrowMessage(napi_env env, napi_value exception) {
   if (env == nullptr || exception == nullptr) return {};
 
-  napi_value source_line = nullptr;
-  napi_value thrown_at = nullptr;
-  if (unofficial_napi_take_preserved_error_formatting(
-          env, exception, &source_line, &thrown_at) == napi_ok) {
-    const std::string preserved = ValueToUtf8(env, source_line);
+  unofficial_napi_error_metadata metadata{};
+  if (unofficial_napi_get_error_metadata(
+          env,
+          exception,
+          unofficial_napi_error_metadata_take_preserved,
+          &metadata) == napi_ok) {
+    const std::string preserved = ValueToUtf8(env, metadata.stderr_line);
     if (!preserved.empty()) return preserved;
   }
 
-  source_line = nullptr;
-  if (unofficial_napi_get_error_source_line_for_stderr(env, exception, &source_line) ==
-      napi_ok) {
-    const std::string formatted = ValueToUtf8(env, source_line);
+  metadata = {};
+  if (unofficial_napi_get_error_metadata(
+          env,
+          exception,
+          unofficial_napi_error_metadata_current,
+          &metadata) == napi_ok) {
+    const std::string formatted = ValueToUtf8(env, metadata.stderr_line);
     if (!formatted.empty()) return formatted;
   }
 
@@ -110,6 +115,68 @@ TEST_F(Test14Exception, SetLastExceptionStoresArrowMessageOnThrownError) {
   ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
   ASSERT_NE(exception, nullptr);
   EXPECT_NE(GetArrowMessage(s.env, exception).find("throw new Error('boom')"), std::string::npos);
+}
+
+TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
+  EnvScope s(runtime_.get());
+
+  napi_value script = nullptr;
+  ASSERT_EQ(
+      napi_create_string_utf8(
+          s.env,
+          "throw new Error('metadata')\n//# sourceURL=metadata.js",
+          NAPI_AUTO_LENGTH,
+          &script),
+      napi_ok);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, script, &result), napi_pending_exception);
+
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_NE(exception, nullptr);
+
+  unofficial_napi_error_metadata metadata{};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_current,
+                &metadata),
+            napi_ok);
+  EXPECT_FALSE(metadata.was_preserved);
+  EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
+            std::string::npos);
+  EXPECT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                static_cast<unofficial_napi_error_metadata_mode>(99),
+                &metadata),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_preserve_error_source_message(s.env, exception),
+            napi_ok);
+  metadata = {};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_take_preserved,
+                &metadata),
+            napi_ok);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_FALSE(metadata.was_preserved);
+#else
+  EXPECT_TRUE(metadata.was_preserved);
+  EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
+            std::string::npos);
+#endif
+
+  metadata = {};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_take_preserved,
+                &metadata),
+            napi_ok);
+  EXPECT_FALSE(metadata.was_preserved);
 }
 
 TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorRethrow) {

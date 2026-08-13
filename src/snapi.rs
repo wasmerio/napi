@@ -192,35 +192,23 @@ unsafe extern "C" {
         callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_source_positions(
+    pub fn snapi_bridge_unofficial_get_error_metadata(
         env: SnapiEnv,
         error_id: u32,
+        mode: i32,
         source_line_out: *mut u32,
         script_resource_name_out: *mut u32,
+        stderr_line_out: *mut u32,
+        thrown_at_out: *mut u32,
         line_number_out: *mut i32,
         start_column_out: *mut i32,
         end_column_out: *mut i32,
+        was_preserved_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_configure_source_maps(
         env: SnapiEnv,
         enabled: i32,
         callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_source_line_for_stderr(
-        env: SnapiEnv,
-        error_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_thrown_at(
-        env: SnapiEnv,
-        error_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_take_preserved_error_formatting(
-        env: SnapiEnv,
-        error_id: u32,
-        source_line_out: *mut u32,
-        thrown_at_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_preserve_error_source_message(
         env: SnapiEnv,

@@ -2383,11 +2383,12 @@ napi_status NAPI_CDECL unofficial_napi_get_promise_details(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
+napi_status NAPI_CDECL unofficial_napi_get_error_metadata(
     napi_env env,
     napi_value error,
-    unofficial_napi_error_source_positions* out) {
-  return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
+    unofficial_napi_error_metadata_mode mode,
+    unofficial_napi_error_metadata* out) {
+  return unofficial_napi_internal::GetErrorMetadata(env, error, mode, out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
@@ -2395,29 +2396,6 @@ napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
     bool enabled,
     napi_value callback) {
   return unofficial_napi_internal::ConfigureSourceMaps(env, enabled, callback);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out) {
-  return unofficial_napi_internal::GetErrorSourceLineForStderr(env, error, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_error_thrown_at(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out) {
-  return unofficial_napi_internal::GetErrorThrownAt(env, error, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_take_preserved_error_formatting(
-    napi_env env,
-    napi_value error,
-    napi_value* source_line_out,
-    napi_value* thrown_at_out) {
-  return unofficial_napi_internal::TakePreservedErrorFormatting(
-      env, error, source_line_out, thrown_at_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(

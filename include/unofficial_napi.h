@@ -222,21 +222,30 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_promise_details(nap
                                                             napi_value* result_out,
                                                             bool* has_result_out);
 
+typedef enum {
+  unofficial_napi_error_metadata_current = 0,
+  unofficial_napi_error_metadata_take_preserved = 1,
+} unofficial_napi_error_metadata_mode;
+
 typedef struct {
   napi_value source_line;
   napi_value script_resource_name;
+  napi_value stderr_line;
+  napi_value thrown_at;
   int32_t line_number;
   int32_t start_column;
   int32_t end_column;
-} unofficial_napi_error_source_positions;
+  bool was_preserved;
+} unofficial_napi_error_metadata;
 
 // Unofficial helpers for Node-style exception/message parity.
 // These expose engine message/source metadata that is not available in the
 // public Node-API.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_source_positions(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_metadata(
     napi_env env,
     napi_value error,
-    unofficial_napi_error_source_positions* out);
+    unofficial_napi_error_metadata_mode mode,
+    unofficial_napi_error_metadata* out);
 
 // Preserve the current engine-generated source arrow/message for an Error
 // object so later rethrows do not overwrite it with the rethrow callsite.
@@ -247,19 +256,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_source_maps(
     napi_env env,
     bool enabled,
     napi_value callback);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_source_line_for_stderr(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_thrown_at(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_take_preserved_error_formatting(
-    napi_env env,
-    napi_value error,
-    napi_value* source_line_out,
-    napi_value* thrown_at_out);
 
 // Unofficial helper used by module_wrap parity paths to tell the runtime's
 // PromiseReject callback machinery that a rejected promise is being handled

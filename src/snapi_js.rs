@@ -3528,23 +3528,31 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_hash_seed(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_source_positions(
+pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_metadata(
     env: SnapiEnv,
     error_id: u32,
+    mode: i32,
     source_line_out: *mut u32,
     script_resource_name_out: *mut u32,
+    stderr_line_out: *mut u32,
+    thrown_at_out: *mut u32,
     line_number_out: *mut i32,
     start_column_out: *mut i32,
     end_column_out: *mut i32,
+    was_preserved_out: *mut i32,
 ) -> i32 {
     let _ = (
         env,
         error_id,
+        mode,
         source_line_out,
         script_resource_name_out,
+        stderr_line_out,
+        thrown_at_out,
         line_number_out,
         start_column_out,
         end_column_out,
+        was_preserved_out,
     );
     NAPI_GENERIC_FAILURE
 }
@@ -3555,34 +3563,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_configure_source_maps(
     callback_id: u32,
 ) -> i32 {
     let _ = (env, enabled, callback_id);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_source_line_for_stderr(
-    env: SnapiEnv,
-    error_id: u32,
-    result_out: *mut u32,
-) -> i32 {
-    let _ = (env, error_id, result_out);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_thrown_at(
-    env: SnapiEnv,
-    error_id: u32,
-    result_out: *mut u32,
-) -> i32 {
-    let _ = (env, error_id, result_out);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_take_preserved_error_formatting(
-    env: SnapiEnv,
-    error_id: u32,
-    source_line_out: *mut u32,
-    thrown_at_out: *mut u32,
-) -> i32 {
-    let _ = (env, error_id, source_line_out, thrown_at_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
