@@ -44,18 +44,14 @@ typedef struct {
   void* shutdown_pump_target;
 } unofficial_napi_embedder_hooks;
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(int32_t module_api_version,
-                                                   napi_env* env_out,
-                                                   void** scope_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env_with_options(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     int32_t module_api_version,
-    const unofficial_napi_env_create_options* options,
+    const unofficial_napi_env_create_options* options_or_null,
     napi_env* env_out,
     void** scope_out);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_embedder_hooks(
     const unofficial_napi_embedder_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_edge_environment(napi_env env, void* environment);
-NAPI_EXTENSION_WASMER_EXTERN void* unofficial_napi_get_edge_environment(napi_env env);
 typedef void (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
     napi_env env,
@@ -74,11 +70,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_context_token_callb
     unofficial_napi_context_token_callback assign_callback,
     unofficial_napi_context_token_callback unassign_callback,
     void* data);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_destroy_env_instance(napi_env env);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(void* scope);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env_with_loop(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     void* scope,
-    struct uv_loop_s* loop);
+    struct uv_loop_s* loop_or_null);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_low_memory_notification(napi_env env);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_flags_from_string(
     const char* flags,
@@ -168,8 +162,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // used when embedder code intentionally stops a worker but still needs the
 // current JS stack to unwind normally.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_pending_exception(napi_env env,
-                                                              napi_value error);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
@@ -243,8 +235,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_near_heap_limit_cal
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_remove_near_heap_limit_callback(
     napi_env env,
     size_t heap_limit);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_stack_limit(napi_env env, void* stack_limit);
-
 // Unofficial helpers used by util/options parity work in edge.
 // These expose engine-specific data that is not available in the public N-API.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_promise_details(napi_env env,
@@ -314,12 +304,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_preview_entries(napi_en
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_call_sites(napi_env env,
                                                        uint32_t frames,
                                                        napi_value* callsites_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_current_stack_trace(napi_env env,
-                                                                uint32_t frames,
-                                                                napi_value* callsites_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_caller_location(napi_env env,
-                                                            napi_value* location_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                     napi_value value,
@@ -328,15 +312,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_arraybuffer_view_has_bu
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
                                                              napi_value value,
                                                              napi_value* name_out);
-
-// Unofficial helper for Node's internalBinding('util').getOwnNonIndexProperties.
-// Returns the target's own property names while skipping indexed elements at the
-// engine level, matching Node's use of IndexFilter::kSkipIndices.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_own_non_index_properties(
-    napi_env env,
-    napi_value value,
-    uint32_t filter_bits,
-    napi_value* result_out);
 
 // Unofficial helper for Node's internalBinding('util').privateSymbols.
 // Returns a JS-visible private symbol value backed by the engine's hidden
@@ -352,12 +327,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_private_symbol(n
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
-    napi_value* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone_with_transfer(
-    napi_env env,
-    napi_value value,
-    napi_value transfer_list,
+    napi_value transfer_list_or_null,
     napi_value* result_out);
 
 // Unofficial helpers for env-agnostic message payload queues.
@@ -602,10 +572,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
     napi_value host_defined_option_id,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_dispose_context(
-    napi_env env,
-    napi_value sandbox_or_context_global);
-
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function(
     napi_env env,
     const unofficial_napi_js_source* source,
@@ -618,32 +584,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_func
     napi_value host_defined_option_id,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function_for_cjs_loader(
-    napi_env env,
-    const unofficial_napi_js_source* source,
-    napi_value filename,
-    bool is_sea_main,
-    bool should_detect_module,
-    napi_value* result_out);
-
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_module_syntax(
     napi_env env,
     napi_value code,
     napi_value filename,
     napi_value resource_name_or_undefined,
     bool cjs_var_in_scope,
-    bool* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_start_sigint_watchdog(
-    napi_env env,
-    bool* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_stop_sigint_watchdog(
-    napi_env env,
-    bool* had_pending_signal_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_watchdog_has_pending_sigint(
-    napi_env env,
     bool* result_out);
 
 // Unofficial helpers for implementing internalBinding('module_wrap') on embedders.
@@ -760,12 +706,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_import_
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
     napi_env env,
     napi_value callback);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_import_module_dynamically(
-    napi_env env,
-    size_t argc,
-    napi_value* argv,
-    napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,

@@ -1521,18 +1521,6 @@ v8::ScriptOrigin BytecodeOrigin(v8::Isolate* isolate,
                           HostDefinedOptions(isolate, host_id_symbol));
 }
 
-v8::Local<v8::Symbol> DefaultCjsHostSymbol(napi_env env) {
-  v8::Local<v8::Symbol> host_id_symbol;
-  napi_value host_id_value = GetVmDynamicImportDefaultInternalSymbol(env);
-  if (host_id_value != nullptr) {
-    v8::Local<v8::Value> host_raw = napi_v8_unwrap_value(host_id_value);
-    if (!host_raw.IsEmpty() && host_raw->IsSymbol()) {
-      host_id_symbol = host_raw.As<v8::Symbol>();
-    }
-  }
-  return host_id_symbol;
-}
-
 // Compiles record->source_utf8 per record->shape and stores the live artifact.
 // consume == true offers record->bytes as a code cache (rejected_out gets
 // V8's verdict); consume == false compiles eagerly and fills record->bytes
@@ -2078,41 +2066,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_dispose_context(
-    napi_env env,
-    napi_value sandbox_or_context_global) {
-  if (env == nullptr || sandbox_or_context_global == nullptr) return napi_invalid_arg;
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return napi_ok;
-
-  auto& records = it->second;
-  for (size_t i = 0; i < records.size(); ++i) {
-    ContextRecord& rec = records[i];
-    if (rec.key_ref == nullptr) continue;
-    napi_value candidate = nullptr;
-    if (napi_get_reference_value(env, rec.key_ref, &candidate) != napi_ok || candidate == nullptr) continue;
-    bool same = false;
-    if (napi_strict_equals(env, candidate, sandbox_or_context_global, &same) != napi_ok || !same) continue;
-    if (env->context_token_unassign_callback != nullptr) {
-      env->context_token_unassign_callback(
-          env, rec.key_ref, env->context_token_callback_data);
-    }
-    napi_delete_reference(env, rec.key_ref);
-    rec.key_ref = nullptr;
-    rec.context.Reset();
-    rec.own_microtask_queue.reset();
-    records.erase(records.begin() + static_cast<long>(i));
-    break;
-  }
-
-  if (records.empty()) {
-    g_context_records.erase(it);
-  }
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     napi_env env,
     const unofficial_napi_js_source* source,
@@ -2306,127 +2259,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_compile_function_for_cjs_loader(
-    napi_env env,
-    const unofficial_napi_js_source* source,
-    napi_value filename,
-    bool is_sea_main,
-    bool should_detect_module,
-    napi_value* result_out) {
-  if (env == nullptr || source == nullptr ||
-      (source->text == nullptr && source->bytecode == nullptr) || filename == nullptr ||
-      result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  (void)is_sea_main;
-
-  v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
-  v8::Context::Scope context_scope(context);
-
-  BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
-  if (bytecode_record != nullptr &&
-      bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function) {
-    return napi_invalid_arg;
-  }
-
-  v8::Local<v8::String> code_str =
-      bytecode_record != nullptr
-          ? v8::String::NewFromUtf8(isolate, bytecode_record->source_utf8.c_str(),
-                                    v8::NewStringType::kNormal,
-                                    static_cast<int>(bytecode_record->source_utf8.size()))
-                .ToLocalChecked()
-          : ToV8String(env, source->text, "");
-  v8::Local<v8::String> filename_str = ToV8String(env, filename, "[eval]");
-  v8::Local<v8::Symbol> host_id_symbol = DefaultCjsHostSymbol(env);
-
-  v8::Local<v8::Function> fn;
-  v8::Local<v8::Value> cjs_exception;
-  v8::Local<v8::Message> cjs_message;
-  bool cjs_ok = false;
-
-  if (bytecode_record != nullptr) {
-    // Fast path: bytecode_compile/deserialize built the artifact in this env
-    // context with the same loader host symbol — reuse it directly.
-    if (!bytecode_record->function.IsEmpty() &&
-        bytecode_record->function_context.Get(isolate) == context) {
-      fn = bytecode_record->function.Get(isolate);
-      cjs_ok = true;
-    } else if (!bytecode_record->bytes.empty()) {
-      v8::TryCatch tc(isolate);
-      auto* cached_data = new v8::ScriptCompiler::CachedData(
-          bytecode_record->bytes.data(), static_cast<int>(bytecode_record->bytes.size()),
-          v8::ScriptCompiler::CachedData::BufferNotOwned);
-      v8::ScriptOrigin origin = BytecodeOrigin(isolate, filename_str, *bytecode_record, host_id_symbol);
-      v8::ScriptCompiler::Source source_obj(code_str, origin, cached_data);
-      std::vector<v8::Local<v8::String>> params = ToV8Params(isolate, bytecode_record->params);
-      cjs_ok = v8::ScriptCompiler::CompileFunction(context,
-                                                   &source_obj,
-                                                   params.size(),
-                                                   params.empty() ? nullptr : params.data(),
-                                                   0,
-                                                   nullptr,
-                                                   v8::ScriptCompiler::kConsumeCodeCache,
-                                                   v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason)
-                   .ToLocal(&fn);
-      // A failure here is unexpected (the retained source is valid); fall
-      // through to a plain text compile below.
-    }
-  }
-
-  if (!cjs_ok) {
-    v8::TryCatch tc(isolate);
-    cjs_ok = CompileCjsFunction(context, code_str, filename_str, true, host_id_symbol).ToLocal(&fn);
-    if (!cjs_ok && tc.HasCaught()) {
-      cjs_exception = tc.Exception();
-      cjs_message = tc.Message();
-    }
-  }
-
-  bool can_parse_as_esm = false;
-  if (!cjs_ok) {
-    if (!cjs_message.IsEmpty()) {
-      can_parse_as_esm =
-          ShouldRetryAsEsm(isolate, context, env, cjs_message->Get(), code_str, filename_str);
-    }
-    if (!can_parse_as_esm || !should_detect_module) {
-      if (!cjs_exception.IsEmpty()) {
-        unofficial_napi_internal::AttachSyntaxArrowMessage(isolate, context, cjs_exception, cjs_message);
-        isolate->ThrowException(cjs_exception);
-      }
-      return cjs_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
-    }
-  }
-
-  v8::Local<v8::Object> out = v8::Object::New(isolate);
-  if (!SetNamed(context, out, "cachedDataRejected", v8::Boolean::New(isolate, false)) ||
-      !SetNamed(context, out, "canParseAsESM", v8::Boolean::New(isolate, can_parse_as_esm))) {
-    return napi_generic_failure;
-  }
-
-  if (cjs_ok) {
-    if (!host_id_symbol.IsEmpty()) {
-      SetApiPrivate(context, fn.As<v8::Object>(), "node:host_defined_option_symbol", host_id_symbol.As<v8::Value>());
-    }
-    v8::ScriptOrigin origin = fn->GetScriptOrigin();
-    if (!SetNamed(context, out, "sourceMapURL", origin.SourceMapUrl()) ||
-        !SetNamed(context, out, "sourceURL", origin.ResourceName()) ||
-        !SetNamed(context, out, "function", fn)) {
-      return napi_generic_failure;
-    }
-  } else {
-    if (!SetNamed(context, out, "sourceMapURL", v8::Undefined(isolate)) ||
-        !SetNamed(context, out, "sourceURL", v8::Undefined(isolate)) ||
-        !SetNamed(context, out, "function", v8::Undefined(isolate))) {
-      return napi_generic_failure;
-    }
-  }
-
-  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
     napi_env env,
     napi_value code,
@@ -2461,32 +2293,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
     }
   }
   *result_out = false;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_contextify_start_sigint_watchdog(
-    napi_env env,
-    bool* result_out) {
-  if (env == nullptr || result_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> action_lock(SigintWatchdogHelper::GetActionMutex());
-  *result_out = SigintWatchdogHelper::GetInstance().Start() == 0;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_contextify_stop_sigint_watchdog(
-    napi_env env,
-    bool* had_pending_signal_out) {
-  if (env == nullptr || had_pending_signal_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> action_lock(SigintWatchdogHelper::GetActionMutex());
-  *had_pending_signal_out = SigintWatchdogHelper::GetInstance().Stop();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_contextify_watchdog_has_pending_sigint(
-    napi_env env,
-    bool* result_out) {
-  if (env == nullptr || result_out == nullptr) return napi_invalid_arg;
-  *result_out = SigintWatchdogHelper::GetInstance().HasPendingSignal();
   return napi_ok;
 }
 
@@ -3082,36 +2888,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_ob
   if (callback != nullptr) napi_create_reference(env, callback, 1, &state->initialize_import_meta_ref);
   env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);
   return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_module_wrap_import_module_dynamically(
-    napi_env env,
-    size_t argc,
-    napi_value* argv,
-    napi_value* result_out) {
-  if (env == nullptr || argv == nullptr || result_out == nullptr) return napi_invalid_arg;
-  *result_out = nullptr;
-
-  auto* state = GetModuleWrapState(env);
-  if (state == nullptr) return napi_generic_failure;
-  napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
-  if (callback == nullptr) return napi_invalid_arg;
-
-  napi_value global = nullptr;
-  napi_get_global(env, &global);
-  if (argc >= 5) {
-    return napi_call_function(env, global, callback, 5, argv, result_out);
-  }
-
-  napi_value referrer_symbol = GetVmDynamicImportDefaultInternalSymbol(env);
-  napi_value phase = nullptr;
-  napi_create_int32(env, 2, &phase);
-  std::vector<v8::Local<v8::Name>> empty_names;
-  std::vector<v8::Local<v8::Value>> empty_values;
-  napi_value attrs = napi_v8_wrap_value(env, CreateFrozenNullProtoObject(env, empty_names, empty_values));
-  napi_value referrer_name = argc >= 2 ? argv[1] : nullptr;
-  napi_value call_argv[5] = {referrer_symbol, argv[0], phase, attrs, referrer_name};
-  return napi_call_function(env, global, callback, 5, call_argv, result_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(

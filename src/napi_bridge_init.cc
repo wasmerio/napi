@@ -435,7 +435,7 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->next_cb_reg_id = 1;
   state->callback_bindings.clear();
   if (state->scope != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->scope);
+    napi_status s = unofficial_napi_release_env(state->scope, nullptr);
     state->scope = nullptr;
     state->env = nullptr;
     g_envs.erase(state);
@@ -2887,16 +2887,15 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   if (guest_heap_ctx != nullptr) {
     unofficial_napi_env_create_options options{};
     options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
-    s = unofficial_napi_create_env_with_options(module_api_version, &options,
-                                                &env, &scope);
+    s = unofficial_napi_create_env(module_api_version, &options, &env, &scope);
   } else {
-    s = unofficial_napi_create_env(module_api_version, &env, &scope);
+    s = unofficial_napi_create_env(module_api_version, nullptr, &env, &scope);
   }
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();
   if (state == nullptr) {
-    (void)unofficial_napi_release_env(scope);
+    (void)unofficial_napi_release_env(scope, nullptr);
     return napi_generic_failure;
   }
   state->env = env;
@@ -2934,13 +2933,13 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
 
   napi_env env = nullptr;
   void* scope = nullptr;
-  napi_status s = unofficial_napi_create_env_with_options(
+  napi_status s = unofficial_napi_create_env(
       module_api_version, has_options ? &options : nullptr, &env, &scope);
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();
   if (state == nullptr) {
-    (void)unofficial_napi_release_env(scope);
+    (void)unofficial_napi_release_env(scope, nullptr);
     return napi_generic_failure;
   }
   state->env = env;
@@ -3151,34 +3150,6 @@ extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_get_current_stack_trace(
-    SnapiEnvState* env_state,
-    uint32_t frames,
-    uint32_t* callsites_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value callsites = nullptr;
-  napi_status s = unofficial_napi_get_current_stack_trace(env, frames, &callsites);
-  if (s != napi_ok) return s;
-  if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_get_caller_location(SnapiEnvState* env_state,
-                                                           uint32_t* location_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value location = nullptr;
-  napi_status s = unofficial_napi_get_caller_location(env, &location);
-  if (s != napi_ok) return s;
-  if (location_out != nullptr) *location_out = StoreValue(*bridge_state, location);
-  return napi_ok;
-}
-
 extern "C" int snapi_bridge_unofficial_arraybuffer_view_has_buffer(SnapiEnvState* env_state,
                                                                    uint32_t value_id,
                                                                    int* result_out) {
@@ -3358,25 +3329,6 @@ extern "C" int snapi_bridge_unofficial_set_promise_hooks(
     return napi_invalid_arg;
   }
   return unofficial_napi_set_promise_hooks(env, init, before, after, resolve);
-}
-
-extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
-    SnapiEnvState* env_state,
-    uint32_t value_id,
-    uint32_t filter_bits,
-    uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value value = LoadValue(*bridge_state, value_id);
-  if (value == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s =
-      unofficial_napi_get_own_non_index_properties(env, value, filter_bits, &result);
-  if (s != napi_ok) return s;
-  if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_get_process_memory_info(
@@ -3713,23 +3665,7 @@ extern "C" void snapi_bridge_unofficial_free_buffer(void* data) {
   }
 }
 
-extern "C" int snapi_bridge_unofficial_structured_clone(SnapiEnvState* env_state,
-                                                        uint32_t value_id,
-                                                        uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value value = LoadValue(*bridge_state, value_id);
-  if (value == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_structured_clone(env, value, &result);
-  if (s != napi_ok) return s;
-  if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_structured_clone_with_transfer(
+extern "C" int snapi_bridge_unofficial_structured_clone(
     SnapiEnvState* env_state,
     uint32_t value_id,
     uint32_t transfer_list_id,
@@ -3746,8 +3682,7 @@ extern "C" int snapi_bridge_unofficial_structured_clone_with_transfer(
   napi_value transfer_list =
       transfer_list_id == 0 ? nullptr : LoadValue(*bridge_state, transfer_list_id);
   napi_value result = nullptr;
-  napi_status s = unofficial_napi_structured_clone_with_transfer(
-      env, value, transfer_list, &result);
+  napi_status s = unofficial_napi_structured_clone(env, value, transfer_list, &result);
   if (s != napi_ok) return s;
   if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
@@ -3884,18 +3819,6 @@ extern "C" int snapi_bridge_unofficial_contextify_run_script(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_contextify_dispose_context(
-    SnapiEnvState* env_state,
-    uint32_t sandbox_or_context_global_id) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value sandbox_or_context_global = LoadValue(*bridge_state, sandbox_or_context_global_id);
-  if (sandbox_or_context_global == nullptr) return napi_invalid_arg;
-  return unofficial_napi_contextify_dispose_context(env, sandbox_or_context_global);
-}
-
 extern "C" int snapi_bridge_unofficial_contextify_compile_function(
     SnapiEnvState* env_state,
     uint32_t source_text_id,
@@ -3939,31 +3862,6 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
       params,
       host_defined_option,
       &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
-    SnapiEnvState* env_state,
-    uint32_t source_text_id,
-    uint32_t source_bytecode_id,
-    uint32_t filename_id,
-    int is_sea_main,
-    int should_detect_module,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
-  void* source_bytecode = LoadBytecodeHandle(*bridge_state, source_bytecode_id);
-  napi_value filename = LoadValue(*bridge_state, filename_id);
-  if ((source_text == nullptr && source_bytecode == nullptr) || filename == nullptr) return napi_invalid_arg;
-  const unofficial_napi_js_source source{source_text, source_bytecode};
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_contextify_compile_function_for_cjs_loader(
-      env, &source, filename, is_sea_main != 0, should_detect_module != 0, &result);
   if (s != napi_ok) return s;
   if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
   return napi_ok;
@@ -4068,52 +3966,6 @@ extern "C" int snapi_bridge_unofficial_bytecode_release(
   napi_status s = unofficial_napi_bytecode_release(env, bytecode);
   RemoveBytecodeHandle(*bridge_state, bytecode_id);
   return s;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_start_sigint_watchdog(
-    SnapiEnvState* env_state,
-    int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (result_out == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_contextify_start_sigint_watchdog(env, &result);
-  if (s != napi_ok) return s;
-  *result_out = result ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
-    SnapiEnvState* env_state,
-    int* had_pending_signal_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (had_pending_signal_out == nullptr) return napi_invalid_arg;
-  bool had_pending_signal = false;
-  napi_status s =
-      unofficial_napi_contextify_stop_sigint_watchdog(env, &had_pending_signal);
-  if (s != napi_ok) return s;
-  *had_pending_signal_out = had_pending_signal ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
-    SnapiEnvState* env_state,
-    int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (result_out == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_contextify_watchdog_has_pending_sigint(env, &result);
-  if (s != napi_ok) return s;
-  *result_out = result ? 1 : 0;
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
@@ -4478,29 +4330,6 @@ snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(env, callback);
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_import_module_dynamically(
-    SnapiEnvState* env_state,
-    uint32_t argc,
-    const uint32_t* argv_ids,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  std::vector<napi_value> argv(argc, nullptr);
-  for (uint32_t i = 0; i < argc; ++i) {
-    napi_value value = LoadValue(*bridge_state, argv_ids[i]);
-    if (value == nullptr) return napi_invalid_arg;
-    argv[i] = value;
-  }
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_module_wrap_import_module_dynamically(
-      env, argc, argc == 0 ? nullptr : argv.data(), &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade(

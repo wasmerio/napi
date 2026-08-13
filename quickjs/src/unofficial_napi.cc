@@ -193,14 +193,7 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
-                                                      napi_env *env_out,
-                                                      void **scope_out)
-    {
-        return unofficial_napi_create_env_with_options(module_api_version, nullptr, env_out, scope_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
+    napi_status NAPI_CDECL unofficial_napi_create_env(
         int32_t module_api_version,
         const unofficial_napi_env_create_options *options,
         napi_env *env_out,
@@ -303,12 +296,7 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_release_env(void *scope)
-    {
-        return ReleaseEnvScope(scope);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_release_env_with_loop(
+    napi_status NAPI_CDECL unofficial_napi_release_env(
         void *scope,
         struct uv_loop_s *loop)
     {
@@ -501,14 +489,6 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_stack_limit(napi_env env, void *stack_limit)
-    {
-        (void)stack_limit;
-        if (!napi_util__::check_env(env) || stack_limit == nullptr)
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_get_promise_details(napi_env env,
                                                                napi_value promise,
                                                                int32_t *state_out,
@@ -665,19 +645,6 @@ extern "C"
         return napi_callsite__::get_call_sites(env, frames, callsites_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
-                                                                   uint32_t frames,
-                                                                   napi_value *callsites_out)
-    {
-        return napi_callsite__::get_current_stack_trace(env, frames, callsites_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env,
-                                                               napi_value *location_out)
-    {
-        return napi_callsite__::get_caller_location(env, location_out);
-    }
-
     napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                        napi_value value,
                                                                        bool *result_out)
@@ -707,106 +674,6 @@ extern "C"
         if (JS_IsException(name))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env, name, name_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
-        napi_env env,
-        napi_value value,
-        uint32_t filter_bits,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
-            return napi_invalid_arg;
-        JSContext *ctx = napi_util__::context(env);
-        JSValue obj = napi_quickjs_value_inner(env, value);
-        if (!JS_IsObject(obj))
-            return napi_object_expected;
-
-        auto is_array_index_atom = [&](JSAtom atom) -> bool
-        {
-            size_t len = 0;
-            const char *name = JS_AtomToCStringLen(ctx, &len, atom);
-            if (name == nullptr)
-                return false;
-            bool is_index = false;
-            if (len > 0 && len <= 10)
-            {
-                uint64_t index = 0;
-                is_index = true;
-                for (size_t i = 0; i < len; ++i)
-                {
-                    if (name[i] < '0' || name[i] > '9')
-                    {
-                        is_index = false;
-                        break;
-                    }
-                    if (i == 0 && len > 1 && name[i] == '0')
-                    {
-                        is_index = false;
-                        break;
-                    }
-                    index = index * 10 + static_cast<uint64_t>(name[i] - '0');
-                }
-                if (is_index && index > 4294967294ULL)
-                    is_index = false;
-            }
-            JS_FreeCString(ctx, name);
-            return is_index;
-        };
-
-        int gpn_flags = napi_util__::key_filter_to_gpn(static_cast<napi_key_filter>(filter_bits));
-        JSPropertyEnum *props = nullptr;
-        uint32_t prop_count = 0;
-        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, obj, gpn_flags) < 0)
-            return napi_util__::return_pending_if_caught(env, "Exception while getting property names");
-
-        JSValue out = JS_NewArray(ctx);
-        uint32_t out_idx = 0;
-
-        for (uint32_t i = 0; i < prop_count; ++i)
-        {
-            if (is_array_index_atom(props[i].atom))
-                continue;
-
-            if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
-            {
-                JSPropertyDescriptor desc;
-                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
-                if (has < 0)
-                {
-                    JS_FreePropertyEnum(ctx, props, prop_count);
-                    JS_FreeValue(ctx, out);
-                    return napi_util__::return_pending_if_caught(env, "Exception while filtering property names");
-                }
-                if (has == 0)
-                    continue;
-
-                bool include = true;
-                if ((filter_bits & napi_key_writable) != 0 && (desc.flags & JS_PROP_WRITABLE) == 0)
-                    include = false;
-                if ((filter_bits & napi_key_configurable) != 0 && (desc.flags & JS_PROP_CONFIGURABLE) == 0)
-                    include = false;
-
-                JS_FreeValue(ctx, desc.value);
-                JS_FreeValue(ctx, desc.getter);
-                JS_FreeValue(ctx, desc.setter);
-
-                if (!include)
-                    continue;
-            }
-
-            JSValue key = JS_AtomToValue(ctx, props[i].atom);
-            if (JS_IsException(key))
-            {
-                JS_FreePropertyEnum(ctx, props, prop_count);
-                JS_FreeValue(ctx, out);
-                return napi_util__::return_pending_if_caught(env, "Failed to convert property name");
-            }
-            JS_SetPropertyUint32(ctx, out, out_idx++, key);
-        }
-
-        JS_FreePropertyEnum(ctx, props, prop_count);
-        return napi_util__::wrap_owned(env, out, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
@@ -876,14 +743,6 @@ extern "C"
     }
 
     napi_status NAPI_CDECL unofficial_napi_structured_clone(
-        napi_env env,
-        napi_value value,
-        napi_value *result_out)
-    {
-        return QuickJSStructuredClone(env, value, nullptr, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
         napi_env env,
         napi_value value,
         napi_value transfer_list_or_null,
@@ -1299,13 +1158,6 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_dispose_context(
-        napi_env env,
-        napi_value sandbox_or_context_global)
-    {
-        return napi_util__::check_env(env) ? env->contextify().dispose_context(sandbox_or_context_global) : napi_invalid_arg;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
         napi_env env,
         const unofficial_napi_js_source *source,
@@ -1583,17 +1435,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return env->module_wrap().set_initialize_import_meta_object_callback(callback);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_import_module_dynamically(
-        napi_env env,
-        size_t argc,
-        napi_value *argv,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().import_module_dynamically(argc, argv, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(

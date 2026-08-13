@@ -37,7 +37,7 @@ inline std::unique_ptr<NapiTestRuntime> FixtureTestBase::runtime_;
 struct EnvScope {
   explicit EnvScope(NapiTestRuntime* runtime) {
     (void)runtime;
-    EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &env, &scope),
+    EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, nullptr, &env, &scope),
               napi_ok);
     EXPECT_NE(env, nullptr);
     EXPECT_NE(scope, nullptr);
@@ -45,7 +45,7 @@ struct EnvScope {
 
   ~EnvScope() {
     if (scope != nullptr) {
-      EXPECT_EQ(unofficial_napi_release_env(scope), napi_ok);
+      EXPECT_EQ(unofficial_napi_release_env(scope, nullptr), napi_ok);
       scope = nullptr;
       env = nullptr;
     }

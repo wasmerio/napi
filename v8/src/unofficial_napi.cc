@@ -1794,10 +1794,6 @@ napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* 
   return napi_ok;
 }
 
-void* unofficial_napi_get_edge_environment(napi_env env) {
-  return env == nullptr ? nullptr : env->edge_environment;
-}
-
 napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
     napi_env env,
     unofficial_napi_env_cleanup_callback callback,
@@ -1830,7 +1826,7 @@ napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
+static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   if (env->env_cleanup_callback != nullptr) {
     env->env_cleanup_callback(env, env->env_cleanup_callback_data);
@@ -1934,12 +1930,6 @@ napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_stack_limit(napi_env env, void* stack_limit) {
-  if (env == nullptr || env->isolate == nullptr || stack_limit == nullptr) return napi_invalid_arg;
-  env->isolate->SetStackLimit(reinterpret_cast<uintptr_t>(stack_limit));
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
                                                            napi_value* result) {
@@ -1948,14 +1938,7 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
-                                                  napi_env* env_out,
-                                                  void** scope_out) {
-  return unofficial_napi_create_env_with_options(
-      module_api_version, nullptr, env_out, scope_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
+napi_status NAPI_CDECL unofficial_napi_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
@@ -2059,7 +2042,7 @@ napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
-    status = unofficial_napi_destroy_env_instance(scope->env);
+    status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }
 
@@ -2085,12 +2068,8 @@ napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
   return status;
 }
 
-napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
-  return ReleaseEnvScope(scope_ptr, nullptr);
-}
-
-napi_status NAPI_CDECL unofficial_napi_release_env_with_loop(void* scope_ptr,
-                                                             struct uv_loop_s* loop) {
+napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr,
+                                                   struct uv_loop_s* loop) {
   return ReleaseEnvScope(scope_ptr, static_cast<void*>(loop));
 }
 
@@ -2276,18 +2255,6 @@ napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) 
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_pending_exception(napi_env env,
-                                                             napi_value error) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
-    return napi_invalid_arg;
-  }
-  env->last_exception.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
-  env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(error));
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(
     napi_env env,
     unofficial_napi_interrupt_callback callback,
@@ -2324,16 +2291,9 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
 napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
+    napi_value transfer_list_or_null,
     napi_value* result_out) {
-  return StructuredCloneImpl(env, value, nullptr, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
-    napi_env env,
-    napi_value value,
-    napi_value transfer_list,
-    napi_value* result_out) {
-  return StructuredCloneImpl(env, value, transfer_list, result_out);
+  return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_serialize_value(
@@ -2719,39 +2679,6 @@ napi_status NAPI_CDECL unofficial_napi_get_call_sites(napi_env env,
   return GetCallSitesImpl(env, frames, 1, callsites_out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
-                                                               uint32_t frames,
-                                                               napi_value* callsites_out) {
-  return GetCallSitesImpl(env, frames, 0, callsites_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_value* location_out) {
-  if (env == nullptr || env->isolate == nullptr || location_out == nullptr) return napi_invalid_arg;
-  *location_out = nullptr;
-
-  v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope scope(isolate);
-
-  v8::Local<v8::StackTrace> trace = v8::StackTrace::CurrentStackTrace(isolate, 2);
-  if (trace->GetFrameCount() != 2) {
-    return napi_ok;
-  }
-
-  v8::Local<v8::StackFrame> frame = trace->GetFrame(isolate, 1);
-  v8::Local<v8::Value> file = frame->GetScriptNameOrSourceURL();
-  if (file.IsEmpty()) {
-    return napi_ok;
-  }
-  v8::Local<v8::Value> values[] = {
-      v8::Integer::New(isolate, frame->GetLineNumber()),
-      v8::Integer::New(isolate, frame->GetColumn()),
-      file,
-  };
-  v8::Local<v8::Array> location = v8::Array::New(isolate, values, 3);
-  *location_out = napi_v8_wrap_value(env, scope.Escape(location));
-  return *location_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                    napi_value value,
                                                                    bool* result_out) {
@@ -2771,29 +2698,6 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   v8::Local<v8::String> name = raw.As<v8::Object>()->GetConstructorName();
   *name_out = napi_v8_wrap_value(env, name);
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
-    napi_env env,
-    napi_value value,
-    uint32_t filter_bits,
-    napi_value* result_out) {
-  if (env == nullptr || value == nullptr || result_out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
-
-  v8::Local<v8::Array> properties;
-  if (!raw.As<v8::Object>()
-           ->GetPropertyNames(env->context(),
-                              v8::KeyCollectionMode::kOwnOnly,
-                              static_cast<v8::PropertyFilter>(filter_bits),
-                              v8::IndexFilter::kSkipIndices)
-           .ToLocal(&properties)) {
-    return napi_generic_failure;
-  }
-
-  *result_out = napi_v8_wrap_value(env, properties);
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,

@@ -93,7 +93,7 @@ int main(void) {
 
   napi_env env2 = NULL;
   void* env2_scope = NULL;
-  NAPI_CALL(env, unofficial_napi_create_env(8, &env2, &env2_scope));
+  NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &env2, &env2_scope));
   CHECK_OR_FAIL(env2 != NULL && env2_scope != NULL,
                 "failed to create the second N-API environment");
 
@@ -111,7 +111,7 @@ int main(void) {
   NAPI_CALL(env, RunInt32Script(
                      env, "globalThis.__napi_env_isolation_marker", &marker));
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
-  NAPI_CALL(env, unofficial_napi_release_env(env2_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
 
   // Every code-generation path must select its execution scope explicitly.
   // In particular, vm compile-function and module compilation must honor the
@@ -457,7 +457,7 @@ int main(void) {
   void* finalizer_env_scope = NULL;
   NAPI_CALL(env,
             unofficial_napi_create_env(
-                8, &finalizer_env, &finalizer_env_scope));
+                8, NULL, &finalizer_env, &finalizer_env_scope));
   napi_value wrapped_object;
   napi_value finalized_object;
   NAPI_CALL(finalizer_env,
@@ -478,7 +478,7 @@ int main(void) {
                                CountAddedFinalizer,
                                (void*)(uintptr_t)0x22,
                                NULL));
-  NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope, NULL));
   CHECK_OR_FAIL(wrap_finalizer_count == 1 && add_finalizer_count == 1,
                 "guest finalizers were not dispatched exactly once");
 
@@ -488,7 +488,7 @@ int main(void) {
   // state.
   napi_env lease_env = NULL;
   void* lease_env_scope = NULL;
-  NAPI_CALL(env, unofficial_napi_create_env(8, &lease_env, &lease_env_scope));
+  NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &lease_env, &lease_env_scope));
   napi_value abandoned_script;
   napi_value abandoned_value;
   NAPI_CALL(lease_env,
@@ -511,7 +511,7 @@ int main(void) {
                 &abandoned_data));
   CHECK_OR_FAIL(abandoned_lease != NULL && abandoned_data != NULL,
                 "failed to acquire teardown lease");
-  NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope, NULL));
 
   return PrintSuccess("RUN_SCRIPT_TEST");
 }

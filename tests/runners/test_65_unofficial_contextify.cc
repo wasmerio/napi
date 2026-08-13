@@ -49,7 +49,7 @@ napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
 
 }  // namespace
 
-TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
+TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
   EnvScope s(runtime_.get());
 
   napi_value sandbox = nullptr;
@@ -94,21 +94,6 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
   ASSERT_EQ(napi_get_value_int32(s.env, answer_value, &answer), napi_ok);
   EXPECT_EQ(answer, 42);
 
-  ASSERT_EQ(unofficial_napi_contextify_dispose_context(s.env, sandbox), napi_ok);
-  const unofficial_napi_js_source disposed_source{Str(s.env, "1"), nullptr};
-  EXPECT_EQ(unofficial_napi_contextify_run_script(s.env,
-                                                  sandbox,
-                                                  &disposed_source,
-                                                  Str(s.env, "after_dispose.js"),
-                                                  0,
-                                                  0,
-                                                  -1,
-                                                  true,
-                                                  false,
-                                                  false,
-                                                  Sym(s.env, "hdo"),
-                                                  &eval_result),
-            napi_invalid_arg);
 }
 
 TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze) {
