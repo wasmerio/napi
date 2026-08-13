@@ -3578,13 +3578,65 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_mark_promise_as_handled(
     let _ = (env, promise_id);
     NAPI_GENERIC_FAILURE
 }
+
+fn host_heap_sizes() -> (u64, u64, u64) {
+    fn metric(memory: &JsValue, name: &str) -> u64 {
+        Reflect::get(memory, &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.min(u64::MAX as f64) as u64)
+            .unwrap_or(0)
+    }
+
+    let global = js_sys::global();
+    let memory = Reflect::get(&global, &JsValue::from_str("performance"))
+        .ok()
+        .and_then(|performance| Reflect::get(&performance, &JsValue::from_str("memory")).ok())
+        .unwrap_or(JsValue::UNDEFINED);
+    let used = metric(&memory, "usedJSHeapSize");
+    let total = metric(&memory, "totalJSHeapSize").max(used);
+    // `performance.memory` is Chromium-specific. When the host does not expose
+    // it, report an unknown-but-nonzero ceiling instead of zero: Node consumers
+    // interpret zero as an exhausted heap and may terminate healthy workers.
+    let limit = metric(&memory, "jsHeapSizeLimit")
+        .max(total)
+        .max(u64::from(u32::MAX));
+    (total, used, limit)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_statistics(
     env: SnapiEnv,
     stats_out: *mut SnapiUnofficialHeapStatistics,
 ) -> i32 {
-    let _ = (env, stats_out);
-    NAPI_GENERIC_FAILURE
+    if stats_out.is_null() || (unsafe { env_mut(env) }).is_err() {
+        return NAPI_INVALID_ARG;
+    }
+    let (total, used, limit) = host_heap_sizes();
+    unsafe {
+        ptr::write(
+            stats_out,
+            SnapiUnofficialHeapStatistics {
+                total_heap_size: total,
+                total_heap_size_executable: 0,
+                total_physical_size: total,
+                total_available_size: limit.saturating_sub(used),
+                used_heap_size: used,
+                heap_size_limit: limit,
+                does_zap_garbage: 0,
+                malloced_memory: used,
+                peak_malloced_memory: used,
+                number_of_native_contexts: 1,
+                number_of_detached_contexts: 0,
+                total_global_handles_size: 0,
+                used_global_handles_size: 0,
+                external_memory: 0,
+                array_buffer_memory: 0,
+            },
+        );
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_space_statistics(
@@ -3593,16 +3645,54 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_space_statistics(
     capacity: u32,
     count_out: *mut u32,
 ) -> i32 {
-    let _ = (env, stats_out, capacity, count_out);
-    NAPI_GENERIC_FAILURE
+    if count_out.is_null()
+        || (capacity > 0 && stats_out.is_null())
+        || (unsafe { env_mut(env) }).is_err()
+    {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe { ptr::write(count_out, 1) };
+    if capacity == 0 {
+        return NAPI_OK;
+    }
+
+    let (total, used, limit) = host_heap_sizes();
+    let mut space_name = [0; 64];
+    space_name[.."host_js".len()].copy_from_slice(b"host_js");
+    unsafe {
+        ptr::write(
+            stats_out,
+            SnapiUnofficialHeapSpaceStatistics {
+                space_name,
+                space_size: total,
+                space_used_size: used,
+                space_available_size: limit.saturating_sub(used),
+                physical_space_size: total,
+            },
+        );
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_code_statistics(
     env: SnapiEnv,
     stats_out: *mut SnapiUnofficialHeapCodeStatistics,
 ) -> i32 {
-    let _ = (env, stats_out);
-    NAPI_GENERIC_FAILURE
+    if stats_out.is_null() || (unsafe { env_mut(env) }).is_err() {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe {
+        ptr::write(
+            stats_out,
+            SnapiUnofficialHeapCodeStatistics {
+                code_and_metadata_size: 0,
+                bytecode_and_metadata_size: 0,
+                external_script_source_size: 0,
+                cpu_profiler_metadata_size: 0,
+            },
+        );
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_profile_start(
