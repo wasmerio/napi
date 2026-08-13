@@ -4125,64 +4125,30 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_namespace(SnapiEnvState* 
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_module_wrap_get_status(SnapiEnvState* env_state,
-                                                              uint32_t handle_id,
-                                                              int32_t* status_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  void* handle = LoadModuleWrapHandle(*bridge_state, handle_id);
-  if (handle == nullptr) return napi_invalid_arg;
-  return unofficial_napi_module_wrap_get_status(env, handle, status_out);
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_get_error(SnapiEnvState* env_state,
-                                                             uint32_t handle_id,
-                                                             uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  void* handle = LoadModuleWrapHandle(*bridge_state, handle_id);
-  if (handle == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_module_wrap_get_error(env, handle, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_has_top_level_await(
+extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
     SnapiEnvState* env_state,
     uint32_t handle_id,
-    int* result_out) {
+    int32_t* status_out,
+    uint32_t* error_out,
+    int* has_top_level_await_out,
+    int* has_async_graph_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   void* handle = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (handle == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_module_wrap_has_top_level_await(env, handle, &result);
+  unofficial_napi_module_state state{};
+  napi_status s = unofficial_napi_module_wrap_get_state(env, handle, &state);
   if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = result ? 1 : 0;
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_has_async_graph(SnapiEnvState* env_state,
-                                                                   uint32_t handle_id,
-                                                                   int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  void* handle = LoadModuleWrapHandle(*bridge_state, handle_id);
-  if (handle == nullptr) return napi_invalid_arg;
-  bool result = false;
-  napi_status s = unofficial_napi_module_wrap_has_async_graph(env, handle, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = result ? 1 : 0;
+  if (status_out != nullptr) *status_out = state.status;
+  if (error_out != nullptr) *error_out = StoreValue(*bridge_state, state.error);
+  if (has_top_level_await_out != nullptr) {
+    *has_top_level_await_out = state.has_top_level_await ? 1 : 0;
+  }
+  if (has_async_graph_out != nullptr) {
+    *has_async_graph_out = state.has_async_graph ? 1 : 0;
+  }
   return napi_ok;
 }
 

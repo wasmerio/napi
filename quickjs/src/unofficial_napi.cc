@@ -1190,52 +1190,16 @@ extern "C"
         return env->module_wrap().get_namespace(handle, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_status(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
         napi_env env,
         void *handle,
-        int32_t *status_out)
+        unofficial_napi_module_state *state_out)
     {
-        if (!napi_util__::check_env(env) || status_out == nullptr)
+        if (!napi_util__::check_env(env) || state_out == nullptr)
             return napi_invalid_arg;
         if (handle == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_status(handle, status_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_error(
-        napi_env env,
-        void *handle,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().get_error(handle, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_has_top_level_await(
-        napi_env env,
-        void *handle,
-        bool *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().has_top_level_await(handle, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_has_async_graph(
-        napi_env env,
-        void *handle,
-        bool *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().has_async_graph(handle, result_out);
+        return env->module_wrap().get_state(handle, state_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(

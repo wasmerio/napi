@@ -4661,67 +4661,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_namespace(
     let id = state.insert(namespace.into());
     unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_status(
-    env: SnapiEnv,
-    handle_id: u32,
-    status_out: *mut i32,
-) -> i32 {
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let status = match refresh_module_status(state, handle_id) {
-        Ok(status) => status,
-        Err(error) => return error,
-    };
-    unsafe { write(status_out, status) }.map_or_else(|error| error, |()| NAPI_OK)
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_error(
-    env: SnapiEnv,
-    handle_id: u32,
-    result_out: *mut u32,
-) -> i32 {
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    if !state.synthetic_modules.contains_key(&handle_id)
-        && !state.source_text_modules.contains_key(&handle_id)
-    {
-        return NAPI_INVALID_ARG;
-    }
-    let error = state
-        .synthetic_modules
-        .get(&handle_id)
-        .and_then(|module| module.error.clone())
-        .or_else(|| {
-            state
-                .source_text_modules
-                .get(&handle_id)
-                .and_then(|module| module.error.clone())
-        })
-        .unwrap_or(JsValue::UNDEFINED);
-    let id = state.insert(error);
-    unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_has_top_level_await(
-    env: SnapiEnv,
-    handle_id: u32,
-    result_out: *mut i32,
-) -> i32 {
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let result = if state.synthetic_modules.contains_key(&handle_id) {
-        false
-    } else if let Some(module) = state.source_text_modules.get(&handle_id) {
-        module.has_top_level_await
-    } else {
-        return NAPI_INVALID_ARG;
-    };
-    unsafe { write(result_out, i32::from(result)) }.map_or_else(|error| error, |()| NAPI_OK)
-}
 
 fn module_graph_has_top_level_await(
     state: &HostJsEnv,
@@ -4745,18 +4684,60 @@ fn module_graph_has_top_level_await(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_has_async_graph(
+pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
     env: SnapiEnv,
     handle_id: u32,
-    result_out: *mut i32,
+    status_out: *mut i32,
+    error_out: *mut u32,
+    has_top_level_await_out: *mut i32,
+    has_async_graph_out: *mut i32,
 ) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(result) = module_graph_has_top_level_await(state, handle_id, &mut Vec::new()) else {
+    let status = match refresh_module_status(state, handle_id) {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    let error = state
+        .synthetic_modules
+        .get(&handle_id)
+        .and_then(|module| module.error.clone())
+        .or_else(|| {
+            state
+                .source_text_modules
+                .get(&handle_id)
+                .and_then(|module| module.error.clone())
+        })
+        .unwrap_or(JsValue::UNDEFINED);
+    let has_top_level_await = if state.synthetic_modules.contains_key(&handle_id) {
+        false
+    } else if let Some(module) = state.source_text_modules.get(&handle_id) {
+        module.has_top_level_await
+    } else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { write(result_out, i32::from(result)) }.map_or_else(|error| error, |()| NAPI_OK)
+    let Some(has_async_graph) = module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+    else {
+        return NAPI_INVALID_ARG;
+    };
+    let error_id = state.insert(error);
+    for result in [
+        unsafe { write(status_out, status) },
+        unsafe { write(error_out, error_id) },
+        unsafe { write(has_top_level_await_out, i32::from(has_top_level_await)) },
+        unsafe {
+            write(
+                has_async_graph_out,
+                i32::from(status >= 2 && has_async_graph),
+            )
+        },
+    ] {
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(

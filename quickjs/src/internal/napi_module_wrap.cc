@@ -759,71 +759,46 @@ napi_status napi_module_wrap__::get_namespace(void *handle, napi_value *result_o
   return wrap_owned(ns, result_out);
 }
 
-napi_status napi_module_wrap__::get_status(void *handle, int32_t *status_out)
+napi_status napi_module_wrap__::get_state(void *handle,
+                                          unofficial_napi_module_state *state_out)
 {
   record *entry = find(handle);
-  if (entry == nullptr || status_out == nullptr)
+  if (entry == nullptr || state_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
   JSValue error = JS_GetModuleEvaluationException(ctx_, entry->module);
   const bool has_error = !JS_IsUndefined(error);
-  JS_FreeValue(ctx_, error);
   if (has_error)
   {
-    *status_out = kErrored;
-    return napi_ok;
+    state_out->status = kErrored;
   }
-
-  switch (JS_GetModuleStatus(ctx_, entry->module))
+  else
   {
-  case JS_MODULE_STATUS_UNLINKED:
-    *status_out = kUninstantiated;
-    break;
-  case JS_MODULE_STATUS_LINKING:
-    *status_out = kInstantiating;
-    break;
-  case JS_MODULE_STATUS_LINKED:
-    *status_out = kInstantiated;
-    break;
-  case JS_MODULE_STATUS_EVALUATING:
-  case JS_MODULE_STATUS_EVALUATING_ASYNC:
-    *status_out = kEvaluating;
-    break;
-  case JS_MODULE_STATUS_EVALUATED:
-    *status_out = kEvaluated;
-    break;
+    switch (JS_GetModuleStatus(ctx_, entry->module))
+    {
+    case JS_MODULE_STATUS_UNLINKED:
+      state_out->status = kUninstantiated;
+      break;
+    case JS_MODULE_STATUS_LINKING:
+      state_out->status = kInstantiating;
+      break;
+    case JS_MODULE_STATUS_LINKED:
+      state_out->status = kInstantiated;
+      break;
+    case JS_MODULE_STATUS_EVALUATING:
+    case JS_MODULE_STATUS_EVALUATING_ASYNC:
+      state_out->status = kEvaluating;
+      break;
+    case JS_MODULE_STATUS_EVALUATED:
+      state_out->status = kEvaluated;
+      break;
+    }
   }
-  return napi_ok;
-}
-
-napi_status napi_module_wrap__::get_error(void *handle, napi_value *result_out)
-{
-  record *entry = find(handle);
-  if (entry == nullptr || result_out == nullptr)
-    return napi_util__::invalid_arg(env_);
-  JSValue error = JS_GetModuleEvaluationException(ctx_, entry->module);
-  return wrap_owned(error, result_out);
-}
-
-napi_status napi_module_wrap__::has_top_level_await(void *handle, bool *result_out)
-{
-  record *entry = find(handle);
-  if (entry == nullptr || result_out == nullptr)
-    return napi_util__::invalid_arg(env_);
-  *result_out = JS_ModuleHasTopLevelAwait(ctx_, entry->module);
-  return napi_ok;
-}
-
-napi_status napi_module_wrap__::has_async_graph(void *handle, bool *result_out)
-{
-  record *entry = find(handle);
-  if (entry == nullptr || result_out == nullptr)
-    return napi_util__::invalid_arg(env_);
-  JSModuleStatusEnum status = JS_GetModuleStatus(ctx_, entry->module);
-  if (status == JS_MODULE_STATUS_UNLINKED || status == JS_MODULE_STATUS_LINKING)
-    return throw_error("ERR_MODULE_NOT_INSTANTIATED", "Module has not been instantiated");
-  *result_out = JS_ModuleHasAsyncGraph(ctx_, entry->module);
-  return napi_ok;
+  state_out->has_top_level_await = JS_ModuleHasTopLevelAwait(ctx_, entry->module);
+  state_out->has_async_graph =
+      state_out->status >= kInstantiated &&
+      JS_ModuleHasAsyncGraph(ctx_, entry->module);
+  return wrap_owned(error, &state_out->error);
 }
 
 napi_status napi_module_wrap__::check_unsettled_top_level_await(napi_value module_wrap,

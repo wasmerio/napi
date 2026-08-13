@@ -48,10 +48,7 @@ public:
                             napi_value parent_filename,
                             napi_value *result_out);
   napi_status get_namespace(void *handle, napi_value *result_out);
-  napi_status get_status(void *handle, int32_t *status_out);
-  napi_status get_error(void *handle, napi_value *result_out);
-  napi_status has_top_level_await(void *handle, bool *result_out);
-  napi_status has_async_graph(void *handle, bool *result_out);
+  napi_status get_state(void *handle, unofficial_napi_module_state *state_out);
   napi_status check_unsettled_top_level_await(napi_value module_wrap,
                                               bool warnings,
                                               bool *settled_out);

@@ -267,6 +267,49 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
 }
 
+TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
+  EnvScope s(runtime_.get());
+
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "export const value = 42;"));
+  void* module = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_create_source_text(s.env,
+                                                           wrapper,
+                                                           Str(s.env, "state.mjs"),
+                                                           undefined,
+                                                           &source,
+                                                           0,
+                                                           0,
+                                                           undefined,
+                                                           &module),
+            napi_ok);
+  ASSERT_NE(module, nullptr);
+
+  unofficial_napi_module_state state{};
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
+  EXPECT_EQ(state.status, 0);
+  EXPECT_FALSE(state.has_top_level_await);
+  EXPECT_FALSE(state.has_async_graph);
+  ASSERT_NE(state.error, nullptr);
+  napi_valuetype error_type = napi_object;
+  ASSERT_EQ(napi_typeof(s.env, state.error, &error_type), napi_ok);
+  EXPECT_EQ(error_type, napi_undefined);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+  state = {};
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
+  EXPECT_EQ(state.status, 2);
+  EXPECT_FALSE(state.has_top_level_await);
+  EXPECT_FALSE(state.has_async_graph);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 // V8 stores the host-defined-options block in each compiled function's
 // ScriptOrigin. This regression covers the V8 bytecode fast path changed in

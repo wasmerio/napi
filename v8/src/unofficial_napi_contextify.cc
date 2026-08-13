@@ -2774,51 +2774,26 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_get_status(
+napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
     napi_env env,
     void* handle,
-    int32_t* status_out) {
-  if (env == nullptr || handle == nullptr || status_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
-  *status_out = static_cast<int32_t>(record->module.Get(env->isolate)->GetStatus());
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_module_wrap_get_error(
-    napi_env env,
-    void* handle,
-    napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+    unofficial_napi_module_state* state_out) {
+  if (env == nullptr || handle == nullptr || state_out == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
-  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(record->module.Get(isolate)->GetException()));
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_module_wrap_has_top_level_await(
-    napi_env env,
-    void* handle,
-    bool* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
-  *result_out = record->module.Get(env->isolate)->HasTopLevelAwait();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_module_wrap_has_async_graph(
-    napi_env env,
-    void* handle,
-    bool* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
   v8::Local<v8::Module> module = record->module.Get(env->isolate);
-  if (module->GetStatus() < v8::Module::Status::kInstantiated) {
-    ThrowCodeError(env, "ERR_MODULE_NOT_INSTANTIATED", "Module is not instantiated");
-    return napi_pending_exception;
-  }
-  *result_out = module->IsGraphAsync();
-  return napi_ok;
+  const v8::Module::Status status = module->GetStatus();
+  state_out->status = static_cast<int32_t>(status);
+  state_out->has_top_level_await = module->HasTopLevelAwait();
+  state_out->has_async_graph =
+      status >= v8::Module::Status::kInstantiated && module->IsGraphAsync();
+  v8::Local<v8::Value> error =
+      status == v8::Module::Status::kErrored
+          ? module->GetException()
+          : v8::Undefined(isolate).As<v8::Value>();
+  state_out->error = napi_v8_wrap_value(env, handle_scope.Escape(error));
+  return state_out->error != nullptr ? napi_ok : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(

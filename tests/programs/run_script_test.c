@@ -246,9 +246,26 @@ int main(void) {
                      &module_handle));
   CHECK_OR_FAIL(module_handle != NULL,
                 "module compilation did not return a handle");
+  unofficial_napi_module_state module_state = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
+                     env, module_handle, &module_state));
+  CHECK_OR_FAIL(module_state.status == 0,
+                "new module snapshot did not report uninstantiated status");
+  CHECK_OR_FAIL(module_state.error != NULL,
+                "module snapshot did not return an undefined error value");
+  CHECK_OR_FAIL(!module_state.has_top_level_await,
+                "synchronous module reported top-level await");
+  CHECK_OR_FAIL(!module_state.has_async_graph,
+                "uninstantiated module reported an async graph");
   NAPI_CALL(env, unofficial_napi_module_wrap_link(
                      env, module_handle, 0, NULL));
   NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module_handle));
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
+                     env, module_handle, &module_state));
+  CHECK_OR_FAIL(module_state.status == 2,
+                "instantiated module snapshot reported the wrong status");
+  CHECK_OR_FAIL(!module_state.has_async_graph,
+                "synchronous module reported an async graph");
   napi_value module_result;
   NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
                      env,

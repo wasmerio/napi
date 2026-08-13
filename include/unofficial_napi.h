@@ -630,25 +630,20 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_namespa
     void* handle,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_status(
-    napi_env env,
-    void* handle,
-    int32_t* status_out);
+typedef struct {
+  int32_t status;
+  napi_value error;
+  bool has_top_level_await;
+  bool has_async_graph;
+} unofficial_napi_module_state;
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_error(
+// Returns one immutable observation of the provider-owned module record.
+// has_async_graph is false before instantiation; callers use status to decide
+// whether that field is observable through Node's module_wrap contract.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_state(
     napi_env env,
     void* handle,
-    napi_value* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_has_top_level_await(
-    napi_env env,
-    void* handle,
-    bool* result_out);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_has_async_graph(
-    napi_env env,
-    void* handle,
-    bool* result_out);
+    unofficial_napi_module_state* state_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_check_unsettled_top_level_await(
     napi_env env,

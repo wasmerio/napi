@@ -394,25 +394,13 @@ unsafe extern "C" {
         handle_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_get_status(
+    pub fn snapi_bridge_unofficial_module_wrap_get_state(
         env: SnapiEnv,
         handle_id: u32,
         status_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_get_error(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_has_top_level_await(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_has_async_graph(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut i32,
+        error_out: *mut u32,
+        has_top_level_await_out: *mut i32,
+        has_async_graph_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
         env: SnapiEnv,

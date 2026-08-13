@@ -2101,74 +2101,33 @@ fn guest_unofficial_napi_module_wrap_get_namespace(
     status
 }
 
-fn guest_unofficial_napi_module_wrap_get_status(
+fn guest_unofficial_napi_module_wrap_get_state(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
-    status_ptr: i32,
+    state_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut status_val = 0i32;
+    let mut error_id = 0u32;
+    let mut has_top_level_await = 0i32;
+    let mut has_async_graph = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_status(env_handle, handle as u32, &mut status_val)
-    };
-    if status == 0 && status_ptr > 0 {
-        write_guest_i32(&mut env, status_ptr as u32, status_val);
-    }
-    status
-}
-
-fn guest_unofficial_napi_module_wrap_get_error(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    handle: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_error(env_handle, handle as u32, &mut result_id)
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
-}
-
-fn guest_unofficial_napi_module_wrap_has_top_level_await(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    handle: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result = 0i32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_has_top_level_await(
+        snapi_bridge_unofficial_module_wrap_get_state(
             env_handle,
             handle as u32,
-            &mut result,
+            &mut status_val,
+            &mut error_id,
+            &mut has_top_level_await,
+            &mut has_async_graph,
         )
     };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
-    }
-    status
-}
-
-fn guest_unofficial_napi_module_wrap_has_async_graph(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    handle: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result = 0i32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_has_async_graph(env_handle, handle as u32, &mut result)
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
+    if status == 0 && state_ptr > 0 {
+        let state_ptr = state_ptr as u32;
+        write_guest_i32(&mut env, state_ptr, status_val);
+        write_guest_u32(&mut env, state_ptr + 4, error_id);
+        write_guest_u8(&mut env, state_ptr + 8, (has_top_level_await != 0) as u8);
+        write_guest_u8(&mut env, state_ptr + 9, (has_async_graph != 0) as u8);
     }
     status
 }
@@ -6182,10 +6141,7 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_evaluate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate),
         "unofficial_napi_module_wrap_evaluate_sync" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate_sync),
         "unofficial_napi_module_wrap_get_namespace" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_namespace),
-        "unofficial_napi_module_wrap_get_status" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_status),
-        "unofficial_napi_module_wrap_get_error" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_error),
-        "unofficial_napi_module_wrap_has_top_level_await" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_has_top_level_await),
-        "unofficial_napi_module_wrap_has_async_graph" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_has_async_graph),
+        "unofficial_napi_module_wrap_get_state" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_state),
         "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_check_unsettled_top_level_await),
         "unofficial_napi_module_wrap_set_export" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_export),
         "unofficial_napi_module_wrap_set_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_module_source_object),
