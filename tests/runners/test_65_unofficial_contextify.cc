@@ -322,7 +322,6 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   unofficial_napi_module_state state{};
   ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
   EXPECT_EQ(state.status, 0);
-  EXPECT_FALSE(state.has_top_level_await);
   EXPECT_FALSE(state.has_async_graph);
   ASSERT_NE(state.error, nullptr);
   napi_valuetype error_type = napi_object;
@@ -334,7 +333,6 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   state = {};
   ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
   EXPECT_EQ(state.status, 2);
-  EXPECT_FALSE(state.has_top_level_await);
   EXPECT_FALSE(state.has_async_graph);
 
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);

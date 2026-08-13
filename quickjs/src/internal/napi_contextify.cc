@@ -639,7 +639,8 @@ namespace quickjs::detail
         std::memset(out, 0, sizeof(*out));
         if (mode == unofficial_napi_error_metadata_take_preserved)
             return napi_ok;
-        if (mode != unofficial_napi_error_metadata_current)
+        if (mode != unofficial_napi_error_metadata_current &&
+            mode != unofficial_napi_error_metadata_positions_only)
             return napi_invalid_arg;
 
         out->line_number = -1;
@@ -652,7 +653,13 @@ namespace quickjs::detail
         out->source_line = empty;
         out->script_resource_name = empty;
 
-        JSValue value = JS_GetPropertyStr(ctx_, napi_quickjs_value_inner(env_, error), "node:arrowMessage");
+        if (mode == unofficial_napi_error_metadata_positions_only)
+            return napi_ok;
+
+        JSValueConst raw_error = napi_quickjs_value_inner(env_, error);
+        if (!JS_IsObject(raw_error))
+            return napi_util__::create_undefined(env_, &out->stderr_line);
+        JSValue value = JS_GetPropertyStr(ctx_, raw_error, "node:arrowMessage");
         if (JS_IsException(value))
             return napi_pending_exception;
         if (JS_IsUndefined(value))
@@ -752,9 +759,7 @@ namespace quickjs::detail
         if (!napi_util__::check_env(env_) ||
             !unofficial_napi_js_source_is_valid(source) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
-                                    ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
-                                    : nullptr;
+        auto *bytecode_record = napi_bytecode_record_from_source(source);
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
@@ -858,9 +863,7 @@ namespace quickjs::detail
             !unofficial_napi_js_source_is_valid(source) || result_out == nullptr)
             return napi_invalid_arg;
 
-        auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
-                                    ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
-                                    : nullptr;
+        auto *bytecode_record = napi_bytecode_record_from_source(source);
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function)
             return napi_invalid_arg;

@@ -461,9 +461,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
       module_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
-                              ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
-                              : nullptr;
+  auto *bytecode_record = napi_bytecode_record_from_source(source);
   if (bytecode_record != nullptr &&
       bytecode_record->shape != unofficial_napi_bytecode_shape_module)
     return napi_util__::invalid_arg(env_);
@@ -798,7 +796,6 @@ napi_status napi_module_wrap__::get_state(unofficial_napi_module module,
       break;
     }
   }
-  state_out->has_top_level_await = JS_ModuleHasTopLevelAwait(ctx_, entry->module);
   state_out->has_async_graph =
       state_out->status >= kInstantiated &&
       JS_ModuleHasAsyncGraph(ctx_, entry->module);

@@ -8,6 +8,7 @@ const JS_SOURCE_SIZE: usize = 12;
 const BYTECODE_OPEN_SIZE: usize = 48;
 const MODULE_CREATE_PREFIX_SIZE: usize = 40;
 const MODULE_HOOKS_SIZE: usize = 16;
+const ENV_HOOKS_SIZE: usize = 40;
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -163,4 +164,12 @@ pub(crate) fn read_module_hooks(
 ) -> Option<(u32, u32)> {
     let bytes = read_versioned(env, guest_ptr, MODULE_HOOKS_SIZE, 1)?;
     Some((u32_at(&bytes, 8)?, u32_at(&bytes, 12)?))
+}
+
+pub(crate) fn read_env_hooks(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<(u32, u32)> {
+    let bytes = read_versioned(env, guest_ptr, ENV_HOOKS_SIZE, 1)?;
+    Some((u32_at(&bytes, 32)?, u32_at(&bytes, 36)?))
 }

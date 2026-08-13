@@ -1107,6 +1107,7 @@ struct HostJsEnv {
     bytecodes: HashMap<u32, HostJsBytecode>,
     synthetic_modules: HashMap<u32, SyntheticModule>,
     source_text_modules: HashMap<u32, SourceTextModule>,
+    embedder_hooks_attached: bool,
 }
 
 struct HostJsBytecode {
@@ -1183,6 +1184,7 @@ impl HostJsEnv {
             bytecodes: HashMap::new(),
             synthetic_modules: HashMap::new(),
             source_text_modules: HashMap::new(),
+            embedder_hooks_attached: false,
         }
     }
 
@@ -3506,10 +3508,17 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     fatal_callback_id: u32,
     oom_callback_id: u32,
 ) -> i32 {
-    let _ = (env, fatal_callback_id, oom_callback_id);
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if state.embedder_hooks_attached {
+        return NAPI_INVALID_ARG;
+    }
+    let _ = (fatal_callback_id, oom_callback_id);
     // JavaScript-hosted execution already runs on the host event loop, and the
     // browser/Node host owns fatal JavaScript and OOM handling. Accept the same
     // single attachment transition without installing embedded-engine hooks.
+    state.embedder_hooks_attached = true;
     NAPI_OK
 }
 #[unsafe(no_mangle)]
@@ -3640,7 +3649,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_metadata(
     line_number_out: *mut i32,
     start_column_out: *mut i32,
     end_column_out: *mut i32,
-    was_preserved_out: *mut i32,
 ) -> i32 {
     let _ = (
         env,
@@ -3653,7 +3661,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_metadata(
         line_number_out,
         start_column_out,
         end_column_out,
-        was_preserved_out,
     );
     NAPI_GENERIC_FAILURE
 }
@@ -4925,7 +4932,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
     handle_id: u32,
     status_out: *mut i32,
     error_out: *mut u32,
-    has_top_level_await_out: *mut i32,
     has_async_graph_out: *mut i32,
 ) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
@@ -4946,13 +4952,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
                 .and_then(|module| module.error.clone())
         })
         .unwrap_or(JsValue::UNDEFINED);
-    let has_top_level_await = if state.synthetic_modules.contains_key(&handle_id) {
-        false
-    } else if let Some(module) = state.source_text_modules.get(&handle_id) {
-        module.has_top_level_await
-    } else {
+    if !state.synthetic_modules.contains_key(&handle_id)
+        && !state.source_text_modules.contains_key(&handle_id)
+    {
         return NAPI_INVALID_ARG;
-    };
+    }
     let Some(has_async_graph) = module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
     else {
         return NAPI_INVALID_ARG;
@@ -4961,7 +4965,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
     for result in [
         unsafe { write(status_out, status) },
         unsafe { write(error_out, error_id) },
-        unsafe { write(has_top_level_await_out, i32::from(has_top_level_await)) },
         unsafe {
             write(
                 has_async_graph_out,

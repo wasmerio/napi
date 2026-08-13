@@ -617,26 +617,13 @@ fn guest_unofficial_napi_attach_env(
     napi_env: i32,
     hooks_ptr: i32,
 ) -> i32 {
-    const HOOKS_SIZE: usize = 40;
-    let Some(bytes) = read_guest_bytes(&mut env, hooks_ptr, HOOKS_SIZE) else {
+    let Some((fatal_id, oom_id)) = abi::read_env_hooks(&mut env, hooks_ptr) else {
         return 1;
     };
-    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) < HOOKS_SIZE as u32
-        || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 1
-        || napi_env <= 0
-        || !env.data_mut().attached_napi_envs.insert(napi_env as u32)
-    {
+    if napi_env <= 0 {
         return 1;
     }
-
-    let fatal_id = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-    let oom_id = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
-    let status =
-        unsafe { snapi_bridge_unofficial_attach_env(snapi_env(&env, napi_env), fatal_id, oom_id) };
-    if status != 0 {
-        env.data_mut().attached_napi_envs.remove(&(napi_env as u32));
-    }
-    status
+    unsafe { snapi_bridge_unofficial_attach_env(snapi_env(&env, napi_env), fatal_id, oom_id) }
 }
 
 fn guest_unofficial_napi_low_memory_notification(
@@ -1289,7 +1276,6 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let mut was_preserved = 0i32;
     let status = unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
@@ -1302,7 +1288,6 @@ fn guest_unofficial_napi_get_error_metadata(
             &mut line_number,
             &mut start_column,
             &mut end_column,
-            &mut was_preserved,
         )
     };
     if status != 0 {
@@ -1316,11 +1301,6 @@ fn guest_unofficial_napi_get_error_metadata(
         write_guest_i32(&mut env, metadata_ptr as u32 + 16, line_number);
         write_guest_i32(&mut env, metadata_ptr as u32 + 20, start_column);
         write_guest_i32(&mut env, metadata_ptr as u32 + 24, end_column);
-        write_guest_u8(
-            &mut env,
-            metadata_ptr as u32 + 28,
-            (was_preserved != 0) as u8,
-        );
     }
     0
 }
@@ -2010,7 +1990,6 @@ fn guest_unofficial_napi_module_wrap_get_state(
     let env_handle = snapi_env(&env, napi_env);
     let mut status_val = 0i32;
     let mut error_id = 0u32;
-    let mut has_top_level_await = 0i32;
     let mut has_async_graph = 0i32;
     let status = unsafe {
         snapi_bridge_unofficial_module_wrap_get_state(
@@ -2018,7 +1997,6 @@ fn guest_unofficial_napi_module_wrap_get_state(
             handle as u32,
             &mut status_val,
             &mut error_id,
-            &mut has_top_level_await,
             &mut has_async_graph,
         )
     };
@@ -2026,8 +2004,7 @@ fn guest_unofficial_napi_module_wrap_get_state(
         let state_ptr = state_ptr as u32;
         write_guest_i32(&mut env, state_ptr, status_val);
         write_guest_u32(&mut env, state_ptr + 4, error_id);
-        write_guest_u8(&mut env, state_ptr + 8, (has_top_level_await != 0) as u8);
-        write_guest_u8(&mut env, state_ptr + 9, (has_async_graph != 0) as u8);
+        write_guest_u8(&mut env, state_ptr + 8, (has_async_graph != 0) as u8);
     }
     status
 }

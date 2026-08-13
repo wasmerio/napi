@@ -425,15 +425,16 @@ napi_status GetErrorMetadata(napi_env env,
   if (mode == unofficial_napi_error_metadata_take_preserved) {
     std::string source_line;
     std::string thrown_at;
-    out->was_preserved =
-        TakePreservedErrorFormattingImpl(env, raw, &source_line, &thrown_at);
-    if (!out->was_preserved) return napi_ok;
+    if (!TakePreservedErrorFormattingImpl(env, raw, &source_line, &thrown_at)) {
+      return napi_ok;
+    }
 
     napi_status status = WrapUtf8String(env, source_line, &out->stderr_line);
     if (status != napi_ok) return status;
     return WrapUtf8String(env, thrown_at, &out->thrown_at);
   }
-  if (mode != unofficial_napi_error_metadata_current) {
+  if (mode != unofficial_napi_error_metadata_current &&
+      mode != unofficial_napi_error_metadata_positions_only) {
     return napi_invalid_arg;
   }
 
@@ -457,6 +458,8 @@ napi_status GetErrorMetadata(napi_env env,
   out->start_column = message->GetStartColumn(context).FromMaybe(0);
   out->end_column =
       message->GetEndColumn(context).FromMaybe(out->start_column + 1);
+
+  if (mode == unofficial_napi_error_metadata_positions_only) return napi_ok;
 
   napi_status status = WrapUtf8String(
       env, GetErrorSourceLineForStderrImpl(env, message), &out->stderr_line);

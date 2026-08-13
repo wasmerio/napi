@@ -3397,8 +3397,7 @@ extern "C" int snapi_bridge_unofficial_get_error_metadata(
     uint32_t* thrown_at_out,
     int32_t* line_number_out,
     int32_t* start_column_out,
-    int32_t* end_column_out,
-    int* was_preserved_out) {
+    int32_t* end_column_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -3428,9 +3427,6 @@ extern "C" int snapi_bridge_unofficial_get_error_metadata(
   if (line_number_out != nullptr) *line_number_out = metadata.line_number;
   if (start_column_out != nullptr) *start_column_out = metadata.start_column;
   if (end_column_out != nullptr) *end_column_out = metadata.end_column;
-  if (was_preserved_out != nullptr) {
-    *was_preserved_out = metadata.was_preserved ? 1 : 0;
-  }
   return napi_ok;
 }
 
@@ -4135,7 +4131,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
     uint32_t handle_id,
     int32_t* status_out,
     uint32_t* error_out,
-    int* has_top_level_await_out,
     int* has_async_graph_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -4148,9 +4143,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
   if (s != napi_ok) return s;
   if (status_out != nullptr) *status_out = state.status;
   if (error_out != nullptr) *error_out = StoreValue(*bridge_state, state.error);
-  if (has_top_level_await_out != nullptr) {
-    *has_top_level_await_out = state.has_top_level_await ? 1 : 0;
-  }
   if (has_async_graph_out != nullptr) {
     *has_async_graph_out = state.has_async_graph ? 1 : 0;
   }

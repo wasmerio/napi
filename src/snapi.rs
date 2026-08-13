@@ -201,7 +201,6 @@ unsafe extern "C" {
         line_number_out: *mut i32,
         start_column_out: *mut i32,
         end_column_out: *mut i32,
-        was_preserved_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_configure_source_maps(
         env: SnapiEnv,
@@ -383,7 +382,6 @@ unsafe extern "C" {
         handle_id: u32,
         status_out: *mut i32,
         error_out: *mut u32,
-        has_top_level_await_out: *mut i32,
         has_async_graph_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(

@@ -228,6 +228,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_promise_details(nap
 typedef enum {
   unofficial_napi_error_metadata_current = 0,
   unofficial_napi_error_metadata_take_preserved = 1,
+  unofficial_napi_error_metadata_positions_only = 2,
 } unofficial_napi_error_metadata_mode;
 
 typedef struct {
@@ -238,7 +239,6 @@ typedef struct {
   int32_t line_number;
   int32_t start_column;
   int32_t end_column;
-  bool was_preserved;
 } unofficial_napi_error_metadata;
 
 // Unofficial helpers for Node-style exception/message parity.
@@ -717,7 +717,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_namespa
 typedef struct {
   int32_t status;
   napi_value error;
-  bool has_top_level_await;
   bool has_async_graph;
 } unofficial_napi_module_state;
 

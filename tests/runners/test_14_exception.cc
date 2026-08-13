@@ -142,7 +142,6 @@ TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
                 unofficial_napi_error_metadata_current,
                 &metadata),
             napi_ok);
-  EXPECT_FALSE(metadata.was_preserved);
   EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
             std::string::npos);
   EXPECT_EQ(unofficial_napi_get_error_metadata(
@@ -162,9 +161,8 @@ TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
                 &metadata),
             napi_ok);
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
-  EXPECT_FALSE(metadata.was_preserved);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
 #else
-  EXPECT_TRUE(metadata.was_preserved);
   EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
             std::string::npos);
 #endif
@@ -176,7 +174,7 @@ TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
                 unofficial_napi_error_metadata_take_preserved,
                 &metadata),
             napi_ok);
-  EXPECT_FALSE(metadata.was_preserved);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
 }
 
 TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorRethrow) {

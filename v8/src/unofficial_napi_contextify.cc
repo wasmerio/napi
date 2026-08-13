@@ -1483,17 +1483,6 @@ BytecodeRecord* BytecodeRecordFromSource(const unofficial_napi_js_source* source
   return reinterpret_cast<BytecodeRecord*>(source->bytecode);
 }
 
-bool IsValidJsSource(const unofficial_napi_js_source* source) {
-  if (source == nullptr) return false;
-  if (source->kind == unofficial_napi_js_source_text) {
-    return source->text != nullptr && source->bytecode == nullptr;
-  }
-  if (source->kind == unofficial_napi_js_source_bytecode) {
-    return source->text == nullptr && source->bytecode != nullptr;
-  }
-  return false;
-}
-
 bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<std::string>* out) {
   out->clear();
   if (IsNullish(env, params_or_undefined)) return true;
@@ -1995,7 +1984,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
     bool break_on_first_line,
     napi_value host_defined_option_id,
     napi_value* result_out) {
-  if (env == nullptr || !IsValidJsSource(source) || filename == nullptr ||
+  if (env == nullptr || !unofficial_napi_js_source_is_valid(source) || filename == nullptr ||
       result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2148,7 +2137,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     napi_value params_or_undefined,
     napi_value host_defined_option_id,
     napi_value* result_out) {
-  if (env == nullptr || !IsValidJsSource(source) || filename == nullptr ||
+  if (env == nullptr || !unofficial_napi_js_source_is_valid(source) || filename == nullptr ||
       result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2381,7 +2370,8 @@ static napi_status CreateSourceTextModule(
     int32_t column_offset,
     napi_value host_defined_option_id,
     unofficial_napi_module* module_out) {
-  if (env == nullptr || wrapper == nullptr || url == nullptr || !IsValidJsSource(source) ||
+  if (env == nullptr || wrapper == nullptr || url == nullptr ||
+      !unofficial_napi_js_source_is_valid(source) ||
       module_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2855,7 +2845,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
   v8::Local<v8::Module> module = record->module.Get(env->isolate);
   const v8::Module::Status status = module->GetStatus();
   state_out->status = static_cast<int32_t>(status);
-  state_out->has_top_level_await = module->HasTopLevelAwait();
   state_out->has_async_graph =
       status >= v8::Module::Status::kInstantiated && module->IsGraphAsync();
   v8::Local<v8::Value> error =
