@@ -170,9 +170,9 @@ void napi_module_wrap__::teardown()
   torn_down_ = true;
 }
 
-napi_module_wrap__::record *napi_module_wrap__::find(void *handle) const
+napi_module_wrap__::record *napi_module_wrap__::find(unofficial_napi_module module) const
 {
-  auto *entry = static_cast<record *>(handle);
+  auto *entry = reinterpret_cast<record *>(module);
   if (entry == nullptr)
     return nullptr;
   for (record *candidate : records_)
@@ -451,14 +451,14 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
                                                    int32_t line_offset,
                                                    int32_t column_offset,
                                                    napi_value host_defined_option_id,
-                                                   void **handle_out)
+                                                   unofficial_napi_module *module_out)
 {
   (void)context_or_undefined;
   (void)column_offset;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !unofficial_napi_js_source_is_valid(source) ||
-      handle_out == nullptr)
+      module_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
   auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
@@ -468,7 +468,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
       bytecode_record->shape != unofficial_napi_bytecode_shape_module)
     return napi_util__::invalid_arg(env_);
 
-  *handle_out = nullptr;
+  *module_out = nullptr;
   std::string url_string = napi_util__::to_utf8(env_, url);
   std::string source_string = bytecode_record != nullptr
                                   ? bytecode_record->source_utf8
@@ -540,7 +540,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceURL",
                     JS_NewString(ctx_, url_string.c_str()));
   JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceMapURL", JS_UNDEFINED);
-  *handle_out = entry;
+  *module_out = reinterpret_cast<unofficial_napi_module>(entry);
   return napi_ok;
 }
 
@@ -549,17 +549,17 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
                                                  napi_value context_or_undefined,
                                                  napi_value export_names,
                                                  napi_value synthetic_eval_steps,
-                                                 void **handle_out)
+                                                 unofficial_napi_module *module_out)
 {
   (void)context_or_undefined;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !napi_util__::check_value(env_, export_names) ||
       !napi_util__::check_value(env_, synthetic_eval_steps) ||
-      handle_out == nullptr)
+      module_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  *handle_out = nullptr;
+  *module_out = nullptr;
   std::string url_string = napi_util__::to_utf8(env_, url);
   JSModuleDef *module = JS_NewCModule(ctx_,
                                       url_string.empty() ? "<synthetic>" : url_string.c_str(),
@@ -594,21 +594,22 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
   entry->synthetic = true;
   records_.push_back(entry);
 
-  *handle_out = entry;
+  *module_out = reinterpret_cast<unofficial_napi_module>(entry);
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::destroy(void *handle)
+napi_status napi_module_wrap__::destroy(unofficial_napi_module module)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry != nullptr)
     free_record(entry);
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::get_module_requests(void *handle, napi_value *result_out)
+napi_status napi_module_wrap__::get_module_requests(unofficial_napi_module module,
+                                                    napi_value *result_out)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
@@ -641,12 +642,12 @@ napi_status napi_module_wrap__::get_module_requests(void *handle, napi_value *re
   return wrap_owned(array, result_out);
 }
 
-napi_status napi_module_wrap__::link(void *handle,
+napi_status napi_module_wrap__::link(unofficial_napi_module module,
                                      size_t count,
-                                     void *const *linked_handles)
+                                     const unofficial_napi_module *linked_modules)
 {
-  record *entry = find(handle);
-  if (entry == nullptr || (count > 0 && linked_handles == nullptr))
+  record *entry = find(module);
+  if (entry == nullptr || (count > 0 && linked_modules == nullptr))
     return napi_util__::invalid_arg(env_);
   if (count != entry->requests.size())
     return throw_error("ERR_MODULE_LINK_MISMATCH", "Module link count mismatch");
@@ -658,7 +659,7 @@ napi_status napi_module_wrap__::link(void *handle,
 
   for (size_t i = 0; i < count; ++i)
   {
-    record *linked = find(linked_handles[i]);
+    record *linked = find(linked_modules[i]);
     if (linked == nullptr)
       return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Linked module is invalid");
 
@@ -688,9 +689,9 @@ napi_status napi_module_wrap__::link(void *handle,
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::instantiate(void *handle)
+napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
   if (JS_LinkModule(ctx_, entry->module) < 0)
@@ -698,14 +699,14 @@ napi_status napi_module_wrap__::instantiate(void *handle)
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::evaluate(void *handle,
+napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
                                          int64_t timeout,
                                          bool break_on_sigint,
                                          napi_value *result_out)
 {
   (void)timeout;
   (void)break_on_sigint;
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
   JSValue promise = JS_EvaluateModule(ctx_, entry->module);
@@ -714,14 +715,14 @@ napi_status napi_module_wrap__::evaluate(void *handle,
   return wrap_owned(promise, result_out);
 }
 
-napi_status napi_module_wrap__::evaluate_sync(void *handle,
+napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
                                               napi_value filename,
                                               napi_value parent_filename,
                                               napi_value *result_out)
 {
   (void)filename;
   (void)parent_filename;
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
@@ -733,7 +734,7 @@ napi_status napi_module_wrap__::evaluate_sync(void *handle,
   if (state == JS_PROMISE_FULFILLED)
   {
     JS_FreeValue(ctx_, promise);
-    return get_namespace(handle, result_out);
+    return get_namespace(module, result_out);
   }
   if (state == JS_PROMISE_REJECTED)
   {
@@ -748,9 +749,10 @@ napi_status napi_module_wrap__::evaluate_sync(void *handle,
                      "require() cannot be used on an ESM graph with top-level await");
 }
 
-napi_status napi_module_wrap__::get_namespace(void *handle, napi_value *result_out)
+napi_status napi_module_wrap__::get_namespace(unofficial_napi_module module,
+                                              napi_value *result_out)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
   JSValue ns = JS_GetModuleNamespace(ctx_, entry->module);
@@ -759,10 +761,10 @@ napi_status napi_module_wrap__::get_namespace(void *handle, napi_value *result_o
   return wrap_owned(ns, result_out);
 }
 
-napi_status napi_module_wrap__::get_state(void *handle,
+napi_status napi_module_wrap__::get_state(unofficial_napi_module module,
                                           unofficial_napi_module_state *state_out)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || state_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
@@ -813,11 +815,11 @@ napi_status napi_module_wrap__::check_unsettled_top_level_await(napi_value modul
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::set_export(void *handle,
+napi_status napi_module_wrap__::set_export(unofficial_napi_module module,
                                            napi_value export_name,
                                            napi_value export_value)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr ||
       !napi_util__::check_value(env_, export_name) ||
       !napi_util__::check_value(env_, export_value))
@@ -837,10 +839,10 @@ napi_status napi_module_wrap__::set_export(void *handle,
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::set_module_source_object(void *handle,
+napi_status napi_module_wrap__::set_module_source_object(unofficial_napi_module module,
                                                          napi_value source_object)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
   JS_FreeValue(ctx_, entry->source_object);
@@ -848,10 +850,10 @@ napi_status napi_module_wrap__::set_module_source_object(void *handle,
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::get_module_source_object(void *handle,
+napi_status napi_module_wrap__::get_module_source_object(unofficial_napi_module module,
                                                          napi_value *result_out)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
   if (JS_IsUndefined(entry->source_object))
@@ -859,7 +861,7 @@ napi_status napi_module_wrap__::get_module_source_object(void *handle,
   return wrap_owned(JS_DupValue(ctx_, entry->source_object), result_out);
 }
 
-napi_status napi_module_wrap__::create_cached_data(void *handle,
+napi_status napi_module_wrap__::create_cached_data(unofficial_napi_module module,
                                                    napi_value *result_out)
 {
   if (result_out == nullptr)
@@ -869,7 +871,7 @@ napi_status napi_module_wrap__::create_cached_data(void *handle,
   // An evaluated module's function bytecode is gone; fall back to an empty
   // buffer in that case, matching the V8 provider's empty-cache behavior.
   std::vector<uint8_t> bytes;
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry != nullptr && !entry->synthetic && !JS_IsUndefined(entry->module_value))
   {
     size_t serialized_size = 0;
@@ -986,10 +988,10 @@ bool napi_module_wrap__::has_pending_provider_work()
   return !pending_dynamic_imports_.empty();
 }
 
-napi_status napi_module_wrap__::create_required_module_facade(void *handle,
+napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_module module,
                                                               napi_value *result_out)
 {
-  record *entry = find(handle);
+  record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 

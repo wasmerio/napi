@@ -233,7 +233,7 @@ int main(void) {
                      &module_source_text));
   const unofficial_napi_js_source module_source =
       unofficial_napi_js_source_from_text(module_source_text);
-  void* module_handle = NULL;
+  unofficial_napi_module module = NULL;
   NAPI_CALL(env, unofficial_napi_module_wrap_create_source_text(
                      env,
                      module_wrapper,
@@ -243,12 +243,12 @@ int main(void) {
                      0,
                      0,
                      undefined_value,
-                     &module_handle));
-  CHECK_OR_FAIL(module_handle != NULL,
+                     &module));
+  CHECK_OR_FAIL(module != NULL,
                 "module compilation did not return a handle");
   unofficial_napi_module_state module_state = {0};
   NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env, module_handle, &module_state));
+                     env, module, &module_state));
   CHECK_OR_FAIL(module_state.status == 0,
                 "new module snapshot did not report uninstantiated status");
   CHECK_OR_FAIL(module_state.error != NULL,
@@ -258,10 +258,10 @@ int main(void) {
   CHECK_OR_FAIL(!module_state.has_async_graph,
                 "uninstantiated module reported an async graph");
   NAPI_CALL(env, unofficial_napi_module_wrap_link(
-                     env, module_handle, 0, NULL));
-  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module_handle));
+                     env, module, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module));
   NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env, module_handle, &module_state));
+                     env, module, &module_state));
   CHECK_OR_FAIL(module_state.status == 2,
                 "instantiated module snapshot reported the wrong status");
   CHECK_OR_FAIL(!module_state.has_async_graph,
@@ -269,20 +269,20 @@ int main(void) {
   napi_value module_result;
   NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
                      env,
-                     module_handle,
+                     module,
                      module_url,
                      module_url,
                      &module_result));
   napi_value module_namespace;
   napi_value module_observed;
   NAPI_CALL(env, unofficial_napi_module_wrap_get_namespace(
-                     env, module_handle, &module_namespace));
+                     env, module, &module_namespace));
   NAPI_CALL(env, napi_get_named_property(
                      env, module_namespace, "observed", &module_observed));
   NAPI_CALL(env, napi_get_value_int32(env, module_observed, &marker));
   CHECK_OR_FAIL(marker == 73,
                 "module evaluation escaped its explicit context");
-  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module_handle));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
 
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
   // owns the value and copy-back. Releasing after the handle scope closes is

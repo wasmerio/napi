@@ -96,6 +96,14 @@ std::mutex g_module_wrap_mu;
 std::unordered_map<napi_env, ModuleWrapBindingState> g_module_wrap_states;
 std::unordered_set<napi_env> g_module_wrap_cleanup_hooks;
 
+ModuleWrapRecord* ModuleRecord(unofficial_napi_module module) {
+  return reinterpret_cast<ModuleWrapRecord*>(module);
+}
+
+unofficial_napi_module ModuleHandle(ModuleWrapRecord* record) {
+  return reinterpret_cast<unofficial_napi_module>(record);
+}
+
 v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
   return v8::String::NewFromUtf8(isolate, value, v8::NewStringType::kInternalized)
       .ToLocalChecked();
@@ -2367,12 +2375,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     int32_t line_offset,
     int32_t column_offset,
     napi_value host_defined_option_id,
-    void** handle_out) {
+    unofficial_napi_module* module_out) {
   if (env == nullptr || wrapper == nullptr || url == nullptr || !IsValidJsSource(source) ||
-      handle_out == nullptr) {
+      module_out == nullptr) {
     return napi_invalid_arg;
   }
-  *handle_out = nullptr;
+  *module_out = nullptr;
 
   EnsureModuleWrapCleanupHook(env);
   v8::Isolate* isolate = env->isolate;
@@ -2489,7 +2497,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     GetModuleWrapState(env)->modules.push_back(record);
   }
-  *handle_out = record;
+  *module_out = ModuleHandle(record);
   return napi_ok;
 }
 
@@ -2500,12 +2508,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
     napi_value context_or_undefined,
     napi_value export_names,
     napi_value synthetic_eval_steps,
-    void** handle_out) {
+    unofficial_napi_module* module_out) {
   if (env == nullptr || wrapper == nullptr || url == nullptr || export_names == nullptr || synthetic_eval_steps == nullptr ||
-      handle_out == nullptr) {
+      module_out == nullptr) {
     return napi_invalid_arg;
   }
-  *handle_out = nullptr;
+  *module_out = nullptr;
 
   bool is_array = false;
   if (napi_is_array(env, export_names, &is_array) != napi_ok || !is_array) return napi_invalid_arg;
@@ -2548,31 +2556,34 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     GetModuleWrapState(env)->modules.push_back(record);
   }
-  *handle_out = record;
+  *module_out = ModuleHandle(record);
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(napi_env env, void* handle) {
-  if (env == nullptr || handle == nullptr) return napi_invalid_arg;
+napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
+    napi_env env,
+    unofficial_napi_module module) {
+  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     auto it = g_module_wrap_states.find(env);
     if (it == g_module_wrap_states.end()) return napi_ok;
     auto& modules = it->second.modules;
-    if (std::find(modules.begin(), modules.end(), static_cast<ModuleWrapRecord*>(handle)) == modules.end()) {
+    if (std::find(modules.begin(), modules.end(), record) == modules.end()) {
       return napi_ok;
     }
   }
-  DestroyModuleRecord(static_cast<ModuleWrapRecord*>(handle));
+  DestroyModuleRecord(record);
   return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
@@ -2613,11 +2624,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     size_t count,
-    void* const* linked_handles) {
-  if (env == nullptr || handle == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+    const unofficial_napi_module* linked_modules) {
+  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
@@ -2625,7 +2636,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
 
   record->linked_requests.assign(count, nullptr);
   for (size_t i = 0; i < count; ++i) {
-    ModuleWrapRecord* linked = linked_handles != nullptr ? static_cast<ModuleWrapRecord*>(linked_handles[i]) : nullptr;
+    ModuleWrapRecord* linked =
+        linked_modules != nullptr ? ModuleRecord(linked_modules[i]) : nullptr;
     if (linked == nullptr) {
       ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
       return napi_pending_exception;
@@ -2644,9 +2656,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, void* handle) {
-  if (env == nullptr || handle == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
+    napi_env env,
+    unofficial_napi_module module_handle) {
+  if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2666,12 +2680,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, voi
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module_handle,
     int64_t /*timeout*/,
     bool /*break_on_sigint*/,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2692,14 +2706,14 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module_handle,
     napi_value filename,
     napi_value parent_filename,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   *result_out = nullptr;
 
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2757,10 +2771,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module_handle,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2776,10 +2790,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module_handle,
     unofficial_napi_module_state* state_out) {
-  if (env == nullptr || handle == nullptr || state_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module_handle == nullptr || state_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Module> module = record->module.Get(env->isolate);
@@ -2837,11 +2851,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_awa
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value export_name,
     napi_value export_value) {
-  if (env == nullptr || handle == nullptr || export_name == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module == nullptr || export_name == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   v8::Local<v8::Value> name = napi_v8_unwrap_value(export_name);
   v8::Local<v8::Value> value =
       export_value != nullptr ? napi_v8_unwrap_value(export_value) : v8::Undefined(env->isolate).As<v8::Value>();
@@ -2854,10 +2868,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_set_module_source_object(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value source_object) {
-  if (env == nullptr || handle == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   ResetRef(env, &record->source_object_ref);
   if (source_object != nullptr) {
     napi_create_reference(env, source_object, 1, &record->source_object_ref);
@@ -2867,20 +2881,20 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_module_source_object(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_source_object(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   *result_out = GetRefValue(env, record->source_object_ref);
   return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module_handle,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Module> module = record->module.Get(isolate);
@@ -2929,10 +2943,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_ob
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out) {
-  if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  ModuleWrapRecord* record = ModuleRecord(module);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();

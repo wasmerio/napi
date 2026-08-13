@@ -276,7 +276,7 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
   const unofficial_napi_js_source source =
       unofficial_napi_js_source_from_text(Str(s.env, "export const value = 42;"));
-  void* module = nullptr;
+  unofficial_napi_module module = nullptr;
   ASSERT_EQ(unofficial_napi_module_wrap_create_source_text(s.env,
                                                            wrapper,
                                                            Str(s.env, "state.mjs"),

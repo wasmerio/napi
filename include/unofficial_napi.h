@@ -572,6 +572,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_mod
 
 // Unofficial helpers for implementing internalBinding('module_wrap') on embedders.
 // These keep V8 module objects behind an opaque native handle so bindings stay N-API only.
+typedef struct unofficial_napi_module__* unofficial_napi_module;
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_source_text(
     napi_env env,
     napi_value wrapper,
@@ -581,7 +583,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_sour
     int32_t line_offset,
     int32_t column_offset,
     napi_value host_defined_option_id,
-    void** handle_out);
+    unofficial_napi_module* module_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_synthetic(
     napi_env env,
@@ -590,44 +592,44 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_synt
     napi_value context_or_undefined,
     napi_value export_names,
     napi_value synthetic_eval_steps,
-    void** handle_out);
+    unofficial_napi_module* module_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_destroy(
     napi_env env,
-    void* handle);
+    unofficial_napi_module module);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_module_requests(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_link(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     size_t count,
-    void* const* linked_handles);
+    const unofficial_napi_module* linked_modules);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_instantiate(
     napi_env env,
-    void* handle);
+    unofficial_napi_module module);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_evaluate(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     int64_t timeout,
     bool break_on_sigint,
     napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_evaluate_sync(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value filename,
     napi_value parent_filename,
     napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_namespace(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out);
 
 typedef struct {
@@ -642,7 +644,7 @@ typedef struct {
 // whether that field is observable through Node's module_wrap contract.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_state(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     unofficial_napi_module_state* state_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_check_unsettled_top_level_await(
@@ -653,23 +655,23 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_check_unset
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_export(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value export_name,
     napi_value export_value);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_module_source_object(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value source_object);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_module_source_object(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_cached_data(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_import_module_dynamically_callback(
@@ -682,7 +684,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_initial
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,
-    void* handle,
+    unofficial_napi_module module,
     napi_value* result_out);
 
 #ifdef __cplusplus
