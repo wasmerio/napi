@@ -324,15 +324,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_deserialize_value(
 
 NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_release_serialized_value(void* payload);
 
-// Unofficial helper for Node-style process.memoryUsage() parity.
-// Returns V8 heap statistics plus allocator-tracked ArrayBuffer memory.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_process_memory_info(
-    napi_env env,
-    double* heap_total_out,
-    double* heap_used_out,
-    double* external_out,
-    double* array_buffers_out);
-
 // Unofficial helper for Node's internalBinding('v8').getHashSeed().
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_hash_seed(napi_env env,
                                                       uint64_t* hash_seed_out);
@@ -354,6 +345,7 @@ typedef struct {
   uint64_t total_global_handles_size;
   uint64_t used_global_handles_size;
   uint64_t external_memory;
+  uint64_t array_buffer_memory;
 } unofficial_napi_heap_statistics;
 
 typedef struct {

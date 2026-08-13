@@ -27,6 +27,7 @@ pub struct SnapiUnofficialHeapStatistics {
     pub total_global_handles_size: u64,
     pub used_global_handles_size: u64,
     pub external_memory: u64,
+    pub array_buffer_memory: u64,
 }
 
 #[repr(C)]
@@ -189,13 +190,6 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
         env: SnapiEnv,
         callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_process_memory_info(
-        env: SnapiEnv,
-        heap_total_out: *mut f64,
-        heap_used_out: *mut f64,
-        external_out: *mut f64,
-        array_buffers_out: *mut f64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
     pub fn snapi_bridge_unofficial_get_error_source_positions(

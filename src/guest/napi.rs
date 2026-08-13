@@ -763,46 +763,6 @@ fn guest_unofficial_napi_set_promise_hooks(
     }
 }
 
-fn guest_unofficial_napi_get_process_memory_info(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    heap_total_out: i32,
-    heap_used_out: i32,
-    external_out: i32,
-    array_buffers_out: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut heap_total = 0.0f64;
-    let mut heap_used = 0.0f64;
-    let mut external = 0.0f64;
-    let mut array_buffers = 0.0f64;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_process_memory_info(
-            env_handle,
-            &mut heap_total,
-            &mut heap_used,
-            &mut external,
-            &mut array_buffers,
-        )
-    };
-    if status != 0 {
-        return status;
-    }
-    if heap_total_out > 0 {
-        write_guest_f64(&mut env, heap_total_out as u32, heap_total);
-    }
-    if heap_used_out > 0 {
-        write_guest_f64(&mut env, heap_used_out as u32, heap_used);
-    }
-    if external_out > 0 {
-        write_guest_f64(&mut env, external_out as u32, external);
-    }
-    if array_buffers_out > 0 {
-        write_guest_f64(&mut env, array_buffers_out as u32, array_buffers);
-    }
-    0
-}
-
 fn guest_unofficial_napi_get_hash_seed(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -986,6 +946,7 @@ fn guest_unofficial_napi_get_heap_statistics(
         total_global_handles_size: 0,
         used_global_handles_size: 0,
         external_memory: 0,
+        array_buffer_memory: 0,
     };
     let status = unsafe { snapi_bridge_unofficial_get_heap_statistics(env_handle, &mut stats) };
     if status == 0 && stats_ptr > 0 && !write_guest_pod(&mut env, stats_ptr, &stats) {
@@ -5318,7 +5279,6 @@ pub fn register_napi_imports(
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
-        "unofficial_napi_get_process_memory_info" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_process_memory_info),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_source_positions" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_source_positions),
         "unofficial_napi_set_source_maps_enabled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_source_maps_enabled),

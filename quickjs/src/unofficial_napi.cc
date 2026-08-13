@@ -702,26 +702,6 @@ extern "C"
         napi_serdes__::release_serialized_value(payload);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(
-        napi_env env,
-        double *heap_total_out,
-        double *heap_used_out,
-        double *external_out,
-        double *array_buffers_out)
-    {
-        if (!napi_util__::check_env(env) || heap_total_out == nullptr || heap_used_out == nullptr ||
-            external_out == nullptr || array_buffers_out == nullptr)
-            return napi_invalid_arg;
-
-        JSMemoryUsage usage{};
-        JS_ComputeMemoryUsage(napi_util__::runtime(env), &usage);
-        *heap_total_out = static_cast<double>(usage.malloc_size);
-        *heap_used_out = static_cast<double>(usage.memory_used_size);
-        *external_out = static_cast<double>(usage.binary_object_size);
-        *array_buffers_out = static_cast<double>(usage.binary_object_size);
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
                                                          uint64_t *hash_seed_out)
     {
@@ -745,6 +725,7 @@ extern "C"
         stats_out->malloced_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
         stats_out->peak_malloced_memory = stats_out->malloced_memory;
         stats_out->external_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.binary_object_size));
+        stats_out->array_buffer_memory = stats_out->external_memory;
 
         // heap_size_limit must never be reported as zero. Consumers read it as
         // "the ceiling this heap can grow to" and divide by it: Next.js uses

@@ -3326,20 +3326,6 @@ extern "C" int snapi_bridge_unofficial_set_promise_hooks(
   return unofficial_napi_set_promise_hooks(env, init, before, after, resolve);
 }
 
-extern "C" int snapi_bridge_unofficial_get_process_memory_info(
-    SnapiEnvState* env_state,
-    double* heap_total_out,
-    double* heap_used_out,
-    double* external_out,
-    double* array_buffers_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_get_process_memory_info(
-      env, heap_total_out, heap_used_out, external_out, array_buffers_out);
-}
-
 extern "C" int snapi_bridge_unofficial_get_hash_seed(SnapiEnvState* env_state,
                                                       uint64_t* hash_seed_out) {
   auto* bridge_state = RequireEnvState(env_state);

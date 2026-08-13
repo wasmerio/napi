@@ -2651,36 +2651,6 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(
-    napi_env env,
-    double* heap_total_out,
-    double* heap_used_out,
-    double* external_out,
-    double* array_buffers_out) {
-  if (env == nullptr || env->isolate == nullptr || heap_total_out == nullptr ||
-      heap_used_out == nullptr || external_out == nullptr || array_buffers_out == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  v8::HeapStatistics stats;
-  env->isolate->GetHeapStatistics(&stats);
-
-  uint64_t array_buffers = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
-    if (it != g_tracking_allocators.end() && it->second) {
-      array_buffers = it->second->total_mem_usage();
-    }
-  }
-
-  *heap_total_out = static_cast<double>(stats.total_heap_size());
-  *heap_used_out = static_cast<double>(stats.used_heap_size());
-  *external_out = static_cast<double>(stats.external_memory());
-  *array_buffers_out = static_cast<double>(array_buffers);
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
                                                      uint64_t* hash_seed_out) {
   if (env == nullptr || env->isolate == nullptr || hash_seed_out == nullptr) {
@@ -2722,6 +2692,14 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
   stats_out->total_global_handles_size = stats.total_global_handles_size();
   stats_out->used_global_handles_size = stats.used_global_handles_size();
   stats_out->external_memory = stats.external_memory();
+  stats_out->array_buffer_memory = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
+    if (it != g_tracking_allocators.end() && it->second) {
+      stats_out->array_buffer_memory = it->second->total_mem_usage();
+    }
+  }
   return napi_ok;
 }
 

@@ -3520,23 +3520,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_promise_reject_callback(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_process_memory_info(
-    env: SnapiEnv,
-    heap_total_out: *mut f64,
-    heap_used_out: *mut f64,
-    external_out: *mut f64,
-    array_buffers_out: *mut f64,
-) -> i32 {
-    let _ = (
-        env,
-        heap_total_out,
-        heap_used_out,
-        external_out,
-        array_buffers_out,
-    );
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_hash_seed(
     env: SnapiEnv,
     hash_seed_out: *mut u64,
