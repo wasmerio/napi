@@ -152,8 +152,12 @@ function(add_fixture_test target_name)
       INSTALL_RPATH "${_napi_engine_lib_dir}"
     )
   endif()
+  # Keep executable discovery in the test phase. Running every engine-backed
+  # binary as a parallel post-link command can turn a transient discovery
+  # failure into a failed build and an incomplete CMake JSON file.
   gtest_discover_tests(
     ${target_name}
+    DISCOVERY_MODE PRE_TEST
     DISCOVERY_TIMEOUT 30
     TEST_PREFIX "${_napi_test_prefix}.${target_name}."
   )
