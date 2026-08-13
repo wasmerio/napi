@@ -3653,20 +3653,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_statistics(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_space_count(
-    env: SnapiEnv,
-    count_out: *mut u32,
-) -> i32 {
-    let _ = (env, count_out);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_space_statistics(
     env: SnapiEnv,
-    space_index: u32,
     stats_out: *mut SnapiUnofficialHeapSpaceStatistics,
+    capacity: u32,
+    count_out: *mut u32,
 ) -> i32 {
-    let _ = (env, space_index, stats_out);
+    let _ = (env, stats_out, capacity, count_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]

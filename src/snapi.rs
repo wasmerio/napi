@@ -236,11 +236,11 @@ unsafe extern "C" {
         env: SnapiEnv,
         stats_out: *mut SnapiUnofficialHeapStatistics,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_get_heap_space_count(env: SnapiEnv, count_out: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_get_heap_space_statistics(
         env: SnapiEnv,
-        space_index: u32,
         stats_out: *mut SnapiUnofficialHeapSpaceStatistics,
+        capacity: u32,
+        count_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_heap_code_statistics(
         env: SnapiEnv,

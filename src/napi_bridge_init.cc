@@ -3504,32 +3504,19 @@ extern "C" int snapi_bridge_unofficial_get_heap_statistics(
   return unofficial_napi_get_heap_statistics(env, stats_out);
 }
 
-extern "C" int snapi_bridge_unofficial_get_heap_space_count(SnapiEnvState* env_state,
-                                                            uint32_t* count_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      count_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  return unofficial_napi_get_heap_space_count(env, count_out);
-}
-
 extern "C" int snapi_bridge_unofficial_get_heap_space_statistics(
     SnapiEnvState* env_state,
-    uint32_t space_index,
-    unofficial_napi_heap_space_statistics* stats_out) {
+    unofficial_napi_heap_space_statistics* stats_out,
+    uint32_t capacity,
+    uint32_t* count_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      stats_out == nullptr) {
+  if (count_out == nullptr || (capacity > 0 && stats_out == nullptr)) {
     return napi_invalid_arg;
   }
-  return unofficial_napi_get_heap_space_statistics(env, space_index, stats_out);
+  return unofficial_napi_get_heap_space_statistics(env, stats_out, capacity, count_out);
 }
 
 extern "C" int snapi_bridge_unofficial_get_heap_code_statistics(

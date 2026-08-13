@@ -837,25 +837,18 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_heap_space_count(
-        napi_env env,
-        uint32_t *count_out)
-    {
-        if (!napi_util__::check_env(env) || count_out == nullptr)
-            return napi_invalid_arg;
-        *count_out = 1;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_get_heap_space_statistics(
         napi_env env,
-        uint32_t space_index,
-        unofficial_napi_heap_space_statistics *stats_out)
+        unofficial_napi_heap_space_statistics *stats_out,
+        uint32_t capacity,
+        uint32_t *count_out)
     {
-        if (!napi_util__::check_env(env) || stats_out == nullptr)
+        if (!napi_util__::check_env(env) || count_out == nullptr ||
+            (capacity > 0 && stats_out == nullptr))
             return napi_invalid_arg;
-        if (space_index != 0)
-            return napi_invalid_arg;
+        *count_out = 1;
+        if (capacity == 0)
+            return napi_ok;
         std::memset(stats_out, 0, sizeof(*stats_out));
         std::strncpy(stats_out->space_name, "quickjs", sizeof(stats_out->space_name) - 1);
         JSMemoryUsage usage{};

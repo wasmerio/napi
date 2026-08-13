@@ -2811,42 +2811,34 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_heap_space_count(
-    napi_env env,
-    uint32_t* count_out) {
-  if (env == nullptr || env->isolate == nullptr || count_out == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  *count_out = static_cast<uint32_t>(env->isolate->NumberOfHeapSpaces());
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_get_heap_space_statistics(
     napi_env env,
-    uint32_t space_index,
-    unofficial_napi_heap_space_statistics* stats_out) {
-  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr) {
+    unofficial_napi_heap_space_statistics* stats_out,
+    uint32_t capacity,
+    uint32_t* count_out) {
+  if (env == nullptr || env->isolate == nullptr || count_out == nullptr ||
+      (capacity > 0 && stats_out == nullptr)) {
     return napi_invalid_arg;
   }
 
   const uint32_t space_count =
       static_cast<uint32_t>(env->isolate->NumberOfHeapSpaces());
-  if (space_index >= space_count) {
-    return napi_invalid_arg;
+  *count_out = space_count;
+  const uint32_t output_count = std::min(capacity, space_count);
+  for (uint32_t space_index = 0; space_index < output_count; ++space_index) {
+    v8::HeapSpaceStatistics stats;
+    env->isolate->GetHeapSpaceStatistics(&stats, space_index);
+
+    auto& output = stats_out[space_index];
+    std::snprintf(output.space_name,
+                  sizeof(output.space_name),
+                  "%s",
+                  stats.space_name() != nullptr ? stats.space_name() : "");
+    output.space_size = stats.space_size();
+    output.space_used_size = stats.space_used_size();
+    output.space_available_size = stats.space_available_size();
+    output.physical_space_size = stats.physical_space_size();
   }
-
-  v8::HeapSpaceStatistics stats;
-  env->isolate->GetHeapSpaceStatistics(&stats, space_index);
-
-  std::snprintf(stats_out->space_name,
-                sizeof(stats_out->space_name),
-                "%s",
-                stats.space_name() != nullptr ? stats.space_name() : "");
-  stats_out->space_size = stats.space_size();
-  stats_out->space_used_size = stats.space_used_size();
-  stats_out->space_available_size = stats.space_available_size();
-  stats_out->physical_space_size = stats.physical_space_size();
   return napi_ok;
 }
 

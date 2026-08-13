@@ -406,14 +406,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_statistics(
     napi_env env,
     unofficial_napi_heap_statistics* stats_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_space_count(
-    napi_env env,
-    uint32_t* count_out);
-
+// Takes one provider snapshot, writes at most `capacity` entries, and reports
+// the snapshot's full entry count through `count_out`. A null `stats_out` is
+// valid only when `capacity` is zero, allowing callers to query capacity.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_space_statistics(
     napi_env env,
-    uint32_t space_index,
-    unofficial_napi_heap_space_statistics* stats_out);
+    unofficial_napi_heap_space_statistics* stats_out,
+    uint32_t capacity,
+    uint32_t* count_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_code_statistics(
     napi_env env,

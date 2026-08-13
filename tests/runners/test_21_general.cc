@@ -6,6 +6,7 @@
 #include "test_env.h"
 #include "upstream_js_test.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 
@@ -93,6 +94,49 @@ TEST_F(Test21General, StructuredCloneOptionalTransferListDetachesArrayBuffer) {
   ASSERT_EQ(cloned_length, 8u);
   ASSERT_NE(cloned_data, nullptr);
   EXPECT_EQ(static_cast<uint8_t*>(cloned_data)[0], 42u);
+}
+
+TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
+  EnvScope s(runtime_.get());
+
+  uint32_t required_count = 0;
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, nullptr, 0, &required_count),
+            napi_ok);
+  ASSERT_GT(required_count, 0u);
+
+  std::array<unofficial_napi_heap_space_statistics, 64> statistics{};
+  uint32_t snapshot_count = 0;
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env,
+                statistics.data(),
+                static_cast<uint32_t>(statistics.size()),
+                &snapshot_count),
+            napi_ok);
+  ASSERT_EQ(snapshot_count, required_count);
+  ASSERT_LE(snapshot_count, statistics.size());
+
+  for (uint32_t index = 0; index < snapshot_count; ++index) {
+    EXPECT_NE(statistics[index].space_name[0], '\0') << "heap space " << index;
+    EXPECT_EQ(statistics[index].space_name[
+                  UNOFFICIAL_NAPI_HEAP_SPACE_NAME_MAX_LENGTH - 1],
+              '\0')
+        << "heap space " << index;
+  }
+
+  uint32_t partial_count = 0;
+  unofficial_napi_heap_space_statistics first_space{};
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, &first_space, 1, &partial_count),
+            napi_ok);
+  EXPECT_EQ(partial_count, required_count);
+  EXPECT_NE(first_space.space_name[0], '\0');
+
+  EXPECT_EQ(unofficial_napi_get_heap_space_statistics(s.env, nullptr, 1, &partial_count),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, statistics.data(), statistics.size(), nullptr),
+            napi_invalid_arg);
 }
 
 #ifdef NAPI_TEST_ENGINE_QUICKJS

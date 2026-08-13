@@ -161,6 +161,23 @@ fn write_guest_pod<T>(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32, value: 
     write_guest_bytes(env, guest_ptr as u32, bytes)
 }
 
+fn write_guest_pod_slice<T>(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    values: &[T],
+) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    if guest_ptr <= 0 {
+        return false;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    };
+    write_guest_bytes(env, guest_ptr as u32, bytes)
+}
+
 fn copy_host_buffer_to_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
     data_out_ptr: i32,
@@ -1460,43 +1477,52 @@ fn guest_unofficial_napi_get_heap_statistics(
     status
 }
 
-fn guest_unofficial_napi_get_heap_space_count(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    count_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut count = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_get_heap_space_count(env_handle, &mut count) };
-    if status == 0 && count_ptr > 0 {
-        write_guest_u32(&mut env, count_ptr as u32, count);
-    }
-    status
-}
-
 fn guest_unofficial_napi_get_heap_space_statistics(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    space_index: i32,
     stats_ptr: i32,
+    capacity: i32,
+    count_ptr: i32,
 ) -> i32 {
+    const MAX_HEAP_SPACE_CAPACITY: usize = 1024;
+    if capacity < 0 || count_ptr <= 0 || (capacity > 0 && stats_ptr <= 0) {
+        return 1;
+    }
+    let capacity = capacity as usize;
+    if capacity > MAX_HEAP_SPACE_CAPACITY {
+        return 1;
+    }
     let env_handle = snapi_env(&env, napi_env);
-    let mut stats = SnapiUnofficialHeapSpaceStatistics {
-        space_name: [0; 64],
-        space_size: 0,
-        space_used_size: 0,
-        space_available_size: 0,
-        physical_space_size: 0,
-    };
+    let mut stats: Vec<SnapiUnofficialHeapSpaceStatistics> = (0..capacity)
+        .map(|_| SnapiUnofficialHeapSpaceStatistics {
+            space_name: [0; 64],
+            space_size: 0,
+            space_used_size: 0,
+            space_available_size: 0,
+            physical_space_size: 0,
+        })
+        .collect();
+    let mut count = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_get_heap_space_statistics(
             env_handle,
-            space_index.max(0) as u32,
-            &mut stats,
+            if stats.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                stats.as_mut_ptr()
+            },
+            capacity as u32,
+            &mut count,
         )
     };
-    if status == 0 && stats_ptr > 0 && !write_guest_pod(&mut env, stats_ptr, &stats) {
-        return 1;
+    if status == 0 {
+        if !write_guest_u32(&mut env, count_ptr as u32, count) {
+            return 1;
+        }
+        let written = capacity.min(count as usize);
+        if !write_guest_pod_slice(&mut env, stats_ptr, &stats[..written]) {
+            return 1;
+        }
     }
     status
 }
@@ -6301,7 +6327,6 @@ pub fn register_napi_imports(
         "unofficial_napi_preserve_error_source_message" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preserve_error_source_message),
         "unofficial_napi_mark_promise_as_handled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_mark_promise_as_handled),
         "unofficial_napi_get_heap_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_statistics),
-        "unofficial_napi_get_heap_space_count" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_space_count),
         "unofficial_napi_get_heap_space_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_space_statistics),
         "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
         "unofficial_napi_set_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_near_heap_limit_callback),
