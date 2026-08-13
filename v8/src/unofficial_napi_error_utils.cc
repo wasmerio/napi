@@ -346,14 +346,9 @@ void SetArrowMessage(v8::Isolate* isolate,
       isolate, context, exception, BuildSyntaxArrowMessage(isolate, context, message));
 }
 
-napi_status SetSourceMapsEnabled(napi_env env, bool enabled) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  g_error_formatting_states[env].source_maps_enabled = enabled;
-  return napi_ok;
-}
-
-napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback) {
+napi_status ConfigureSourceMaps(napi_env env,
+                                bool enabled,
+                                napi_value callback) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
 
   v8::Local<v8::Value> raw =
@@ -362,6 +357,7 @@ napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback
 
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
   ErrorFormattingState& state = g_error_formatting_states[env];
+  state.source_maps_enabled = enabled;
   state.get_source_map_error_source.Reset();
   if (!raw.IsEmpty()) {
     state.get_source_map_error_source.Reset(env->isolate, raw.As<v8::Function>());

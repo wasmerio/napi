@@ -2390,16 +2390,11 @@ napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
   return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_source_maps_enabled(
+napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
     napi_env env,
-    bool enabled) {
-  return unofficial_napi_internal::SetSourceMapsEnabled(env, enabled);
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_get_source_map_error_source_callback(
-    napi_env env,
+    bool enabled,
     napi_value callback) {
-  return unofficial_napi_internal::SetGetSourceMapErrorSourceCallback(env, callback);
+  return unofficial_napi_internal::ConfigureSourceMaps(env, enabled, callback);
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(

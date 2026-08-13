@@ -656,15 +656,7 @@ namespace quickjs::detail
         return napi_ok;
     }
 
-    napi_status napi_contextify__::set_source_maps_enabled(bool enabled)
-    {
-        if (!napi_util__::check_env(env_))
-            return napi_invalid_arg;
-        source_maps_enabled_ = enabled;
-        return napi_ok;
-    }
-
-    napi_status napi_contextify__::set_get_source_map_error_source_callback(napi_value callback)
+    napi_status napi_contextify__::configure_source_maps(bool enabled, napi_value callback)
     {
         if (!napi_util__::check_env(env_))
             return napi_invalid_arg;
@@ -674,6 +666,7 @@ namespace quickjs::detail
             return napi_invalid_arg;
         }
 
+        source_maps_enabled_ = enabled;
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ =
             callback == nullptr ? JS_UNDEFINED : JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback));

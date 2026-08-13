@@ -28,8 +28,7 @@ namespace quickjs::detail
         napi_status get_error_source_positions(napi_value error,
                                                unofficial_napi_error_source_positions *out);
         napi_status preserve_error_source_message(napi_value error);
-        napi_status set_source_maps_enabled(bool enabled);
-        napi_status set_get_source_map_error_source_callback(napi_value callback);
+        napi_status configure_source_maps(bool enabled, napi_value callback);
         napi_status get_error_source_line_for_stderr(napi_value error,
                                                      napi_value *result_out);
         napi_status get_error_thrown_at(napi_value error,

@@ -141,8 +141,6 @@ TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorReth
 TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSourceMapsEnabled) {
   EnvScope s(runtime_.get());
 
-  ASSERT_EQ(unofficial_napi_set_source_maps_enabled(s.env, true), napi_ok);
-
   napi_value callback_script = nullptr;
   ASSERT_EQ(
       napi_create_string_utf8(
@@ -155,7 +153,7 @@ TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSo
   ASSERT_EQ(napi_run_script(s.env, callback_script, &callback), napi_ok);
   ASSERT_NE(callback, nullptr);
   ASSERT_EQ(
-      unofficial_napi_set_get_source_map_error_source_callback(s.env, callback),
+      unofficial_napi_configure_source_maps(s.env, true, callback),
       napi_ok);
 
   napi_value script = nullptr;

@@ -457,18 +457,12 @@ extern "C"
         return napi_util__::check_env(env) ? env->contextify().preserve_error_source_message(error) : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_source_maps_enabled(
+    napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
         napi_env env,
-        bool enabled)
-    {
-        return napi_util__::check_env(env) ? env->contextify().set_source_maps_enabled(enabled) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_get_source_map_error_source_callback(
-        napi_env env,
+        bool enabled,
         napi_value callback)
     {
-        return napi_util__::check_env(env) ? env->contextify().set_get_source_map_error_source_callback(callback) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->contextify().configure_source_maps(enabled, callback) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(

@@ -3549,19 +3549,12 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_error_source_positions(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_source_maps_enabled(
+pub unsafe extern "C" fn snapi_bridge_unofficial_configure_source_maps(
     env: SnapiEnv,
     enabled: i32,
-) -> i32 {
-    let _ = (env, enabled);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_get_source_map_error_source_callback(
-    env: SnapiEnv,
     callback_id: u32,
 ) -> i32 {
-    let _ = (env, callback_id);
+    let _ = (env, enabled, callback_id);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]

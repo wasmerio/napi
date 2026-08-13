@@ -3370,18 +3370,9 @@ extern "C" int snapi_bridge_unofficial_get_error_source_positions(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_set_source_maps_enabled(
+extern "C" int snapi_bridge_unofficial_configure_source_maps(
     SnapiEnvState* env_state,
-    int enabled) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_set_source_maps_enabled(env, enabled != 0);
-}
-
-extern "C" int snapi_bridge_unofficial_set_get_source_map_error_source_callback(
-    SnapiEnvState* env_state,
+    int enabled,
     uint32_t callback_id) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -3389,7 +3380,7 @@ extern "C" int snapi_bridge_unofficial_set_get_source_map_error_source_callback(
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
-  return unofficial_napi_set_get_source_map_error_source_callback(env, callback);
+  return unofficial_napi_configure_source_maps(env, enabled != 0, callback);
 }
 
 extern "C" int snapi_bridge_unofficial_get_error_source_line_for_stderr(

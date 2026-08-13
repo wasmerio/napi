@@ -814,25 +814,15 @@ fn guest_unofficial_napi_get_error_source_positions(
     0
 }
 
-fn guest_unofficial_napi_set_source_maps_enabled(
+fn guest_unofficial_napi_configure_source_maps(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     enabled: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_set_source_maps_enabled(env_handle, enabled) }
-}
-
-fn guest_unofficial_napi_set_get_source_map_error_source_callback(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
     callback: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    unsafe {
-        snapi_bridge_unofficial_set_get_source_map_error_source_callback(env_handle, callback_id)
-    }
+    unsafe { snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id) }
 }
 
 fn guest_unofficial_napi_get_error_source_line_for_stderr(
@@ -5281,8 +5271,7 @@ pub fn register_napi_imports(
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_source_positions" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_source_positions),
-        "unofficial_napi_set_source_maps_enabled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_source_maps_enabled),
-        "unofficial_napi_set_get_source_map_error_source_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_get_source_map_error_source_callback),
+        "unofficial_napi_configure_source_maps" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_source_maps),
         "unofficial_napi_get_error_source_line_for_stderr" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_source_line_for_stderr),
         "unofficial_napi_get_error_thrown_at" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_thrown_at),
         "unofficial_napi_take_preserved_error_formatting" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_preserved_error_formatting),

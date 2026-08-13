@@ -35,8 +35,7 @@ void PreserveErrorFormatting(napi_env env,
                              const std::string& source_line,
                              const std::string& thrown_at);
 
-napi_status SetSourceMapsEnabled(napi_env env, bool enabled);
-napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback);
+napi_status ConfigureSourceMaps(napi_env env, bool enabled, napi_value callback);
 napi_status PreserveErrorSourceMessage(napi_env env, napi_value error);
 napi_status GetErrorSourceLineForStderr(napi_env env,
                                         napi_value error,

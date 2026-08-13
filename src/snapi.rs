@@ -201,9 +201,9 @@ unsafe extern "C" {
         start_column_out: *mut i32,
         end_column_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_set_source_maps_enabled(env: SnapiEnv, enabled: i32) -> i32;
-    pub fn snapi_bridge_unofficial_set_get_source_map_error_source_callback(
+    pub fn snapi_bridge_unofficial_configure_source_maps(
         env: SnapiEnv,
+        enabled: i32,
         callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_error_source_line_for_stderr(

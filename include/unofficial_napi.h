@@ -243,11 +243,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_source_positi
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_preserve_error_source_message(
     napi_env env,
     napi_value error);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_source_maps_enabled(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_source_maps(
     napi_env env,
-    bool enabled);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_get_source_map_error_source_callback(
-    napi_env env,
+    bool enabled,
     napi_value callback);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_error_source_line_for_stderr(
     napi_env env,
