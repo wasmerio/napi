@@ -56,6 +56,45 @@ TEST_F(Test21General, ProviderOwnsUninitializedArrayBufferAllocation) {
   EXPECT_EQ(length, 0u);
 }
 
+TEST_F(Test21General, StructuredCloneOptionalTransferListDetachesArrayBuffer) {
+  EnvScope s(runtime_.get());
+
+  void* source_data = nullptr;
+  napi_value source_buffer = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 8, &source_data, &source_buffer), napi_ok);
+  ASSERT_NE(source_buffer, nullptr);
+  ASSERT_NE(source_data, nullptr);
+  static_cast<uint8_t*>(source_data)[0] = 42;
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "buffer", source_buffer), napi_ok);
+
+  napi_value transfer_list = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 1, &transfer_list), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, transfer_list, 0, source_buffer), napi_ok);
+
+  napi_value clone = nullptr;
+  ASSERT_EQ(unofficial_napi_structured_clone(s.env, source, transfer_list, &clone), napi_ok);
+  ASSERT_NE(clone, nullptr);
+
+  napi_value source_byte_length = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, source_buffer, "byteLength", &source_byte_length),
+            napi_ok);
+  uint32_t source_length = 8;
+  ASSERT_EQ(napi_get_value_uint32(s.env, source_byte_length, &source_length), napi_ok);
+  EXPECT_EQ(source_length, 0u);
+
+  napi_value cloned_buffer = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, clone, "buffer", &cloned_buffer), napi_ok);
+  void* cloned_data = nullptr;
+  size_t cloned_length = 0;
+  ASSERT_EQ(napi_get_arraybuffer_info(s.env, cloned_buffer, &cloned_data, &cloned_length), napi_ok);
+  ASSERT_EQ(cloned_length, 8u);
+  ASSERT_NE(cloned_data, nullptr);
+  EXPECT_EQ(static_cast<uint8_t*>(cloned_data)[0], 42u);
+}
+
 #ifdef NAPI_TEST_ENGINE_QUICKJS
 TEST_F(Test21General, GlobalBufferPrototypeDetection) {
   EnvScope s(runtime_.get());
