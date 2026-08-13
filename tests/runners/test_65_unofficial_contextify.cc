@@ -276,16 +276,31 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
   const unofficial_napi_js_source source =
       unofficial_napi_js_source_from_text(Str(s.env, "export const value = 42;"));
+  unofficial_napi_module_create_options create_options{};
+  create_options.size = sizeof(create_options);
+  create_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  create_options.kind = unofficial_napi_module_source_text;
+  create_options.wrapper = wrapper;
+  create_options.url = Str(s.env, "state.mjs");
+  create_options.context_or_undefined = undefined;
+  create_options.payload.source_text.source = &source;
+  create_options.payload.source_text.host_defined_option_id = undefined;
   unofficial_napi_module module = nullptr;
-  ASSERT_EQ(unofficial_napi_module_wrap_create_source_text(s.env,
-                                                           wrapper,
-                                                           Str(s.env, "state.mjs"),
-                                                           undefined,
-                                                           &source,
-                                                           0,
-                                                           0,
-                                                           undefined,
-                                                           &module),
+
+  auto invalid_options = create_options;
+  invalid_options.size = sizeof(invalid_options) - 1;
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+            napi_invalid_arg);
+  invalid_options = create_options;
+  invalid_options.version++;
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+            napi_invalid_arg);
+  invalid_options = create_options;
+  invalid_options.kind = static_cast<unofficial_napi_module_kind>(99);
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &create_options, &module),
             napi_ok);
   ASSERT_NE(module, nullptr);
 

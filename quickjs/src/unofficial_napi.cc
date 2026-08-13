@@ -1073,46 +1073,39 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
         napi_env env,
-        napi_value wrapper,
-        napi_value url,
-        napi_value context_or_undefined,
-        const unofficial_napi_js_source *source,
-        int32_t line_offset,
-        int32_t column_offset,
-        napi_value host_defined_option_id,
+        const unofficial_napi_module_create_options *options,
         unofficial_napi_module *module_out)
     {
-        if (!napi_util__::check_env(env) || module_out == nullptr)
+        if (!napi_util__::check_env(env) || options == nullptr ||
+            options->size < sizeof(*options) ||
+            options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
+            module_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_source_text(wrapper,
-                                                     url,
-                                                     context_or_undefined,
-                                                     source,
-                                                     line_offset,
-                                                     column_offset,
-                                                     host_defined_option_id,
-                                                     module_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
-        napi_env env,
-        napi_value wrapper,
-        napi_value url,
-        napi_value context_or_undefined,
-        napi_value export_names,
-        napi_value synthetic_eval_steps,
-        unofficial_napi_module *module_out)
-    {
-        if (!napi_util__::check_env(env) || module_out == nullptr)
+        switch (options->kind)
+        {
+        case unofficial_napi_module_source_text:
+            return env->module_wrap().create_source_text(
+                options->wrapper,
+                options->url,
+                options->context_or_undefined,
+                options->payload.source_text.source,
+                options->payload.source_text.line_offset,
+                options->payload.source_text.column_offset,
+                options->payload.source_text.host_defined_option_id,
+                module_out);
+        case unofficial_napi_module_synthetic:
+            return env->module_wrap().create_synthetic(
+                options->wrapper,
+                options->url,
+                options->context_or_undefined,
+                options->payload.synthetic.export_names,
+                options->payload.synthetic.synthetic_evaluation_steps,
+                module_out);
+        default:
             return napi_invalid_arg;
-        return env->module_wrap().create_synthetic(wrapper,
-                                                   url,
-                                                   context_or_undefined,
-                                                   export_names,
-                                                   synthetic_eval_steps,
-                                                   module_out);
+        }
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(

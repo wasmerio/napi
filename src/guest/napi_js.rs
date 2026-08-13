@@ -1884,81 +1884,75 @@ fn guest_unofficial_napi_bytecode_release(
     unsafe { snapi_bridge_unofficial_bytecode_release(env_handle, bytecode as u32) }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn guest_unofficial_napi_module_wrap_create_source_text(
+fn guest_unofficial_napi_module_wrap_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    wrapper: i32,
-    url: i32,
-    context_or_undefined: i32,
-    source_ptr: i32,
-    line_offset: i32,
-    column_offset: i32,
-    host_defined_option_id: i32,
+    options_ptr: i32,
     handle_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let Some((source_text, source_bytecode)) = read_guest_js_source(&mut env, source_ptr) else {
+    const OPTIONS_PREFIX_SIZE: usize = 40;
+    let Some(fields) = read_guest_bytes(&mut env, options_ptr, OPTIONS_PREFIX_SIZE) else {
         return 1;
     };
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    if u32_at(0) < OPTIONS_PREFIX_SIZE as u32 || u32_at(4) != 1 || handle_ptr <= 0 {
+        return 1;
+    }
+
+    let kind = u32_at(8) as i32;
+    let wrapper = u32_at(12);
+    let url = u32_at(16);
+    let context_or_undefined = u32_at(20);
+    let (
+        source_text,
+        source_bytecode,
+        line_offset,
+        column_offset,
+        host_defined_option_id,
+        export_names,
+        synthetic_eval_steps,
+    ) = match kind {
+        1 => {
+            let Some((source_text, source_bytecode)) =
+                read_guest_js_source(&mut env, u32_at(24) as i32)
+            else {
+                return 1;
+            };
+            (
+                source_text,
+                source_bytecode,
+                u32_at(28) as i32,
+                u32_at(32) as i32,
+                u32_at(36),
+                0,
+                0,
+            )
+        }
+        2 => (0, 0, 0, 0, 0, u32_at(24), u32_at(28)),
+        _ => return 1,
+    };
+    let env_handle = snapi_env(&env, napi_env);
     let mut handle_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_create_source_text(
+        snapi_bridge_unofficial_module_wrap_create(
             env_handle,
-            wrapper as u32,
-            url as u32,
-            if context_or_undefined > 0 {
-                context_or_undefined as u32
-            } else {
-                0
-            },
+            kind,
+            wrapper,
+            url,
+            context_or_undefined,
             source_text,
             source_bytecode,
             line_offset,
             column_offset,
-            if host_defined_option_id > 0 {
-                host_defined_option_id as u32
-            } else {
-                0
-            },
+            host_defined_option_id,
+            export_names,
+            synthetic_eval_steps,
             &mut handle_id,
         )
     };
-    if status == 0 && handle_ptr > 0 {
-        write_guest_u32(&mut env, handle_ptr as u32, handle_id);
-    }
-    status
-}
-
-#[allow(clippy::too_many_arguments)]
-fn guest_unofficial_napi_module_wrap_create_synthetic(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    wrapper: i32,
-    url: i32,
-    context_or_undefined: i32,
-    export_names: i32,
-    synthetic_eval_steps: i32,
-    handle_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut handle_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_create_synthetic(
-            env_handle,
-            wrapper as u32,
-            url as u32,
-            if context_or_undefined > 0 {
-                context_or_undefined as u32
-            } else {
-                0
-            },
-            export_names as u32,
-            synthetic_eval_steps as u32,
-            &mut handle_id,
-        )
-    };
-    if status == 0 && handle_ptr > 0 {
+    if status == 0 {
         write_guest_u32(&mut env, handle_ptr as u32, handle_id);
     }
     status
@@ -6122,8 +6116,7 @@ pub fn register_napi_imports(
         "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),
         "unofficial_napi_bytecode_serialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_serialize),
         "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),
-        "unofficial_napi_module_wrap_create_source_text" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_source_text),
-        "unofficial_napi_module_wrap_create_synthetic" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_synthetic),
+        "unofficial_napi_module_wrap_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create),
         "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),
         "unofficial_napi_module_wrap_get_module_requests" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_module_requests),
         "unofficial_napi_module_wrap_link" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_link),

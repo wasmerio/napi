@@ -2366,7 +2366,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
+static napi_status CreateSourceTextModule(
     napi_env env,
     napi_value wrapper,
     napi_value url,
@@ -2501,7 +2501,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
+static napi_status CreateSyntheticModule(
     napi_env env,
     napi_value wrapper,
     napi_value url,
@@ -2558,6 +2558,41 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
   }
   *module_out = ModuleHandle(record);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
+    napi_env env,
+    const unofficial_napi_module_create_options* options,
+    unofficial_napi_module* module_out) {
+  if (options == nullptr || options->size < sizeof(*options) ||
+      options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
+      module_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  switch (options->kind) {
+    case unofficial_napi_module_source_text:
+      return CreateSourceTextModule(
+          env,
+          options->wrapper,
+          options->url,
+          options->context_or_undefined,
+          options->payload.source_text.source,
+          options->payload.source_text.line_offset,
+          options->payload.source_text.column_offset,
+          options->payload.source_text.host_defined_option_id,
+          module_out);
+    case unofficial_napi_module_synthetic:
+      return CreateSyntheticModule(
+          env,
+          options->wrapper,
+          options->url,
+          options->context_or_undefined,
+          options->payload.synthetic.export_names,
+          options->payload.synthetic.synthetic_evaluation_steps,
+          module_out);
+    default:
+      return napi_invalid_arg;
+  }
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(

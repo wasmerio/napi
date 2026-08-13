@@ -4116,8 +4116,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_release(
         NAPI_INVALID_ARG
     }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
+unsafe fn host_js_create_source_text_module(
     env: SnapiEnv,
     wrapper_id: u32,
     url_id: u32,
@@ -4212,8 +4211,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
     );
     unsafe { write(handle_out, handle) }.map_or_else(|error| error, |()| NAPI_OK)
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_synthetic(
+unsafe fn host_js_create_synthetic_module(
     env: SnapiEnv,
     wrapper_id: u32,
     url_id: u32,
@@ -4272,6 +4270,52 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_synthetic(
         },
     );
     unsafe { write(handle_out, handle) }.map_or_else(|error| error, |()| NAPI_OK)
+}
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
+    env: SnapiEnv,
+    kind: i32,
+    wrapper_id: u32,
+    url_id: u32,
+    context_id: u32,
+    source_text_id: u32,
+    source_bytecode_id: u32,
+    line_offset: i32,
+    column_offset: i32,
+    host_defined_option_id: u32,
+    export_names_id: u32,
+    synthetic_eval_steps_id: u32,
+    handle_out: *mut u32,
+) -> i32 {
+    match kind {
+        1 => unsafe {
+            host_js_create_source_text_module(
+                env,
+                wrapper_id,
+                url_id,
+                context_id,
+                source_text_id,
+                source_bytecode_id,
+                line_offset,
+                column_offset,
+                host_defined_option_id,
+                handle_out,
+            )
+        },
+        2 => unsafe {
+            host_js_create_synthetic_module(
+                env,
+                wrapper_id,
+                url_id,
+                context_id,
+                export_names_id,
+                synthetic_eval_steps_id,
+                handle_out,
+            )
+        },
+        _ => NAPI_INVALID_ARG,
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_destroy(

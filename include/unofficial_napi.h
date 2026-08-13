@@ -574,24 +574,44 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_mod
 // These keep V8 module objects behind an opaque native handle so bindings stay N-API only.
 typedef struct unofficial_napi_module__* unofficial_napi_module;
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_source_text(
-    napi_env env,
-    napi_value wrapper,
-    napi_value url,
-    napi_value context_or_undefined,
-    const unofficial_napi_js_source* source,
-    int32_t line_offset,
-    int32_t column_offset,
-    napi_value host_defined_option_id,
-    unofficial_napi_module* module_out);
+// Versioned, tagged transaction for creating either kind of module. Keeping
+// creation behind one descriptor gives providers one validation boundary and
+// lets the ABI grow without adding one import per module kind.
+#define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 1u
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_synthetic(
+typedef enum {
+  unofficial_napi_module_source_text = 1,
+  unofficial_napi_module_synthetic = 2,
+} unofficial_napi_module_kind;
+
+typedef struct {
+  const unofficial_napi_js_source* source;
+  int32_t line_offset;
+  int32_t column_offset;
+  napi_value host_defined_option_id;
+} unofficial_napi_source_text_module_options;
+
+typedef struct {
+  napi_value export_names;
+  napi_value synthetic_evaluation_steps;
+} unofficial_napi_synthetic_module_options;
+
+typedef struct {
+  size_t size;
+  uint32_t version;
+  unofficial_napi_module_kind kind;
+  napi_value wrapper;
+  napi_value url;
+  napi_value context_or_undefined;
+  union {
+    unofficial_napi_source_text_module_options source_text;
+    unofficial_napi_synthetic_module_options synthetic;
+  } payload;
+} unofficial_napi_module_create_options;
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create(
     napi_env env,
-    napi_value wrapper,
-    napi_value url,
-    napi_value context_or_undefined,
-    napi_value export_names,
-    napi_value synthetic_eval_steps,
+    const unofficial_napi_module_create_options* options,
     unofficial_napi_module* module_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_destroy(

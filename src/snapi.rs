@@ -341,8 +341,9 @@ unsafe extern "C" {
         buffer_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_release(env: SnapiEnv, bytecode_id: u32) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_create_source_text(
+    pub fn snapi_bridge_unofficial_module_wrap_create(
         env: SnapiEnv,
+        kind: i32,
         wrapper_id: u32,
         url_id: u32,
         context_id: u32,
@@ -351,13 +352,6 @@ unsafe extern "C" {
         line_offset: i32,
         column_offset: i32,
         host_defined_option_id: u32,
-        handle_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_create_synthetic(
-        env: SnapiEnv,
-        wrapper_id: u32,
-        url_id: u32,
-        context_id: u32,
         export_names_id: u32,
         synthetic_eval_steps_id: u32,
         handle_out: *mut u32,

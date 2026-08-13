@@ -233,17 +233,17 @@ int main(void) {
                      &module_source_text));
   const unofficial_napi_js_source module_source =
       unofficial_napi_js_source_from_text(module_source_text);
+  unofficial_napi_module_create_options module_options = {0};
+  module_options.size = sizeof(module_options);
+  module_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  module_options.kind = unofficial_napi_module_source_text;
+  module_options.wrapper = module_wrapper;
+  module_options.url = module_url;
+  module_options.context_or_undefined = context;
+  module_options.payload.source_text.source = &module_source;
+  module_options.payload.source_text.host_defined_option_id = undefined_value;
   unofficial_napi_module module = NULL;
-  NAPI_CALL(env, unofficial_napi_module_wrap_create_source_text(
-                     env,
-                     module_wrapper,
-                     module_url,
-                     context,
-                     &module_source,
-                     0,
-                     0,
-                     undefined_value,
-                     &module));
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &module_options, &module));
   CHECK_OR_FAIL(module != NULL,
                 "module compilation did not return a handle");
   unofficial_napi_module_state module_state = {0};

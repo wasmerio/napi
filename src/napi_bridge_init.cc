@@ -3933,8 +3933,9 @@ extern "C" int snapi_bridge_unofficial_bytecode_release(
   return s;
 }
 
-extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
+extern "C" int snapi_bridge_unofficial_module_wrap_create(
     SnapiEnvState* env_state,
+    int32_t kind,
     uint32_t wrapper_id,
     uint32_t url_id,
     uint32_t context_id,
@@ -3943,6 +3944,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
     int32_t line_offset,
     int32_t column_offset,
     uint32_t host_defined_option_id,
+    uint32_t export_names_id,
+    uint32_t synthetic_eval_steps_id,
     uint32_t* handle_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -3956,48 +3959,51 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
       LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value host_defined_option =
       host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
-  if (wrapper == nullptr || url == nullptr ||
-      (source_text == nullptr && source_bytecode == nullptr)) {
-    return napi_invalid_arg;
-  }
+  napi_value export_names =
+      export_names_id == 0 ? nullptr : LoadValue(*bridge_state, export_names_id);
+  napi_value synthetic_eval_steps = synthetic_eval_steps_id == 0
+                                        ? nullptr
+                                        : LoadValue(*bridge_state, synthetic_eval_steps_id);
+  if (wrapper == nullptr || url == nullptr) return napi_invalid_arg;
   if (context_id != 0 && context == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  const unofficial_napi_js_source source = source_text != nullptr
-                                               ? unofficial_napi_js_source_from_text(source_text)
-                                               : unofficial_napi_js_source_from_bytecode(source_bytecode);
-  unofficial_napi_module module = nullptr;
-  napi_status s = unofficial_napi_module_wrap_create_source_text(
-      env, wrapper, url, context, &source, line_offset, column_offset, host_defined_option, &module);
-  if (s != napi_ok) return s;
-  if (handle_out != nullptr) *handle_out = StoreModuleWrapHandle(*bridge_state, module);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_create_synthetic(
-    SnapiEnvState* env_state,
-    uint32_t wrapper_id,
-    uint32_t url_id,
-    uint32_t context_id,
-    uint32_t export_names_id,
-    uint32_t synthetic_eval_steps_id,
-    uint32_t* handle_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value wrapper = LoadValue(*bridge_state, wrapper_id);
-  napi_value url = LoadValue(*bridge_state, url_id);
-  napi_value context = context_id == 0 ? nullptr : LoadValue(*bridge_state, context_id);
-  napi_value export_names = LoadValue(*bridge_state, export_names_id);
-  napi_value synthetic_eval_steps = LoadValue(*bridge_state, synthetic_eval_steps_id);
-  if (wrapper == nullptr || url == nullptr || export_names == nullptr ||
-      synthetic_eval_steps == nullptr) {
+  if (export_names_id != 0 && export_names == nullptr) return napi_invalid_arg;
+  if (synthetic_eval_steps_id != 0 && synthetic_eval_steps == nullptr) {
     return napi_invalid_arg;
   }
-  if (context_id != 0 && context == nullptr) return napi_invalid_arg;
+
+  unofficial_napi_js_source source{};
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = static_cast<unofficial_napi_module_kind>(kind);
+  options.wrapper = wrapper;
+  options.url = url;
+  options.context_or_undefined = context;
+  switch (options.kind) {
+    case unofficial_napi_module_source_text:
+      if (source_text == nullptr && source_bytecode == nullptr) return napi_invalid_arg;
+      source = source_text != nullptr
+                   ? unofficial_napi_js_source_from_text(source_text)
+                   : unofficial_napi_js_source_from_bytecode(source_bytecode);
+      options.payload.source_text.source = &source;
+      options.payload.source_text.line_offset = line_offset;
+      options.payload.source_text.column_offset = column_offset;
+      options.payload.source_text.host_defined_option_id = host_defined_option;
+      break;
+    case unofficial_napi_module_synthetic:
+      if (export_names == nullptr || synthetic_eval_steps == nullptr) {
+        return napi_invalid_arg;
+      }
+      options.payload.synthetic.export_names = export_names;
+      options.payload.synthetic.synthetic_evaluation_steps = synthetic_eval_steps;
+      break;
+    default:
+      return napi_invalid_arg;
+  }
+
   unofficial_napi_module module = nullptr;
-  napi_status s = unofficial_napi_module_wrap_create_synthetic(
-      env, wrapper, url, context, export_names, synthetic_eval_steps, &module);
+  napi_status s = unofficial_napi_module_wrap_create(env, &options, &module);
   if (s != napi_ok) return s;
   if (handle_out != nullptr) *handle_out = StoreModuleWrapHandle(*bridge_state, module);
   return napi_ok;
