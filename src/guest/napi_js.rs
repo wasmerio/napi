@@ -1888,7 +1888,7 @@ fn guest_unofficial_napi_module_wrap_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     options_ptr: i32,
-    handle_ptr: i32,
+    result_ptr: i32,
 ) -> i32 {
     const OPTIONS_PREFIX_SIZE: usize = 40;
     let Some(fields) = read_guest_bytes(&mut env, options_ptr, OPTIONS_PREFIX_SIZE) else {
@@ -1897,7 +1897,7 @@ fn guest_unofficial_napi_module_wrap_create(
     let u32_at = |offset: usize| {
         u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
     };
-    if u32_at(0) < OPTIONS_PREFIX_SIZE as u32 || u32_at(4) != 1 || handle_ptr <= 0 {
+    if u32_at(0) < OPTIONS_PREFIX_SIZE as u32 || u32_at(4) != 1 || result_ptr <= 0 {
         return 1;
     }
 
@@ -1935,6 +1935,8 @@ fn guest_unofficial_napi_module_wrap_create(
     };
     let env_handle = snapi_env(&env, napi_env);
     let mut handle_id = 0u32;
+    let mut requests_id = 0u32;
+    let mut has_top_level_await = 0u8;
     let status = unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
@@ -1950,10 +1952,14 @@ fn guest_unofficial_napi_module_wrap_create(
             export_names,
             synthetic_eval_steps,
             &mut handle_id,
+            &mut requests_id,
+            &mut has_top_level_await,
         )
     };
     if status == 0 {
-        write_guest_u32(&mut env, handle_ptr as u32, handle_id);
+        write_guest_u32(&mut env, result_ptr as u32, handle_id);
+        write_guest_u32(&mut env, result_ptr as u32 + 4, requests_id);
+        write_guest_bytes(&mut env, result_ptr as u32 + 8, &[has_top_level_await]);
     }
     status
 }
@@ -1965,27 +1971,6 @@ fn guest_unofficial_napi_module_wrap_destroy(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_module_wrap_destroy(env_handle, handle as u32) }
-}
-
-fn guest_unofficial_napi_module_wrap_get_module_requests(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    handle: i32,
-    result_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_module_requests(
-            env_handle,
-            handle as u32,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
 }
 
 fn guest_unofficial_napi_module_wrap_link(
@@ -6118,7 +6103,6 @@ pub fn register_napi_imports(
         "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),
         "unofficial_napi_module_wrap_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create),
         "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),
-        "unofficial_napi_module_wrap_get_module_requests" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_module_requests),
         "unofficial_napi_module_wrap_link" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_link),
         "unofficial_napi_module_wrap_instantiate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_instantiate),
         "unofficial_napi_module_wrap_evaluate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate),

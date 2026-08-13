@@ -1076,17 +1076,19 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
         napi_env env,
         const unofficial_napi_module_create_options *options,
-        unofficial_napi_module *module_out)
+        unofficial_napi_module_create_result *result_out)
     {
         if (!napi_util__::check_env(env) || options == nullptr ||
             options->size < sizeof(*options) ||
             options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
-            module_out == nullptr)
+            result_out == nullptr)
             return napi_invalid_arg;
+        *result_out = {};
+        napi_status status = napi_invalid_arg;
         switch (options->kind)
         {
         case unofficial_napi_module_source_text:
-            return env->module_wrap().create_source_text(
+            status = env->module_wrap().create_source_text(
                 options->wrapper,
                 options->url,
                 options->context_or_undefined,
@@ -1094,18 +1096,32 @@ extern "C"
                 options->payload.source_text.line_offset,
                 options->payload.source_text.column_offset,
                 options->payload.source_text.host_defined_option_id,
-                module_out);
+                &result_out->module);
+            break;
         case unofficial_napi_module_synthetic:
-            return env->module_wrap().create_synthetic(
+            status = env->module_wrap().create_synthetic(
                 options->wrapper,
                 options->url,
                 options->context_or_undefined,
                 options->payload.synthetic.export_names,
                 options->payload.synthetic.synthetic_evaluation_steps,
-                module_out);
+                &result_out->module);
+            break;
         default:
             return napi_invalid_arg;
         }
+        if (status != napi_ok)
+            return status;
+        status = env->module_wrap().get_creation_metadata(
+            result_out->module,
+            &result_out->module_requests,
+            &result_out->has_top_level_await);
+        if (status != napi_ok)
+        {
+            env->module_wrap().destroy(result_out->module);
+            *result_out = {};
+        }
+        return status;
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
@@ -1115,16 +1131,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return env->module_wrap().destroy(module);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
-        napi_env env,
-        unofficial_napi_module module,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().get_module_requests(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_link(

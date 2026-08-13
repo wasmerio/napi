@@ -242,10 +242,16 @@ int main(void) {
   module_options.context_or_undefined = context;
   module_options.payload.source_text.source = &module_source;
   module_options.payload.source_text.host_defined_option_id = undefined_value;
-  unofficial_napi_module module = NULL;
-  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &module_options, &module));
+  unofficial_napi_module_create_result module_create_result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(
+                     env, &module_options, &module_create_result));
+  unofficial_napi_module module = module_create_result.module;
   CHECK_OR_FAIL(module != NULL,
                 "module compilation did not return a handle");
+  CHECK_OR_FAIL(module_create_result.module_requests != NULL,
+                "module compilation did not return requests");
+  CHECK_OR_FAIL(!module_create_result.has_top_level_await,
+                "synchronous module reported top-level await at creation");
   unofficial_napi_module_state module_state = {0};
   NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
                      env, module, &module_state));

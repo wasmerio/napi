@@ -3946,7 +3946,9 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
     uint32_t host_defined_option_id,
     uint32_t export_names_id,
     uint32_t synthetic_eval_steps_id,
-    uint32_t* handle_out) {
+    uint32_t* handle_out,
+    uint32_t* requests_out,
+    uint8_t* has_top_level_await_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -4002,10 +4004,24 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
       return napi_invalid_arg;
   }
 
-  unofficial_napi_module module = nullptr;
-  napi_status s = unofficial_napi_module_wrap_create(env, &options, &module);
+  unofficial_napi_module_create_result result{};
+  napi_status s = unofficial_napi_module_wrap_create(env, &options, &result);
   if (s != napi_ok) return s;
-  if (handle_out != nullptr) *handle_out = StoreModuleWrapHandle(*bridge_state, module);
+  if (result.module == nullptr || result.module_requests == nullptr) {
+    if (result.module != nullptr) {
+      (void)unofficial_napi_module_wrap_destroy(env, result.module);
+    }
+    return napi_generic_failure;
+  }
+  if (handle_out != nullptr) {
+    *handle_out = StoreModuleWrapHandle(*bridge_state, result.module);
+  }
+  if (requests_out != nullptr) {
+    *requests_out = StoreValue(*bridge_state, result.module_requests);
+  }
+  if (has_top_level_await_out != nullptr) {
+    *has_top_level_await_out = result.has_top_level_await ? 1 : 0;
+  }
   return napi_ok;
 }
 
@@ -4020,23 +4036,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_destroy(SnapiEnvState* env_st
   napi_status s = unofficial_napi_module_wrap_destroy(env, module);
   if (s == napi_ok) RemoveModuleWrapHandle(*bridge_state, handle_id);
   return s;
-}
-
-extern "C" int snapi_bridge_unofficial_module_wrap_get_module_requests(
-    SnapiEnvState* env_state,
-    uint32_t handle_id,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
-  if (module == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_module_wrap_get_module_requests(env, module, &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_module_wrap_link(SnapiEnvState* env_state,

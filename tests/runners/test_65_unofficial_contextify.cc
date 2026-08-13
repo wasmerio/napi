@@ -285,24 +285,31 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   create_options.context_or_undefined = undefined;
   create_options.payload.source_text.source = &source;
   create_options.payload.source_text.host_defined_option_id = undefined;
-  unofficial_napi_module module = nullptr;
+  unofficial_napi_module_create_result create_result{};
 
   auto invalid_options = create_options;
   invalid_options.size = sizeof(invalid_options) - 1;
-  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
             napi_invalid_arg);
   invalid_options = create_options;
   invalid_options.version++;
-  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
             napi_invalid_arg);
   invalid_options = create_options;
   invalid_options.kind = static_cast<unofficial_napi_module_kind>(99);
-  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &module),
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
             napi_invalid_arg);
 
-  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &create_options, &module),
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &create_options, &create_result),
             napi_ok);
+  unofficial_napi_module module = create_result.module;
   ASSERT_NE(module, nullptr);
+  ASSERT_NE(create_result.module_requests, nullptr);
+  uint32_t request_count = 1;
+  ASSERT_EQ(napi_get_array_length(s.env, create_result.module_requests, &request_count),
+            napi_ok);
+  EXPECT_EQ(request_count, 0u);
+  EXPECT_FALSE(create_result.has_top_level_await);
 
   unofficial_napi_module_state state{};
   ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);

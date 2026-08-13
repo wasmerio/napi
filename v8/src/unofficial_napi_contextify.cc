@@ -2366,6 +2366,11 @@ napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
   return napi_ok;
 }
 
+static napi_status MaterializeModuleRequests(
+    napi_env env,
+    unofficial_napi_module module,
+    napi_value* result_out);
+
 static napi_status CreateSourceTextModule(
     napi_env env,
     napi_value wrapper,
@@ -2563,15 +2568,17 @@ static napi_status CreateSyntheticModule(
 napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
     napi_env env,
     const unofficial_napi_module_create_options* options,
-    unofficial_napi_module* module_out) {
+    unofficial_napi_module_create_result* result_out) {
   if (options == nullptr || options->size < sizeof(*options) ||
       options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
-      module_out == nullptr) {
+      result_out == nullptr) {
     return napi_invalid_arg;
   }
+  *result_out = {};
+  napi_status status = napi_invalid_arg;
   switch (options->kind) {
     case unofficial_napi_module_source_text:
-      return CreateSourceTextModule(
+      status = CreateSourceTextModule(
           env,
           options->wrapper,
           options->url,
@@ -2580,19 +2587,33 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
           options->payload.source_text.line_offset,
           options->payload.source_text.column_offset,
           options->payload.source_text.host_defined_option_id,
-          module_out);
+          &result_out->module);
+      break;
     case unofficial_napi_module_synthetic:
-      return CreateSyntheticModule(
+      status = CreateSyntheticModule(
           env,
           options->wrapper,
           options->url,
           options->context_or_undefined,
           options->payload.synthetic.export_names,
           options->payload.synthetic.synthetic_evaluation_steps,
-          module_out);
+          &result_out->module);
+      break;
     default:
       return napi_invalid_arg;
   }
+  if (status != napi_ok) return status;
+
+  status = MaterializeModuleRequests(env, result_out->module,
+                                     &result_out->module_requests);
+  if (status != napi_ok) {
+    DestroyModuleRecord(ModuleRecord(result_out->module));
+    *result_out = {};
+    return status;
+  }
+  result_out->has_top_level_await =
+      ModuleRecord(result_out->module)->module.Get(env->isolate)->HasTopLevelAwait();
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
@@ -2613,7 +2634,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
+static napi_status MaterializeModuleRequests(
     napi_env env,
     unofficial_napi_module module,
     napi_value* result_out) {

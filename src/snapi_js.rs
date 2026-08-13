@@ -4127,6 +4127,8 @@ unsafe fn host_js_create_source_text_module(
     column_offset: i32,
     host_defined_option_id: u32,
     handle_out: *mut u32,
+    requests_out: *mut u32,
+    has_top_level_await_out: *mut u8,
 ) -> i32 {
     let _ = (line_offset, column_offset, host_defined_option_id);
     let Ok(state) = (unsafe { env_mut(env) }) else {
@@ -4194,6 +4196,7 @@ unsafe fn host_js_create_source_text_module(
 
     let handle = state.next_module;
     state.next_module = state.next_module.wrapping_add(1).max(1);
+    let requests_id = state.insert(requests.clone().into());
     state.source_text_modules.insert(
         handle,
         SourceTextModule {
@@ -4209,7 +4212,16 @@ unsafe fn host_js_create_source_text_module(
             evaluation: None,
         },
     );
-    unsafe { write(handle_out, handle) }.map_or_else(|error| error, |()| NAPI_OK)
+    for result in [
+        unsafe { write(handle_out, handle) },
+        unsafe { write(requests_out, requests_id) },
+        unsafe { write(has_top_level_await_out, u8::from(has_top_level_await)) },
+    ] {
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    NAPI_OK
 }
 unsafe fn host_js_create_synthetic_module(
     env: SnapiEnv,
@@ -4219,6 +4231,8 @@ unsafe fn host_js_create_synthetic_module(
     export_names_id: u32,
     synthetic_eval_steps_id: u32,
     handle_out: *mut u32,
+    requests_out: *mut u32,
+    has_top_level_await_out: *mut u8,
 ) -> i32 {
     let _ = (url_id, context_id);
     let Ok(state) = (unsafe { env_mut(env) }) else {
@@ -4269,7 +4283,17 @@ unsafe fn host_js_create_synthetic_module(
             evaluation: None,
         },
     );
-    unsafe { write(handle_out, handle) }.map_or_else(|error| error, |()| NAPI_OK)
+    let requests_id = state.insert(Array::new().into());
+    for result in [
+        unsafe { write(handle_out, handle) },
+        unsafe { write(requests_out, requests_id) },
+        unsafe { write(has_top_level_await_out, 0) },
+    ] {
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -4287,6 +4311,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
     export_names_id: u32,
     synthetic_eval_steps_id: u32,
     handle_out: *mut u32,
+    requests_out: *mut u32,
+    has_top_level_await_out: *mut u8,
 ) -> i32 {
     match kind {
         1 => unsafe {
@@ -4301,6 +4327,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
                 column_offset,
                 host_defined_option_id,
                 handle_out,
+                requests_out,
+                has_top_level_await_out,
             )
         },
         2 => unsafe {
@@ -4312,6 +4340,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
                 export_names_id,
                 synthetic_eval_steps_id,
                 handle_out,
+                requests_out,
+                has_top_level_await_out,
             )
         },
         _ => NAPI_INVALID_ARG,
@@ -4328,25 +4358,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_destroy(
     state.synthetic_modules.remove(&handle_id);
     state.source_text_modules.remove(&handle_id);
     NAPI_OK
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_module_requests(
-    env: SnapiEnv,
-    handle_id: u32,
-    result_out: *mut u32,
-) -> i32 {
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let requests = if state.synthetic_modules.contains_key(&handle_id) {
-        Array::new()
-    } else if let Some(module) = state.source_text_modules.get(&handle_id) {
-        module.requests.clone()
-    } else {
-        return NAPI_INVALID_ARG;
-    };
-    let id = state.insert(requests.into());
-    unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_link(

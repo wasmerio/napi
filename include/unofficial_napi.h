@@ -609,19 +609,23 @@ typedef struct {
   } payload;
 } unofficial_napi_module_create_options;
 
+// Immutable metadata produced by the same transaction that creates a module.
+// The layout is selected by options.version, so adding fields requires a new
+// create-options version rather than another query function.
+typedef struct {
+  unofficial_napi_module module;
+  napi_value module_requests;
+  bool has_top_level_await;
+} unofficial_napi_module_create_result;
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create(
     napi_env env,
     const unofficial_napi_module_create_options* options,
-    unofficial_napi_module* module_out);
+    unofficial_napi_module_create_result* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_destroy(
     napi_env env,
     unofficial_napi_module module);
-
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_module_requests(
-    napi_env env,
-    unofficial_napi_module module,
-    napi_value* result_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_link(
     napi_env env,

@@ -606,11 +606,12 @@ napi_status napi_module_wrap__::destroy(unofficial_napi_module module)
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::get_module_requests(unofficial_napi_module module,
-                                                    napi_value *result_out)
+napi_status napi_module_wrap__::get_creation_metadata(unofficial_napi_module module,
+                                                      napi_value *requests_out,
+                                                      bool *has_top_level_await_out)
 {
   record *entry = find(module);
-  if (entry == nullptr || result_out == nullptr)
+  if (entry == nullptr || requests_out == nullptr || has_top_level_await_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
   JSValue array = JS_NewArray(ctx_);
@@ -639,7 +640,8 @@ napi_status napi_module_wrap__::get_module_requests(unofficial_napi_module modul
     JS_DefinePropertyValueUint32(ctx_, array, static_cast<uint32_t>(i),
                                  object, JS_PROP_C_W_E);
   }
-  return wrap_owned(array, result_out);
+  *has_top_level_await_out = JS_ModuleHasTopLevelAwait(ctx_, entry->module);
+  return wrap_owned(array, requests_out);
 }
 
 napi_status napi_module_wrap__::link(unofficial_napi_module module,

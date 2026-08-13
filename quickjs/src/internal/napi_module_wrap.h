@@ -36,8 +36,9 @@ public:
                                napi_value synthetic_eval_steps,
                                unofficial_napi_module *module_out);
   napi_status destroy(unofficial_napi_module module);
-  napi_status get_module_requests(unofficial_napi_module module,
-                                  napi_value *result_out);
+  napi_status get_creation_metadata(unofficial_napi_module module,
+                                    napi_value *requests_out,
+                                    bool *has_top_level_await_out);
   napi_status link(unofficial_napi_module module,
                    size_t count,
                    const unofficial_napi_module *linked_modules);
