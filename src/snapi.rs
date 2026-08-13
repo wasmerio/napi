@@ -180,6 +180,12 @@ unsafe extern "C" {
         env: SnapiEnv,
         callback_id: u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_get_own_non_index_properties(
+        env: SnapiEnv,
+        value_id: u32,
+        filter_bits: u32,
+        out_id: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
     pub fn snapi_bridge_unofficial_get_error_metadata(
         env: SnapiEnv,

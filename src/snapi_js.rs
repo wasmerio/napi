@@ -1104,9 +1104,36 @@ struct HostJsEnv {
     type_tags: HashMap<u32, (u64, u64)>,
     next_module: u32,
     next_bytecode: u32,
-    bytecodes: HashMap<u32, JsValue>,
+    bytecodes: HashMap<u32, HostJsBytecode>,
     synthetic_modules: HashMap<u32, SyntheticModule>,
     source_text_modules: HashMap<u32, SourceTextModule>,
+}
+
+struct HostJsBytecode {
+    source: JsValue,
+    shape: i32,
+}
+
+fn host_js_source_for_shape(
+    state: &HostJsEnv,
+    source_text_id: u32,
+    source_bytecode_id: u32,
+    expected_shape: i32,
+) -> Result<String, i32> {
+    if source_text_id != 0 {
+        return state
+            .get(source_text_id)
+            .and_then(JsValue::as_string)
+            .ok_or(NAPI_STRING_EXPECTED);
+    }
+    let bytecode = state
+        .bytecodes
+        .get(&source_bytecode_id)
+        .ok_or(NAPI_INVALID_ARG)?;
+    if bytecode.shape != expected_shape {
+        return Err(NAPI_INVALID_ARG);
+    }
+    bytecode.source.as_string().ok_or(NAPI_STRING_EXPECTED)
 }
 
 impl HostJsEnv {
@@ -3517,6 +3544,83 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_promise_reject_callback(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
+    env: SnapiEnv,
+    value_id: u32,
+    filter_bits: u32,
+    out_id: *mut u32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.get(value_id).cloned() else {
+        return NAPI_INVALID_ARG;
+    };
+    if !value.is_object() && !value.is_function() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+
+    let object = Object::from(value);
+    let keys = match Reflect::own_keys(&object) {
+        Ok(keys) => keys,
+        Err(error) => {
+            state.last_exception = Some(error);
+            return NAPI_PENDING_EXCEPTION;
+        }
+    };
+    let filtered = Array::new();
+    for key in keys.iter() {
+        if key.is_symbol() {
+            if filter_bits & 16 != 0 {
+                continue;
+            }
+        } else if let Some(text) = key.as_string() {
+            if filter_bits & 8 != 0 || is_array_index_key(&text) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if filter_bits & 7 != 0 {
+            let descriptor = match Reflect::get_own_property_descriptor(&object, &key) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    state.last_exception = Some(error);
+                    return NAPI_PENDING_EXCEPTION;
+                }
+            };
+            if descriptor.is_undefined() {
+                continue;
+            }
+            if filter_bits & 1 != 0
+                && Reflect::get(&descriptor, &JsValue::from_str("writable"))
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    == Some(false)
+            {
+                continue;
+            }
+            if filter_bits & 2 != 0
+                && !Reflect::get(&descriptor, &JsValue::from_str("enumerable"))
+                    .is_ok_and(|value| value.is_truthy())
+            {
+                continue;
+            }
+            if filter_bits & 4 != 0
+                && !Reflect::get(&descriptor, &JsValue::from_str("configurable"))
+                    .is_ok_and(|value| value.is_truthy())
+            {
+                continue;
+            }
+        }
+        filtered.push(&key);
+    }
+
+    let id = state.insert(filtered.into());
+    unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_hash_seed(
     env: SnapiEnv,
     hash_seed_out: *mut u64,
@@ -3941,13 +4045,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let source_value = if source_text_id != 0 {
-        state.get(source_text_id)
-    } else {
-        state.bytecodes.get(&source_bytecode_id)
-    };
-    let Some(source) = source_value.and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
+    let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 0) {
+        Ok(source) => source,
+        Err(status) => return status,
     };
     let sandbox = state
         .get(sandbox_or_null_id)
@@ -3982,13 +4082,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let source_value = if source_text_id != 0 {
-        state.get(source_text_id)
-    } else {
-        state.bytecodes.get(&source_bytecode_id)
-    };
-    let Some(source) = source_value.and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
+    let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 1) {
+        Ok(source) => source,
+        Err(status) => return status,
     };
     let params = Array::new();
     if let Some(values) = state.get(params_id).filter(|value| Array::is_array(value)) {
@@ -4127,7 +4223,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
 
     let bytecode = state.next_bytecode.max(1);
     state.next_bytecode = bytecode.wrapping_add(1).max(1);
-    state.bytecodes.insert(bytecode, source_value);
+    state.bytecodes.insert(
+        bytecode,
+        HostJsBytecode {
+            source: source_value,
+            shape,
+        },
+    );
     if let Err(error) = unsafe { write(bytecode_out, bytecode) } {
         state.bytecodes.remove(&bytecode);
         return error;
@@ -4195,13 +4297,9 @@ unsafe fn host_js_create_source_text_module(
     let Some(url) = state.get(url_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
-    let source_value = if source_text_id != 0 {
-        state.get(source_text_id)
-    } else {
-        state.bytecodes.get(&source_bytecode_id)
-    };
-    let Some(source) = source_value.and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
+    let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 2) {
+        Ok(source) => source,
+        Err(status) => return status,
     };
 
     let scope = match evaluation_scope(state, context_id) {

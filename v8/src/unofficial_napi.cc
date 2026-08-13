@@ -40,6 +40,7 @@ namespace {
 
 struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
+  std::string engine_flags;
   uint32_t refcount = 0;
 };
 
@@ -692,17 +693,35 @@ void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
   }
 }
 
-napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
+napi_status AcquireRuntime(EdgeV8Platform** platform_out,
+                           const char* engine_flags,
+                           size_t engine_flags_length) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
 
-  if (g_runtime.refcount == 0 && g_runtime.platform == nullptr) {
+  if (g_runtime.platform == nullptr) {
     ApplyDefaultV8Flags();
+    if (engine_flags_length > 0) {
+      v8::V8::SetFlagsFromString(
+          engine_flags, static_cast<int>(engine_flags_length));
+    }
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupData("");
     g_runtime.platform = EdgeV8Platform::Create();
+    if (g_runtime.platform == nullptr) return napi_generic_failure;
     v8::V8::InitializePlatform(g_runtime.platform.get());
     v8::V8::Initialize();
+    g_runtime.engine_flags.assign(
+        engine_flags_length > 0 ? engine_flags : "", engine_flags_length);
+  } else if (engine_flags_length > 0 &&
+             (g_runtime.engine_flags.size() != engine_flags_length ||
+              std::memcmp(g_runtime.engine_flags.data(),
+                          engine_flags,
+                          engine_flags_length) != 0)) {
+    // V8 flags are frozen after process-global runtime initialization. Treat
+    // repeated identical configuration as idempotent, but never attempt to
+    // mutate a live runtime or silently ignore a conflicting request.
+    return napi_invalid_arg;
   }
 
   g_runtime.refcount++;
@@ -1893,14 +1912,11 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     return napi_invalid_arg;
   }
 
-  if (options != nullptr && options->engine_flags_length > 0) {
-    v8::V8::SetFlagsFromString(
-        options->engine_flags,
-        static_cast<int>(options->engine_flags_length));
-  }
-
   EdgeV8Platform* platform = nullptr;
-  napi_status status = AcquireRuntime(&platform);
+  napi_status status = AcquireRuntime(
+      &platform,
+      options != nullptr ? options->engine_flags : nullptr,
+      options != nullptr ? options->engine_flags_length : 0);
   if (status != napi_ok || platform == nullptr) {
     if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
     return status != napi_ok ? status : napi_generic_failure;
@@ -2647,6 +2663,31 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
   }
 
   *result_out = napi_v8_wrap_value(env, scope.Escape(symbol_value));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out) {
+  if (env == nullptr || value == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
+
+  v8::Local<v8::Array> properties;
+  if (!raw.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              v8::KeyCollectionMode::kOwnOnly,
+                              static_cast<v8::PropertyFilter>(filter_bits),
+                              v8::IndexFilter::kSkipIndices)
+           .ToLocal(&properties)) {
+    return napi_generic_failure;
+  }
+
+  *result_out = napi_v8_wrap_value(env, properties);
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 

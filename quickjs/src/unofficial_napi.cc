@@ -674,6 +674,116 @@ extern "C"
         napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
     }
 
+    napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
+        napi_env env,
+        napi_value value,
+        uint32_t filter_bits,
+        napi_value *result_out)
+    {
+        if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
+            return napi_invalid_arg;
+        JSContext *ctx = napi_util__::context(env);
+        JSValue obj = napi_quickjs_value_inner(env, value);
+        if (!JS_IsObject(obj))
+            return napi_object_expected;
+
+        auto string_is_array_index = [&](JSValue key) -> bool
+        {
+            size_t len = 0;
+            const char *name = JS_ToCStringLen(ctx, &len, key);
+            if (name == nullptr)
+                return false;
+            bool is_index = len > 0 && len <= 10;
+            uint64_t index = 0;
+            for (size_t i = 0; is_index && i < len; ++i)
+            {
+                if (name[i] < '0' || name[i] > '9' ||
+                    (i == 0 && len > 1 && name[i] == '0'))
+                {
+                    is_index = false;
+                    break;
+                }
+                index = index * 10 + static_cast<uint64_t>(name[i] - '0');
+            }
+            JS_FreeCString(ctx, name);
+            return is_index && index <= 4294967294ULL;
+        };
+
+        const int gpn_flags = napi_util__::key_filter_to_gpn(
+            static_cast<napi_key_filter>(filter_bits));
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, obj, gpn_flags) < 0)
+            return napi_util__::return_pending_if_caught(
+                env, "Exception while getting property names");
+
+        JSValue out = JS_NewArray(ctx);
+        uint32_t out_idx = 0;
+        for (uint32_t i = 0; i < prop_count; ++i)
+        {
+            JSValue key = JS_AtomToValue(ctx, props[i].atom);
+            if (JS_IsException(key))
+            {
+                JS_FreePropertyEnum(ctx, props, prop_count);
+                JS_FreeValue(ctx, out);
+                return napi_util__::return_pending_if_caught(
+                    env, "Failed to convert property name");
+            }
+
+            // Dense integer property atoms become numbers, avoiding a CString
+            // allocation for every element. Only string atoms that could be
+            // larger uint32 indices need parsing.
+            const bool is_index = JS_IsNumber(key) ||
+                                  (JS_IsString(key) && string_is_array_index(key));
+            if (is_index)
+            {
+                JS_FreeValue(ctx, key);
+                continue;
+            }
+
+            if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
+            {
+                JSPropertyDescriptor desc;
+                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
+                if (has < 0)
+                {
+                    JS_FreeValue(ctx, key);
+                    JS_FreePropertyEnum(ctx, props, prop_count);
+                    JS_FreeValue(ctx, out);
+                    return napi_util__::return_pending_if_caught(
+                        env, "Exception while filtering property names");
+                }
+                if (has == 0)
+                {
+                    JS_FreeValue(ctx, key);
+                    continue;
+                }
+
+                bool include = true;
+                if ((filter_bits & napi_key_writable) != 0 &&
+                    (desc.flags & JS_PROP_WRITABLE) == 0)
+                    include = false;
+                if ((filter_bits & napi_key_configurable) != 0 &&
+                    (desc.flags & JS_PROP_CONFIGURABLE) == 0)
+                    include = false;
+
+                JS_FreeValue(ctx, desc.value);
+                JS_FreeValue(ctx, desc.getter);
+                JS_FreeValue(ctx, desc.setter);
+                if (!include)
+                {
+                    JS_FreeValue(ctx, key);
+                    continue;
+                }
+            }
+
+            JS_SetPropertyUint32(ctx, out, out_idx++, key);
+        }
+
+        JS_FreePropertyEnum(ctx, props, prop_count);
+        return napi_util__::wrap_owned(env, out, result_out);
+    }
+
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
                                                          uint64_t *hash_seed_out)
     {

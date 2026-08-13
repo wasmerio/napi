@@ -323,6 +323,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_take(
 
 NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_message_drop(unofficial_napi_message message);
 
+// Returns own property keys while filtering indexed elements inside the
+// provider. This bulk operation avoids materializing every array index and
+// crossing the guest/host boundary once per key.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out);
+
 // Unofficial helper for Node's internalBinding('v8').getHashSeed().
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_hash_seed(napi_env env,
                                                       uint64_t* hash_seed_out);
@@ -399,8 +408,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_code_statistic
 // Unofficial helpers for worker-thread profiling/snapshot support. These must
 // be called on the target env's engine thread, typically from
 // unofficial_napi_request_interrupt(). A successful start returns one opaque,
-// env-owned session. Stop consumes that session; any sessions still active at
-// env teardown are stopped and released by the provider.
+// env-owned session. Stop leaves the session active when it returns
+// napi_cannot_run_js, so the caller can retry from the target engine thread.
+// Once stop accepts the thread/env preconditions it consumes the session even
+// if producing the final result fails. Sessions still active at env teardown
+// are stopped and released by the provider.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_profile_start(
     napi_env env,
     unofficial_napi_profile_kind kind,

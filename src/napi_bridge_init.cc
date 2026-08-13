@@ -3330,6 +3330,25 @@ extern "C" int snapi_bridge_unofficial_set_promise_reject_callback(SnapiEnvState
   return unofficial_napi_set_promise_reject_callback(env, callback);
 }
 
+extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
+    SnapiEnvState* env_state,
+    uint32_t value_id,
+    uint32_t filter_bits,
+    uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || out_id == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value value = LoadValue(*bridge_state, value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status status = unofficial_napi_get_own_non_index_properties(
+      env, value, filter_bits, &result);
+  if (status != napi_ok) return status;
+  *out_id = StoreValue(*bridge_state, result);
+  return *out_id != 0 ? napi_ok : napi_generic_failure;
+}
+
 extern "C" int snapi_bridge_unofficial_set_promise_hooks(
     SnapiEnvState* env_state,
     uint32_t init_callback_id,
@@ -3526,10 +3545,13 @@ extern "C" int snapi_bridge_unofficial_profile_stop(SnapiEnvState* env_state,
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (json_out == nullptr) return napi_invalid_arg;
   auto profile = reinterpret_cast<unofficial_napi_profile>(
-      bridge_state->profile_handles.Take(profile_id));
+      bridge_state->profile_handles.Load(profile_id));
   if (profile == nullptr) return napi_invalid_arg;
   napi_value json = nullptr;
   napi_status s = unofficial_napi_profile_stop(env, profile, &json);
+  if (s != napi_cannot_run_js && s != napi_invalid_arg) {
+    (void)bridge_state->profile_handles.Take(profile_id);
+  }
   if (s != napi_ok) return s;
   *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
   return napi_ok;

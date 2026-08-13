@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
@@ -77,8 +78,10 @@ TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;
   void* owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
   ASSERT_EQ(unofficial_napi_create_env(
-                NAPI_TEST_MODULE_API_VERSION, nullptr, &env, &owner),
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
             napi_ok);
   ASSERT_NE(env, nullptr);
   ASSERT_NE(owner, nullptr);
@@ -103,6 +106,41 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   EXPECT_EQ(probe.cleanup_calls, 1);
   EXPECT_EQ(probe.destroy_calls, 1);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test21General, EngineFlagsAreImmutableAfterRuntimeInitialization) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+
+  napi_env first_env = nullptr;
+  void* first_owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &first_env, &first_owner),
+            napi_ok);
+
+  napi_env second_env = nullptr;
+  void* second_owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &second_env, &second_owner),
+            napi_ok);
+
+  static constexpr char kConflictingFlags[] = "--no-js-float16array";
+  options.engine_flags = kConflictingFlags;
+  options.engine_flags_length = sizeof(kConflictingFlags) - 1;
+  napi_env conflicting_env = nullptr;
+  void* conflicting_owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION,
+                                       &options,
+                                       &conflicting_env,
+                                       &conflicting_owner),
+            napi_invalid_arg);
+  EXPECT_EQ(conflicting_env, nullptr);
+  EXPECT_EQ(conflicting_owner, nullptr);
+
+  EXPECT_EQ(unofficial_napi_release_env(second_owner, nullptr), napi_ok);
+  EXPECT_EQ(unofficial_napi_release_env(first_owner, nullptr), napi_ok);
+}
+#endif
 
 TEST_F(Test21General, NearHeapLimitCallbackUsesOneConfigurationSlot) {
   EnvScope s(runtime_.get());
@@ -242,6 +280,59 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   unofficial_napi_message_drop(dropped);
 }
 
+TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  napi_value index_value = nullptr;
+  ASSERT_EQ(napi_create_uint32(s.env, 1, &index_value), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, source, 0, index_value), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, source, 999999, index_value), napi_ok);
+
+  napi_value visible = nullptr;
+  ASSERT_EQ(napi_get_boolean(s.env, true, &visible), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "visible", visible), napi_ok);
+
+  napi_value description = nullptr;
+  napi_value symbol = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, "own-symbol", NAPI_AUTO_LENGTH, &description),
+            napi_ok);
+  ASSERT_EQ(napi_create_symbol(s.env, description, &symbol), napi_ok);
+  ASSERT_EQ(napi_set_property(s.env, source, symbol, visible), napi_ok);
+
+  napi_value keys = nullptr;
+  ASSERT_EQ(unofficial_napi_get_own_non_index_properties(
+                s.env, source, napi_key_all_properties, &keys),
+            napi_ok);
+  ASSERT_NE(keys, nullptr);
+  uint32_t length = 0;
+  ASSERT_EQ(napi_get_array_length(s.env, keys, &length), napi_ok);
+  ASSERT_EQ(length, 2u);
+
+  bool saw_visible = false;
+  bool saw_symbol = false;
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value key = nullptr;
+    ASSERT_EQ(napi_get_element(s.env, keys, index, &key), napi_ok);
+    napi_valuetype type = napi_undefined;
+    ASSERT_EQ(napi_typeof(s.env, key, &type), napi_ok);
+    if (type == napi_symbol) {
+      saw_symbol = true;
+    } else if (type == napi_string) {
+      char text[16] = {};
+      size_t copied = 0;
+      ASSERT_EQ(napi_get_value_string_utf8(s.env, key, text, sizeof(text), &copied),
+                napi_ok);
+      saw_visible = std::string(text, copied) == "visible";
+    } else {
+      ADD_FAILURE() << "unexpected key type " << static_cast<int>(type);
+    }
+  }
+  EXPECT_TRUE(saw_visible);
+  EXPECT_TRUE(saw_symbol);
+}
+
 TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
   EnvScope s(runtime_.get());
 
@@ -317,6 +408,31 @@ TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
   napi_value second_json = nullptr;
   EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &second_json),
             napi_invalid_arg);
+}
+
+TEST_F(Test21General, CpuProfileStopCanRetryFromTheEnvironmentThread) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_profile_start_result start_result =
+      unofficial_napi_profile_start_busy;
+  unofficial_napi_profile profile = nullptr;
+  ASSERT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &start_result, &profile),
+            napi_ok);
+  ASSERT_EQ(start_result, unofficial_napi_profile_start_ok);
+  ASSERT_NE(profile, nullptr);
+
+  napi_status off_thread_status = napi_ok;
+  std::thread off_thread([&]() {
+    napi_value json = nullptr;
+    off_thread_status = unofficial_napi_profile_stop(s.env, profile, &json);
+  });
+  off_thread.join();
+  EXPECT_EQ(off_thread_status, napi_cannot_run_js);
+
+  napi_value json = nullptr;
+  EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &json), napi_ok);
+  EXPECT_NE(json, nullptr);
 }
 #endif
 

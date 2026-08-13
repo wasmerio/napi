@@ -1206,6 +1206,32 @@ fn guest_unofficial_napi_set_promise_reject_callback(
     unsafe { snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id) }
 }
 
+fn guest_unofficial_napi_get_own_non_index_properties(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    value: i32,
+    filter_bits: i32,
+    result_out_ptr: i32,
+) -> i32 {
+    if value <= 0 || result_out_ptr <= 0 {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut out = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_own_non_index_properties(
+            env_handle,
+            value as u32,
+            filter_bits.max(0) as u32,
+            &mut out,
+        )
+    };
+    if status == 0 {
+        write_guest_u32(&mut env, result_out_ptr as u32, out);
+    }
+    status
+}
+
 fn guest_unofficial_napi_set_promise_hooks(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1768,8 +1794,14 @@ fn guest_unofficial_napi_bytecode_open(
     let cache_ptr = u32_at(36) as i32;
     let cache_length = u32_at(40) as usize;
     let has_cache = fields[44];
-    let cache = if has_cache != 0 && cache_ptr > 0 && cache_length > 0 {
-        read_guest_bytes(&mut env, cache_ptr, cache_length).unwrap_or_default()
+    let cache = if has_cache != 0 && cache_length > 0 {
+        if cache_ptr <= 0 {
+            return 1;
+        }
+        let Some(cache) = read_guest_bytes(&mut env, cache_ptr, cache_length) else {
+            return 1;
+        };
+        cache
     } else {
         Vec::new()
     };
@@ -6020,6 +6052,7 @@ pub fn register_napi_imports(
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
+        "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
