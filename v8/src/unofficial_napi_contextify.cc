@@ -1474,7 +1474,22 @@ struct BytecodeRecord {
 };
 
 BytecodeRecord* BytecodeRecordFromSource(const unofficial_napi_js_source* source) {
-  return source != nullptr ? static_cast<BytecodeRecord*>(source->bytecode) : nullptr;
+  if (source == nullptr || source->kind != unofficial_napi_js_source_bytecode ||
+      source->text != nullptr || source->bytecode == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<BytecodeRecord*>(source->bytecode);
+}
+
+bool IsValidJsSource(const unofficial_napi_js_source* source) {
+  if (source == nullptr) return false;
+  if (source->kind == unofficial_napi_js_source_text) {
+    return source->text != nullptr && source->bytecode == nullptr;
+  }
+  if (source->kind == unofficial_napi_js_source_bytecode) {
+    return source->text == nullptr && source->bytecode != nullptr;
+  }
+  return false;
 }
 
 bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<std::string>* out) {
@@ -1762,7 +1777,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
+static napi_status BytecodeCompile(
     napi_env env,
     napi_value source_text,
     napi_value filename,
@@ -1771,7 +1786,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
     napi_value host_defined_option_id,
     int32_t line_offset,
     int32_t column_offset,
-    void** bytecode_out,
+    unofficial_napi_bytecode* bytecode_out,
     bool* can_parse_as_module_out) {
   if (env == nullptr || source_text == nullptr || filename == nullptr || bytecode_out == nullptr) {
     return napi_invalid_arg;
@@ -1824,11 +1839,11 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
     return napi_generic_failure;
   }
 
-  *bytecode_out = record.release();
+  *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
+static napi_status BytecodeDeserialize(
     napi_env env,
     const uint8_t* bytes,
     size_t byte_length,
@@ -1837,7 +1852,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
     int32_t shape,
     napi_value params_or_undefined,
     napi_value host_defined_option_id,
-    void** bytecode_out,
+    unofficial_napi_bytecode* bytecode_out,
     bool* rejected_out) {
   if (env == nullptr || bytes == nullptr || byte_length == 0 || source_text == nullptr ||
       filename == nullptr || bytecode_out == nullptr) {
@@ -1878,16 +1893,64 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
     return napi_ok;
   }
 
-  *bytecode_out = record.release();
+  *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_bytecode_open(
+    napi_env env,
+    const unofficial_napi_bytecode_open_options* options,
+    unofficial_napi_bytecode_open_result* result) {
+  if (env == nullptr || options == nullptr || result == nullptr ||
+      options->size < sizeof(*options) ||
+      options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
+      options->source_text == nullptr || options->filename == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result = {};
+
+  if (options->has_cache != 0 && options->cache_bytes != nullptr &&
+      options->cache_byte_length != 0) {
+    bool rejected = false;
+    const napi_status status = BytecodeDeserialize(env,
+                                                   options->cache_bytes,
+                                                   options->cache_byte_length,
+                                                   options->source_text,
+                                                   options->filename,
+                                                   options->shape,
+                                                   options->params_or_undefined,
+                                                   options->host_defined_option_id,
+                                                   &result->bytecode,
+                                                   &rejected);
+    result->cache_rejected = rejected ? 1 : 0;
+    if (status != napi_ok) return status;
+    if (result->bytecode != nullptr) return napi_ok;
+    result->cache_rejected = 1;
+  } else if (options->has_cache != 0) {
+    result->cache_rejected = 1;
+  }
+
+  bool can_parse_as_module = false;
+  const napi_status status = BytecodeCompile(env,
+                                             options->source_text,
+                                             options->filename,
+                                             options->shape,
+                                             options->params_or_undefined,
+                                             options->host_defined_option_id,
+                                             options->line_offset,
+                                             options->column_offset,
+                                             &result->bytecode,
+                                             &can_parse_as_module);
+  result->can_parse_as_module = can_parse_as_module ? 1 : 0;
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
     napi_env env,
-    void* bytecode,
+    unofficial_napi_bytecode bytecode,
     napi_value* buffer_out) {
   if (env == nullptr || bytecode == nullptr || buffer_out == nullptr) return napi_invalid_arg;
-  auto* record = static_cast<BytecodeRecord*>(bytecode);
+  auto* record = reinterpret_cast<BytecodeRecord*>(bytecode);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
@@ -1904,9 +1967,10 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
   return *buffer_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
-napi_status NAPI_CDECL unofficial_napi_bytecode_release(napi_env env, void* bytecode) {
+napi_status NAPI_CDECL unofficial_napi_bytecode_release(
+    napi_env env, unofficial_napi_bytecode bytecode) {
   if (env == nullptr || bytecode == nullptr) return napi_invalid_arg;
-  delete static_cast<BytecodeRecord*>(bytecode);
+  delete reinterpret_cast<BytecodeRecord*>(bytecode);
   return napi_ok;
 }
 
@@ -1923,8 +1987,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
     bool break_on_first_line,
     napi_value host_defined_option_id,
     napi_value* result_out) {
-  if (env == nullptr || source == nullptr ||
-      (source->text == nullptr && source->bytecode == nullptr) || filename == nullptr ||
+  if (env == nullptr || !IsValidJsSource(source) || filename == nullptr ||
       result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2077,8 +2140,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     napi_value params_or_undefined,
     napi_value host_defined_option_id,
     napi_value* result_out) {
-  if (env == nullptr || source == nullptr ||
-      (source->text == nullptr && source->bytecode == nullptr) || filename == nullptr ||
+  if (env == nullptr || !IsValidJsSource(source) || filename == nullptr ||
       result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2306,8 +2368,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
     int32_t column_offset,
     napi_value host_defined_option_id,
     void** handle_out) {
-  if (env == nullptr || wrapper == nullptr || url == nullptr || source == nullptr ||
-      (source->text == nullptr && source->bytecode == nullptr) || handle_out == nullptr) {
+  if (env == nullptr || wrapper == nullptr || url == nullptr || !IsValidJsSource(source) ||
+      handle_out == nullptr) {
     return napi_invalid_arg;
   }
   *handle_out = nullptr;

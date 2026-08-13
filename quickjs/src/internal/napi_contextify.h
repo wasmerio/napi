@@ -72,7 +72,7 @@ namespace quickjs::detail
                                      napi_value host_defined_option_id,
                                      int32_t line_offset,
                                      int32_t column_offset,
-                                     void **bytecode_out,
+                                     unofficial_napi_bytecode *bytecode_out,
                                      bool *can_parse_as_module_out);
         napi_status bytecode_deserialize(const uint8_t *bytes,
                                          size_t byte_length,
@@ -81,10 +81,10 @@ namespace quickjs::detail
                                          int32_t shape,
                                          napi_value params_or_undefined,
                                          napi_value host_defined_option_id,
-                                         void **bytecode_out,
+                                         unofficial_napi_bytecode *bytecode_out,
                                          bool *rejected_out);
-        napi_status bytecode_serialize(void *bytecode, napi_value *buffer_out);
-        napi_status bytecode_release(void *bytecode);
+        napi_status bytecode_serialize(unofficial_napi_bytecode bytecode, napi_value *buffer_out);
+        napi_status bytecode_release(unofficial_napi_bytecode bytecode);
 
     private:
         bool compile_trace_enabled() const;

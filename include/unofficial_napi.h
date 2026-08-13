@@ -445,13 +445,45 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context
     napi_value host_defined_option_id,
     napi_value* result_out);
 
-// A JS source for compile/eval APIs: exactly one of `text` (a JS string) or
-// `bytecode` (an opaque handle from unofficial_napi_bytecode_compile /
-// unofficial_napi_bytecode_deserialize) is set.
+// Provider-owned compiled JavaScript. The handle is bound to its creating
+// environment and must be released explicitly.
+typedef struct unofficial_napi_bytecode__* unofficial_napi_bytecode;
+
+// A tagged JS source for compile/eval APIs. Providers reject descriptors whose
+// selected field is null or whose unselected field is non-null.
+typedef enum {
+  unofficial_napi_js_source_text = 0,
+  unofficial_napi_js_source_bytecode = 1,
+} unofficial_napi_js_source_kind;
+
 typedef struct unofficial_napi_js_source {
+  int32_t kind;
   napi_value text;
-  void* bytecode;
+  unofficial_napi_bytecode bytecode;
 } unofficial_napi_js_source;
+
+static inline bool unofficial_napi_js_source_is_valid(
+    const unofficial_napi_js_source* source) {
+  return source != NULL &&
+         ((source->kind == unofficial_napi_js_source_text &&
+           source->text != NULL && source->bytecode == NULL) ||
+          (source->kind == unofficial_napi_js_source_bytecode &&
+           source->text == NULL && source->bytecode != NULL));
+}
+
+static inline unofficial_napi_js_source unofficial_napi_js_source_from_text(
+    napi_value text) {
+  unofficial_napi_js_source source = {
+      unofficial_napi_js_source_text, text, NULL};
+  return source;
+}
+
+static inline unofficial_napi_js_source unofficial_napi_js_source_from_bytecode(
+    unofficial_napi_bytecode bytecode) {
+  unofficial_napi_js_source source = {
+      unofficial_napi_js_source_bytecode, NULL, bytecode};
+  return source;
+}
 
 // Compile shape of a bytecode artifact; bytecode is only usable by APIs that
 // compile the same shape.
@@ -461,64 +493,48 @@ typedef enum {
   unofficial_napi_bytecode_shape_module = 2,        // ES module
 } unofficial_napi_bytecode_shape;
 
-// Eagerly compiles source text into bytecode. The returned handle holds the
-// live compiled artifact plus serializable engine bytes, and retains the
-// text/filename/shape/params (V8 code caches are consumed against the
-// original source). On compile FAILURE with a non-module shape,
-// *can_parse_as_module_out (nullable) reports whether the source parses as an
-// ES module — the detect-module signal — while the compile exception stays
-// pending.
-// host_defined_option_id (Symbol or nullish) is baked into the compiled
-// artifact's origin so consumers with the same symbol can reuse it directly;
-// a consumer with different options re-consumes the serialized bytes instead.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_compile(
-    napi_env env,
-    napi_value source_text,
-    napi_value filename,
-    int32_t shape,
-    napi_value params_or_undefined,
-    napi_value host_defined_option_id,
-    int32_t line_offset,
-    int32_t column_offset,
-    void** bytecode_out,
-    bool* can_parse_as_module_out);
+// Versioned input for opening a compiled artifact. When `has_cache` is nonzero,
+// the provider first validates the supplied bytes against every compile input.
+// A rejected cache is atomically replaced by compiling `source_text`; callers
+// never implement a second provider-dependent fallback path.
+#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 1u
+typedef struct unofficial_napi_bytecode_open_options {
+  uint32_t size;
+  uint32_t version;
+  napi_value source_text;
+  napi_value filename;
+  int32_t shape;
+  napi_value params_or_undefined;
+  napi_value host_defined_option_id;
+  int32_t line_offset;
+  int32_t column_offset;
+  const uint8_t* cache_bytes;
+  size_t cache_byte_length;
+  uint8_t has_cache;
+} unofficial_napi_bytecode_open_options;
 
-// Deserializes engine bytes (e.g. a sidecar payload) into a live compiled
-// artifact. source_text is the source the bytes were produced from. On
-// stale/incompatible bytes the call succeeds with *bytecode_out = NULL and
-// *rejected_out = true; the caller falls back to compiling the text.
-// Payloads are fully self-validating against (shape, source_text, params,
-// filename) — V8 natively via CachedData; QuickJS via the provider's QJSB
-// header written at serialize time (which also guards payload integrity,
-// since JS_ReadObject is not hardened). A stored filename hash of 0 is
-// "unenforced" (vm.SourceTextModule#createCachedData writes 0 because Node
-// numbers vm module identifiers). So untrusted cachedData can be handed
-// straight in: a mismatch on any of those dimensions is reported as rejected
-// without the caller needing its own validation wrapper.
+typedef struct unofficial_napi_bytecode_open_result {
+  unofficial_napi_bytecode bytecode;
+  uint8_t cache_rejected;
+  uint8_t can_parse_as_module;
+} unofficial_napi_bytecode_open_result;
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_deserialize(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_open(
     napi_env env,
-    const uint8_t* bytes,
-    size_t byte_length,
-    napi_value source_text,
-    napi_value filename,
-    int32_t shape,
-    napi_value params_or_undefined,
-    napi_value host_defined_option_id,
-    void** bytecode_out,
-    bool* rejected_out);
+    const unofficial_napi_bytecode_open_options* options,
+    unofficial_napi_bytecode_open_result* result);
 
 // Engine bytes for persistence, as a Uint8Array (V8: raw CachedData;
 // QuickJS: self-validating QJSB header [shape, source, params, filename,
 // payload hashes] + JS_WriteObject output).
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_serialize(
     napi_env env,
-    void* bytecode,
+    unofficial_napi_bytecode bytecode,
     napi_value* buffer_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_release(
     napi_env env,
-    void* bytecode);
+    unofficial_napi_bytecode bytecode);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
     napi_env env,

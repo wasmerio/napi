@@ -749,10 +749,12 @@ namespace quickjs::detail
         (void)display_errors;
         (void)break_on_sigint;
         (void)break_on_first_line;
-        if (!napi_util__::check_env(env_) || source == nullptr ||
-            (source->text == nullptr && source->bytecode == nullptr) || result_out == nullptr)
+        if (!napi_util__::check_env(env_) ||
+            !unofficial_napi_js_source_is_valid(source) || result_out == nullptr)
             return napi_invalid_arg;
-        auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+        auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
+                                    ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
+                                    : nullptr;
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
@@ -852,11 +854,13 @@ namespace quickjs::detail
     {
         (void)context_extensions_or_undefined;
         (void)host_defined_option_id;
-        if (!napi_util__::check_env(env_) || source == nullptr ||
-            (source->text == nullptr && source->bytecode == nullptr) || result_out == nullptr)
+        if (!napi_util__::check_env(env_) ||
+            !unofficial_napi_js_source_is_valid(source) || result_out == nullptr)
             return napi_invalid_arg;
 
-        auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+        auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
+                                    ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
+                                    : nullptr;
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function)
             return napi_invalid_arg;
@@ -1048,7 +1052,7 @@ namespace quickjs::detail
                                                     napi_value host_defined_option_id,
                                                     int32_t line_offset,
                                                     int32_t column_offset,
-                                                    void **bytecode_out,
+                                                    unofficial_napi_bytecode *bytecode_out,
                                                     bool *can_parse_as_module_out)
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
@@ -1126,7 +1130,7 @@ namespace quickjs::detail
             return napi_invalid_arg;
         }
 
-        *bytecode_out = record.release();
+        *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
         return napi_ok;
     }
 
@@ -1137,7 +1141,7 @@ namespace quickjs::detail
                                                         int32_t shape,
                                                         napi_value params_or_undefined,
                                                         napi_value host_defined_option_id,
-                                                        void **bytecode_out,
+                                                        unofficial_napi_bytecode *bytecode_out,
                                                         bool *rejected_out)
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
@@ -1215,15 +1219,15 @@ namespace quickjs::detail
             record->artifact = restored;
         }
 
-        *bytecode_out = record.release();
+        *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
         return napi_ok;
     }
 
-    napi_status napi_contextify__::bytecode_serialize(void *bytecode, napi_value *buffer_out)
+    napi_status napi_contextify__::bytecode_serialize(unofficial_napi_bytecode bytecode, napi_value *buffer_out)
     {
         if (!napi_util__::check_env(env_) || bytecode == nullptr || buffer_out == nullptr)
             return napi_invalid_arg;
-        auto *record = static_cast<napi_bytecode_record__ *>(bytecode);
+        auto *record = reinterpret_cast<napi_bytecode_record__ *>(bytecode);
         std::vector<uint8_t> persisted;
         if (!record->bytes.empty())
         {
@@ -1244,11 +1248,11 @@ namespace quickjs::detail
         return napi_create_typedarray(env_, napi_uint8_array, persisted.size(), arraybuffer, 0, buffer_out);
     }
 
-    napi_status napi_contextify__::bytecode_release(void *bytecode)
+    napi_status napi_contextify__::bytecode_release(unofficial_napi_bytecode bytecode)
     {
         if (bytecode == nullptr)
             return napi_invalid_arg;
-        auto *record = static_cast<napi_bytecode_record__ *>(bytecode);
+        auto *record = reinterpret_cast<napi_bytecode_record__ *>(bytecode);
         if (record->ctx != nullptr && !JS_IsUndefined(record->artifact))
             JS_FreeValue(record->ctx, record->artifact);
         delete record;

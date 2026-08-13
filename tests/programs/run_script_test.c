@@ -143,8 +143,8 @@ int main(void) {
                      "globalThis.__napi_context_marker",
                      NAPI_AUTO_LENGTH,
                      &context_source_text));
-  const unofficial_napi_js_source context_source = {
-      context_source_text, NULL};
+  const unofficial_napi_js_source context_source =
+      unofficial_napi_js_source_from_text(context_source_text);
   napi_value context_result;
   NAPI_CALL(env, unofficial_napi_contextify_run_script(
                      env,
@@ -185,8 +185,8 @@ int main(void) {
                      "__napi_context_extension_marker;",
                      NAPI_AUTO_LENGTH,
                      &function_source_text));
-  const unofficial_napi_js_source function_source = {
-      function_source_text, NULL};
+  const unofficial_napi_js_source function_source =
+      unofficial_napi_js_source_from_text(function_source_text);
   napi_value compiled;
   NAPI_CALL(env, unofficial_napi_contextify_compile_function(
                      env,
@@ -231,7 +231,8 @@ int main(void) {
                      "globalThis.__napi_context_marker;",
                      NAPI_AUTO_LENGTH,
                      &module_source_text));
-  const unofficial_napi_js_source module_source = {module_source_text, NULL};
+  const unofficial_napi_js_source module_source =
+      unofficial_napi_js_source_from_text(module_source_text);
   void* module_handle = NULL;
   NAPI_CALL(env, unofficial_napi_module_wrap_create_source_text(
                      env,

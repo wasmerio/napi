@@ -396,12 +396,12 @@ void RemoveModuleWrapHandle(SnapiEnvState& state, uint32_t id) {
   state.module_wrap_handles.Remove(id);
 }
 
-uint32_t StoreBytecodeHandle(SnapiEnvState& state, void* handle) {
-  return state.bytecode_handles.Store(handle);
+uint32_t StoreBytecodeHandle(SnapiEnvState& state, unofficial_napi_bytecode handle) {
+  return state.bytecode_handles.Store(reinterpret_cast<void*>(handle));
 }
 
-void* LoadBytecodeHandle(SnapiEnvState& state, uint32_t id) {
-  return state.bytecode_handles.Load(id);
+unofficial_napi_bytecode LoadBytecodeHandle(SnapiEnvState& state, uint32_t id) {
+  return reinterpret_cast<unofficial_napi_bytecode>(state.bytecode_handles.Load(id));
 }
 
 void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
@@ -442,7 +442,8 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   // explicitly — env teardown does not reclaim them.
   for (auto& entry : state->bytecode_handles.handles) {
     if (entry.second != nullptr) {
-      (void)unofficial_napi_bytecode_release(state->env, entry.second);
+      (void)unofficial_napi_bytecode_release(
+          state->env, reinterpret_cast<unofficial_napi_bytecode>(entry.second));
     }
   }
   state->bytecode_handles.Reset();
@@ -3767,14 +3768,17 @@ extern "C" int snapi_bridge_unofficial_contextify_run_script(
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value sandbox_or_null = sandbox_or_null_id == 0 ? nullptr : LoadValue(*bridge_state, sandbox_or_null_id);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
-  void* source_bytecode = LoadBytecodeHandle(*bridge_state, source_bytecode_id);
+  unofficial_napi_bytecode source_bytecode =
+      LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
   napi_value host_defined_option =
       host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
   if (sandbox_or_null_id != 0 && sandbox_or_null == nullptr) return napi_invalid_arg;
   if ((source_text == nullptr && source_bytecode == nullptr) || filename == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  const unofficial_napi_js_source source{source_text, source_bytecode};
+  const unofficial_napi_js_source source = source_text != nullptr
+                                               ? unofficial_napi_js_source_from_text(source_text)
+                                               : unofficial_napi_js_source_from_bytecode(source_bytecode);
   napi_value result = nullptr;
   napi_status s = unofficial_napi_contextify_run_script(
       env,
@@ -3811,7 +3815,8 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
-  void* source_bytecode = LoadBytecodeHandle(*bridge_state, source_bytecode_id);
+  unofficial_napi_bytecode source_bytecode =
+      LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
   napi_value parsing_context = parsing_context_id == 0 ? nullptr : LoadValue(*bridge_state, parsing_context_id);
   napi_value context_extensions =
@@ -3824,7 +3829,9 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   if (context_extensions_id != 0 && context_extensions == nullptr) return napi_invalid_arg;
   if (params_id != 0 && params == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  const unofficial_napi_js_source source{source_text, source_bytecode};
+  const unofficial_napi_js_source source = source_text != nullptr
+                                               ? unofficial_napi_js_source_from_text(source_text)
+                                               : unofficial_napi_js_source_from_bytecode(source_bytecode);
   napi_value result = nullptr;
   napi_status s = unofficial_napi_contextify_compile_function(
       env,
@@ -3842,7 +3849,7 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_bytecode_compile(
+extern "C" int snapi_bridge_unofficial_bytecode_open(
     SnapiEnvState* env_state,
     uint32_t source_text_id,
     uint32_t filename_id,
@@ -3851,7 +3858,11 @@ extern "C" int snapi_bridge_unofficial_bytecode_compile(
     uint32_t host_defined_option_id,
     int32_t line_offset,
     int32_t column_offset,
+    const uint8_t* cache_bytes,
+    size_t cache_byte_length,
+    uint8_t has_cache,
     uint32_t* bytecode_out,
+    uint8_t* cache_rejected_out,
     uint8_t* can_parse_as_module_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -3865,50 +3876,29 @@ extern "C" int snapi_bridge_unofficial_bytecode_compile(
   if (source_text == nullptr || filename == nullptr) return napi_invalid_arg;
   if (params_id != 0 && params == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  void* bytecode = nullptr;
-  bool can_parse_as_module = false;
-  napi_status s = unofficial_napi_bytecode_compile(
-      env, source_text, filename, shape, params, host_defined_option, line_offset, column_offset,
-      &bytecode, &can_parse_as_module);
-  if (can_parse_as_module_out != nullptr) *can_parse_as_module_out = can_parse_as_module ? 1 : 0;
-  if (s != napi_ok) return s;
-  if (bytecode_out != nullptr) *bytecode_out = StoreBytecodeHandle(*bridge_state, bytecode);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_bytecode_deserialize(
-    SnapiEnvState* env_state,
-    const uint8_t* bytes,
-    size_t byte_length,
-    uint32_t source_text_id,
-    uint32_t filename_id,
-    int32_t shape,
-    uint32_t params_id,
-    uint32_t host_defined_option_id,
-    uint32_t* bytecode_out,
-    uint8_t* rejected_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value source_text = LoadValue(*bridge_state, source_text_id);
-  napi_value filename = LoadValue(*bridge_state, filename_id);
-  napi_value params = params_id == 0 ? nullptr : LoadValue(*bridge_state, params_id);
-  if (bytes == nullptr || byte_length == 0 || source_text == nullptr || filename == nullptr) {
-    return napi_invalid_arg;
+  unofficial_napi_bytecode_open_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  options.source_text = source_text;
+  options.filename = filename;
+  options.shape = shape;
+  options.params_or_undefined = params;
+  options.host_defined_option_id = host_defined_option;
+  options.line_offset = line_offset;
+  options.column_offset = column_offset;
+  options.cache_bytes = cache_bytes;
+  options.cache_byte_length = cache_byte_length;
+  options.has_cache = has_cache;
+  unofficial_napi_bytecode_open_result result{};
+  napi_status s = unofficial_napi_bytecode_open(env, &options, &result);
+  if (cache_rejected_out != nullptr) *cache_rejected_out = result.cache_rejected;
+  if (can_parse_as_module_out != nullptr) {
+    *can_parse_as_module_out = result.can_parse_as_module;
   }
-  if (params_id != 0 && params == nullptr) return napi_invalid_arg;
-  napi_value host_defined_option =
-      host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
-  if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  void* bytecode = nullptr;
-  bool rejected = false;
-  napi_status s = unofficial_napi_bytecode_deserialize(
-      env, bytes, byte_length, source_text, filename, shape, params, host_defined_option,
-      &bytecode, &rejected);
-  if (rejected_out != nullptr) *rejected_out = rejected ? 1 : 0;
   if (s != napi_ok) return s;
-  if (bytecode_out != nullptr) *bytecode_out = StoreBytecodeHandle(*bridge_state, bytecode);
+  if (bytecode_out != nullptr) {
+    *bytecode_out = StoreBytecodeHandle(*bridge_state, result.bytecode);
+  }
   return napi_ok;
 }
 
@@ -3920,7 +3910,7 @@ extern "C" int snapi_bridge_unofficial_bytecode_serialize(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  void* bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
+  unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
   if (bytecode == nullptr) return napi_invalid_arg;
   napi_value buffer = nullptr;
   napi_status s = unofficial_napi_bytecode_serialize(env, bytecode, &buffer);
@@ -3936,7 +3926,7 @@ extern "C" int snapi_bridge_unofficial_bytecode_release(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  void* bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
+  unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
   if (bytecode == nullptr) return napi_invalid_arg;
   napi_status s = unofficial_napi_bytecode_release(env, bytecode);
   RemoveBytecodeHandle(*bridge_state, bytecode_id);
@@ -3962,7 +3952,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
   napi_value url = LoadValue(*bridge_state, url_id);
   napi_value context = context_id == 0 ? nullptr : LoadValue(*bridge_state, context_id);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
-  void* source_bytecode = LoadBytecodeHandle(*bridge_state, source_bytecode_id);
+  unofficial_napi_bytecode source_bytecode =
+      LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value host_defined_option =
       host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
   if (wrapper == nullptr || url == nullptr ||
@@ -3971,7 +3962,9 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_source_text(
   }
   if (context_id != 0 && context == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  const unofficial_napi_js_source source{source_text, source_bytecode};
+  const unofficial_napi_js_source source = source_text != nullptr
+                                               ? unofficial_napi_js_source_from_text(source_text)
+                                               : unofficial_napi_js_source_from_bytecode(source_bytecode);
   void* handle = nullptr;
   napi_status s = unofficial_napi_module_wrap_create_source_text(
       env, wrapper, url, context, &source, line_offset, column_offset, host_defined_option, &handle);

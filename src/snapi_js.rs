@@ -429,6 +429,15 @@ function wasmerNapiCollectBindingNames(pattern, names) {
     wasmerNapiCollectBindingNames(pattern.argument, names);
   }
 }
+export function wasmer_napi_validate_script(source, filename) {
+  wasmerNapiParse(source, {
+    ecmaVersion: 'latest',
+    sourceType: 'script',
+    allowHashBang: true,
+    locations: true,
+    sourceFile: filename,
+  });
+}
 export function wasmer_napi_compile_module(scope, source, filename) {
   const program = wasmerNapiParse(source, {
     ecmaVersion: 'latest',
@@ -918,6 +927,8 @@ extern "C" {
         source: &str,
         filename: &str,
     ) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_validate_script(source: &str, filename: &str) -> Result<(), JsValue>;
     fn wasmer_napi_create_module_evaluation() -> Object;
     fn wasmer_napi_finish_module_evaluation(
         evaluation: &Object,
@@ -1093,6 +1104,8 @@ struct HostJsEnv {
     backing_tokens: HashMap<u32, u64>,
     type_tags: HashMap<u32, (u64, u64)>,
     next_module: u32,
+    next_bytecode: u32,
+    bytecodes: HashMap<u32, JsValue>,
     synthetic_modules: HashMap<u32, SyntheticModule>,
     source_text_modules: HashMap<u32, SourceTextModule>,
 }
@@ -1140,6 +1153,8 @@ impl HostJsEnv {
             backing_tokens: HashMap::new(),
             type_tags: HashMap::new(),
             next_module: 1,
+            next_bytecode: 1,
+            bytecodes: HashMap::new(),
             synthetic_modules: HashMap::new(),
             source_text_modules: HashMap::new(),
         }
@@ -3871,12 +3886,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source) = state.get(source_text_id).and_then(JsValue::as_string) else {
-        return if source_bytecode_id != 0 {
-            NAPI_GENERIC_FAILURE
-        } else {
-            NAPI_STRING_EXPECTED
-        };
+    let source_value = if source_text_id != 0 {
+        state.get(source_text_id)
+    } else {
+        state.bytecodes.get(&source_bytecode_id)
+    };
+    let Some(source) = source_value.and_then(JsValue::as_string) else {
+        return NAPI_STRING_EXPECTED;
     };
     let sandbox = state
         .get(sandbox_or_null_id)
@@ -3911,12 +3927,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source) = state.get(source_text_id).and_then(JsValue::as_string) else {
-        return if source_bytecode_id != 0 {
-            NAPI_GENERIC_FAILURE
-        } else {
-            NAPI_STRING_EXPECTED
-        };
+    let source_value = if source_text_id != 0 {
+        state.get(source_text_id)
+    } else {
+        state.bytecodes.get(&source_bytecode_id)
+    };
+    let Some(source) = source_value.and_then(JsValue::as_string) else {
+        return NAPI_STRING_EXPECTED;
     };
     let params = Array::new();
     if let Some(values) = state.get(params_id).filter(|value| Array::is_array(value)) {
@@ -3987,7 +4004,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_compile(
+pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
     env: SnapiEnv,
     source_text_id: u32,
     filename_id: u32,
@@ -3996,49 +4013,79 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_compile(
     host_defined_option_id: u32,
     line_offset: i32,
     column_offset: i32,
+    cache_bytes: *const u8,
+    cache_byte_length: usize,
+    has_cache: u8,
     bytecode_out: *mut u32,
+    cache_rejected_out: *mut u8,
     can_parse_as_module_out: *mut u8,
 ) -> i32 {
-    let _ = (
-        env,
-        source_text_id,
-        filename_id,
-        shape,
-        params_id,
-        host_defined_option_id,
-        line_offset,
-        column_offset,
-        bytecode_out,
-        can_parse_as_module_out,
-    );
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_deserialize(
-    env: SnapiEnv,
-    bytes: *const u8,
-    byte_length: usize,
-    source_text_id: u32,
-    filename_id: u32,
-    shape: i32,
-    params_id: u32,
-    host_defined_option_id: u32,
-    bytecode_out: *mut u32,
-    rejected_out: *mut u8,
-) -> i32 {
-    let _ = (
-        env,
-        bytes,
-        byte_length,
-        source_text_id,
-        filename_id,
-        shape,
-        params_id,
-        host_defined_option_id,
-        bytecode_out,
-        rejected_out,
-    );
-    NAPI_GENERIC_FAILURE
+    let _ = (host_defined_option_id, line_offset, column_offset);
+    let _ = (cache_bytes, cache_byte_length);
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(source_value) = state.get(source_text_id).cloned() else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(source) = source_value.as_string() else {
+        return NAPI_STRING_EXPECTED;
+    };
+    let filename = state
+        .get(filename_id)
+        .and_then(JsValue::as_string)
+        .unwrap_or_default();
+    let params = Array::new();
+    if params_id != 0 {
+        let Some(values) = state.get(params_id).filter(|value| Array::is_array(value)) else {
+            return NAPI_ARRAY_EXPECTED;
+        };
+        for value in Array::from(values).iter() {
+            match js_string(&value) {
+                Ok(value) => {
+                    params.push(&JsValue::from_str(&value));
+                }
+                Err(error) => {
+                    state.last_exception = Some(error);
+                    return NAPI_PENDING_EXCEPTION;
+                }
+            }
+        }
+    }
+    let scope = wasmer_napi_global_context_scope(&state.global_context);
+    let context_extensions = Array::new();
+    let compile_result = match shape {
+        0 => wasmer_napi_validate_script(&source, &filename),
+        1 => wasmer_napi_compile_function(&scope, &context_extensions, &params, &source, &filename)
+            .map(|_| ()),
+        2 => wasmer_napi_compile_module(&scope, &source, &filename).map(|_| ()),
+        _ => return NAPI_INVALID_ARG,
+    };
+    if let Err(error) = compile_result {
+        let can_parse_as_module =
+            shape != 2 && wasmer_napi_compile_module(&scope, &source, &filename).is_ok();
+        let _ = unsafe { write(cache_rejected_out, has_cache) };
+        let _ = unsafe { write(can_parse_as_module_out, u8::from(can_parse_as_module)) };
+        state.last_exception = Some(error);
+        return NAPI_PENDING_EXCEPTION;
+    }
+
+    let bytecode = state.next_bytecode.max(1);
+    state.next_bytecode = bytecode.wrapping_add(1).max(1);
+    state.bytecodes.insert(bytecode, source_value);
+    if let Err(error) = unsafe { write(bytecode_out, bytecode) } {
+        state.bytecodes.remove(&bytecode);
+        return error;
+    }
+    if let Err(error) = unsafe { write(cache_rejected_out, has_cache) } {
+        state.bytecodes.remove(&bytecode);
+        return error;
+    }
+    if let Err(error) = unsafe { write(can_parse_as_module_out, 0) } {
+        state.bytecodes.remove(&bytecode);
+        return error;
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_serialize(
@@ -4046,16 +4093,28 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_serialize(
     bytecode_id: u32,
     buffer_out: *mut u32,
 ) -> i32 {
-    let _ = (env, bytecode_id, buffer_out);
-    NAPI_GENERIC_FAILURE
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if !state.bytecodes.contains_key(&bytecode_id) {
+        return NAPI_INVALID_ARG;
+    }
+    let id = state.insert(Uint8Array::new_with_length(0).into());
+    unsafe { write(buffer_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_release(
     env: SnapiEnv,
     bytecode_id: u32,
 ) -> i32 {
-    let _ = (env, bytecode_id);
-    NAPI_GENERIC_FAILURE
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if state.bytecodes.remove(&bytecode_id).is_some() {
+        NAPI_OK
+    } else {
+        NAPI_INVALID_ARG
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
@@ -4080,10 +4139,12 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_source_text(
     let Some(url) = state.get(url_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
-    if source_bytecode_id != 0 {
-        return NAPI_GENERIC_FAILURE;
-    }
-    let Some(source) = state.get(source_text_id).and_then(JsValue::as_string) else {
+    let source_value = if source_text_id != 0 {
+        state.get(source_text_id)
+    } else {
+        state.bytecodes.get(&source_bytecode_id)
+    };
+    let Some(source) = source_value.and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
 

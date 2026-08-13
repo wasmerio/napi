@@ -966,64 +966,68 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
+    napi_status NAPI_CDECL unofficial_napi_bytecode_open(
         napi_env env,
-        napi_value source_text,
-        napi_value filename,
-        int32_t shape,
-        napi_value params_or_undefined,
-        napi_value host_defined_option_id,
-        int32_t line_offset,
-        int32_t column_offset,
-        void **bytecode_out,
-        bool *can_parse_as_module_out)
+        const unofficial_napi_bytecode_open_options *options,
+        unofficial_napi_bytecode_open_result *result)
     {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_compile(source_text,
-                                                                  filename,
-                                                                  shape,
-                                                                  params_or_undefined,
-                                                                  host_defined_option_id,
-                                                                  line_offset,
-                                                                  column_offset,
-                                                                  bytecode_out,
-                                                                  can_parse_as_module_out)
-                             : napi_invalid_arg;
-    }
+        if (!napi_util__::check_env(env) || options == nullptr || result == nullptr ||
+            options->size < sizeof(*options) ||
+            options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
+            options->source_text == nullptr || options->filename == nullptr)
+            return napi_invalid_arg;
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
-        napi_env env,
-        const uint8_t *bytes,
-        size_t byte_length,
-        napi_value source_text,
-        napi_value filename,
-        int32_t shape,
-        napi_value params_or_undefined,
-        napi_value host_defined_option_id,
-        void **bytecode_out,
-        bool *rejected_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_deserialize(bytes,
-                                                                      byte_length,
-                                                                      source_text,
-                                                                      filename,
-                                                                      shape,
-                                                                      params_or_undefined,
-                                                                      host_defined_option_id,
-                                                                      bytecode_out,
-                                                                      rejected_out)
-                             : napi_invalid_arg;
+        *result = {};
+        if (options->has_cache != 0 && options->cache_bytes != nullptr &&
+            options->cache_byte_length != 0)
+        {
+            bool rejected = false;
+            napi_status status = env->contextify().bytecode_deserialize(options->cache_bytes,
+                                                                        options->cache_byte_length,
+                                                                        options->source_text,
+                                                                        options->filename,
+                                                                        options->shape,
+                                                                        options->params_or_undefined,
+                                                                        options->host_defined_option_id,
+                                                                        &result->bytecode,
+                                                                        &rejected);
+            result->cache_rejected = rejected ? 1 : 0;
+            if (status != napi_ok)
+                return status;
+            if (result->bytecode != nullptr)
+                return napi_ok;
+            result->cache_rejected = 1;
+        }
+        else if (options->has_cache != 0)
+        {
+            result->cache_rejected = 1;
+        }
+
+        bool can_parse_as_module = false;
+        napi_status status = env->contextify().bytecode_compile(options->source_text,
+                                                                options->filename,
+                                                                options->shape,
+                                                                options->params_or_undefined,
+                                                                options->host_defined_option_id,
+                                                                options->line_offset,
+                                                                options->column_offset,
+                                                                &result->bytecode,
+                                                                &can_parse_as_module);
+        result->can_parse_as_module = can_parse_as_module ? 1 : 0;
+        return status;
     }
 
     napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
         napi_env env,
-        void *bytecode,
+        unofficial_napi_bytecode bytecode,
         napi_value *buffer_out)
     {
         return napi_util__::check_env(env) ? env->contextify().bytecode_serialize(bytecode, buffer_out)
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_release(napi_env env, void *bytecode)
+    napi_status NAPI_CDECL unofficial_napi_bytecode_release(
+        napi_env env, unofficial_napi_bytecode bytecode)
     {
         return napi_util__::check_env(env) ? env->contextify().bytecode_release(bytecode)
                              : napi_invalid_arg;

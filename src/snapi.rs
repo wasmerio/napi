@@ -319,7 +319,7 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_bytecode_compile(
+    pub fn snapi_bridge_unofficial_bytecode_open(
         env: SnapiEnv,
         source_text_id: u32,
         filename_id: u32,
@@ -328,20 +328,12 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         line_offset: i32,
         column_offset: i32,
+        cache_bytes: *const u8,
+        cache_byte_length: usize,
+        has_cache: u8,
         bytecode_out: *mut u32,
+        cache_rejected_out: *mut u8,
         can_parse_as_module_out: *mut u8,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_bytecode_deserialize(
-        env: SnapiEnv,
-        bytes: *const u8,
-        byte_length: usize,
-        source_text_id: u32,
-        filename_id: u32,
-        shape: i32,
-        params_id: u32,
-        host_defined_option_id: u32,
-        bytecode_out: *mut u32,
-        rejected_out: *mut u8,
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_serialize(
         env: SnapiEnv,

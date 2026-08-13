@@ -457,12 +457,13 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   (void)column_offset;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
-      source == nullptr ||
-      (source->text == nullptr && source->bytecode == nullptr) ||
+      !unofficial_napi_js_source_is_valid(source) ||
       handle_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  auto *bytecode_record = static_cast<napi_bytecode_record__ *>(source->bytecode);
+  auto *bytecode_record = source->kind == unofficial_napi_js_source_bytecode
+                              ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
+                              : nullptr;
   if (bytecode_record != nullptr &&
       bytecode_record->shape != unofficial_napi_bytecode_shape_module)
     return napi_util__::invalid_arg(env_);
