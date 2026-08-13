@@ -303,20 +303,22 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
     napi_value transfer_list_or_null,
     napi_value* result_out);
 
-// Unofficial helpers for env-agnostic message payload queues.
-// The returned opaque payload must be released with
-// unofficial_napi_release_serialized_value().
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_serialize_value(
+// Opaque provider-owned message which may cross N-API environments. A message
+// is consumed by message_take on both success and failure, or explicitly
+// destroyed with message_drop while it is still queued.
+typedef struct unofficial_napi_message__* unofficial_napi_message;
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_create(
     napi_env env,
     napi_value value,
-    void** payload_out);
+    unofficial_napi_message* message_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_deserialize_value(
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_take(
     napi_env env,
-    void* payload,
+    unofficial_napi_message message,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_release_serialized_value(void* payload);
+NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_message_drop(unofficial_napi_message message);
 
 // Unofficial helper for Node's internalBinding('v8').getHashSeed().
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_hash_seed(napi_env env,

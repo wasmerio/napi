@@ -61,6 +61,21 @@ struct HandleTable {
     const auto it = handles.find(id);
     return it != handles.end() ? it->second : nullptr;
   }
+  void* Take(uint32_t id) {
+    if (id == 0) return nullptr;
+    const auto it = handles.find(id);
+    if (it == handles.end()) return nullptr;
+    void* handle = it->second;
+    handles.erase(it);
+    return handle;
+  }
+  std::vector<void*> TakeAll() {
+    std::vector<void*> result;
+    result.reserve(handles.size());
+    for (const auto& entry : handles) result.push_back(entry.second);
+    Reset();
+    return result;
+  }
   void Remove(uint32_t id) { handles.erase(id); }
   void Reset() {
     handles.clear();
@@ -158,6 +173,10 @@ struct CallbackBinding {
 // Never destroyed: static destructors race concurrent env teardown at process
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_set<SnapiEnvState*>& g_envs = *new std::unordered_set<SnapiEnvState*>();
+// Message resources cross environment boundaries, so their guest-visible IDs
+// cannot belong to either the source or destination environment. The table is
+// process-wide and each entry is removed atomically by take or drop.
+HandleTable& g_message_handles = *new HandleTable();
 
 CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) {
   if (state == nullptr || reg_id == 0) return nullptr;
@@ -3591,6 +3610,59 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_message_create(
+    SnapiEnvState* env_state,
+    uint32_t value_id,
+    uint32_t* message_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || message_out == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value value = LoadValue(*bridge_state, value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  unofficial_napi_message message = nullptr;
+  napi_status status =
+      unofficial_napi_message_create(bridge_state->env, value, &message);
+  if (status != napi_ok) return status;
+  const uint32_t message_id =
+      g_message_handles.Store(reinterpret_cast<void*>(message));
+  if (message_id == 0) {
+    unofficial_napi_message_drop(message);
+    return napi_generic_failure;
+  }
+  *message_out = message_id;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_message_take(
+    SnapiEnvState* env_state,
+    uint32_t message_id,
+    uint32_t* value_out) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto* message = reinterpret_cast<unofficial_napi_message>(
+      g_message_handles.Take(message_id));
+  if (message == nullptr) return napi_invalid_arg;
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || value_out == nullptr) {
+    unofficial_napi_message_drop(message);
+    return napi_invalid_arg;
+  }
+  napi_value value = nullptr;
+  napi_status status =
+      unofficial_napi_message_take(bridge_state->env, message, &value);
+  if (status != napi_ok) return status;
+  const uint32_t value_id = StoreValue(*bridge_state, value);
+  if (value_id == 0) return napi_generic_failure;
+  *value_out = value_id;
+  return napi_ok;
+}
+
+extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto* message = reinterpret_cast<unofficial_napi_message>(
+      g_message_handles.Take(message_id));
+  if (message != nullptr) unofficial_napi_message_drop(message);
+}
+
 extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
     SnapiEnvState* env_state) {
   auto* bridge_state = RequireEnvState(env_state);
@@ -4265,5 +4337,9 @@ extern "C" void snapi_bridge_dispose() {
   }
   for (auto* env_state : env_states) {
     (void)DisposeBridgeStateLocked(env_state);
+  }
+  for (void* handle : g_message_handles.TakeAll()) {
+    unofficial_napi_message_drop(
+        reinterpret_cast<unofficial_napi_message>(handle));
   }
 }

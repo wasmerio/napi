@@ -651,25 +651,33 @@ extern "C"
         return QuickJSStructuredClone(env, value, transfer_list_or_null, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_serialize_value(
+    napi_status NAPI_CDECL unofficial_napi_message_create(
         napi_env env,
         napi_value value,
-        void **payload_out)
+        unofficial_napi_message *message_out)
     {
-        return napi_serdes__::serialize_value(env, value, payload_out);
+        return napi_serdes__::serialize_value(
+            env, value, reinterpret_cast<void **>(message_out));
     }
 
-    napi_status NAPI_CDECL unofficial_napi_deserialize_value(
+    napi_status NAPI_CDECL unofficial_napi_message_take(
         napi_env env,
-        void *payload,
+        unofficial_napi_message message,
         napi_value *result_out)
     {
-        return napi_serdes__::deserialize_value(env, payload, result_out);
+        if (message == nullptr)
+            return napi_invalid_arg;
+        struct MessageGuard
+        {
+            void *payload;
+            ~MessageGuard() { napi_serdes__::release_serialized_value(payload); }
+        } guard{reinterpret_cast<void *>(message)};
+        return napi_serdes__::deserialize_value(env, guard.payload, result_out);
     }
 
-    void NAPI_CDECL unofficial_napi_release_serialized_value(void *payload)
+    void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message)
     {
-        napi_serdes__::release_serialized_value(payload);
+        napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,

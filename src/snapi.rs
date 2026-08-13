@@ -259,17 +259,17 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_serialize_value(
+    pub fn snapi_bridge_unofficial_message_create(
         env: SnapiEnv,
         value_id: u32,
         payload_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_deserialize_value(
+    pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,
         payload: u32,
         value_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_release_serialized_value(payload: u32);
+    pub fn snapi_bridge_unofficial_message_drop(payload: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(

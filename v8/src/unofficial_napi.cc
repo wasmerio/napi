@@ -2210,14 +2210,14 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
   return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_serialize_value(
+napi_status NAPI_CDECL unofficial_napi_message_create(
     napi_env env,
     napi_value value,
-    void** payload_out) {
-  if (env == nullptr || env->isolate == nullptr || value == nullptr || payload_out == nullptr) {
+    unofficial_napi_message* message_out) {
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || message_out == nullptr) {
     return napi_invalid_arg;
   }
-  *payload_out = nullptr;
+  *message_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
@@ -2245,20 +2245,22 @@ napi_status NAPI_CDECL unofficial_napi_serialize_value(
   std::free(released.first);
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
-  *payload_out = payload;
+  *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_deserialize_value(
+napi_status NAPI_CDECL unofficial_napi_message_take(
     napi_env env,
-    void* payload_ptr,
+    unofficial_napi_message message,
     napi_value* result_out) {
-  if (env == nullptr || env->isolate == nullptr || payload_ptr == nullptr || result_out == nullptr) {
+  if (message == nullptr) return napi_invalid_arg;
+  std::unique_ptr<SerializedClonePayload> payload(
+      reinterpret_cast<SerializedClonePayload*>(message));
+  if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
   *result_out = nullptr;
 
-  auto* payload = static_cast<SerializedClonePayload*>(payload_ptr);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
@@ -2278,8 +2280,8 @@ napi_status NAPI_CDECL unofficial_napi_deserialize_value(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-void NAPI_CDECL unofficial_napi_release_serialized_value(void* payload_ptr) {
-  delete static_cast<SerializedClonePayload*>(payload_ptr);
+void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
+  delete reinterpret_cast<SerializedClonePayload*>(message);
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {

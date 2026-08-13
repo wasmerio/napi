@@ -3686,7 +3686,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_structured_clone(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_serialize_value(
+pub unsafe extern "C" fn snapi_bridge_unofficial_message_create(
     env: SnapiEnv,
     value_id: u32,
     payload_out: *mut u32,
@@ -3701,8 +3701,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_serialize_value(
         return NAPI_GENERIC_FAILURE;
     };
     match wasmer_napi_share_message(&value, payload) {
-        Ok(_) => unsafe { write(payload_out, payload) }.map_or_else(|error| error, |()| NAPI_OK),
+        Ok(_) => match unsafe { write(payload_out, payload) } {
+            Ok(()) => NAPI_OK,
+            Err(error) => {
+                wasmer_napi_release_message(payload);
+                error
+            }
+        },
         Err(error) => {
+            wasmer_napi_release_message(payload);
             state.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
@@ -3710,15 +3717,18 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_serialize_value(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_deserialize_value(
+pub unsafe extern "C" fn snapi_bridge_unofficial_message_take(
     env: SnapiEnv,
     payload: u32,
     value_out: *mut u32,
 ) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
+        wasmer_napi_release_message(payload);
         return NAPI_INVALID_ARG;
     };
-    match wasmer_napi_obtain_message(payload) {
+    let obtained = wasmer_napi_obtain_message(payload);
+    wasmer_napi_release_message(payload);
+    match obtained {
         Ok(value) => {
             let id = state.insert(value);
             unsafe { write(value_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
@@ -3731,7 +3741,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_deserialize_value(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn snapi_bridge_unofficial_release_serialized_value(payload: u32) {
+pub extern "C" fn snapi_bridge_unofficial_message_drop(payload: u32) {
     wasmer_napi_release_message(payload);
 }
 #[unsafe(no_mangle)]

@@ -681,31 +681,52 @@ fn guest_unofficial_napi_structured_clone(
     status
 }
 
-fn guest_unofficial_napi_serialize_value(
+fn guest_unofficial_napi_message_create(
     mut env: FunctionEnvMut<NapiEnv>,
-    _napi_env: i32,
+    napi_env: i32,
     value: i32,
     payload_out_ptr: i32,
 ) -> i32 {
-    if payload_out_ptr > 0 {
-        write_guest_u32(&mut env, payload_out_ptr as u32, value.max(0) as u32);
+    if payload_out_ptr <= 0 {
+        return 1;
     }
-    0
+    let env_handle = snapi_env(&env, napi_env);
+    let mut message = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_message_create(env_handle, value.max(0) as u32, &mut message)
+    };
+    if status == 0 {
+        write_guest_u32(&mut env, payload_out_ptr as u32, message);
+    }
+    status
 }
 
-fn guest_unofficial_napi_deserialize_value(
+fn guest_unofficial_napi_message_take(
     mut env: FunctionEnvMut<NapiEnv>,
-    _napi_env: i32,
+    napi_env: i32,
     payload: i32,
     result_out_ptr: i32,
 ) -> i32 {
-    if result_out_ptr > 0 {
-        write_guest_u32(&mut env, result_out_ptr as u32, payload.max(0) as u32);
+    if payload <= 0 {
+        return 1;
     }
-    0
+    if result_out_ptr <= 0 {
+        unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut value = 0u32;
+    let status =
+        unsafe { snapi_bridge_unofficial_message_take(env_handle, payload as u32, &mut value) };
+    if status == 0 {
+        write_guest_u32(&mut env, result_out_ptr as u32, value);
+    }
+    status
 }
 
-fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<NapiEnv>, _payload: i32) {}
+fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: i32) {
+    unsafe { snapi_bridge_unofficial_message_drop(payload.max(0) as u32) };
+}
 
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
@@ -5208,9 +5229,9 @@ pub fn register_napi_imports(
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
         "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
-        "unofficial_napi_serialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_serialize_value),
-        "unofficial_napi_deserialize_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_deserialize_value),
-        "unofficial_napi_release_serialized_value" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_serialized_value),
+        "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
+        "unofficial_napi_message_take" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take),
+        "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),

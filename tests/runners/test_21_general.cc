@@ -176,6 +176,34 @@ TEST_F(Test21General, StructuredCloneOptionalTransferListDetachesArrayBuffer) {
   EXPECT_EQ(static_cast<uint8_t*>(cloned_data)[0], 42u);
 }
 
+TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  napi_value expected = nullptr;
+  ASSERT_EQ(napi_create_uint32(s.env, 42, &expected), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "answer", expected), napi_ok);
+
+  unofficial_napi_message message = nullptr;
+  ASSERT_EQ(unofficial_napi_message_create(s.env, source, &message), napi_ok);
+  ASSERT_NE(message, nullptr);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(unofficial_napi_message_take(s.env, message, &result), napi_ok);
+  ASSERT_NE(result, nullptr);
+  napi_value answer = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, result, "answer", &answer), napi_ok);
+  uint32_t actual = 0;
+  ASSERT_EQ(napi_get_value_uint32(s.env, answer, &actual), napi_ok);
+  EXPECT_EQ(actual, 42u);
+
+  unofficial_napi_message dropped = nullptr;
+  ASSERT_EQ(unofficial_napi_message_create(s.env, source, &dropped), napi_ok);
+  ASSERT_NE(dropped, nullptr);
+  unofficial_napi_message_drop(dropped);
+}
+
 TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
   EnvScope s(runtime_.get());
 
