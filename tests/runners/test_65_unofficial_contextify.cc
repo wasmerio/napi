@@ -310,6 +310,22 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
 
+TEST_F(Test65UnofficialContextify, ModuleHooksUseOneVersionedConfiguration) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks) - 1;
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_invalid_arg);
+
+  hooks.size = sizeof(hooks);
+  hooks.version = 0;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_invalid_arg);
+
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 // V8 stores the host-defined-options block in each compiled function's
 // ScriptOrigin. This regression covers the V8 bytecode fast path changed in
@@ -327,9 +343,13 @@ TEST_F(Test65UnofficialContextify,
                                  nullptr,
                                  &callback),
             napi_ok);
-  ASSERT_EQ(
-      unofficial_napi_module_wrap_set_import_module_dynamically_callback(s.env, callback),
-      napi_ok);
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks),
+      UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION,
+      callback,
+      nullptr,
+  };
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
 
   napi_value undefined = nullptr;
   ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);

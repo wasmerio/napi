@@ -674,13 +674,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_cach
     unofficial_napi_module module,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_import_module_dynamically_callback(
-    napi_env env,
-    napi_value callback);
+#define UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION 1u
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
+typedef struct {
+  size_t size;
+  uint32_t version;
+  napi_value import_module_dynamically;
+  napi_value initialize_import_meta_object;
+} unofficial_napi_module_hooks;
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_set_hooks(
     napi_env env,
-    napi_value callback);
+    const unofficial_napi_module_hooks* hooks);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_required_module_facade(
     napi_env env,

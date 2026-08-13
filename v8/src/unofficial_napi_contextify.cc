@@ -2914,29 +2914,39 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
   return *result_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_set_import_module_dynamically_callback(
+napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
     napi_env env,
-    napi_value callback) {
-  if (env == nullptr) return napi_invalid_arg;
+    const unofficial_napi_module_hooks* hooks) {
+  if (env == nullptr || hooks == nullptr || hooks->size < sizeof(*hooks) ||
+      hooks->version != UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION) {
+    return napi_invalid_arg;
+  }
+
+  napi_ref import_ref = nullptr;
+  napi_ref import_meta_ref = nullptr;
+  if (hooks->import_module_dynamically != nullptr) {
+    napi_status status = napi_create_reference(
+        env, hooks->import_module_dynamically, 1, &import_ref);
+    if (status != napi_ok) return status;
+  }
+  if (hooks->initialize_import_meta_object != nullptr) {
+    napi_status status = napi_create_reference(
+        env, hooks->initialize_import_meta_object, 1, &import_meta_ref);
+    if (status != napi_ok) {
+      ResetRef(env, &import_ref);
+      return status;
+    }
+  }
+
   EnsureModuleWrapCleanupHook(env);
   std::lock_guard<std::mutex> lock(g_module_wrap_mu);
   auto* state = GetModuleWrapState(env);
   ResetRef(env, &state->import_module_dynamically_ref);
-  if (callback != nullptr) napi_create_reference(env, callback, 1, &state->import_module_dynamically_ref);
+  ResetRef(env, &state->initialize_import_meta_ref);
+  state->import_module_dynamically_ref = import_ref;
+  state->initialize_import_meta_ref = import_meta_ref;
   env->isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
   env->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(ImportModuleDynamicallyWithPhase);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
-    napi_env env,
-    napi_value callback) {
-  if (env == nullptr) return napi_invalid_arg;
-  EnsureModuleWrapCleanupHook(env);
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto* state = GetModuleWrapState(env);
-  ResetRef(env, &state->initialize_import_meta_ref);
-  if (callback != nullptr) napi_create_reference(env, callback, 1, &state->initialize_import_meta_ref);
   env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);
   return napi_ok;
 }

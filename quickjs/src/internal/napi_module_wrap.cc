@@ -910,23 +910,27 @@ napi_status napi_module_wrap__::create_cached_data(unofficial_napi_module module
   return napi_create_typedarray(env_, napi_uint8_array, bytes.size(), arraybuffer, 0, result_out);
 }
 
-napi_status napi_module_wrap__::set_import_module_dynamically_callback(napi_value callback)
+napi_status napi_module_wrap__::set_hooks(const unofficial_napi_module_hooks *hooks)
 {
-  JS_FreeValue(ctx_, import_module_dynamically_callback_);
-  import_module_dynamically_callback_ =
-      (!is_nullish(env_, callback) && JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, callback)))
-          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback))
-          : JS_UNDEFINED;
-  return napi_ok;
-}
+  if (hooks == nullptr || hooks->size < sizeof(*hooks) ||
+      hooks->version != UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION)
+    return napi_util__::invalid_arg(env_);
 
-napi_status napi_module_wrap__::set_initialize_import_meta_object_callback(napi_value callback)
-{
-  JS_FreeValue(ctx_, initialize_import_meta_callback_);
-  initialize_import_meta_callback_ =
-      (!is_nullish(env_, callback) && JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, callback)))
-          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, callback))
+  JSValue import_callback =
+      (!is_nullish(env_, hooks->import_module_dynamically) &&
+       JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, hooks->import_module_dynamically)))
+          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, hooks->import_module_dynamically))
           : JS_UNDEFINED;
+  JSValue import_meta_callback =
+      (!is_nullish(env_, hooks->initialize_import_meta_object) &&
+       JS_IsFunction(ctx_, napi_quickjs_value_inner(env_, hooks->initialize_import_meta_object)))
+          ? JS_DupValue(ctx_, napi_quickjs_value_inner(env_, hooks->initialize_import_meta_object))
+          : JS_UNDEFINED;
+
+  JS_FreeValue(ctx_, import_module_dynamically_callback_);
+  JS_FreeValue(ctx_, initialize_import_meta_callback_);
+  import_module_dynamically_callback_ = import_callback;
+  initialize_import_meta_callback_ = import_meta_callback;
   return napi_ok;
 }
 

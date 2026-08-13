@@ -429,13 +429,10 @@ unsafe extern "C" {
         handle_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_set_import_module_dynamically_callback(
+    pub fn snapi_bridge_unofficial_module_wrap_set_hooks(
         env: SnapiEnv,
-        callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
-        env: SnapiEnv,
-        callback_id: u32,
+        import_callback_id: u32,
+        import_meta_callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_required_module_facade(
         env: SnapiEnv,

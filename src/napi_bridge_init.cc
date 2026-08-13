@@ -4244,29 +4244,31 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_cached_data(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_module_wrap_set_import_module_dynamically_callback(
+extern "C" int snapi_bridge_unofficial_module_wrap_set_hooks(
     SnapiEnvState* env_state,
-    uint32_t callback_id) {
+    uint32_t import_callback_id,
+    uint32_t import_meta_callback_id) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
-  if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
-  return unofficial_napi_module_wrap_set_import_module_dynamically_callback(env, callback);
-}
-
-extern "C" int
-snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
-    SnapiEnvState* env_state,
-    uint32_t callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
-  if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
-  return unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(env, callback);
+  napi_value import_callback = import_callback_id == 0
+                                   ? nullptr
+                                   : LoadValue(*bridge_state, import_callback_id);
+  napi_value import_meta_callback = import_meta_callback_id == 0
+                                        ? nullptr
+                                        : LoadValue(*bridge_state, import_meta_callback_id);
+  if ((import_callback_id != 0 && import_callback == nullptr) ||
+      (import_meta_callback_id != 0 && import_meta_callback == nullptr)) {
+    return napi_invalid_arg;
+  }
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks),
+      UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION,
+      import_callback,
+      import_meta_callback,
+  };
+  return unofficial_napi_module_wrap_set_hooks(env, &hooks);
 }
 
 extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade(

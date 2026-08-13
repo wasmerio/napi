@@ -1809,32 +1809,22 @@ fn guest_unofficial_napi_module_wrap_create_cached_data(
     status
 }
 
-fn guest_unofficial_napi_module_wrap_set_import_module_dynamically_callback(
-    env: FunctionEnvMut<NapiEnv>,
+fn guest_unofficial_napi_module_wrap_set_hooks(
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    callback: i32,
+    hooks_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe {
-        snapi_bridge_unofficial_module_wrap_set_import_module_dynamically_callback(
-            env_handle,
-            if callback > 0 { callback as u32 } else { 0 },
-        )
+    let Some(fields) = read_guest_bytes(&mut env, hooks_ptr, 16) else {
+        return 1;
+    };
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(fields[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    if u32_at(0) < 16 || u32_at(4) != 1 {
+        return 1;
     }
-}
-
-fn guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    callback: i32,
-) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe {
-        snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
-            env_handle,
-            if callback > 0 { callback as u32 } else { 0 },
-        )
-    }
+    unsafe { snapi_bridge_unofficial_module_wrap_set_hooks(env_handle, u32_at(8), u32_at(12)) }
 }
 
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(
@@ -5193,8 +5183,7 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_set_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_module_source_object),
         "unofficial_napi_module_wrap_get_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_module_source_object),
         "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
-        "unofficial_napi_module_wrap_set_import_module_dynamically_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_import_module_dynamically_callback),
-        "unofficial_napi_module_wrap_set_initialize_import_meta_object_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_initialize_import_meta_object_callback),
+        "unofficial_napi_module_wrap_set_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_hooks),
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 

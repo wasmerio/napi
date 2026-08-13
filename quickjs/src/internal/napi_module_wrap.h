@@ -66,8 +66,7 @@ public:
                                        napi_value *result_out);
   napi_status create_cached_data(unofficial_napi_module module,
                                  napi_value *result_out);
-  napi_status set_import_module_dynamically_callback(napi_value callback);
-  napi_status set_initialize_import_meta_object_callback(napi_value callback);
+  napi_status set_hooks(const unofficial_napi_module_hooks *hooks);
   napi_status import_module_dynamically(size_t argc,
                                         napi_value const *argv,
                                         napi_value *result_out);

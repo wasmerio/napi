@@ -4831,19 +4831,12 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_cached_data(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_import_module_dynamically_callback(
+pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_hooks(
     env: SnapiEnv,
-    callback_id: u32,
+    import_callback_id: u32,
+    import_meta_callback_id: u32,
 ) -> i32 {
-    let _ = (env, callback_id);
-    NAPI_OK
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
-    env: SnapiEnv,
-    callback_id: u32,
-) -> i32 {
-    let _ = (env, callback_id);
+    let _ = (env, import_callback_id, import_meta_callback_id);
     NAPI_OK
 }
 #[unsafe(no_mangle)]

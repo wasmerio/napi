@@ -1262,22 +1262,13 @@ extern "C"
         return env->module_wrap().create_cached_data(module, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_import_module_dynamically_callback(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
         napi_env env,
-        napi_value callback)
+        const unofficial_napi_module_hooks *hooks)
     {
-        if (!napi_util__::check_env(env))
+        if (!napi_util__::check_env(env) || hooks == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_import_module_dynamically_callback(callback);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
-        napi_env env,
-        napi_value callback)
-    {
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return env->module_wrap().set_initialize_import_meta_object_callback(callback);
+        return env->module_wrap().set_hooks(hooks);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(
