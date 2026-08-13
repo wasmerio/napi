@@ -25,7 +25,6 @@
 #include "node_api.h"
 #include "unofficial_napi.h"
 #include "internal/napi_v8_env.h"
-#include "edge_napi_embedder_hooks.h"
 
 namespace {
 
@@ -2886,6 +2885,8 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   napi_status s;
   if (guest_heap_ctx != nullptr) {
     unofficial_napi_env_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
     options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
     s = unofficial_napi_create_env(module_api_version, &options, &env, &scope);
   } else {
@@ -2908,10 +2909,14 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
 
 extern "C" int snapi_bridge_unofficial_create_env_with_options(
     int32_t module_api_version,
+    uint64_t total_memory,
+    uint64_t constrained_memory,
     uint32_t max_young_generation_size_in_bytes,
     uint32_t max_old_generation_size_in_bytes,
     uint32_t code_range_size_in_bytes,
     uint32_t /*stack_limit*/,
+    const char* engine_flags,
+    uint32_t engine_flags_length,
     const void* guest_heap_ctx,
     SnapiEnvState** env_out) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
@@ -2920,7 +2925,14 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
       max_young_generation_size_in_bytes > 0 ||
       max_old_generation_size_in_bytes > 0 ||
       code_range_size_in_bytes > 0 ||
+      total_memory > 0 ||
+      constrained_memory > 0 ||
+      engine_flags_length > 0 ||
       guest_heap_ctx != nullptr;
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  options.total_memory = total_memory;
+  options.constrained_memory = constrained_memory;
   options.max_young_generation_size_in_bytes =
       max_young_generation_size_in_bytes;
   options.max_old_generation_size_in_bytes =
@@ -2930,6 +2942,8 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   // native stack address for the host thread running V8.
   options.stack_limit = nullptr;
   options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
+  options.engine_flags = engine_flags;
+  options.engine_flags_length = engine_flags_length;
 
   napi_env env = nullptr;
   void* scope = nullptr;
@@ -3014,12 +3028,6 @@ extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_
   return DisposeBridgeStateLocked(env_state);
 }
 
-extern "C" int snapi_bridge_unofficial_set_flags_from_string(const char* flags,
-                                                             uint32_t length) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_set_flags_from_string(flags, static_cast<size_t>(length));
-}
-
 extern "C" int snapi_bridge_unofficial_low_memory_notification(SnapiEnvState* env_state) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -3067,14 +3075,6 @@ extern "C" int snapi_bridge_unofficial_set_prepare_stack_trace_callback(
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_set_prepare_stack_trace_callback(env, callback);
-}
-
-extern "C" int snapi_bridge_unofficial_set_embedder_hooks(SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  EdgeInstallNapiEmbedderHooks();
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_get_promise_details(SnapiEnvState* env_state,

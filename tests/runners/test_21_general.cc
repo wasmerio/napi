@@ -38,6 +38,32 @@ void AttachmentDestroy(napi_env env, void* data) {
 
 }  // namespace
 
+TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
+  napi_env env = nullptr;
+  void* owner = nullptr;
+
+  unofficial_napi_env_create_options options{};
+  options.size = sizeof(options) - 1;
+  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+
+  options.size = sizeof(options);
+  options.version += 1;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+
+  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  options.engine_flags_length = 1;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+}
+
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;
   void* owner = nullptr;

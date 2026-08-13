@@ -37,9 +37,13 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         unsafe {
             snapi_bridge_unofficial_create_env_with_options(
                 8,
+                0,
+                0,
                 reservation.max_young,
                 reservation.max_old,
                 reservation.code_range,
+                0,
+                std::ptr::null(),
                 0,
                 guest_heap_ctx,
                 &mut snapi_env_state,
@@ -66,21 +70,6 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
         .as_ref()
         .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
         .unwrap_or(std::ptr::null())
-}
-
-fn guest_unofficial_napi_set_flags_from_string(
-    mut env: FunctionEnvMut<NapiEnv>,
-    flags_ptr: i32,
-    flags_len: i32,
-) -> i32 {
-    if flags_ptr <= 0 || flags_len < 0 {
-        return 1;
-    }
-    let Some(flags_bytes) = read_guest_bytes(&mut env, flags_ptr, flags_len as usize) else {
-        return 1;
-    };
-    let flags = CString::new(flags_bytes).unwrap_or_default();
-    unsafe { snapi_bridge_unofficial_set_flags_from_string(flags.as_ptr(), flags_len as u32) }
 }
 
 /// Run a bridge call that may re-enter the guest via host V8 callbacks, then
@@ -225,22 +214,50 @@ fn guest_unofficial_napi_create_env(
     scope_out_ptr: i32,
 ) -> i32 {
     let (
+        total_memory,
+        constrained_memory,
         max_young_generation_size_in_bytes,
         max_old_generation_size_in_bytes,
         code_range_size_in_bytes,
         stack_limit,
+        engine_flags,
     ) = if options_ptr > 0 {
-        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, 16) else {
+        const OPTIONS_PREFIX_SIZE: usize = 52;
+        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, OPTIONS_PREFIX_SIZE) else {
             return 1;
         };
+        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) < OPTIONS_PREFIX_SIZE as u32
+            || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 1
+        {
+            return 1;
+        }
+        let flags_ptr = u32::from_le_bytes(bytes[44..48].try_into().unwrap()) as i32;
+        let flags_len = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
+        let flags = if flags_len == 0 {
+            CString::default()
+        } else {
+            if flags_ptr <= 0 {
+                return 1;
+            }
+            let Some(flags_bytes) = read_guest_bytes(&mut env, flags_ptr, flags_len) else {
+                return 1;
+            };
+            let Ok(flags) = CString::new(flags_bytes) else {
+                return 1;
+            };
+            flags
+        };
         (
-            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            flags,
         )
     } else {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, CString::default())
     };
 
     let requested = RequestedHeap {
@@ -258,10 +275,14 @@ fn guest_unofficial_napi_create_env(
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
             module_api_version,
+            total_memory,
+            constrained_memory,
             reservation.max_young,
             reservation.max_old,
             reservation.code_range,
             stack_limit,
+            engine_flags.as_ptr(),
+            engine_flags.as_bytes().len() as u32,
             guest_heap_ctx,
             &mut snapi_env_state,
         )
@@ -291,11 +312,6 @@ fn guest_unofficial_napi_release_env(
     };
     let loop_id = if loop_ptr > 0 { loop_ptr as u32 } else { 0 };
     unsafe { snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id) }
-}
-
-fn guest_unofficial_napi_set_embedder_hooks(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_set_embedder_hooks(env_handle) }
 }
 
 fn guest_unofficial_napi_attach_env(
@@ -5271,9 +5287,7 @@ pub fn register_napi_imports(
     };
 
     let napi_extension_wasmer_namespace = namespace! {
-        "unofficial_napi_set_flags_from_string" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_flags_from_string),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
-        "unofficial_napi_set_embedder_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_embedder_hooks),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),

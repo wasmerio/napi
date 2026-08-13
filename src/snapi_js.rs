@@ -1727,10 +1727,14 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_create_env_with_options(
     version: i32,
+    _total_memory: u64,
+    _constrained_memory: u64,
     _young: u32,
     _old: u32,
     _code: u32,
     _stack: u32,
+    _engine_flags: *const i8,
+    _engine_flags_length: u32,
     guest_heap_ctx: *const c_void,
     out: *mut SnapiEnv,
 ) -> i32 {
@@ -3290,19 +3294,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
 // ABI-complete placeholders. These deliberately return napi_generic_failure
 // until their host-JS semantics are implemented; keeping the symbols local
 // prevents wasm-bindgen output from acquiring raw C imports.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_flags_from_string(
-    flags: *const i8,
-    length: u32,
-) -> i32 {
-    let _ = (flags, length);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_embedder_hooks(env: SnapiEnv) -> i32 {
-    let _ = env;
-    NAPI_GENERIC_FAILURE
-}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32 {
     let _ = env;

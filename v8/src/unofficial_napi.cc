@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -35,10 +36,6 @@ namespace {
 struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
   uint32_t refcount = 0;
-};
-
-struct EmbedderHooksState {
-  unofficial_napi_embedder_hooks hooks{};
 };
 
 class TrackingArrayBufferAllocator;
@@ -88,7 +85,6 @@ std::mutex g_runtime_mu;
 // for the teardown thread (Isolate::Delete touches the platform's page
 // allocator and tracing controller). The OS reclaims everything at _exit.
 SharedRuntime& g_runtime = *new SharedRuntime();
-EmbedderHooksState g_embedder_hooks;
 std::unordered_map<v8::Isolate*, napi_env>& g_env_by_isolate =
     *new std::unordered_map<v8::Isolate*, napi_env>();
 std::unordered_map<v8::Isolate*, uint64_t>& g_hash_seeds =
@@ -133,26 +129,6 @@ struct ProfilerState {
 
 std::unordered_map<napi_env, ProfilerState>& g_profiler_states =
     *new std::unordered_map<napi_env, ProfilerState>();
-
-unofficial_napi_embedder_hooks CopyEmbedderHooks() {
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  return g_embedder_hooks.hooks;
-}
-
-bool QueryEmbedderMemoryInfo(unofficial_napi_embedder_memory_info* out) {
-  if (out == nullptr) return false;
-  *out = unofficial_napi_embedder_memory_info{};
-  const unofficial_napi_embedder_hooks hooks = CopyEmbedderHooks();
-  if (hooks.memory_info_callback == nullptr) return false;
-  return hooks.memory_info_callback(hooks.memory_info_target, out) == napi_ok;
-}
-
-bool PumpEmbedderShutdown(void* handle) {
-  if (handle == nullptr) return false;
-  const unofficial_napi_embedder_hooks hooks = CopyEmbedderHooks();
-  if (hooks.shutdown_pump_callback == nullptr) return false;
-  return hooks.shutdown_pump_callback(hooks.shutdown_pump_target, handle) == napi_ok;
-}
 
 class StringOutputStream final : public v8::OutputStream {
  public:
@@ -577,17 +553,16 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   std::atomic<void*> guest_heap_ctx_ {nullptr};
 };
 
-void ApplyNodeIsolateCreateParams(v8::Isolate::CreateParams* params) {
-  if (params == nullptr) return;
+void ApplyNodeIsolateCreateParams(
+    v8::Isolate::CreateParams* params,
+    const unofficial_napi_env_create_options* options) {
+  if (params == nullptr || options == nullptr) return;
 
-  unofficial_napi_embedder_memory_info memory_info{};
-  if (!QueryEmbedderMemoryInfo(&memory_info)) return;
-
-  const uint64_t constrained_memory = memory_info.constrained_memory;
+  const uint64_t constrained_memory = options->constrained_memory;
   const uint64_t total_memory =
       constrained_memory > 0
-          ? std::min<uint64_t>(memory_info.total_memory, constrained_memory)
-          : memory_info.total_memory;
+          ? std::min<uint64_t>(options->total_memory, constrained_memory)
+          : options->total_memory;
   if (total_memory > 0 &&
       params->constraints.max_old_generation_size_in_bytes() == 0) {
     params->constraints.ConfigureDefaults(total_memory, 0);
@@ -630,18 +605,10 @@ void OnPlatformShutdownFinished(void* data) {
 }
 
 void WaitForPlatformShutdown(PlatformShutdownWaiter* waiter,
-                             void* shutdown_pump_handle) {
+                             void* /*shutdown_pump_handle*/) {
   if (waiter == nullptr) return;
   std::unique_lock<std::mutex> lock(waiter->mutex);
   while (!waiter->finished) {
-    if (shutdown_pump_handle != nullptr) {
-      lock.unlock();
-      if (!PumpEmbedderShutdown(shutdown_pump_handle)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-      lock.lock();
-      continue;
-    }
     waiter->cv.wait_for(lock, std::chrono::milliseconds(1));
   }
 }
@@ -1731,17 +1698,6 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
   return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
-    const unofficial_napi_embedder_hooks* hooks) {
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  if (hooks == nullptr) {
-    g_embedder_hooks.hooks = unofficial_napi_embedder_hooks{};
-  } else {
-    g_embedder_hooks.hooks = *hooks;
-  }
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks) {
@@ -1902,9 +1858,21 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // failure before the allocator takes it.
   void* guest_heap_ctx =
       options != nullptr ? options->guest_heap_ctx : nullptr;
-  if (env_out == nullptr || scope_out == nullptr) {
+  if (env_out == nullptr || scope_out == nullptr ||
+      (options != nullptr &&
+       (options->size < sizeof(unofficial_napi_env_create_options) ||
+        options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION ||
+        (options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
+        options->engine_flags_length >
+            static_cast<size_t>(std::numeric_limits<int>::max())))) {
     if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
     return napi_invalid_arg;
+  }
+
+  if (options != nullptr && options->engine_flags_length > 0) {
+    v8::V8::SetFlagsFromString(
+        options->engine_flags,
+        static_cast<int>(options->engine_flags_length));
   }
 
   EdgeV8Platform* platform = nullptr;
@@ -1947,7 +1915,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
           static_cast<uint32_t*>(options->stack_limit));
     }
   }
-  ApplyNodeIsolateCreateParams(&params);
+  ApplyNodeIsolateCreateParams(&params, options);
   v8::Isolate* isolate = CreateIsolateForEnv(platform, params);
   if (isolate == nullptr) {
     ReleaseRuntime();
@@ -2030,14 +1998,6 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr,
 napi_status NAPI_CDECL unofficial_napi_low_memory_notification(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   env->isolate->LowMemoryNotification();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
-    const char* flags,
-    size_t length) {
-  if (flags == nullptr) return napi_invalid_arg;
-  v8::V8::SetFlagsFromString(flags, static_cast<int>(length));
   return napi_ok;
 }
 

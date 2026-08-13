@@ -199,7 +199,11 @@ extern "C"
         napi_env *env_out,
         void **scope_out)
     {
-        if (env_out == nullptr || scope_out == nullptr)
+        if (env_out == nullptr || scope_out == nullptr ||
+            (options != nullptr &&
+             (options->size < sizeof(unofficial_napi_env_create_options) ||
+              options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION ||
+              (options->engine_flags_length > 0 && options->engine_flags == nullptr))))
             return napi_invalid_arg;
 
         auto rt = JS_NewRuntime();
@@ -243,13 +247,6 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
-        const unofficial_napi_embedder_hooks *hooks)
-    {
-        (void)hooks;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_attach_env(
         napi_env env,
         const unofficial_napi_env_hooks *hooks)
@@ -275,15 +272,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         JS_RunGC(napi_util__::runtime(env));
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
-        const char *flags,
-        size_t length)
-    {
-        (void)flags;
-        (void)length;
         return napi_ok;
     }
 

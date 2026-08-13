@@ -192,7 +192,6 @@ while IFS= read -r dep; do
 done < <(find "$NAPI_INCLUDE_DIR" "$TEST_INCLUDE_DIR" -type f \( -name '*.h' -o -name '*.hpp' \) | sort)
 
 NAPI_V8_SOURCES=(
-  "$ROOT_DIR/src/edge_napi_embedder_hooks.cc"
   "$NAPI_LIB_SRC/napi_buffer_lease.cc"
   "$NAPI_LIB_SRC/napi_error_state.cc"
   "$NAPI_LIB_SRC/napi_lifetime_tracker.cc"

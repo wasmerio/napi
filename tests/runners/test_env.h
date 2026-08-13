@@ -13,12 +13,7 @@
 
 class NapiTestRuntime {
  public:
-  NapiTestRuntime() {
-    static constexpr char kDefaultFlags[] = "--expose-gc --js-float16array";
-    EXPECT_EQ(unofficial_napi_set_flags_from_string(
-                  kDefaultFlags, sizeof(kDefaultFlags) - 1),
-              napi_ok);
-  }
+  NapiTestRuntime() = default;
   ~NapiTestRuntime() = default;
 
   NapiTestRuntime(const NapiTestRuntime&) = delete;
@@ -37,7 +32,13 @@ inline std::unique_ptr<NapiTestRuntime> FixtureTestBase::runtime_;
 struct EnvScope {
   explicit EnvScope(NapiTestRuntime* runtime) {
     (void)runtime;
-    EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, nullptr, &env, &scope),
+    static constexpr char kDefaultFlags[] = "--expose-gc --js-float16array";
+    unofficial_napi_env_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+    options.engine_flags = kDefaultFlags;
+    options.engine_flags_length = sizeof(kDefaultFlags) - 1;
+    EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &scope),
               napi_ok);
     EXPECT_NE(env, nullptr);
     EXPECT_NE(scope, nullptr);

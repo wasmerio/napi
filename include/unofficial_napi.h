@@ -11,8 +11,17 @@ extern "C" {
 
 struct uv_loop_s;
 
-// Unofficial/test-only helper APIs for creating and releasing an env scope.
+enum { UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION = 1 };
+
+// All provider configuration needed before engine/isolate creation. The
+// descriptor is observed only for the duration of unofficial_napi_create_env;
+// pointed-to strings remain owned by the caller. `size` and `version` make
+// additions ABI-compatible without introducing mutable process-global setters.
 typedef struct {
+  uint32_t size;
+  uint32_t version;
+  uint64_t total_memory;
+  uint64_t constrained_memory;
   size_t max_young_generation_size_in_bytes;
   size_t max_old_generation_size_in_bytes;
   size_t code_range_size_in_bytes;
@@ -23,26 +32,9 @@ typedef struct {
    * released exactly once via napi_host_guest_heap_release (by the allocator
    * destructor, or on env-creation failure). */
   void* guest_heap_ctx;
+  const char* engine_flags;
+  size_t engine_flags_length;
 } unofficial_napi_env_create_options;
-
-typedef struct {
-  uint64_t total_memory;
-  uint64_t constrained_memory;
-} unofficial_napi_embedder_memory_info;
-
-typedef napi_status (*unofficial_napi_embedder_memory_info_callback)(
-    void* target,
-    unofficial_napi_embedder_memory_info* info_out);
-typedef napi_status (*unofficial_napi_embedder_shutdown_pump_callback)(
-    void* target,
-    void* handle);
-
-typedef struct {
-  unofficial_napi_embedder_memory_info_callback memory_info_callback;
-  void* memory_info_target;
-  unofficial_napi_embedder_shutdown_pump_callback shutdown_pump_callback;
-  void* shutdown_pump_target;
-} unofficial_napi_embedder_hooks;
 
 typedef void (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
 typedef void (*unofficial_napi_env_destroy_callback)(napi_env env, void* data);
@@ -90,8 +82,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     const unofficial_napi_env_create_options* options_or_null,
     napi_env* env_out,
     void** scope_out);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_embedder_hooks(
-    const unofficial_napi_embedder_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks);
@@ -99,9 +89,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     void* scope,
     struct uv_loop_s* loop_or_null);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_low_memory_notification(napi_env env);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_flags_from_string(
-    const char* flags,
-    size_t length);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback);
