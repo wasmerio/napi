@@ -116,10 +116,43 @@ TEST_F(Test65UnofficialContextify, SandboxGlobalThisIsNotEnumerableForDeepFreeze
             napi_ok);
   ASSERT_NE(result, nullptr);
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // QuickJS keeps its context marker on the sandbox rather than copying it
+  // into the context global. Pin the host-visible property contract directly.
+  napi_value marker_key = Str(s.env, "__quickjs_contextified");
+  bool has_marker = false;
+  ASSERT_EQ(napi_has_own_property(s.env, sandbox, marker_key, &has_marker), napi_ok);
+  EXPECT_TRUE(has_marker);
+
+  napi_value enumerable_keys = nullptr;
+  ASSERT_EQ(napi_get_all_property_names(s.env,
+                                        sandbox,
+                                        napi_key_own_only,
+                                        napi_key_enumerable,
+                                        napi_key_numbers_to_strings,
+                                        &enumerable_keys),
+            napi_ok);
+  uint32_t key_count = 0;
+  ASSERT_EQ(napi_get_array_length(s.env, enumerable_keys, &key_count), napi_ok);
+  for (uint32_t index = 0; index < key_count; ++index) {
+    napi_value key = nullptr;
+    ASSERT_EQ(napi_get_element(s.env, enumerable_keys, index, &key), napi_ok);
+    char text[64] = {};
+    size_t copied = 0;
+    ASSERT_EQ(napi_get_value_string_utf8(s.env, key, text, sizeof(text), &copied), napi_ok);
+    EXPECT_STRNE(text, "__quickjs_contextified");
+  }
+
+  napi_value marker_false = nullptr;
+  napi_value marker_true = nullptr;
+  ASSERT_EQ(napi_get_boolean(s.env, false, &marker_false), napi_ok);
+  ASSERT_EQ(napi_get_boolean(s.env, true, &marker_true), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "__quickjs_contextified", marker_false), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "__quickjs_contextified", marker_true), napi_ok);
+#endif
+
   napi_value eval_result = nullptr;
-  const unofficial_napi_js_source freeze_source = unofficial_napi_js_source_from_text(
-      Str(s.env,
-          R"JS(
+  std::string freeze_script = R"JS(
 const globalThisDescriptor = Object.getOwnPropertyDescriptor(globalThis, "globalThis");
 if (!globalThisDescriptor || globalThisDescriptor.enumerable ||
     !globalThisDescriptor.writable || !globalThisDescriptor.configurable) {
@@ -129,6 +162,8 @@ const keys = Object.keys(globalThis);
 if (keys.includes("globalThis")) {
   throw new Error("contextify internals should not be enumerable");
 }
+)JS";
+  freeze_script += R"JS(
 globalThis.__RSC_MANIFEST = {};
 globalThis.__RSC_MANIFEST["/x"] = { ok: true };
 function deepFreeze(obj) {
@@ -142,7 +177,9 @@ function deepFreeze(obj) {
 }
 deepFreeze(globalThis);
 globalThis.__RSC_MANIFEST["/x"].ok;
-)JS"));
+)JS";
+  const unofficial_napi_js_source freeze_source = unofficial_napi_js_source_from_text(
+      Str(s.env, freeze_script.c_str()));
   ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
                                                   sandbox,
                                                   &freeze_source,
