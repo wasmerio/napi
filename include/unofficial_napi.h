@@ -207,13 +207,16 @@ typedef size_t (*unofficial_napi_near_heap_limit_callback)(
     size_t current_heap_limit,
     size_t initial_heap_limit);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_near_heap_limit_callback(
+// Atomically configures the environment's one near-heap-limit callback slot.
+// A non-null callback installs or replaces the slot and requires
+// `restored_heap_limit` to be zero. A null callback removes the slot, requires
+// `data` to be null, and restores the provider heap limit to the supplied
+// value.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_near_heap_limit_callback(
     napi_env env,
-    unofficial_napi_near_heap_limit_callback callback,
-    void* data);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_remove_near_heap_limit_callback(
-    napi_env env,
-    size_t heap_limit);
+    unofficial_napi_near_heap_limit_callback callback_or_null,
+    void* data,
+    size_t restored_heap_limit);
 // Unofficial helpers used by util/options parity work in edge.
 // These expose engine-specific data that is not available in the public N-API.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_promise_details(napi_env env,
@@ -673,7 +676,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_state(
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_check_unsettled_top_level_await(
     napi_env env,
-    napi_value module_wrap,
+    unofficial_napi_module module,
     bool warnings,
     bool* settled_out);
 

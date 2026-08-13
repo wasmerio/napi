@@ -930,20 +930,14 @@ ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> 
   return nullptr;
 }
 
-ModuleWrapRecord* FindModuleRecordForWrapper(napi_env env, napi_value wrapper) {
-  if (env == nullptr || wrapper == nullptr) return nullptr;
+ModuleWrapRecord* FindModuleRecordForHandle(napi_env env,
+                                            unofficial_napi_module module) {
+  if (env == nullptr || module == nullptr) return nullptr;
   auto* state = GetModuleWrapState(env);
   if (state == nullptr) return nullptr;
-  for (ModuleWrapRecord* record : state->modules) {
-    if (record == nullptr || record->wrapper_ref == nullptr) continue;
-    napi_value candidate = GetRefValue(env, record->wrapper_ref);
-    if (candidate == nullptr) continue;
-    bool same = false;
-    if (napi_strict_equals(env, candidate, wrapper, &same) == napi_ok && same) {
-      return record;
-    }
-  }
-  return nullptr;
+  ModuleWrapRecord* candidate = ModuleRecord(module);
+  auto it = std::find(state->modules.begin(), state->modules.end(), candidate);
+  return it != state->modules.end() ? candidate : nullptr;
 }
 
 bool SetHostDefinedOptionSymbolOnWrapper(napi_env env, napi_value wrapper, napi_value id_value) {
@@ -2868,20 +2862,15 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(
     napi_env env,
-    napi_value module_wrap,
+    unofficial_napi_module module_handle,
     bool warnings,
     bool* settled_out) {
-  if (env == nullptr || settled_out == nullptr) return napi_invalid_arg;
-  *settled_out = true;
-  if (module_wrap == nullptr) return napi_ok;
-
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, module_wrap, &type) != napi_ok || type != napi_object) {
-    return napi_ok;
+  if (env == nullptr || module_handle == nullptr || settled_out == nullptr) {
+    return napi_invalid_arg;
   }
-
-  ModuleWrapRecord* record = FindModuleRecordForWrapper(env, module_wrap);
-  if (record == nullptr) return napi_ok;
+  *settled_out = true;
+  ModuleWrapRecord* record = FindModuleRecordForHandle(env, module_handle);
+  if (record == nullptr) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);

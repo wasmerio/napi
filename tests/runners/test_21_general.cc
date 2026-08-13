@@ -36,6 +36,16 @@ void AttachmentDestroy(napi_env env, void* data) {
   ++probe->destroy_calls;
 }
 
+size_t NearHeapLimitProbe(napi_env env,
+                          void* data,
+                          size_t current_heap_limit,
+                          size_t initial_heap_limit) {
+  EXPECT_NE(env, nullptr);
+  EXPECT_NE(data, nullptr);
+  EXPECT_GE(current_heap_limit, initial_heap_limit);
+  return current_heap_limit;
+}
+
 }  // namespace
 
 TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
@@ -92,6 +102,34 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
   EXPECT_EQ(probe.cleanup_calls, 1);
   EXPECT_EQ(probe.destroy_calls, 1);
+}
+
+TEST_F(Test21General, NearHeapLimitCallbackUsesOneConfigurationSlot) {
+  EnvScope s(runtime_.get());
+  int callback_data = 1;
+
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 1),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, &callback_data, 0),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 0),
+            napi_ok);
+  // Reconfiguration replaces the one logical slot rather than registering a
+  // second provider callback.
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 0),
+            napi_ok);
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, nullptr, 0),
+            napi_ok);
+  // Removing an already-empty slot is idempotent.
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, nullptr, 0),
+            napi_ok);
 }
 
 TEST_F(Test21General, PortedCoreFlow) {

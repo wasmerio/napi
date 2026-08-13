@@ -121,17 +121,6 @@ unsafe extern "C" {
     /// registrations) this env may hold, bounding host-side bookkeeping RSS.
     /// `limit == 0` means unlimited.
     pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
-    #[allow(dead_code)]
-    pub fn snapi_bridge_unofficial_set_near_heap_limit_callback(
-        env: SnapiEnv,
-        callback_id: u32,
-        data: u32,
-    ) -> i32;
-    #[allow(dead_code)]
-    pub fn snapi_bridge_unofficial_remove_near_heap_limit_callback(
-        env: SnapiEnv,
-        heap_limit: u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -389,7 +378,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
         env: SnapiEnv,
-        module_wrap_id: u32,
+        handle_id: u32,
         warnings: i32,
         settled_out: *mut i32,
     ) -> i32;

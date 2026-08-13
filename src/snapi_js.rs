@@ -1057,7 +1057,6 @@ struct SyntheticModule {
 }
 
 struct SourceTextModule {
-    wrapper: JsValue,
     url: String,
     requests: Array,
     linked_handles: Vec<u32>,
@@ -3360,23 +3359,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_promise_hooks(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_near_heap_limit_callback(
-    env: SnapiEnv,
-    callback_id: u32,
-    data: u32,
-) -> i32 {
-    let _ = (env, callback_id, data);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_remove_near_heap_limit_callback(
-    env: SnapiEnv,
-    heap_limit: u32,
-) -> i32 {
-    let _ = (env, heap_limit);
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_promise_details(
     env: SnapiEnv,
     promise_id: u32,
@@ -4117,9 +4099,9 @@ unsafe fn host_js_create_source_text_module(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrapper) = state.get(wrapper_id).cloned() else {
+    if state.get(wrapper_id).is_none() {
         return NAPI_INVALID_ARG;
-    };
+    }
     let Some(url) = state.get(url_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
@@ -4183,7 +4165,6 @@ unsafe fn host_js_create_source_text_module(
     state.source_text_modules.insert(
         handle,
         SourceTextModule {
-            wrapper,
             url,
             requests,
             linked_handles: Vec::new(),
@@ -4780,7 +4761,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
     env: SnapiEnv,
-    module_wrap_id: u32,
+    handle_id: u32,
     warnings: i32,
     settled_out: *mut i32,
 ) -> i32 {
@@ -4788,19 +4769,14 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_check_unsettled_top
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrapper) = state.get(module_wrap_id).cloned() else {
-        return unsafe { write(settled_out, 1) }.map_or_else(|error| error, |()| NAPI_OK);
-    };
-    let handle_id = state
-        .source_text_modules
-        .iter()
-        .find_map(|(handle, module)| Object::is(&wrapper, &module.wrapper).then_some(*handle));
-    let settled = if let Some(handle_id) = handle_id {
+    let settled = if state.source_text_modules.contains_key(&handle_id) {
         let is_async =
             module_graph_has_top_level_await(state, handle_id, &mut Vec::new()).unwrap_or(false);
         !is_async || refresh_module_status(state, handle_id).unwrap_or(4) != 3
-    } else {
+    } else if state.synthetic_modules.contains_key(&handle_id) {
         true
+    } else {
+        return NAPI_INVALID_ARG;
     };
     unsafe { write(settled_out, i32::from(settled)) }.map_or_else(|error| error, |()| NAPI_OK)
 }

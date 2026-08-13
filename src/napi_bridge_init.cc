@@ -3012,8 +3012,11 @@ extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
   if (env_state == nullptr || env_state->env == nullptr) {
     return napi_invalid_arg;
   }
-  return unofficial_napi_set_near_heap_limit_callback(
-      env_state->env, HostNearHeapLimitTrampoline, const_cast<void*>(data));
+  return unofficial_napi_configure_near_heap_limit_callback(
+      env_state->env,
+      HostNearHeapLimitTrampoline,
+      const_cast<void*>(data),
+      0);
 }
 
 // Debug/diagnostics: live count of slot-table entries (leak assertions).
@@ -4132,23 +4135,20 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
 
 extern "C" int snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
     SnapiEnvState* env_state,
-    uint32_t module_wrap_id,
+    uint32_t handle_id,
     int warnings,
     int* settled_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      settled_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  napi_value module_wrap =
-      module_wrap_id == 0 ? nullptr : LoadValue(*bridge_state, module_wrap_id);
-  if (module_wrap_id != 0 && module_wrap == nullptr) return napi_invalid_arg;
+  if (settled_out == nullptr) return napi_invalid_arg;
+  unofficial_napi_module module =
+      LoadModuleWrapHandle(*bridge_state, handle_id);
+  if (module == nullptr) return napi_invalid_arg;
   bool settled = true;
   napi_status s = unofficial_napi_module_wrap_check_unsettled_top_level_await(
-      env, module_wrap, warnings != 0, &settled);
+      env, module, warnings != 0, &settled);
   if (s != napi_ok) return s;
   *settled_out = settled ? 1 : 0;
   return napi_ok;

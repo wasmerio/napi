@@ -1439,19 +1439,12 @@ fn guest_unofficial_napi_get_heap_code_statistics(
     status
 }
 
-fn guest_unofficial_napi_set_near_heap_limit_callback(
+fn guest_unofficial_napi_configure_near_heap_limit_callback(
     _env: FunctionEnvMut<NapiEnv>,
     _napi_env: i32,
     _callback: i32,
     _data: i32,
-) -> i32 {
-    0
-}
-
-fn guest_unofficial_napi_remove_near_heap_limit_callback(
-    _env: FunctionEnvMut<NapiEnv>,
-    _napi_env: i32,
-    _heap_limit: i32,
+    _restored_heap_limit: i32,
 ) -> i32 {
     0
 }
@@ -2068,21 +2061,17 @@ fn guest_unofficial_napi_module_wrap_get_state(
 fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
-    module_wrap: i32,
+    handle: i32,
     warnings: i32,
     settled_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let module_wrap_id = if module_wrap > 0 {
-        module_wrap as u32
-    } else {
-        0
-    };
+    let handle_id = if handle > 0 { handle as u32 } else { 0 };
     let mut settled = 0i32;
     let status = unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
-            module_wrap_id,
+            handle_id,
             warnings,
             &mut settled,
         )
@@ -6040,8 +6029,7 @@ pub fn register_napi_imports(
         "unofficial_napi_get_heap_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_statistics),
         "unofficial_napi_get_heap_space_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_space_statistics),
         "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
-        "unofficial_napi_set_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_near_heap_limit_callback),
-        "unofficial_napi_remove_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_remove_near_heap_limit_callback),
+        "unofficial_napi_configure_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_near_heap_limit_callback),
         "unofficial_napi_profile_start" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_start),
         "unofficial_napi_profile_stop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_stop),
         "unofficial_napi_take_heap_snapshot" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_heap_snapshot),

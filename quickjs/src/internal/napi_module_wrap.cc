@@ -805,13 +805,12 @@ napi_status napi_module_wrap__::get_state(unofficial_napi_module module,
   return wrap_owned(error, &state_out->error);
 }
 
-napi_status napi_module_wrap__::check_unsettled_top_level_await(napi_value module_wrap,
+napi_status napi_module_wrap__::check_unsettled_top_level_await(unofficial_napi_module module,
                                                                 bool warnings,
                                                                 bool *settled_out)
 {
-  (void)module_wrap;
   (void)warnings;
-  if (settled_out == nullptr)
+  if (find(module) == nullptr || settled_out == nullptr)
     return napi_util__::invalid_arg(env_);
   *settled_out = true;
   return napi_ok;

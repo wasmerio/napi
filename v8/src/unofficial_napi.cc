@@ -1824,31 +1824,43 @@ static napi_status DestroyEnvInstance(napi_env env) {
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_near_heap_limit_callback(
+napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
     napi_env env,
-    unofficial_napi_near_heap_limit_callback callback,
-    void* data) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+    unofficial_napi_near_heap_limit_callback callback_or_null,
+    void* data,
+    size_t restored_heap_limit) {
+  if (env == nullptr || env->isolate == nullptr ||
+      (callback_or_null != nullptr && restored_heap_limit != 0) ||
+      (callback_or_null == nullptr && data != nullptr)) {
+    return napi_invalid_arg;
+  }
 
+  if (callback_or_null != nullptr) {
+    bool install_provider_callback = false;
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      auto [it, inserted] =
+          g_near_heap_limit_callbacks.try_emplace(env->isolate);
+      it->second.callback = callback_or_null;
+      it->second.data = data;
+      install_provider_callback = inserted;
+    }
+    if (install_provider_callback) {
+      env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
+    }
+    return napi_ok;
+  }
+
+  bool remove_provider_callback = false;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto& entry = g_near_heap_limit_callbacks[env->isolate];
-    entry.callback = callback;
-    entry.data = data;
+    remove_provider_callback =
+        g_near_heap_limit_callbacks.erase(env->isolate) != 0;
   }
-  env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
-    napi_env env,
-    size_t heap_limit) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_near_heap_limit_callbacks.erase(env->isolate);
+  if (remove_provider_callback) {
+    env->isolate->RemoveNearHeapLimitCallback(
+        NearHeapLimitCallback, restored_heap_limit);
   }
-  env->isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, heap_limit);
   return napi_ok;
 }
 

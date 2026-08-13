@@ -397,25 +397,19 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_near_heap_limit_callback(
+    napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
         napi_env env,
-        unofficial_napi_near_heap_limit_callback callback,
-        void *data)
+        unofficial_napi_near_heap_limit_callback callback_or_null,
+        void *data,
+        size_t restored_heap_limit)
     {
-        (void)callback;
+        if (!napi_util__::check_env(env) ||
+            (callback_or_null != nullptr && restored_heap_limit != 0) ||
+            (callback_or_null == nullptr && data != nullptr))
+            return napi_invalid_arg;
+        (void)callback_or_null;
         (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
-        napi_env env,
-        size_t heap_limit)
-    {
-        (void)heap_limit;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
+        (void)restored_heap_limit;
         return napi_ok;
     }
 
@@ -1184,13 +1178,13 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(
         napi_env env,
-        napi_value module_wrap,
+        unofficial_napi_module module,
         bool warnings,
         bool *settled_out)
     {
-        if (!napi_util__::check_env(env) || settled_out == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr || settled_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().check_unsettled_top_level_await(module_wrap,
+        return env->module_wrap().check_unsettled_top_level_await(module,
                                                                   warnings,
                                                                   settled_out);
     }
