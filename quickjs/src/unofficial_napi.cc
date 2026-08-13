@@ -250,48 +250,14 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void *environment)
-    {
-        (void)environment;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_status NAPI_CDECL unofficial_napi_attach_env(
         napi_env env,
-        unofficial_napi_env_cleanup_callback callback,
-        void *data)
+        const unofficial_napi_env_hooks *hooks)
     {
-        (void)callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
-        napi_env env,
-        unofficial_napi_env_destroy_callback callback,
-        void *data)
-    {
-        (void)callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
-        napi_env env,
-        unofficial_napi_context_token_callback assign_callback,
-        unofficial_napi_context_token_callback unassign_callback,
-        void *data)
-    {
-        (void)assign_callback;
-        (void)unassign_callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
+        if (!napi_util__::check_env(env) || hooks == nullptr ||
+            hooks->size < sizeof(unofficial_napi_env_hooks) ||
+            hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
+            !env->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
         return napi_ok;
     }
@@ -405,18 +371,6 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
-        napi_env env,
-        unofficial_napi_enqueue_foreground_task_callback callback,
-        void *target)
-    {
-        (void)callback;
-        (void)target;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback)
     {
         if (!napi_util__::check_env(env) || !napi_util__::is_callable(env, callback))
@@ -452,18 +406,6 @@ extern "C"
         if (status != napi_ok)
             return status;
         env->promises().attach_runtime_hooks();
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
-        napi_env env,
-        unofficial_napi_fatal_error_callback fatal_callback,
-        unofficial_napi_oom_error_callback oom_callback)
-    {
-        (void)fatal_callback;
-        (void)oom_callback;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
         return napi_ok;
     }
 

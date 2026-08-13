@@ -3227,18 +3227,7 @@ extern "C" int snapi_bridge_unofficial_set_continuation_preserved_embedder_data(
   return unofficial_napi_set_continuation_preserved_embedder_data(env, value);
 }
 
-extern "C" int snapi_bridge_unofficial_set_enqueue_foreground_task_callback(
-    SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  // Keep parity with the previous bridge behavior (no custom foreground task hook).
-  // The runtime drives provider work through the event-loop checkpoint.
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_set_fatal_error_callbacks(
+extern "C" int snapi_bridge_unofficial_attach_env(
     SnapiEnvState* env_state,
     uint32_t /*fatal_callback_id*/,
     uint32_t /*oom_callback_id*/) {
@@ -3246,7 +3235,13 @@ extern "C" int snapi_bridge_unofficial_set_fatal_error_callbacks(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_set_fatal_error_callbacks(env, nullptr, nullptr);
+  // Guest callbacks cannot be installed as native provider function pointers.
+  // Guest lifecycle stays in the Wasmer bridge, while the provider receives
+  // the same single immutable attachment transition with empty native hooks.
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  return unofficial_napi_attach_env(env, &hooks);
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {

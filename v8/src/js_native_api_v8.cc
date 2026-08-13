@@ -587,7 +587,6 @@ napi_env__::~napi_env__() {
   if (env_destroy_callback != nullptr) {
     env_destroy_callback(this, env_destroy_callback_data);
   }
-  edge_environment = nullptr;
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 

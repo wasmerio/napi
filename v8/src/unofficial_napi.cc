@@ -1742,20 +1742,45 @@ napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
+napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
-    unofficial_napi_enqueue_foreground_task_callback callback,
-    void* target) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->enqueue_foreground_task_callback = callback;
-  env->enqueue_foreground_task_target = target;
+    const unofficial_napi_env_hooks* hooks) {
+  if (env == nullptr || env->isolate == nullptr || hooks == nullptr ||
+      hooks->size < sizeof(unofficial_napi_env_hooks) ||
+      hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
+      env->embedder_hooks_attached) {
+    return napi_invalid_arg;
+  }
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr &&
-        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
+        !g_runtime.platform->BindForegroundTaskTarget(
+            env->isolate,
+            env,
+            hooks->enqueue_foreground_task_callback,
+            hooks->data)) {
       return napi_generic_failure;
     }
+    auto& fatal = g_fatal_error_callbacks[env->isolate];
+    fatal.fatal = hooks->fatal_error_callback;
+    fatal.oom = hooks->oom_error_callback;
   }
+
+  env->env_cleanup_callback = hooks->cleanup_callback;
+  env->env_cleanup_callback_data = hooks->data;
+  env->env_destroy_callback = hooks->destroy_callback;
+  env->env_destroy_callback_data = hooks->data;
+  env->context_token_assign_callback = hooks->context_token_assign_callback;
+  env->context_token_unassign_callback = hooks->context_token_unassign_callback;
+  env->context_token_callback_data = hooks->data;
+  env->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
+  env->enqueue_foreground_task_target = hooks->data;
+  env->embedder_hooks_attached = true;
+
+  env->isolate->SetFatalErrorHandler(
+      hooks->fatal_error_callback != nullptr ? FatalErrorCallback : nullptr);
+  env->isolate->SetOOMErrorHandler(
+      hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
   return napi_ok;
 }
 
@@ -1770,44 +1795,6 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
     g_env_by_isolate[env->isolate] = env;
   }
   *result = env;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* environment) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->edge_environment = environment;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
-    napi_env env,
-    unofficial_napi_env_cleanup_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_cleanup_callback = callback;
-  env->env_cleanup_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
-    napi_env env,
-    unofficial_napi_env_destroy_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_destroy_callback = callback;
-  env->env_destroy_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
-    napi_env env,
-    unofficial_napi_context_token_callback assign_callback,
-    unofficial_napi_context_token_callback unassign_callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->context_token_assign_callback = assign_callback;
-  env->context_token_unassign_callback = unassign_callback;
-  env->context_token_callback_data = data;
   return napi_ok;
 }
 
@@ -1866,24 +1853,6 @@ static napi_status DestroyEnvInstance(napi_env env) {
     env->isolate->SetOOMErrorHandler(nullptr);
   }
   delete env;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
-    napi_env env,
-    unofficial_napi_fatal_error_callback fatal_callback,
-    unofficial_napi_oom_error_callback oom_callback) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto& entry = g_fatal_error_callbacks[env->isolate];
-    entry.fatal = fatal_callback;
-    entry.oom = oom_callback;
-  }
-
-  env->isolate->SetFatalErrorHandler(fatal_callback != nullptr ? FatalErrorCallback : nullptr);
-  env->isolate->SetOOMErrorHandler(oom_callback != nullptr ? OOMErrorCallback : nullptr);
   return napi_ok;
 }
 
@@ -3112,29 +3081,3 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
-
-void* NapiV8GetCurrentEdgeEnvironment(v8::Isolate* isolate) {
-  if (isolate == nullptr) return nullptr;
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  auto it = g_env_by_isolate.find(isolate);
-  if (it == g_env_by_isolate.end()) return nullptr;
-  napi_env env = it->second;
-  return env != nullptr ? env->edge_environment : nullptr;
-}
-
-void* NapiV8GetCurrentEdgeEnvironment(v8::Local<v8::Context> context) {
-  if (context.IsEmpty()) return nullptr;
-  napi_env env = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_env_by_isolate.find(context->GetIsolate());
-    if (it == g_env_by_isolate.end()) return nullptr;
-    env = it->second;
-  }
-  if (env == nullptr) return nullptr;
-  v8::Local<v8::Context> principal_context = env->context();
-  if (context != principal_context && !NapiV8IsContextifyContext(env, context)) {
-    return nullptr;
-  }
-  return env->edge_environment;
-}

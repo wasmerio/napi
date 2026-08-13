@@ -298,6 +298,33 @@ fn guest_unofficial_napi_set_embedder_hooks(env: FunctionEnvMut<NapiEnv>, napi_e
     unsafe { snapi_bridge_unofficial_set_embedder_hooks(env_handle) }
 }
 
+fn guest_unofficial_napi_attach_env(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: i32,
+    hooks_ptr: i32,
+) -> i32 {
+    const HOOKS_SIZE: usize = 40;
+    let Some(bytes) = read_guest_bytes(&mut env, hooks_ptr, HOOKS_SIZE) else {
+        return 1;
+    };
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) < HOOKS_SIZE as u32
+        || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 1
+        || napi_env <= 0
+        || !env.data_mut().attached_napi_envs.insert(napi_env as u32)
+    {
+        return 1;
+    }
+
+    let fatal_id = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+    let oom_id = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let status =
+        unsafe { snapi_bridge_unofficial_attach_env(snapi_env(&env, napi_env), fatal_id, oom_id) };
+    if status != 0 {
+        env.data_mut().attached_napi_envs.remove(&(napi_env as u32));
+    }
+    status
+}
+
 fn guest_unofficial_napi_low_memory_notification(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -580,36 +607,6 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle) }
-}
-
-fn guest_unofficial_napi_set_enqueue_foreground_task_callback(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    _callback: i32,
-    _target: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_set_enqueue_foreground_task_callback(env_handle) }
-}
-
-fn guest_unofficial_napi_set_fatal_error_callbacks(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    fatal_callback: i32,
-    oom_callback: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let fatal_id = if fatal_callback > 0 {
-        fatal_callback as u32
-    } else {
-        0
-    };
-    let oom_id = if oom_callback > 0 {
-        oom_callback as u32
-    } else {
-        0
-    };
-    unsafe { snapi_bridge_unofficial_set_fatal_error_callbacks(env_handle, fatal_id, oom_id) }
 }
 
 fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
@@ -5277,6 +5274,7 @@ pub fn register_napi_imports(
         "unofficial_napi_set_flags_from_string" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_flags_from_string),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_set_embedder_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_embedder_hooks),
+        "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
@@ -5296,8 +5294,6 @@ pub fn register_napi_imports(
         "unofficial_napi_get_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_continuation_preserved_embedder_data),
         "unofficial_napi_set_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_continuation_preserved_embedder_data),
         "unofficial_napi_notify_datetime_configuration_change" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_notify_datetime_configuration_change),
-        "unofficial_napi_set_enqueue_foreground_task_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_enqueue_foreground_task_callback),
-        "unofficial_napi_set_fatal_error_callbacks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_fatal_error_callbacks),
         "unofficial_napi_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_terminate_execution),
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),

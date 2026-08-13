@@ -15,6 +15,59 @@ extern "C" napi_value Init(napi_env env, napi_value exports);
 
 class Test21General : public FixtureTestBase {};
 
+namespace {
+
+struct EnvAttachmentProbe {
+  int cleanup_calls = 0;
+  int destroy_calls = 0;
+};
+
+void AttachmentCleanup(napi_env env, void* data) {
+  EXPECT_NE(env, nullptr);
+  auto* probe = static_cast<EnvAttachmentProbe*>(data);
+  ASSERT_NE(probe, nullptr);
+  ++probe->cleanup_calls;
+}
+
+void AttachmentDestroy(napi_env env, void* data) {
+  EXPECT_NE(env, nullptr);
+  auto* probe = static_cast<EnvAttachmentProbe*>(data);
+  ASSERT_NE(probe, nullptr);
+  ++probe->destroy_calls;
+}
+
+}  // namespace
+
+TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
+  napi_env env = nullptr;
+  void* owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, nullptr, &env, &owner),
+            napi_ok);
+  ASSERT_NE(env, nullptr);
+  ASSERT_NE(owner, nullptr);
+
+  EnvAttachmentProbe probe;
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.data = &probe;
+  hooks.cleanup_callback = AttachmentCleanup;
+  hooks.destroy_callback = AttachmentDestroy;
+
+  unofficial_napi_env_hooks invalid = hooks;
+  invalid.version += 1;
+  EXPECT_EQ(unofficial_napi_attach_env(env, &invalid), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks), napi_ok);
+  EXPECT_EQ(unofficial_napi_attach_env(env, &hooks), napi_invalid_arg);
+  EXPECT_EQ(probe.cleanup_calls, 0);
+  EXPECT_EQ(probe.destroy_calls, 0);
+
+  ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  EXPECT_EQ(probe.cleanup_calls, 1);
+  EXPECT_EQ(probe.destroy_calls, 1);
+}
+
 TEST_F(Test21General, PortedCoreFlow) {
   EnvScope s(runtime_.get());
   napi_value exports = nullptr;

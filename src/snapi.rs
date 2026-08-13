@@ -177,8 +177,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         value_id: u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_set_enqueue_foreground_task_callback(env: SnapiEnv) -> i32;
-    pub fn snapi_bridge_unofficial_set_fatal_error_callbacks(
+    pub fn snapi_bridge_unofficial_attach_env(
         env: SnapiEnv,
         fatal_callback_id: u32,
         oom_callback_id: u32,

@@ -3,6 +3,7 @@
 
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
+#include "../../../include/unofficial_napi.h"
 #include "napi_callback_info.h"
 #include "napi_buffer.h"
 #include "napi_contextify.h"
@@ -113,6 +114,15 @@ struct napi_env__
   quickjs::detail::napi_module_wrap__ &module_wrap();
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
+  bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks)
+  {
+    if (embedder_hooks_attached_)
+      return false;
+    embedder_hooks_ = hooks;
+    embedder_hooks_attached_ = true;
+    return true;
+  }
+
 private:
   void clear_refs_for_teardown();
 
@@ -164,6 +174,8 @@ private:
   // Env teardown state.
   bool torn_down_ = false;
   bool clearing_refs_for_teardown_ = false;
+  bool embedder_hooks_attached_ = false;
+  unofficial_napi_env_hooks embedder_hooks_{};
 };
 
 class napi_env_context_scope__

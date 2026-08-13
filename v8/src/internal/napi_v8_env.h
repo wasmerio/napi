@@ -95,7 +95,6 @@ struct napi_env__ {
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
-  void* edge_environment = nullptr;
   std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
   std::vector<napi_buffer_record__*> buffer_records;
@@ -114,6 +113,7 @@ struct napi_env__ {
   void* context_token_callback_data = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
   void* enqueue_foreground_task_target = nullptr;
+  bool embedder_hooks_attached = false;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   napi::periodic_gate__ lifetime_stats_gate_{2000};

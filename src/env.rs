@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,6 +130,7 @@ pub(crate) struct NapiEnv {
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
     pub(crate) napi_envs: HashMap<u32, usize>,
+    pub(crate) attached_napi_envs: HashSet<u32>,
     pub(crate) napi_state_to_guest_env: HashMap<usize, u32>,
     pub(crate) napi_scopes: HashMap<u32, u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -181,6 +182,7 @@ impl NapiEnv {
             next_napi_env_id: 0,
             next_napi_scope_id: 0,
             napi_envs: HashMap::new(),
+            attached_napi_envs: HashSet::new(),
             napi_state_to_guest_env: HashMap::new(),
             napi_scopes: HashMap::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -414,6 +416,7 @@ impl NapiEnv {
 
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
+        self.attached_napi_envs.remove(&env_id);
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
         }

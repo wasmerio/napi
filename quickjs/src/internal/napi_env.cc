@@ -32,6 +32,8 @@ napi_env__::~napi_env__()
 {
   prepare_teardown();
   finalize_instance_data();
+  if (embedder_hooks_.destroy_callback != nullptr)
+    embedder_hooks_.destroy_callback(this, embedder_hooks_.data);
 }
 
 void napi_env__::prepare_teardown()
@@ -40,6 +42,8 @@ void napi_env__::prepare_teardown()
     return;
 
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
+  if (embedder_hooks_.cleanup_callback != nullptr)
+    embedder_hooks_.cleanup_callback(this, embedder_hooks_.data);
   while (!env_cleanup_hooks_.empty())
   {
     auto *entry = env_cleanup_hooks_.back();

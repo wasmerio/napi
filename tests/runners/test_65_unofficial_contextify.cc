@@ -96,7 +96,7 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
 
 }
 
-TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze) {
+TEST_F(Test65UnofficialContextify, SandboxGlobalThisIsNotEnumerableForDeepFreeze) {
   EnvScope s(runtime_.get());
 
   napi_value sandbox = nullptr;
@@ -120,17 +120,12 @@ TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableFor
       Str(s.env,
           R"JS(
 const globalThisDescriptor = Object.getOwnPropertyDescriptor(globalThis, "globalThis");
-const markerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__quickjs_contextified");
 if (!globalThisDescriptor || globalThisDescriptor.enumerable ||
     !globalThisDescriptor.writable || !globalThisDescriptor.configurable) {
   throw new Error("globalThis should be writable/configurable but non-enumerable");
 }
-if (!markerDescriptor || markerDescriptor.enumerable ||
-    !markerDescriptor.writable || !markerDescriptor.configurable) {
-  throw new Error("contextify marker should be writable/configurable but non-enumerable");
-}
 const keys = Object.keys(globalThis);
-if (keys.includes("globalThis") || keys.includes("__quickjs_contextified")) {
+if (keys.includes("globalThis")) {
   throw new Error("contextify internals should not be enumerable");
 }
 globalThis.__RSC_MANIFEST = {};

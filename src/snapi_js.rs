@@ -3486,25 +3486,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_continuation_preserved_embe
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_enqueue_foreground_task_callback(
-    env: SnapiEnv,
-) -> i32 {
-    let _ = env;
-    // JavaScript-hosted execution already runs on the host event loop. EdgeJS
-    // installs this hook for engine-owned foreground tasks; there is no
-    // separate embedded-engine queue to bridge in this backend.
-    NAPI_OK
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_set_fatal_error_callbacks(
+pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     env: SnapiEnv,
     fatal_callback_id: u32,
     oom_callback_id: u32,
 ) -> i32 {
     let _ = (env, fatal_callback_id, oom_callback_id);
-    // The browser/Node host owns fatal JavaScript and OOM handling. There is
-    // no embedded engine whose fatal hooks can be replaced, so accepting the
-    // registration is the JS-backend equivalent of installing them.
+    // JavaScript-hosted execution already runs on the host event loop, and the
+    // browser/Node host owns fatal JavaScript and OOM handling. Accept the same
+    // single attachment transition without installing embedded-engine hooks.
     NAPI_OK
 }
 #[unsafe(no_mangle)]
