@@ -191,21 +191,6 @@ ProfilerState& EnsureProfilerState(napi_env env) {
   return g_profiler_states[env];
 }
 
-bool CopyStringToMallocBuffer(const std::string& input, char** data_out, size_t* len_out) {
-  if (data_out == nullptr || len_out == nullptr) return false;
-  *data_out = nullptr;
-  *len_out = 0;
-  char* buffer = static_cast<char*>(std::malloc(input.size() + 1));
-  if (buffer == nullptr) return false;
-  if (!input.empty()) {
-    std::memcpy(buffer, input.data(), input.size());
-  }
-  buffer[input.size()] = '\0';
-  *data_out = buffer;
-  *len_out = input.size();
-  return true;
-}
-
 uint64_t GenerateHashSeed() {
   try {
     std::random_device random_device;
@@ -2907,15 +2892,13 @@ napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
     napi_env env,
     uint32_t profile_id,
     bool* found_out,
-    char** json_out,
-    size_t* json_len_out) {
+    napi_value* json_out) {
   if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
-      json_out == nullptr || json_len_out == nullptr) {
+      json_out == nullptr) {
     return napi_invalid_arg;
   }
   *found_out = false;
   *json_out = nullptr;
-  *json_len_out = 0;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   v8::CpuProfiler* cpu_profiler = nullptr;
@@ -2944,9 +2927,9 @@ napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
   StringOutputStream stream;
   profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
   profile->Delete();
-  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
+  napi_status status = napi_create_string_utf8(
+      env, stream.output().data(), stream.output().size(), json_out);
+  if (status != napi_ok) return status;
   *found_out = true;
   return napi_ok;
 }
@@ -2972,15 +2955,13 @@ napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
 napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
     napi_env env,
     bool* found_out,
-    char** json_out,
-    size_t* json_len_out) {
+    napi_value* json_out) {
   if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
-      json_out == nullptr || json_len_out == nullptr) {
+      json_out == nullptr) {
     return napi_invalid_arg;
   }
   *found_out = false;
   *json_out = nullptr;
-  *json_len_out = 0;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   {
@@ -3003,9 +2984,8 @@ napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
       it->second.heap_profile_started = false;
     }
   }
-  if (!CopyStringToMallocBuffer(json, json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
+  napi_status status = napi_create_string_utf8(env, json.data(), json.size(), json_out);
+  if (status != napi_ok) return status;
   *found_out = true;
   return napi_ok;
 }
@@ -3013,14 +2993,11 @@ napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
 napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
     napi_env env,
     const unofficial_napi_heap_snapshot_options* options,
-    char** json_out,
-    size_t* json_len_out) {
-  if (env == nullptr || env->isolate == nullptr || json_out == nullptr ||
-      json_len_out == nullptr) {
+    napi_value* json_out) {
+  if (env == nullptr || env->isolate == nullptr || json_out == nullptr) {
     return napi_invalid_arg;
   }
   *json_out = nullptr;
-  *json_len_out = 0;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   v8::HeapProfiler::HeapSnapshotOptions snapshot_options;
@@ -3040,14 +3017,8 @@ napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
   StringOutputStream stream;
   snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
   const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
-  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
-  return napi_ok;
-}
-
-void NAPI_CDECL unofficial_napi_free_buffer(void* data) {
-  std::free(data);
+  return napi_create_string_utf8(
+      env, stream.output().data(), stream.output().size(), json_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(

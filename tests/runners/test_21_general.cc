@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
@@ -138,6 +139,39 @@ TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
                 s.env, statistics.data(), statistics.size(), nullptr),
             napi_invalid_arg);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test21General, CpuProfileResultIsEnvironmentOwnedString) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_cpu_profile_start_result start_result =
+      unofficial_napi_cpu_profile_start_too_many;
+  uint32_t profile_id = 0;
+  ASSERT_EQ(unofficial_napi_start_cpu_profile(
+                s.env, &start_result, &profile_id),
+            napi_ok);
+  ASSERT_EQ(start_result, unofficial_napi_cpu_profile_start_ok);
+
+  ASSERT_TRUE(RunScript(s,
+                        "let total = 0; for (let i = 0; i < 10000; ++i) total += i;",
+                        "cpu-profile-work.js"));
+
+  bool found = false;
+  napi_value json = nullptr;
+  ASSERT_EQ(unofficial_napi_stop_cpu_profile(
+                s.env, profile_id, &found, &json),
+            napi_ok);
+  ASSERT_TRUE(found);
+  ASSERT_NE(json, nullptr);
+
+  napi_valuetype type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, json, &type), napi_ok);
+  ASSERT_EQ(type, napi_string);
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, json, nullptr, 0, &length), napi_ok);
+  EXPECT_GT(length, 0u);
+}
+#endif
 
 #ifdef NAPI_TEST_ENGINE_QUICKJS
 TEST_F(Test21General, GlobalBufferPrototypeDetection) {

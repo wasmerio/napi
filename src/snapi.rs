@@ -255,24 +255,21 @@ unsafe extern "C" {
         env: SnapiEnv,
         profile_id: u32,
         found_out: *mut i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
+        json_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_start_heap_profile(env: SnapiEnv, started_out: *mut i32) -> i32;
     pub fn snapi_bridge_unofficial_stop_heap_profile(
         env: SnapiEnv,
         found_out: *mut i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
+        json_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_take_heap_snapshot(
         env: SnapiEnv,
         expose_internals: i32,
         expose_numeric_values: i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
+        json_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_free_buffer(data: *mut c_void);
+    pub fn snapi_bridge_free_buffer(data: *mut c_void);
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
         value_id: u32,

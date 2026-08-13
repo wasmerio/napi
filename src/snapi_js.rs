@@ -1771,7 +1771,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env_with_loop(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_free_buffer(data: *mut c_void) {
+pub unsafe extern "C" fn snapi_bridge_free_buffer(data: *mut c_void) {
     if !data.is_null() {
         BUFFER_ALLOCS.with(|allocs| {
             allocs.borrow_mut().remove(&(data as usize));
@@ -3684,10 +3684,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_stop_cpu_profile(
     env: SnapiEnv,
     profile_id: u32,
     found_out: *mut i32,
-    json_out: *mut u64,
-    json_len_out: *mut u32,
+    json_out: *mut u32,
 ) -> i32 {
-    let _ = (env, profile_id, found_out, json_out, json_len_out);
+    let _ = (env, profile_id, found_out, json_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
@@ -3702,10 +3701,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_start_heap_profile(
 pub unsafe extern "C" fn snapi_bridge_unofficial_stop_heap_profile(
     env: SnapiEnv,
     found_out: *mut i32,
-    json_out: *mut u64,
-    json_len_out: *mut u32,
+    json_out: *mut u32,
 ) -> i32 {
-    let _ = (env, found_out, json_out, json_len_out);
+    let _ = (env, found_out, json_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
@@ -3713,16 +3711,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_take_heap_snapshot(
     env: SnapiEnv,
     expose_internals: i32,
     expose_numeric_values: i32,
-    json_out: *mut u64,
-    json_len_out: *mut u32,
+    json_out: *mut u32,
 ) -> i32 {
-    let _ = (
-        env,
-        expose_internals,
-        expose_numeric_values,
-        json_out,
-        json_len_out,
-    );
+    let _ = (env, expose_internals, expose_numeric_values, json_out);
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]

@@ -3556,25 +3556,20 @@ extern "C" int snapi_bridge_unofficial_start_cpu_profile(SnapiEnvState* env_stat
 extern "C" int snapi_bridge_unofficial_stop_cpu_profile(SnapiEnvState* env_state,
                                                         uint32_t profile_id,
                                                         int* found_out,
-                                                        uint64_t* json_out,
-                                                        uint32_t* json_len_out) {
+                                                        uint32_t* json_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      found_out == nullptr || json_out == nullptr || json_len_out == nullptr) {
+  if (found_out == nullptr || json_out == nullptr) {
     return napi_invalid_arg;
   }
   bool found = false;
-  char* json = nullptr;
-  size_t json_len = 0;
-  napi_status s = unofficial_napi_stop_cpu_profile(env, profile_id, &found, &json,
-                                                   &json_len);
+  napi_value json = nullptr;
+  napi_status s = unofficial_napi_stop_cpu_profile(env, profile_id, &found, &json);
   if (s != napi_ok) return s;
   *found_out = found ? 1 : 0;
-  *json_out = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(json));
-  *json_len_out = static_cast<uint32_t>(json_len);
+  *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
   return napi_ok;
 }
 
@@ -3597,25 +3592,20 @@ extern "C" int snapi_bridge_unofficial_start_heap_profile(SnapiEnvState* env_sta
 
 extern "C" int snapi_bridge_unofficial_stop_heap_profile(SnapiEnvState* env_state,
                                                          int* found_out,
-                                                         uint64_t* json_out,
-                                                         uint32_t* json_len_out) {
+                                                         uint32_t* json_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      found_out == nullptr || json_out == nullptr || json_len_out == nullptr) {
+  if (found_out == nullptr || json_out == nullptr) {
     return napi_invalid_arg;
   }
   bool found = false;
-  char* json = nullptr;
-  size_t json_len = 0;
-  napi_status s =
-      unofficial_napi_stop_heap_profile(env, &found, &json, &json_len);
+  napi_value json = nullptr;
+  napi_status s = unofficial_napi_stop_heap_profile(env, &found, &json);
   if (s != napi_ok) return s;
   *found_out = found ? 1 : 0;
-  *json_out = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(json));
-  *json_len_out = static_cast<uint32_t>(json_len);
+  *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
   return napi_ok;
 }
 
@@ -3623,33 +3613,26 @@ extern "C" int snapi_bridge_unofficial_take_heap_snapshot(
     SnapiEnvState* env_state,
     int expose_internals,
     int expose_numeric_values,
-    uint64_t* json_out,
-    uint32_t* json_len_out) {
+    uint32_t* json_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (
-      json_out == nullptr || json_len_out == nullptr) {
+  if (json_out == nullptr) {
     return napi_invalid_arg;
   }
   unofficial_napi_heap_snapshot_options options{};
   options.expose_internals = expose_internals != 0;
   options.expose_numeric_values = expose_numeric_values != 0;
-  char* json = nullptr;
-  size_t json_len = 0;
-  napi_status s =
-      unofficial_napi_take_heap_snapshot(env, &options, &json, &json_len);
+  napi_value json = nullptr;
+  napi_status s = unofficial_napi_take_heap_snapshot(env, &options, &json);
   if (s != napi_ok) return s;
-  *json_out = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(json));
-  *json_len_out = static_cast<uint32_t>(json_len);
+  *json_out = json != nullptr ? StoreValue(*bridge_state, json) : 0;
   return napi_ok;
 }
 
-extern "C" void snapi_bridge_unofficial_free_buffer(void* data) {
-  if (data != nullptr) {
-    unofficial_napi_free_buffer(data);
-  }
+extern "C" void snapi_bridge_free_buffer(void* data) {
+  std::free(data);
 }
 
 extern "C" int snapi_bridge_unofficial_structured_clone(

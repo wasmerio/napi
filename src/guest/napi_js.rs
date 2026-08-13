@@ -178,39 +178,6 @@ fn write_guest_pod_slice<T>(
     write_guest_bytes(env, guest_ptr as u32, bytes)
 }
 
-fn copy_host_buffer_to_guest(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    data_out_ptr: i32,
-    len_out_ptr: i32,
-    host_ptr: u64,
-    host_len: u32,
-) -> i32 {
-    let mut guest_ptr = 0u32;
-    if host_ptr != 0 && host_len > 0 {
-        let host_slice =
-            unsafe { std::slice::from_raw_parts(host_ptr as *const u8, host_len as usize) };
-        let Some(ptr) = allocate_guest_bytes(env, host_slice) else {
-            unsafe { snapi_bridge_unofficial_free_buffer(host_ptr as *mut c_void) };
-            return 1;
-        };
-        guest_ptr = ptr;
-    }
-    if data_out_ptr > 0 {
-        write_guest_u32(env, data_out_ptr as u32, guest_ptr);
-    }
-    if len_out_ptr > 0 {
-        write_guest_u32(
-            env,
-            len_out_ptr as u32,
-            if guest_ptr == 0 { 0 } else { host_len },
-        );
-    }
-    if host_ptr != 0 {
-        unsafe { snapi_bridge_unofficial_free_buffer(host_ptr as *mut c_void) };
-    }
-    0
-}
-
 fn remember_guest_backing_store(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: u32,
@@ -1564,12 +1531,6 @@ fn guest_unofficial_napi_remove_near_heap_limit_callback(
     0
 }
 
-fn guest_unofficial_napi_free_buffer(mut env: FunctionEnvMut<NapiEnv>, data: i32) {
-    if data > 0 {
-        let _ = recycle_guest_allocation(&mut env, data as u32);
-    }
-}
-
 fn guest_unofficial_napi_start_cpu_profile(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1600,19 +1561,16 @@ fn guest_unofficial_napi_stop_cpu_profile(
     profile_id: i32,
     found_ptr: i32,
     json_ptr: i32,
-    json_len_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut found = 0i32;
-    let mut host_ptr = 0u64;
-    let mut host_len = 0u32;
+    let mut json = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_stop_cpu_profile(
             env_handle,
             profile_id.max(0) as u32,
             &mut found,
-            &mut host_ptr,
-            &mut host_len,
+            &mut json,
         )
     };
     if status != 0 {
@@ -1621,7 +1579,10 @@ fn guest_unofficial_napi_stop_cpu_profile(
     if found_ptr > 0 {
         write_guest_u8(&mut env, found_ptr as u32, (found != 0) as u8);
     }
-    copy_host_buffer_to_guest(&mut env, json_ptr, json_len_ptr, host_ptr, host_len)
+    if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
+        return 1;
+    }
+    0
 }
 
 fn guest_unofficial_napi_start_heap_profile(
@@ -1643,27 +1604,22 @@ fn guest_unofficial_napi_stop_heap_profile(
     napi_env: i32,
     found_ptr: i32,
     json_ptr: i32,
-    json_len_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut found = 0i32;
-    let mut host_ptr = 0u64;
-    let mut host_len = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_stop_heap_profile(
-            env_handle,
-            &mut found,
-            &mut host_ptr,
-            &mut host_len,
-        )
-    };
+    let mut json = 0u32;
+    let status =
+        unsafe { snapi_bridge_unofficial_stop_heap_profile(env_handle, &mut found, &mut json) };
     if status != 0 {
         return status;
     }
     if found_ptr > 0 {
         write_guest_u8(&mut env, found_ptr as u32, (found != 0) as u8);
     }
-    copy_host_buffer_to_guest(&mut env, json_ptr, json_len_ptr, host_ptr, host_len)
+    if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
+        return 1;
+    }
+    0
 }
 
 fn guest_unofficial_napi_take_heap_snapshot(
@@ -1671,7 +1627,6 @@ fn guest_unofficial_napi_take_heap_snapshot(
     napi_env: i32,
     options_ptr: i32,
     json_ptr: i32,
-    json_len_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let (expose_internals, expose_numeric_values) = if options_ptr > 0 {
@@ -1682,21 +1637,22 @@ fn guest_unofficial_napi_take_heap_snapshot(
     } else {
         (0, 0)
     };
-    let mut host_ptr = 0u64;
-    let mut host_len = 0u32;
+    let mut json = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_take_heap_snapshot(
             env_handle,
             expose_internals,
             expose_numeric_values,
-            &mut host_ptr,
-            &mut host_len,
+            &mut json,
         )
     };
     if status != 0 {
         return status;
     }
-    copy_host_buffer_to_guest(&mut env, json_ptr, json_len_ptr, host_ptr, host_len)
+    if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
+        return 1;
+    }
+    0
 }
 
 fn guest_unofficial_napi_create_serdes_binding(
@@ -3731,7 +3687,7 @@ fn guest_napi_create_external_buffer(
             )
         };
         if host_data != 0 {
-            unsafe { snapi_bridge_unofficial_free_buffer(host_data as *mut c_void) };
+            unsafe { snapi_bridge_free_buffer(host_data as *mut c_void) };
         }
         if status != 0 {
             return status;
@@ -3839,7 +3795,7 @@ fn guest_napi_get_arraybuffer_info(
         None
     };
     if host_data_addr != 0 {
-        unsafe { snapi_bridge_unofficial_free_buffer(host_data_addr as *mut c_void) };
+        unsafe { snapi_bridge_free_buffer(host_data_addr as *mut c_void) };
     }
     if let Some(guest_data_ptr) = guest_data_ptr {
         write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
@@ -4076,7 +4032,7 @@ fn guest_napi_get_typedarray_info(
             }
         }
         if host_data_addr != 0 {
-            unsafe { snapi_bridge_unofficial_free_buffer(host_data_addr as *mut c_void) };
+            unsafe { snapi_bridge_free_buffer(host_data_addr as *mut c_void) };
         }
         if abp > 0 {
             write_guest_u32(&mut env, abp as u32, ab);
@@ -4157,7 +4113,7 @@ fn guest_napi_get_dataview_info(
             None
         };
         if host_data_addr != 0 {
-            unsafe { snapi_bridge_unofficial_free_buffer(host_data_addr as *mut c_void) };
+            unsafe { snapi_bridge_free_buffer(host_data_addr as *mut c_void) };
         }
         if let Some(guest_data_ptr) = guest_data_ptr {
             write_guest_u32(&mut env, dp as u32, guest_data_ptr);
@@ -6331,7 +6287,6 @@ pub fn register_napi_imports(
         "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
         "unofficial_napi_set_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_near_heap_limit_callback),
         "unofficial_napi_remove_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_remove_near_heap_limit_callback),
-        "unofficial_napi_free_buffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_free_buffer),
         "unofficial_napi_start_cpu_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_start_cpu_profile),
         "unofficial_napi_stop_cpu_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_stop_cpu_profile),
         "unofficial_napi_start_heap_profile" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_start_heap_profile),

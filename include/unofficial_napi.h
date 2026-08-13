@@ -431,8 +431,7 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_stop_cpu_profile(
     napi_env env,
     uint32_t profile_id,
     bool* found_out,
-    char** json_out,
-    size_t* json_len_out);
+    napi_value* json_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_start_heap_profile(
     napi_env env,
@@ -441,16 +440,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_start_heap_profile(
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_stop_heap_profile(
     napi_env env,
     bool* found_out,
-    char** json_out,
-    size_t* json_len_out);
+    napi_value* json_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_take_heap_snapshot(
     napi_env env,
     const unofficial_napi_heap_snapshot_options* options,
-    char** json_out,
-    size_t* json_len_out);
-
-NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_free_buffer(void* data);
+    napi_value* json_out);
 
 // Unofficial helpers for Node's async_context_frame parity. These expose the
 // engine continuation-preserved embedder data used by AsyncContextFrame.

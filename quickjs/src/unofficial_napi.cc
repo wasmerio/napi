@@ -889,15 +889,13 @@ extern "C"
         napi_env env,
         uint32_t profile_id,
         bool *found_out,
-        char **json_out,
-        size_t *json_len_out)
+        napi_value *json_out)
     {
         (void)profile_id;
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr || json_len_out == nullptr)
+        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr)
             return napi_invalid_arg;
         *found_out = false;
         *json_out = nullptr;
-        *json_len_out = 0;
         return napi_ok;
     }
 
@@ -914,34 +912,25 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
         napi_env env,
         bool *found_out,
-        char **json_out,
-        size_t *json_len_out)
+        napi_value *json_out)
     {
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr || json_len_out == nullptr)
+        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr)
             return napi_invalid_arg;
         *found_out = false;
         *json_out = nullptr;
-        *json_len_out = 0;
         return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
         napi_env env,
         const unofficial_napi_heap_snapshot_options *options,
-        char **json_out,
-        size_t *json_len_out)
+        napi_value *json_out)
     {
         (void)options;
-        if (!napi_util__::check_env(env) || json_out == nullptr || json_len_out == nullptr)
+        if (!napi_util__::check_env(env) || json_out == nullptr)
             return napi_invalid_arg;
         *json_out = nullptr;
-        *json_len_out = 0;
         return napi_generic_failure;
-    }
-
-    void NAPI_CDECL unofficial_napi_free_buffer(void *data)
-    {
-        std::free(data);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(
