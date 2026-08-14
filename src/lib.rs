@@ -20,10 +20,12 @@ pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub use budget::{BudgetedMemory, BudgetedTunables, budgeted_tunables};
 pub use budget::{
-    EnvRejected, HeapReservation, OverBudget, Pool, RequestedHeap, ResourceBudget, ResourceUsage,
+    EnvRejected, HeapReservation, NapiMemoryAccountant, OverBudget, Pool, RequestedHeap,
+    ResourceBudget, ResourceUsage,
 };
 pub use ctx::{
-    NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeHooks, NapiSession,
+    NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeControl,
+    NapiRuntimeHooks, NapiSession,
 };
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
@@ -53,6 +55,47 @@ pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
         None
     }
 }
+
+/// Sets how many background worker threads V8 gets, process-wide.
+///
+/// V8 sizes this pool from the host's processor count, which suits a process
+/// running one JS app. A host running many gets a pool whose threads compete
+/// with every tenant's foreground JS, and whose work is attributed to no one:
+/// GC marking and sweeping, parallel scavenging, and background compilation
+/// all land there.
+///
+/// Passing `None` keeps V8's default. Lowering it doesn't strand work — V8's
+/// parallel jobs are cooperative and the posting thread participates, so the
+/// work migrates onto whichever thread asked for it.
+///
+/// The pool is built with the process-wide platform, when the first V8 isolate
+/// is created, so this must be called before then. Afterwards, asking for the
+/// size already in place still succeeds — several components may configure the
+/// runtime from one setting — and asking for a different one returns
+/// [`WorkerThreadsAlreadyFixed`].
+pub fn set_v8_worker_threads(count: Option<u32>) -> Result<(), WorkerThreadsAlreadyFixed> {
+    // Safety: plain integer in, no pointers; the callee only stores it.
+    let applied = unsafe { snapi::snapi_bridge_set_v8_worker_thread_count(count.unwrap_or(0)) };
+    if applied == 0 {
+        return Err(WorkerThreadsAlreadyFixed);
+    }
+    Ok(())
+}
+
+/// The V8 platform already exists, so its worker pool can no longer be resized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerThreadsAlreadyFixed;
+
+impl Display for WorkerThreadsAlreadyFixed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the V8 worker thread count must be set before the first isolate is created, and \
+             the V8 platform already exists",
+        )
+    }
+}
+
+impl std::error::Error for WorkerThreadsAlreadyFixed {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum NapiVersion {

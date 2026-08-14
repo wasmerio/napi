@@ -296,8 +296,29 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
   }
 };
 
+namespace {
+// Worker threads for the shared platform: 0 means "let V8 decide". Read once,
+// when the platform is built.
+std::atomic<int> g_worker_thread_count{0};
+std::atomic<bool> g_platform_created{false};
+}  // namespace
+
+bool EdgeV8Platform::SetWorkerThreadCount(int count) {
+  const int requested = count < 0 ? 0 : count;
+  if (g_platform_created.load(std::memory_order_acquire)) {
+    // The pool is already built. Asking for what is already in place is not an
+    // error -- several embedder components may configure the runtime from the
+    // same setting -- but asking for anything else cannot be honoured.
+    return g_worker_thread_count.load(std::memory_order_acquire) == requested;
+  }
+  g_worker_thread_count.store(requested, std::memory_order_release);
+  return true;
+}
+
 std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create() {
-  std::unique_ptr<v8::Platform> fallback = v8::platform::NewDefaultPlatform();
+  g_platform_created.store(true, std::memory_order_release);
+  std::unique_ptr<v8::Platform> fallback = v8::platform::NewDefaultPlatform(
+      g_worker_thread_count.load(std::memory_order_acquire));
   if (!fallback) return nullptr;
   WarmUpFallbackWorkerThreads(fallback.get());
   return std::unique_ptr<EdgeV8Platform>(new EdgeV8Platform(std::move(fallback)));

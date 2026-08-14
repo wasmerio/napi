@@ -445,21 +445,29 @@ impl GuestHeap {
         let delta_pages = want_bytes.div_ceil(WASM_PAGE);
         let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
 
-        // Reserve against the budget first, exactly like a guest-issued grow:
-        // a denied charge must look like hitting the memory's maximum.
-        if self
-            .budget
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .is_err()
-        {
-            return None;
-        }
+        // Growth goes through the store, so an embedder metering it through
+        // its own tunables charges these bytes itself; see
+        // `wasm_is_externally_accounted`. Standing alone, the heap reserves
+        // first, exactly like a guest-issued grow: a denied charge must look
+        // like hitting the memory's maximum.
+        let charge = if self.budget.wasm_is_externally_accounted() {
+            0
+        } else {
+            if self
+                .budget
+                .try_charge(Pool::WasmLinear, delta_bytes)
+                .is_err()
+            {
+                return None;
+            }
+            delta_bytes
+        };
 
         let Some((prev, base_now)) = grow_lent_memory(&inner.memories, Pages(delta_pages)) else {
-            self.budget.uncharge(Pool::WasmLinear, delta_bytes);
+            self.budget.uncharge(Pool::WasmLinear, charge);
             return None;
         };
-        self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
+        self.finish_claim(inner, prev, delta_pages, base_now, charge)
     }
 
     /// Top the arena up when free space is low or an allocation recently came
@@ -493,25 +501,32 @@ impl GuestHeap {
         };
         let want_bytes = chunk_size_for(min_bytes);
         let delta_pages = want_bytes.div_ceil(WASM_PAGE);
+        // Same rule as the lent-store lane above: only charge when no embedder
+        // is already accounting for growth through its tunables.
         let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
+        let charge = if self.budget.wasm_is_externally_accounted() {
+            0
+        } else {
+            if self
+                .budget
+                .try_charge(Pool::WasmLinear, delta_bytes)
+                .is_err()
+            {
+                return false;
+            }
+            delta_bytes
+        };
 
-        if self
-            .budget
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .is_err()
-        {
-            return false;
-        }
         let prev = match memory.grow(&mut *store, Pages(delta_pages)) {
             Ok(prev) => prev,
             Err(_) => {
-                self.budget.uncharge(Pool::WasmLinear, delta_bytes);
+                self.budget.uncharge(Pool::WasmLinear, charge);
                 return false;
             }
         };
         let base_now = memory.view(store).data_ptr();
         inner.pending_want = 0;
-        self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
+        self.finish_claim(inner, prev, delta_pages, base_now, charge)
             .is_some()
     }
 
@@ -537,15 +552,15 @@ impl GuestHeap {
 
         let start = u64::from(prev.0) * u64::from(WASM_PAGE);
         let len = u64::from(delta_pages) * u64::from(WASM_PAGE);
+        // Once the physical grow succeeds its bytes remain resident even if an
+        // integrity check prevents this allocator from using the new range.
+        self.charged.fetch_add(charged_bytes, Ordering::AcqRel);
         if start + len > self.max_bytes {
             // Cannot happen (grow enforces the maximum), but never hand out
             // ranges beyond the reservation.
             integrity_warn("claimed range beyond memory maximum");
-            self.budget.uncharge(Pool::WasmLinear, charged_bytes);
             return None;
         }
-        self.charged.fetch_add(charged_bytes, Ordering::AcqRel);
-
         let start = start as u32;
         let len = len as u32;
         inner.chunks.push(Chunk {
@@ -1006,6 +1021,27 @@ mod tests {
                 .is_none(),
             "another store's handle must not be used to grow this memory"
         );
+    }
+
+    #[test]
+    fn successful_shared_grow_stays_charged_after_integrity_rejection() {
+        let mut store = Store::default();
+        let budget = ResourceBudget::with_memory_limit(2 * u64::from(WASM_PAGE));
+        let (_memory, heap) = shared_heap(&mut store, Arc::clone(&budget));
+        let charged = u64::from(WASM_PAGE);
+        budget.try_charge(Pool::WasmLinear, charged).unwrap();
+
+        {
+            let mut inner = heap.inner.lock().unwrap();
+            assert!(
+                heap.finish_claim(&mut inner, Pages(2048), 1, heap.base, charged)
+                    .is_none()
+            );
+        }
+        assert_eq!(budget.memory_charged(), charged);
+
+        drop(heap);
+        assert_eq!(budget.memory_charged(), 0);
     }
 
     #[test]
