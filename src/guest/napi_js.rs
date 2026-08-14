@@ -1966,7 +1966,9 @@ fn guest_unofficial_napi_module_wrap_get_state(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
-    state_ptr: i32,
+    status_ptr: i32,
+    error_ptr: i32,
+    has_async_graph_ptr: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut status_val = 0i32;
@@ -1976,16 +1978,37 @@ fn guest_unofficial_napi_module_wrap_get_state(
         snapi_bridge_unofficial_module_wrap_get_state(
             env_handle,
             handle as u32,
-            &mut status_val,
-            &mut error_id,
-            &mut has_async_graph,
+            if status_ptr > 0 {
+                &mut status_val
+            } else {
+                std::ptr::null_mut()
+            },
+            if error_ptr > 0 {
+                &mut error_id
+            } else {
+                std::ptr::null_mut()
+            },
+            if has_async_graph_ptr > 0 {
+                &mut has_async_graph
+            } else {
+                std::ptr::null_mut()
+            },
         )
     };
-    if status == 0 && state_ptr > 0 {
-        let state_ptr = state_ptr as u32;
-        write_guest_i32(&mut env, state_ptr, status_val);
-        write_guest_u32(&mut env, state_ptr + 4, error_id);
-        write_guest_u8(&mut env, state_ptr + 8, (has_async_graph != 0) as u8);
+    if status == 0 {
+        if status_ptr > 0 {
+            write_guest_i32(&mut env, status_ptr as u32, status_val);
+        }
+        if error_ptr > 0 {
+            write_guest_u32(&mut env, error_ptr as u32, error_id);
+        }
+        if has_async_graph_ptr > 0 {
+            write_guest_u8(
+                &mut env,
+                has_async_graph_ptr as u32,
+                (has_async_graph != 0) as u8,
+            );
+        }
     }
     status
 }

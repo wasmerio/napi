@@ -4138,13 +4138,22 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
-  unofficial_napi_module_state state{};
-  napi_status s = unofficial_napi_module_wrap_get_state(env, module, &state);
+  if (status_out == nullptr && error_out == nullptr &&
+      has_async_graph_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  napi_value error = nullptr;
+  bool has_async_graph = false;
+  napi_status s = unofficial_napi_module_wrap_get_state(
+      env,
+      module,
+      status_out,
+      error_out != nullptr ? &error : nullptr,
+      has_async_graph_out != nullptr ? &has_async_graph : nullptr);
   if (s != napi_ok) return s;
-  if (status_out != nullptr) *status_out = state.status;
-  if (error_out != nullptr) *error_out = StoreValue(*bridge_state, state.error);
+  if (error_out != nullptr) *error_out = StoreValue(*bridge_state, error);
   if (has_async_graph_out != nullptr) {
-    *has_async_graph_out = state.has_async_graph ? 1 : 0;
+    *has_async_graph_out = has_async_graph ? 1 : 0;
   }
   return napi_ok;
 }

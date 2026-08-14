@@ -356,21 +356,31 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(request_count, 0u);
   EXPECT_FALSE(create_result.has_top_level_await);
 
-  unofficial_napi_module_state state{};
-  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
-  EXPECT_EQ(state.status, 0);
-  EXPECT_FALSE(state.has_async_graph);
-  ASSERT_NE(state.error, nullptr);
+  EXPECT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, nullptr, nullptr, nullptr),
+            napi_invalid_arg);
+  int32_t status = -1;
+  napi_value error = nullptr;
+  bool has_async_graph = true;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, &status, &error, &has_async_graph),
+            napi_ok);
+  EXPECT_EQ(status, 0);
+  EXPECT_FALSE(has_async_graph);
+  ASSERT_NE(error, nullptr);
   napi_valuetype error_type = napi_object;
-  ASSERT_EQ(napi_typeof(s.env, state.error, &error_type), napi_ok);
+  ASSERT_EQ(napi_typeof(s.env, error, &error_type), napi_ok);
   EXPECT_EQ(error_type, napi_undefined);
 
   ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
   ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
-  state = {};
-  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, &state), napi_ok);
-  EXPECT_EQ(state.status, 2);
-  EXPECT_FALSE(state.has_async_graph);
+  status = -1;
+  has_async_graph = true;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, &status, nullptr, &has_async_graph),
+            napi_ok);
+  EXPECT_EQ(status, 2);
+  EXPECT_FALSE(has_async_graph);
 
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }

@@ -762,44 +762,60 @@ napi_status napi_module_wrap__::get_namespace(unofficial_napi_module module,
 }
 
 napi_status napi_module_wrap__::get_state(unofficial_napi_module module,
-                                          unofficial_napi_module_state *state_out)
+                                          int32_t *status_out,
+                                          napi_value *error_out,
+                                          bool *has_async_graph_out)
 {
   record *entry = find(module);
-  if (entry == nullptr || state_out == nullptr)
+  if (entry == nullptr ||
+      (status_out == nullptr && error_out == nullptr &&
+       has_async_graph_out == nullptr))
     return napi_util__::invalid_arg(env_);
 
   JSValue error = JS_GetModuleEvaluationException(ctx_, entry->module);
   const bool has_error = !JS_IsUndefined(error);
-  if (has_error)
+  int32_t status = kUninstantiated;
+  if (status_out != nullptr || has_async_graph_out != nullptr)
   {
-    state_out->status = kErrored;
-  }
-  else
-  {
-    switch (JS_GetModuleStatus(ctx_, entry->module))
+    if (has_error)
     {
-    case JS_MODULE_STATUS_UNLINKED:
-      state_out->status = kUninstantiated;
-      break;
-    case JS_MODULE_STATUS_LINKING:
-      state_out->status = kInstantiating;
-      break;
-    case JS_MODULE_STATUS_LINKED:
-      state_out->status = kInstantiated;
-      break;
-    case JS_MODULE_STATUS_EVALUATING:
-    case JS_MODULE_STATUS_EVALUATING_ASYNC:
-      state_out->status = kEvaluating;
-      break;
-    case JS_MODULE_STATUS_EVALUATED:
-      state_out->status = kEvaluated;
-      break;
+      status = kErrored;
+    }
+    else
+    {
+      switch (JS_GetModuleStatus(ctx_, entry->module))
+      {
+      case JS_MODULE_STATUS_UNLINKED:
+        status = kUninstantiated;
+        break;
+      case JS_MODULE_STATUS_LINKING:
+        status = kInstantiating;
+        break;
+      case JS_MODULE_STATUS_LINKED:
+        status = kInstantiated;
+        break;
+      case JS_MODULE_STATUS_EVALUATING:
+      case JS_MODULE_STATUS_EVALUATING_ASYNC:
+        status = kEvaluating;
+        break;
+      case JS_MODULE_STATUS_EVALUATED:
+        status = kEvaluated;
+        break;
+      }
     }
   }
-  state_out->has_async_graph =
-      state_out->status >= kInstantiated &&
-      JS_ModuleHasAsyncGraph(ctx_, entry->module);
-  return wrap_owned(error, &state_out->error);
+  if (status_out != nullptr)
+    *status_out = status;
+  if (has_async_graph_out != nullptr)
+  {
+    *has_async_graph_out =
+        status >= kInstantiated && JS_ModuleHasAsyncGraph(ctx_, entry->module);
+  }
+  if (error_out != nullptr)
+    return wrap_owned(error, error_out);
+
+  JS_FreeValue(ctx_, error);
+  return napi_ok;
 }
 
 napi_status napi_module_wrap__::check_unsettled_top_level_await(unofficial_napi_module module,

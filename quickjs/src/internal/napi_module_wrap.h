@@ -54,7 +54,9 @@ public:
   napi_status get_namespace(unofficial_napi_module module,
                             napi_value *result_out);
   napi_status get_state(unofficial_napi_module module,
-                        unofficial_napi_module_state *state_out);
+                        int32_t *status_out,
+                        napi_value *error_out,
+                        bool *has_async_graph_out);
   napi_status check_unsettled_top_level_await(unofficial_napi_module module,
                                               bool warnings,
                                               bool *settled_out);

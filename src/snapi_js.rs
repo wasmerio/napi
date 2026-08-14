@@ -4937,42 +4937,47 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    if status_out.is_null() && error_out.is_null() && has_async_graph_out.is_null() {
+        return NAPI_INVALID_ARG;
+    }
     let status = match refresh_module_status(state, handle_id) {
         Ok(status) => status,
         Err(error) => return error,
     };
-    let error = state
-        .synthetic_modules
-        .get(&handle_id)
-        .and_then(|module| module.error.clone())
-        .or_else(|| {
-            state
-                .source_text_modules
-                .get(&handle_id)
-                .and_then(|module| module.error.clone())
-        })
-        .unwrap_or(JsValue::UNDEFINED);
-    if !state.synthetic_modules.contains_key(&handle_id)
-        && !state.source_text_modules.contains_key(&handle_id)
-    {
-        return NAPI_INVALID_ARG;
+    if !status_out.is_null() {
+        if let Err(error) = unsafe { write(status_out, status) } {
+            return error;
+        }
     }
-    let Some(has_async_graph) = module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
-    else {
-        return NAPI_INVALID_ARG;
-    };
-    let error_id = state.insert(error);
-    for result in [
-        unsafe { write(status_out, status) },
-        unsafe { write(error_out, error_id) },
-        unsafe {
+    if !error_out.is_null() {
+        let error = state
+            .synthetic_modules
+            .get(&handle_id)
+            .and_then(|module| module.error.clone())
+            .or_else(|| {
+                state
+                    .source_text_modules
+                    .get(&handle_id)
+                    .and_then(|module| module.error.clone())
+            })
+            .unwrap_or(JsValue::UNDEFINED);
+        let error_id = state.insert(error);
+        if let Err(error) = unsafe { write(error_out, error_id) } {
+            return error;
+        }
+    }
+    if !has_async_graph_out.is_null() {
+        let Some(has_async_graph) =
+            module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+        else {
+            return NAPI_INVALID_ARG;
+        };
+        if let Err(error) = unsafe {
             write(
                 has_async_graph_out,
                 i32::from(status >= 2 && has_async_graph),
             )
-        },
-    ] {
-        if let Err(error) = result {
+        } {
             return error;
         }
     }

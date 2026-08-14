@@ -1316,13 +1316,18 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
         napi_env env,
         unofficial_napi_module module,
-        unofficial_napi_module_state *state_out)
+        int32_t *status_out,
+        napi_value *error_out,
+        bool *has_async_graph_out)
     {
-        if (!napi_util__::check_env(env) || state_out == nullptr)
+        if (!napi_util__::check_env(env) ||
+            (status_out == nullptr && error_out == nullptr &&
+             has_async_graph_out == nullptr))
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_state(module, state_out);
+        return env->module_wrap().get_state(
+            module, status_out, error_out, has_async_graph_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(

@@ -2837,22 +2837,34 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
     napi_env env,
     unofficial_napi_module module_handle,
-    unofficial_napi_module_state* state_out) {
-  if (env == nullptr || module_handle == nullptr || state_out == nullptr) return napi_invalid_arg;
+    int32_t* status_out,
+    napi_value* error_out,
+    bool* has_async_graph_out) {
+  if (env == nullptr || module_handle == nullptr ||
+      (status_out == nullptr && error_out == nullptr &&
+       has_async_graph_out == nullptr)) {
+    return napi_invalid_arg;
+  }
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Module> module = record->module.Get(env->isolate);
   const v8::Module::Status status = module->GetStatus();
-  state_out->status = static_cast<int32_t>(status);
-  state_out->has_async_graph =
-      status >= v8::Module::Status::kInstantiated && module->IsGraphAsync();
-  v8::Local<v8::Value> error =
-      status == v8::Module::Status::kErrored
-          ? module->GetException()
-          : v8::Undefined(isolate).As<v8::Value>();
-  state_out->error = napi_v8_wrap_value(env, handle_scope.Escape(error));
-  return state_out->error != nullptr ? napi_ok : napi_generic_failure;
+  if (status_out != nullptr) {
+    *status_out = static_cast<int32_t>(status);
+  }
+  if (has_async_graph_out != nullptr) {
+    *has_async_graph_out =
+        status >= v8::Module::Status::kInstantiated && module->IsGraphAsync();
+  }
+  if (error_out != nullptr) {
+    v8::Local<v8::Value> error =
+        status == v8::Module::Status::kErrored
+            ? module->GetException()
+            : v8::Undefined(isolate).As<v8::Value>();
+    *error_out = napi_v8_wrap_value(env, error);
+    if (*error_out == nullptr) return napi_generic_failure;
+  }
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(
