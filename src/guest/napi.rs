@@ -198,7 +198,7 @@ fn resolve_host_data_to_guest(
     foreign_store_warn();
     let heap = env.data().guest_heap.clone()?;
     let host_slice = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) };
-    let guest_ptr = heap.alloc(byte_len, false)?;
+    let guest_ptr = alloc_guest(env, &heap, byte_len, false)?;
     if !write_guest_bytes(env, guest_ptr, host_slice) {
         heap.free_offset(guest_ptr);
         return None;
@@ -3306,7 +3306,8 @@ fn guest_napi_create_arraybuffer(
 ) -> i32 {
     // Guest-memory-backed ArrayBuffer via the host-side heap (WASIX path).
     if let Some(heap) = env.data().guest_heap.clone() {
-        let Some(guest_ptr) = heap.alloc(byte_length.max(0) as usize, /* zero = */ true) else {
+        let Some(guest_ptr) = alloc_guest(&mut env, &heap, byte_length.max(0) as usize, true)
+        else {
             return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
         let host_addr = heap.offset_to_host(guest_ptr) as u64;
@@ -4753,7 +4754,7 @@ fn guest_napi_create_buffer(
 ) -> i32 {
     // Buffers must be backed by guest linear memory (same pattern as create_arraybuffer)
     if let Some(heap) = env.data().guest_heap.clone() {
-        let Some(guest_ptr) = heap.alloc(length.max(0) as usize, /* zero = */ true) else {
+        let Some(guest_ptr) = alloc_guest(&mut env, &heap, length.max(0) as usize, true) else {
             return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
         let host_addr = heap.offset_to_host(guest_ptr) as u64;
@@ -4811,7 +4812,7 @@ fn guest_napi_create_buffer_copy(
     };
 
     if let Some(heap) = env.data().guest_heap.clone() {
-        let Some(guest_ptr) = heap.alloc(length.max(0) as usize, /* zero = */ false) else {
+        let Some(guest_ptr) = alloc_guest(&mut env, &heap, length.max(0) as usize, false) else {
             return 9; // napi_generic_failure: memory maximum or budget exhausted
         };
         write_guest_bytes(&mut env, guest_ptr, &src_data);
@@ -4949,7 +4950,7 @@ fn guest_unofficial_napi_acquire_buffer_lease(
             };
             return 9;
         };
-        let Some(ptr) = heap.alloc(byte_len, false) else {
+        let Some(ptr) = alloc_guest(&mut env, &heap, byte_len, false) else {
             let _ = unsafe {
                 snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
             };
@@ -5084,7 +5085,8 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32
     if let Some(heap) = env.data().guest_heap.clone() {
         let release_str = b"napi-external\0";
         let struct_size = 16usize; // 3 * u32 + a wasm32 pointer
-        let Some(guest_ptr) = heap.alloc(struct_size + release_str.len(), false) else {
+        let Some(guest_ptr) = alloc_guest(&mut env, &heap, struct_size + release_str.len(), false)
+        else {
             return 9; // napi_generic_failure
         };
         let release_offset = guest_ptr + struct_size as u32;

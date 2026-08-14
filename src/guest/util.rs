@@ -2,7 +2,7 @@
 // Guest memory helpers
 // ============================================================
 
-use wasmer::FunctionEnvMut;
+use wasmer::{AsStoreMut, FunctionEnvMut};
 
 use crate::NapiEnv;
 
@@ -74,9 +74,25 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     memory.view(&store).data_size()
 }
 
+/// Allocate `len` bytes of guest memory, lending the store for the duration so
+/// the heap can claim more from the guest when its arena is short.
+///
+/// The heap grows through whichever store is lent to the thread (see
+/// [`crate::guest_heap`]), which is how the V8 allocator hooks reach one from
+/// inside V8's frames. Import handlers hold the store instead of lending it,
+/// so they park it here for the same effect.
+pub fn alloc_guest(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    heap: &crate::guest_heap::GuestHeap,
+    len: usize,
+    zero: bool,
+) -> Option<u32> {
+    env.as_store_mut().parked(|| heap.alloc(len, zero))
+}
+
 pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
     let heap = env.data().guest_heap.clone()?;
-    let guest_ptr = heap.alloc(data.len(), false)?;
+    let guest_ptr = alloc_guest(env, &heap, data.len(), false)?;
     if !write_guest_bytes(env, guest_ptr, data) {
         heap.free_offset(guest_ptr);
         return None;
