@@ -97,6 +97,47 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
 
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, MakeContextPreservesThrownProxyException) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = Str(
+      s.env,
+      "(() => { const sentinel = {}; return { sentinel, sandbox: new Proxy({}, { ownKeys() { throw sentinel; } }) }; })()");
+  ASSERT_NE(source, nullptr);
+  napi_value fixture = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &fixture), napi_ok);
+  ASSERT_NE(fixture, nullptr);
+
+  napi_value sentinel = nullptr;
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sentinel", &sentinel), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sandbox", &sandbox), napi_ok);
+
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "ctx"),
+                                                    Str(s.env, "test://origin"),
+                                                    true,
+                                                    true,
+                                                    false,
+                                                    Sym(s.env, "hdo"),
+                                                    &result),
+            napi_pending_exception);
+  EXPECT_EQ(result, nullptr);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  napi_value caught = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &caught), napi_ok);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, caught, sentinel, &same), napi_ok);
+  EXPECT_TRUE(same);
+}
+#endif
+
 TEST_F(Test65UnofficialContextify, SandboxGlobalThisIsNotEnumerableForDeepFreeze) {
   EnvScope s(runtime_.get());
 

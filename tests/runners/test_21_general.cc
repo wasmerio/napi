@@ -140,6 +140,35 @@ TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeLate
   EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
 }
 
+TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeOutputValidation) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  int first_guest_heap_marker = 0;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&first_guest_heap_marker);
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, nullptr, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 1);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+
+  int second_guest_heap_marker = 0;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&second_guest_heap_marker);
+  napi_env env = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, nullptr),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 2);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+}
+
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;

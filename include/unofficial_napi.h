@@ -35,9 +35,10 @@ typedef struct {
   /* Opaque guest-heap resource (see napi_host_guest_heap_alloc). When set, the
    * env's array-buffer allocator places every backing store in the guest's
    * linear memory from isolate birth. Ownership transfers only after size and
-   * version validation proves that this field is present. It is then released
-   * exactly once via napi_host_guest_heap_release (by the allocator destructor,
-   * or on a later env-creation failure). */
+   * version validation proves that this field is present, before validating
+   * any other argument. It is then released exactly once via
+   * napi_host_guest_heap_release (by the allocator destructor, or on any later
+   * env-creation failure). */
   unofficial_napi_guest_heap guest_heap;
   const char* engine_flags;
   size_t engine_flags_length;

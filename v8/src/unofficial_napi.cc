@@ -1932,9 +1932,6 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
-  if (env_out == nullptr || owner_out == nullptr) {
-    return napi_invalid_arg;
-  }
   if (options != nullptr &&
       (options->size < sizeof(unofficial_napi_env_create_options) ||
        options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION)) {
@@ -1946,6 +1943,10 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // function owns it from here on and must release it exactly once.
   unofficial_napi_guest_heap guest_heap =
       options != nullptr ? options->guest_heap : nullptr;
+  if (env_out == nullptr || owner_out == nullptr) {
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    return napi_invalid_arg;
+  }
   if (options != nullptr &&
       ((options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
        options->engine_flags_length >

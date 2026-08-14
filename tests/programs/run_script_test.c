@@ -252,25 +252,35 @@ int main(void) {
                 "module compilation did not return requests");
   CHECK_OR_FAIL(!module_create_result.has_top_level_await,
                 "synchronous module reported top-level await at creation");
-  unofficial_napi_module_state module_state = {0};
+  int32_t module_status = -1;
+  napi_value module_error = NULL;
+  bool module_has_async_graph = false;
   NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env, module, &module_state));
-  CHECK_OR_FAIL(module_state.status == 0,
+                     env,
+                     module,
+                     &module_status,
+                     &module_error,
+                     &module_has_async_graph));
+  CHECK_OR_FAIL(module_status == 0,
                 "new module snapshot did not report uninstantiated status");
-  CHECK_OR_FAIL(module_state.error != NULL,
+  CHECK_OR_FAIL(module_error != NULL,
                 "module snapshot did not return an undefined error value");
-  CHECK_OR_FAIL(!module_state.has_top_level_await,
-                "synchronous module reported top-level await");
-  CHECK_OR_FAIL(!module_state.has_async_graph,
+  CHECK_OR_FAIL(!module_has_async_graph,
                 "uninstantiated module reported an async graph");
   NAPI_CALL(env, unofficial_napi_module_wrap_link(
                      env, module, 0, NULL));
   NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module));
+  module_status = -1;
+  module_has_async_graph = true;
   NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env, module, &module_state));
-  CHECK_OR_FAIL(module_state.status == 2,
+                     env,
+                     module,
+                     &module_status,
+                     NULL,
+                     &module_has_async_graph));
+  CHECK_OR_FAIL(module_status == 2,
                 "instantiated module snapshot reported the wrong status");
-  CHECK_OR_FAIL(!module_state.has_async_graph,
+  CHECK_OR_FAIL(!module_has_async_graph,
                 "synchronous module reported an async graph");
   napi_value module_result;
   NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
@@ -466,6 +476,7 @@ int main(void) {
 
   // Forged guest lengths are rejected before allocating a host scratch
   // buffer. This call must return an error rather than aborting the host.
+#if defined(__wasm__)
   napi_status oversized_string_status =
       napi_get_value_string_utf8(env,
                                  result,
@@ -474,6 +485,7 @@ int main(void) {
                                  &len);
   CHECK_OR_FAIL(oversized_string_status != napi_ok,
                 "oversized guest string length was not rejected");
+#endif
 
   // Guest wrap/add-finalizer callbacks are dispatched at an explicit provider
   // checkpoint; environment teardown force-drains remaining live records.

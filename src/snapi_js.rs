@@ -4941,6 +4941,16 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
         Ok(status) => status,
         Err(error) => return error,
     };
+    let has_async_graph = if has_async_graph_out.is_null() {
+        None
+    } else {
+        let Some(has_async_graph) =
+            module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+        else {
+            return NAPI_INVALID_ARG;
+        };
+        Some(status >= 2 && has_async_graph)
+    };
     if !status_out.is_null() {
         if let Err(error) = unsafe { write(status_out, status) } {
             return error;
@@ -4963,18 +4973,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
             return error;
         }
     }
-    if !has_async_graph_out.is_null() {
-        let Some(has_async_graph) =
-            module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
-        else {
-            return NAPI_INVALID_ARG;
-        };
-        if let Err(error) = unsafe {
-            write(
-                has_async_graph_out,
-                i32::from(status >= 2 && has_async_graph),
-            )
-        } {
+    if let Some(has_async_graph) = has_async_graph {
+        if let Err(error) = unsafe { write(has_async_graph_out, i32::from(has_async_graph)) } {
             return error;
         }
     }
