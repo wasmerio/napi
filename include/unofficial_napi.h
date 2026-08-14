@@ -103,6 +103,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
     napi_env env,
     napi_value callback);
 
+// Run a synchronous microtask checkpoint without yielding to a host task.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(
+    napi_env env);
+
 typedef enum unofficial_napi_event_loop_checkpoint_mode {
   // Drain promise/microtask work without admitting a host task turn.
   unofficial_napi_event_loop_checkpoint_microtasks = 0,

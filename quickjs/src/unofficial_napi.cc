@@ -314,6 +314,13 @@ extern "C"
         return napi_ok;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        return napi_util__::run_pending_jobs(env);
+    }
+
     napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
         napi_env env,
         unofficial_napi_event_loop_checkpoint_mode mode,

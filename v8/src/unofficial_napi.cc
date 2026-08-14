@@ -2190,6 +2190,12 @@ void DrainMicrotasksForEnv(napi_env env) {
   PumpPlatformForegroundTasks(env);
 }
 
+napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  DrainMicrotasksForEnv(env);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
