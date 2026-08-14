@@ -205,16 +205,30 @@ extern "C"
         napi_env *env_out,
         void **scope_out)
     {
+        if (env_out == nullptr || scope_out == nullptr)
+            return napi_invalid_arg;
+        if (options != nullptr &&
+            (options->size < sizeof(unofficial_napi_env_create_options) ||
+             options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION))
+        {
+            // A truncated descriptor cannot transfer ownership of a field it
+            // does not contain.
+            return napi_invalid_arg;
+        }
+
         void *guest_heap_ctx = options != nullptr ? options->guest_heap_ctx : nullptr;
+        if (options != nullptr &&
+            options->engine_flags_length > 0 && options->engine_flags == nullptr)
+        {
+            if (guest_heap_ctx != nullptr)
+                napi_host_guest_heap_release(guest_heap_ctx);
+            return napi_invalid_arg;
+        }
+
+        // QuickJS does not allocate backing stores from the guest heap, so it
+        // consumes the transferred context immediately.
         if (guest_heap_ctx != nullptr)
             napi_host_guest_heap_release(guest_heap_ctx);
-
-        if (env_out == nullptr || scope_out == nullptr ||
-            (options != nullptr &&
-             (options->size < sizeof(unofficial_napi_env_create_options) ||
-              options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION ||
-              (options->engine_flags_length > 0 && options->engine_flags == nullptr))))
-            return napi_invalid_arg;
 
         auto rt = JS_NewRuntime();
         if (rt == nullptr)

@@ -500,38 +500,19 @@ fn guest_unofficial_napi_create_env(
         stack_limit,
         engine_flags,
     ) = if options_ptr > 0 {
-        const OPTIONS_PREFIX_SIZE: usize = 52;
-        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, OPTIONS_PREFIX_SIZE) else {
+        let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
             return 1;
         };
-        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) < OPTIONS_PREFIX_SIZE as u32
-            || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 1
-        {
+        let Ok(flags) = CString::new(options.engine_flags) else {
             return 1;
-        }
-        let flags_ptr = u32::from_le_bytes(bytes[44..48].try_into().unwrap()) as i32;
-        let flags_len = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
-        let flags = if flags_len == 0 {
-            CString::default()
-        } else {
-            if flags_ptr <= 0 {
-                return 1;
-            }
-            let Some(flags_bytes) = read_guest_bytes(&mut env, flags_ptr, flags_len) else {
-                return 1;
-            };
-            let Ok(flags) = CString::new(flags_bytes) else {
-                return 1;
-            };
-            flags
         };
         (
-            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
-            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
-            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            options.total_memory,
+            options.constrained_memory,
+            options.max_young_generation_size_in_bytes,
+            options.max_old_generation_size_in_bytes,
+            options.code_range_size_in_bytes,
+            options.stack_limit,
             flags,
         )
     } else {

@@ -501,6 +501,12 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 
 }  // namespace
 
+void napi_v8_set_last_exception(napi_env env,
+                                v8::Local<v8::Value> exception,
+                                v8::Local<v8::Message> message) {
+  SetLastException(env, exception, message);
+}
+
 napi_handle_scope__::napi_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 

@@ -1928,18 +1928,23 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     void** scope_out) {
-  // This function owns options->guest_heap_ctx from here on: it must be
-  // released exactly once, either by the allocator's destructor or on a
-  // failure before the allocator takes it.
-  void* guest_heap_ctx =
-      options != nullptr ? options->guest_heap_ctx : nullptr;
-  if (env_out == nullptr || scope_out == nullptr ||
-      (options != nullptr &&
-       (options->size < sizeof(unofficial_napi_env_create_options) ||
-        options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION ||
-        (options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
-        options->engine_flags_length >
-            static_cast<size_t>(std::numeric_limits<int>::max())))) {
+  if (env_out == nullptr || scope_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (options != nullptr &&
+      (options->size < sizeof(unofficial_napi_env_create_options) ||
+       options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION)) {
+    // The descriptor is not large enough to transfer guest_heap_ctx ownership.
+    return napi_invalid_arg;
+  }
+
+  // Size/version validation above proves that guest_heap_ctx is present. This
+  // function owns it from here on and must release it exactly once.
+  void* guest_heap_ctx = options != nullptr ? options->guest_heap_ctx : nullptr;
+  if (options != nullptr &&
+      ((options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
+       options->engine_flags_length >
+           static_cast<size_t>(std::numeric_limits<int>::max()))) {
     if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
     return napi_invalid_arg;
   }
@@ -2709,6 +2714,7 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
   if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
 
+  v8::TryCatch try_catch(env->isolate);
   v8::Local<v8::Array> properties;
   if (!raw.As<v8::Object>()
            ->GetPropertyNames(env->context(),
@@ -2716,6 +2722,11 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
                               static_cast<v8::PropertyFilter>(filter_bits),
                               v8::IndexFilter::kSkipIndices)
            .ToLocal(&properties)) {
+    if (try_catch.HasCaught()) {
+      napi_v8_set_last_exception(
+          env, try_catch.Exception(), try_catch.Message());
+      return napi_pending_exception;
+    }
     return napi_generic_failure;
   }
 

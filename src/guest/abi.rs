@@ -5,6 +5,7 @@ use crate::NapiEnv;
 use super::util::read_guest_bytes;
 
 const JS_SOURCE_SIZE: usize = 12;
+const ENV_CREATE_PREFIX_SIZE: usize = 52;
 const BYTECODE_OPEN_SIZE: usize = 48;
 const MODULE_CREATE_PREFIX_SIZE: usize = 40;
 const MODULE_HOOKS_SIZE: usize = 16;
@@ -41,6 +42,42 @@ pub(crate) fn read_output_header(
     let bytes = read_guest_bytes(env, guest_ptr, 8)?;
     let size = u32_at(&bytes, 0)?;
     (size >= minimum_size as u32 && u32_at(&bytes, 4)? == version).then_some(size)
+}
+
+pub(crate) struct EnvCreate {
+    pub total_memory: u64,
+    pub constrained_memory: u64,
+    pub max_young_generation_size_in_bytes: u32,
+    pub max_old_generation_size_in_bytes: u32,
+    pub code_range_size_in_bytes: u32,
+    pub stack_limit: u32,
+    pub engine_flags: Vec<u8>,
+}
+
+pub(crate) fn read_env_create(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<EnvCreate> {
+    let bytes = read_versioned(env, guest_ptr, ENV_CREATE_PREFIX_SIZE, 1)?;
+    let flags_ptr = u32_at(&bytes, 44)? as i32;
+    let flags_length = u32_at(&bytes, 48)? as usize;
+    let engine_flags = if flags_length == 0 {
+        Vec::new()
+    } else {
+        if flags_ptr <= 0 {
+            return None;
+        }
+        read_guest_bytes(env, flags_ptr, flags_length)?
+    };
+    Some(EnvCreate {
+        total_memory: u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?),
+        constrained_memory: u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?),
+        max_young_generation_size_in_bytes: u32_at(&bytes, 24)?,
+        max_old_generation_size_in_bytes: u32_at(&bytes, 28)?,
+        code_range_size_in_bytes: u32_at(&bytes, 32)?,
+        stack_limit: u32_at(&bytes, 36)?,
+        engine_flags,
+    })
 }
 
 pub(crate) fn read_js_source(

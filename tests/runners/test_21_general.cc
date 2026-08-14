@@ -7,12 +7,23 @@
 #include "upstream_js_test.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <thread>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
+
+namespace {
+int g_guest_heap_release_calls = 0;
+void* g_last_released_guest_heap_ctx = nullptr;
+}  // namespace
+
+extern "C" void napi_host_guest_heap_release(void* ctx) {
+  ++g_guest_heap_release_calls;
+  g_last_released_guest_heap_ctx = ctx;
+}
 
 class Test21General : public FixtureTestBase {};
 
@@ -73,6 +84,58 @@ TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
   EXPECT_EQ(unofficial_napi_create_env(
                 NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
             napi_invalid_arg);
+}
+
+TEST_F(Test21General, TruncatedEnvironmentOptionsDoNotTransferGuestHeapOwnership) {
+  alignas(unofficial_napi_env_create_options)
+      std::array<std::byte, sizeof(unofficial_napi_env_create_options)> bytes{};
+  const uint32_t size = 2 * sizeof(uint32_t);
+  const uint32_t version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  int guest_heap_marker = 0;
+  void* guest_heap_ctx = &guest_heap_marker;
+  std::memcpy(bytes.data(), &size, sizeof(size));
+  std::memcpy(bytes.data() + sizeof(size), &version, sizeof(version));
+  std::memcpy(bytes.data() + offsetof(unofficial_napi_env_create_options,
+                                     guest_heap_ctx),
+              &guest_heap_ctx,
+              sizeof(guest_heap_ctx));
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  napi_env env = nullptr;
+  void* owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION,
+                reinterpret_cast<const unofficial_napi_env_create_options*>(
+                    bytes.data()),
+                &env,
+                &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 0);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, nullptr);
+}
+
+TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeLaterValidation) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  int guest_heap_marker = 0;
+  options.guest_heap_ctx = &guest_heap_marker;
+  options.engine_flags = nullptr;
+  options.engine_flags_length = 1;
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  napi_env env = nullptr;
+  void* owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 1);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap_ctx);
 }
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
@@ -331,6 +394,40 @@ TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {
   }
   EXPECT_TRUE(saw_visible);
   EXPECT_TRUE(saw_symbol);
+}
+
+TEST_F(Test21General, PropertyEnumerationPreservesThrownProxyException) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "(() => { const sentinel = {}; return { sentinel, proxy: new Proxy({}, { ownKeys() { throw sentinel; } }) }; })()",
+                NAPI_AUTO_LENGTH,
+                &source),
+            napi_ok);
+  napi_value fixture = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &fixture), napi_ok);
+  ASSERT_NE(fixture, nullptr);
+  napi_value sentinel = nullptr;
+  napi_value proxy = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sentinel", &sentinel), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "proxy", &proxy), napi_ok);
+
+  napi_value keys = nullptr;
+  EXPECT_EQ(unofficial_napi_get_own_non_index_properties(
+                s.env, proxy, napi_key_all_properties, &keys),
+            napi_pending_exception);
+  EXPECT_EQ(keys, nullptr);
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+
+  napi_value caught = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &caught), napi_ok);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, caught, sentinel, &same), napi_ok);
+  EXPECT_TRUE(same);
 }
 
 TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {

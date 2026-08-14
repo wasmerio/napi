@@ -130,6 +130,11 @@ napi_status napi_v8_set_last_error(napi_env env,
 
 napi_status napi_v8_clear_last_error(napi_env env);
 
+void napi_v8_set_last_exception(
+    napi_env env,
+    v8::Local<v8::Value> exception,
+    v8::Local<v8::Message> message = v8::Local<v8::Message>());
+
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_finalize_buffer_records(napi_env env);
