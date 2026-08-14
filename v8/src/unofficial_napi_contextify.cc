@@ -1708,55 +1708,53 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   std::vector<SavedOwnProperty> saved_properties;
   v8::Local<v8::Object> sandbox_object;
   v8::MaybeLocal<v8::Value> maybe_global_object;
-  v8::Local<v8::Context> context;
-  v8::Local<v8::Object> key_object;
-  {
+  if (!vanilla) {
+    v8::Local<v8::Value> sandbox_value =
+        napi_v8_unwrap_value(sandbox_or_symbol);
+    if (sandbox_value.IsEmpty() || !sandbox_value->IsObject()) {
+      return napi_invalid_arg;
+    }
+    sandbox_object = sandbox_value.As<v8::Object>();
+
+    // Reading a proxy's own keys or values may run JavaScript and throw. Keep
+    // the exception boundary local to that operation: successful context
+    // creation must retain V8's normal, uncaught lifecycle.
     v8::TryCatch try_catch(isolate);
-    const auto record_pending_exception = [&]() {
+    if (!SnapshotOwnProperties(
+            isolate, current, sandbox_object, &saved_properties)) {
       if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
         napi_v8_set_last_exception(
             env, try_catch.Exception(), try_catch.Message());
       }
       return napi_pending_exception;
-    };
-
-    if (!vanilla) {
-      v8::Local<v8::Value> sandbox_value =
-          napi_v8_unwrap_value(sandbox_or_symbol);
-      if (sandbox_value.IsEmpty() || !sandbox_value->IsObject()) {
-        return napi_invalid_arg;
-      }
-      sandbox_object = sandbox_value.As<v8::Object>();
-      if (!SnapshotOwnProperties(
-              isolate, current, sandbox_object, &saved_properties)) {
-        return record_pending_exception();
-      }
-      maybe_global_object = sandbox_value;
     }
+    maybe_global_object = sandbox_value;
+  }
 
-    context = v8::Context::New(isolate,
-                               nullptr,
-                               v8::MaybeLocal<v8::ObjectTemplate>(),
-                               maybe_global_object,
-                               v8::DeserializeInternalFieldsCallback(),
-                               queue);
+  v8::Local<v8::Context> context =
+      v8::Context::New(isolate,
+                       nullptr,
+                       v8::MaybeLocal<v8::ObjectTemplate>(),
+                       maybe_global_object,
+                       v8::DeserializeInternalFieldsCallback(),
+                       queue);
 
-    if (context.IsEmpty()) {
-      return record_pending_exception();
-    }
+  if (context.IsEmpty()) {
+    return napi_pending_exception;
+  }
 
-    context->SetSecurityToken(current->GetSecurityToken());
-    context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
-    NapiV8ApplyPromiseHooksToContext(env, context);
+  context->SetSecurityToken(current->GetSecurityToken());
+  context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
+  NapiV8ApplyPromiseHooksToContext(env, context);
 
-    if (vanilla) {
-      key_object = context->Global();
-    } else {
-      key_object = sandbox_object;
-      if (!RestoreOwnProperties(
-              isolate, context, key_object, saved_properties)) {
-        return record_pending_exception();
-      }
+  v8::Local<v8::Object> key_object;
+  if (vanilla) {
+    key_object = context->Global();
+  } else {
+    key_object = sandbox_object;
+    if (!RestoreOwnProperties(
+            isolate, context, key_object, saved_properties)) {
+      return napi_pending_exception;
     }
   }
 
