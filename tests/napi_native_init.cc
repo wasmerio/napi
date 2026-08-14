@@ -7,7 +7,7 @@
 #include "unofficial_napi.h"
 
 static napi_env g_env = nullptr;
-static void* g_scope = nullptr;
+static unofficial_napi_env_owner g_scope = nullptr;
 
 extern "C" napi_env napi_wasm_init_env(void) {
   if (g_env != nullptr) return g_env;

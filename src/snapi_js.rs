@@ -3338,12 +3338,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
 // until their host-JS semantics are implemented; keeping the symbols local
 // prevents wasm-bindgen output from acquiring raw C imports.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32 {
-    let _ = env;
-    NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32 {
+pub unsafe extern "C" fn snapi_bridge_unofficial_collect_garbage(
+    env: SnapiEnv,
+) -> i32 {
     let _ = env;
     NAPI_GENERIC_FAILURE
 }

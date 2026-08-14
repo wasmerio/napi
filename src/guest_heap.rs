@@ -611,7 +611,7 @@ impl Drop for GuestHeap {
 use std::ffi::c_void;
 
 /// Context installed into a V8 array-buffer allocator
-/// (`unofficial_napi_env_create_options.guest_heap_ctx`).
+/// (`unofficial_napi_env_create_options.guest_heap`).
 pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,

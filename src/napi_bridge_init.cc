@@ -117,7 +117,7 @@ struct ScopeFrame {
 
 struct SnapiEnvState {
   napi_env env = nullptr;
-  void* scope = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
 
   // Value slot table: maps generation-tagged u32 IDs to scope-bound raw
   // napi_values. A value id is valid until the scope frame that owns its slot
@@ -459,9 +459,9 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->cb_registry.clear();
   state->next_cb_reg_id = 1;
   state->callback_bindings.clear();
-  if (state->scope != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->scope, nullptr);
-    state->scope = nullptr;
+  if (state->owner != nullptr) {
+    napi_status s = unofficial_napi_release_env(state->owner, nullptr);
+    state->owner = nullptr;
     state->env = nullptr;
     g_envs.erase(state);
     delete state;
@@ -2907,26 +2907,27 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   SnapiEnvState** env_out) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_env env = nullptr;
-  void* scope = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
   napi_status s;
   if (guest_heap_ctx != nullptr) {
     unofficial_napi_env_create_options options{};
     options.size = sizeof(options);
     options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
-    options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
-    s = unofficial_napi_create_env(module_api_version, &options, &env, &scope);
+    options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
+        const_cast<void*>(guest_heap_ctx));
+    s = unofficial_napi_create_env(module_api_version, &options, &env, &owner);
   } else {
-    s = unofficial_napi_create_env(module_api_version, nullptr, &env, &scope);
+    s = unofficial_napi_create_env(module_api_version, nullptr, &env, &owner);
   }
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();
   if (state == nullptr) {
-    (void)unofficial_napi_release_env(scope, nullptr);
+    (void)unofficial_napi_release_env(owner, nullptr);
     return napi_generic_failure;
   }
   state->env = env;
-  state->scope = scope;
+  state->owner = owner;
   g_envs.insert(state);
 
   if (env_out != nullptr) *env_out = state;
@@ -2967,23 +2968,24 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   // The guest-provided stack limit is a Wasm linear-memory address, not a
   // native stack address for the host thread running V8.
   options.stack_limit = nullptr;
-  options.guest_heap_ctx = const_cast<void*>(guest_heap_ctx);
+  options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
+      const_cast<void*>(guest_heap_ctx));
   options.engine_flags = engine_flags;
   options.engine_flags_length = engine_flags_length;
 
   napi_env env = nullptr;
-  void* scope = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
   napi_status s = unofficial_napi_create_env(
-      module_api_version, has_options ? &options : nullptr, &env, &scope);
+      module_api_version, has_options ? &options : nullptr, &env, &owner);
   if (s != napi_ok) return s;
 
   auto* state = new (std::nothrow) SnapiEnvState();
   if (state == nullptr) {
-    (void)unofficial_napi_release_env(scope, nullptr);
+    (void)unofficial_napi_release_env(owner, nullptr);
     return napi_generic_failure;
   }
   state->env = env;
-  state->scope = scope;
+  state->owner = owner;
   g_envs.insert(state);
 
   if (env_out != nullptr) *env_out = state;
@@ -3057,12 +3059,13 @@ extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_
   return DisposeBridgeStateLocked(env_state);
 }
 
-extern "C" int snapi_bridge_unofficial_low_memory_notification(SnapiEnvState* env_state) {
+extern "C" int snapi_bridge_unofficial_collect_garbage(
+    SnapiEnvState* env_state) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_low_memory_notification(env);
+  return unofficial_napi_collect_garbage(env);
 }
 
 extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
@@ -3084,14 +3087,6 @@ extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     *checkpoint_state = state;
   }
   return status;
-}
-
-extern "C" int snapi_bridge_unofficial_request_gc_for_testing(SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_request_gc_for_testing(env);
 }
 
 extern "C" int snapi_bridge_unofficial_set_prepare_stack_trace_callback(

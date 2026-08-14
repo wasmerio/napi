@@ -49,12 +49,12 @@ namespace
         return napi_ok;
     }
 
-    napi_status ReleaseEnvScope(void *scope_ptr)
+    napi_status ReleaseEnvScope(unofficial_napi_env_owner owner)
     {
-        if (scope_ptr == nullptr)
+        if (owner == nullptr)
             return napi_invalid_arg;
 
-        auto *scope = static_cast<UnofficialEnvScope *>(scope_ptr);
+        auto *scope = reinterpret_cast<UnofficialEnvScope *>(owner);
         napi_status status = napi_ok;
         napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)
@@ -203,9 +203,9 @@ extern "C"
         int32_t module_api_version,
         const unofficial_napi_env_create_options *options,
         napi_env *env_out,
-        void **scope_out)
+        unofficial_napi_env_owner *owner_out)
     {
-        if (env_out == nullptr || scope_out == nullptr)
+        if (env_out == nullptr || owner_out == nullptr)
             return napi_invalid_arg;
         if (options != nullptr &&
             (options->size < sizeof(unofficial_napi_env_create_options) ||
@@ -216,19 +216,20 @@ extern "C"
             return napi_invalid_arg;
         }
 
-        void *guest_heap_ctx = options != nullptr ? options->guest_heap_ctx : nullptr;
+        unofficial_napi_guest_heap guest_heap =
+            options != nullptr ? options->guest_heap : nullptr;
         if (options != nullptr &&
             options->engine_flags_length > 0 && options->engine_flags == nullptr)
         {
-            if (guest_heap_ctx != nullptr)
-                napi_host_guest_heap_release(guest_heap_ctx);
+            if (guest_heap != nullptr)
+                napi_host_guest_heap_release(guest_heap);
             return napi_invalid_arg;
         }
 
         // QuickJS does not allocate backing stores from the guest heap, so it
         // consumes the transferred context immediately.
-        if (guest_heap_ctx != nullptr)
-            napi_host_guest_heap_release(guest_heap_ctx);
+        if (guest_heap != nullptr)
+            napi_host_guest_heap_release(guest_heap);
 
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
@@ -265,7 +266,7 @@ extern "C"
             return (status == napi_ok) ? napi_generic_failure : status;
         }
 
-        *scope_out = reinterpret_cast<void *>(scope);
+        *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
         *env_out = scope->env;
 
         return napi_ok;
@@ -284,14 +285,14 @@ extern "C"
     }
 
     napi_status NAPI_CDECL unofficial_napi_release_env(
-        void *scope,
+        unofficial_napi_env_owner owner,
         struct uv_loop_s *loop)
     {
         (void)loop;
-        return ReleaseEnvScope(scope);
+        return ReleaseEnvScope(owner);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_low_memory_notification(napi_env env)
+    napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env)
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
@@ -307,11 +308,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env)
-    {
-        return unofficial_napi_low_memory_notification(env);
     }
 
     napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(

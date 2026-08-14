@@ -72,7 +72,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
-    pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
         env: SnapiEnv,
         mode: i32,
@@ -94,7 +94,6 @@ unsafe extern "C" {
         guest_ptr_out: *mut u32,
         recyclable_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
         env: SnapiEnv,
         callback_id: u32,

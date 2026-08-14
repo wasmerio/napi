@@ -63,7 +63,7 @@ struct EnvScope {
   EnvScope& operator=(const EnvScope&) = delete;
 
   napi_env env = nullptr;
-  void* scope = nullptr;
+  unofficial_napi_env_owner scope = nullptr;
 };
 
 #endif  // NAPI_SHARED_TEST_ENV_H_

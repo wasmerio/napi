@@ -509,9 +509,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 
   ~TrackingArrayBufferAllocator() override {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr) {
-      napi_host_guest_heap_release(gctx);
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr) {
+      napi_host_guest_heap_release(guest_heap);
     }
     delete backing_;
   }
@@ -523,9 +524,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   }
 
   void Free(void* data, size_t length) override {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr && data != nullptr &&
-        napi_host_guest_heap_free(gctx, data, length) != 0) {
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr && data != nullptr &&
+        napi_host_guest_heap_free(guest_heap, data, length) != 0) {
       // Guest-heap provenance: no external-budget uncharge (those bytes were
       // never charged; they are wasm linear memory).
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
@@ -543,7 +545,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     size_t backing_max = backing_ != nullptr
                              ? backing_->MaxAllocationSize()
                              : v8::ArrayBuffer::Allocator::MaxAllocationSize();
-    if (guest_heap_ctx_.load(std::memory_order_acquire) != nullptr) {
+    if (guest_heap_.load(std::memory_order_acquire) != nullptr) {
       // Guest-heap backing stores live in a 32-bit address space.
       constexpr size_t kGuestHeapMax = 0x7fff0000u;
       return backing_max < kGuestHeapMax ? backing_max : kGuestHeapMax;
@@ -562,19 +564,21 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   // Install the guest-heap context: from now on every backing store is
   // allocated inside the guest's linear memory. Ownership transfers to the
   // allocator, which releases it in its destructor.
-  void set_guest_heap_ctx(void* ctx) {
-    guest_heap_ctx_.store(ctx, std::memory_order_release);
+  void set_guest_heap(unofficial_napi_guest_heap guest_heap) {
+    guest_heap_.store(guest_heap, std::memory_order_release);
   }
 
  private:
   void* AllocateImpl(size_t length, bool zeroed) {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr) {
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr) {
       // Guest-heap path. The claimed pages are already charged as wasm linear
       // memory, so the external budget is deliberately not consulted. On
       // failure return null (V8 throws RangeError); never fall back to host
       // memory, which the guest could not address.
-      void* data = napi_host_guest_heap_alloc(gctx, length, zeroed ? 1 : 0);
+      void* data = napi_host_guest_heap_alloc(
+          guest_heap, length, zeroed ? 1 : 0);
       if (data != nullptr) {
         total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
       }
@@ -595,7 +599,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
 
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
   std::atomic<uint64_t> total_mem_usage_ {0};
-  std::atomic<void*> guest_heap_ctx_ {nullptr};
+  std::atomic<unofficial_napi_guest_heap> guest_heap_ {nullptr};
 };
 
 void ApplyNodeIsolateCreateParams(
@@ -1927,25 +1931,26 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
-    void** scope_out) {
-  if (env_out == nullptr || scope_out == nullptr) {
+    unofficial_napi_env_owner* owner_out) {
+  if (env_out == nullptr || owner_out == nullptr) {
     return napi_invalid_arg;
   }
   if (options != nullptr &&
       (options->size < sizeof(unofficial_napi_env_create_options) ||
        options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION)) {
-    // The descriptor is not large enough to transfer guest_heap_ctx ownership.
+    // The descriptor is not large enough to transfer guest_heap ownership.
     return napi_invalid_arg;
   }
 
-  // Size/version validation above proves that guest_heap_ctx is present. This
+  // Size/version validation above proves that guest_heap is present. This
   // function owns it from here on and must release it exactly once.
-  void* guest_heap_ctx = options != nullptr ? options->guest_heap_ctx : nullptr;
+  unofficial_napi_guest_heap guest_heap =
+      options != nullptr ? options->guest_heap : nullptr;
   if (options != nullptr &&
       ((options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
        options->engine_flags_length >
            static_cast<size_t>(std::numeric_limits<int>::max()))) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
   }
 
@@ -1955,21 +1960,21 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
       options != nullptr ? options->engine_flags : nullptr,
       options != nullptr ? options->engine_flags_length : 0);
   if (status != napi_ok || platform == nullptr) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     ReleaseRuntime();
     return napi_generic_failure;
   }
-  if (guest_heap_ctx != nullptr) {
+  if (guest_heap != nullptr) {
     // Armed before the isolate exists, so even bootstrap-time backing stores
     // are guest-memory-backed. The allocator's destructor releases the ctx on
     // every later failure path.
-    allocator->set_guest_heap_ctx(guest_heap_ctx);
+    allocator->set_guest_heap(guest_heap);
   }
 
   v8::Isolate::CreateParams params{};
@@ -2031,13 +2036,14 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
 
   *env_out = scope->env;
-  *scope_out = scope;
+  *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
 }
 
-napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
-  if (scope_ptr == nullptr) return napi_invalid_arg;
-  auto* scope = static_cast<UnofficialEnvScope*>(scope_ptr);
+napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
+                            void* shutdown_pump_handle) {
+  if (owner == nullptr) return napi_invalid_arg;
+  auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
@@ -2067,13 +2073,16 @@ napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
   return status;
 }
 
-napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr,
+napi_status NAPI_CDECL unofficial_napi_release_env(unofficial_napi_env_owner owner,
                                                    struct uv_loop_s* loop) {
-  return ReleaseEnvScope(scope_ptr, static_cast<void*>(loop));
+  return ReleaseEnvScope(owner, static_cast<void*>(loop));
 }
 
-napi_status NAPI_CDECL unofficial_napi_low_memory_notification(napi_env env) {
+napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // This is the production embedder API for asking V8 to reclaim as much
+  // memory as possible. RequestGarbageCollectionForTesting is intentionally
+  // not used: it aborts unless V8 was initialized with testing-only flags.
   env->isolate->LowMemoryNotification();
   return napi_ok;
 }
@@ -2178,15 +2187,6 @@ void DrainMicrotasksForEnv(napi_env env) {
   env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
   PumpPlatformForegroundTasks(env);
-}
-
-napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Match Node test expectations for global.gc(): force an actual full GC
-  // cycle rather than only hinting memory pressure.
-  env->isolate->RequestGarbageCollectionForTesting(
-      v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(

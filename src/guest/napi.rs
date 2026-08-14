@@ -293,12 +293,12 @@ fn guest_unofficial_napi_attach_env(
     unsafe { snapi_bridge_unofficial_attach_env(snapi_env(&env, napi_env), fatal_id, oom_id) }
 }
 
-fn guest_unofficial_napi_low_memory_notification(
+fn guest_unofficial_napi_collect_garbage(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_low_memory_notification(env_handle) }
+    unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
 fn guest_unofficial_napi_event_loop_checkpoint(
@@ -338,14 +338,6 @@ fn guest_unofficial_napi_create_uninitialized_arraybuffer(
     // storage. Allocate directly in the provider without requesting a guest
     // pointer; engines which mandate zero initialization may return zeros.
     guest_napi_create_arraybuffer(env, napi_env, length, 0, result_ptr)
-}
-
-fn guest_unofficial_napi_request_gc_for_testing(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_request_gc_for_testing(env_handle) }
 }
 
 fn guest_unofficial_napi_get_promise_details(
@@ -4966,13 +4958,12 @@ pub fn register_napi_imports(
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
-        "unofficial_napi_low_memory_notification" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_low_memory_notification),
+        "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
-        "unofficial_napi_request_gc_for_testing" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_gc_for_testing),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

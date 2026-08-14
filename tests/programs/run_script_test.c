@@ -92,7 +92,7 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "failed to set the first environment marker");
 
   napi_env env2 = NULL;
-  void* env2_scope = NULL;
+  unofficial_napi_env_owner env2_scope = NULL;
   NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &env2, &env2_scope));
   CHECK_OR_FAIL(env2 != NULL && env2_scope != NULL,
                 "failed to create the second N-API environment");
@@ -478,7 +478,7 @@ int main(void) {
   // Guest wrap/add-finalizer callbacks are dispatched at an explicit provider
   // checkpoint; environment teardown force-drains remaining live records.
   napi_env finalizer_env = NULL;
-  void* finalizer_env_scope = NULL;
+  unofficial_napi_env_owner finalizer_env_scope = NULL;
   NAPI_CALL(env,
             unofficial_napi_create_env(
                 8, NULL, &finalizer_env, &finalizer_env_scope));
@@ -511,7 +511,7 @@ int main(void) {
   // a scope-bound value or an explicit release from already-destroyed Edge
   // state.
   napi_env lease_env = NULL;
-  void* lease_env_scope = NULL;
+  unofficial_napi_env_owner lease_env_scope = NULL;
   NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &lease_env, &lease_env_scope));
   napi_value abandoned_script;
   napi_value abandoned_value;

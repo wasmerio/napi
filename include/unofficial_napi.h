@@ -11,6 +11,12 @@ extern "C" {
 
 struct uv_loop_s;
 
+// Provider-owned resources used during environment construction and teardown.
+// Their representations are private to the provider; callers may only move
+// them through the operations that name the corresponding handle type.
+typedef struct unofficial_napi_env_owner__* unofficial_napi_env_owner;
+typedef struct unofficial_napi_guest_heap__* unofficial_napi_guest_heap;
+
 enum { UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION = 1 };
 
 // All provider configuration needed before engine/isolate creation. The
@@ -26,13 +32,13 @@ typedef struct {
   size_t max_old_generation_size_in_bytes;
   size_t code_range_size_in_bytes;
   void* stack_limit;
-  /* Opaque guest-heap context (see napi_host_guest_heap_alloc). When set, the
+  /* Opaque guest-heap resource (see napi_host_guest_heap_alloc). When set, the
    * env's array-buffer allocator places every backing store in the guest's
    * linear memory from isolate birth. Ownership transfers only after size and
    * version validation proves that this field is present. It is then released
    * exactly once via napi_host_guest_heap_release (by the allocator destructor,
    * or on a later env-creation failure). */
-  void* guest_heap_ctx;
+  unofficial_napi_guest_heap guest_heap;
   const char* engine_flags;
   size_t engine_flags_length;
 } unofficial_napi_env_create_options;
@@ -82,20 +88,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options_or_null,
     napi_env* env_out,
-    void** scope_out);
+    unofficial_napi_env_owner* owner_out);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
-    void* scope,
+    unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_low_memory_notification(napi_env env);
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage(
+    napi_env env);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback);
-
-// Unofficial/test-only helper. Requests a full GC cycle for testing.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 
 typedef enum unofficial_napi_event_loop_checkpoint_mode {
   // Drain promise/microtask work without admitting a host task turn.

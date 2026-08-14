@@ -62,7 +62,7 @@ size_t NearHeapLimitProbe(napi_env env,
 
 TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
   napi_env env = nullptr;
-  void* owner = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
 
   unofficial_napi_env_create_options options{};
   options.size = sizeof(options) - 1;
@@ -92,18 +92,19 @@ TEST_F(Test21General, TruncatedEnvironmentOptionsDoNotTransferGuestHeapOwnership
   const uint32_t size = 2 * sizeof(uint32_t);
   const uint32_t version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
   int guest_heap_marker = 0;
-  void* guest_heap_ctx = &guest_heap_marker;
+  unofficial_napi_guest_heap guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
   std::memcpy(bytes.data(), &size, sizeof(size));
   std::memcpy(bytes.data() + sizeof(size), &version, sizeof(version));
   std::memcpy(bytes.data() + offsetof(unofficial_napi_env_create_options,
-                                     guest_heap_ctx),
-              &guest_heap_ctx,
-              sizeof(guest_heap_ctx));
+                                     guest_heap),
+              &guest_heap,
+              sizeof(guest_heap));
 
   g_guest_heap_release_calls = 0;
   g_last_released_guest_heap_ctx = nullptr;
   napi_env env = nullptr;
-  void* owner = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(unofficial_napi_create_env(
                 NAPI_TEST_MODULE_API_VERSION,
                 reinterpret_cast<const unofficial_napi_env_create_options*>(
@@ -121,26 +122,27 @@ TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeLate
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
   int guest_heap_marker = 0;
-  options.guest_heap_ctx = &guest_heap_marker;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
   options.engine_flags = nullptr;
   options.engine_flags_length = 1;
 
   g_guest_heap_release_calls = 0;
   g_last_released_guest_heap_ctx = nullptr;
   napi_env env = nullptr;
-  void* owner = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(unofficial_napi_create_env(
                 NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
             napi_invalid_arg);
   EXPECT_EQ(env, nullptr);
   EXPECT_EQ(owner, nullptr);
   EXPECT_EQ(g_guest_heap_release_calls, 1);
-  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap_ctx);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
 }
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;
-  void* owner = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
   ASSERT_EQ(unofficial_napi_create_env(
@@ -170,19 +172,26 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   EXPECT_EQ(probe.destroy_calls, 1);
 }
 
+TEST_F(Test21General, GarbageCollectionUsesProductionProviderPrimitive) {
+  EnvScope s(runtime_.get());
+
+  EXPECT_EQ(unofficial_napi_collect_garbage(nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test21General, EngineFlagsAreImmutableAfterRuntimeInitialization) {
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
 
   napi_env first_env = nullptr;
-  void* first_owner = nullptr;
+  unofficial_napi_env_owner first_owner = nullptr;
   ASSERT_EQ(unofficial_napi_create_env(
                 NAPI_TEST_MODULE_API_VERSION, &options, &first_env, &first_owner),
             napi_ok);
 
   napi_env second_env = nullptr;
-  void* second_owner = nullptr;
+  unofficial_napi_env_owner second_owner = nullptr;
   ASSERT_EQ(unofficial_napi_create_env(
                 NAPI_TEST_MODULE_API_VERSION, &options, &second_env, &second_owner),
             napi_ok);
@@ -191,7 +200,7 @@ TEST_F(Test21General, EngineFlagsAreImmutableAfterRuntimeInitialization) {
   options.engine_flags = kConflictingFlags;
   options.engine_flags_length = sizeof(kConflictingFlags) - 1;
   napi_env conflicting_env = nullptr;
-  void* conflicting_owner = nullptr;
+  unofficial_napi_env_owner conflicting_owner = nullptr;
   EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION,
                                        &options,
                                        &conflicting_env,
