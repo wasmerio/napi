@@ -52,6 +52,10 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
+    pub fn snapi_bridge_unofficial_configure_runtime(
+        engine_flags: *const i8,
+        engine_flags_length: u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
@@ -65,8 +69,6 @@ unsafe extern "C" {
         max_old_generation_size_in_bytes: u32,
         code_range_size_in_bytes: u32,
         stack_limit: u32,
-        engine_flags: *const i8,
-        engine_flags_length: u32,
         guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
@@ -175,6 +177,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         fatal_callback_id: u32,
         oom_callback_id: u32,
+        accepted_hooks_out: *mut u64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;

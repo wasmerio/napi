@@ -1430,11 +1430,40 @@ impl HostJsEnv {
 
 thread_local! {
     static BUFFER_ALLOCS: RefCell<HashMap<usize, Box<[u8]>>> = RefCell::new(HashMap::new());
+    static RUNTIME_ENGINE_FLAGS: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     // N-API calls normally arrive in long runs from one guest environment.
     // Realm activation is only a context switch; repeating its wasm-bindgen
     // call before every operation doubles the host boundary crossings on the
     // hottest path without changing observable state.
     static ACTIVE_HOST_JS_ENV: Cell<usize> = const { Cell::new(0) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_configure_runtime(
+    engine_flags: *const i8,
+    engine_flags_length: u32,
+) -> i32 {
+    if engine_flags_length > 0 && engine_flags.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let requested = if engine_flags_length == 0 {
+        Vec::new()
+    } else {
+        unsafe {
+            slice::from_raw_parts(engine_flags.cast::<u8>(), engine_flags_length as usize).to_vec()
+        }
+    };
+    RUNTIME_ENGINE_FLAGS.with(|configured| {
+        let mut configured = configured.borrow_mut();
+        match configured.as_ref() {
+            Some(existing) if existing != &requested => NAPI_INVALID_ARG,
+            Some(_) => NAPI_OK,
+            None => {
+                *configured = Some(requested);
+                NAPI_OK
+            }
+        }
+    })
 }
 
 unsafe fn env_mut<'a>(env: SnapiEnv) -> Result<&'a mut HostJsEnv, i32> {
@@ -1758,7 +1787,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
     _guest_heap_ctx: *const c_void,
     out: *mut SnapiEnv,
 ) -> i32 {
-    if out.is_null() {
+    let runtime_configured = RUNTIME_ENGINE_FLAGS.with(|flags| flags.borrow().is_some());
+    if out.is_null() || !runtime_configured {
         return NAPI_INVALID_ARG;
     }
     let env = Box::new(HostJsEnv::new());
@@ -1776,8 +1806,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env_with_options(
     _old: u32,
     _code: u32,
     _stack: u32,
-    _engine_flags: *const i8,
-    _engine_flags_length: u32,
     guest_heap_ctx: *const c_void,
     out: *mut SnapiEnv,
 ) -> i32 {
@@ -3338,9 +3366,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_event_loop_checkpoint(
 // until their host-JS semantics are implemented; keeping the symbols local
 // prevents wasm-bindgen output from acquiring raw C imports.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_collect_garbage(
-    env: SnapiEnv,
-) -> i32 {
+pub unsafe extern "C" fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32 {
     let _ = env;
     NAPI_GENERIC_FAILURE
 }
@@ -3504,18 +3530,21 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     env: SnapiEnv,
     fatal_callback_id: u32,
     oom_callback_id: u32,
+    accepted_hooks_out: *mut u64,
 ) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if state.embedder_hooks_attached {
+    if state.embedder_hooks_attached || accepted_hooks_out.is_null() {
         return NAPI_INVALID_ARG;
     }
     let _ = (fatal_callback_id, oom_callback_id);
     // JavaScript-hosted execution already runs on the host event loop, and the
     // browser/Node host owns fatal JavaScript and OOM handling. Accept the same
-    // single attachment transition without installing embedded-engine hooks.
+    // single attachment transition while reporting that no guest callback can
+    // be invoked as a native provider function pointer.
     state.embedder_hooks_attached = true;
+    unsafe { accepted_hooks_out.write(0) };
     NAPI_OK
 }
 #[unsafe(no_mangle)]

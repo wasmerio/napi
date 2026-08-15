@@ -34,6 +34,7 @@ const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let _ = unsafe { snapi_bridge_init() };
+    let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
 
     if let Some(env_id) = env.data().default_napi_env_id {
         return env_id as i32;
@@ -484,6 +485,21 @@ fn resolve_current_host_value_to_guest(
     Some(guest_ptr)
 }
 
+fn guest_unofficial_napi_configure_runtime(
+    mut env: FunctionEnvMut<NapiEnv>,
+    options_ptr: i32,
+) -> i32 {
+    let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
+        return 1;
+    };
+    let Ok(flags) = CString::new(flags) else {
+        return 1;
+    };
+    unsafe {
+        snapi_bridge_unofficial_configure_runtime(flags.as_ptr(), flags.as_bytes().len() as u32)
+    }
+}
+
 fn guest_unofficial_napi_create_env(
     mut env: FunctionEnvMut<NapiEnv>,
     module_api_version: i32,
@@ -498,12 +514,8 @@ fn guest_unofficial_napi_create_env(
         max_old_generation_size_in_bytes,
         code_range_size_in_bytes,
         stack_limit,
-        engine_flags,
     ) = if options_ptr > 0 {
         let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
-            return 1;
-        };
-        let Ok(flags) = CString::new(options.engine_flags) else {
             return 1;
         };
         (
@@ -513,10 +525,9 @@ fn guest_unofficial_napi_create_env(
             options.max_old_generation_size_in_bytes,
             options.code_range_size_in_bytes,
             options.stack_limit,
-            flags,
         )
     } else {
-        (0, 0, 0, 0, 0, 0, CString::default())
+        (0, 0, 0, 0, 0, 0)
     };
 
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
@@ -529,8 +540,6 @@ fn guest_unofficial_napi_create_env(
             max_old_generation_size_in_bytes,
             code_range_size_in_bytes,
             stack_limit,
-            engine_flags.as_ptr(),
-            engine_flags.as_bytes().len() as u32,
             std::ptr::null(),
             &mut snapi_env_state,
         )
@@ -597,20 +606,31 @@ fn guest_unofficial_napi_attach_env(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     hooks_ptr: i32,
+    accepted_hooks_ptr: i32,
 ) -> i32 {
-    let Some((fatal_id, oom_id)) = abi::read_env_hooks(&mut env, hooks_ptr) else {
+    let Some(hooks) = abi::read_env_hooks(&mut env, hooks_ptr) else {
         return 1;
     };
-    if napi_env <= 0 {
+    if napi_env <= 0 || accepted_hooks_ptr <= 0 {
         return 1;
     }
-    unsafe { snapi_bridge_unofficial_attach_env(snapi_env(&env, napi_env), fatal_id, oom_id) }
+    let mut accepted_hooks = 0u64;
+    let status = unsafe {
+        snapi_bridge_unofficial_attach_env(
+            snapi_env(&env, napi_env),
+            hooks.fatal,
+            hooks.oom,
+            &mut accepted_hooks,
+        )
+    };
+    if status == 0 {
+        write_guest_u64(&mut env, accepted_hooks_ptr as u32, accepted_hooks);
+        debug_assert_eq!(accepted_hooks & !hooks.requested, 0);
+    }
+    status
 }
 
-fn guest_unofficial_napi_collect_garbage(
-    env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-) -> i32 {
+fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
@@ -5939,6 +5959,7 @@ pub fn register_napi_imports(
     };
 
     let napi_extension_wasmer_namespace = namespace! {
+        "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),

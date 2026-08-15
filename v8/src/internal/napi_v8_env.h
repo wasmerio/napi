@@ -104,10 +104,6 @@ struct napi_env__ {
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
-  unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
-  void* env_cleanup_callback_data = nullptr;
-  unofficial_napi_env_destroy_callback env_destroy_callback = nullptr;
-  void* env_destroy_callback_data = nullptr;
   unofficial_napi_context_token_callback context_token_assign_callback = nullptr;
   unofficial_napi_context_token_callback context_token_unassign_callback = nullptr;
   void* context_token_callback_data = nullptr;

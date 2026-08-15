@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +31,10 @@ extern "C" __attribute__((weak)) void napi_host_guest_heap_release(
 
 namespace
 {
+    std::mutex g_runtime_config_mutex;
+    bool g_runtime_configured = false;
+    std::string g_runtime_engine_flags;
+
     struct UnofficialEnvScope
     {
         JSRuntime *rt = nullptr;
@@ -136,6 +141,31 @@ namespace
 
 extern "C"
 {
+    napi_status NAPI_CDECL unofficial_napi_configure_runtime(
+        const unofficial_napi_runtime_options *options)
+    {
+        if (options != nullptr &&
+            (options->size < sizeof(unofficial_napi_runtime_options) ||
+             options->version != UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION ||
+             (options->engine_flags_length > 0 && options->engine_flags == nullptr)))
+            return napi_invalid_arg;
+
+        const char *flags = options != nullptr && options->engine_flags_length > 0
+                                ? options->engine_flags
+                                : "";
+        const size_t flags_length = options != nullptr ? options->engine_flags_length : 0;
+        std::lock_guard<std::mutex> lock(g_runtime_config_mutex);
+        if (g_runtime_configured)
+            return g_runtime_engine_flags.size() == flags_length &&
+                           (flags_length == 0 ||
+                            std::memcmp(g_runtime_engine_flags.data(), flags, flags_length) == 0)
+                       ? napi_ok
+                       : napi_invalid_arg;
+        g_runtime_engine_flags.assign(flags, flags_length);
+        g_runtime_configured = true;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
         napi_env env, napi_typedarray_type type, size_t length, void **data, napi_value *result)
     {
@@ -222,12 +252,14 @@ extern "C"
                 napi_host_guest_heap_release(guest_heap);
             return napi_invalid_arg;
         }
-        if (options != nullptr &&
-            options->engine_flags_length > 0 && options->engine_flags == nullptr)
         {
-            if (guest_heap != nullptr)
-                napi_host_guest_heap_release(guest_heap);
-            return napi_invalid_arg;
+            std::lock_guard<std::mutex> lock(g_runtime_config_mutex);
+            if (!g_runtime_configured)
+            {
+                if (guest_heap != nullptr)
+                    napi_host_guest_heap_release(guest_heap);
+                return napi_invalid_arg;
+            }
         }
 
         // QuickJS does not allocate backing stores from the guest heap, so it
@@ -278,13 +310,18 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_attach_env(
         napi_env env,
-        const unofficial_napi_env_hooks *hooks)
+        const unofficial_napi_env_hooks *hooks,
+        uint64_t *accepted_hooks_out)
     {
-        if (!napi_util__::check_env(env) || hooks == nullptr ||
+        if (!napi_util__::check_env(env) || hooks == nullptr || accepted_hooks_out == nullptr ||
             hooks->size < sizeof(unofficial_napi_env_hooks) ||
             hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
             !env->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
+        // QuickJS currently drives none of the remaining provider-owned hook
+        // classes. Attaching the transaction is valid, but no capability is
+        // advertised until the corresponding engine callback exists.
+        *accepted_hooks_out = 0;
         return napi_ok;
     }
 
@@ -312,13 +349,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env)
-    {
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_util__::run_pending_jobs(env);
     }
 
     napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(

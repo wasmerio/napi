@@ -590,9 +590,6 @@ napi_env__::~napi_env__() {
   if (instance_data_finalize_cb != nullptr) {
     instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
   }
-  if (env_destroy_callback != nullptr) {
-    env_destroy_callback(this, env_destroy_callback_data);
-  }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 

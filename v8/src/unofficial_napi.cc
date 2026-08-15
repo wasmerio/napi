@@ -729,37 +729,42 @@ void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
   }
 }
 
-napi_status AcquireRuntime(EdgeV8Platform** platform_out,
-                           const char* engine_flags,
-                           size_t engine_flags_length) {
-  if (platform_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-
-  if (g_runtime.platform == nullptr) {
-    ApplyDefaultV8Flags();
-    if (engine_flags_length > 0) {
-      v8::V8::SetFlagsFromString(
-          engine_flags, static_cast<int>(engine_flags_length));
-    }
-    v8::V8::InitializeICUDefaultLocation("");
-    v8::V8::InitializeExternalStartupData("");
-    g_runtime.platform = EdgeV8Platform::Create();
-    if (g_runtime.platform == nullptr) return napi_generic_failure;
-    v8::V8::InitializePlatform(g_runtime.platform.get());
-    v8::V8::Initialize();
-    g_runtime.engine_flags.assign(
-        engine_flags_length > 0 ? engine_flags : "", engine_flags_length);
-  } else if (engine_flags_length > 0 &&
-             (g_runtime.engine_flags.size() != engine_flags_length ||
-              std::memcmp(g_runtime.engine_flags.data(),
-                          engine_flags,
-                          engine_flags_length) != 0)) {
-    // V8 flags are frozen after process-global runtime initialization. Treat
-    // repeated identical configuration as idempotent, but never attempt to
-    // mutate a live runtime or silently ignore a conflicting request.
+napi_status ConfigureRuntime(const char* engine_flags,
+                             size_t engine_flags_length) {
+  if ((engine_flags_length > 0 && engine_flags == nullptr) ||
+      engine_flags_length > static_cast<size_t>(std::numeric_limits<int>::max())) {
     return napi_invalid_arg;
   }
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (g_runtime.platform != nullptr) {
+    return g_runtime.engine_flags.size() == engine_flags_length &&
+                   (engine_flags_length == 0 ||
+                    std::memcmp(g_runtime.engine_flags.data(), engine_flags,
+                                engine_flags_length) == 0)
+               ? napi_ok
+               : napi_invalid_arg;
+  }
 
+  ApplyDefaultV8Flags();
+  if (engine_flags_length > 0) {
+    v8::V8::SetFlagsFromString(engine_flags,
+                               static_cast<int>(engine_flags_length));
+  }
+  v8::V8::InitializeICUDefaultLocation("");
+  v8::V8::InitializeExternalStartupData("");
+  g_runtime.platform = EdgeV8Platform::Create();
+  if (g_runtime.platform == nullptr) return napi_generic_failure;
+  v8::V8::InitializePlatform(g_runtime.platform.get());
+  v8::V8::Initialize();
+  g_runtime.engine_flags.assign(engine_flags_length > 0 ? engine_flags : "",
+                                engine_flags_length);
+  return napi_ok;
+}
+
+napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
+  if (platform_out == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (g_runtime.platform == nullptr) return napi_invalid_arg;
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;
@@ -1741,6 +1746,17 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 
 extern "C" {
 
+napi_status NAPI_CDECL unofficial_napi_configure_runtime(
+    const unofficial_napi_runtime_options* options) {
+  if (options != nullptr &&
+      (options->size < sizeof(unofficial_napi_runtime_options) ||
+       options->version != UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION)) {
+    return napi_invalid_arg;
+  }
+  return ConfigureRuntime(options != nullptr ? options->engine_flags : nullptr,
+                          options != nullptr ? options->engine_flags_length : 0);
+}
+
 napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
     napi_env env, napi_typedarray_type type, size_t length, void** data,
     napi_value* result) {
@@ -1767,8 +1783,10 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
 
 napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
-    const unofficial_napi_env_hooks* hooks) {
+    const unofficial_napi_env_hooks* hooks,
+    uint64_t* accepted_hooks_out) {
   if (env == nullptr || env->isolate == nullptr || hooks == nullptr ||
+      accepted_hooks_out == nullptr ||
       hooks->size < sizeof(unofficial_napi_env_hooks) ||
       hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
       env->embedder_hooks_attached) {
@@ -1789,10 +1807,6 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
     fatal.oom = hooks->oom_error_callback;
   }
 
-  env->env_cleanup_callback = hooks->cleanup_callback;
-  env->env_cleanup_callback_data = hooks->data;
-  env->env_destroy_callback = hooks->destroy_callback;
-  env->env_destroy_callback_data = hooks->data;
   env->context_token_assign_callback = hooks->context_token_assign_callback;
   env->context_token_unassign_callback = hooks->context_token_unassign_callback;
   env->context_token_callback_data = hooks->data;
@@ -1804,6 +1818,7 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
       hooks->fatal_error_callback != nullptr ? FatalErrorCallback : nullptr);
   env->isolate->SetOOMErrorHandler(
       hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
+  *accepted_hooks_out = unofficial_napi_env_hooks_requested(hooks);
   return napi_ok;
 }
 
@@ -1823,9 +1838,6 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
 
 static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  if (env->env_cleanup_callback != nullptr) {
-    env->env_cleanup_callback(env, env->env_cleanup_callback_data);
-  }
   ProfilerState profiler_state;
   bool has_profiler_state = false;
   {
@@ -1947,19 +1959,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
   }
-  if (options != nullptr &&
-      ((options->engine_flags_length > 0 && options->engine_flags == nullptr) ||
-       options->engine_flags_length >
-           static_cast<size_t>(std::numeric_limits<int>::max()))) {
-    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
-    return napi_invalid_arg;
-  }
-
   EdgeV8Platform* platform = nullptr;
-  napi_status status = AcquireRuntime(
-      &platform,
-      options != nullptr ? options->engine_flags : nullptr,
-      options != nullptr ? options->engine_flags_length : 0);
+  napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
@@ -2188,12 +2189,6 @@ void DrainMicrotasksForEnv(napi_env env) {
   env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
   PumpPlatformForegroundTasks(env);
-}
-
-napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  DrainMicrotasksForEnv(env);
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(

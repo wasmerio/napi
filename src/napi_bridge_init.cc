@@ -2934,6 +2934,17 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_configure_runtime(
+    const char* engine_flags,
+    uint32_t engine_flags_length) {
+  unofficial_napi_runtime_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+  options.engine_flags = engine_flags;
+  options.engine_flags_length = engine_flags_length;
+  return unofficial_napi_configure_runtime(&options);
+}
+
 extern "C" int snapi_bridge_unofficial_create_env_with_options(
     int32_t module_api_version,
     uint64_t total_memory,
@@ -2942,8 +2953,6 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t max_old_generation_size_in_bytes,
     uint32_t code_range_size_in_bytes,
     uint32_t /*stack_limit*/,
-    const char* engine_flags,
-    uint32_t engine_flags_length,
     const void* guest_heap_ctx,
     SnapiEnvState** env_out) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
@@ -2954,7 +2963,6 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
       code_range_size_in_bytes > 0 ||
       total_memory > 0 ||
       constrained_memory > 0 ||
-      engine_flags_length > 0 ||
       guest_heap_ctx != nullptr;
   options.size = sizeof(options);
   options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
@@ -2970,9 +2978,6 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   options.stack_limit = nullptr;
   options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
       const_cast<void*>(guest_heap_ctx));
-  options.engine_flags = engine_flags;
-  options.engine_flags_length = engine_flags_length;
-
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   napi_status s = unofficial_napi_create_env(
@@ -3254,9 +3259,10 @@ extern "C" int snapi_bridge_unofficial_set_continuation_preserved_embedder_data(
 extern "C" int snapi_bridge_unofficial_attach_env(
     SnapiEnvState* env_state,
     uint32_t /*fatal_callback_id*/,
-    uint32_t /*oom_callback_id*/) {
+    uint32_t /*oom_callback_id*/,
+    uint64_t* accepted_hooks_out) {
   auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
+  if (bridge_state == nullptr || accepted_hooks_out == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   // Guest callbacks cannot be installed as native provider function pointers.
@@ -3265,7 +3271,7 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   unofficial_napi_env_hooks hooks{};
   hooks.size = sizeof(hooks);
   hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
-  return unofficial_napi_attach_env(env, &hooks);
+  return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {

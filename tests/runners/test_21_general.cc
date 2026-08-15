@@ -29,25 +29,6 @@ class Test21General : public FixtureTestBase {};
 
 namespace {
 
-struct EnvAttachmentProbe {
-  int cleanup_calls = 0;
-  int destroy_calls = 0;
-};
-
-void AttachmentCleanup(napi_env env, void* data) {
-  EXPECT_NE(env, nullptr);
-  auto* probe = static_cast<EnvAttachmentProbe*>(data);
-  ASSERT_NE(probe, nullptr);
-  ++probe->cleanup_calls;
-}
-
-void AttachmentDestroy(napi_env env, void* data) {
-  EXPECT_NE(env, nullptr);
-  auto* probe = static_cast<EnvAttachmentProbe*>(data);
-  ASSERT_NE(probe, nullptr);
-  ++probe->destroy_calls;
-}
-
 size_t NearHeapLimitProbe(napi_env env,
                           void* data,
                           size_t current_heap_limit,
@@ -79,11 +60,25 @@ TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
                 NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
             napi_invalid_arg);
 
-  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
-  options.engine_flags_length = 1;
-  EXPECT_EQ(unofficial_napi_create_env(
-                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
-            napi_invalid_arg);
+}
+
+TEST_F(Test21General, RuntimeConfigurationIsVersionedAndImmutable) {
+  unofficial_napi_runtime_options malformed{};
+  malformed.size = sizeof(malformed) - 1;
+  malformed.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&malformed), napi_invalid_arg);
+
+  malformed.size = sizeof(malformed);
+  malformed.version += 1;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&malformed), napi_invalid_arg);
+
+  static constexpr char kConflictingFlags[] = "--no-js-float16array";
+  unofficial_napi_runtime_options conflicting{};
+  conflicting.size = sizeof(conflicting);
+  conflicting.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+  conflicting.engine_flags = kConflictingFlags;
+  conflicting.engine_flags_length = sizeof(kConflictingFlags) - 1;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&conflicting), napi_invalid_arg);
 }
 
 TEST_F(Test21General, TruncatedEnvironmentOptionsDoNotTransferGuestHeapOwnership) {
@@ -116,28 +111,6 @@ TEST_F(Test21General, TruncatedEnvironmentOptionsDoNotTransferGuestHeapOwnership
   EXPECT_EQ(owner, nullptr);
   EXPECT_EQ(g_guest_heap_release_calls, 0);
   EXPECT_EQ(g_last_released_guest_heap_ctx, nullptr);
-}
-
-TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeLaterValidation) {
-  unofficial_napi_env_create_options options{};
-  InitializeTestEnvCreateOptions(&options);
-  int guest_heap_marker = 0;
-  options.guest_heap =
-      reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
-  options.engine_flags = nullptr;
-  options.engine_flags_length = 1;
-
-  g_guest_heap_release_calls = 0;
-  g_last_released_guest_heap_ctx = nullptr;
-  napi_env env = nullptr;
-  unofficial_napi_env_owner owner = nullptr;
-  EXPECT_EQ(unofficial_napi_create_env(
-                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
-            napi_invalid_arg);
-  EXPECT_EQ(env, nullptr);
-  EXPECT_EQ(owner, nullptr);
-  EXPECT_EQ(g_guest_heap_release_calls, 1);
-  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
 }
 
 TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeOutputValidation) {
@@ -180,25 +153,19 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   ASSERT_NE(env, nullptr);
   ASSERT_NE(owner, nullptr);
 
-  EnvAttachmentProbe probe;
   unofficial_napi_env_hooks hooks{};
   hooks.size = sizeof(hooks);
   hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
-  hooks.data = &probe;
-  hooks.cleanup_callback = AttachmentCleanup;
-  hooks.destroy_callback = AttachmentDestroy;
 
   unofficial_napi_env_hooks invalid = hooks;
   invalid.version += 1;
-  EXPECT_EQ(unofficial_napi_attach_env(env, &invalid), napi_invalid_arg);
-  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks), napi_ok);
-  EXPECT_EQ(unofficial_napi_attach_env(env, &hooks), napi_invalid_arg);
-  EXPECT_EQ(probe.cleanup_calls, 0);
-  EXPECT_EQ(probe.destroy_calls, 0);
+  uint64_t accepted_hooks = 0;
+  EXPECT_EQ(unofficial_napi_attach_env(env, &invalid, &accepted_hooks), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_ok);
+  EXPECT_EQ(accepted_hooks, 0);
+  EXPECT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_invalid_arg);
 
   ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
-  EXPECT_EQ(probe.cleanup_calls, 1);
-  EXPECT_EQ(probe.destroy_calls, 1);
 }
 
 TEST_F(Test21General, GarbageCollectionUsesProductionProviderPrimitive) {
@@ -207,41 +174,6 @@ TEST_F(Test21General, GarbageCollectionUsesProductionProviderPrimitive) {
   EXPECT_EQ(unofficial_napi_collect_garbage(nullptr), napi_invalid_arg);
   EXPECT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
 }
-
-#if defined(NAPI_TEST_ENGINE_V8)
-TEST_F(Test21General, EngineFlagsAreImmutableAfterRuntimeInitialization) {
-  unofficial_napi_env_create_options options{};
-  InitializeTestEnvCreateOptions(&options);
-
-  napi_env first_env = nullptr;
-  unofficial_napi_env_owner first_owner = nullptr;
-  ASSERT_EQ(unofficial_napi_create_env(
-                NAPI_TEST_MODULE_API_VERSION, &options, &first_env, &first_owner),
-            napi_ok);
-
-  napi_env second_env = nullptr;
-  unofficial_napi_env_owner second_owner = nullptr;
-  ASSERT_EQ(unofficial_napi_create_env(
-                NAPI_TEST_MODULE_API_VERSION, &options, &second_env, &second_owner),
-            napi_ok);
-
-  static constexpr char kConflictingFlags[] = "--no-js-float16array";
-  options.engine_flags = kConflictingFlags;
-  options.engine_flags_length = sizeof(kConflictingFlags) - 1;
-  napi_env conflicting_env = nullptr;
-  unofficial_napi_env_owner conflicting_owner = nullptr;
-  EXPECT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION,
-                                       &options,
-                                       &conflicting_env,
-                                       &conflicting_owner),
-            napi_invalid_arg);
-  EXPECT_EQ(conflicting_env, nullptr);
-  EXPECT_EQ(conflicting_owner, nullptr);
-
-  EXPECT_EQ(unofficial_napi_release_env(second_owner, nullptr), napi_ok);
-  EXPECT_EQ(unofficial_napi_release_env(first_owner, nullptr), napi_ok);
-}
-#endif
 
 TEST_F(Test21General, NearHeapLimitCallbackUsesOneConfigurationSlot) {
   EnvScope s(runtime_.get());

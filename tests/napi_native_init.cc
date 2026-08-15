@@ -11,6 +11,7 @@ static unofficial_napi_env_owner g_scope = nullptr;
 
 extern "C" napi_env napi_wasm_init_env(void) {
   if (g_env != nullptr) return g_env;
+  if (unofficial_napi_configure_runtime(nullptr) != napi_ok) return nullptr;
   napi_status s = unofficial_napi_create_env(8, nullptr, &g_env, &g_scope);
   return (s == napi_ok) ? g_env : nullptr;
 }

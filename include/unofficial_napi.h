@@ -19,10 +19,27 @@ typedef struct unofficial_napi_guest_heap__* unofficial_napi_guest_heap;
 
 enum { UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION = 1 };
 
+enum { UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION = 1 };
+
+// Configuration for the provider's process-global JavaScript runtime. This
+// must be applied before creating an environment. Repeating an identical
+// configuration is idempotent; a conflicting configuration is rejected.
+// Pointed-to strings are observed only for the duration of the call.
+typedef struct {
+  uint32_t size;
+  uint32_t version;
+  const char* engine_flags;
+  size_t engine_flags_length;
+} unofficial_napi_runtime_options;
+
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_runtime(
+    const unofficial_napi_runtime_options* options_or_null);
+
 // All provider configuration needed before engine/isolate creation. The
 // descriptor is observed only for the duration of unofficial_napi_create_env;
 // pointed-to strings remain owned by the caller. `size` and `version` make
-// additions ABI-compatible without introducing mutable process-global setters.
+// additions ABI-compatible. Process-global configuration is deliberately
+// excluded and belongs to unofficial_napi_configure_runtime.
 typedef struct {
   uint32_t size;
   uint32_t version;
@@ -40,12 +57,8 @@ typedef struct {
    * napi_host_guest_heap_release (by the allocator destructor, or on any later
    * env-creation failure). */
   unofficial_napi_guest_heap guest_heap;
-  const char* engine_flags;
-  size_t engine_flags_length;
 } unofficial_napi_env_create_options;
 
-typedef void (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
-typedef void (*unofficial_napi_env_destroy_callback)(napi_env env, void* data);
 typedef void (*unofficial_napi_context_token_callback)(napi_env env,
                                                        void* token,
                                                        void* data);
@@ -67,23 +80,46 @@ typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
                                                    bool is_heap_oom,
                                                    const char* detail);
 
+typedef enum {
+  unofficial_napi_env_hook_context_token_assign = 1u << 0,
+  unofficial_napi_env_hook_context_token_unassign = 1u << 1,
+  unofficial_napi_env_hook_enqueue_foreground_task = 1u << 2,
+  unofficial_napi_env_hook_fatal_error = 1u << 3,
+  unofficial_napi_env_hook_oom_error = 1u << 4,
+} unofficial_napi_env_hook;
+
 enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 
 // Immutable embedder callbacks attached as one complete environment state
 // transition. `size` and `version` make additions ABI-compatible. `data` is
-// owned by the embedder and must remain valid until destroy_callback returns.
+// owned by the embedder and must remain valid until the environment is released.
 typedef struct {
   uint32_t size;
   uint32_t version;
   void* data;
-  unofficial_napi_env_cleanup_callback cleanup_callback;
-  unofficial_napi_env_destroy_callback destroy_callback;
   unofficial_napi_context_token_callback context_token_assign_callback;
   unofficial_napi_context_token_callback context_token_unassign_callback;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback;
   unofficial_napi_fatal_error_callback fatal_error_callback;
   unofficial_napi_oom_error_callback oom_error_callback;
 } unofficial_napi_env_hooks;
+
+static inline uint64_t unofficial_napi_env_hooks_requested(
+    const unofficial_napi_env_hooks* hooks) {
+  if (hooks == NULL) return 0;
+  uint64_t requested = 0;
+  if (hooks->context_token_assign_callback != NULL)
+    requested |= unofficial_napi_env_hook_context_token_assign;
+  if (hooks->context_token_unassign_callback != NULL)
+    requested |= unofficial_napi_env_hook_context_token_unassign;
+  if (hooks->enqueue_foreground_task_callback != NULL)
+    requested |= unofficial_napi_env_hook_enqueue_foreground_task;
+  if (hooks->fatal_error_callback != NULL)
+    requested |= unofficial_napi_env_hook_fatal_error;
+  if (hooks->oom_error_callback != NULL)
+    requested |= unofficial_napi_env_hook_oom_error;
+  return requested;
+}
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     int32_t module_api_version,
@@ -92,7 +128,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     unofficial_napi_env_owner* owner_out);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
-    const unofficial_napi_env_hooks* hooks);
+    const unofficial_napi_env_hooks* hooks,
+    uint64_t* accepted_hooks_out);
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
@@ -102,10 +139,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage(
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback);
-
-// Run a synchronous microtask checkpoint without yielding to a host task.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_process_microtasks(
-    napi_env env);
 
 typedef enum unofficial_napi_event_loop_checkpoint_mode {
   // Drain promise/microtask work without admitting a host task turn.
@@ -565,7 +598,7 @@ typedef enum {
   unofficial_napi_bytecode_cache_compile_on_reject = 0,
   unofficial_napi_bytecode_cache_validate_only = 1,
 } unofficial_napi_bytecode_cache_policy;
-#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 2u
+#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 1u
 typedef struct unofficial_napi_bytecode_open_options {
   uint32_t size;
   uint32_t version;
@@ -779,6 +812,49 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_requ
     napi_env env,
     unofficial_napi_module module,
     napi_value* result_out);
+
+#include "unofficial_napi_wasm32_abi.h"
+
+#if defined(__wasm32__)
+#if defined(__cplusplus)
+static_assert(sizeof(unofficial_napi_env_create_options) ==
+              sizeof(unofficial_napi_wasm32_env_create_options_v1));
+static_assert(sizeof(unofficial_napi_runtime_options) ==
+              sizeof(unofficial_napi_wasm32_runtime_options_v1));
+static_assert(sizeof(unofficial_napi_env_hooks) ==
+              sizeof(unofficial_napi_wasm32_env_hooks_v1));
+static_assert(sizeof(unofficial_napi_js_source) ==
+              sizeof(unofficial_napi_wasm32_js_source));
+static_assert(sizeof(unofficial_napi_bytecode_open_options) ==
+              sizeof(unofficial_napi_wasm32_bytecode_open_options_v1));
+static_assert(sizeof(unofficial_napi_module_create_options) ==
+              sizeof(unofficial_napi_wasm32_module_create_options_v1));
+static_assert(sizeof(unofficial_napi_module_hooks) ==
+              sizeof(unofficial_napi_wasm32_module_hooks_v1));
+#else
+_Static_assert(sizeof(unofficial_napi_env_create_options) ==
+                   sizeof(unofficial_napi_wasm32_env_create_options_v1),
+               "public env-create layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_runtime_options) ==
+                   sizeof(unofficial_napi_wasm32_runtime_options_v1),
+               "public runtime-options layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_env_hooks) ==
+                   sizeof(unofficial_napi_wasm32_env_hooks_v1),
+               "public env-hooks layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_js_source) ==
+                   sizeof(unofficial_napi_wasm32_js_source),
+               "public JS-source layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_bytecode_open_options) ==
+                   sizeof(unofficial_napi_wasm32_bytecode_open_options_v1),
+               "public bytecode-open layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_module_create_options) ==
+                   sizeof(unofficial_napi_wasm32_module_create_options_v1),
+               "public module-create layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_module_hooks) ==
+                   sizeof(unofficial_napi_wasm32_module_hooks_v1),
+               "public module-hooks layout differs from its wasm32 wire ABI");
+#endif
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"
