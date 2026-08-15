@@ -13,7 +13,10 @@ use std::{
     ptr,
     rc::Rc,
     slice,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use js_sys::{
@@ -44,6 +47,11 @@ const SERIALIZED_MESSAGE_SEQUENCE_MASK: u32 = (1 << SERIALIZED_MESSAGE_SEQUENCE_
 const SERIALIZED_MESSAGE_SCOPE_MAX: u32 = (1 << (32 - SERIALIZED_MESSAGE_SEQUENCE_BITS)) - 1;
 
 static NEXT_SERIALIZED_MESSAGE_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+// Runtime flags configure the provider, not an individual N-API environment
+// or calling thread. Worker environments are created on guest pthreads, so a
+// thread-local configuration would incorrectly make the process-global setup
+// performed by the main thread invisible there.
+static RUNTIME_ENGINE_FLAGS: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 fn next_serialized_message(scope: u32) -> Option<u32> {
     if scope > SERIALIZED_MESSAGE_SCOPE_MAX {
@@ -1430,7 +1438,6 @@ impl HostJsEnv {
 
 thread_local! {
     static BUFFER_ALLOCS: RefCell<HashMap<usize, Box<[u8]>>> = RefCell::new(HashMap::new());
-    static RUNTIME_ENGINE_FLAGS: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     // N-API calls normally arrive in long runs from one guest environment.
     // Realm activation is only a context switch; repeating its wasm-bindgen
     // call before every operation doubles the host boundary crossings on the
@@ -1453,17 +1460,17 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_configure_runtime(
             slice::from_raw_parts(engine_flags.cast::<u8>(), engine_flags_length as usize).to_vec()
         }
     };
-    RUNTIME_ENGINE_FLAGS.with(|configured| {
-        let mut configured = configured.borrow_mut();
-        match configured.as_ref() {
-            Some(existing) if existing != &requested => NAPI_INVALID_ARG,
-            Some(_) => NAPI_OK,
-            None => {
-                *configured = Some(requested);
-                NAPI_OK
-            }
+    let Ok(mut configured) = RUNTIME_ENGINE_FLAGS.lock() else {
+        return NAPI_GENERIC_FAILURE;
+    };
+    match configured.as_ref() {
+        Some(existing) if existing != &requested => NAPI_INVALID_ARG,
+        Some(_) => NAPI_OK,
+        None => {
+            *configured = Some(requested);
+            NAPI_OK
         }
-    })
+    }
 }
 
 unsafe fn env_mut<'a>(env: SnapiEnv) -> Result<&'a mut HostJsEnv, i32> {
@@ -1787,7 +1794,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
     _guest_heap_ctx: *const c_void,
     out: *mut SnapiEnv,
 ) -> i32 {
-    let runtime_configured = RUNTIME_ENGINE_FLAGS.with(|flags| flags.borrow().is_some());
+    let runtime_configured = RUNTIME_ENGINE_FLAGS
+        .lock()
+        .is_ok_and(|flags| flags.is_some());
     if out.is_null() || !runtime_configured {
         return NAPI_INVALID_ARG;
     }
@@ -3769,11 +3778,16 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_heap_statistics(
             SnapiUnofficialHeapStatistics {
                 size: output_size,
                 version: 1,
-                valid_fields: if measured {
-                    (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5)
-                } else {
-                    0
-                },
+                // The conservative ceiling is intentionally available even
+                // when Chromium withholds `performance.memory`. Only mark the
+                // host measurements valid when the host actually supplied
+                // them, but always expose the nonzero ceiling we computed.
+                valid_fields: (1 << 5)
+                    | if measured {
+                        (1 << 0) | (1 << 3) | (1 << 4)
+                    } else {
+                        0
+                    },
                 total_heap_size: total,
                 total_heap_size_executable: 0,
                 total_physical_size: 0,

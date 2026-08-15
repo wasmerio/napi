@@ -275,28 +275,6 @@ void AppendJsonNumber(std::string* out, T value) {
   out->append(stream.str());
 }
 
-void StripStackFrameLine(std::string* stack, const char* prefix) {
-  if (stack == nullptr || prefix == nullptr || stack->empty()) return;
-  size_t pos = stack->find(prefix);
-  while (pos != std::string::npos) {
-    const size_t end = stack->find('\n', pos + 1);
-    stack->erase(pos, end == std::string::npos ? std::string::npos : end - pos);
-    pos = stack->find(prefix);
-  }
-}
-
-void StripInternalAsyncStackFrames(std::string* stack) {
-  static constexpr const char* kPrefixes[] = {
-      "\n    at process.processTicksAndRejections (node:internal/process/task_queues:",
-      "\n    at process.processTicksAndRejections (node:internal/process/task_queues)",
-      "\n    at triggerUncaughtException (node:internal/process/promises:",
-      "\n    at triggerUncaughtException (node:internal/modules/run_main:",
-  };
-  for (const char* prefix : kPrefixes) {
-    StripStackFrameLine(stack, prefix);
-  }
-}
-
 void BuildHeapProfileNode(v8::Isolate* isolate,
                           const v8::AllocationProfile::Node* profile_node,
                           std::string* out) {
@@ -438,25 +416,7 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     try_catch.ReThrow();
   }
-  v8::Local<v8::Value> value;
-  if (!result.ToLocal(&value) || !value->IsString()) {
-    return result;
-  }
-
-  v8::String::Utf8Value utf8(context->GetIsolate(), value);
-  std::string formatted =
-      *utf8 != nullptr ? std::string(*utf8, utf8.length()) : std::string();
-  StripInternalAsyncStackFrames(&formatted);
-  v8::Local<v8::String> filtered;
-  if (!v8::String::NewFromUtf8(
-           context->GetIsolate(),
-           formatted.c_str(),
-           v8::NewStringType::kNormal,
-           static_cast<int>(formatted.size()))
-           .ToLocal(&filtered)) {
-    return value;
-  }
-  return filtered;
+  return result;
 }
 
 bool IsEnvThreadEntered(napi_env env) {

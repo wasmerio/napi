@@ -21,6 +21,15 @@ napi_value Sym(napi_env env, const char* value) {
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
+constexpr char kPreparedStack[] =
+    "Error: sentinel\n"
+    "    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)\n"
+    "    at triggerUncaughtException (node:internal/process/promises:251:13)";
+
+napi_value ReturnPreparedStack(napi_env env, napi_callback_info /*info*/) {
+  return Str(env, kPreparedStack);
+}
+
 napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -806,3 +815,40 @@ TEST_F(Test65UnofficialContextify, PrivateSymbolAcceptsAutoLength) {
   ASSERT_EQ(napi_typeof(s.env, symbol, &type), napi_ok);
   EXPECT_TRUE(type == napi_symbol || type == napi_object);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
+  EnvScope s(runtime_.get());
+
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_create_function(s.env,
+                                 "prepareStackTrace",
+                                 NAPI_AUTO_LENGTH,
+                                 ReturnPreparedStack,
+                                 nullptr,
+                                 &callback),
+            napi_ok);
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(s.env, callback),
+            napi_ok);
+
+  napi_value source = Str(s.env, "new Error('sentinel').stack");
+  napi_value stack = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &stack), napi_ok);
+  ASSERT_NE(stack, nullptr);
+
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, stack, nullptr, 0, &length),
+            napi_ok);
+  std::string actual(length + 1, '\0');
+  size_t written = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(
+                s.env, stack, actual.data(), actual.size(), &written),
+            napi_ok);
+  actual.resize(written);
+  EXPECT_EQ(actual, kPreparedStack);
+
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(s.env, nullptr),
+            napi_ok);
+}
+#endif
