@@ -273,6 +273,9 @@ typedef enum {
   unofficial_napi_error_metadata_current = 0,
   unofficial_napi_error_metadata_take_preserved = 1,
   unofficial_napi_error_metadata_positions_only = 2,
+  // Return only the provider stack's "Thrown at" text. Unlike `current`, this
+  // mode must not request source-map formatting or invoke embedder JavaScript.
+  unofficial_napi_error_metadata_thrown_at_only = 3,
 } unofficial_napi_error_metadata_mode;
 
 typedef struct {
@@ -434,6 +437,58 @@ static inline void unofficial_napi_heap_statistics_init(
 #endif
   stats->size = sizeof(*stats);
   stats->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
+}
+
+// Providers identify measured fields through `valid_fields`; unsupported
+// fields have no provider-neutral meaning. Consumers that expose a dense
+// Node-compatible object should normalize once at the boundary instead of
+// accidentally treating provider scratch values as observations.
+static inline void unofficial_napi_heap_statistics_normalize(
+    unofficial_napi_heap_statistics* stats) {
+  if (stats == NULL) return;
+#define UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(bit, field) \
+  do {                                                   \
+    if ((stats->valid_fields & (bit)) == 0) {           \
+      stats->field = 0;                                 \
+    }                                                    \
+  } while (0)
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_total_heap_size, total_heap_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_total_heap_size_executable,
+      total_heap_size_executable);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_total_physical_size, total_physical_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_total_available_size, total_available_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_used_heap_size, used_heap_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_heap_size_limit, heap_size_limit);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_does_zap_garbage, does_zap_garbage);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_malloced_memory, malloced_memory);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_peak_malloced_memory, peak_malloced_memory);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_number_of_native_contexts,
+      number_of_native_contexts);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_number_of_detached_contexts,
+      number_of_detached_contexts);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_total_global_handles_size,
+      total_global_handles_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_used_global_handles_size,
+      used_global_handles_size);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_external_memory, external_memory);
+  UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD(
+      unofficial_napi_heap_stat_array_buffer_memory, array_buffer_memory);
+  stats->valid_fields &= unofficial_napi_heap_stat_all;
+#undef UNOFFICIAL_NAPI_NORMALIZE_HEAP_FIELD
 }
 
 typedef struct {

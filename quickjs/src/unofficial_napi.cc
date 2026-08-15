@@ -871,7 +871,12 @@ extern "C"
         stats_out->total_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
         stats_out->used_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.memory_used_size));
         stats_out->malloced_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
+        // QuickJS does not retain a historical allocator peak, but its current
+        // malloc size is still an honest lower bound and preserves the value
+        // exposed by the pre-consolidation process-memory operation.
+        stats_out->peak_malloced_memory = stats_out->malloced_memory;
         stats_out->external_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.binary_object_size));
+        stats_out->array_buffer_memory = stats_out->external_memory;
 
         // heap_size_limit must never be reported as zero. Consumers read it as
         // "the ceiling this heap can grow to" and divide by it: Next.js uses
@@ -897,7 +902,9 @@ extern "C"
             unofficial_napi_heap_stat_used_heap_size |
             unofficial_napi_heap_stat_heap_size_limit |
             unofficial_napi_heap_stat_malloced_memory |
-            unofficial_napi_heap_stat_external_memory;
+            unofficial_napi_heap_stat_peak_malloced_memory |
+            unofficial_napi_heap_stat_external_memory |
+            unofficial_napi_heap_stat_array_buffer_memory;
         return napi_ok;
     }
 
@@ -946,8 +953,9 @@ extern "C"
         if (!napi_util__::check_env(env) || result_out == nullptr || profile_out == nullptr ||
             (kind != unofficial_napi_profile_cpu && kind != unofficial_napi_profile_heap))
             return napi_invalid_arg;
-        *result_out = unofficial_napi_profile_start_ok;
-        *profile_out = nullptr;
+        // Unsupported providers leave outputs untouched on failure. Out
+        // parameters describe only successful calls; they are not a second,
+        // contradictory status channel.
         return napi_generic_failure;
     }
 

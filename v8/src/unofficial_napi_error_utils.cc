@@ -434,7 +434,8 @@ napi_status GetErrorMetadata(napi_env env,
     return WrapUtf8String(env, thrown_at, &out->thrown_at);
   }
   if (mode != unofficial_napi_error_metadata_current &&
-      mode != unofficial_napi_error_metadata_positions_only) {
+      mode != unofficial_napi_error_metadata_positions_only &&
+      mode != unofficial_napi_error_metadata_thrown_at_only) {
     return napi_invalid_arg;
   }
 
@@ -442,32 +443,34 @@ napi_status GetErrorMetadata(napi_env env,
   v8::Local<v8::Message> message = v8::Exception::CreateMessage(isolate, raw);
   if (message.IsEmpty()) return napi_generic_failure;
 
-  v8::Local<v8::String> source_line;
-  if (message->GetSourceLine(context).ToLocal(&source_line)) {
-    out->source_line = napi_v8_wrap_value(env, source_line);
-    if (out->source_line == nullptr) return napi_generic_failure;
+  if (mode != unofficial_napi_error_metadata_thrown_at_only) {
+    v8::Local<v8::String> source_line;
+    if (message->GetSourceLine(context).ToLocal(&source_line)) {
+      out->source_line = napi_v8_wrap_value(env, source_line);
+      if (out->source_line == nullptr) return napi_generic_failure;
+    }
+
+    v8::Local<v8::Value> resource_name = message->GetScriptOrigin().ResourceName();
+    if (!resource_name.IsEmpty()) {
+      out->script_resource_name = napi_v8_wrap_value(env, resource_name);
+      if (out->script_resource_name == nullptr) return napi_generic_failure;
+    }
+
+    out->line_number = message->GetLineNumber(context).FromMaybe(0);
+    out->start_column = message->GetStartColumn(context).FromMaybe(0);
+    out->end_column =
+        message->GetEndColumn(context).FromMaybe(out->start_column + 1);
+
+    if (mode == unofficial_napi_error_metadata_positions_only) return napi_ok;
+
+    napi_status status = WrapUtf8String(
+        env, GetErrorSourceLineForStderrImpl(env, message), &out->stderr_line);
+    if (status != napi_ok) return status;
   }
-
-  v8::Local<v8::Value> resource_name = message->GetScriptOrigin().ResourceName();
-  if (!resource_name.IsEmpty()) {
-    out->script_resource_name = napi_v8_wrap_value(env, resource_name);
-    if (out->script_resource_name == nullptr) return napi_generic_failure;
-  }
-
-  out->line_number = message->GetLineNumber(context).FromMaybe(0);
-  out->start_column = message->GetStartColumn(context).FromMaybe(0);
-  out->end_column =
-      message->GetEndColumn(context).FromMaybe(out->start_column + 1);
-
-  if (mode == unofficial_napi_error_metadata_positions_only) return napi_ok;
-
-  napi_status status = WrapUtf8String(
-      env, GetErrorSourceLineForStderrImpl(env, message), &out->stderr_line);
-  if (status != napi_ok) return status;
 
   v8::Local<v8::StackTrace> stack = message->GetStackTrace();
   if (!stack.IsEmpty() && stack->GetFrameCount() > 0) {
-    status = WrapUtf8String(
+    napi_status status = WrapUtf8String(
         env, "Thrown at:\n" + FormatStackTrace(isolate, stack), &out->thrown_at);
     if (status != napi_ok) return status;
   }

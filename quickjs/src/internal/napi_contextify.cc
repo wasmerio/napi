@@ -640,8 +640,15 @@ namespace quickjs::detail
         if (mode == unofficial_napi_error_metadata_take_preserved)
             return napi_ok;
         if (mode != unofficial_napi_error_metadata_current &&
-            mode != unofficial_napi_error_metadata_positions_only)
+            mode != unofficial_napi_error_metadata_positions_only &&
+            mode != unofficial_napi_error_metadata_thrown_at_only)
             return napi_invalid_arg;
+
+        // QuickJS does not currently expose a provider stack snapshot for an
+        // arbitrary caught value. The cheap query is nevertheless a valid,
+        // side-effect-free empty result and must not inspect user properties.
+        if (mode == unofficial_napi_error_metadata_thrown_at_only)
+            return napi_ok;
 
         out->line_number = -1;
         out->start_column = -1;

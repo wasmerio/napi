@@ -454,9 +454,45 @@ TEST_F(Test21General, HeapStatisticsDeclareMeasuredFields) {
 #if defined(NAPI_TEST_ENGINE_V8)
   EXPECT_EQ(statistics.valid_fields, unofficial_napi_heap_stat_all);
 #elif defined(NAPI_TEST_ENGINE_QUICKJS)
-  EXPECT_EQ(statistics.valid_fields & unofficial_napi_heap_stat_array_buffer_memory, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_peak_malloced_memory, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_array_buffer_memory, 0u);
+  EXPECT_EQ(statistics.peak_malloced_memory, statistics.malloced_memory);
+  EXPECT_EQ(statistics.array_buffer_memory, statistics.external_memory);
 #endif
 }
+
+TEST_F(Test21General, HeapStatisticsNormalizationClearsUnsupportedFields) {
+  unofficial_napi_heap_statistics statistics{};
+  unofficial_napi_heap_statistics_init(&statistics);
+  statistics.valid_fields = unofficial_napi_heap_stat_used_heap_size |
+                            (uint64_t{1} << 63);
+  statistics.used_heap_size = 42;
+  statistics.heap_size_limit = 99;
+  statistics.external_memory = 77;
+
+  unofficial_napi_heap_statistics_normalize(&statistics);
+
+  EXPECT_EQ(statistics.valid_fields, unofficial_napi_heap_stat_used_heap_size);
+  EXPECT_EQ(statistics.used_heap_size, 42u);
+  EXPECT_EQ(statistics.heap_size_limit, 0u);
+  EXPECT_EQ(statistics.external_memory, 0u);
+}
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test21General, UnsupportedProfileStartLeavesOutputsUntouched) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_profile_start_result result =
+      unofficial_napi_profile_start_busy;
+  auto profile = reinterpret_cast<unofficial_napi_profile>(uintptr_t{1});
+
+  EXPECT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &result, &profile),
+            napi_generic_failure);
+  EXPECT_EQ(result, unofficial_napi_profile_start_busy);
+  EXPECT_EQ(profile,
+            reinterpret_cast<unofficial_napi_profile>(uintptr_t{1}));
+}
+#endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test21General, CpuProfileResultUsesExternalUtf8Bytes) {

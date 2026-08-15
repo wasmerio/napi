@@ -244,3 +244,54 @@ TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSo
             "mapped.js:10\nconst boom = 1;\n      ^\n\n");
 #endif
 }
+
+TEST_F(Test14Exception, ThrownAtOnlyMetadataDoesNotInvokeSourceMapCallback) {
+  EnvScope s(runtime_.get());
+
+  napi_value script = nullptr;
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "globalThis.__sourceMapCalls = 0; "
+                "(() => { ++globalThis.__sourceMapCalls; return 'mapped'; })",
+                NAPI_AUTO_LENGTH,
+                &script),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, script, &callback), napi_ok);
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_configure_source_maps(s.env, true, callback), napi_ok);
+
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "(() => { try { throw new Error('cheap metadata'); } "
+                "catch (error) { return error; } })()",
+                NAPI_AUTO_LENGTH,
+                &script),
+            napi_ok);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, script, &error), napi_ok);
+  ASSERT_NE(error, nullptr);
+
+  unofficial_napi_error_metadata metadata{};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                error,
+                unofficial_napi_error_metadata_thrown_at_only,
+                &metadata),
+            napi_ok);
+  EXPECT_EQ(metadata.source_line, nullptr);
+  EXPECT_EQ(metadata.script_resource_name, nullptr);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
+  // A caught V8 Error does not necessarily retain message stack frames, so
+  // thrown_at may legitimately be absent. The contract here is that no
+  // unrequested source/position metadata (and no source-map JS) is evaluated.
+
+  napi_value calls = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env, "globalThis.__sourceMapCalls", NAPI_AUTO_LENGTH, &script),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, script, &calls), napi_ok);
+  int32_t call_count = -1;
+  ASSERT_EQ(napi_get_value_int32(s.env, calls, &call_count), napi_ok);
+  EXPECT_EQ(call_count, 0);
+}
