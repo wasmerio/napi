@@ -27,18 +27,23 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 std::string GetArrowMessage(napi_env env, napi_value exception) {
   if (env == nullptr || exception == nullptr) return {};
 
-  napi_value source_line = nullptr;
-  napi_value thrown_at = nullptr;
-  if (unofficial_napi_take_preserved_error_formatting(
-          env, exception, &source_line, &thrown_at) == napi_ok) {
-    const std::string preserved = ValueToUtf8(env, source_line);
+  unofficial_napi_error_metadata metadata{};
+  if (unofficial_napi_get_error_metadata(
+          env,
+          exception,
+          unofficial_napi_error_metadata_take_preserved,
+          &metadata) == napi_ok) {
+    const std::string preserved = ValueToUtf8(env, metadata.stderr_line);
     if (!preserved.empty()) return preserved;
   }
 
-  source_line = nullptr;
-  if (unofficial_napi_get_error_source_line_for_stderr(env, exception, &source_line) ==
-      napi_ok) {
-    const std::string formatted = ValueToUtf8(env, source_line);
+  metadata = {};
+  if (unofficial_napi_get_error_metadata(
+          env,
+          exception,
+          unofficial_napi_error_metadata_current,
+          &metadata) == napi_ok) {
+    const std::string formatted = ValueToUtf8(env, metadata.stderr_line);
     if (!formatted.empty()) return formatted;
   }
 
@@ -112,6 +117,66 @@ TEST_F(Test14Exception, SetLastExceptionStoresArrowMessageOnThrownError) {
   EXPECT_NE(GetArrowMessage(s.env, exception).find("throw new Error('boom')"), std::string::npos);
 }
 
+TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
+  EnvScope s(runtime_.get());
+
+  napi_value script = nullptr;
+  ASSERT_EQ(
+      napi_create_string_utf8(
+          s.env,
+          "throw new Error('metadata')\n//# sourceURL=metadata.js",
+          NAPI_AUTO_LENGTH,
+          &script),
+      napi_ok);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, script, &result), napi_pending_exception);
+
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_NE(exception, nullptr);
+
+  unofficial_napi_error_metadata metadata{};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_current,
+                &metadata),
+            napi_ok);
+  EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
+            std::string::npos);
+  EXPECT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                static_cast<unofficial_napi_error_metadata_mode>(99),
+                &metadata),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_preserve_error_source_message(s.env, exception),
+            napi_ok);
+  metadata = {};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_take_preserved,
+                &metadata),
+            napi_ok);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(metadata.stderr_line, nullptr);
+#else
+  EXPECT_NE(ValueToUtf8(s.env, metadata.stderr_line).find("metadata"),
+            std::string::npos);
+#endif
+
+  metadata = {};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                exception,
+                unofficial_napi_error_metadata_take_preserved,
+                &metadata),
+            napi_ok);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
+}
+
 TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorRethrow) {
   EnvScope s(runtime_.get());
 
@@ -141,8 +206,6 @@ TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorReth
 TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSourceMapsEnabled) {
   EnvScope s(runtime_.get());
 
-  ASSERT_EQ(unofficial_napi_set_source_maps_enabled(s.env, true), napi_ok);
-
   napi_value callback_script = nullptr;
   ASSERT_EQ(
       napi_create_string_utf8(
@@ -155,7 +218,7 @@ TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSo
   ASSERT_EQ(napi_run_script(s.env, callback_script, &callback), napi_ok);
   ASSERT_NE(callback, nullptr);
   ASSERT_EQ(
-      unofficial_napi_set_get_source_map_error_source_callback(s.env, callback),
+      unofficial_napi_configure_source_maps(s.env, true, callback),
       napi_ok);
 
   napi_value script = nullptr;
@@ -180,4 +243,55 @@ TEST_F(Test14Exception, PreserveErrorSourceMessageStoresMappedArrowMessageWhenSo
   EXPECT_EQ(GetArrowMessage(s.env, error),
             "mapped.js:10\nconst boom = 1;\n      ^\n\n");
 #endif
+}
+
+TEST_F(Test14Exception, ThrownAtOnlyMetadataDoesNotInvokeSourceMapCallback) {
+  EnvScope s(runtime_.get());
+
+  napi_value script = nullptr;
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "globalThis.__sourceMapCalls = 0; "
+                "(() => { ++globalThis.__sourceMapCalls; return 'mapped'; })",
+                NAPI_AUTO_LENGTH,
+                &script),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, script, &callback), napi_ok);
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_configure_source_maps(s.env, true, callback), napi_ok);
+
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "(() => { try { throw new Error('cheap metadata'); } "
+                "catch (error) { return error; } })()",
+                NAPI_AUTO_LENGTH,
+                &script),
+            napi_ok);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, script, &error), napi_ok);
+  ASSERT_NE(error, nullptr);
+
+  unofficial_napi_error_metadata metadata{};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(
+                s.env,
+                error,
+                unofficial_napi_error_metadata_thrown_at_only,
+                &metadata),
+            napi_ok);
+  EXPECT_EQ(metadata.source_line, nullptr);
+  EXPECT_EQ(metadata.script_resource_name, nullptr);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
+  // A caught V8 Error does not necessarily retain message stack frames, so
+  // thrown_at may legitimately be absent. The contract here is that no
+  // unrequested source/position metadata (and no source-map JS) is evaluated.
+
+  napi_value calls = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env, "globalThis.__sourceMapCalls", NAPI_AUTO_LENGTH, &script),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, script, &calls), napi_ok);
+  int32_t call_count = -1;
+  ASSERT_EQ(napi_get_value_int32(s.env, calls, &call_count), napi_ok);
+  EXPECT_EQ(call_count, 0);
 }

@@ -14,7 +14,5 @@ void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
 void NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);
-void* NapiV8GetCurrentEdgeEnvironment(v8::Isolate* isolate);
-void* NapiV8GetCurrentEdgeEnvironment(v8::Local<v8::Context> context);
 
 #endif  // NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_

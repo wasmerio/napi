@@ -6,12 +6,202 @@
 #include "test_env.h"
 #include "upstream_js_test.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <thread>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
+namespace {
+int g_guest_heap_release_calls = 0;
+void* g_last_released_guest_heap_ctx = nullptr;
+}  // namespace
+
+extern "C" void napi_host_guest_heap_release(void* ctx) {
+  ++g_guest_heap_release_calls;
+  g_last_released_guest_heap_ctx = ctx;
+}
+
 class Test21General : public FixtureTestBase {};
+
+namespace {
+
+size_t NearHeapLimitProbe(napi_env env,
+                          void* data,
+                          size_t current_heap_limit,
+                          size_t initial_heap_limit) {
+  EXPECT_NE(env, nullptr);
+  EXPECT_NE(data, nullptr);
+  EXPECT_GE(current_heap_limit, initial_heap_limit);
+  return current_heap_limit;
+}
+
+}  // namespace
+
+TEST_F(Test21General, EnvironmentCreationOptionsAreVersioned) {
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+
+  unofficial_napi_env_create_options options{};
+  options.size = sizeof(options) - 1;
+  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+
+  options.size = sizeof(options);
+  options.version += 1;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_invalid_arg);
+
+}
+
+TEST_F(Test21General, RuntimeConfigurationIsVersionedAndImmutable) {
+  unofficial_napi_runtime_options malformed{};
+  malformed.size = sizeof(malformed) - 1;
+  malformed.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&malformed), napi_invalid_arg);
+
+  malformed.size = sizeof(malformed);
+  malformed.version += 1;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&malformed), napi_invalid_arg);
+
+  static constexpr char kConflictingFlags[] = "--no-js-float16array";
+  unofficial_napi_runtime_options conflicting{};
+  conflicting.size = sizeof(conflicting);
+  conflicting.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+  conflicting.engine_flags = kConflictingFlags;
+  conflicting.engine_flags_length = sizeof(kConflictingFlags) - 1;
+  EXPECT_EQ(unofficial_napi_configure_runtime(&conflicting), napi_invalid_arg);
+}
+
+TEST_F(Test21General, TruncatedEnvironmentOptionsDoNotTransferGuestHeapOwnership) {
+  alignas(unofficial_napi_env_create_options)
+      std::array<std::byte, sizeof(unofficial_napi_env_create_options)> bytes{};
+  const uint32_t size = 2 * sizeof(uint32_t);
+  const uint32_t version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  int guest_heap_marker = 0;
+  unofficial_napi_guest_heap guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+  std::memcpy(bytes.data(), &size, sizeof(size));
+  std::memcpy(bytes.data() + sizeof(size), &version, sizeof(version));
+  std::memcpy(bytes.data() + offsetof(unofficial_napi_env_create_options,
+                                     guest_heap),
+              &guest_heap,
+              sizeof(guest_heap));
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION,
+                reinterpret_cast<const unofficial_napi_env_create_options*>(
+                    bytes.data()),
+                &env,
+                &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 0);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, nullptr);
+}
+
+TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeOutputValidation) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  int first_guest_heap_marker = 0;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&first_guest_heap_marker);
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, nullptr, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 1);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+
+  int second_guest_heap_marker = 0;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&second_guest_heap_marker);
+  napi_env env = nullptr;
+  EXPECT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, nullptr),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 2);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+}
+
+TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_ok);
+  ASSERT_NE(env, nullptr);
+  ASSERT_NE(owner, nullptr);
+
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+
+  unofficial_napi_env_hooks invalid = hooks;
+  invalid.version += 1;
+  uint64_t accepted_hooks = 0;
+  EXPECT_EQ(unofficial_napi_attach_env(env, &invalid, &accepted_hooks), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_ok);
+  EXPECT_EQ(accepted_hooks, 0);
+  EXPECT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+
+TEST_F(Test21General, GarbageCollectionUsesProductionProviderPrimitive) {
+  EnvScope s(runtime_.get());
+
+  EXPECT_EQ(unofficial_napi_collect_garbage(nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+}
+
+TEST_F(Test21General, NearHeapLimitCallbackUsesOneConfigurationSlot) {
+  EnvScope s(runtime_.get());
+  int callback_data = 1;
+
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 1),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, &callback_data, 0),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 0),
+            napi_ok);
+  // Reconfiguration replaces the one logical slot rather than registering a
+  // second provider callback.
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, NearHeapLimitProbe, &callback_data, 0),
+            napi_ok);
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, nullptr, 0),
+            napi_ok);
+  // Removing an already-empty slot is idempotent.
+  EXPECT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                s.env, nullptr, nullptr, 0),
+            napi_ok);
+}
 
 TEST_F(Test21General, PortedCoreFlow) {
   EnvScope s(runtime_.get());
@@ -55,6 +245,321 @@ TEST_F(Test21General, ProviderOwnsUninitializedArrayBufferAllocation) {
   ASSERT_EQ(napi_get_arraybuffer_info(s.env, empty, &data, &length), napi_ok);
   EXPECT_EQ(length, 0u);
 }
+
+TEST_F(Test21General, StructuredCloneOptionalTransferListDetachesArrayBuffer) {
+  EnvScope s(runtime_.get());
+
+  void* source_data = nullptr;
+  napi_value source_buffer = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 8, &source_data, &source_buffer), napi_ok);
+  ASSERT_NE(source_buffer, nullptr);
+  ASSERT_NE(source_data, nullptr);
+  static_cast<uint8_t*>(source_data)[0] = 42;
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "buffer", source_buffer), napi_ok);
+
+  napi_value transfer_list = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 1, &transfer_list), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, transfer_list, 0, source_buffer), napi_ok);
+
+  napi_value clone = nullptr;
+  ASSERT_EQ(unofficial_napi_structured_clone(s.env, source, transfer_list, &clone), napi_ok);
+  ASSERT_NE(clone, nullptr);
+
+  napi_value source_byte_length = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, source_buffer, "byteLength", &source_byte_length),
+            napi_ok);
+  uint32_t source_length = 8;
+  ASSERT_EQ(napi_get_value_uint32(s.env, source_byte_length, &source_length), napi_ok);
+  EXPECT_EQ(source_length, 0u);
+
+  napi_value cloned_buffer = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, clone, "buffer", &cloned_buffer), napi_ok);
+  void* cloned_data = nullptr;
+  size_t cloned_length = 0;
+  ASSERT_EQ(napi_get_arraybuffer_info(s.env, cloned_buffer, &cloned_data, &cloned_length), napi_ok);
+  ASSERT_EQ(cloned_length, 8u);
+  ASSERT_NE(cloned_data, nullptr);
+  EXPECT_EQ(static_cast<uint8_t*>(cloned_data)[0], 42u);
+}
+
+TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  napi_value expected = nullptr;
+  ASSERT_EQ(napi_create_uint32(s.env, 42, &expected), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "answer", expected), napi_ok);
+
+  unofficial_napi_message message = nullptr;
+  ASSERT_EQ(unofficial_napi_message_create(s.env, source, &message), napi_ok);
+  ASSERT_NE(message, nullptr);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(unofficial_napi_message_take(s.env, message, &result), napi_ok);
+  ASSERT_NE(result, nullptr);
+  napi_value answer = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, result, "answer", &answer), napi_ok);
+  uint32_t actual = 0;
+  ASSERT_EQ(napi_get_value_uint32(s.env, answer, &actual), napi_ok);
+  EXPECT_EQ(actual, 42u);
+
+  unofficial_napi_message dropped = nullptr;
+  ASSERT_EQ(unofficial_napi_message_create(s.env, source, &dropped), napi_ok);
+  ASSERT_NE(dropped, nullptr);
+  unofficial_napi_message_drop(dropped);
+}
+
+TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &source), napi_ok);
+  napi_value index_value = nullptr;
+  ASSERT_EQ(napi_create_uint32(s.env, 1, &index_value), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, source, 0, index_value), napi_ok);
+  ASSERT_EQ(napi_set_element(s.env, source, 999999, index_value), napi_ok);
+
+  napi_value visible = nullptr;
+  ASSERT_EQ(napi_get_boolean(s.env, true, &visible), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, source, "visible", visible), napi_ok);
+
+  napi_value description = nullptr;
+  napi_value symbol = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, "own-symbol", NAPI_AUTO_LENGTH, &description),
+            napi_ok);
+  ASSERT_EQ(napi_create_symbol(s.env, description, &symbol), napi_ok);
+  ASSERT_EQ(napi_set_property(s.env, source, symbol, visible), napi_ok);
+
+  napi_value keys = nullptr;
+  ASSERT_EQ(unofficial_napi_get_own_non_index_properties(
+                s.env, source, napi_key_all_properties, &keys),
+            napi_ok);
+  ASSERT_NE(keys, nullptr);
+  uint32_t length = 0;
+  ASSERT_EQ(napi_get_array_length(s.env, keys, &length), napi_ok);
+  ASSERT_EQ(length, 2u);
+
+  bool saw_visible = false;
+  bool saw_symbol = false;
+  for (uint32_t index = 0; index < length; ++index) {
+    napi_value key = nullptr;
+    ASSERT_EQ(napi_get_element(s.env, keys, index, &key), napi_ok);
+    napi_valuetype type = napi_undefined;
+    ASSERT_EQ(napi_typeof(s.env, key, &type), napi_ok);
+    if (type == napi_symbol) {
+      saw_symbol = true;
+    } else if (type == napi_string) {
+      char text[16] = {};
+      size_t copied = 0;
+      ASSERT_EQ(napi_get_value_string_utf8(s.env, key, text, sizeof(text), &copied),
+                napi_ok);
+      saw_visible = std::string(text, copied) == "visible";
+    } else {
+      ADD_FAILURE() << "unexpected key type " << static_cast<int>(type);
+    }
+  }
+  EXPECT_TRUE(saw_visible);
+  EXPECT_TRUE(saw_symbol);
+}
+
+TEST_F(Test21General, PropertyEnumerationPreservesThrownProxyException) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                s.env,
+                "(() => { const sentinel = {}; return { sentinel, proxy: new Proxy({}, { ownKeys() { throw sentinel; } }) }; })()",
+                NAPI_AUTO_LENGTH,
+                &source),
+            napi_ok);
+  napi_value fixture = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &fixture), napi_ok);
+  ASSERT_NE(fixture, nullptr);
+  napi_value sentinel = nullptr;
+  napi_value proxy = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sentinel", &sentinel), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "proxy", &proxy), napi_ok);
+
+  napi_value keys = nullptr;
+  EXPECT_EQ(unofficial_napi_get_own_non_index_properties(
+                s.env, proxy, napi_key_all_properties, &keys),
+            napi_pending_exception);
+  EXPECT_EQ(keys, nullptr);
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+
+  napi_value caught = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &caught), napi_ok);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, caught, sentinel, &same), napi_ok);
+  EXPECT_TRUE(same);
+}
+
+TEST_F(Test21General, HeapSpaceStatisticsUseOneBulkSnapshot) {
+  EnvScope s(runtime_.get());
+
+  uint32_t required_count = 0;
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, nullptr, 0, &required_count),
+            napi_ok);
+  ASSERT_GT(required_count, 0u);
+
+  std::array<unofficial_napi_heap_space_statistics, 64> statistics{};
+  uint32_t snapshot_count = 0;
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env,
+                statistics.data(),
+                static_cast<uint32_t>(statistics.size()),
+                &snapshot_count),
+            napi_ok);
+  ASSERT_EQ(snapshot_count, required_count);
+  ASSERT_LE(snapshot_count, statistics.size());
+
+  for (uint32_t index = 0; index < snapshot_count; ++index) {
+    EXPECT_NE(statistics[index].space_name[0], '\0') << "heap space " << index;
+    EXPECT_EQ(statistics[index].space_name[
+                  UNOFFICIAL_NAPI_HEAP_SPACE_NAME_MAX_LENGTH - 1],
+              '\0')
+        << "heap space " << index;
+  }
+
+  uint32_t partial_count = 0;
+  unofficial_napi_heap_space_statistics first_space{};
+  ASSERT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, &first_space, 1, &partial_count),
+            napi_ok);
+  EXPECT_EQ(partial_count, required_count);
+  EXPECT_NE(first_space.space_name[0], '\0');
+
+  EXPECT_EQ(unofficial_napi_get_heap_space_statistics(s.env, nullptr, 1, &partial_count),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_get_heap_space_statistics(
+                s.env, statistics.data(), statistics.size(), nullptr),
+            napi_invalid_arg);
+}
+
+TEST_F(Test21General, HeapStatisticsDeclareMeasuredFields) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_heap_statistics statistics{};
+  unofficial_napi_heap_statistics_init(&statistics);
+  ASSERT_EQ(unofficial_napi_get_heap_statistics(s.env, &statistics), napi_ok);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_total_heap_size, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_used_heap_size, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_heap_size_limit, 0u);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(statistics.valid_fields, unofficial_napi_heap_stat_all);
+#elif defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_peak_malloced_memory, 0u);
+  EXPECT_NE(statistics.valid_fields & unofficial_napi_heap_stat_array_buffer_memory, 0u);
+  EXPECT_EQ(statistics.peak_malloced_memory, statistics.malloced_memory);
+  EXPECT_EQ(statistics.array_buffer_memory, statistics.external_memory);
+#endif
+}
+
+TEST_F(Test21General, HeapStatisticsNormalizationClearsUnsupportedFields) {
+  unofficial_napi_heap_statistics statistics{};
+  unofficial_napi_heap_statistics_init(&statistics);
+  statistics.valid_fields = unofficial_napi_heap_stat_used_heap_size |
+                            (uint64_t{1} << 63);
+  statistics.used_heap_size = 42;
+  statistics.heap_size_limit = 99;
+  statistics.external_memory = 77;
+
+  unofficial_napi_heap_statistics_normalize(&statistics);
+
+  EXPECT_EQ(statistics.valid_fields, unofficial_napi_heap_stat_used_heap_size);
+  EXPECT_EQ(statistics.used_heap_size, 42u);
+  EXPECT_EQ(statistics.heap_size_limit, 0u);
+  EXPECT_EQ(statistics.external_memory, 0u);
+}
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test21General, UnsupportedProfileStartLeavesOutputsUntouched) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_profile_start_result result =
+      unofficial_napi_profile_start_busy;
+  auto profile = reinterpret_cast<unofficial_napi_profile>(uintptr_t{1});
+
+  EXPECT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &result, &profile),
+            napi_generic_failure);
+  EXPECT_EQ(result, unofficial_napi_profile_start_busy);
+  EXPECT_EQ(profile,
+            reinterpret_cast<unofficial_napi_profile>(uintptr_t{1}));
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test21General, CpuProfileResultUsesExternalUtf8Bytes) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_profile_start_result start_result =
+      unofficial_napi_profile_start_busy;
+  unofficial_napi_profile profile = nullptr;
+  ASSERT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &start_result, &profile),
+            napi_ok);
+  ASSERT_EQ(start_result, unofficial_napi_profile_start_ok);
+  ASSERT_NE(profile, nullptr);
+
+  ASSERT_TRUE(RunScript(s,
+                        "let total = 0; for (let i = 0; i < 10000; ++i) total += i;",
+                        "cpu-profile-work.js"));
+
+  napi_value json = nullptr;
+  ASSERT_EQ(unofficial_napi_profile_stop(s.env, profile, &json),
+            napi_ok);
+  ASSERT_NE(json, nullptr);
+
+  bool is_typedarray = false;
+  ASSERT_EQ(napi_is_typedarray(s.env, json, &is_typedarray), napi_ok);
+  ASSERT_TRUE(is_typedarray);
+  napi_typedarray_type type = napi_int8_array;
+  size_t length = 0;
+  void* data = nullptr;
+  ASSERT_EQ(napi_get_typedarray_info(
+                s.env, json, &type, &length, &data, nullptr, nullptr),
+            napi_ok);
+  EXPECT_EQ(type, napi_uint8_array);
+  EXPECT_GT(length, 0u);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<const char*>(data)[0], '{');
+
+  napi_value second_json = nullptr;
+  EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &second_json),
+            napi_invalid_arg);
+}
+
+TEST_F(Test21General, CpuProfileStopCanRetryFromTheEnvironmentThread) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_profile_start_result start_result =
+      unofficial_napi_profile_start_busy;
+  unofficial_napi_profile profile = nullptr;
+  ASSERT_EQ(unofficial_napi_profile_start(
+                s.env, unofficial_napi_profile_cpu, &start_result, &profile),
+            napi_ok);
+  ASSERT_EQ(start_result, unofficial_napi_profile_start_ok);
+  ASSERT_NE(profile, nullptr);
+
+  napi_status off_thread_status = napi_ok;
+  std::thread off_thread([&]() {
+    napi_value json = nullptr;
+    off_thread_status = unofficial_napi_profile_stop(s.env, profile, &json);
+  });
+  off_thread.join();
+  EXPECT_EQ(off_thread_status, napi_cannot_run_js);
+
+  napi_value json = nullptr;
+  EXPECT_EQ(unofficial_napi_profile_stop(s.env, profile, &json), napi_ok);
+  EXPECT_NE(json, nullptr);
+}
+#endif
 
 #ifdef NAPI_TEST_ENGINE_QUICKJS
 TEST_F(Test21General, GlobalBufferPrototypeDetection) {

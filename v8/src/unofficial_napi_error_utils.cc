@@ -209,6 +209,25 @@ bool TakePreservedErrorFormattingImpl(napi_env env,
   return true;
 }
 
+napi_status WrapUtf8String(napi_env env,
+                           const std::string& value,
+                           napi_value* out) {
+  if (out == nullptr) return napi_invalid_arg;
+  *out = nullptr;
+  if (value.empty()) return napi_ok;
+
+  v8::Local<v8::String> string;
+  if (!v8::String::NewFromUtf8(env->isolate,
+                               value.c_str(),
+                               v8::NewStringType::kNormal,
+                               static_cast<int>(value.size()))
+           .ToLocal(&string)) {
+    return napi_generic_failure;
+  }
+  *out = napi_v8_wrap_value(env, string);
+  return *out == nullptr ? napi_generic_failure : napi_ok;
+}
+
 }  // namespace
 
 namespace unofficial_napi_internal {
@@ -346,14 +365,9 @@ void SetArrowMessage(v8::Isolate* isolate,
       isolate, context, exception, BuildSyntaxArrowMessage(isolate, context, message));
 }
 
-napi_status SetSourceMapsEnabled(napi_env env, bool enabled) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  g_error_formatting_states[env].source_maps_enabled = enabled;
-  return napi_ok;
-}
-
-napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback) {
+napi_status ConfigureSourceMaps(napi_env env,
+                                bool enabled,
+                                napi_value callback) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
 
   v8::Local<v8::Value> raw =
@@ -362,6 +376,7 @@ napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback
 
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
   ErrorFormattingState& state = g_error_formatting_states[env];
+  state.source_maps_enabled = enabled;
   state.get_source_map_error_source.Reset();
   if (!raw.IsEmpty()) {
     state.get_source_map_error_source.Reset(env->isolate, raw.As<v8::Function>());
@@ -393,56 +408,72 @@ napi_status PreserveErrorSourceMessage(napi_env env, napi_value error) {
   return napi_ok;
 }
 
-napi_status TakePreservedErrorFormatting(napi_env env,
-                                         napi_value error,
-                                         napi_value* source_line_out,
-                                         napi_value* thrown_at_out) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
+napi_status GetErrorMetadata(napi_env env,
+                             napi_value error,
+                             unofficial_napi_error_metadata_mode mode,
+                             unofficial_napi_error_metadata* out) {
+  if (env == nullptr || env->isolate == nullptr || error == nullptr ||
+      out == nullptr) {
     return napi_invalid_arg;
   }
-
-  if (source_line_out != nullptr) *source_line_out = nullptr;
-  if (thrown_at_out != nullptr) *thrown_at_out = nullptr;
+  *out = {};
 
   v8::Isolate* isolate = env->isolate;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
   if (raw.IsEmpty()) return napi_invalid_arg;
 
-  std::string preserved_source_line;
-  std::string preserved_thrown_at;
-  if (!TakePreservedErrorFormattingImpl(
-          env, raw, &preserved_source_line, &preserved_thrown_at)) {
-    return napi_ok;
-  }
-
-  if (source_line_out != nullptr && !preserved_source_line.empty()) {
-    v8::Local<v8::String> source_line_value;
-    if (!v8::String::NewFromUtf8(
-             isolate,
-             preserved_source_line.c_str(),
-             v8::NewStringType::kNormal,
-             static_cast<int>(preserved_source_line.size()))
-             .ToLocal(&source_line_value)) {
-      return napi_generic_failure;
+  if (mode == unofficial_napi_error_metadata_take_preserved) {
+    std::string source_line;
+    std::string thrown_at;
+    if (!TakePreservedErrorFormattingImpl(env, raw, &source_line, &thrown_at)) {
+      return napi_ok;
     }
-    *source_line_out = napi_v8_wrap_value(env, source_line_value);
-    if (*source_line_out == nullptr) return napi_generic_failure;
+
+    napi_status status = WrapUtf8String(env, source_line, &out->stderr_line);
+    if (status != napi_ok) return status;
+    return WrapUtf8String(env, thrown_at, &out->thrown_at);
+  }
+  if (mode != unofficial_napi_error_metadata_current &&
+      mode != unofficial_napi_error_metadata_positions_only &&
+      mode != unofficial_napi_error_metadata_thrown_at_only) {
+    return napi_invalid_arg;
   }
 
-  if (thrown_at_out != nullptr && !preserved_thrown_at.empty()) {
-    v8::Local<v8::String> thrown_at_value;
-    if (!v8::String::NewFromUtf8(
-             isolate,
-             preserved_thrown_at.c_str(),
-             v8::NewStringType::kNormal,
-             static_cast<int>(preserved_thrown_at.size()))
-             .ToLocal(&thrown_at_value)) {
-      return napi_generic_failure;
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Message> message = v8::Exception::CreateMessage(isolate, raw);
+  if (message.IsEmpty()) return napi_generic_failure;
+
+  if (mode != unofficial_napi_error_metadata_thrown_at_only) {
+    v8::Local<v8::String> source_line;
+    if (message->GetSourceLine(context).ToLocal(&source_line)) {
+      out->source_line = napi_v8_wrap_value(env, source_line);
+      if (out->source_line == nullptr) return napi_generic_failure;
     }
-    *thrown_at_out = napi_v8_wrap_value(env, thrown_at_value);
-    if (*thrown_at_out == nullptr) return napi_generic_failure;
+
+    v8::Local<v8::Value> resource_name = message->GetScriptOrigin().ResourceName();
+    if (!resource_name.IsEmpty()) {
+      out->script_resource_name = napi_v8_wrap_value(env, resource_name);
+      if (out->script_resource_name == nullptr) return napi_generic_failure;
+    }
+
+    out->line_number = message->GetLineNumber(context).FromMaybe(0);
+    out->start_column = message->GetStartColumn(context).FromMaybe(0);
+    out->end_column =
+        message->GetEndColumn(context).FromMaybe(out->start_column + 1);
+
+    if (mode == unofficial_napi_error_metadata_positions_only) return napi_ok;
+
+    napi_status status = WrapUtf8String(
+        env, GetErrorSourceLineForStderrImpl(env, message), &out->stderr_line);
+    if (status != napi_ok) return status;
   }
 
+  v8::Local<v8::StackTrace> stack = message->GetStackTrace();
+  if (!stack.IsEmpty() && stack->GetFrameCount() > 0) {
+    napi_status status = WrapUtf8String(
+        env, "Thrown at:\n" + FormatStackTrace(isolate, stack), &out->thrown_at);
+    if (status != napi_ok) return status;
+  }
   return napi_ok;
 }
 
@@ -454,111 +485,6 @@ void ResetErrorFormattingState(napi_env env) {
   ClearPreservedErrorFormatting(&it->second);
   it->second.get_source_map_error_source.Reset();
   g_error_formatting_states.erase(it);
-}
-
-napi_status GetErrorSourcePositions(napi_env env,
-                                    napi_value error,
-                                    unofficial_napi_error_source_positions* out) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr || out == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  out->source_line = nullptr;
-  out->script_resource_name = nullptr;
-  out->line_number = 0;
-  out->start_column = 0;
-  out->end_column = 0;
-
-  v8::Isolate* isolate = env->isolate;
-  v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
-  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
-
-  v8::Local<v8::Message> msg = GetMessageFromError(env, error);
-  if (msg.IsEmpty()) return napi_generic_failure;
-
-  v8::Local<v8::String> source_line;
-  if (!msg->GetSourceLine(context).ToLocal(&source_line)) {
-    return napi_generic_failure;
-  }
-
-  int line_number = 0;
-  if (!msg->GetLineNumber(context).To(&line_number)) {
-    return napi_generic_failure;
-  }
-
-  out->source_line = napi_v8_wrap_value(env, source_line);
-  if (out->source_line == nullptr) return napi_generic_failure;
-
-  v8::Local<v8::Value> resource_name = msg->GetScriptOrigin().ResourceName();
-  out->script_resource_name = napi_v8_wrap_value(env, resource_name);
-  if (out->script_resource_name == nullptr) return napi_generic_failure;
-
-  out->line_number = line_number;
-  out->start_column = msg->GetStartColumn(context).FromMaybe(0);
-  out->end_column = msg->GetEndColumn(context).FromMaybe(out->start_column + 1);
-  return napi_ok;
-}
-
-napi_status GetErrorSourceLineForStderr(napi_env env,
-                                        napi_value error,
-                                        napi_value* result_out) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr ||
-      result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  *result_out = nullptr;
-  v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope scope(isolate);
-  v8::Local<v8::Message> message = GetMessageFromError(env, error);
-  if (message.IsEmpty()) return napi_generic_failure;
-
-  const std::string formatted = GetErrorSourceLineForStderrImpl(env, message);
-  if (formatted.empty()) return napi_ok;
-
-  v8::Local<v8::String> out;
-  if (!v8::String::NewFromUtf8(
-           isolate,
-           formatted.c_str(),
-           v8::NewStringType::kNormal,
-           static_cast<int>(formatted.size()))
-           .ToLocal(&out)) {
-    return napi_generic_failure;
-  }
-  *result_out = napi_v8_wrap_value(env, scope.Escape(out));
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
-napi_status GetErrorThrownAt(napi_env env,
-                             napi_value error,
-                             napi_value* result_out) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr ||
-      result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  *result_out = nullptr;
-  v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope scope(isolate);
-  v8::Local<v8::Message> message = GetMessageFromError(env, error);
-  if (message.IsEmpty()) return napi_generic_failure;
-
-  v8::Local<v8::StackTrace> stack = message->GetStackTrace();
-  if (stack.IsEmpty() || stack->GetFrameCount() == 0) return napi_ok;
-
-  const std::string thrown_at = "Thrown at:\n" + FormatStackTrace(isolate, stack);
-  v8::Local<v8::String> out;
-  if (!v8::String::NewFromUtf8(
-           isolate,
-           thrown_at.c_str(),
-           v8::NewStringType::kNormal,
-           static_cast<int>(thrown_at.size()))
-           .ToLocal(&out)) {
-    return napi_generic_failure;
-  }
-  *result_out = napi_v8_wrap_value(env, scope.Escape(out));
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 }  // namespace unofficial_napi_internal

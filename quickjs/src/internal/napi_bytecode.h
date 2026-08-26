@@ -153,6 +153,15 @@ namespace quickjs::detail
         // cjs_function -> the compiled function; module -> the module value.
         JSValue artifact = JS_UNDEFINED;
     };
+
+    inline napi_bytecode_record__ *napi_bytecode_record_from_source(
+        const unofficial_napi_js_source *source)
+    {
+        return source != nullptr &&
+                       source->kind == unofficial_napi_js_source_bytecode
+                   ? reinterpret_cast<napi_bytecode_record__ *>(source->bytecode)
+                   : nullptr;
+    }
 }
 
 #endif  // NAPI_QUICKJS_INTERNAL_NAPI_BYTECODE_H_

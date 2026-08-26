@@ -84,6 +84,23 @@ static napi_value GetPropertyNames(napi_env env, napi_callback_info info) {
   return output;
 }
 
+static napi_value GetOwnPropertyNamesKeepNumbers(napi_env env,
+                                                 napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  NODE_API_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+
+  NODE_API_ASSERT(env, argc >= 1, "Wrong number of arguments");
+
+  napi_value output;
+  NODE_API_CALL(env,
+      napi_get_all_property_names(
+          env, args[0], napi_key_own_only, napi_key_skip_symbols,
+          napi_key_keep_numbers, &output));
+
+  return output;
+}
+
 static napi_value GetSymbolNames(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -807,6 +824,8 @@ napi_value Init(napi_env env, napi_value exports) {
       DECLARE_NODE_API_PROPERTY("Get", Get),
       DECLARE_NODE_API_PROPERTY("GetNamed", GetNamed),
       DECLARE_NODE_API_PROPERTY("GetPropertyNames", GetPropertyNames),
+      DECLARE_NODE_API_PROPERTY("GetOwnPropertyNamesKeepNumbers",
+                                GetOwnPropertyNamesKeepNumbers),
       DECLARE_NODE_API_PROPERTY("GetSymbolNames", GetSymbolNames),
       DECLARE_NODE_API_PROPERTY("GetEnumerableWritableNames",
                                 GetEnumerableWritableNames),

@@ -13,6 +13,9 @@ pub type SnapiEnv = *mut SnapiEnvState;
 
 #[repr(C)]
 pub struct SnapiUnofficialHeapStatistics {
+    pub size: u32,
+    pub version: u32,
+    pub valid_fields: u64,
     pub total_heap_size: u64,
     pub total_heap_size_executable: u64,
     pub total_physical_size: u64,
@@ -27,6 +30,7 @@ pub struct SnapiUnofficialHeapStatistics {
     pub total_global_handles_size: u64,
     pub used_global_handles_size: u64,
     pub external_memory: u64,
+    pub array_buffer_memory: u64,
 }
 
 #[repr(C)]
@@ -48,7 +52,10 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
-    pub fn snapi_bridge_unofficial_set_flags_from_string(flags: *const i8, length: u32) -> i32;
+    pub fn snapi_bridge_unofficial_configure_runtime(
+        engine_flags: *const i8,
+        engine_flags_length: u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
@@ -56,6 +63,8 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_create_env_with_options(
         module_api_version: i32,
+        total_memory: u64,
+        constrained_memory: u64,
         max_young_generation_size_in_bytes: u32,
         max_old_generation_size_in_bytes: u32,
         code_range_size_in_bytes: u32,
@@ -63,10 +72,9 @@ unsafe extern "C" {
         guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_set_embedder_hooks(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
-    pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
         env: SnapiEnv,
         mode: i32,
@@ -88,7 +96,6 @@ unsafe extern "C" {
         guest_ptr_out: *mut u32,
         recyclable_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_request_gc_for_testing(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
         env: SnapiEnv,
         callback_id: u32,
@@ -107,8 +114,6 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    #[allow(dead_code)]
-    pub fn snapi_bridge_unofficial_set_stack_limit(env: SnapiEnv, stack_limit: u32) -> i32;
     /// Register a host-owned near-heap-limit callback that charges V8 heap
     /// growth against the resource budget. `data` is an
     /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
@@ -120,17 +125,6 @@ unsafe extern "C" {
     /// registrations) this env may hold, bounding host-side bookkeeping RSS.
     /// `limit == 0` means unlimited.
     pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
-    #[allow(dead_code)]
-    pub fn snapi_bridge_unofficial_set_near_heap_limit_callback(
-        env: SnapiEnv,
-        callback_id: u32,
-        data: u32,
-    ) -> i32;
-    #[allow(dead_code)]
-    pub fn snapi_bridge_unofficial_remove_near_heap_limit_callback(
-        env: SnapiEnv,
-        heap_limit: u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -154,15 +148,6 @@ unsafe extern "C" {
         env: SnapiEnv,
         frames: u32,
         callsites_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_current_stack_trace(
-        env: SnapiEnv,
-        frames: u32,
-        callsites_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_caller_location(
-        env: SnapiEnv,
-        location_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_arraybuffer_view_has_buffer(
         env: SnapiEnv,
@@ -188,11 +173,11 @@ unsafe extern "C" {
         env: SnapiEnv,
         value_id: u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_set_enqueue_foreground_task_callback(env: SnapiEnv) -> i32;
-    pub fn snapi_bridge_unofficial_set_fatal_error_callbacks(
+    pub fn snapi_bridge_unofficial_attach_env(
         env: SnapiEnv,
         fatal_callback_id: u32,
         oom_callback_id: u32,
+        accepted_hooks_out: *mut u64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
@@ -206,43 +191,23 @@ unsafe extern "C" {
         filter_bits: u32,
         out_id: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_get_process_memory_info(
-        env: SnapiEnv,
-        heap_total_out: *mut f64,
-        heap_used_out: *mut f64,
-        external_out: *mut f64,
-        array_buffers_out: *mut f64,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_source_positions(
+    pub fn snapi_bridge_unofficial_get_error_metadata(
         env: SnapiEnv,
         error_id: u32,
+        mode: i32,
         source_line_out: *mut u32,
         script_resource_name_out: *mut u32,
+        stderr_line_out: *mut u32,
+        thrown_at_out: *mut u32,
         line_number_out: *mut i32,
         start_column_out: *mut i32,
         end_column_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_set_source_maps_enabled(env: SnapiEnv, enabled: i32) -> i32;
-    pub fn snapi_bridge_unofficial_set_get_source_map_error_source_callback(
+    pub fn snapi_bridge_unofficial_configure_source_maps(
         env: SnapiEnv,
+        enabled: i32,
         callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_source_line_for_stderr(
-        env: SnapiEnv,
-        error_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_get_error_thrown_at(
-        env: SnapiEnv,
-        error_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_take_preserved_error_formatting(
-        env: SnapiEnv,
-        error_id: u32,
-        source_line_out: *mut u32,
-        thrown_at_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_preserve_error_source_message(
         env: SnapiEnv,
@@ -253,65 +218,51 @@ unsafe extern "C" {
         env: SnapiEnv,
         stats_out: *mut SnapiUnofficialHeapStatistics,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_get_heap_space_count(env: SnapiEnv, count_out: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_get_heap_space_statistics(
         env: SnapiEnv,
-        space_index: u32,
         stats_out: *mut SnapiUnofficialHeapSpaceStatistics,
+        capacity: u32,
+        count_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_heap_code_statistics(
         env: SnapiEnv,
         stats_out: *mut SnapiUnofficialHeapCodeStatistics,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_start_cpu_profile(
+    pub fn snapi_bridge_unofficial_profile_start(
         env: SnapiEnv,
+        kind: i32,
         result_out: *mut i32,
-        profile_id_out: *mut u32,
+        profile_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_stop_cpu_profile(
+    pub fn snapi_bridge_unofficial_profile_stop(
         env: SnapiEnv,
-        profile_id: u32,
-        found_out: *mut i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_start_heap_profile(env: SnapiEnv, started_out: *mut i32) -> i32;
-    pub fn snapi_bridge_unofficial_stop_heap_profile(
-        env: SnapiEnv,
-        found_out: *mut i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
+        profile: u32,
+        json_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_take_heap_snapshot(
         env: SnapiEnv,
         expose_internals: i32,
         expose_numeric_values: i32,
-        json_out: *mut u64,
-        json_len_out: *mut u32,
+        json_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_free_buffer(data: *mut c_void);
+    pub fn snapi_bridge_free_buffer(data: *mut c_void);
     pub fn snapi_bridge_unofficial_structured_clone(
-        env: SnapiEnv,
-        value_id: u32,
-        out_id: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_structured_clone_with_transfer(
         env: SnapiEnv,
         value_id: u32,
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_serialize_value(
+    pub fn snapi_bridge_unofficial_message_create(
         env: SnapiEnv,
         value_id: u32,
         payload_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_deserialize_value(
+    pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,
         payload: u32,
         value_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_release_serialized_value(payload: u32);
+    pub fn snapi_bridge_unofficial_message_drop(payload: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(
@@ -348,10 +299,6 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_dispose_context(
-        env: SnapiEnv,
-        sandbox_or_context_global_id: u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_compile_function(
         env: SnapiEnv,
         source_text_id: u32,
@@ -365,16 +312,7 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_compile_function_for_cjs_loader(
-        env: SnapiEnv,
-        source_text_id: u32,
-        source_bytecode_id: u32,
-        filename_id: u32,
-        is_sea_main: i32,
-        should_detect_module: i32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_bytecode_compile(
+    pub fn snapi_bridge_unofficial_bytecode_open(
         env: SnapiEnv,
         source_text_id: u32,
         filename_id: u32,
@@ -383,20 +321,13 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         line_offset: i32,
         column_offset: i32,
+        cache_bytes: *const u8,
+        cache_byte_length: usize,
+        has_cache: u8,
+        cache_policy: u8,
         bytecode_out: *mut u32,
+        cache_rejected_out: *mut u8,
         can_parse_as_module_out: *mut u8,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_bytecode_deserialize(
-        env: SnapiEnv,
-        bytes: *const u8,
-        byte_length: usize,
-        source_text_id: u32,
-        filename_id: u32,
-        shape: i32,
-        params_id: u32,
-        host_defined_option_id: u32,
-        bytecode_out: *mut u32,
-        rejected_out: *mut u8,
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_serialize(
         env: SnapiEnv,
@@ -404,20 +335,9 @@ unsafe extern "C" {
         buffer_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_release(env: SnapiEnv, bytecode_id: u32) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
+    pub fn snapi_bridge_unofficial_module_wrap_create(
         env: SnapiEnv,
-        result_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
-        env: SnapiEnv,
-        had_pending_signal_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
-        env: SnapiEnv,
-        result_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_create_source_text(
-        env: SnapiEnv,
+        kind: i32,
         wrapper_id: u32,
         url_id: u32,
         context_id: u32,
@@ -426,23 +346,13 @@ unsafe extern "C" {
         line_offset: i32,
         column_offset: i32,
         host_defined_option_id: u32,
-        handle_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_create_synthetic(
-        env: SnapiEnv,
-        wrapper_id: u32,
-        url_id: u32,
-        context_id: u32,
         export_names_id: u32,
         synthetic_eval_steps_id: u32,
         handle_out: *mut u32,
+        requests_out: *mut u32,
+        has_top_level_await_out: *mut u8,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_destroy(env: SnapiEnv, handle_id: u32) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_get_module_requests(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_link(
         env: SnapiEnv,
         handle_id: u32,
@@ -469,29 +379,16 @@ unsafe extern "C" {
         handle_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_get_status(
+    pub fn snapi_bridge_unofficial_module_wrap_get_state(
         env: SnapiEnv,
         handle_id: u32,
         status_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_get_error(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_has_top_level_await(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut i32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_has_async_graph(
-        env: SnapiEnv,
-        handle_id: u32,
-        result_out: *mut i32,
+        error_out: *mut u32,
+        has_async_graph_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
         env: SnapiEnv,
-        module_wrap_id: u32,
+        handle_id: u32,
         warnings: i32,
         settled_out: *mut i32,
     ) -> i32;
@@ -516,19 +413,10 @@ unsafe extern "C" {
         handle_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_set_import_module_dynamically_callback(
+    pub fn snapi_bridge_unofficial_module_wrap_set_hooks(
         env: SnapiEnv,
-        callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_set_initialize_import_meta_object_callback(
-        env: SnapiEnv,
-        callback_id: u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_module_wrap_import_module_dynamically(
-        env: SnapiEnv,
-        argc: u32,
-        argv_ids: *const u32,
-        result_out: *mut u32,
+        import_callback_id: u32,
+        import_meta_callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_required_module_facade(
         env: SnapiEnv,

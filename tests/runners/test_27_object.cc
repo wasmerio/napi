@@ -200,6 +200,19 @@ assert.deepStrictEqual(__to.GetEnumerableWritableNames(pnObj), ['5','normal','wr
 assert.deepStrictEqual(__to.GetOwnWritableNames(pnObj), ['5','normal','unenumerable','writable',fooSymbol]);
 assert.deepStrictEqual(__to.GetEnumerableConfigurableNames(pnObj), ['5','normal','configurable',fooSymbol,'inherited']);
 assert.deepStrictEqual(__to.GetOwnConfigurableNames(pnObj), ['5','normal','unenumerable','configurable',fooSymbol]);
+
+const keepNumbers = {};
+keepNumbers[0] = 'zero';
+keepNumbers[42] = 'forty-two';
+keepNumbers[4294967294] = 'max-array-index';
+keepNumbers['01'] = 'leading-zero';
+keepNumbers['-0'] = 'negative-zero';
+keepNumbers['1.0'] = 'decimal';
+keepNumbers['4294967295'] = 'past-array-index';
+keepNumbers.normal = true;
+assert.deepStrictEqual(__to.GetOwnPropertyNamesKeepNumbers(keepNumbers),
+                       [0, 42, 4294967294, '01', '-0', '1.0',
+                        '4294967295', 'normal']);
 })();
 )JS", "test_27_object"));
 }

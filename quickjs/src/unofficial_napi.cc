@@ -16,14 +16,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace quickjs::detail;
 
+// QuickJS does not allocate ArrayBuffer backing stores from the guest heap,
+// but create_env still owns a supplied context according to the common
+// provider contract. The weak fallback keeps native embedders linkable.
+extern "C" __attribute__((weak)) void napi_host_guest_heap_release(
+    void * /*ctx*/) {}
+
 namespace
 {
+    std::mutex g_runtime_config_mutex;
+    bool g_runtime_configured = false;
+    std::string g_runtime_engine_flags;
+
     struct UnofficialEnvScope
     {
         JSRuntime *rt = nullptr;
@@ -43,12 +54,12 @@ namespace
         return napi_ok;
     }
 
-    napi_status ReleaseEnvScope(void *scope_ptr)
+    napi_status ReleaseEnvScope(unofficial_napi_env_owner owner)
     {
-        if (scope_ptr == nullptr)
+        if (owner == nullptr)
             return napi_invalid_arg;
 
-        auto *scope = static_cast<UnofficialEnvScope *>(scope_ptr);
+        auto *scope = reinterpret_cast<UnofficialEnvScope *>(owner);
         napi_status status = napi_ok;
         napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)
@@ -130,6 +141,31 @@ namespace
 
 extern "C"
 {
+    napi_status NAPI_CDECL unofficial_napi_configure_runtime(
+        const unofficial_napi_runtime_options *options)
+    {
+        if (options != nullptr &&
+            (options->size < sizeof(unofficial_napi_runtime_options) ||
+             options->version != UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION ||
+             (options->engine_flags_length > 0 && options->engine_flags == nullptr)))
+            return napi_invalid_arg;
+
+        const char *flags = options != nullptr && options->engine_flags_length > 0
+                                ? options->engine_flags
+                                : "";
+        const size_t flags_length = options != nullptr ? options->engine_flags_length : 0;
+        std::lock_guard<std::mutex> lock(g_runtime_config_mutex);
+        if (g_runtime_configured)
+            return g_runtime_engine_flags.size() == flags_length &&
+                           (flags_length == 0 ||
+                            std::memcmp(g_runtime_engine_flags.data(), flags, flags_length) == 0)
+                       ? napi_ok
+                       : napi_invalid_arg;
+        g_runtime_engine_flags.assign(flags, flags_length);
+        g_runtime_configured = true;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
         napi_env env, napi_typedarray_type type, size_t length, void **data, napi_value *result)
     {
@@ -193,21 +229,43 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
-                                                      napi_env *env_out,
-                                                      void **scope_out)
-    {
-        return unofficial_napi_create_env_with_options(module_api_version, nullptr, env_out, scope_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
+    napi_status NAPI_CDECL unofficial_napi_create_env(
         int32_t module_api_version,
         const unofficial_napi_env_create_options *options,
         napi_env *env_out,
-        void **scope_out)
+        unofficial_napi_env_owner *owner_out)
     {
-        if (env_out == nullptr || scope_out == nullptr)
+        if (options != nullptr &&
+            (options->size < sizeof(unofficial_napi_env_create_options) ||
+             options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION))
+        {
+            // A truncated descriptor cannot transfer ownership of a field it
+            // does not contain.
             return napi_invalid_arg;
+        }
+
+        unofficial_napi_guest_heap guest_heap =
+            options != nullptr ? options->guest_heap : nullptr;
+        if (env_out == nullptr || owner_out == nullptr)
+        {
+            if (guest_heap != nullptr)
+                napi_host_guest_heap_release(guest_heap);
+            return napi_invalid_arg;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_runtime_config_mutex);
+            if (!g_runtime_configured)
+            {
+                if (guest_heap != nullptr)
+                    napi_host_guest_heap_release(guest_heap);
+                return napi_invalid_arg;
+            }
+        }
+
+        // QuickJS does not allocate backing stores from the guest heap, so it
+        // consumes the transferred context immediately.
+        if (guest_heap != nullptr)
+            napi_host_guest_heap_release(guest_heap);
 
         auto rt = JS_NewRuntime();
         if (rt == nullptr)
@@ -244,92 +302,42 @@ extern "C"
             return (status == napi_ok) ? napi_generic_failure : status;
         }
 
-        *scope_out = reinterpret_cast<void *>(scope);
+        *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
         *env_out = scope->env;
 
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
-        const unofficial_napi_embedder_hooks *hooks)
-    {
-        (void)hooks;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void *environment)
-    {
-        (void)environment;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_status NAPI_CDECL unofficial_napi_attach_env(
         napi_env env,
-        unofficial_napi_env_cleanup_callback callback,
-        void *data)
+        const unofficial_napi_env_hooks *hooks,
+        uint64_t *accepted_hooks_out)
     {
-        (void)callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
+        if (!napi_util__::check_env(env) || hooks == nullptr || accepted_hooks_out == nullptr ||
+            hooks->size < sizeof(unofficial_napi_env_hooks) ||
+            hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
+            !env->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
+        // QuickJS currently drives none of the remaining provider-owned hook
+        // classes. Attaching the transaction is valid, but no capability is
+        // advertised until the corresponding engine callback exists.
+        *accepted_hooks_out = 0;
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
-        napi_env env,
-        unofficial_napi_env_destroy_callback callback,
-        void *data)
-    {
-        (void)callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
-        napi_env env,
-        unofficial_napi_context_token_callback assign_callback,
-        unofficial_napi_context_token_callback unassign_callback,
-        void *data)
-    {
-        (void)assign_callback;
-        (void)unassign_callback;
-        (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_release_env(void *scope)
-    {
-        return ReleaseEnvScope(scope);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_release_env_with_loop(
-        void *scope,
+    napi_status NAPI_CDECL unofficial_napi_release_env(
+        unofficial_napi_env_owner owner,
         struct uv_loop_s *loop)
     {
         (void)loop;
-        return ReleaseEnvScope(scope);
+        return ReleaseEnvScope(owner);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_low_memory_notification(napi_env env)
+    napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env)
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         JS_RunGC(napi_util__::runtime(env));
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
-        const char *flags,
-        size_t length)
-    {
-        (void)flags;
-        (void)length;
         return napi_ok;
     }
 
@@ -341,11 +349,6 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env)
-    {
-        return unofficial_napi_low_memory_notification(env);
     }
 
     napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
@@ -417,18 +420,6 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
-        napi_env env,
-        unofficial_napi_enqueue_foreground_task_callback callback,
-        void *target)
-    {
-        (void)callback;
-        (void)target;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback)
     {
         if (!napi_util__::check_env(env) || !napi_util__::is_callable(env, callback))
@@ -467,45 +458,19 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
+    napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
         napi_env env,
-        unofficial_napi_fatal_error_callback fatal_callback,
-        unofficial_napi_oom_error_callback oom_callback)
+        unofficial_napi_near_heap_limit_callback callback_or_null,
+        void *data,
+        size_t restored_heap_limit)
     {
-        (void)fatal_callback;
-        (void)oom_callback;
-        if (!napi_util__::check_env(env))
+        if (!napi_util__::check_env(env) ||
+            (callback_or_null != nullptr && restored_heap_limit != 0) ||
+            (callback_or_null == nullptr && data != nullptr))
             return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_near_heap_limit_callback(
-        napi_env env,
-        unofficial_napi_near_heap_limit_callback callback,
-        void *data)
-    {
-        (void)callback;
+        (void)callback_or_null;
         (void)data;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
-        napi_env env,
-        size_t heap_limit)
-    {
-        (void)heap_limit;
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_stack_limit(napi_env env, void *stack_limit)
-    {
-        (void)stack_limit;
-        if (!napi_util__::check_env(env) || stack_limit == nullptr)
-            return napi_invalid_arg;
+        (void)restored_heap_limit;
         return napi_ok;
     }
 
@@ -532,12 +497,13 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
+    napi_status NAPI_CDECL unofficial_napi_get_error_metadata(
         napi_env env,
         napi_value error,
-        unofficial_napi_error_source_positions *out)
+        unofficial_napi_error_metadata_mode mode,
+        unofficial_napi_error_metadata *out)
     {
-        return napi_util__::check_env(env) ? env->contextify().get_error_source_positions(error, out) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->contextify().get_error_metadata(error, mode, out) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
@@ -547,43 +513,12 @@ extern "C"
         return napi_util__::check_env(env) ? env->contextify().preserve_error_source_message(error) : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_set_source_maps_enabled(
+    napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
         napi_env env,
-        bool enabled)
-    {
-        return napi_util__::check_env(env) ? env->contextify().set_source_maps_enabled(enabled) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_set_get_source_map_error_source_callback(
-        napi_env env,
+        bool enabled,
         napi_value callback)
     {
-        return napi_util__::check_env(env) ? env->contextify().set_get_source_map_error_source_callback(callback) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
-        napi_env env,
-        napi_value error,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().get_error_source_line_for_stderr(error, result_out) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_error_thrown_at(
-        napi_env env,
-        napi_value error,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().get_error_thrown_at(error, result_out) : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_take_preserved_error_formatting(
-        napi_env env,
-        napi_value error,
-        napi_value *source_line_out,
-        napi_value *thrown_at_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().take_preserved_error_formatting(error, source_line_out, thrown_at_out) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->contextify().configure_source_maps(enabled, callback) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
@@ -665,19 +600,6 @@ extern "C"
         return napi_callsite__::get_call_sites(env, frames, callsites_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
-                                                                   uint32_t frames,
-                                                                   napi_value *callsites_out)
-    {
-        return napi_callsite__::get_current_stack_trace(env, frames, callsites_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env,
-                                                               napi_value *location_out)
-    {
-        return napi_callsite__::get_caller_location(env, location_out);
-    }
-
     napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                        napi_value value,
                                                                        bool *result_out)
@@ -707,106 +629,6 @@ extern "C"
         if (JS_IsException(name))
             return napi_pending_exception;
         return napi_util__::wrap_owned(env, name, name_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
-        napi_env env,
-        napi_value value,
-        uint32_t filter_bits,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
-            return napi_invalid_arg;
-        JSContext *ctx = napi_util__::context(env);
-        JSValue obj = napi_quickjs_value_inner(env, value);
-        if (!JS_IsObject(obj))
-            return napi_object_expected;
-
-        auto is_array_index_atom = [&](JSAtom atom) -> bool
-        {
-            size_t len = 0;
-            const char *name = JS_AtomToCStringLen(ctx, &len, atom);
-            if (name == nullptr)
-                return false;
-            bool is_index = false;
-            if (len > 0 && len <= 10)
-            {
-                uint64_t index = 0;
-                is_index = true;
-                for (size_t i = 0; i < len; ++i)
-                {
-                    if (name[i] < '0' || name[i] > '9')
-                    {
-                        is_index = false;
-                        break;
-                    }
-                    if (i == 0 && len > 1 && name[i] == '0')
-                    {
-                        is_index = false;
-                        break;
-                    }
-                    index = index * 10 + static_cast<uint64_t>(name[i] - '0');
-                }
-                if (is_index && index > 4294967294ULL)
-                    is_index = false;
-            }
-            JS_FreeCString(ctx, name);
-            return is_index;
-        };
-
-        int gpn_flags = napi_util__::key_filter_to_gpn(static_cast<napi_key_filter>(filter_bits));
-        JSPropertyEnum *props = nullptr;
-        uint32_t prop_count = 0;
-        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, obj, gpn_flags) < 0)
-            return napi_util__::return_pending_if_caught(env, "Exception while getting property names");
-
-        JSValue out = JS_NewArray(ctx);
-        uint32_t out_idx = 0;
-
-        for (uint32_t i = 0; i < prop_count; ++i)
-        {
-            if (is_array_index_atom(props[i].atom))
-                continue;
-
-            if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
-            {
-                JSPropertyDescriptor desc;
-                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
-                if (has < 0)
-                {
-                    JS_FreePropertyEnum(ctx, props, prop_count);
-                    JS_FreeValue(ctx, out);
-                    return napi_util__::return_pending_if_caught(env, "Exception while filtering property names");
-                }
-                if (has == 0)
-                    continue;
-
-                bool include = true;
-                if ((filter_bits & napi_key_writable) != 0 && (desc.flags & JS_PROP_WRITABLE) == 0)
-                    include = false;
-                if ((filter_bits & napi_key_configurable) != 0 && (desc.flags & JS_PROP_CONFIGURABLE) == 0)
-                    include = false;
-
-                JS_FreeValue(ctx, desc.value);
-                JS_FreeValue(ctx, desc.getter);
-                JS_FreeValue(ctx, desc.setter);
-
-                if (!include)
-                    continue;
-            }
-
-            JSValue key = JS_AtomToValue(ctx, props[i].atom);
-            if (JS_IsException(key))
-            {
-                JS_FreePropertyEnum(ctx, props, prop_count);
-                JS_FreeValue(ctx, out);
-                return napi_util__::return_pending_if_caught(env, "Failed to convert property name");
-            }
-            JS_SetPropertyUint32(ctx, out, out_idx++, key);
-        }
-
-        JS_FreePropertyEnum(ctx, props, prop_count);
-        return napi_util__::wrap_owned(env, out, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
@@ -878,59 +700,149 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_structured_clone(
         napi_env env,
         napi_value value,
-        napi_value *result_out)
-    {
-        return QuickJSStructuredClone(env, value, nullptr, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
-        napi_env env,
-        napi_value value,
         napi_value transfer_list_or_null,
         napi_value *result_out)
     {
         return QuickJSStructuredClone(env, value, transfer_list_or_null, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_serialize_value(
+    napi_status NAPI_CDECL unofficial_napi_message_create(
         napi_env env,
         napi_value value,
-        void **payload_out)
+        unofficial_napi_message *message_out)
     {
-        return napi_serdes__::serialize_value(env, value, payload_out);
+        return napi_serdes__::serialize_value(
+            env, value, reinterpret_cast<void **>(message_out));
     }
 
-    napi_status NAPI_CDECL unofficial_napi_deserialize_value(
+    napi_status NAPI_CDECL unofficial_napi_message_take(
         napi_env env,
-        void *payload,
+        unofficial_napi_message message,
         napi_value *result_out)
     {
-        return napi_serdes__::deserialize_value(env, payload, result_out);
-    }
-
-    void NAPI_CDECL unofficial_napi_release_serialized_value(void *payload)
-    {
-        napi_serdes__::release_serialized_value(payload);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(
-        napi_env env,
-        double *heap_total_out,
-        double *heap_used_out,
-        double *external_out,
-        double *array_buffers_out)
-    {
-        if (!napi_util__::check_env(env) || heap_total_out == nullptr || heap_used_out == nullptr ||
-            external_out == nullptr || array_buffers_out == nullptr)
+        if (message == nullptr)
             return napi_invalid_arg;
+        struct MessageGuard
+        {
+            void *payload;
+            ~MessageGuard() { napi_serdes__::release_serialized_value(payload); }
+        } guard{reinterpret_cast<void *>(message)};
+        return napi_serdes__::deserialize_value(env, guard.payload, result_out);
+    }
 
-        JSMemoryUsage usage{};
-        JS_ComputeMemoryUsage(napi_util__::runtime(env), &usage);
-        *heap_total_out = static_cast<double>(usage.malloc_size);
-        *heap_used_out = static_cast<double>(usage.memory_used_size);
-        *external_out = static_cast<double>(usage.binary_object_size);
-        *array_buffers_out = static_cast<double>(usage.binary_object_size);
-        return napi_ok;
+    void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message)
+    {
+        napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
+        napi_env env,
+        napi_value value,
+        uint32_t filter_bits,
+        napi_value *result_out)
+    {
+        if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
+            return napi_invalid_arg;
+        JSContext *ctx = napi_util__::context(env);
+        JSValue obj = napi_quickjs_value_inner(env, value);
+        if (!JS_IsObject(obj))
+            return napi_object_expected;
+
+        auto string_is_array_index = [&](JSValue key) -> bool
+        {
+            size_t len = 0;
+            const char *name = JS_ToCStringLen(ctx, &len, key);
+            if (name == nullptr)
+                return false;
+            bool is_index = len > 0 && len <= 10;
+            uint64_t index = 0;
+            for (size_t i = 0; is_index && i < len; ++i)
+            {
+                if (name[i] < '0' || name[i] > '9' ||
+                    (i == 0 && len > 1 && name[i] == '0'))
+                {
+                    is_index = false;
+                    break;
+                }
+                index = index * 10 + static_cast<uint64_t>(name[i] - '0');
+            }
+            JS_FreeCString(ctx, name);
+            return is_index && index <= 4294967294ULL;
+        };
+
+        const int gpn_flags = napi_util__::key_filter_to_gpn(
+            static_cast<napi_key_filter>(filter_bits));
+        JSPropertyEnum *props = nullptr;
+        uint32_t prop_count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, obj, gpn_flags) < 0)
+            return napi_util__::return_pending_if_caught(
+                env, "Exception while getting property names");
+
+        JSValue out = JS_NewArray(ctx);
+        uint32_t out_idx = 0;
+        for (uint32_t i = 0; i < prop_count; ++i)
+        {
+            JSValue key = JS_AtomToValue(ctx, props[i].atom);
+            if (JS_IsException(key))
+            {
+                JS_FreePropertyEnum(ctx, props, prop_count);
+                JS_FreeValue(ctx, out);
+                return napi_util__::return_pending_if_caught(
+                    env, "Failed to convert property name");
+            }
+
+            // Dense integer property atoms become numbers, avoiding a CString
+            // allocation for every element. Only string atoms that could be
+            // larger uint32 indices need parsing.
+            const bool is_index = JS_IsNumber(key) ||
+                                  (JS_IsString(key) && string_is_array_index(key));
+            if (is_index)
+            {
+                JS_FreeValue(ctx, key);
+                continue;
+            }
+
+            if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
+            {
+                JSPropertyDescriptor desc;
+                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
+                if (has < 0)
+                {
+                    JS_FreeValue(ctx, key);
+                    JS_FreePropertyEnum(ctx, props, prop_count);
+                    JS_FreeValue(ctx, out);
+                    return napi_util__::return_pending_if_caught(
+                        env, "Exception while filtering property names");
+                }
+                if (has == 0)
+                {
+                    JS_FreeValue(ctx, key);
+                    continue;
+                }
+
+                bool include = true;
+                if ((filter_bits & napi_key_writable) != 0 &&
+                    (desc.flags & JS_PROP_WRITABLE) == 0)
+                    include = false;
+                if ((filter_bits & napi_key_configurable) != 0 &&
+                    (desc.flags & JS_PROP_CONFIGURABLE) == 0)
+                    include = false;
+
+                JS_FreeValue(ctx, desc.value);
+                JS_FreeValue(ctx, desc.getter);
+                JS_FreeValue(ctx, desc.setter);
+                if (!include)
+                {
+                    JS_FreeValue(ctx, key);
+                    continue;
+                }
+            }
+
+            JS_SetPropertyUint32(ctx, out, out_idx++, key);
+        }
+
+        JS_FreePropertyEnum(ctx, props, prop_count);
+        return napi_util__::wrap_owned(env, out, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
@@ -946,16 +858,25 @@ extern "C"
         napi_env env,
         unofficial_napi_heap_statistics *stats_out)
     {
-        if (!napi_util__::check_env(env) || stats_out == nullptr)
+        if (!napi_util__::check_env(env) || stats_out == nullptr ||
+            stats_out->size < sizeof(*stats_out) ||
+            stats_out->version != UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION)
             return napi_invalid_arg;
+        const uint32_t output_size = stats_out->size;
         std::memset(stats_out, 0, sizeof(*stats_out));
+        stats_out->size = output_size;
+        stats_out->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
         JSMemoryUsage usage{};
         JS_ComputeMemoryUsage(napi_util__::runtime(env), &usage);
         stats_out->total_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
         stats_out->used_heap_size = static_cast<uint64_t>(std::max<int64_t>(0, usage.memory_used_size));
         stats_out->malloced_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.malloc_size));
+        // QuickJS does not retain a historical allocator peak, but its current
+        // malloc size is still an honest lower bound and preserves the value
+        // exposed by the pre-consolidation process-memory operation.
         stats_out->peak_malloced_memory = stats_out->malloced_memory;
         stats_out->external_memory = static_cast<uint64_t>(std::max<int64_t>(0, usage.binary_object_size));
+        stats_out->array_buffer_memory = stats_out->external_memory;
 
         // heap_size_limit must never be reported as zero. Consumers read it as
         // "the ceiling this heap can grow to" and divide by it: Next.js uses
@@ -975,28 +896,30 @@ extern "C"
             stats_out->heap_size_limit > stats_out->used_heap_size
                 ? stats_out->heap_size_limit - stats_out->used_heap_size
                 : 0;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_get_heap_space_count(
-        napi_env env,
-        uint32_t *count_out)
-    {
-        if (!napi_util__::check_env(env) || count_out == nullptr)
-            return napi_invalid_arg;
-        *count_out = 1;
+        stats_out->valid_fields =
+            unofficial_napi_heap_stat_total_heap_size |
+            unofficial_napi_heap_stat_total_available_size |
+            unofficial_napi_heap_stat_used_heap_size |
+            unofficial_napi_heap_stat_heap_size_limit |
+            unofficial_napi_heap_stat_malloced_memory |
+            unofficial_napi_heap_stat_peak_malloced_memory |
+            unofficial_napi_heap_stat_external_memory |
+            unofficial_napi_heap_stat_array_buffer_memory;
         return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_heap_space_statistics(
         napi_env env,
-        uint32_t space_index,
-        unofficial_napi_heap_space_statistics *stats_out)
+        unofficial_napi_heap_space_statistics *stats_out,
+        uint32_t capacity,
+        uint32_t *count_out)
     {
-        if (!napi_util__::check_env(env) || stats_out == nullptr)
+        if (!napi_util__::check_env(env) || count_out == nullptr ||
+            (capacity > 0 && stats_out == nullptr))
             return napi_invalid_arg;
-        if (space_index != 0)
-            return napi_invalid_arg;
+        *count_out = 1;
+        if (capacity == 0)
+            return napi_ok;
         std::memset(stats_out, 0, sizeof(*stats_out));
         std::strncpy(stats_out->space_name, "quickjs", sizeof(stats_out->space_name) - 1);
         JSMemoryUsage usage{};
@@ -1021,75 +944,42 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_start_cpu_profile(
+    napi_status NAPI_CDECL unofficial_napi_profile_start(
         napi_env env,
-        unofficial_napi_cpu_profile_start_result *result_out,
-        uint32_t *profile_id_out)
+        unofficial_napi_profile_kind kind,
+        unofficial_napi_profile_start_result *result_out,
+        unofficial_napi_profile *profile_out)
     {
-        if (!napi_util__::check_env(env) || result_out == nullptr || profile_id_out == nullptr)
+        if (!napi_util__::check_env(env) || result_out == nullptr || profile_out == nullptr ||
+            (kind != unofficial_napi_profile_cpu && kind != unofficial_napi_profile_heap))
             return napi_invalid_arg;
-        *result_out = unofficial_napi_cpu_profile_start_ok;
-        *profile_id_out = 1;
+        // Unsupported providers leave outputs untouched on failure. Out
+        // parameters describe only successful calls; they are not a second,
+        // contradictory status channel.
         return napi_generic_failure;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
+    napi_status NAPI_CDECL unofficial_napi_profile_stop(
         napi_env env,
-        uint32_t profile_id,
-        bool *found_out,
-        char **json_out,
-        size_t *json_len_out)
+        unofficial_napi_profile profile,
+        napi_value *json_out)
     {
-        (void)profile_id;
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr || json_len_out == nullptr)
+        if (!napi_util__::check_env(env) || profile == nullptr || json_out == nullptr)
             return napi_invalid_arg;
-        *found_out = false;
         *json_out = nullptr;
-        *json_len_out = 0;
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
-        napi_env env,
-        bool *started_out)
-    {
-        if (!napi_util__::check_env(env) || started_out == nullptr)
-            return napi_invalid_arg;
-        *started_out = false;
         return napi_generic_failure;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
-        napi_env env,
-        bool *found_out,
-        char **json_out,
-        size_t *json_len_out)
-    {
-        if (!napi_util__::check_env(env) || found_out == nullptr || json_out == nullptr || json_len_out == nullptr)
-            return napi_invalid_arg;
-        *found_out = false;
-        *json_out = nullptr;
-        *json_len_out = 0;
-        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
         napi_env env,
         const unofficial_napi_heap_snapshot_options *options,
-        char **json_out,
-        size_t *json_len_out)
+        napi_value *json_out)
     {
         (void)options;
-        if (!napi_util__::check_env(env) || json_out == nullptr || json_len_out == nullptr)
+        if (!napi_util__::check_env(env) || json_out == nullptr)
             return napi_invalid_arg;
         *json_out = nullptr;
-        *json_len_out = 0;
         return napi_generic_failure;
-    }
-
-    void NAPI_CDECL unofficial_napi_free_buffer(void *data)
-    {
-        std::free(data);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(
@@ -1236,74 +1126,76 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_compile(
+    napi_status NAPI_CDECL unofficial_napi_bytecode_open(
         napi_env env,
-        napi_value source_text,
-        napi_value filename,
-        int32_t shape,
-        napi_value params_or_undefined,
-        napi_value host_defined_option_id,
-        int32_t line_offset,
-        int32_t column_offset,
-        void **bytecode_out,
-        bool *can_parse_as_module_out)
+        const unofficial_napi_bytecode_open_options *options,
+        unofficial_napi_bytecode_open_result *result)
     {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_compile(source_text,
-                                                                  filename,
-                                                                  shape,
-                                                                  params_or_undefined,
-                                                                  host_defined_option_id,
-                                                                  line_offset,
-                                                                  column_offset,
-                                                                  bytecode_out,
-                                                                  can_parse_as_module_out)
-                             : napi_invalid_arg;
-    }
+        if (!napi_util__::check_env(env) || options == nullptr || result == nullptr ||
+            options->size < sizeof(*options) ||
+            options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
+            options->source_text == nullptr || options->filename == nullptr ||
+            (options->cache_policy != unofficial_napi_bytecode_cache_compile_on_reject &&
+             options->cache_policy != unofficial_napi_bytecode_cache_validate_only))
+            return napi_invalid_arg;
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_deserialize(
-        napi_env env,
-        const uint8_t *bytes,
-        size_t byte_length,
-        napi_value source_text,
-        napi_value filename,
-        int32_t shape,
-        napi_value params_or_undefined,
-        napi_value host_defined_option_id,
-        void **bytecode_out,
-        bool *rejected_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_deserialize(bytes,
-                                                                      byte_length,
-                                                                      source_text,
-                                                                      filename,
-                                                                      shape,
-                                                                      params_or_undefined,
-                                                                      host_defined_option_id,
-                                                                      bytecode_out,
-                                                                      rejected_out)
-                             : napi_invalid_arg;
+        *result = {};
+        if (options->has_cache != 0 && options->cache_bytes != nullptr &&
+            options->cache_byte_length != 0)
+        {
+            bool rejected = false;
+            napi_status status = env->contextify().bytecode_deserialize(options->cache_bytes,
+                                                                        options->cache_byte_length,
+                                                                        options->source_text,
+                                                                        options->filename,
+                                                                        options->shape,
+                                                                        options->params_or_undefined,
+                                                                        options->host_defined_option_id,
+                                                                        &result->bytecode,
+                                                                        &rejected);
+            result->cache_rejected = rejected ? 1 : 0;
+            if (status != napi_ok)
+                return status;
+            if (result->bytecode != nullptr)
+                return napi_ok;
+            result->cache_rejected = 1;
+        }
+        else if (options->has_cache != 0)
+        {
+            result->cache_rejected = 1;
+        }
+
+        if (result->cache_rejected != 0 &&
+            options->cache_policy == unofficial_napi_bytecode_cache_validate_only)
+            return napi_ok;
+        bool can_parse_as_module = false;
+        napi_status status = env->contextify().bytecode_compile(options->source_text,
+                                                                options->filename,
+                                                                options->shape,
+                                                                options->params_or_undefined,
+                                                                options->host_defined_option_id,
+                                                                options->line_offset,
+                                                                options->column_offset,
+                                                                &result->bytecode,
+                                                                &can_parse_as_module);
+        result->can_parse_as_module = can_parse_as_module ? 1 : 0;
+        return status;
     }
 
     napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
         napi_env env,
-        void *bytecode,
+        unofficial_napi_bytecode bytecode,
         napi_value *buffer_out)
     {
         return napi_util__::check_env(env) ? env->contextify().bytecode_serialize(bytecode, buffer_out)
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_bytecode_release(napi_env env, void *bytecode)
+    napi_status NAPI_CDECL unofficial_napi_bytecode_release(
+        napi_env env, unofficial_napi_bytecode bytecode)
     {
         return napi_util__::check_env(env) ? env->contextify().bytecode_release(bytecode)
                              : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_contextify_dispose_context(
-        napi_env env,
-        napi_value sandbox_or_context_global)
-    {
-        return napi_util__::check_env(env) ? env->contextify().dispose_context(sandbox_or_context_global) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
@@ -1346,266 +1238,218 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
         napi_env env,
-        napi_value wrapper,
-        napi_value url,
-        napi_value context_or_undefined,
-        const unofficial_napi_js_source *source,
-        int32_t line_offset,
-        int32_t column_offset,
-        napi_value host_defined_option_id,
-        void **handle_out)
+        const unofficial_napi_module_create_options *options,
+        unofficial_napi_module_create_result *result_out)
     {
-        if (!napi_util__::check_env(env) || handle_out == nullptr)
+        if (!napi_util__::check_env(env) || options == nullptr ||
+            options->size < sizeof(*options) ||
+            options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
+            result_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_source_text(wrapper,
-                                                     url,
-                                                     context_or_undefined,
-                                                     source,
-                                                     line_offset,
-                                                     column_offset,
-                                                     host_defined_option_id,
-                                                     handle_out);
+        *result_out = {};
+        napi_status status = napi_invalid_arg;
+        switch (options->kind)
+        {
+        case unofficial_napi_module_source_text:
+            status = env->module_wrap().create_source_text(
+                options->wrapper,
+                options->url,
+                options->context_or_undefined,
+                options->payload.source_text.source,
+                options->payload.source_text.line_offset,
+                options->payload.source_text.column_offset,
+                options->payload.source_text.host_defined_option_id,
+                &result_out->module);
+            break;
+        case unofficial_napi_module_synthetic:
+            status = env->module_wrap().create_synthetic(
+                options->wrapper,
+                options->url,
+                options->context_or_undefined,
+                options->payload.synthetic.export_names,
+                options->payload.synthetic.synthetic_evaluation_steps,
+                &result_out->module);
+            break;
+        default:
+            return napi_invalid_arg;
+        }
+        if (status != napi_ok)
+            return status;
+        status = env->module_wrap().get_creation_metadata(
+            result_out->module,
+            &result_out->module_requests,
+            &result_out->has_top_level_await);
+        if (status != napi_ok)
+        {
+            env->module_wrap().destroy(result_out->module);
+            *result_out = {};
+        }
+        return status;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_create_synthetic(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
         napi_env env,
-        napi_value wrapper,
-        napi_value url,
-        napi_value context_or_undefined,
-        napi_value export_names,
-        napi_value synthetic_eval_steps,
-        void **handle_out)
-    {
-        if (!napi_util__::check_env(env) || handle_out == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().create_synthetic(wrapper,
-                                                   url,
-                                                   context_or_undefined,
-                                                   export_names,
-                                                   synthetic_eval_steps,
-                                                   handle_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(napi_env env, void *handle)
+        unofficial_napi_module module)
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        return env->module_wrap().destroy(handle);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_requests(
-        napi_env env,
-        void *handle,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().get_module_requests(handle, result_out);
+        return env->module_wrap().destroy(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         size_t count,
-        void *const *linked_handles)
+        const unofficial_napi_module *linked_modules)
     {
-        if (!napi_util__::check_env(env) || handle == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().link(handle, count, linked_handles);
+        return env->module_wrap().link(module, count, linked_modules);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(napi_env env, void *handle)
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
+        napi_env env,
+        unofficial_napi_module module)
     {
-        if (!napi_util__::check_env(env) || handle == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().instantiate(handle);
+        return env->module_wrap().instantiate(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         int64_t timeout,
         bool break_on_sigint,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate(handle, timeout, break_on_sigint, result_out);
+        return env->module_wrap().evaluate(module, timeout, break_on_sigint, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value filename,
         napi_value parent_filename,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate_sync(handle, filename, parent_filename, result_out);
+        return env->module_wrap().evaluate_sync(module, filename, parent_filename, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_namespace(handle, result_out);
+        return env->module_wrap().get_namespace(module, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_status(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
         napi_env env,
-        void *handle,
-        int32_t *status_out)
+        unofficial_napi_module module,
+        int32_t *status_out,
+        napi_value *error_out,
+        bool *has_async_graph_out)
     {
-        if (!napi_util__::check_env(env) || status_out == nullptr)
+        if (!napi_util__::check_env(env) ||
+            (status_out == nullptr && error_out == nullptr &&
+             has_async_graph_out == nullptr))
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_status(handle, status_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_get_error(
-        napi_env env,
-        void *handle,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().get_error(handle, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_has_top_level_await(
-        napi_env env,
-        void *handle,
-        bool *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().has_top_level_await(handle, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_has_async_graph(
-        napi_env env,
-        void *handle,
-        bool *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        if (handle == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().has_async_graph(handle, result_out);
+        return env->module_wrap().get_state(
+            module, status_out, error_out, has_async_graph_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_await(
         napi_env env,
-        napi_value module_wrap,
+        unofficial_napi_module module,
         bool warnings,
         bool *settled_out)
     {
-        if (!napi_util__::check_env(env) || settled_out == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr || settled_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().check_unsettled_top_level_await(module_wrap,
+        return env->module_wrap().check_unsettled_top_level_await(module,
                                                                   warnings,
                                                                   settled_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value export_name,
         napi_value export_value)
     {
-        if (!napi_util__::check_env(env) || handle == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_export(handle, export_name, export_value);
+        return env->module_wrap().set_export(module, export_name, export_value);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_module_source_object(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value source_object)
     {
-        if (!napi_util__::check_env(env) || handle == nullptr)
+        if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_module_source_object(handle, source_object);
+        return env->module_wrap().set_module_source_object(module, source_object);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_source_object(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_module_source_object(handle, result_out);
+        return env->module_wrap().get_module_source_object(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_cached_data(handle, result_out);
+        return env->module_wrap().create_cached_data(module, result_out);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_import_module_dynamically_callback(
+    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
         napi_env env,
-        napi_value callback)
+        const unofficial_napi_module_hooks *hooks)
     {
-        if (!napi_util__::check_env(env))
+        if (!napi_util__::check_env(env) || hooks == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_import_module_dynamically_callback(callback);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_set_initialize_import_meta_object_callback(
-        napi_env env,
-        napi_value callback)
-    {
-        if (!napi_util__::check_env(env))
-            return napi_invalid_arg;
-        return env->module_wrap().set_initialize_import_meta_object_callback(callback);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_module_wrap_import_module_dynamically(
-        napi_env env,
-        size_t argc,
-        napi_value *argv,
-        napi_value *result_out)
-    {
-        if (!napi_util__::check_env(env) || result_out == nullptr)
-            return napi_invalid_arg;
-        return env->module_wrap().import_module_dynamically(argc, argv, result_out);
+        return env->module_wrap().set_hooks(hooks);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(
         napi_env env,
-        void *handle,
+        unofficial_napi_module module,
         napi_value *result_out)
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        if (handle == nullptr)
+        if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_required_module_facade(handle, result_out);
+        return env->module_wrap().create_required_module_facade(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env)
