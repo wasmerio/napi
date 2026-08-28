@@ -8,14 +8,14 @@ use wasmer::{Module, Store};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_types::ModuleHash;
 use wasmer_wasix::{
-    os::{tty_sys::SysTty, TtyBridge},
+    Pipe, PluggableRuntime, WasiError,
+    os::{TtyBridge, tty_sys::SysTty},
     runners::wasi::{RuntimeOrEngine, WasiRunner},
     runtime::task_manager::tokio::TokioTaskManager,
-    Pipe, PluggableRuntime, WasiError,
 };
 
 use crate::{
-    budget::budgeted_tunables, budget::ResourceBudget, guest::napi::register_env_imports, NapiCtx,
+    NapiCtx, budget::ResourceBudget, budget::budgeted_tunables, guest::napi::register_env_imports,
 };
 use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 
