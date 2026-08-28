@@ -799,10 +799,10 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
 /// Build [`BudgetedTunables`] over the platform default base tunables.
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub fn budgeted_tunables(
-    target: &wasmer::sys::Target,
+    _target: &wasmer::sys::Target,
     budget: Arc<ResourceBudget>,
 ) -> BudgetedTunables<BaseTunables> {
-    BudgetedTunables::new(BaseTunables::for_target(target), budget)
+    BudgetedTunables::new(BaseTunables::new(), budget)
 }
 
 #[cfg(test)]
