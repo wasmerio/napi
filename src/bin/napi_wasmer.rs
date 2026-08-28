@@ -213,6 +213,35 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn retains_automatic_app_mount_without_covering_mount() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "napi-wasmer-remap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let script_path = test_dir.join("entry.mjs");
+        std::fs::write(&script_path, "").unwrap();
+
+        let mut guest_args = vec![script_path.to_string_lossy().into_owned()];
+        let mut mounts = Vec::new();
+        maybe_remap_first_guest_arg_to_app_mount(&mut guest_args, &mut mounts).unwrap();
+
+        assert_eq!(guest_args, vec!["/app/entry.mjs"]);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].host_path,
+            std::fs::canonicalize(&test_dir).unwrap()
+        );
+        assert_eq!(mounts[0].guest_path, PathBuf::from("/app"));
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
 }
 
 fn parse_mount(spec: &str) -> Result<GuestMount> {
