@@ -298,7 +298,7 @@ impl GuestHeap {
         // The base can only be stable if the whole range is reserved up
         // front. On 64-bit hosts this is always the case for wasm32.
         match store.engine().tunables().memory_style(&ty) {
-            MemoryStyle::Static { bound, .. } if bound.0 >= max_pages => {}
+            MemoryStyle::Static if MemoryStyle::static_bound().0 >= max_pages => {}
             style => {
                 integrity_warn(&format!(
                     "memory style {style:?} does not guarantee a stable base; \
@@ -663,7 +663,7 @@ impl Drop for GuestHeap {
 use std::ffi::c_void;
 
 /// Context installed into a V8 array-buffer allocator
-/// (`unofficial_napi_env_create_options.guest_heap_ctx`).
+/// (`unofficial_napi_env_create_options.guest_heap`).
 pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,

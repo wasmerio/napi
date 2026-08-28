@@ -1,3 +1,4 @@
+pub(crate) mod abi;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub mod callback;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]

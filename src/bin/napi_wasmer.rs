@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use wasmer_napi::{
     NapiCtx,
-    cli::{GuestMount, run_wasix_main_capture_stdio_with_ctx},
+    cli::{GuestMount, run_wasix_main_with_ctx},
 };
 
 const BUILTIN_JS_GUEST_PATH: &str = "/edgejs-builtins";
@@ -99,6 +99,20 @@ fn resolve_app_dir_mount(extra_mounts: &mut Vec<GuestMount>, host_dir: &str) -> 
     Ok(())
 }
 
+fn map_host_path_through_mount(host_path: &Path, mounts: &[GuestMount]) -> Option<PathBuf> {
+    mounts
+        .iter()
+        .filter_map(|mount| {
+            let relative_path = host_path.strip_prefix(&mount.host_path).ok()?;
+            Some((
+                mount.host_path.components().count(),
+                mount.guest_path.join(relative_path),
+            ))
+        })
+        .max_by_key(|(host_component_count, _)| *host_component_count)
+        .map(|(_, guest_path)| guest_path)
+}
+
 fn maybe_remap_first_guest_arg_to_app_mount(
     guest_args: &mut [String],
     extra_mounts: &mut Vec<GuestMount>,
@@ -126,6 +140,11 @@ fn maybe_remap_first_guest_arg_to_app_mount(
         return Ok(());
     }
 
+    if let Some(guest_script) = map_host_path_through_mount(&host_script, extra_mounts) {
+        *first_arg = guest_script.to_string_lossy().into_owned();
+        return Ok(());
+    }
+
     let script_parent = host_script
         .parent()
         .ok_or_else(|| anyhow!("script has no parent dir: {}", host_script.display()))?;
@@ -144,6 +163,85 @@ fn maybe_remap_first_guest_arg_to_app_mount(
         .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
     *first_arg = format!("/app/{}", script_name.to_string_lossy());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_nested_script_relative_to_existing_mount() {
+        let mounts = vec![GuestMount {
+            host_path: PathBuf::from("/host/project"),
+            guest_path: PathBuf::from("/app"),
+        }];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/project/dist/server/entry.mjs"), &mounts,),
+            Some(PathBuf::from("/app/dist/server/entry.mjs"))
+        );
+    }
+
+    #[test]
+    fn uses_most_specific_covering_mount() {
+        let mounts = vec![
+            GuestMount {
+                host_path: PathBuf::from("/host/project"),
+                guest_path: PathBuf::from("/app"),
+            },
+            GuestMount {
+                host_path: PathBuf::from("/host/project/src"),
+                guest_path: PathBuf::from("/src"),
+            },
+        ];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/project/src/node/server.js"), &mounts),
+            Some(PathBuf::from("/src/node/server.js"))
+        );
+    }
+
+    #[test]
+    fn does_not_map_path_outside_mounts() {
+        let mounts = vec![GuestMount {
+            host_path: PathBuf::from("/host/project"),
+            guest_path: PathBuf::from("/app"),
+        }];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/other/server.js"), &mounts),
+            None
+        );
+    }
+
+    #[test]
+    fn retains_automatic_app_mount_without_covering_mount() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "napi-wasmer-remap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let script_path = test_dir.join("entry.mjs");
+        std::fs::write(&script_path, "").unwrap();
+
+        let mut guest_args = vec![script_path.to_string_lossy().into_owned()];
+        let mut mounts = Vec::new();
+        maybe_remap_first_guest_arg_to_app_mount(&mut guest_args, &mut mounts).unwrap();
+
+        assert_eq!(guest_args, vec!["/app/entry.mjs"]);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].host_path,
+            std::fs::canonicalize(&test_dir).unwrap()
+        );
+        assert_eq!(mounts[0].guest_path, PathBuf::from("/app"));
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
 }
 
 fn parse_mount(spec: &str) -> Result<GuestMount> {
@@ -168,19 +266,36 @@ fn parse_mount(spec: &str) -> Result<GuestMount> {
     })
 }
 
+fn parse_env(spec: &str) -> Result<(String, String)> {
+    let (key, value) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid env {spec:?}, expected <key>=<value>"))?;
+    if key.is_empty() {
+        bail!("environment variable name must not be empty");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 fn main() -> Result<()> {
     let mut argv = std::env::args().skip(1);
     let wasm_path = match argv.next() {
         Some(path) => PathBuf::from(path),
         None => {
             bail!(
-                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--] [guest-args...]"
+                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--] [guest-args...]"
             );
         }
     };
 
     let mut builtin_js_dir: Option<String> = None;
     let mut extra_mounts = Vec::new();
+    let mut envs = Vec::new();
+    let mut current_dir: Option<PathBuf> = None;
+    let mut program_name = wasm_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("guest-test")
+        .to_string();
     let mut guest_args = Vec::new();
     let mut forwarding_guest_args = false;
 
@@ -203,6 +318,28 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow!("--mount requires <host-dir>:<guest-dir>"))?;
                 extra_mounts.push(parse_mount(&spec)?);
             }
+            "--env" => {
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| anyhow!("--env requires <key>=<value>"))?;
+                envs.push(parse_env(&spec)?);
+            }
+            "--cwd" => {
+                let dir = argv
+                    .next()
+                    .ok_or_else(|| anyhow!("--cwd requires an absolute guest directory"))?;
+                let dir = PathBuf::from(dir);
+                if !dir.is_absolute() {
+                    bail!("guest cwd must be an absolute path: {}", dir.display());
+                }
+                current_dir = Some(dir);
+            }
+            "--program-name" => {
+                program_name = argv
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| anyhow!("--program-name requires a non-empty name"))?;
+            }
             "--builtin-js-dir" => {
                 builtin_js_dir = Some(
                     argv.next()
@@ -211,6 +348,23 @@ fn main() -> Result<()> {
             }
             _ if arg.starts_with("--mount=") => {
                 extra_mounts.push(parse_mount(arg.trim_start_matches("--mount="))?);
+            }
+            _ if arg.starts_with("--env=") => {
+                envs.push(parse_env(arg.trim_start_matches("--env="))?);
+            }
+            _ if arg.starts_with("--cwd=") => {
+                let dir = PathBuf::from(arg.trim_start_matches("--cwd="));
+                if !dir.is_absolute() {
+                    bail!("guest cwd must be an absolute path: {}", dir.display());
+                }
+                current_dir = Some(dir);
+            }
+            _ if arg.starts_with("--program-name=") => {
+                let name = arg.trim_start_matches("--program-name=");
+                if name.is_empty() {
+                    bail!("--program-name requires a non-empty name");
+                }
+                program_name = name.to_string();
             }
             _ if arg.starts_with("--builtin-js-dir=") => {
                 builtin_js_dir = Some(arg.trim_start_matches("--builtin-js-dir=").to_string());
@@ -230,8 +384,15 @@ fn main() -> Result<()> {
     maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
 
     let ctx = NapiCtx::default();
-    let (exit_code, _stdout, _stderr) =
-        run_wasix_main_capture_stdio_with_ctx(&ctx, &wasm_path, &guest_args, &extra_mounts)?;
+    let exit_code = run_wasix_main_with_ctx(
+        &ctx,
+        &wasm_path,
+        &program_name,
+        &guest_args,
+        &extra_mounts,
+        &envs,
+        current_dir.as_deref(),
+    )?;
 
     if exit_code != 0 {
         std::process::exit(exit_code);

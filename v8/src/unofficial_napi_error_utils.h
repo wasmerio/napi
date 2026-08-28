@@ -35,24 +35,13 @@ void PreserveErrorFormatting(napi_env env,
                              const std::string& source_line,
                              const std::string& thrown_at);
 
-napi_status SetSourceMapsEnabled(napi_env env, bool enabled);
-napi_status SetGetSourceMapErrorSourceCallback(napi_env env, napi_value callback);
+napi_status ConfigureSourceMaps(napi_env env, bool enabled, napi_value callback);
 napi_status PreserveErrorSourceMessage(napi_env env, napi_value error);
-napi_status GetErrorSourceLineForStderr(napi_env env,
-                                        napi_value error,
-                                        napi_value* result_out);
-napi_status GetErrorThrownAt(napi_env env,
+napi_status GetErrorMetadata(napi_env env,
                              napi_value error,
-                             napi_value* result_out);
-napi_status TakePreservedErrorFormatting(napi_env env,
-                                         napi_value error,
-                                         napi_value* source_line_out,
-                                         napi_value* thrown_at_out);
+                             unofficial_napi_error_metadata_mode mode,
+                             unofficial_napi_error_metadata* out);
 void ResetErrorFormattingState(napi_env env);
-
-napi_status GetErrorSourcePositions(napi_env env,
-                                    napi_value error,
-                                    unofficial_napi_error_source_positions* out);
 
 }  // namespace unofficial_napi_internal
 

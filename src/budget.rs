@@ -11,7 +11,7 @@
 //! same budget, and add CPU metering; the [`Pool`] enum and the budget API are
 //! the insertion points for them.
 //!
-//! ## Install path
+//! ## Native sys install path
 //!
 //! The guest's linear memory is *imported* (host-created). wasmer's public API
 //! does not let an embedder inject a custom [`LinearMemory`] into a
@@ -21,23 +21,29 @@
 //! wrapped in a [`BudgetedMemory`]. Installing those tunables on the engine
 //! (see `cli.rs`) makes `Memory::new` — and therefore the guest's imported
 //! memory — budget-aware with no change to the memory-creation call site.
+//!
+//! This tunables path exists only for Wasmer's native `sys` backend. A
+//! `wasm32` host-JavaScript build uses the host's WebAssembly memory and does
+//! not compile or install [`BudgetedTunables`]. It still uses
+//! [`ResourceBudget`] for provider-owned resources such as environments,
+//! value handles, and declared external memory.
 
 use std::ffi::c_void;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::vm::{
     ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
     VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::{BaseTunables, Tunables};
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 use wasmer::{MemoryStyle, MemoryType, Pages, TableStyle, TableType, WASM_PAGE_SIZE};
 
 /// Sentinel meaning "no memory limit". A budget built with this total tracks
@@ -64,13 +70,13 @@ pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 /// [`ResourceBudget::value_handle_limit`].
 pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
 }
 
 /// Round `bytes` up to a whole number of wasm pages, saturating.
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn round_up_to_page(bytes: u64) -> u64 {
     let page = WASM_PAGE_SIZE as u64;
     bytes.div_ceil(page).saturating_mul(page)
@@ -579,12 +585,14 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
 /// underlying mmap — cloning a shared memory shares this, so the charge is
 /// released exactly once, when the last handle drops.
 #[derive(Debug)]
+#[cfg(not(target_arch = "wasm32"))]
 struct MemoryCharge {
     budget: Arc<ResourceBudget>,
     /// Bytes currently charged for this allocation.
     bytes: AtomicU64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MemoryCharge {
     fn new(budget: Arc<ResourceBudget>, bytes: u64) -> Result<Arc<Self>, OverBudget> {
         budget.try_charge(Pool::WasmLinear, bytes)?;
@@ -595,6 +603,7 @@ impl MemoryCharge {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for MemoryCharge {
     fn drop(&mut self) {
         let bytes = self.bytes.swap(0, Ordering::AcqRel);
@@ -610,13 +619,13 @@ impl Drop for MemoryCharge {
 /// `memory.grow` returning `-1`, i.e. an ordinary allocation failure — when the
 /// budget is exhausted. The initial (minimum) size is charged at construction.
 #[derive(Debug)]
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct BudgetedMemory {
     inner: VMMemory,
     charge: Arc<MemoryCharge>,
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl BudgetedMemory {
     /// Wrap an already-allocated backend memory, charging its current size.
     ///
@@ -635,12 +644,12 @@ impl BudgetedMemory {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
     MemoryError::Generic(err.to_string())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl LinearMemory for BudgetedMemory {
     fn ty(&self) -> MemoryType {
         self.inner.ty()
@@ -785,13 +794,13 @@ impl LinearMemory for BudgetedMemory {
 /// Phase 1; the edgejs guest *imports* its memory, so it flows through
 /// `create_host_memory` and is charged. The max-pages clamp still bounds the
 /// defined case cheaply.
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct BudgetedTunables<T: Tunables> {
     base: T,
     budget: Arc<ResourceBudget>,
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: Tunables> BudgetedTunables<T> {
     /// Wrap `base`, charging every host memory against `budget`.
     pub fn new(base: T, budget: Arc<ResourceBudget>) -> Self {
@@ -833,7 +842,7 @@ impl<T: Tunables> BudgetedTunables<T> {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: Tunables> Tunables for BudgetedTunables<T> {
     fn memory_style(&self, memory: &MemoryType) -> MemoryStyle {
         self.base.memory_style(&self.adjust_memory(memory))
@@ -889,15 +898,12 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
 }
 
 /// Build [`BudgetedTunables`] over the platform default base tunables.
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-pub fn budgeted_tunables(
-    target: &wasmer::sys::Target,
-    budget: Arc<ResourceBudget>,
-) -> BudgetedTunables<BaseTunables> {
-    BudgetedTunables::new(BaseTunables::for_target(target), budget)
+#[cfg(not(target_arch = "wasm32"))]
+pub fn budgeted_tunables(budget: Arc<ResourceBudget>) -> BudgetedTunables<BaseTunables> {
+    BudgetedTunables::new(BaseTunables::new(), budget)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use wasmer::sys::{Cranelift, EngineBuilder};
@@ -908,7 +914,7 @@ mod tests {
     /// A store whose engine charges guest wasm linear memory against `budget`.
     fn budgeted_store(budget: Arc<ResourceBudget>) -> Store {
         let mut engine = EngineBuilder::new(Cranelift::default()).engine();
-        let tunables = budgeted_tunables(engine.target(), budget);
+        let tunables = budgeted_tunables(budget);
         engine.set_tunables(tunables);
         Store::new(engine)
     }

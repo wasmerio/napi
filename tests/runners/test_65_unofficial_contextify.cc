@@ -21,6 +21,15 @@ napi_value Sym(napi_env env, const char* value) {
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
+constexpr char kPreparedStack[] =
+    "Error: sentinel\n"
+    "    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)\n"
+    "    at triggerUncaughtException (node:internal/process/promises:251:13)";
+
+napi_value ReturnPreparedStack(napi_env env, napi_callback_info /*info*/) {
+  return Str(env, kPreparedStack);
+}
+
 napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -49,7 +58,7 @@ napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
 
 }  // namespace
 
-TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
+TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
   EnvScope s(runtime_.get());
 
   napi_value sandbox = nullptr;
@@ -69,7 +78,8 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
   ASSERT_NE(result, nullptr);
 
   napi_value eval_result = nullptr;
-  const unofficial_napi_js_source run_source{Str(s.env, "globalThis.answer = 42; answer"), nullptr};
+  const unofficial_napi_js_source run_source =
+      unofficial_napi_js_source_from_text(Str(s.env, "globalThis.answer = 42; answer"));
   ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
                                                   sandbox,
                                                   &run_source,
@@ -94,24 +104,50 @@ TEST_F(Test65UnofficialContextify, MakeRunDisposeRoundTrip) {
   ASSERT_EQ(napi_get_value_int32(s.env, answer_value, &answer), napi_ok);
   EXPECT_EQ(answer, 42);
 
-  ASSERT_EQ(unofficial_napi_contextify_dispose_context(s.env, sandbox), napi_ok);
-  const unofficial_napi_js_source disposed_source{Str(s.env, "1"), nullptr};
-  EXPECT_EQ(unofficial_napi_contextify_run_script(s.env,
-                                                  sandbox,
-                                                  &disposed_source,
-                                                  Str(s.env, "after_dispose.js"),
-                                                  0,
-                                                  0,
-                                                  -1,
-                                                  true,
-                                                  false,
-                                                  false,
-                                                  Sym(s.env, "hdo"),
-                                                  &eval_result),
-            napi_invalid_arg);
 }
 
-TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze) {
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, MakeContextPreservesThrownProxyException) {
+  EnvScope s(runtime_.get());
+
+  napi_value source = Str(
+      s.env,
+      "(() => { const sentinel = {}; return { sentinel, sandbox: new Proxy({}, { ownKeys() { throw sentinel; } }) }; })()");
+  ASSERT_NE(source, nullptr);
+  napi_value fixture = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &fixture), napi_ok);
+  ASSERT_NE(fixture, nullptr);
+
+  napi_value sentinel = nullptr;
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sentinel", &sentinel), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, fixture, "sandbox", &sandbox), napi_ok);
+
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "ctx"),
+                                                    Str(s.env, "test://origin"),
+                                                    true,
+                                                    true,
+                                                    false,
+                                                    Sym(s.env, "hdo"),
+                                                    &result),
+            napi_pending_exception);
+  EXPECT_EQ(result, nullptr);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  napi_value caught = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &caught), napi_ok);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, caught, sentinel, &same), napi_ok);
+  EXPECT_TRUE(same);
+}
+#endif
+
+TEST_F(Test65UnofficialContextify, SandboxGlobalThisIsNotEnumerableForDeepFreeze) {
   EnvScope s(runtime_.get());
 
   napi_value sandbox = nullptr;
@@ -130,24 +166,54 @@ TEST_F(Test65UnofficialContextify, SandboxGlobalThisAndMarkerAreNotEnumerableFor
             napi_ok);
   ASSERT_NE(result, nullptr);
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // QuickJS keeps its context marker on the sandbox rather than copying it
+  // into the context global. Pin the host-visible property contract directly.
+  napi_value marker_key = Str(s.env, "__quickjs_contextified");
+  bool has_marker = false;
+  ASSERT_EQ(napi_has_own_property(s.env, sandbox, marker_key, &has_marker), napi_ok);
+  EXPECT_TRUE(has_marker);
+
+  napi_value enumerable_keys = nullptr;
+  ASSERT_EQ(napi_get_all_property_names(s.env,
+                                        sandbox,
+                                        napi_key_own_only,
+                                        napi_key_enumerable,
+                                        napi_key_numbers_to_strings,
+                                        &enumerable_keys),
+            napi_ok);
+  uint32_t key_count = 0;
+  ASSERT_EQ(napi_get_array_length(s.env, enumerable_keys, &key_count), napi_ok);
+  for (uint32_t index = 0; index < key_count; ++index) {
+    napi_value key = nullptr;
+    ASSERT_EQ(napi_get_element(s.env, enumerable_keys, index, &key), napi_ok);
+    char text[64] = {};
+    size_t copied = 0;
+    ASSERT_EQ(napi_get_value_string_utf8(s.env, key, text, sizeof(text), &copied), napi_ok);
+    EXPECT_STRNE(text, "__quickjs_contextified");
+  }
+
+  napi_value marker_false = nullptr;
+  napi_value marker_true = nullptr;
+  ASSERT_EQ(napi_get_boolean(s.env, false, &marker_false), napi_ok);
+  ASSERT_EQ(napi_get_boolean(s.env, true, &marker_true), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "__quickjs_contextified", marker_false), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "__quickjs_contextified", marker_true), napi_ok);
+#endif
+
   napi_value eval_result = nullptr;
-  const unofficial_napi_js_source freeze_source{
-      Str(s.env,
-          R"JS(
+  std::string freeze_script = R"JS(
 const globalThisDescriptor = Object.getOwnPropertyDescriptor(globalThis, "globalThis");
-const markerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__quickjs_contextified");
 if (!globalThisDescriptor || globalThisDescriptor.enumerable ||
     !globalThisDescriptor.writable || !globalThisDescriptor.configurable) {
   throw new Error("globalThis should be writable/configurable but non-enumerable");
 }
-if (!markerDescriptor || markerDescriptor.enumerable ||
-    !markerDescriptor.writable || !markerDescriptor.configurable) {
-  throw new Error("contextify marker should be writable/configurable but non-enumerable");
-}
 const keys = Object.keys(globalThis);
-if (keys.includes("globalThis") || keys.includes("__quickjs_contextified")) {
+if (keys.includes("globalThis")) {
   throw new Error("contextify internals should not be enumerable");
 }
+)JS";
+  freeze_script += R"JS(
 globalThis.__RSC_MANIFEST = {};
 globalThis.__RSC_MANIFEST["/x"] = { ok: true };
 function deepFreeze(obj) {
@@ -161,8 +227,9 @@ function deepFreeze(obj) {
 }
 deepFreeze(globalThis);
 globalThis.__RSC_MANIFEST["/x"].ok;
-)JS"),
-      nullptr};
+)JS";
+  const unofficial_napi_js_source freeze_source = unofficial_napi_js_source_from_text(
+      Str(s.env, freeze_script.c_str()));
   ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
                                                   sandbox,
                                                   &freeze_source,
@@ -198,7 +265,8 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
-  const unofficial_napi_js_source fn_source{Str(s.env, "return a + b;"), nullptr};
+  const unofficial_napi_js_source fn_source =
+      unofficial_napi_js_source_from_text(Str(s.env, "return a + b;"));
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                         &fn_source,
                                                         Str(s.env, "fn.js"),
@@ -230,18 +298,17 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
 
   // Cached data now flows through the bytecode handle APIs: compile eagerly,
   // serialize the engine bytes, and restore a live artifact from them.
-  void* bytecode = nullptr;
-  ASSERT_EQ(unofficial_napi_bytecode_compile(s.env,
-                                             Str(s.env, "1 + 1"),
-                                             Str(s.env, "script.js"),
-                                             unofficial_napi_bytecode_shape_script,
-                                             undef,
-                                             Sym(s.env, "hdo"),
-                                             0,
-                                             0,
-                                             &bytecode,
-                                             nullptr),
-            napi_ok);
+  unofficial_napi_bytecode_open_options open_options{};
+  open_options.size = sizeof(open_options);
+  open_options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  open_options.source_text = Str(s.env, "1 + 1");
+  open_options.filename = Str(s.env, "script.js");
+  open_options.shape = unofficial_napi_bytecode_shape_script;
+  open_options.params_or_undefined = undef;
+  open_options.host_defined_option_id = Sym(s.env, "hdo");
+  unofficial_napi_bytecode_open_result open_result{};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+  unofficial_napi_bytecode bytecode = open_result.bytecode;
   ASSERT_NE(bytecode, nullptr);
 
   napi_value cached_data = nullptr;
@@ -264,22 +331,124 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_GT(byte_length, 0u);
   bytes = static_cast<const uint8_t*>(data);
 
-  void* restored = nullptr;
-  bool rejected = false;
-  ASSERT_EQ(unofficial_napi_bytecode_deserialize(s.env,
-                                                 bytes,
-                                                 byte_length,
-                                                 Str(s.env, "1 + 1"),
-                                                 Str(s.env, "script.js"),
-                                                 unofficial_napi_bytecode_shape_script,
-                                                 undef,
-                                                 Sym(s.env, "hdo"),
-                                                 &restored,
-                                                 &rejected),
-            napi_ok);
-  EXPECT_FALSE(rejected);
+  open_options.cache_bytes = bytes;
+  open_options.cache_byte_length = byte_length;
+  open_options.has_cache = 1;
+  open_result = {};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+  EXPECT_EQ(open_result.cache_rejected, 0);
+  unofficial_napi_bytecode restored = open_result.bytecode;
   ASSERT_NE(restored, nullptr);
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, restored), napi_ok);
+
+  open_options.source_text = Str(s.env, "1000 + 2000 + 3000");
+  open_options.cache_policy = unofficial_napi_bytecode_cache_validate_only;
+  open_result = {};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+  EXPECT_EQ(open_result.cache_rejected, 1);
+  EXPECT_EQ(open_result.bytecode, nullptr);
+
+  // A present-but-empty cache is a cache miss, not a malformed transaction.
+  // The provider reports the rejection and atomically prepares the fallback
+  // artifact from source so callers never need a deserialize/compile branch.
+  open_options.cache_bytes = nullptr;
+  open_options.cache_byte_length = 0;
+  open_options.has_cache = 1;
+  open_options.cache_policy = unofficial_napi_bytecode_cache_compile_on_reject;
+  open_result = {};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+  EXPECT_EQ(open_result.cache_rejected, 1);
+  ASSERT_NE(open_result.bytecode, nullptr);
+  ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
+  EnvScope s(runtime_.get());
+
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "export const value = 42;"));
+  unofficial_napi_module_create_options create_options{};
+  create_options.size = sizeof(create_options);
+  create_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  create_options.kind = unofficial_napi_module_source_text;
+  create_options.wrapper = wrapper;
+  create_options.url = Str(s.env, "state.mjs");
+  create_options.context_or_undefined = undefined;
+  create_options.payload.source_text.source = &source;
+  create_options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result create_result{};
+
+  auto invalid_options = create_options;
+  invalid_options.size = sizeof(invalid_options) - 1;
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
+            napi_invalid_arg);
+  invalid_options = create_options;
+  invalid_options.version++;
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
+            napi_invalid_arg);
+  invalid_options = create_options;
+  invalid_options.kind = static_cast<unofficial_napi_module_kind>(99);
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
+            napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &create_options, &create_result),
+            napi_ok);
+  unofficial_napi_module module = create_result.module;
+  ASSERT_NE(module, nullptr);
+  ASSERT_NE(create_result.module_requests, nullptr);
+  uint32_t request_count = 1;
+  ASSERT_EQ(napi_get_array_length(s.env, create_result.module_requests, &request_count),
+            napi_ok);
+  EXPECT_EQ(request_count, 0u);
+  EXPECT_FALSE(create_result.has_top_level_await);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, nullptr, nullptr, nullptr),
+            napi_invalid_arg);
+  int32_t status = -1;
+  napi_value error = nullptr;
+  bool has_async_graph = true;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, &status, &error, &has_async_graph),
+            napi_ok);
+  EXPECT_EQ(status, 0);
+  EXPECT_FALSE(has_async_graph);
+  ASSERT_NE(error, nullptr);
+  napi_valuetype error_type = napi_object;
+  ASSERT_EQ(napi_typeof(s.env, error, &error_type), napi_ok);
+  EXPECT_EQ(error_type, napi_undefined);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+  status = -1;
+  has_async_graph = true;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(
+                s.env, module, &status, nullptr, &has_async_graph),
+            napi_ok);
+  EXPECT_EQ(status, 2);
+  EXPECT_FALSE(has_async_graph);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, ModuleHooksUseOneVersionedConfiguration) {
+  EnvScope s(runtime_.get());
+
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks) - 1;
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_invalid_arg);
+
+  hooks.size = sizeof(hooks);
+  hooks.version = 0;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_invalid_arg);
+
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  EXPECT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
@@ -299,9 +468,13 @@ TEST_F(Test65UnofficialContextify,
                                  nullptr,
                                  &callback),
             napi_ok);
-  ASSERT_EQ(
-      unofficial_napi_module_wrap_set_import_module_dynamically_callback(s.env, callback),
-      napi_ok);
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks),
+      UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION,
+      callback,
+      nullptr,
+  };
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
 
   napi_value undefined = nullptr;
   ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
@@ -309,23 +482,22 @@ TEST_F(Test65UnofficialContextify,
   ASSERT_NE(explicit_id, nullptr);
 
   auto compile_invoke_and_capture = [&](napi_value host_id) -> napi_value {
-    void* bytecode = nullptr;
-    EXPECT_EQ(unofficial_napi_bytecode_compile(
-                  s.env,
-                  Str(s.env, "return import('node:test');"),
-                  Str(s.env, "host-id.js"),
-                  unofficial_napi_bytecode_shape_cjs_function,
-                  undefined,
-                  host_id,
-                  0,
-                  0,
-                  &bytecode,
-                  nullptr),
-              napi_ok);
+    unofficial_napi_bytecode_open_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+    options.source_text = Str(s.env, "return import('node:test');");
+    options.filename = Str(s.env, "host-id.js");
+    options.shape = unofficial_napi_bytecode_shape_cjs_function;
+    options.params_or_undefined = undefined;
+    options.host_defined_option_id = host_id;
+    unofficial_napi_bytecode_open_result result{};
+    EXPECT_EQ(unofficial_napi_bytecode_open(s.env, &options, &result), napi_ok);
+    unofficial_napi_bytecode bytecode = result.bytecode;
     EXPECT_NE(bytecode, nullptr);
     if (bytecode == nullptr) return nullptr;
 
-    const unofficial_napi_js_source source{nullptr, bytecode};
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_bytecode(bytecode);
     napi_value compiled = nullptr;
     EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                           &source,
@@ -414,7 +586,8 @@ globalThis.Function = function Function() {
   ASSERT_EQ(napi_set_element(s.env, params, 0, Str(s.env, "value")), napi_ok);
 
   napi_value out = nullptr;
-  const unofficial_napi_js_source fn_source{Str(s.env, "return value + 1;"), nullptr};
+  const unofficial_napi_js_source fn_source =
+      unofficial_napi_js_source_from_text(Str(s.env, "return value + 1;"));
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                         &fn_source,
                                                         Str(s.env, "no-global-function.js"),
@@ -451,7 +624,8 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAcceptsHashbangBody) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
-  const unofficial_napi_js_source hashbang_source{Str(s.env, "#!/usr/bin/env node\nreturn 42;"), nullptr};
+  const unofficial_napi_js_source hashbang_source = unofficial_napi_js_source_from_text(
+      Str(s.env, "#!/usr/bin/env node\nreturn 42;"));
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                         &hashbang_source,
                                                         Str(s.env, ""),
@@ -486,8 +660,8 @@ TEST_F(Test65UnofficialContextify, CompileFunctionRejectsBomBeforeHashbang) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
-  const unofficial_napi_js_source bom_source{
-      Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"), nullptr};
+  const unofficial_napi_js_source bom_source = unofficial_napi_js_source_from_text(
+      Str(s.env, "\xEF\xBB\xBF#!/usr/bin/env node\nreturn 42;"));
   EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                         &bom_source,
                                                         Str(s.env, "bom_hashbang.js"),
@@ -559,7 +733,8 @@ TEST_F(Test65UnofficialContextify, CjsCompileAndSyntaxDetection) {
   ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
 
   napi_value out = nullptr;
-  const unofficial_napi_js_source cjs_source{Str(s.env, "module.exports = 1;"), nullptr};
+  const unofficial_napi_js_source cjs_source =
+      unofficial_napi_js_source_from_text(Str(s.env, "module.exports = 1;"));
   ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env,
                                                         &cjs_source,
                                                         Str(s.env, "cjs.js"),
@@ -640,3 +815,40 @@ TEST_F(Test65UnofficialContextify, PrivateSymbolAcceptsAutoLength) {
   ASSERT_EQ(napi_typeof(s.env, symbol, &type), napi_ok);
   EXPECT_TRUE(type == napi_symbol || type == napi_object);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
+  EnvScope s(runtime_.get());
+
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_create_function(s.env,
+                                 "prepareStackTrace",
+                                 NAPI_AUTO_LENGTH,
+                                 ReturnPreparedStack,
+                                 nullptr,
+                                 &callback),
+            napi_ok);
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(s.env, callback),
+            napi_ok);
+
+  napi_value source = Str(s.env, "new Error('sentinel').stack");
+  napi_value stack = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &stack), napi_ok);
+  ASSERT_NE(stack, nullptr);
+
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, stack, nullptr, 0, &length),
+            napi_ok);
+  std::string actual(length + 1, '\0');
+  size_t written = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(
+                s.env, stack, actual.data(), actual.size(), &written),
+            napi_ok);
+  actual.resize(written);
+  EXPECT_EQ(actual, kPreparedStack);
+
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(s.env, nullptr),
+            napi_ok);
+}
+#endif

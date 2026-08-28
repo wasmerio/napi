@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 
@@ -18,6 +19,43 @@ constexpr size_t kMaxSymlinkExpansions = 64;
 bool starts_with(std::string_view value, std::string_view prefix)
 {
   return value.substr(0, prefix.size()) == prefix;
+}
+
+int property_key_to_array_index(JSContext *ctx, JSValue key, uint32_t *index_out)
+{
+  if (JS_IsNumber(key))
+    return JS_ToUint32(ctx, index_out, key) < 0 ? -1 : 1;
+
+  if (!JS_IsString(key))
+    return 0;
+
+  size_t length = 0;
+  const char *text = JS_ToCStringLen(ctx, &length, key);
+  if (text == nullptr)
+    return -1;
+
+  bool is_index = length != 0 && length <= 10 &&
+                  (length == 1 || text[0] != '0');
+  uint64_t index = 0;
+  for (size_t i = 0; is_index && i < length; ++i)
+  {
+    const char ch = text[i];
+    if (ch < '0' || ch > '9')
+    {
+      is_index = false;
+      break;
+    }
+    index = index * 10 + static_cast<uint64_t>(ch - '0');
+  }
+  JS_FreeCString(ctx, text);
+
+  constexpr uint64_t kMaxArrayIndex =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 1;
+  if (!is_index || index > kMaxArrayIndex)
+    return 0;
+
+  *index_out = static_cast<uint32_t>(index);
+  return 1;
 }
 
 int hex_digit_value(char ch)
@@ -613,6 +651,22 @@ napi_status napi_util__::get_property_names(napi_env env,
       else
       {
         key = JS_AtomToValue(ctx, t[i].atom);
+        if (!JS_IsException(key))
+        {
+          uint32_t array_index = 0;
+          const int is_array_index = property_key_to_array_index(ctx, key, &array_index);
+          if (is_array_index < 0)
+          {
+            JS_FreeValue(ctx, key);
+            JS_FreePropertyEnum(ctx, t, count);
+            return return_pending_if_caught(env, "Failed to convert property name");
+          }
+          if (is_array_index != 0 && !JS_IsNumber(key))
+          {
+            JS_FreeValue(ctx, key);
+            key = JS_NewUint32(ctx, array_index);
+          }
+        }
       }
       if (JS_IsException(key))
       {

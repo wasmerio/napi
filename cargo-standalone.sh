@@ -63,8 +63,8 @@ cleanup_standalone_work_dir() {
 trap cleanup_standalone_work_dir EXIT
 
 cp "$standalone_manifest" "$standalone_work_dir/Cargo.toml"
-if [[ -f "$repo_root/Cargo.lock" ]]; then
-  cp "$repo_root/Cargo.lock" "$standalone_work_dir/Cargo.lock"
+if [[ -f "$repo_root/Cargo.standalone.lock" ]]; then
+  cp "$repo_root/Cargo.standalone.lock" "$standalone_work_dir/Cargo.lock"
 fi
 
 for entry in build.rs include lib src tests v8; do

@@ -17,7 +17,7 @@ pub const NAPI_MODULE_NAME: &str = "napi";
 pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
 pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub use budget::{BudgetedMemory, BudgetedTunables, budgeted_tunables};
 pub use budget::{
     EnvRejected, HeapReservation, NapiMemoryAccountant, OverBudget, Pool, RequestedHeap,

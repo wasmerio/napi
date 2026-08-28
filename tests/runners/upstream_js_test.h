@@ -90,7 +90,7 @@ inline bool RunScript(EnvScope& s, const std::string& source_text, const char* l
 
 inline napi_value ForceGcCallback(napi_env env, napi_callback_info info) {
   (void)info;
-  (void)unofficial_napi_request_gc_for_testing(env);
+  (void)unofficial_napi_collect_garbage(env);
   (void)unofficial_napi_event_loop_checkpoint(
       env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr);
 

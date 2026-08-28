@@ -501,6 +501,12 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 
 }  // namespace
 
+void napi_v8_set_last_exception(napi_env env,
+                                v8::Local<v8::Value> exception,
+                                v8::Local<v8::Message> message) {
+  SetLastException(env, exception, message);
+}
+
 napi_handle_scope__::napi_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 
@@ -584,10 +590,6 @@ napi_env__::~napi_env__() {
   if (instance_data_finalize_cb != nullptr) {
     instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
   }
-  if (env_destroy_callback != nullptr) {
-    env_destroy_callback(this, env_destroy_callback_data);
-  }
-  edge_environment = nullptr;
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 

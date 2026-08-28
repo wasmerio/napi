@@ -92,8 +92,8 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "failed to set the first environment marker");
 
   napi_env env2 = NULL;
-  void* env2_scope = NULL;
-  NAPI_CALL(env, unofficial_napi_create_env(8, &env2, &env2_scope));
+  unofficial_napi_env_owner env2_scope = NULL;
+  NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &env2, &env2_scope));
   CHECK_OR_FAIL(env2 != NULL && env2_scope != NULL,
                 "failed to create the second N-API environment");
 
@@ -111,7 +111,7 @@ int main(void) {
   NAPI_CALL(env, RunInt32Script(
                      env, "globalThis.__napi_env_isolation_marker", &marker));
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
-  NAPI_CALL(env, unofficial_napi_release_env(env2_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
 
   // Every code-generation path must select its execution scope explicitly.
   // In particular, vm compile-function and module compilation must honor the
@@ -143,8 +143,8 @@ int main(void) {
                      "globalThis.__napi_context_marker",
                      NAPI_AUTO_LENGTH,
                      &context_source_text));
-  const unofficial_napi_js_source context_source = {
-      context_source_text, NULL};
+  const unofficial_napi_js_source context_source =
+      unofficial_napi_js_source_from_text(context_source_text);
   napi_value context_result;
   NAPI_CALL(env, unofficial_napi_contextify_run_script(
                      env,
@@ -185,8 +185,8 @@ int main(void) {
                      "__napi_context_extension_marker;",
                      NAPI_AUTO_LENGTH,
                      &function_source_text));
-  const unofficial_napi_js_source function_source = {
-      function_source_text, NULL};
+  const unofficial_napi_js_source function_source =
+      unofficial_napi_js_source_from_text(function_source_text);
   napi_value compiled;
   NAPI_CALL(env, unofficial_napi_contextify_compile_function(
                      env,
@@ -231,40 +231,74 @@ int main(void) {
                      "globalThis.__napi_context_marker;",
                      NAPI_AUTO_LENGTH,
                      &module_source_text));
-  const unofficial_napi_js_source module_source = {module_source_text, NULL};
-  void* module_handle = NULL;
-  NAPI_CALL(env, unofficial_napi_module_wrap_create_source_text(
-                     env,
-                     module_wrapper,
-                     module_url,
-                     context,
-                     &module_source,
-                     0,
-                     0,
-                     undefined_value,
-                     &module_handle));
-  CHECK_OR_FAIL(module_handle != NULL,
+  const unofficial_napi_js_source module_source =
+      unofficial_napi_js_source_from_text(module_source_text);
+  unofficial_napi_module_create_options module_options = {0};
+  module_options.size = sizeof(module_options);
+  module_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  module_options.kind = unofficial_napi_module_source_text;
+  module_options.wrapper = module_wrapper;
+  module_options.url = module_url;
+  module_options.context_or_undefined = context;
+  module_options.payload.source_text.source = &module_source;
+  module_options.payload.source_text.host_defined_option_id = undefined_value;
+  unofficial_napi_module_create_result module_create_result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(
+                     env, &module_options, &module_create_result));
+  unofficial_napi_module module = module_create_result.module;
+  CHECK_OR_FAIL(module != NULL,
                 "module compilation did not return a handle");
+  CHECK_OR_FAIL(module_create_result.module_requests != NULL,
+                "module compilation did not return requests");
+  CHECK_OR_FAIL(!module_create_result.has_top_level_await,
+                "synchronous module reported top-level await at creation");
+  int32_t module_status = -1;
+  napi_value module_error = NULL;
+  bool module_has_async_graph = false;
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
+                     env,
+                     module,
+                     &module_status,
+                     &module_error,
+                     &module_has_async_graph));
+  CHECK_OR_FAIL(module_status == 0,
+                "new module snapshot did not report uninstantiated status");
+  CHECK_OR_FAIL(module_error != NULL,
+                "module snapshot did not return an undefined error value");
+  CHECK_OR_FAIL(!module_has_async_graph,
+                "uninstantiated module reported an async graph");
   NAPI_CALL(env, unofficial_napi_module_wrap_link(
-                     env, module_handle, 0, NULL));
-  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module_handle));
+                     env, module, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module));
+  module_status = -1;
+  module_has_async_graph = true;
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
+                     env,
+                     module,
+                     &module_status,
+                     NULL,
+                     &module_has_async_graph));
+  CHECK_OR_FAIL(module_status == 2,
+                "instantiated module snapshot reported the wrong status");
+  CHECK_OR_FAIL(!module_has_async_graph,
+                "synchronous module reported an async graph");
   napi_value module_result;
   NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
                      env,
-                     module_handle,
+                     module,
                      module_url,
                      module_url,
                      &module_result));
   napi_value module_namespace;
   napi_value module_observed;
   NAPI_CALL(env, unofficial_napi_module_wrap_get_namespace(
-                     env, module_handle, &module_namespace));
+                     env, module, &module_namespace));
   NAPI_CALL(env, napi_get_named_property(
                      env, module_namespace, "observed", &module_observed));
   NAPI_CALL(env, napi_get_value_int32(env, module_observed, &marker));
   CHECK_OR_FAIL(marker == 73,
                 "module evaluation escaped its explicit context");
-  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module_handle));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
 
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
   // owns the value and copy-back. Releasing after the handle scope closes is
@@ -442,6 +476,7 @@ int main(void) {
 
   // Forged guest lengths are rejected before allocating a host scratch
   // buffer. This call must return an error rather than aborting the host.
+#if defined(__wasm__)
   napi_status oversized_string_status =
       napi_get_value_string_utf8(env,
                                  result,
@@ -450,14 +485,15 @@ int main(void) {
                                  &len);
   CHECK_OR_FAIL(oversized_string_status != napi_ok,
                 "oversized guest string length was not rejected");
+#endif
 
   // Guest wrap/add-finalizer callbacks are dispatched at an explicit provider
   // checkpoint; environment teardown force-drains remaining live records.
   napi_env finalizer_env = NULL;
-  void* finalizer_env_scope = NULL;
+  unofficial_napi_env_owner finalizer_env_scope = NULL;
   NAPI_CALL(env,
             unofficial_napi_create_env(
-                8, &finalizer_env, &finalizer_env_scope));
+                8, NULL, &finalizer_env, &finalizer_env_scope));
   napi_value wrapped_object;
   napi_value finalized_object;
   NAPI_CALL(finalizer_env,
@@ -478,7 +514,7 @@ int main(void) {
                                CountAddedFinalizer,
                                (void*)(uintptr_t)0x22,
                                NULL));
-  NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope, NULL));
   CHECK_OR_FAIL(wrap_finalizer_count == 1 && add_finalizer_count == 1,
                 "guest finalizers were not dispatched exactly once");
 
@@ -487,8 +523,8 @@ int main(void) {
   // a scope-bound value or an explicit release from already-destroyed Edge
   // state.
   napi_env lease_env = NULL;
-  void* lease_env_scope = NULL;
-  NAPI_CALL(env, unofficial_napi_create_env(8, &lease_env, &lease_env_scope));
+  unofficial_napi_env_owner lease_env_scope = NULL;
+  NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &lease_env, &lease_env_scope));
   napi_value abandoned_script;
   napi_value abandoned_value;
   NAPI_CALL(lease_env,
@@ -511,7 +547,7 @@ int main(void) {
                 &abandoned_data));
   CHECK_OR_FAIL(abandoned_lease != NULL && abandoned_data != NULL,
                 "failed to acquire teardown lease");
-  NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope));
+  NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope, NULL));
 
   return PrintSuccess("RUN_SCRIPT_TEST");
 }

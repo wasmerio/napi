@@ -51,8 +51,6 @@ fn main() {
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=lib/src");
     println!("cargo:rerun-if-changed=v8/src");
-    println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.cc");
-    println!("cargo:rerun-if-changed=src/edge_napi_embedder_hooks.h");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -100,7 +98,6 @@ fn main() {
         .include(napi_lib_src.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
-        .file("src/edge_napi_embedder_hooks.cc")
         .file(napi_lib_src.join("napi_error_state.cc").to_str().unwrap())
         .file(
             napi_lib_src

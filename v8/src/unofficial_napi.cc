@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -30,15 +31,17 @@
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
+struct unofficial_napi_profile__ {
+  unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
+  uint32_t provider_id = 0;
+};
+
 namespace {
 
 struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
+  std::string engine_flags;
   uint32_t refcount = 0;
-};
-
-struct EmbedderHooksState {
-  unofficial_napi_embedder_hooks hooks{};
 };
 
 class TrackingArrayBufferAllocator;
@@ -88,7 +91,6 @@ std::mutex g_runtime_mu;
 // for the teardown thread (Isolate::Delete touches the platform's page
 // allocator and tracing controller). The OS reclaims everything at _exit.
 SharedRuntime& g_runtime = *new SharedRuntime();
-EmbedderHooksState g_embedder_hooks;
 std::unordered_map<v8::Isolate*, napi_env>& g_env_by_isolate =
     *new std::unordered_map<v8::Isolate*, napi_env>();
 std::unordered_map<v8::Isolate*, uint64_t>& g_hash_seeds =
@@ -127,32 +129,11 @@ struct InterruptRequest {
 
 struct ProfilerState {
   v8::CpuProfiler* cpu_profiler = nullptr;
-  std::vector<uint32_t> active_cpu_profiles;
-  bool heap_profile_started = false;
+  std::vector<unofficial_napi_profile> active_profiles;
 };
 
 std::unordered_map<napi_env, ProfilerState>& g_profiler_states =
     *new std::unordered_map<napi_env, ProfilerState>();
-
-unofficial_napi_embedder_hooks CopyEmbedderHooks() {
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  return g_embedder_hooks.hooks;
-}
-
-bool QueryEmbedderMemoryInfo(unofficial_napi_embedder_memory_info* out) {
-  if (out == nullptr) return false;
-  *out = unofficial_napi_embedder_memory_info{};
-  const unofficial_napi_embedder_hooks hooks = CopyEmbedderHooks();
-  if (hooks.memory_info_callback == nullptr) return false;
-  return hooks.memory_info_callback(hooks.memory_info_target, out) == napi_ok;
-}
-
-bool PumpEmbedderShutdown(void* handle) {
-  if (handle == nullptr) return false;
-  const unofficial_napi_embedder_hooks hooks = CopyEmbedderHooks();
-  if (hooks.shutdown_pump_callback == nullptr) return false;
-  return hooks.shutdown_pump_callback(hooks.shutdown_pump_target, handle) == napi_ok;
-}
 
 class StringOutputStream final : public v8::OutputStream {
  public:
@@ -163,25 +144,65 @@ class StringOutputStream final : public v8::OutputStream {
 
   void EndOfStream() override {}
 
-  const std::string& output() const { return output_; }
+  std::string TakeOutput() { return std::move(output_); }
 
  private:
   std::string output_;
 };
 
+napi_status CreateExternalUtf8Bytes(napi_env env,
+                                    std::string&& bytes,
+                                    napi_value* result) {
+  if (env == nullptr || result == nullptr) return napi_invalid_arg;
+  auto* owner = new (std::nothrow) std::string(std::move(bytes));
+  if (owner == nullptr) return napi_generic_failure;
+  if (owner->empty()) {
+    delete owner;
+    napi_value arraybuffer = nullptr;
+    napi_status status = napi_create_arraybuffer(env, 0, nullptr, &arraybuffer);
+    if (status != napi_ok) return status;
+    return napi_create_typedarray(
+        env, napi_uint8_array, 0, arraybuffer, 0, result);
+  }
+  napi_value arraybuffer = nullptr;
+  napi_status status = napi_create_external_arraybuffer(
+      env,
+      owner->data(),
+      owner->size(),
+      [](napi_env, void*, void* hint) {
+        delete static_cast<std::string*>(hint);
+      },
+      owner,
+      &arraybuffer);
+  if (status != napi_ok) {
+    delete owner;
+    return status;
+  }
+  return napi_create_typedarray(
+      env, napi_uint8_array, owner->size(), arraybuffer, 0, result);
+}
+
 void DisposeProfilerState(napi_env env, ProfilerState* state) {
   if (env == nullptr || env->isolate == nullptr || state == nullptr) return;
-  if (state->heap_profile_started) {
-    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
-    state->heap_profile_started = false;
-  }
-  if (state->cpu_profiler != nullptr) {
-    for (uint32_t profile_id : state->active_cpu_profiles) {
-      if (v8::CpuProfile* profile = state->cpu_profiler->Stop(profile_id)) {
+  bool heap_profile_started = false;
+  for (unofficial_napi_profile profile_session : state->active_profiles) {
+    if (profile_session == nullptr) continue;
+    if (profile_session->kind == unofficial_napi_profile_cpu &&
+        state->cpu_profiler != nullptr) {
+      if (v8::CpuProfile* profile =
+              state->cpu_profiler->Stop(profile_session->provider_id)) {
         profile->Delete();
       }
+    } else if (profile_session->kind == unofficial_napi_profile_heap) {
+      heap_profile_started = true;
     }
-    state->active_cpu_profiles.clear();
+    delete profile_session;
+  }
+  state->active_profiles.clear();
+  if (heap_profile_started) {
+    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+  }
+  if (state->cpu_profiler != nullptr) {
     state->cpu_profiler->Dispose();
     state->cpu_profiler = nullptr;
   }
@@ -189,21 +210,6 @@ void DisposeProfilerState(napi_env env, ProfilerState* state) {
 
 ProfilerState& EnsureProfilerState(napi_env env) {
   return g_profiler_states[env];
-}
-
-bool CopyStringToMallocBuffer(const std::string& input, char** data_out, size_t* len_out) {
-  if (data_out == nullptr || len_out == nullptr) return false;
-  *data_out = nullptr;
-  *len_out = 0;
-  char* buffer = static_cast<char*>(std::malloc(input.size() + 1));
-  if (buffer == nullptr) return false;
-  if (!input.empty()) {
-    std::memcpy(buffer, input.data(), input.size());
-  }
-  buffer[input.size()] = '\0';
-  *data_out = buffer;
-  *len_out = input.size();
-  return true;
 }
 
 uint64_t GenerateHashSeed() {
@@ -267,28 +273,6 @@ void AppendJsonNumber(std::string* out, T value) {
   std::ostringstream stream;
   stream << value;
   out->append(stream.str());
-}
-
-void StripStackFrameLine(std::string* stack, const char* prefix) {
-  if (stack == nullptr || prefix == nullptr || stack->empty()) return;
-  size_t pos = stack->find(prefix);
-  while (pos != std::string::npos) {
-    const size_t end = stack->find('\n', pos + 1);
-    stack->erase(pos, end == std::string::npos ? std::string::npos : end - pos);
-    pos = stack->find(prefix);
-  }
-}
-
-void StripInternalAsyncStackFrames(std::string* stack) {
-  static constexpr const char* kPrefixes[] = {
-      "\n    at process.processTicksAndRejections (node:internal/process/task_queues:",
-      "\n    at process.processTicksAndRejections (node:internal/process/task_queues)",
-      "\n    at triggerUncaughtException (node:internal/process/promises:",
-      "\n    at triggerUncaughtException (node:internal/modules/run_main:",
-  };
-  for (const char* prefix : kPrefixes) {
-    StripStackFrameLine(stack, prefix);
-  }
 }
 
 void BuildHeapProfileNode(v8::Isolate* isolate,
@@ -432,25 +416,7 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     try_catch.ReThrow();
   }
-  v8::Local<v8::Value> value;
-  if (!result.ToLocal(&value) || !value->IsString()) {
-    return result;
-  }
-
-  v8::String::Utf8Value utf8(context->GetIsolate(), value);
-  std::string formatted =
-      *utf8 != nullptr ? std::string(*utf8, utf8.length()) : std::string();
-  StripInternalAsyncStackFrames(&formatted);
-  v8::Local<v8::String> filtered;
-  if (!v8::String::NewFromUtf8(
-           context->GetIsolate(),
-           formatted.c_str(),
-           v8::NewStringType::kNormal,
-           static_cast<int>(formatted.size()))
-           .ToLocal(&filtered)) {
-    return value;
-  }
-  return filtered;
+  return result;
 }
 
 bool IsEnvThreadEntered(napi_env env) {
@@ -503,9 +469,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 
   ~TrackingArrayBufferAllocator() override {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr) {
-      napi_host_guest_heap_release(gctx);
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr) {
+      napi_host_guest_heap_release(guest_heap);
     }
     delete backing_;
   }
@@ -517,9 +484,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   }
 
   void Free(void* data, size_t length) override {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr && data != nullptr &&
-        napi_host_guest_heap_free(gctx, data, length) != 0) {
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr && data != nullptr &&
+        napi_host_guest_heap_free(guest_heap, data, length) != 0) {
       // Guest-heap provenance: no external-budget uncharge (those bytes were
       // never charged; they are wasm linear memory).
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
@@ -537,7 +505,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     size_t backing_max = backing_ != nullptr
                              ? backing_->MaxAllocationSize()
                              : v8::ArrayBuffer::Allocator::MaxAllocationSize();
-    if (guest_heap_ctx_.load(std::memory_order_acquire) != nullptr) {
+    if (guest_heap_.load(std::memory_order_acquire) != nullptr) {
       // Guest-heap backing stores live in a 32-bit address space.
       constexpr size_t kGuestHeapMax = 0x7fff0000u;
       return backing_max < kGuestHeapMax ? backing_max : kGuestHeapMax;
@@ -556,19 +524,21 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   // Install the guest-heap context: from now on every backing store is
   // allocated inside the guest's linear memory. Ownership transfers to the
   // allocator, which releases it in its destructor.
-  void set_guest_heap_ctx(void* ctx) {
-    guest_heap_ctx_.store(ctx, std::memory_order_release);
+  void set_guest_heap(unofficial_napi_guest_heap guest_heap) {
+    guest_heap_.store(guest_heap, std::memory_order_release);
   }
 
  private:
   void* AllocateImpl(size_t length, bool zeroed) {
-    void* gctx = guest_heap_ctx_.load(std::memory_order_acquire);
-    if (gctx != nullptr) {
+    unofficial_napi_guest_heap guest_heap =
+        guest_heap_.load(std::memory_order_acquire);
+    if (guest_heap != nullptr) {
       // Guest-heap path. The claimed pages are already charged as wasm linear
       // memory, so the external budget is deliberately not consulted. On
       // failure return null (V8 throws RangeError); never fall back to host
       // memory, which the guest could not address.
-      void* data = napi_host_guest_heap_alloc(gctx, length, zeroed ? 1 : 0);
+      void* data = napi_host_guest_heap_alloc(
+          guest_heap, length, zeroed ? 1 : 0);
       if (data != nullptr) {
         total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
       }
@@ -589,20 +559,19 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
 
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
   std::atomic<uint64_t> total_mem_usage_ {0};
-  std::atomic<void*> guest_heap_ctx_ {nullptr};
+  std::atomic<unofficial_napi_guest_heap> guest_heap_ {nullptr};
 };
 
-void ApplyNodeIsolateCreateParams(v8::Isolate::CreateParams* params) {
-  if (params == nullptr) return;
+void ApplyNodeIsolateCreateParams(
+    v8::Isolate::CreateParams* params,
+    const unofficial_napi_env_create_options* options) {
+  if (params == nullptr || options == nullptr) return;
 
-  unofficial_napi_embedder_memory_info memory_info{};
-  if (!QueryEmbedderMemoryInfo(&memory_info)) return;
-
-  const uint64_t constrained_memory = memory_info.constrained_memory;
+  const uint64_t constrained_memory = options->constrained_memory;
   const uint64_t total_memory =
       constrained_memory > 0
-          ? std::min<uint64_t>(memory_info.total_memory, constrained_memory)
-          : memory_info.total_memory;
+          ? std::min<uint64_t>(options->total_memory, constrained_memory)
+          : options->total_memory;
   if (total_memory > 0 &&
       params->constraints.max_old_generation_size_in_bytes() == 0) {
     params->constraints.ConfigureDefaults(total_memory, 0);
@@ -645,18 +614,10 @@ void OnPlatformShutdownFinished(void* data) {
 }
 
 void WaitForPlatformShutdown(PlatformShutdownWaiter* waiter,
-                             void* shutdown_pump_handle) {
+                             void* /*shutdown_pump_handle*/) {
   if (waiter == nullptr) return;
   std::unique_lock<std::mutex> lock(waiter->mutex);
   while (!waiter->finished) {
-    if (shutdown_pump_handle != nullptr) {
-      lock.unlock();
-      if (!PumpEmbedderShutdown(shutdown_pump_handle)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-      lock.lock();
-      continue;
-    }
     waiter->cv.wait_for(lock, std::chrono::milliseconds(1));
   }
 }
@@ -728,19 +689,42 @@ void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
   }
 }
 
+napi_status ConfigureRuntime(const char* engine_flags,
+                             size_t engine_flags_length) {
+  if ((engine_flags_length > 0 && engine_flags == nullptr) ||
+      engine_flags_length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return napi_invalid_arg;
+  }
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (g_runtime.platform != nullptr) {
+    return g_runtime.engine_flags.size() == engine_flags_length &&
+                   (engine_flags_length == 0 ||
+                    std::memcmp(g_runtime.engine_flags.data(), engine_flags,
+                                engine_flags_length) == 0)
+               ? napi_ok
+               : napi_invalid_arg;
+  }
+
+  ApplyDefaultV8Flags();
+  if (engine_flags_length > 0) {
+    v8::V8::SetFlagsFromString(engine_flags,
+                               static_cast<int>(engine_flags_length));
+  }
+  v8::V8::InitializeICUDefaultLocation("");
+  v8::V8::InitializeExternalStartupData("");
+  g_runtime.platform = EdgeV8Platform::Create();
+  if (g_runtime.platform == nullptr) return napi_generic_failure;
+  v8::V8::InitializePlatform(g_runtime.platform.get());
+  v8::V8::Initialize();
+  g_runtime.engine_flags.assign(engine_flags_length > 0 ? engine_flags : "",
+                                engine_flags_length);
+  return napi_ok;
+}
+
 napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
-
-  if (g_runtime.refcount == 0 && g_runtime.platform == nullptr) {
-    ApplyDefaultV8Flags();
-    v8::V8::InitializeICUDefaultLocation("");
-    v8::V8::InitializeExternalStartupData("");
-    g_runtime.platform = EdgeV8Platform::Create();
-    v8::V8::InitializePlatform(g_runtime.platform.get());
-    v8::V8::Initialize();
-  }
-
+  if (g_runtime.platform == nullptr) return napi_invalid_arg;
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;
@@ -1722,6 +1706,17 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 
 extern "C" {
 
+napi_status NAPI_CDECL unofficial_napi_configure_runtime(
+    const unofficial_napi_runtime_options* options) {
+  if (options != nullptr &&
+      (options->size < sizeof(unofficial_napi_runtime_options) ||
+       options->version != UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION)) {
+    return napi_invalid_arg;
+  }
+  return ConfigureRuntime(options != nullptr ? options->engine_flags : nullptr,
+                          options != nullptr ? options->engine_flags_length : 0);
+}
+
 napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
     napi_env env, napi_typedarray_type type, size_t length, void** data,
     napi_value* result) {
@@ -1746,31 +1741,44 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
   return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_embedder_hooks(
-    const unofficial_napi_embedder_hooks* hooks) {
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  if (hooks == nullptr) {
-    g_embedder_hooks.hooks = unofficial_napi_embedder_hooks{};
-  } else {
-    g_embedder_hooks.hooks = *hooks;
-  }
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
+napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
-    unofficial_napi_enqueue_foreground_task_callback callback,
-    void* target) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->enqueue_foreground_task_callback = callback;
-  env->enqueue_foreground_task_target = target;
+    const unofficial_napi_env_hooks* hooks,
+    uint64_t* accepted_hooks_out) {
+  if (env == nullptr || env->isolate == nullptr || hooks == nullptr ||
+      accepted_hooks_out == nullptr ||
+      hooks->size < sizeof(unofficial_napi_env_hooks) ||
+      hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
+      env->embedder_hooks_attached) {
+    return napi_invalid_arg;
+  }
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr &&
-        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
+        !g_runtime.platform->BindForegroundTaskTarget(
+            env->isolate,
+            env,
+            hooks->enqueue_foreground_task_callback,
+            hooks->data)) {
       return napi_generic_failure;
     }
+    auto& fatal = g_fatal_error_callbacks[env->isolate];
+    fatal.fatal = hooks->fatal_error_callback;
+    fatal.oom = hooks->oom_error_callback;
   }
+
+  env->context_token_assign_callback = hooks->context_token_assign_callback;
+  env->context_token_unassign_callback = hooks->context_token_unassign_callback;
+  env->context_token_callback_data = hooks->data;
+  env->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
+  env->enqueue_foreground_task_target = hooks->data;
+  env->embedder_hooks_attached = true;
+
+  env->isolate->SetFatalErrorHandler(
+      hooks->fatal_error_callback != nullptr ? FatalErrorCallback : nullptr);
+  env->isolate->SetOOMErrorHandler(
+      hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
+  *accepted_hooks_out = unofficial_napi_env_hooks_requested(hooks);
   return napi_ok;
 }
 
@@ -1788,53 +1796,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* environment) {
+static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  env->edge_environment = environment;
-  return napi_ok;
-}
-
-void* unofficial_napi_get_edge_environment(napi_env env) {
-  return env == nullptr ? nullptr : env->edge_environment;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
-    napi_env env,
-    unofficial_napi_env_cleanup_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_cleanup_callback = callback;
-  env->env_cleanup_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
-    napi_env env,
-    unofficial_napi_env_destroy_callback callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->env_destroy_callback = callback;
-  env->env_destroy_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
-    napi_env env,
-    unofficial_napi_context_token_callback assign_callback,
-    unofficial_napi_context_token_callback unassign_callback,
-    void* data) {
-  if (env == nullptr) return napi_invalid_arg;
-  env->context_token_assign_callback = assign_callback;
-  env->context_token_unassign_callback = unassign_callback;
-  env->context_token_callback_data = data;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
-  if (env == nullptr) return napi_invalid_arg;
-  if (env->env_cleanup_callback != nullptr) {
-    env->env_cleanup_callback(env, env->env_cleanup_callback_data);
-  }
   ProfilerState profiler_state;
   bool has_profiler_state = false;
   {
@@ -1888,55 +1851,43 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
+napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
     napi_env env,
-    unofficial_napi_fatal_error_callback fatal_callback,
-    unofficial_napi_oom_error_callback oom_callback) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto& entry = g_fatal_error_callbacks[env->isolate];
-    entry.fatal = fatal_callback;
-    entry.oom = oom_callback;
+    unofficial_napi_near_heap_limit_callback callback_or_null,
+    void* data,
+    size_t restored_heap_limit) {
+  if (env == nullptr || env->isolate == nullptr ||
+      (callback_or_null != nullptr && restored_heap_limit != 0) ||
+      (callback_or_null == nullptr && data != nullptr)) {
+    return napi_invalid_arg;
   }
 
-  env->isolate->SetFatalErrorHandler(fatal_callback != nullptr ? FatalErrorCallback : nullptr);
-  env->isolate->SetOOMErrorHandler(oom_callback != nullptr ? OOMErrorCallback : nullptr);
-  return napi_ok;
-}
+  if (callback_or_null != nullptr) {
+    bool install_provider_callback = false;
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      auto [it, inserted] =
+          g_near_heap_limit_callbacks.try_emplace(env->isolate);
+      it->second.callback = callback_or_null;
+      it->second.data = data;
+      install_provider_callback = inserted;
+    }
+    if (install_provider_callback) {
+      env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
+    }
+    return napi_ok;
+  }
 
-napi_status NAPI_CDECL unofficial_napi_set_near_heap_limit_callback(
-    napi_env env,
-    unofficial_napi_near_heap_limit_callback callback,
-    void* data) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-
+  bool remove_provider_callback = false;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto& entry = g_near_heap_limit_callbacks[env->isolate];
-    entry.callback = callback;
-    entry.data = data;
+    remove_provider_callback =
+        g_near_heap_limit_callbacks.erase(env->isolate) != 0;
   }
-  env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_remove_near_heap_limit_callback(
-    napi_env env,
-    size_t heap_limit) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_near_heap_limit_callbacks.erase(env->isolate);
+  if (remove_provider_callback) {
+    env->isolate->RemoveNearHeapLimitCallback(
+        NearHeapLimitCallback, restored_heap_limit);
   }
-  env->isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, heap_limit);
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_stack_limit(napi_env env, void* stack_limit) {
-  if (env == nullptr || env->isolate == nullptr || stack_limit == nullptr) return napi_invalid_arg;
-  env->isolate->SetStackLimit(reinterpret_cast<uintptr_t>(stack_limit));
   return napi_ok;
 }
 
@@ -1948,46 +1899,44 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
-                                                  napi_env* env_out,
-                                                  void** scope_out) {
-  return unofficial_napi_create_env_with_options(
-      module_api_version, nullptr, env_out, scope_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
+napi_status NAPI_CDECL unofficial_napi_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
-    void** scope_out) {
-  // This function owns options->guest_heap_ctx from here on: it must be
-  // released exactly once, either by the allocator's destructor or on a
-  // failure before the allocator takes it.
-  void* guest_heap_ctx =
-      options != nullptr ? options->guest_heap_ctx : nullptr;
-  if (env_out == nullptr || scope_out == nullptr) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    unofficial_napi_env_owner* owner_out) {
+  if (options != nullptr &&
+      (options->size < sizeof(unofficial_napi_env_create_options) ||
+       options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION)) {
+    // The descriptor is not large enough to transfer guest_heap ownership.
     return napi_invalid_arg;
   }
 
+  // Size/version validation above proves that guest_heap is present. This
+  // function owns it from here on and must release it exactly once.
+  unofficial_napi_guest_heap guest_heap =
+      options != nullptr ? options->guest_heap : nullptr;
+  if (env_out == nullptr || owner_out == nullptr) {
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    return napi_invalid_arg;
+  }
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
-    if (guest_heap_ctx != nullptr) napi_host_guest_heap_release(guest_heap_ctx);
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     ReleaseRuntime();
     return napi_generic_failure;
   }
-  if (guest_heap_ctx != nullptr) {
+  if (guest_heap != nullptr) {
     // Armed before the isolate exists, so even bootstrap-time backing stores
     // are guest-memory-backed. The allocator's destructor releases the ctx on
     // every later failure path.
-    allocator->set_guest_heap_ctx(guest_heap_ctx);
+    allocator->set_guest_heap(guest_heap);
   }
 
   v8::Isolate::CreateParams params{};
@@ -2010,7 +1959,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
           static_cast<uint32_t*>(options->stack_limit));
     }
   }
-  ApplyNodeIsolateCreateParams(&params);
+  ApplyNodeIsolateCreateParams(&params, options);
   v8::Isolate* isolate = CreateIsolateForEnv(platform, params);
   if (isolate == nullptr) {
     ReleaseRuntime();
@@ -2049,17 +1998,18 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
   }
 
   *env_out = scope->env;
-  *scope_out = scope;
+  *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
 }
 
-napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
-  if (scope_ptr == nullptr) return napi_invalid_arg;
-  auto* scope = static_cast<UnofficialEnvScope*>(scope_ptr);
+napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
+                            void* shutdown_pump_handle) {
+  if (owner == nullptr) return napi_invalid_arg;
+  auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
-    status = unofficial_napi_destroy_env_instance(scope->env);
+    status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }
 
@@ -2085,26 +2035,17 @@ napi_status ReleaseEnvScope(void* scope_ptr, void* shutdown_pump_handle) {
   return status;
 }
 
-napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
-  return ReleaseEnvScope(scope_ptr, nullptr);
+napi_status NAPI_CDECL unofficial_napi_release_env(unofficial_napi_env_owner owner,
+                                                   struct uv_loop_s* loop) {
+  return ReleaseEnvScope(owner, static_cast<void*>(loop));
 }
 
-napi_status NAPI_CDECL unofficial_napi_release_env_with_loop(void* scope_ptr,
-                                                             struct uv_loop_s* loop) {
-  return ReleaseEnvScope(scope_ptr, static_cast<void*>(loop));
-}
-
-napi_status NAPI_CDECL unofficial_napi_low_memory_notification(napi_env env) {
+napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // This is the production embedder API for asking V8 to reclaim as much
+  // memory as possible. RequestGarbageCollectionForTesting is intentionally
+  // not used: it aborts unless V8 was initialized with testing-only flags.
   env->isolate->LowMemoryNotification();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
-    const char* flags,
-    size_t length) {
-  if (flags == nullptr) return napi_invalid_arg;
-  v8::V8::SetFlagsFromString(flags, static_cast<int>(length));
   return napi_ok;
 }
 
@@ -2210,15 +2151,6 @@ void DrainMicrotasksForEnv(napi_env env) {
   PumpPlatformForegroundTasks(env);
 }
 
-napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Match Node test expectations for global.gc(): force an actual full GC
-  // cycle rather than only hinting memory pressure.
-  env->isolate->RequestGarbageCollectionForTesting(
-      v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
@@ -2276,18 +2208,6 @@ napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) 
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_pending_exception(napi_env env,
-                                                             napi_value error) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
-    return napi_invalid_arg;
-  }
-  env->last_exception.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
-  env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(error));
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(
     napi_env env,
     unofficial_napi_interrupt_callback callback,
@@ -2324,26 +2244,19 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
 napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
+    napi_value transfer_list_or_null,
     napi_value* result_out) {
-  return StructuredCloneImpl(env, value, nullptr, result_out);
+  return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_structured_clone_with_transfer(
+napi_status NAPI_CDECL unofficial_napi_message_create(
     napi_env env,
     napi_value value,
-    napi_value transfer_list,
-    napi_value* result_out) {
-  return StructuredCloneImpl(env, value, transfer_list, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_serialize_value(
-    napi_env env,
-    napi_value value,
-    void** payload_out) {
-  if (env == nullptr || env->isolate == nullptr || value == nullptr || payload_out == nullptr) {
+    unofficial_napi_message* message_out) {
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || message_out == nullptr) {
     return napi_invalid_arg;
   }
-  *payload_out = nullptr;
+  *message_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
@@ -2371,20 +2284,22 @@ napi_status NAPI_CDECL unofficial_napi_serialize_value(
   std::free(released.first);
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
-  *payload_out = payload;
+  *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_deserialize_value(
+napi_status NAPI_CDECL unofficial_napi_message_take(
     napi_env env,
-    void* payload_ptr,
+    unofficial_napi_message message,
     napi_value* result_out) {
-  if (env == nullptr || env->isolate == nullptr || payload_ptr == nullptr || result_out == nullptr) {
+  if (message == nullptr) return napi_invalid_arg;
+  std::unique_ptr<SerializedClonePayload> payload(
+      reinterpret_cast<SerializedClonePayload*>(message));
+  if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
   *result_out = nullptr;
 
-  auto* payload = static_cast<SerializedClonePayload*>(payload_ptr);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
@@ -2404,8 +2319,8 @@ napi_status NAPI_CDECL unofficial_napi_deserialize_value(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-void NAPI_CDECL unofficial_napi_release_serialized_value(void* payload_ptr) {
-  delete static_cast<SerializedClonePayload*>(payload_ptr);
+void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
+  delete reinterpret_cast<SerializedClonePayload*>(message);
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {
@@ -2509,46 +2424,19 @@ napi_status NAPI_CDECL unofficial_napi_get_promise_details(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
+napi_status NAPI_CDECL unofficial_napi_get_error_metadata(
     napi_env env,
     napi_value error,
-    unofficial_napi_error_source_positions* out) {
-  return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
+    unofficial_napi_error_metadata_mode mode,
+    unofficial_napi_error_metadata* out) {
+  return unofficial_napi_internal::GetErrorMetadata(env, error, mode, out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_set_source_maps_enabled(
+napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
     napi_env env,
-    bool enabled) {
-  return unofficial_napi_internal::SetSourceMapsEnabled(env, enabled);
-}
-
-napi_status NAPI_CDECL unofficial_napi_set_get_source_map_error_source_callback(
-    napi_env env,
+    bool enabled,
     napi_value callback) {
-  return unofficial_napi_internal::SetGetSourceMapErrorSourceCallback(env, callback);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out) {
-  return unofficial_napi_internal::GetErrorSourceLineForStderr(env, error, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_error_thrown_at(
-    napi_env env,
-    napi_value error,
-    napi_value* result_out) {
-  return unofficial_napi_internal::GetErrorThrownAt(env, error, result_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_take_preserved_error_formatting(
-    napi_env env,
-    napi_value error,
-    napi_value* source_line_out,
-    napi_value* thrown_at_out) {
-  return unofficial_napi_internal::TakePreservedErrorFormatting(
-      env, error, source_line_out, thrown_at_out);
+  return unofficial_napi_internal::ConfigureSourceMaps(env, enabled, callback);
 }
 
 napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
@@ -2719,39 +2607,6 @@ napi_status NAPI_CDECL unofficial_napi_get_call_sites(napi_env env,
   return GetCallSitesImpl(env, frames, 1, callsites_out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_current_stack_trace(napi_env env,
-                                                               uint32_t frames,
-                                                               napi_value* callsites_out) {
-  return GetCallSitesImpl(env, frames, 0, callsites_out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_value* location_out) {
-  if (env == nullptr || env->isolate == nullptr || location_out == nullptr) return napi_invalid_arg;
-  *location_out = nullptr;
-
-  v8::Isolate* isolate = env->isolate;
-  v8::EscapableHandleScope scope(isolate);
-
-  v8::Local<v8::StackTrace> trace = v8::StackTrace::CurrentStackTrace(isolate, 2);
-  if (trace->GetFrameCount() != 2) {
-    return napi_ok;
-  }
-
-  v8::Local<v8::StackFrame> frame = trace->GetFrame(isolate, 1);
-  v8::Local<v8::Value> file = frame->GetScriptNameOrSourceURL();
-  if (file.IsEmpty()) {
-    return napi_ok;
-  }
-  v8::Local<v8::Value> values[] = {
-      v8::Integer::New(isolate, frame->GetLineNumber()),
-      v8::Integer::New(isolate, frame->GetColumn()),
-      file,
-  };
-  v8::Local<v8::Array> location = v8::Array::New(isolate, values, 3);
-  *location_out = napi_v8_wrap_value(env, scope.Escape(location));
-  return *location_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
 napi_status NAPI_CDECL unofficial_napi_arraybuffer_view_has_buffer(napi_env env,
                                                                    napi_value value,
                                                                    bool* result_out) {
@@ -2771,29 +2626,6 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   v8::Local<v8::String> name = raw.As<v8::Object>()->GetConstructorName();
   *name_out = napi_v8_wrap_value(env, name);
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
-    napi_env env,
-    napi_value value,
-    uint32_t filter_bits,
-    napi_value* result_out) {
-  if (env == nullptr || value == nullptr || result_out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
-
-  v8::Local<v8::Array> properties;
-  if (!raw.As<v8::Object>()
-           ->GetPropertyNames(env->context(),
-                              v8::KeyCollectionMode::kOwnOnly,
-                              static_cast<v8::PropertyFilter>(filter_bits),
-                              v8::IndexFilter::kSkipIndices)
-           .ToLocal(&properties)) {
-    return napi_generic_failure;
-  }
-
-  *result_out = napi_v8_wrap_value(env, properties);
-  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
@@ -2833,34 +2665,35 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(
+napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
     napi_env env,
-    double* heap_total_out,
-    double* heap_used_out,
-    double* external_out,
-    double* array_buffers_out) {
-  if (env == nullptr || env->isolate == nullptr || heap_total_out == nullptr ||
-      heap_used_out == nullptr || external_out == nullptr || array_buffers_out == nullptr) {
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out) {
+  if (env == nullptr || value == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
 
-  v8::HeapStatistics stats;
-  env->isolate->GetHeapStatistics(&stats);
-
-  uint64_t array_buffers = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
-    if (it != g_tracking_allocators.end() && it->second) {
-      array_buffers = it->second->total_mem_usage();
+  v8::TryCatch try_catch(env->isolate);
+  v8::Local<v8::Array> properties;
+  if (!raw.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              v8::KeyCollectionMode::kOwnOnly,
+                              static_cast<v8::PropertyFilter>(filter_bits),
+                              v8::IndexFilter::kSkipIndices)
+           .ToLocal(&properties)) {
+    if (try_catch.HasCaught()) {
+      napi_v8_set_last_exception(
+          env, try_catch.Exception(), try_catch.Message());
+      return napi_pending_exception;
     }
+    return napi_generic_failure;
   }
 
-  *heap_total_out = static_cast<double>(stats.total_heap_size());
-  *heap_used_out = static_cast<double>(stats.used_heap_size());
-  *external_out = static_cast<double>(stats.external_memory());
-  *array_buffers_out = static_cast<double>(array_buffers);
-  return napi_ok;
+  *result_out = napi_v8_wrap_value(env, properties);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
@@ -2883,13 +2716,20 @@ napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
 napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
     napi_env env,
     unofficial_napi_heap_statistics* stats_out) {
-  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr) {
+  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr ||
+      stats_out->size < sizeof(*stats_out) ||
+      stats_out->version != UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION) {
     return napi_invalid_arg;
   }
 
   v8::HeapStatistics stats;
   env->isolate->GetHeapStatistics(&stats);
 
+  const uint32_t output_size = stats_out->size;
+  std::memset(stats_out, 0, sizeof(*stats_out));
+  stats_out->size = output_size;
+  stats_out->version = UNOFFICIAL_NAPI_HEAP_STATISTICS_VERSION;
+  stats_out->valid_fields = unofficial_napi_heap_stat_all;
   stats_out->total_heap_size = stats.total_heap_size();
   stats_out->total_heap_size_executable = stats.total_heap_size_executable();
   stats_out->total_physical_size = stats.total_physical_size();
@@ -2904,45 +2744,45 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
   stats_out->total_global_handles_size = stats.total_global_handles_size();
   stats_out->used_global_handles_size = stats.used_global_handles_size();
   stats_out->external_memory = stats.external_memory();
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_heap_space_count(
-    napi_env env,
-    uint32_t* count_out) {
-  if (env == nullptr || env->isolate == nullptr || count_out == nullptr) {
-    return napi_invalid_arg;
+  stats_out->array_buffer_memory = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
+    if (it != g_tracking_allocators.end() && it->second) {
+      stats_out->array_buffer_memory = it->second->total_mem_usage();
+    }
   }
-
-  *count_out = static_cast<uint32_t>(env->isolate->NumberOfHeapSpaces());
   return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_heap_space_statistics(
     napi_env env,
-    uint32_t space_index,
-    unofficial_napi_heap_space_statistics* stats_out) {
-  if (env == nullptr || env->isolate == nullptr || stats_out == nullptr) {
+    unofficial_napi_heap_space_statistics* stats_out,
+    uint32_t capacity,
+    uint32_t* count_out) {
+  if (env == nullptr || env->isolate == nullptr || count_out == nullptr ||
+      (capacity > 0 && stats_out == nullptr)) {
     return napi_invalid_arg;
   }
 
   const uint32_t space_count =
       static_cast<uint32_t>(env->isolate->NumberOfHeapSpaces());
-  if (space_index >= space_count) {
-    return napi_invalid_arg;
+  *count_out = space_count;
+  const uint32_t output_count = std::min(capacity, space_count);
+  for (uint32_t space_index = 0; space_index < output_count; ++space_index) {
+    v8::HeapSpaceStatistics stats;
+    env->isolate->GetHeapSpaceStatistics(&stats, space_index);
+
+    auto& output = stats_out[space_index];
+    std::snprintf(output.space_name,
+                  sizeof(output.space_name),
+                  "%s",
+                  stats.space_name() != nullptr ? stats.space_name() : "");
+    output.space_size = stats.space_size();
+    output.space_used_size = stats.space_used_size();
+    output.space_available_size = stats.space_available_size();
+    output.physical_space_size = stats.physical_space_size();
   }
-
-  v8::HeapSpaceStatistics stats;
-  env->isolate->GetHeapSpaceStatistics(&stats, space_index);
-
-  std::snprintf(stats_out->space_name,
-                sizeof(stats_out->space_name),
-                "%s",
-                stats.space_name() != nullptr ? stats.space_name() : "");
-  stats_out->space_size = stats.space_size();
-  stats_out->space_used_size = stats.space_used_size();
-  stats_out->space_available_size = stats.space_available_size();
-  stats_out->physical_space_size = stats.physical_space_size();
   return napi_ok;
 }
 
@@ -2963,168 +2803,153 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_code_statistics(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_start_cpu_profile(
+napi_status NAPI_CDECL unofficial_napi_profile_start(
     napi_env env,
-    unofficial_napi_cpu_profile_start_result* result_out,
-    uint32_t* profile_id_out) {
+    unofficial_napi_profile_kind kind,
+    unofficial_napi_profile_start_result* result_out,
+    unofficial_napi_profile* profile_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr ||
-      profile_id_out == nullptr) {
+      profile_out == nullptr ||
+      (kind != unofficial_napi_profile_cpu &&
+       kind != unofficial_napi_profile_heap)) {
     return napi_invalid_arg;
   }
-  *result_out = unofficial_napi_cpu_profile_start_ok;
-  *profile_id_out = 0;
+  *result_out = unofficial_napi_profile_start_ok;
+  *profile_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
-  ProfilerState* state = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    state = &EnsureProfilerState(env);
-    if (state->cpu_profiler == nullptr) {
-      state->cpu_profiler = v8::CpuProfiler::New(env->isolate);
-      if (state->cpu_profiler == nullptr) return napi_generic_failure;
+  if (kind == unofficial_napi_profile_heap) {
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      auto it = g_profiler_states.find(env);
+      if (it != g_profiler_states.end() &&
+          std::any_of(it->second.active_profiles.begin(),
+                      it->second.active_profiles.end(),
+                      [](unofficial_napi_profile profile) {
+                        return profile != nullptr &&
+                               profile->kind == unofficial_napi_profile_heap;
+                      })) {
+        *result_out = unofficial_napi_profile_start_busy;
+        return napi_ok;
+      }
     }
+    if (!env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler()) {
+      *result_out = unofficial_napi_profile_start_busy;
+      return napi_ok;
+    }
+    auto* profile = new (std::nothrow) unofficial_napi_profile__;
+    if (profile == nullptr) {
+      env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+      return napi_generic_failure;
+    }
+    profile->kind = kind;
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      EnsureProfilerState(env).active_profiles.push_back(profile);
+    }
+    *profile_out = profile;
+    return napi_ok;
   }
 
-  v8::CpuProfilingResult result = state->cpu_profiler->Start(
+  v8::CpuProfiler* cpu_profiler = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    ProfilerState& state = EnsureProfilerState(env);
+    if (state.cpu_profiler == nullptr) {
+      state.cpu_profiler = v8::CpuProfiler::New(env->isolate);
+      if (state.cpu_profiler == nullptr) return napi_generic_failure;
+    }
+    cpu_profiler = state.cpu_profiler;
+  }
+
+  v8::CpuProfilingResult result = cpu_profiler->Start(
       v8::CpuProfilingOptions{v8::CpuProfilingMode::kLeafNodeLineNumbers,
                               v8::CpuProfilingOptions::kNoSampleLimit});
   if (result.status == v8::CpuProfilingStatus::kErrorTooManyProfilers) {
-    *result_out = unofficial_napi_cpu_profile_start_too_many;
+    *result_out = unofficial_napi_profile_start_busy;
     return napi_ok;
   }
   if (result.status != v8::CpuProfilingStatus::kStarted) {
     return napi_generic_failure;
   }
 
-  *profile_id_out = static_cast<uint32_t>(result.id);
+  auto* profile = new (std::nothrow) unofficial_napi_profile__;
+  if (profile == nullptr) {
+    if (v8::CpuProfile* stopped = cpu_profiler->Stop(result.id)) {
+      stopped->Delete();
+    }
+    return napi_generic_failure;
+  }
+  profile->kind = kind;
+  profile->provider_id = static_cast<uint32_t>(result.id);
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     auto it = g_profiler_states.find(env);
     if (it != g_profiler_states.end()) {
-      it->second.active_cpu_profiles.push_back(*profile_id_out);
+      it->second.active_profiles.push_back(profile);
     }
   }
+  *profile_out = profile;
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
+napi_status NAPI_CDECL unofficial_napi_profile_stop(
     napi_env env,
-    uint32_t profile_id,
-    bool* found_out,
-    char** json_out,
-    size_t* json_len_out) {
-  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
-      json_out == nullptr || json_len_out == nullptr) {
+    unofficial_napi_profile profile,
+    napi_value* json_out) {
+  if (env == nullptr || env->isolate == nullptr || profile == nullptr ||
+      json_out == nullptr) {
     return napi_invalid_arg;
   }
-  *found_out = false;
   *json_out = nullptr;
-  *json_len_out = 0;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   v8::CpuProfiler* cpu_profiler = nullptr;
+  unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
+  uint32_t provider_id = 0;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     auto it = g_profiler_states.find(env);
-    if (it == g_profiler_states.end() || it->second.cpu_profiler == nullptr) {
-      return napi_ok;
-    }
-    auto active_it = std::find(
-        it->second.active_cpu_profiles.begin(),
-        it->second.active_cpu_profiles.end(),
-        profile_id);
-    if (active_it == it->second.active_cpu_profiles.end()) {
-      return napi_ok;
-    }
-    it->second.active_cpu_profiles.erase(active_it);
+    if (it == g_profiler_states.end()) return napi_invalid_arg;
+    auto active_it = std::find(it->second.active_profiles.begin(),
+                               it->second.active_profiles.end(), profile);
+    if (active_it == it->second.active_profiles.end()) return napi_invalid_arg;
+    kind = profile->kind;
+    provider_id = profile->provider_id;
+    it->second.active_profiles.erase(active_it);
     cpu_profiler = it->second.cpu_profiler;
   }
 
-  v8::CpuProfile* profile = cpu_profiler->Stop(profile_id);
-  if (profile == nullptr) {
-    return napi_ok;
+  if (kind == unofficial_napi_profile_heap) {
+    std::string json;
+    const bool serialized = SerializeHeapProfile(env->isolate, &json);
+    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+    delete profile;
+    if (!serialized) return napi_generic_failure;
+    return CreateExternalUtf8Bytes(env, std::move(json), json_out);
   }
 
+  if (cpu_profiler == nullptr) {
+    delete profile;
+    return napi_generic_failure;
+  }
+  v8::CpuProfile* cpu_profile = cpu_profiler->Stop(provider_id);
+  delete profile;
+  if (cpu_profile == nullptr) return napi_generic_failure;
   StringOutputStream stream;
-  profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
-  profile->Delete();
-  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
-  *found_out = true;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
-    napi_env env,
-    bool* started_out) {
-  if (env == nullptr || env->isolate == nullptr || started_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  *started_out = false;
-  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
-
-  const bool started = env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler();
-  if (started) {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    EnsureProfilerState(env).heap_profile_started = true;
-  }
-  *started_out = started;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
-    napi_env env,
-    bool* found_out,
-    char** json_out,
-    size_t* json_len_out) {
-  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
-      json_out == nullptr || json_len_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  *found_out = false;
-  *json_out = nullptr;
-  *json_len_out = 0;
-  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
-
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it == g_profiler_states.end() || !it->second.heap_profile_started) {
-      return napi_ok;
-    }
-  }
-
-  std::string json;
-  if (!SerializeHeapProfile(env->isolate, &json)) {
-    return napi_ok;
-  }
-  env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it != g_profiler_states.end()) {
-      it->second.heap_profile_started = false;
-    }
-  }
-  if (!CopyStringToMallocBuffer(json, json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
-  *found_out = true;
-  return napi_ok;
+  cpu_profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
+  cpu_profile->Delete();
+  return CreateExternalUtf8Bytes(env, stream.TakeOutput(), json_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
     napi_env env,
     const unofficial_napi_heap_snapshot_options* options,
-    char** json_out,
-    size_t* json_len_out) {
-  if (env == nullptr || env->isolate == nullptr || json_out == nullptr ||
-      json_len_out == nullptr) {
+    napi_value* json_out) {
+  if (env == nullptr || env->isolate == nullptr || json_out == nullptr) {
     return napi_invalid_arg;
   }
   *json_out = nullptr;
-  *json_len_out = 0;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
   v8::HeapProfiler::HeapSnapshotOptions snapshot_options;
@@ -3144,14 +2969,7 @@ napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
   StringOutputStream stream;
   snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
   const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
-  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
-    return napi_generic_failure;
-  }
-  return napi_ok;
-}
-
-void NAPI_CDECL unofficial_napi_free_buffer(void* data) {
-  std::free(data);
+  return CreateExternalUtf8Bytes(env, stream.TakeOutput(), json_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(
@@ -3245,29 +3063,3 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
-
-void* NapiV8GetCurrentEdgeEnvironment(v8::Isolate* isolate) {
-  if (isolate == nullptr) return nullptr;
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  auto it = g_env_by_isolate.find(isolate);
-  if (it == g_env_by_isolate.end()) return nullptr;
-  napi_env env = it->second;
-  return env != nullptr ? env->edge_environment : nullptr;
-}
-
-void* NapiV8GetCurrentEdgeEnvironment(v8::Local<v8::Context> context) {
-  if (context.IsEmpty()) return nullptr;
-  napi_env env = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_env_by_isolate.find(context->GetIsolate());
-    if (it == g_env_by_isolate.end()) return nullptr;
-    env = it->second;
-  }
-  if (env == nullptr) return nullptr;
-  v8::Local<v8::Context> principal_context = env->context();
-  if (context != principal_context && !NapiV8IsContextifyContext(env, context)) {
-    return nullptr;
-  }
-  return env->edge_environment;
-}
