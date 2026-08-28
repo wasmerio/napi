@@ -54,11 +54,17 @@ offset-allocator = "0.2.0"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { version = "=0.703.0", path = "../wasix", default-features = false, features = ["js"] }
+wasmer-wasix = { version = "=0.703.0", path = "../wasix", default-features = false, features = [
+  "js",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasmer = { version = "=7.3.0", path = "../api", default-features = false, features = ["sys-default"] }
-wasmer-wasix = { version = "=0.703.0", path = "../wasix", default-features = false, features = ["sys"] }
+wasmer = { version = "=7.3.0", path = "../api", default-features = false, features = [
+  "sys-default",
+] }
+wasmer-wasix = { version = "=0.703.0", path = "../wasix", default-features = false, features = [
+  "sys",
+] }
 
 [build-dependencies]
 cc = "1"
