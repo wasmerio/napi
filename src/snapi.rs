@@ -48,6 +48,7 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
+    pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_flags_from_string(flags: *const i8, length: u32) -> i32;
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,

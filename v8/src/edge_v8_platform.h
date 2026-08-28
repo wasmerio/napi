@@ -17,6 +17,16 @@ class EdgeV8Platform final : public v8::Platform {
 
   static std::unique_ptr<EdgeV8Platform> Create();
 
+  // Sets how many background worker threads the platform gets. Zero restores
+  // V8's own default, which sizes the pool from the host's processor count --
+  // reasonable for a process running one JS app, less so for a host running
+  // many, where those threads compete with every tenant's foreground JS and
+  // their work is not attributed to anyone.
+  //
+  // The pool is process-wide and built when the first isolate is created, so
+  // this has no effect afterwards; it returns false in that case.
+  static bool SetWorkerThreadCount(int count);
+
   ~EdgeV8Platform() override;
 
   bool RegisterIsolate(v8::Isolate* isolate);

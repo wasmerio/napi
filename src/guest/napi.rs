@@ -730,6 +730,12 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
+    if env.data().host_stopped() {
+        unsafe {
+            snapi_bridge_unofficial_terminate_execution(env_handle);
+        }
+        return 1;
+    }
     unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
 }
 

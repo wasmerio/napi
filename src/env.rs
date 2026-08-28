@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -94,6 +94,8 @@ pub(crate) struct NapiEnv {
     pub(crate) budget: Arc<ResourceBudget>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
     pub(crate) max_envs: Option<usize>,
+    env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
+    host_stopped: Arc<AtomicBool>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
@@ -163,10 +165,17 @@ pub(crate) struct NapiEnv {
 }
 
 impl NapiEnv {
-    pub(crate) fn new(budget: Arc<ResourceBudget>, max_envs: Option<usize>) -> Self {
+    pub(crate) fn new(
+        budget: Arc<ResourceBudget>,
+        max_envs: Option<usize>,
+        env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
+        host_stopped: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             budget,
             max_envs,
+            env_registry,
+            host_stopped,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
             callback_depth: 0,
@@ -263,10 +272,33 @@ impl NapiEnv {
         reservation: &HeapReservation,
     ) -> (u32, u32) {
         let (env_id, scope_id) = self.register_napi_env(env);
+        {
+            let mut registry = self
+                .env_registry
+                .lock()
+                .expect("poisoned N-API env registry");
+            registry.insert(env as usize);
+
+            // If the host already stopped this app's JS, an isolate created
+            // afterwards must not start running either. Checking under the
+            // registry lock closes the race against a concurrent
+            // `NapiRuntimeControl::terminate_all`, which sets the flag before
+            // taking this lock: either it sees this env in the registry, or
+            // we see its flag here.
+            if self.host_stopped.load(Ordering::Acquire) {
+                // SAFETY: `env` is the isolate just created and is still live.
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
+                }
+            }
+        }
 
         let tracker = if reservation.clamped {
             let boxed = Box::into_raw(Box::new(EnvHeapCharge {
                 budget: Arc::clone(&self.budget),
+                env: env as usize,
+                host_stopped: Arc::clone(&self.host_stopped),
+                unwind_slack_available: std::sync::atomic::AtomicBool::new(true),
                 granted: AtomicU64::new(0),
             }));
             // SAFETY: `env` is the isolate just created; `boxed` outlives the
@@ -327,6 +359,10 @@ impl NapiEnv {
         let release = bytes.min(self.external_declared);
         self.external_declared -= release;
         self.budget.uncharge(Pool::V8External, release);
+    }
+
+    pub(crate) fn host_stopped(&self) -> bool {
+        self.host_stopped.load(Ordering::Acquire)
     }
 
     /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
@@ -417,6 +453,15 @@ impl NapiEnv {
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
         }
+        let env = *self.napi_envs.get(&env_id)?;
+        // Remove from the shared registry before any env- or isolate-owned
+        // state is reclaimed. This synchronizes against terminate_all, which
+        // holds the same mutex while calling into V8.
+        self.env_registry
+            .lock()
+            .expect("poisoned N-API env registry")
+            .remove(&env);
+
         // Leases are environment-owned resources. Explicit release publishes
         // writes; environment teardown only discards snapshots and returns any
         // guest allocations because the JavaScript value is being destroyed.
@@ -438,7 +483,7 @@ impl NapiEnv {
             self.budget.uncharge(Pool::V8HeapReserved, granted);
             self.budget.release_env(handle.ceiling);
         }
-        let env = self.napi_envs.remove(&env_id)?;
+        self.napi_envs.remove(&env_id);
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         unsafe {
             snapi_bridge_swap_active_callback_ctx(env as SnapiEnv, std::ptr::null_mut());
@@ -489,7 +534,12 @@ mod tests {
     #[test]
     fn declared_external_charges_denies_and_clamps() {
         let budget = ResourceBudget::with_memory_limit(10 * MIB);
-        let mut env = NapiEnv::new(Arc::clone(&budget), None);
+        let mut env = NapiEnv::new(
+            Arc::clone(&budget),
+            None,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
 
         assert!(env.charge_declared_external(6 * MIB));
         assert_eq!(budget.snapshot().v8_external, 6 * MIB);
@@ -513,7 +563,12 @@ mod tests {
     fn declared_external_released_on_drop() {
         let budget = ResourceBudget::with_memory_limit(10 * MIB);
         {
-            let mut env = NapiEnv::new(Arc::clone(&budget), None);
+            let mut env = NapiEnv::new(
+                Arc::clone(&budget),
+                None,
+                Arc::new(std::sync::Mutex::new(HashSet::new())),
+                Arc::new(AtomicBool::new(false)),
+            );
             assert!(env.charge_declared_external(4 * MIB));
             assert_eq!(budget.snapshot().v8_external, 4 * MIB);
         }
@@ -526,7 +581,12 @@ mod tests {
 
     #[test]
     fn callback_reentrancy_is_bounded() {
-        let mut env = NapiEnv::new(ResourceBudget::unlimited(), None);
+        let mut env = NapiEnv::new(
+            ResourceBudget::unlimited(),
+            None,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
         let max = crate::guest::MAX_CALLBACK_DEPTH;
 
         // Reentrancy is allowed up to the limit, then refused.
