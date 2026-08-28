@@ -8,13 +8,14 @@ use wasmer::{Module, Store};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_types::ModuleHash;
 use wasmer_wasix::{
-    Pipe, PluggableRuntime, WasiError,
+    os::{tty_sys::SysTty, TtyBridge},
     runners::wasi::{RuntimeOrEngine, WasiRunner},
     runtime::task_manager::tokio::TokioTaskManager,
+    Pipe, PluggableRuntime, WasiError,
 };
 
 use crate::{
-    NapiCtx, budget::ResourceBudget, budget::budgeted_tunables, guest::napi::register_env_imports,
+    budget::budgeted_tunables, budget::ResourceBudget, guest::napi::register_env_imports, NapiCtx,
 };
 use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 
@@ -93,6 +94,16 @@ fn spawn_pipe_drain_thread(
     })
 }
 
+fn configure_system_tty(runtime: &mut PluggableRuntime, enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    let tty = Arc::new(SysTty);
+    tty.reset();
+    runtime.set_tty(tty);
+}
+
 pub fn load_wasix_module(wasm_path: &Path) -> Result<LoadedWasm> {
     load_wasix_module_with_budget(wasm_path, ResourceBudget::unlimited())
 }
@@ -159,12 +170,19 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
     let (stderr_tx, stderr_rx) = Pipe::channel();
     let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
     let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
-    let exit_code =
-        run_wasix_main_with_runner(ctx, wasm_path, "guest-test", args, extra_mounts, |runner| {
+    let exit_code = run_wasix_main_with_runner(
+        ctx,
+        wasm_path,
+        "guest-test",
+        args,
+        extra_mounts,
+        |runner| {
             runner
                 .with_stdout(Box::new(stdout_tx))
                 .with_stderr(Box::new(stderr_tx));
-        })?;
+        },
+        false,
+    )?;
 
     let stdout = stdout_thread
         .join()
@@ -184,16 +202,24 @@ pub fn run_wasix_main_with_ctx(
     envs: &[(String, String)],
     current_dir: Option<&Path>,
 ) -> Result<i32> {
-    run_wasix_main_with_runner(ctx, wasm_path, program_name, args, extra_mounts, |runner| {
-        runner
-            .with_stdin(Box::new(virtual_fs::host_fs::Stdin::default()))
-            .with_stdout(Box::new(virtual_fs::host_fs::Stdout::default()))
-            .with_stderr(Box::new(virtual_fs::host_fs::Stderr::default()))
-            .with_envs(envs.iter().cloned());
-        if let Some(current_dir) = current_dir {
-            runner.with_current_dir(current_dir);
-        }
-    })
+    run_wasix_main_with_runner(
+        ctx,
+        wasm_path,
+        program_name,
+        args,
+        extra_mounts,
+        |runner| {
+            runner
+                .with_stdin(Box::new(virtual_fs::host_fs::Stdin::default()))
+                .with_stdout(Box::new(virtual_fs::host_fs::Stdout::default()))
+                .with_stderr(Box::new(virtual_fs::host_fs::Stderr::default()))
+                .with_envs(envs.iter().cloned());
+            if let Some(current_dir) = current_dir {
+                runner.with_current_dir(current_dir);
+            }
+        },
+        true,
+    )
 }
 
 fn run_wasix_main_with_runner(
@@ -203,12 +229,13 @@ fn run_wasix_main_with_runner(
     args: &[String],
     extra_mounts: &[GuestMount],
     configure_runner: impl FnOnce(&mut WasiRunner),
+    use_system_tty: bool,
 ) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create tokio runtime for WASIX")?;
-    let _guard = runtime.enter();
+    let guard = runtime.enter();
 
     let exit_code = {
         let loaded = load_wasix_module_with_budget(wasm_path, ctx.budget())?;
@@ -224,6 +251,7 @@ fn run_wasix_main_with_runner(
         let task_manager = Arc::new(TokioTaskManager::new(tokio::runtime::Handle::current()));
         let mut runtime = PluggableRuntime::new(task_manager);
         runtime.set_engine(engine.clone());
+        configure_system_tty(&mut runtime, use_system_tty);
 
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(&module);
         if napi_version.is_some() || napi_extension_version.is_some() {
@@ -258,6 +286,15 @@ fn run_wasix_main_with_runner(
         }
     };
 
+    drop(guard);
+    if use_system_tty {
+        // A host stdin read may still occupy Tokio's blocking pool after the
+        // guest closes its TTY. Waiting for that OS read while dropping the
+        // runtime would keep the standalone CLI alive indefinitely even
+        // though the guest has exited.
+        runtime.shutdown_background();
+    }
+
     Ok(exit_code)
 }
 
@@ -279,4 +316,27 @@ pub fn run_wasix_main_capture_stdout_with_ctx(
     let (exit_code, stdout, _stderr) =
         run_wasix_main_capture_stdio_with_ctx(ctx, wasm_path, args, extra_mounts)?;
     Ok((exit_code, stdout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmer_wasix::runtime::Runtime;
+
+    #[test]
+    fn system_tty_is_only_installed_for_direct_stdio() {
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+        let _guard = tokio_runtime.enter();
+        let task_manager = Arc::new(TokioTaskManager::new(tokio::runtime::Handle::current()));
+        let mut runtime = PluggableRuntime::new(task_manager);
+
+        configure_system_tty(&mut runtime, false);
+        assert!(runtime.tty().is_none());
+
+        configure_system_tty(&mut runtime, true);
+        assert!(runtime.tty().is_some());
+    }
 }
