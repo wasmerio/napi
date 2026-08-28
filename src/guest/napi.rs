@@ -1193,13 +1193,13 @@ fn guest_unofficial_napi_contextify_run_script(
     break_on_first_line: i32,
     host_defined_option_id: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
-        return 1;
+        return Ok(1);
     };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_contextify_run_script(
             env_handle,
             if sandbox_or_null > 0 {
@@ -1223,11 +1223,11 @@ fn guest_unofficial_napi_contextify_run_script(
             },
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
-    status
+    Ok(status)
 }
 
 #[allow(clippy::too_many_arguments)]
