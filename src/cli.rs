@@ -40,7 +40,7 @@ fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
     // Charge the guest's (imported) wasm linear memory against the app budget.
     // The runtime instantiates the guest with this engine, so its budgeted
     // tunables cover the main store and every worker store cloned from it.
-    let tunables = budgeted_tunables(engine.target(), budget);
+    let tunables = budgeted_tunables(budget);
     engine.set_tunables(tunables);
     Store::new(engine)
 }
