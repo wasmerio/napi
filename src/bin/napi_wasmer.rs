@@ -99,6 +99,20 @@ fn resolve_app_dir_mount(extra_mounts: &mut Vec<GuestMount>, host_dir: &str) -> 
     Ok(())
 }
 
+fn map_host_path_through_mount(host_path: &Path, mounts: &[GuestMount]) -> Option<PathBuf> {
+    mounts
+        .iter()
+        .filter_map(|mount| {
+            let relative_path = host_path.strip_prefix(&mount.host_path).ok()?;
+            Some((
+                mount.host_path.components().count(),
+                mount.guest_path.join(relative_path),
+            ))
+        })
+        .max_by_key(|(host_component_count, _)| *host_component_count)
+        .map(|(_, guest_path)| guest_path)
+}
+
 fn maybe_remap_first_guest_arg_to_app_mount(
     guest_args: &mut [String],
     extra_mounts: &mut Vec<GuestMount>,
@@ -126,6 +140,11 @@ fn maybe_remap_first_guest_arg_to_app_mount(
         return Ok(());
     }
 
+    if let Some(guest_script) = map_host_path_through_mount(&host_script, extra_mounts) {
+        *first_arg = guest_script.to_string_lossy().into_owned();
+        return Ok(());
+    }
+
     let script_parent = host_script
         .parent()
         .ok_or_else(|| anyhow!("script has no parent dir: {}", host_script.display()))?;
@@ -144,6 +163,56 @@ fn maybe_remap_first_guest_arg_to_app_mount(
         .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
     *first_arg = format!("/app/{}", script_name.to_string_lossy());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_nested_script_relative_to_existing_mount() {
+        let mounts = vec![GuestMount {
+            host_path: PathBuf::from("/host/project"),
+            guest_path: PathBuf::from("/app"),
+        }];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/project/dist/server/entry.mjs"), &mounts,),
+            Some(PathBuf::from("/app/dist/server/entry.mjs"))
+        );
+    }
+
+    #[test]
+    fn uses_most_specific_covering_mount() {
+        let mounts = vec![
+            GuestMount {
+                host_path: PathBuf::from("/host/project"),
+                guest_path: PathBuf::from("/app"),
+            },
+            GuestMount {
+                host_path: PathBuf::from("/host/project/src"),
+                guest_path: PathBuf::from("/src"),
+            },
+        ];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/project/src/node/server.js"), &mounts),
+            Some(PathBuf::from("/src/node/server.js"))
+        );
+    }
+
+    #[test]
+    fn does_not_map_path_outside_mounts() {
+        let mounts = vec![GuestMount {
+            host_path: PathBuf::from("/host/project"),
+            guest_path: PathBuf::from("/app"),
+        }];
+
+        assert_eq!(
+            map_host_path_through_mount(Path::new("/host/other/server.js"), &mounts),
+            None
+        );
+    }
 }
 
 fn parse_mount(spec: &str) -> Result<GuestMount> {
