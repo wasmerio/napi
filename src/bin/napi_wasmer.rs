@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use wasmer_napi::{
     NapiCtx,
-    cli::{GuestMount, run_wasix_main_capture_stdio_with_ctx},
+    cli::{GuestMount, run_wasix_main_with_ctx},
 };
 
 const BUILTIN_JS_GUEST_PATH: &str = "/edgejs-builtins";
@@ -168,19 +168,36 @@ fn parse_mount(spec: &str) -> Result<GuestMount> {
     })
 }
 
+fn parse_env(spec: &str) -> Result<(String, String)> {
+    let (key, value) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid env {spec:?}, expected <key>=<value>"))?;
+    if key.is_empty() {
+        bail!("environment variable name must not be empty");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 fn main() -> Result<()> {
     let mut argv = std::env::args().skip(1);
     let wasm_path = match argv.next() {
         Some(path) => PathBuf::from(path),
         None => {
             bail!(
-                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--] [guest-args...]"
+                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--] [guest-args...]"
             );
         }
     };
 
     let mut builtin_js_dir: Option<String> = None;
     let mut extra_mounts = Vec::new();
+    let mut envs = Vec::new();
+    let mut current_dir: Option<PathBuf> = None;
+    let mut program_name = wasm_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("guest-test")
+        .to_string();
     let mut guest_args = Vec::new();
     let mut forwarding_guest_args = false;
 
@@ -203,6 +220,28 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow!("--mount requires <host-dir>:<guest-dir>"))?;
                 extra_mounts.push(parse_mount(&spec)?);
             }
+            "--env" => {
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| anyhow!("--env requires <key>=<value>"))?;
+                envs.push(parse_env(&spec)?);
+            }
+            "--cwd" => {
+                let dir = argv
+                    .next()
+                    .ok_or_else(|| anyhow!("--cwd requires an absolute guest directory"))?;
+                let dir = PathBuf::from(dir);
+                if !dir.is_absolute() {
+                    bail!("guest cwd must be an absolute path: {}", dir.display());
+                }
+                current_dir = Some(dir);
+            }
+            "--program-name" => {
+                program_name = argv
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| anyhow!("--program-name requires a non-empty name"))?;
+            }
             "--builtin-js-dir" => {
                 builtin_js_dir = Some(
                     argv.next()
@@ -211,6 +250,23 @@ fn main() -> Result<()> {
             }
             _ if arg.starts_with("--mount=") => {
                 extra_mounts.push(parse_mount(arg.trim_start_matches("--mount="))?);
+            }
+            _ if arg.starts_with("--env=") => {
+                envs.push(parse_env(arg.trim_start_matches("--env="))?);
+            }
+            _ if arg.starts_with("--cwd=") => {
+                let dir = PathBuf::from(arg.trim_start_matches("--cwd="));
+                if !dir.is_absolute() {
+                    bail!("guest cwd must be an absolute path: {}", dir.display());
+                }
+                current_dir = Some(dir);
+            }
+            _ if arg.starts_with("--program-name=") => {
+                let name = arg.trim_start_matches("--program-name=");
+                if name.is_empty() {
+                    bail!("--program-name requires a non-empty name");
+                }
+                program_name = name.to_string();
             }
             _ if arg.starts_with("--builtin-js-dir=") => {
                 builtin_js_dir = Some(arg.trim_start_matches("--builtin-js-dir=").to_string());
@@ -230,8 +286,15 @@ fn main() -> Result<()> {
     maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
 
     let ctx = NapiCtx::default();
-    let (exit_code, _stdout, _stderr) =
-        run_wasix_main_capture_stdio_with_ctx(&ctx, &wasm_path, &guest_args, &extra_mounts)?;
+    let exit_code = run_wasix_main_with_ctx(
+        &ctx,
+        &wasm_path,
+        &program_name,
+        &guest_args,
+        &extra_mounts,
+        &envs,
+        current_dir.as_deref(),
+    )?;
 
     if exit_code != 0 {
         std::process::exit(exit_code);

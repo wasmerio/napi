@@ -3,10 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, FileSystem};
-use wasmer::sys::{EngineBuilder, Features};
+use wasmer::sys::{Cranelift, EngineBuilder, Features};
 use wasmer::{Module, Store};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
-use wasmer_compiler_llvm::{LLVM, LLVMOptLevel};
 use wasmer_types::ModuleHash;
 use wasmer_wasix::{
     Pipe, PluggableRuntime, WasiError,
@@ -35,10 +34,7 @@ fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
     let mut features = Features::default();
     features.exceptions(true);
 
-    let mut compiler = LLVM::default();
-    compiler.opt_level(LLVMOptLevel::Less);
-
-    let mut engine = EngineBuilder::new(compiler)
+    let mut engine = EngineBuilder::new(Cranelift::default())
         .set_features(Some(features))
         .engine();
     // Charge the guest's (imported) wasm linear memory against the app budget.
@@ -50,9 +46,9 @@ fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
 }
 
 fn wasmer_cache_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("wasmer-cache")
+    std::env::var_os("WASMER_NAPI_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("wasmer-napi-cache"))
 }
 
 fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {
@@ -159,16 +155,61 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
     args: &[String],
     extra_mounts: &[GuestMount],
 ) -> Result<(i32, String, String)> {
+    let (stdout_tx, stdout_rx) = Pipe::channel();
+    let (stderr_tx, stderr_rx) = Pipe::channel();
+    let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
+    let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
+    let exit_code =
+        run_wasix_main_with_runner(ctx, wasm_path, "guest-test", args, extra_mounts, |runner| {
+            runner
+                .with_stdout(Box::new(stdout_tx))
+                .with_stderr(Box::new(stderr_tx));
+        })?;
+
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
+    Ok((exit_code, stdout, stderr))
+}
+
+pub fn run_wasix_main_with_ctx(
+    ctx: &NapiCtx,
+    wasm_path: &Path,
+    program_name: &str,
+    args: &[String],
+    extra_mounts: &[GuestMount],
+    envs: &[(String, String)],
+    current_dir: Option<&Path>,
+) -> Result<i32> {
+    run_wasix_main_with_runner(ctx, wasm_path, program_name, args, extra_mounts, |runner| {
+        runner
+            .with_stdin(Box::new(virtual_fs::host_fs::Stdin::default()))
+            .with_stdout(Box::new(virtual_fs::host_fs::Stdout::default()))
+            .with_stderr(Box::new(virtual_fs::host_fs::Stderr::default()))
+            .with_envs(envs.iter().cloned());
+        if let Some(current_dir) = current_dir {
+            runner.with_current_dir(current_dir);
+        }
+    })
+}
+
+fn run_wasix_main_with_runner(
+    ctx: &NapiCtx,
+    wasm_path: &Path,
+    program_name: &str,
+    args: &[String],
+    extra_mounts: &[GuestMount],
+    configure_runner: impl FnOnce(&mut WasiRunner),
+) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create tokio runtime for WASIX")?;
     let _guard = runtime.enter();
 
-    let (stdout_tx, stdout_rx) = Pipe::channel();
-    let (stderr_tx, stderr_rx) = Pipe::channel();
-    let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
-    let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
     let exit_code = {
         let loaded = load_wasix_module_with_budget(wasm_path, ctx.budget())?;
         let engine = loaded.store.engine().clone();
@@ -176,11 +217,9 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
         let module_hash = loaded.module_hash;
 
         let mut runner = WasiRunner::new();
-        runner
-            .with_stdout(Box::new(stdout_tx))
-            .with_stderr(Box::new(stderr_tx))
-            .with_args(args.iter().cloned());
+        runner.with_args(args.iter().cloned());
         configure_runner_mounts(&mut runner, wasm_path, extra_mounts)?;
+        configure_runner(&mut runner);
 
         let task_manager = Arc::new(TokioTaskManager::new(tokio::runtime::Handle::current()));
         let mut runtime = PluggableRuntime::new(task_manager);
@@ -204,7 +243,7 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
 
         match runner.run_wasm(
             RuntimeOrEngine::Runtime(Arc::new(runtime)),
-            "guest-test",
+            program_name,
             module,
             module_hash,
         ) {
@@ -219,13 +258,7 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
         }
     };
 
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
-    Ok((exit_code, stdout, stderr))
+    Ok(exit_code)
 }
 
 pub fn run_wasix_main_capture_stdout(
