@@ -8,6 +8,16 @@
 
 static int wrap_finalizer_count = 0;
 static int add_finalizer_count = 0;
+static int facade_evaluation_count = 0;
+
+static napi_value NAPI_CDECL CountFacadeEvaluation(napi_env env,
+                                                    napi_callback_info info) {
+  (void)info;
+  facade_evaluation_count++;
+  napi_value result = NULL;
+  if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+  return result;
+}
 
 static void NAPI_CDECL CountWrapFinalizer(napi_env env,
                                           void* data,
@@ -299,6 +309,55 @@ int main(void) {
   CHECK_OR_FAIL(marker == 73,
                 "module evaluation escaped its explicit context");
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
+
+  // Creating the CommonJS facade evaluates the original module internally,
+  // so a synthetic module's guest evaluation callback must be able to re-enter
+  // while the facade is built.
+  napi_value facade_exports;
+  napi_value facade_default_export;
+  napi_value facade_named_export;
+  napi_value facade_evaluation_steps;
+  NAPI_CALL(env, napi_create_array_with_length(env, 2, &facade_exports));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env, "default", NAPI_AUTO_LENGTH, &facade_default_export));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env, "named", NAPI_AUTO_LENGTH, &facade_named_export));
+  NAPI_CALL(env, napi_set_element(
+                     env, facade_exports, 0, facade_default_export));
+  NAPI_CALL(env, napi_set_element(
+                     env, facade_exports, 1, facade_named_export));
+  NAPI_CALL(env, napi_create_function(env,
+                                      "evaluateFacadeSource",
+                                      NAPI_AUTO_LENGTH,
+                                      CountFacadeEvaluation,
+                                      NULL,
+                                      &facade_evaluation_steps));
+  unofficial_napi_module_create_options synthetic_options = {0};
+  synthetic_options.size = sizeof(synthetic_options);
+  synthetic_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  synthetic_options.kind = unofficial_napi_module_synthetic;
+  synthetic_options.wrapper = module_wrapper;
+  synthetic_options.url = module_url;
+  synthetic_options.context_or_undefined = undefined_value;
+  synthetic_options.payload.synthetic.export_names = facade_exports;
+  synthetic_options.payload.synthetic.synthetic_evaluation_steps =
+      facade_evaluation_steps;
+  unofficial_napi_module_create_result synthetic_create_result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(
+                     env, &synthetic_options, &synthetic_create_result));
+  unofficial_napi_module synthetic_module = synthetic_create_result.module;
+  CHECK_OR_FAIL(synthetic_module != NULL,
+                "synthetic module creation did not return a handle");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(
+                     env, synthetic_module, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(
+                     env, synthetic_module));
+  napi_value facade_namespace;
+  NAPI_CALL(env, unofficial_napi_module_wrap_create_required_module_facade(
+                     env, synthetic_module, &facade_namespace));
+  CHECK_OR_FAIL(facade_namespace != NULL && facade_evaluation_count == 1,
+                "required-module facade did not run its guest evaluation callback");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, synthetic_module));
 
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
   // owns the value and copy-back. Releasing after the handle scope closes is

@@ -280,13 +280,19 @@ fn guest_unofficial_napi_release_env(
     mut env: FunctionEnvMut<NapiEnv>,
     scope_ptr: i32,
     loop_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
-    let Some(snapi_env_state) = env.data_mut().unregister_napi_scope(scope_id) else {
-        return 1;
+    let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
+    else {
+        return Ok(1);
     };
     let loop_id = if loop_ptr > 0 { loop_ptr as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id) }
+    let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
+        snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
+    });
+    env.data_mut()
+        .finish_unregister_napi_env(guest_env, snapi_env_state);
+    status
 }
 
 fn guest_unofficial_napi_attach_env(
@@ -1700,20 +1706,20 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     napi_env: i32,
     handle: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
             env_handle,
             handle as u32,
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
-    status
+    Ok(status)
 }
 
 // --- Singleton getters ---

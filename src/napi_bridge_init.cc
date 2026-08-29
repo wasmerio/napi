@@ -454,7 +454,6 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   }
   state->bytecode_handles.Reset();
   state->profile_handles.Reset();
-  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->callback_invocations.clear();
   state->next_callback_invocation_id = 1;
   state->cb_registry.clear();
@@ -462,12 +461,14 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->callback_bindings.clear();
   if (state->owner != nullptr) {
     napi_status s = unofficial_napi_release_env(state->owner, nullptr);
+    state->active_callback_ctx.store(nullptr, std::memory_order_release);
     state->owner = nullptr;
     state->env = nullptr;
     g_envs.erase(state);
     delete state;
     return s;
   }
+  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->env = nullptr;
   g_envs.erase(state);
   delete state;

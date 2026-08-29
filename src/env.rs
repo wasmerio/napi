@@ -448,7 +448,7 @@ impl NapiEnv {
         }
     }
 
-    pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
+    pub(crate) fn begin_unregister_napi_scope(&mut self, scope_id: u32) -> Option<(u32, SnapiEnv)> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
             self.default_napi_env_id = None;
@@ -466,6 +466,10 @@ impl NapiEnv {
         // writes; environment teardown only discards snapshots and returns any
         // guest allocations because the JavaScript value is being destroyed.
         self.discard_buffer_leases_for_env(env_id);
+        Some((env_id, env as SnapiEnv))
+    }
+
+    pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv) {
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
@@ -486,11 +490,16 @@ impl NapiEnv {
         self.napi_envs.remove(&env_id);
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         unsafe {
-            snapi_bridge_swap_active_callback_ctx(env as SnapiEnv, std::ptr::null_mut());
+            snapi_bridge_swap_active_callback_ctx(env, std::ptr::null_mut());
             self.persistent_callback_contexts.remove(&env_id);
         }
-        self.napi_state_to_guest_env.remove(&env);
-        Some(env as SnapiEnv)
+        self.napi_state_to_guest_env.remove(&(env as usize));
+    }
+
+    pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
+        let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
+        self.finish_unregister_napi_env(env_id, env);
+        Some(env)
     }
 
     pub(crate) fn resolve_napi_env(&self, guest_env: i32) -> SnapiEnv {
