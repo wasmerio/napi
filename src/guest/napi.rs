@@ -1452,10 +1452,10 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     timeout: i64,
     break_on_sigint: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate(
             env_handle,
             handle as u32,
@@ -1463,11 +1463,11 @@ fn guest_unofficial_napi_module_wrap_evaluate(
             break_on_sigint,
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_evaluate_sync(
@@ -1477,10 +1477,10 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     filename: i32,
     parent_filename: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate_sync(
             env_handle,
             handle as u32,
@@ -1492,11 +1492,11 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
             },
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_get_namespace(
