@@ -1,14 +1,17 @@
 use anyhow::{Context, Result, bail};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
-    budget::ResourceBudget,
+    budget::{NapiMemoryAccountant, ResourceBudget},
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
@@ -32,9 +35,10 @@ impl NapiLimits {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
+    accountant: Option<Arc<dyn NapiMemoryAccountant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +71,38 @@ pub struct NapiRuntimeHooks {
     ctx: NapiCtx,
 }
 
+/// Opaque control surface for stopping every V8 isolate owned by a context.
+#[derive(Clone, Debug)]
+pub struct NapiRuntimeControl {
+    envs: Arc<Mutex<HashSet<usize>>>,
+    host_stopped: Arc<AtomicBool>,
+}
+
+impl NapiRuntimeControl {
+    /// Permanently stop every currently-live V8 isolate owned by this context.
+    ///
+    /// Embedders call this both when the app exceeded its memory budget and
+    /// when the instance was killed for an unrelated reason; N-API itself
+    /// draws no distinction, since either way the app's JS must never run
+    /// again. The stop is sticky: guest code cannot undo it with
+    /// `napi_cancel_terminate_execution`, and isolates created afterwards
+    /// stay terminated ([`NapiEnv::commit_isolate`] re-checks the flag under
+    /// the same registry lock this holds).
+    ///
+    /// [`NapiEnv::commit_isolate`]: crate::env::NapiEnv::commit_isolate
+    pub fn terminate_all(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        let envs = self.envs.lock().expect("poisoned N-API env registry");
+        for env in envs.iter().copied() {
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                    env as crate::snapi::SnapiEnv,
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NapiCtxInner {
     limits: NapiLimits,
@@ -75,6 +111,8 @@ struct NapiCtxInner {
     /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
     /// external-memory, and CPU paths.
     budget: Arc<ResourceBudget>,
+    envs: Arc<Mutex<HashSet<usize>>>,
+    host_stopped: Arc<AtomicBool>,
 }
 
 struct NapiSessionInner {
@@ -124,16 +162,27 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Delegate total-memory admission to the embedder.
+    pub fn memory_accountant(mut self, accountant: Arc<dyn NapiMemoryAccountant>) -> Self {
+        self.accountant = Some(accountant);
+        self
+    }
+
     pub fn build(self) -> NapiCtx {
-        let budget = match self.limits.memory_budget_bytes() {
-            Some(bytes) => ResourceBudget::with_memory_limit(bytes),
-            None => ResourceBudget::unlimited(),
+        let budget = match self.accountant {
+            Some(accountant) => ResourceBudget::with_accountant(accountant),
+            None => match self.limits.memory_budget_bytes() {
+                Some(bytes) => ResourceBudget::with_memory_limit(bytes),
+                None => ResourceBudget::unlimited(),
+            },
         };
         NapiCtx {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,
                 active_sessions: AtomicUsize::new(0),
                 budget,
+                envs: Arc::new(Mutex::new(HashSet::new())),
+                host_stopped: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -203,6 +252,13 @@ impl NapiCtx {
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
         NapiRuntimeHooks { ctx: self.clone() }
+    }
+
+    pub fn runtime_control(&self) -> NapiRuntimeControl {
+        NapiRuntimeControl {
+            envs: Arc::clone(&self.inner.envs),
+            host_stopped: Arc::clone(&self.inner.host_stopped),
+        }
     }
 
     pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
@@ -333,6 +389,8 @@ impl NapiSession {
         let napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
             self.inner.ctx.limits.max_envs,
+            Arc::clone(&self.inner.ctx.envs),
+            Arc::clone(&self.inner.ctx.host_stopped),
         );
         let func_env = FunctionEnv::new(store, napi_env);
         {
@@ -469,6 +527,41 @@ mod tests {
     use wat::parse_str;
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+
+    #[test]
+    fn runtime_stop_is_sticky_without_live_envs() {
+        let ctx = NapiCtx::default();
+        ctx.runtime_control().terminate_all();
+        assert!(
+            ctx.inner
+                .host_stopped
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn runtime_control_shares_stop_state_with_the_context() {
+        // Edge holds a control surface for both the memory-budget callback and
+        // the instance-kill path, so a stop requested through any clone must be
+        // visible to every env the context later hands out.
+        let ctx = NapiCtx::default();
+        let control = ctx.runtime_control();
+        let other_control = control.clone();
+
+        assert!(
+            !ctx.inner
+                .host_stopped
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        other_control.terminate_all();
+
+        assert!(
+            ctx.inner
+                .host_stopped
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
 
     #[test]
     fn max_sessions_limit_is_enforced() {

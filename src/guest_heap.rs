@@ -28,19 +28,36 @@
 //! Host pointers derived from `base` are handed to V8 as external backing
 //! stores, so the mapping must never move. On 64-bit hosts every wasm32 memory
 //! is `MemoryStyle::Static` with the full range reserved up front (growth can
-//! never remap), which [`GuestHeap::new`] verifies for shared memories. As
-//! defense-in-depth every grow re-checks the base and aborts the process on a
-//! move (continuing would be immediate use-after-unmap all over the host).
+//! never remap), which [`GuestHeap::new`] verifies. As defense-in-depth every
+//! grow re-checks the base and aborts the process on a move (continuing would
+//! be immediate use-after-unmap all over the host).
+//!
+//! ## Where the store comes from
+//!
+//! Growing a wasm memory needs the store that owns it. Ordinary import handlers
+//! pass their store explicitly. V8 array-buffer allocation arrives from inside
+//! C++ frames, so only bridge operations that may synchronously invoke guest
+//! code install an invocation guard and lend their store
+//! ([`crate::guest::callback`]). A foreground allocation inside such a guarded
+//! call can recover that store; a background allocator thread has no lent store
+//! and remains arena-only. Growth is always the ordinary `Memory::grow`.
+//!
+//! Memory handles are store-scoped and WASIX worker threads share one linear
+//! memory while each has its own store, so the heap keeps one handle per store
+//! that reaches it and grows through whichever handle belongs to the explicitly
+//! supplied store.
+//!
+//! Nothing guarantees a store is available: a V8 background thread has none.
+//! So the heap keeps an arena ahead of demand — pre-claimed at instantiation
+//! and topped up from import boundaries ([`GuestHeap::maybe_refill`]) — and an
+//! allocation that arrives store-less is served from it.
 //!
 //! ## Concurrency
 //!
-//! `alloc`/`free` take the internal mutex only. For shared memories the grow
-//! handle is a cloned [`VMSharedMemory`], so growth needs no store and is safe
-//! from any thread (V8 GC threads free backing stores off the JS thread). Lock
-//! order is the `inner` mutex → budget atomics → the memory's own grow lock;
-//! nothing else is acquired while the mutex is held. Non-shared memories can
-//! only grow where a store is available, so those heaps are pre-funded at
-//! instantiation and refilled from import boundaries ([`GuestHeap::maybe_refill`]).
+//! `alloc`/`free` take the internal mutex only. Frees need no store at all, so
+//! V8's GC threads can release backing stores off the JS thread. Lock order is
+//! the `inner` mutex → budget atomics → the memory's own grow lock; nothing
+//! else is acquired while the mutex is held.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -49,8 +66,8 @@ use std::sync::{
 };
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
-use wasmer::sys::vm::{LinearMemory, VMSharedMemory};
-use wasmer::{MemoryStyle, Pages, StoreMut};
+use wasmer::sys::NativeEngineExt;
+use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -64,21 +81,13 @@ const WASM_PAGE: u32 = wasmer::WASM_PAGE_SIZE as u32;
 /// Minimum bytes claimed per grow, to amortize grow calls and chunk overhead.
 const MIN_CHUNK_BYTES: u32 = 1024 * 1024;
 
-/// Bytes pre-claimed at heap creation for memories that cannot grow without a
-/// store.
-const OWNED_PREFUND_BYTES: u32 = 16 * 1024 * 1024;
+/// Bytes pre-claimed at heap creation, so an allocation that arrives without a
+/// store has somewhere to come from.
+const PREFUND_BYTES: u32 = 16 * 1024 * 1024;
 
-/// When a non-shared-memory heap's free space drops below this, the next
-/// [`GuestHeap::maybe_refill`] claims more.
-const OWNED_LOW_WATER_BYTES: u64 = 4 * 1024 * 1024;
-
-enum GrowHandle {
-    /// Shared memory: growable from any thread without a store.
-    Shared(VMSharedMemory),
-    /// Non-shared memory: growable only where a store is available. The
-    /// handle is used solely by [`GuestHeap::maybe_refill`].
-    Owned(wasmer::Memory),
-}
+/// When free space drops below this, the next [`GuestHeap::maybe_refill`]
+/// claims more.
+const LOW_WATER_BYTES: u64 = 4 * 1024 * 1024;
 
 struct Chunk {
     /// Guest offset of the first byte this chunk manages.
@@ -100,13 +109,16 @@ struct LiveAlloc {
 }
 
 struct HeapInner {
-    grow: GrowHandle,
+    /// One handle to this heap's linear memory per store that has reached it.
+    /// A handle only works with the store that made it, so growing means
+    /// finding the one belonging to the store currently lent.
+    memories: Vec<Memory>,
     chunks: Vec<Chunk>,
     live: HashMap<u32, LiveAlloc>,
     /// Free bytes across all chunks (maintained on alloc/free/claim).
     free_bytes: u64,
-    /// Bytes a recent allocation failed to find (non-shared lane): the next
-    /// refill claims at least this much.
+    /// Bytes a recent allocation failed to find: the next refill claims at
+    /// least this much.
     pending_want: u32,
 }
 
@@ -123,10 +135,9 @@ pub(crate) struct GuestHeap {
     inner: Mutex<HeapInner>,
 }
 
-// SAFETY: `base` points into a mapping that outlives the heap (the shared grow
-// handle keeps the allocation alive; for owned memories the instance's store
-// does, and the heap is dropped with the env). All mutable state is behind the
-// mutex or atomics.
+// SAFETY: `base` points into a mapping that outlives the heap: the instance's
+// store keeps it alive, and the heap is dropped with the env. All mutable
+// state is behind the mutex or atomics.
 unsafe impl Send for GuestHeap {}
 unsafe impl Sync for GuestHeap {}
 
@@ -213,6 +224,10 @@ impl GuestHeap {
             .lock()
             .expect("guest-heap registry poisoned");
         if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
+            // This store reaches the heap for the first time; its handle is
+            // the only one that can grow the memory while it is the store
+            // being lent.
+            existing.register_memory(store, memory);
             return Some(existing);
         }
         let heap = Self::new(store, memory, budget)?;
@@ -221,6 +236,21 @@ impl GuestHeap {
         // across many short-lived instances that reuse addresses.
         reg.retain(|_, w| w.strong_count() > 0);
         Some(heap)
+    }
+
+    /// Record the handle `store` uses for this heap's linear memory, if it has
+    /// not already. Only the handle belonging to the store being lent can grow
+    /// the memory, so every store that reaches a shared heap contributes one.
+    fn register_memory(&self, store: &impl AsStoreRef, memory: &Memory) {
+        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        if inner
+            .memories
+            .iter()
+            .any(|known| known.is_from_store(store))
+        {
+            return;
+        }
+        inner.memories.push(memory.clone());
     }
 
     /// Build a fresh heap over the instance's imported memory. Prefer
@@ -240,28 +270,18 @@ impl GuestHeap {
         let max_pages = ty.maximum.map(|p| p.0).unwrap_or(65536).min(65536);
         let max_bytes = u64::from(max_pages) * u64::from(WASM_PAGE);
 
-        let grow = if ty.shared {
-            let Some(shared) = memory.as_shared(store) else {
-                integrity_warn("shared memory without a shared handle; guest heap disabled");
+        // The base can only be stable if the whole range is reserved up
+        // front. On 64-bit hosts this is always the case for wasm32.
+        match store.engine().tunables().memory_style(&ty) {
+            MemoryStyle::Static if MemoryStyle::static_bound().0 >= max_pages => {}
+            style => {
+                integrity_warn(&format!(
+                    "memory style {style:?} does not guarantee a stable base; \
+                     guest heap disabled"
+                ));
                 return None;
-            };
-            let vm = shared.vm_shared_memory().unwrap_sys_ref().clone();
-            // The base can only be stable if the whole range is reserved up
-            // front. On 64-bit hosts this is always the case for wasm32.
-            match vm.style() {
-                MemoryStyle::Static if MemoryStyle::static_bound().0 >= max_pages => {}
-                style => {
-                    integrity_warn(&format!(
-                        "memory style {style:?} does not guarantee a stable base; \
-                         guest heap disabled"
-                    ));
-                    return None;
-                }
             }
-            GrowHandle::Shared(vm)
-        } else {
-            GrowHandle::Owned(memory.clone())
-        };
+        }
 
         let heap = Arc::new(Self {
             base,
@@ -269,7 +289,7 @@ impl GuestHeap {
             budget,
             charged: AtomicU64::new(0),
             inner: Mutex::new(HeapInner {
-                grow,
+                memories: vec![memory.clone()],
                 chunks: Vec::new(),
                 live: HashMap::new(),
                 free_bytes: 0,
@@ -277,15 +297,14 @@ impl GuestHeap {
             }),
         });
 
-        if !ty.shared {
-            // Non-shared memories cannot grow without a store, so pre-claim a
-            // working arena while we have one. Failure to prefund is fatal for
-            // the heap: an empty owned heap would fail every V8 allocation.
+        {
+            // Claim a working arena while a store is unambiguously in hand.
+            // Best effort: an allocation that arrives with a store can
+            // still claim for itself, so an unfunded heap is slower, not
+            // broken. One that arrives without one has only this to draw on.
             let mut inner = heap.inner.lock().expect("guest-heap mutex poisoned");
-            if !heap.refill_with_store_locked(&mut inner, store, OWNED_PREFUND_BYTES) {
-                drop(inner);
-                integrity_warn("failed to pre-claim arena for non-shared memory");
-                return None;
+            if !heap.refill_with_store_locked(&mut inner, store, PREFUND_BYTES) {
+                integrity_warn("could not pre-claim the guest heap arena");
             }
         }
 
@@ -328,7 +347,7 @@ impl GuestHeap {
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        let offset = match self.alloc_locked(&mut inner, units) {
+        let offset = match Self::try_chunks(&mut inner, units) {
             Some(offset) => offset,
             None => {
                 // Remember what we needed so a store-side refill can size
@@ -347,19 +366,45 @@ impl GuestHeap {
         Some(offset)
     }
 
-    fn alloc_locked(&self, inner: &mut HeapInner, units: u32) -> Option<u32> {
-        // Try existing chunks first.
-        if let Some(offset) = Self::try_chunks(inner, units) {
-            return Some(offset);
-        }
-        // Claim more memory. Only the shared lane can grow here; the owned
-        // lane must wait for a store-side refill.
-        let needed_bytes = units.checked_mul(UNIT)?;
-        if !matches!(inner.grow, GrowHandle::Shared(_)) {
+    /// Allocate with explicit access to the store that owns this heap's memory.
+    /// Existing arena space remains the fast path; only exhaustion grows the
+    /// memory. This is used directly by import handlers and, through a lent
+    /// store, by synchronous foreground V8 allocator calls in guarded bridges.
+    pub(crate) fn alloc_with_store(
+        &self,
+        store: &mut StoreMut<'_>,
+        len: usize,
+        zero: bool,
+    ) -> Option<u32> {
+        if len > self.max_bytes as usize {
             return None;
         }
-        self.claim_chunk_locked(inner, needed_bytes)?;
-        Self::try_chunks(inner, units)
+        let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
+
+        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let offset = if let Some(offset) = Self::try_chunks(&mut inner, units) {
+            offset
+        } else {
+            let needed_bytes = units.checked_mul(UNIT)?;
+            if !self.refill_with_store_locked(&mut inner, store, needed_bytes) {
+                inner.pending_want = inner.pending_want.max(needed_bytes);
+                return None;
+            }
+            match Self::try_chunks(&mut inner, units) {
+                Some(offset) => offset,
+                None => {
+                    inner.pending_want = inner.pending_want.max(needed_bytes);
+                    return None;
+                }
+            }
+        };
+        drop(inner);
+
+        if zero {
+            // SAFETY: `offset..offset+len` lies within a chunk this heap owns.
+            unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len) };
+        }
+        Some(offset)
     }
 
     fn try_chunks(inner: &mut HeapInner, units: u32) -> Option<u32> {
@@ -396,51 +441,16 @@ impl GuestHeap {
         None
     }
 
-    /// Claim at least `min_bytes` of fresh linear memory as a new chunk.
-    /// Shared-memory lane only (store-free grow).
-    fn claim_chunk_locked(&self, inner: &mut HeapInner, min_bytes: u32) -> Option<()> {
-        let want_bytes = chunk_size_for(min_bytes);
-        let delta_pages = want_bytes.div_ceil(WASM_PAGE);
-        let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
-
-        // Reserve against the budget first, exactly like a guest-issued grow:
-        // a denied charge must look like hitting the memory's maximum.
-        if self
-            .budget
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .is_err()
-        {
-            return None;
-        }
-
-        let GrowHandle::Shared(vm) = &mut inner.grow else {
-            self.budget.uncharge(Pool::WasmLinear, delta_bytes);
-            return None;
-        };
-        let prev = match vm.grow(Pages(delta_pages)) {
-            Ok(prev) => prev,
-            Err(_) => {
-                self.budget.uncharge(Pool::WasmLinear, delta_bytes);
-                return None;
-            }
-        };
-        // SAFETY: the definition pointer is valid for the life of the memory.
-        let base_now = unsafe { vm.vmmemory().as_ref().base };
-        self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
-    }
-
-    /// Store-side refill for non-shared memories: claim more arena when free
-    /// space is low or an allocation recently failed. Called from import
-    /// boundaries where a store is available. No-op for shared memories.
+    /// Top the arena up when free space is low or an allocation recently came
+    /// up short. Called from import boundaries, where the store is in hand
+    /// without any parking, so the arena stays ahead of allocations that
+    /// arrive without a store.
     pub(crate) fn maybe_refill(&self, store: &mut StoreMut<'_>) {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        if matches!(inner.grow, GrowHandle::Shared(_)) {
+        if inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
             return;
         }
-        if inner.free_bytes >= OWNED_LOW_WATER_BYTES && inner.pending_want == 0 {
-            return;
-        }
-        let want = inner.pending_want.max(OWNED_PREFUND_BYTES);
+        let want = inner.pending_want.max(PREFUND_BYTES);
         let _ = self.refill_with_store_locked(&mut inner, store, want);
     }
 
@@ -450,31 +460,44 @@ impl GuestHeap {
         store: &mut StoreMut<'_>,
         min_bytes: u32,
     ) -> bool {
-        let GrowHandle::Owned(memory) = &inner.grow else {
+        let Some(memory) = inner
+            .memories
+            .iter()
+            .find(|memory| memory.is_from_store(store))
+            .cloned()
+        else {
+            // This store has no handle on the heap's memory, so it is not the
+            // store that owns it.
             return false;
         };
-        let memory = memory.clone();
         let want_bytes = chunk_size_for(min_bytes);
         let delta_pages = want_bytes.div_ceil(WASM_PAGE);
+        // Only charge here when no embedder
+        // is already accounting for growth through its tunables.
         let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
+        let charge = if self.budget.wasm_is_externally_accounted() {
+            0
+        } else {
+            if self
+                .budget
+                .try_charge(Pool::WasmLinear, delta_bytes)
+                .is_err()
+            {
+                return false;
+            }
+            delta_bytes
+        };
 
-        if self
-            .budget
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .is_err()
-        {
-            return false;
-        }
         let prev = match memory.grow(&mut *store, Pages(delta_pages)) {
             Ok(prev) => prev,
             Err(_) => {
-                self.budget.uncharge(Pool::WasmLinear, delta_bytes);
+                self.budget.uncharge(Pool::WasmLinear, charge);
                 return false;
             }
         };
         let base_now = memory.view(store).data_ptr();
         inner.pending_want = 0;
-        self.finish_claim(inner, prev, delta_pages, base_now, delta_bytes)
+        self.finish_claim(inner, prev, delta_pages, base_now, charge)
             .is_some()
     }
 
@@ -500,15 +523,15 @@ impl GuestHeap {
 
         let start = u64::from(prev.0) * u64::from(WASM_PAGE);
         let len = u64::from(delta_pages) * u64::from(WASM_PAGE);
+        // Once the physical grow succeeds its bytes remain resident even if an
+        // integrity check prevents this allocator from using the new range.
+        self.charged.fetch_add(charged_bytes, Ordering::AcqRel);
         if start + len > self.max_bytes {
             // Cannot happen (grow enforces the maximum), but never hand out
             // ranges beyond the reservation.
             integrity_warn("claimed range beyond memory maximum");
-            self.budget.uncharge(Pool::WasmLinear, charged_bytes);
             return None;
         }
-        self.charged.fetch_add(charged_bytes, Ordering::AcqRel);
-
         let start = start as u32;
         let len = len as u32;
         inner.chunks.push(Chunk {
@@ -676,7 +699,9 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    match heap.alloc(length, zero != 0) {
+    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
+        .unwrap_or_else(|| heap.alloc(length, zero != 0));
+    match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
     }
@@ -900,24 +925,116 @@ mod tests {
     #[test]
     fn budget_charged_and_released_on_drop() {
         let mut store = Store::default();
+        // Under the prefund, so the arena claims what the budget allows and no
+        // more; the allocations below have to claim for themselves.
         let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
         let (_memory, heap) = shared_heap(&mut store, Arc::clone(&budget));
 
-        assert_eq!(budget.memory_charged(), 0);
-        let a = heap.alloc(1024, false).expect("alloc under budget");
-        let charged_after_alloc = budget.memory_charged();
-        assert!(charged_after_alloc >= 1024 * 1024); // at least one chunk claimed
+        let charged_after_prefund = budget.memory_charged();
+        assert!(charged_after_prefund <= 8 * 1024 * 1024);
+
+        let a = heap
+            .alloc_with_store(&mut store.as_store_mut(), 1024, false)
+            .expect("alloc under budget");
+        assert!(budget.memory_charged() >= 1024 * 1024); // at least one chunk claimed
 
         // A request beyond the budget is denied without corrupting state.
-        assert!(heap.alloc(64 * 1024 * 1024, false).is_none());
+        assert!(
+            heap.alloc_with_store(&mut store.as_store_mut(), 64 * 1024 * 1024, false)
+                .is_none()
+        );
         assert!(heap.free_offset(a));
 
         drop(heap);
         assert_eq!(budget.memory_charged(), 0);
     }
 
+    /// The heap grows through an explicitly supplied store. Without one it is
+    /// limited to the arena it already claimed — which is the case the prefund
+    /// and [`GuestHeap::maybe_refill`] exist to cover.
     #[test]
-    fn owned_memory_prefunds_and_refills() {
+    fn growth_needs_an_explicit_store_and_the_arena_covers_the_rest() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+
+        // Served from the prefunded arena, with no store at all: this is
+        // the V8-background-thread case.
+        let from_arena = heap.alloc(1024, false).expect("served from the arena");
+        assert!(heap.free_offset(from_arena));
+
+        // Past what the arena holds, and with no store, the allocation
+        // fails rather than growing the guest's memory behind its back.
+        let past_arena = (PREFUND_BYTES as usize) * 2;
+        assert!(heap.alloc(past_arena, false).is_none());
+
+        // Supply one, and the same request claims the pages it needs.
+        let grown = heap
+            .alloc_with_store(&mut store.as_store_mut(), past_arena, false)
+            .expect("claims with an explicit store");
+        assert!(heap.free_offset(grown));
+    }
+
+    /// The foreign V8 allocator has no Rust store argument. It may recover a
+    /// store only while an explicitly guarded bridge lends one; otherwise it
+    /// is limited to the already-prefunded arena.
+    #[test]
+    fn allocator_hook_grows_only_with_a_lent_store() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let ctx = heap.make_alloc_ctx();
+        let past_arena = (PREFUND_BYTES as usize) * 2;
+
+        let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+        assert!(without_guard.is_null());
+
+        let with_guard = store
+            .as_store_mut()
+            .parked(|| napi_host_guest_heap_alloc(ctx, past_arena, 0));
+        assert!(!with_guard.is_null());
+        assert_eq!(napi_host_guest_heap_free(ctx, with_guard, past_arena), 1);
+
+        napi_host_guest_heap_release(ctx);
+    }
+
+    /// A store that has not registered a handle on this heap's memory cannot
+    /// grow it even when supplied explicitly.
+    #[test]
+    fn an_unregistered_store_does_not_grow_the_memory() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+
+        let mut stranger = Store::default();
+        let past_arena = (PREFUND_BYTES as usize) * 2;
+        assert!(
+            heap.alloc_with_store(&mut stranger.as_store_mut(), past_arena, false)
+                .is_none(),
+            "another store's handle must not be used to grow this memory"
+        );
+    }
+
+    #[test]
+    fn successful_shared_grow_stays_charged_after_integrity_rejection() {
+        let mut store = Store::default();
+        let budget = ResourceBudget::with_memory_limit(2 * u64::from(WASM_PAGE));
+        let (_memory, heap) = shared_heap(&mut store, Arc::clone(&budget));
+        let charged = u64::from(WASM_PAGE);
+        budget.try_charge(Pool::WasmLinear, charged).unwrap();
+
+        {
+            let mut inner = heap.inner.lock().unwrap();
+            assert!(
+                heap.finish_claim(&mut inner, Pages(2048), 1, heap.base, charged)
+                    .is_none()
+            );
+        }
+        assert_eq!(budget.memory_charged(), charged);
+
+        drop(heap);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn prefunds_and_refills() {
         let mut store = Store::default();
         let ty = MemoryType::new(Pages(64), Some(Pages(2048)), false);
         let memory = Memory::new(&mut store, ty).expect("create owned memory");

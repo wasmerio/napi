@@ -2,7 +2,7 @@
 // Guest memory helpers
 // ============================================================
 
-use wasmer::FunctionEnvMut;
+use wasmer::{AsStoreMut, FunctionEnvMut};
 
 use crate::NapiEnv;
 
@@ -72,6 +72,32 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     };
     let (_, store) = env.data_and_store_mut();
     memory.view(&store).data_size()
+}
+
+/// Allocate `len` bytes of guest memory, passing the import's store directly so
+/// the heap can claim more from the guest when its arena is short.
+///
+/// V8 allocator hooks can recover a store only inside an explicitly guarded
+/// reentrant bridge; ordinary imports already have the store and should not
+/// publish and rediscover it through runtime TLS.
+pub fn alloc_guest(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    heap: &crate::guest_heap::GuestHeap,
+    len: usize,
+    zero: bool,
+) -> Option<u32> {
+    let mut store = env.as_store_mut();
+    heap.alloc_with_store(&mut store, len, zero)
+}
+
+pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
+    let heap = env.data().guest_heap.clone()?;
+    let guest_ptr = alloc_guest(env, &heap, data.len(), false)?;
+    if !write_guest_bytes(env, guest_ptr, data) {
+        heap.free_offset(guest_ptr);
+        return None;
+    }
+    Some(guest_ptr)
 }
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {

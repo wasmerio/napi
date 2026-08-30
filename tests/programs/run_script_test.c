@@ -8,6 +8,78 @@
 
 static int wrap_finalizer_count = 0;
 static int add_finalizer_count = 0;
+static int facade_evaluation_count = 0;
+
+typedef struct {
+  napi_value proxy;
+  int own_keys_count;
+} nested_property_names_context;
+
+static napi_value NAPI_CDECL NestedOwnKeys(napi_env env,
+                                           napi_callback_info info) {
+  size_t argc = 0;
+  void* data = NULL;
+  if (napi_get_cb_info(env, info, &argc, NULL, NULL, &data) != napi_ok) {
+    return NULL;
+  }
+
+  nested_property_names_context* context =
+      (nested_property_names_context*)data;
+  context->own_keys_count++;
+
+  napi_value keys;
+  napi_value key;
+  if (napi_create_array_with_length(env, 1, &keys) != napi_ok ||
+      napi_create_string_utf8(env, "nestedKey", NAPI_AUTO_LENGTH, &key) !=
+          napi_ok ||
+      napi_set_element(env, keys, 0, key) != napi_ok) {
+    return NULL;
+  }
+  return keys;
+}
+
+static napi_value NAPI_CDECL EnumerateNestedProxy(napi_env env,
+                                                  napi_callback_info info) {
+  size_t argc = 0;
+  void* data = NULL;
+  if (napi_get_cb_info(env, info, &argc, NULL, NULL, &data) != napi_ok) {
+    return NULL;
+  }
+
+  nested_property_names_context* context =
+      (nested_property_names_context*)data;
+  napi_value names;
+  napi_value all_names;
+  uint32_t names_length = 0;
+  uint32_t all_names_length = 0;
+  if (napi_get_property_names(env, context->proxy, &names) != napi_ok ||
+      napi_get_array_length(env, names, &names_length) != napi_ok ||
+      napi_get_all_property_names(env,
+                                  context->proxy,
+                                  napi_key_own_only,
+                                  napi_key_all_properties,
+                                  napi_key_keep_numbers,
+                                  &all_names) != napi_ok ||
+      napi_get_array_length(env, all_names, &all_names_length) != napi_ok) {
+    return NULL;
+  }
+
+  napi_value result;
+  if (napi_create_uint32(env, names_length + all_names_length, &result) !=
+      napi_ok) {
+    return NULL;
+  }
+  return result;
+}
+
+static napi_value NAPI_CDECL CountFacadeEvaluation(napi_env env,
+                                                    napi_callback_info info) {
+  (void)info;
+  facade_evaluation_count++;
+  napi_value result = NULL;
+  if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+  return result;
+}
 
 static void NAPI_CDECL CountWrapFinalizer(napi_env env,
                                           void* data,
@@ -81,6 +153,59 @@ int main(void) {
   double num;
   NAPI_CALL(env, napi_get_value_double(env, num_result, &num));
   CHECK_OR_FAIL(num > 13.9 && num < 14.1, "expected 14");
+
+  // Property-name enumeration is a host-to-JS boundary: a Proxy can invoke a
+  // guest ownKeys callback while an outer guest callback still owns the store.
+  // Both enumeration APIs must lend the store for that nested callback.
+  nested_property_names_context nested_names = {0};
+  napi_value nested_global;
+  napi_value proxy_constructor;
+  napi_value proxy_target;
+  napi_value proxy_handler;
+  napi_value own_keys_function;
+  napi_value nested_key_value;
+  NAPI_CALL(env, napi_get_global(env, &nested_global));
+  NAPI_CALL(env, napi_get_named_property(
+                     env, nested_global, "Proxy", &proxy_constructor));
+  NAPI_CALL(env, napi_create_object(env, &proxy_target));
+  NAPI_CALL(env, napi_create_int32(env, 1, &nested_key_value));
+  NAPI_CALL(env, napi_set_named_property(
+                     env, proxy_target, "nestedKey", nested_key_value));
+  NAPI_CALL(env, napi_create_object(env, &proxy_handler));
+  NAPI_CALL(env, napi_create_function(env,
+                                      "nestedOwnKeys",
+                                      NAPI_AUTO_LENGTH,
+                                      NestedOwnKeys,
+                                      &nested_names,
+                                      &own_keys_function));
+  NAPI_CALL(env, napi_set_named_property(
+                     env, proxy_handler, "ownKeys", own_keys_function));
+  napi_value proxy_args[] = {proxy_target, proxy_handler};
+  NAPI_CALL(env, napi_new_instance(env,
+                                   proxy_constructor,
+                                   2,
+                                   proxy_args,
+                                   &nested_names.proxy));
+
+  napi_value enumerate_function;
+  napi_value enumeration_result;
+  uint32_t enumeration_count = 0;
+  NAPI_CALL(env, napi_create_function(env,
+                                      "enumerateNestedProxy",
+                                      NAPI_AUTO_LENGTH,
+                                      EnumerateNestedProxy,
+                                      &nested_names,
+                                      &enumerate_function));
+  NAPI_CALL(env, napi_call_function(env,
+                                    nested_global,
+                                    enumerate_function,
+                                    0,
+                                    NULL,
+                                    &enumeration_result));
+  NAPI_CALL(env, napi_get_value_uint32(
+                     env, enumeration_result, &enumeration_count));
+  CHECK_OR_FAIL(enumeration_count == 2 && nested_names.own_keys_count == 2,
+                "property enumeration did not re-enter the guest ownKeys trap");
 
   // Each N-API environment owns its global context. This is also a control
   // plane boundary: evaluating in the host worker's real global would leak the
@@ -299,6 +424,55 @@ int main(void) {
   CHECK_OR_FAIL(marker == 73,
                 "module evaluation escaped its explicit context");
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
+
+  // Creating the CommonJS facade evaluates the original module internally,
+  // so a synthetic module's guest evaluation callback must be able to re-enter
+  // while the facade is built.
+  napi_value facade_exports;
+  napi_value facade_default_export;
+  napi_value facade_named_export;
+  napi_value facade_evaluation_steps;
+  NAPI_CALL(env, napi_create_array_with_length(env, 2, &facade_exports));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env, "default", NAPI_AUTO_LENGTH, &facade_default_export));
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env, "named", NAPI_AUTO_LENGTH, &facade_named_export));
+  NAPI_CALL(env, napi_set_element(
+                     env, facade_exports, 0, facade_default_export));
+  NAPI_CALL(env, napi_set_element(
+                     env, facade_exports, 1, facade_named_export));
+  NAPI_CALL(env, napi_create_function(env,
+                                      "evaluateFacadeSource",
+                                      NAPI_AUTO_LENGTH,
+                                      CountFacadeEvaluation,
+                                      NULL,
+                                      &facade_evaluation_steps));
+  unofficial_napi_module_create_options synthetic_options = {0};
+  synthetic_options.size = sizeof(synthetic_options);
+  synthetic_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  synthetic_options.kind = unofficial_napi_module_synthetic;
+  synthetic_options.wrapper = module_wrapper;
+  synthetic_options.url = module_url;
+  synthetic_options.context_or_undefined = undefined_value;
+  synthetic_options.payload.synthetic.export_names = facade_exports;
+  synthetic_options.payload.synthetic.synthetic_evaluation_steps =
+      facade_evaluation_steps;
+  unofficial_napi_module_create_result synthetic_create_result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(
+                     env, &synthetic_options, &synthetic_create_result));
+  unofficial_napi_module synthetic_module = synthetic_create_result.module;
+  CHECK_OR_FAIL(synthetic_module != NULL,
+                "synthetic module creation did not return a handle");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(
+                     env, synthetic_module, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(
+                     env, synthetic_module));
+  napi_value facade_namespace;
+  NAPI_CALL(env, unofficial_napi_module_wrap_create_required_module_facade(
+                     env, synthetic_module, &facade_namespace));
+  CHECK_OR_FAIL(facade_namespace != NULL && facade_evaluation_count == 1,
+                "required-module facade did not run its guest evaluation callback");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, synthetic_module));
 
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
   // owns the value and copy-back. Releasing after the handle scope closes is

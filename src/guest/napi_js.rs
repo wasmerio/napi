@@ -2205,10 +2205,7 @@ fn guest_napi_get_boolean(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, 
 
 fn guest_napi_get_global(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let snapi = snapi_env(&env, e);
-    let s = with_cb_context(&mut env, e, || unsafe {
-        snapi_bridge_get_global(snapi, &mut out)
-    });
+    let s = unsafe { snapi_bridge_get_global(snapi_env(&env, e), &mut out) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2945,7 +2942,11 @@ fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: i32, ah: i32
 
 fn guest_napi_get_property_names(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_property_names(snapi_env(&env, e), o as u32, &mut out) };
+    let snapi = snapi_env(&env, e);
+    // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_property_names(snapi, o as u32, &mut out)
+    });
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2962,16 +2963,11 @@ fn guest_napi_get_all_property_names(
     rp: i32,
 ) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_get_all_property_names(
-            snapi_env(&env, e),
-            o as u32,
-            mode,
-            filter,
-            conversion,
-            &mut out,
-        )
-    };
+    let snapi = snapi_env(&env, e);
+    // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_all_property_names(snapi, o as u32, mode, filter, conversion, &mut out)
+    });
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }

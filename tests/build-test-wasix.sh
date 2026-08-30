@@ -60,6 +60,11 @@ fi
 
 # Compile to WASIX. Core N-API functions import from "napi" and Wasmer-specific
 # unofficial APIs import from "napi_extension_wasmer_v0" based on the headers.
+#
+# `wasixcc` runs `wasm-opt` on the result, passing the wasm features it built
+# with. If the installed binaryen predates one of them it fails with e.g.
+# "Unknown option '--enable-wide-arithmetic'"; refresh it with
+# `wasixccenv download-binaryen`.
 WASIX_DRIVER="wasixcc"
 case "$TEST_SRC" in
   *.cc|*.cpp)

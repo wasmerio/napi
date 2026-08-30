@@ -31,7 +31,7 @@
 use std::ffi::c_void;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -56,6 +56,9 @@ const MIB: u64 = 1024 * 1024;
 pub const DEFAULT_INITIAL_ISOLATE_HEAP: u64 = 64 * MIB;
 /// Increment the near-heap-limit callback reserves per grow grant.
 pub const DEFAULT_HEAP_GROW_STEP: u64 = 32 * MIB;
+/// One-time V8 heap slack reserved up front so a denied growth callback can
+/// terminate and unwind without entering V8s fatal out-of-memory path.
+pub const DEFAULT_UNWIND_SLACK: u64 = 16 * MIB;
 /// Fixed per-isolate overhead charged to cover young generation, code range,
 /// and V8's own malloc'd metadata without sampling.
 pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
@@ -87,8 +90,8 @@ pub enum Pool {
     /// Guest wasm linear memory (wasmer `WasmMmap`).
     WasmLinear,
     /// V8 per-isolate heap *ceiling* (old + young + code range + per-isolate
-    /// overhead), charged by reservation at env creation and raised in
-    /// grow-steps by the near-heap-limit callback. Charged by ceiling, not
+    /// overhead + pre-reserved unwind slack), charged by reservation at env
+    /// creation and raised in grow-steps by the near-heap-limit callback. Charged by ceiling, not
     /// live usage, so the guarantee never races V8's GC.
     V8HeapReserved,
     /// V8 external memory the guest has explicitly declared via
@@ -97,6 +100,17 @@ pub enum Pool {
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].
     V8External,
+}
+
+/// Embedder-owned aggregate accounting for byte reservations made by N-API.
+///
+/// N-API retains its own per-pool counters; the embedder sees only byte totals,
+/// keeping pool policy and future N-API implementation details out of Edge.
+pub trait NapiMemoryAccountant: Send + Sync {
+    fn memory_limit(&self) -> u64;
+    fn memory_charged(&self) -> u64;
+    fn try_charge(&self, bytes: u64) -> bool;
+    fn uncharge(&self, bytes: u64);
 }
 
 /// Error returned by [`ResourceBudget::try_charge`] when a charge would push
@@ -130,7 +144,8 @@ impl std::error::Error for OverBudget {}
 pub struct ResourceUsage {
     /// The app's total memory budget (`u64::MAX` if unlimited).
     pub mem_total: u64,
-    /// Sum of all currently-charged bytes across every pool.
+    /// Aggregate bytes currently charged. With an embedder accountant this also
+    /// includes non-N-API memory sharing the same application budget.
     pub mem_charged: u64,
     /// Currently-charged guest wasm linear memory bytes.
     pub wasm_linear: u64,
@@ -180,18 +195,34 @@ pub enum EnvRejected {
 /// moment they become live, so `actual usage <= mem_charged <= mem_total`
 /// always holds and enforcement never races a garbage collector. All state is
 /// atomic, so worker threads (each its own store + isolate) share one budget.
-#[derive(Debug)]
 pub struct ResourceBudget {
     /// Total byte budget. `UNLIMITED` disables enforcement (tracking only).
     mem_total: u64,
     /// Sum of all currently-charged bytes across every pool.
     mem_charged: AtomicU64,
+    accountant: Option<Arc<dyn NapiMemoryAccountant>>,
     /// Per-pool charge, for observability and reconciliation.
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
     v8_external: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
+}
+
+impl std::fmt::Debug for ResourceBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceBudget")
+            .field("mem_total", &self.memory_limit())
+            .field("mem_charged", &self.memory_charged())
+            .field("wasm_linear", &self.wasm_linear.load(Ordering::Acquire))
+            .field(
+                "v8_heap_reserved",
+                &self.v8_heap_reserved.load(Ordering::Acquire),
+            )
+            .field("v8_external", &self.v8_external.load(Ordering::Acquire))
+            .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
+            .finish()
+    }
 }
 
 impl ResourceBudget {
@@ -205,10 +236,35 @@ impl ResourceBudget {
         Arc::new(Self::with_total(bytes))
     }
 
+    /// Use an embedder-owned total while retaining N-API per-pool policy.
+    /// Whether an embedder owns wasm linear-memory accounting.
+    ///
+    /// The guest heap grows the guest's memory through the store, so an
+    /// embedder that meters growth through its own tunables has already
+    /// charged those bytes by the time we see them; charging again would
+    /// count one allocation twice against the same total. With no accountant
+    /// nothing else is counting, so the heap charges its own claims.
+    pub(crate) fn wasm_is_externally_accounted(&self) -> bool {
+        self.accountant.is_some()
+    }
+
+    pub fn with_accountant(accountant: Arc<dyn NapiMemoryAccountant>) -> Arc<Self> {
+        Arc::new(Self {
+            mem_total: accountant.memory_limit(),
+            mem_charged: AtomicU64::new(0),
+            accountant: Some(accountant),
+            wasm_linear: AtomicU64::new(0),
+            v8_heap_reserved: AtomicU64::new(0),
+            v8_external: AtomicU64::new(0),
+            live_isolates: AtomicUsize::new(0),
+        })
+    }
+
     fn with_total(mem_total: u64) -> Self {
         Self {
             mem_total,
             mem_charged: AtomicU64::new(0),
+            accountant: None,
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
@@ -218,22 +274,27 @@ impl ResourceBudget {
 
     /// Whether this budget enforces a limit.
     pub fn is_unlimited(&self) -> bool {
-        self.mem_total == UNLIMITED
+        self.memory_limit() == UNLIMITED
     }
 
     /// The total memory budget (`u64::MAX` if unlimited).
     pub fn memory_limit(&self) -> u64 {
-        self.mem_total
+        self.accountant
+            .as_ref()
+            .map_or(self.mem_total, |x| x.memory_limit())
     }
 
     /// Bytes currently charged across all pools.
     pub fn memory_charged(&self) -> u64 {
-        self.mem_charged.load(Ordering::Acquire)
+        self.accountant.as_ref().map_or_else(
+            || self.mem_charged.load(Ordering::Acquire),
+            |x| x.memory_charged(),
+        )
     }
 
     /// Bytes still available before the budget is exhausted.
     pub fn memory_remaining(&self) -> u64 {
-        self.mem_total.saturating_sub(self.memory_charged())
+        self.memory_limit().saturating_sub(self.memory_charged())
     }
 
     /// Atomically charge `bytes` against `pool`; `Err` if it would exceed the
@@ -246,7 +307,17 @@ impl ResourceBudget {
             return Ok(());
         }
 
-        if self.mem_total == UNLIMITED {
+        if let Some(accountant) = &self.accountant {
+            if !accountant.try_charge(bytes) {
+                return Err(OverBudget {
+                    pool,
+                    requested: bytes,
+                    charged: accountant.memory_charged(),
+                    total: accountant.memory_limit(),
+                });
+            }
+            self.mem_charged.fetch_add(bytes, Ordering::AcqRel);
+        } else if self.mem_total == UNLIMITED {
             self.mem_charged.fetch_add(bytes, Ordering::AcqRel);
         } else {
             // CAS loop so a concurrent charge can never let the sum slip past
@@ -287,6 +358,9 @@ impl ResourceBudget {
         }
         self.pool_counter(pool).fetch_sub(bytes, Ordering::AcqRel);
         self.mem_charged.fetch_sub(bytes, Ordering::AcqRel);
+        if let Some(accountant) = &self.accountant {
+            accountant.uncharge(bytes);
+        }
     }
 
     fn pool_counter(&self, pool: Pool) -> &AtomicU64 {
@@ -300,8 +374,8 @@ impl ResourceBudget {
     /// Snapshot the current charges for metrics / billing.
     pub fn snapshot(&self) -> ResourceUsage {
         ResourceUsage {
-            mem_total: self.mem_total,
-            mem_charged: self.mem_charged.load(Ordering::Acquire),
+            mem_total: self.memory_limit(),
+            mem_charged: self.memory_charged(),
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
             v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
             v8_external: self.v8_external.load(Ordering::Acquire),
@@ -322,7 +396,7 @@ impl ResourceBudget {
         if self.is_unlimited() {
             None
         } else {
-            Some((self.mem_total / EST_HOST_BYTES_PER_VALUE).max(1))
+            Some((self.memory_limit() / EST_HOST_BYTES_PER_VALUE).max(1))
         }
     }
 
@@ -411,6 +485,7 @@ impl ResourceBudget {
         let young = u64::from(req.max_young);
         let code = u64::from(req.code_range);
         let fixed = DEFAULT_PER_ISOLATE_OVERHEAD
+            .checked_add(DEFAULT_UNWIND_SLACK)?
             .checked_add(young)?
             .checked_add(code)?;
 
@@ -448,6 +523,9 @@ impl ResourceBudget {
 /// bytes granted beyond the initial ceiling.
 pub(crate) struct EnvHeapCharge {
     pub(crate) budget: Arc<ResourceBudget>,
+    pub(crate) env: usize,
+    pub(crate) host_stopped: Arc<AtomicBool>,
+    pub(crate) unwind_slack_available: AtomicBool,
     /// Bytes granted beyond the initial ceiling by grow-step grants.
     pub(crate) granted: AtomicU64,
 }
@@ -456,9 +534,9 @@ pub(crate) struct EnvHeapCharge {
 ///
 /// When V8 approaches a heap ceiling it invokes this on the isolate's JS
 /// thread. We charge one [`DEFAULT_HEAP_GROW_STEP`] against the budget and, if
-/// granted, raise the limit by that step; if the budget is exhausted we leave
-/// the limit unchanged, at which point V8 takes its own OOM path (graceful,
-/// abort-free teardown is a later phase). The budget is atomic, so this is safe
+/// granted, raise the limit by that step. If the budget is exhausted, request
+/// isolate termination and expose the pre-reserved unwind slack once. A second
+/// denial leaves the limit unchanged, so the quota cannot be expanded repeatedly. The budget is atomic, so this is safe
 /// to call concurrently with charges on other threads.
 ///
 /// # Safety
@@ -483,7 +561,21 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
             tracker.granted.fetch_add(step, Ordering::AcqRel);
             current_limit.saturating_add(step as usize)
         }
-        Err(_) => current_limit,
+        Err(_) => {
+            tracker.host_stopped.store(true, Ordering::Release);
+            if tracker.env != 0 {
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                        tracker.env as crate::snapi::SnapiEnv,
+                    );
+                }
+            }
+            if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
+                current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
+            } else {
+                current_limit
+            }
+        }
     }
 }
 
@@ -948,10 +1040,10 @@ mod tests {
             .try_reserve_env(RequestedHeap::default(), None)
             .expect("env fits");
         assert!(res.clamped);
-        // Default old-gen (64 MiB) fits, plus 8 MiB overhead.
+        // Default old-gen (64 MiB) fits, plus 8 MiB overhead and 16 MiB unwind slack.
         assert_eq!(u64::from(res.max_old), DEFAULT_INITIAL_ISOLATE_HEAP);
-        assert_eq!(res.ceiling_bytes, 72 * MIB);
-        assert_eq!(budget.snapshot().v8_heap_reserved, 72 * MIB);
+        assert_eq!(res.ceiling_bytes, 88 * MIB);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 88 * MIB);
         assert_eq!(budget.live_isolates(), 1);
 
         budget.release_env(res.ceiling_bytes);
@@ -961,14 +1053,14 @@ mod tests {
 
     #[test]
     fn env_reservation_clamps_old_gen_to_fit() {
-        // Only 20 MiB: overhead (8) leaves 12 MiB for old-gen, below the 64 MiB
-        // default, so old-gen is clamped down and the whole budget is charged.
-        let budget = ResourceBudget::with_memory_limit(20 * MIB);
+        // Only 40 MiB: overhead (8) and unwind slack (16) leave 16 MiB for
+        // old-gen, below the 64 MiB default, so it is clamped to fit.
+        let budget = ResourceBudget::with_memory_limit(40 * MIB);
         let res = budget
             .try_reserve_env(RequestedHeap::default(), None)
             .expect("clamped env fits");
-        assert_eq!(u64::from(res.max_old), 12 * MIB);
-        assert_eq!(res.ceiling_bytes, 20 * MIB);
+        assert_eq!(u64::from(res.max_old), 16 * MIB);
+        assert_eq!(res.ceiling_bytes, 40 * MIB);
     }
 
     #[test]
@@ -980,16 +1072,16 @@ mod tests {
             code_range: (2 * MIB) as u32,
         };
         let res = budget.try_reserve_env(req, None).expect("fits");
-        // ceiling = overhead(8) + young(4) + code(2) + old(16) = 30 MiB.
+        // ceiling = overhead(8) + unwind(16) + young(4) + code(2) + old(16).
         assert_eq!(res.max_young, (4 * MIB) as u32);
         assert_eq!(res.max_old, (16 * MIB) as u32);
         assert_eq!(res.code_range, (2 * MIB) as u32);
-        assert_eq!(res.ceiling_bytes, 30 * MIB);
+        assert_eq!(res.ceiling_bytes, 46 * MIB);
     }
 
     #[test]
     fn env_reservation_refused_when_heap_cannot_fit() {
-        // Below the per-isolate overhead, so no viable heap exists.
+        // Below overhead plus unwind slack, so no viable heap exists.
         let budget = ResourceBudget::with_memory_limit(4 * MIB);
         let err = budget
             .try_reserve_env(RequestedHeap::default(), None)
@@ -1048,10 +1140,19 @@ mod tests {
     #[test]
     fn near_heap_limit_callback_grants_until_budget_exhausted() {
         let step = DEFAULT_HEAP_GROW_STEP as usize;
-        // Room for exactly two grow-step grants.
-        let budget = ResourceBudget::with_memory_limit(2 * DEFAULT_HEAP_GROW_STEP);
+        // The unwind slack is pre-reserved as part of the env ceiling, with room
+        // for exactly two additional grow-step grants.
+        let budget =
+            ResourceBudget::with_memory_limit(DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP);
+        budget
+            .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
+            .unwrap();
+        let host_stopped = Arc::new(AtomicBool::new(false));
         let ptr = Box::into_raw(Box::new(EnvHeapCharge {
             budget: Arc::clone(&budget),
+            env: 0,
+            host_stopped: Arc::clone(&host_stopped),
+            unwind_slack_available: AtomicBool::new(true),
             granted: AtomicU64::new(0),
         }));
         let data = ptr as *const c_void;
@@ -1068,25 +1169,36 @@ mod tests {
         );
         assert_eq!(
             budget.snapshot().v8_heap_reserved,
-            2 * DEFAULT_HEAP_GROW_STEP
+            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP
         );
 
-        // Budget exhausted: the limit is left unchanged (V8 then OOMs on its own).
+        // Budget exhaustion requests termination and exposes the already-reserved
+        // unwind slack exactly once.
         assert_eq!(
             napi_host_near_heap_limit_grant(data, base + 2 * step, base),
-            base + 2 * step
+            base + 2 * step + DEFAULT_UNWIND_SLACK as usize
+        );
+        assert_eq!(
+            napi_host_near_heap_limit_grant(
+                data,
+                base + 2 * step + DEFAULT_UNWIND_SLACK as usize,
+                base,
+            ),
+            base + 2 * step + DEFAULT_UNWIND_SLACK as usize
         );
         assert_eq!(
             budget.snapshot().v8_heap_reserved,
-            2 * DEFAULT_HEAP_GROW_STEP
+            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP
         );
+
+        assert!(host_stopped.load(Ordering::Acquire));
 
         // The tracker recorded exactly what was granted, and releasing it (as
         // env teardown does) returns the pool to zero.
         let tracker = unsafe { Box::from_raw(ptr) };
         let granted = tracker.granted.load(Ordering::Acquire);
         assert_eq!(granted, 2 * DEFAULT_HEAP_GROW_STEP);
-        budget.uncharge(Pool::V8HeapReserved, granted);
+        budget.uncharge(Pool::V8HeapReserved, granted + DEFAULT_UNWIND_SLACK);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
     }
 
@@ -1132,5 +1244,78 @@ mod tests {
 
         budget.uncharge(Pool::V8External, 3 * MIB);
         assert_eq!(budget.snapshot().v8_external, 0);
+    }
+}
+
+#[cfg(test)]
+mod external_accountant_tests {
+    use super::*;
+
+    struct TestAccountant {
+        limit: u64,
+        charged: AtomicU64,
+    }
+
+    impl TestAccountant {
+        fn new(limit: u64) -> Arc<Self> {
+            Arc::new(Self {
+                limit,
+                charged: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl NapiMemoryAccountant for TestAccountant {
+        fn memory_limit(&self) -> u64 {
+            self.limit
+        }
+
+        fn memory_charged(&self) -> u64 {
+            self.charged.load(Ordering::Acquire)
+        }
+
+        fn try_charge(&self, bytes: u64) -> bool {
+            let mut current = self.charged.load(Ordering::Acquire);
+            loop {
+                let Some(next) = current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.limit)
+                else {
+                    return false;
+                };
+                match self.charged.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        fn uncharge(&self, bytes: u64) {
+            self.charged.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn external_accountant_includes_non_napi_charges() {
+        let accountant = TestAccountant::new(100);
+        assert!(accountant.try_charge(40));
+
+        let external: Arc<dyn NapiMemoryAccountant> = accountant.clone();
+        let budget = ResourceBudget::with_accountant(external);
+        budget.try_charge(Pool::V8HeapReserved, 60).unwrap();
+
+        let usage = budget.snapshot();
+        assert_eq!(usage.mem_charged, 100);
+        assert_eq!(usage.v8_heap_reserved, 60);
+        assert!(budget.try_charge(Pool::V8External, 1).is_err());
+
+        budget.uncharge(Pool::V8HeapReserved, 60);
+        assert_eq!(accountant.memory_charged(), 40);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
     }
 }

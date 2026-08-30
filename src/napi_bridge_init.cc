@@ -24,6 +24,7 @@
 
 #include "node_api.h"
 #include "unofficial_napi.h"
+#include "edge_v8_platform.h"
 #include "internal/napi_v8_env.h"
 
 namespace {
@@ -453,7 +454,6 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   }
   state->bytecode_handles.Reset();
   state->profile_handles.Reset();
-  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->callback_invocations.clear();
   state->next_callback_invocation_id = 1;
   state->cb_registry.clear();
@@ -461,12 +461,14 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->callback_bindings.clear();
   if (state->owner != nullptr) {
     napi_status s = unofficial_napi_release_env(state->owner, nullptr);
+    state->active_callback_ctx.store(nullptr, std::memory_order_release);
     state->owner = nullptr;
     state->env = nullptr;
     g_envs.erase(state);
     delete state;
     return s;
   }
+  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->env = nullptr;
   g_envs.erase(state);
   delete state;
@@ -478,6 +480,13 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
 // ============================================================
 // Initialization
 // ============================================================
+
+// Host-only: sizes the process-wide V8 background worker pool. Not reachable
+// from guest code -- a guest must not get to choose how many threads the host
+// runs. Returns 0 once the platform exists, since the pool is fixed then.
+extern "C" int snapi_bridge_set_v8_worker_thread_count(uint32_t count) {
+  return EdgeV8Platform::SetWorkerThreadCount(static_cast<int>(count)) ? 1 : 0;
+}
 
 extern "C" int snapi_bridge_init() {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
