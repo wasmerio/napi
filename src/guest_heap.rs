@@ -34,13 +34,13 @@
 //!
 //! ## Where the store comes from
 //!
-//! Growing a wasm memory needs the store that owns it. Import handlers pass
-//! their store explicitly. V8 array-buffer allocation arrives from inside C++
-//! frames, so the enclosing N-API bridge scope exposes only its current
-//! `FunctionEnvMut` through a short-lived thread-local token
-//! ([`crate::guest::callback`]); a synchronous foreground allocation can use
-//! that token, while a background allocator thread sees no token and remains
-//! arena-only. Growth is always the ordinary `Memory::grow`.
+//! Growing a wasm memory needs the store that owns it. Ordinary import handlers
+//! pass their store explicitly. V8 array-buffer allocation arrives from inside
+//! C++ frames, so only bridge operations that may synchronously invoke guest
+//! code install an invocation guard and lend their store
+//! ([`crate::guest::callback`]). A foreground allocation inside such a guarded
+//! call can recover that store; a background allocator thread has no lent store
+//! and remains arena-only. Growth is always the ordinary `Memory::grow`.
 //!
 //! Memory handles are store-scoped and WASIX worker threads share one linear
 //! memory while each has its own store, so the heap keeps one handle per store
@@ -67,7 +67,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreMut, AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
+use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -368,8 +368,8 @@ impl GuestHeap {
 
     /// Allocate with explicit access to the store that owns this heap's memory.
     /// Existing arena space remains the fast path; only exhaustion grows the
-    /// memory. This is used directly by import handlers and, through the scoped
-    /// callback token, by synchronous foreground V8 allocator calls.
+    /// memory. This is used directly by import handlers and, through a lent
+    /// store, by synchronous foreground V8 allocator calls in guarded bridges.
     pub(crate) fn alloc_with_store(
         &self,
         store: &mut StoreMut<'_>,
@@ -699,13 +699,8 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    let offset = crate::guest::callback::with_active_callback_env(|active_env| {
-        let Some(active_env) = active_env else {
-            return heap.alloc(length, zero != 0);
-        };
-        let mut store = active_env.as_store_mut();
-        heap.alloc_with_store(&mut store, length, zero != 0)
-    });
+    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
+        .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
@@ -977,6 +972,28 @@ mod tests {
             .alloc_with_store(&mut store.as_store_mut(), past_arena, false)
             .expect("claims with an explicit store");
         assert!(heap.free_offset(grown));
+    }
+
+    /// The foreign V8 allocator has no Rust store argument. It may recover a
+    /// store only while an explicitly guarded bridge lends one; otherwise it
+    /// is limited to the already-prefunded arena.
+    #[test]
+    fn allocator_hook_grows_only_with_a_lent_store() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let ctx = heap.make_alloc_ctx();
+        let past_arena = (PREFUND_BYTES as usize) * 2;
+
+        let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+        assert!(without_guard.is_null());
+
+        let with_guard = store
+            .as_store_mut()
+            .parked(|| napi_host_guest_heap_alloc(ctx, past_arena, 0));
+        assert!(!with_guard.is_null());
+        assert_eq!(napi_host_guest_heap_free(ctx, with_guard, past_arena), 1);
+
+        napi_host_guest_heap_release(ctx);
     }
 
     /// A store that has not registered a handle on this heap's memory cannot

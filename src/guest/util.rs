@@ -77,9 +77,9 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
 /// Allocate `len` bytes of guest memory, passing the import's store directly so
 /// the heap can claim more from the guest when its arena is short.
 ///
-/// V8 allocator hooks use a separate scoped foreground token when they arrive
-/// through C++ frames; imports already have the store and should not publish
-/// and rediscover it through runtime TLS.
+/// V8 allocator hooks can recover a store only inside an explicitly guarded
+/// reentrant bridge; ordinary imports already have the store and should not
+/// publish and rediscover it through runtime TLS.
 pub fn alloc_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
     heap: &crate::guest_heap::GuestHeap,
