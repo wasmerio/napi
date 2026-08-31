@@ -34,24 +34,23 @@
 //!
 //! ## Where the store comes from
 //!
-//! Growing a wasm memory needs the store that owns it, and the allocation that
-//! needs the growth usually arrives with no store in sight: V8 calls the
-//! array-buffer allocator from inside its own C++ frames, several levels below
-//! the N-API import that entered it. The import lends its store across that
-//! boundary — it parks its own borrow around the bridge call
-//! ([`crate::guest::napi`]) — and this file picks it back up with
-//! [`Store::with_current`]. Growth is then the ordinary `Memory::grow`.
+//! Growing a wasm memory needs the store that owns it. Import handlers pass
+//! their store explicitly. V8 array-buffer allocation arrives from inside C++
+//! frames, so the enclosing N-API bridge scope exposes only its current
+//! `FunctionEnvMut` through a short-lived thread-local token
+//! ([`crate::guest::callback`]); a synchronous foreground allocation can use
+//! that token, while a background allocator thread sees no token and remains
+//! arena-only. Growth is always the ordinary `Memory::grow`.
 //!
 //! Memory handles are store-scoped and WASIX worker threads share one linear
 //! memory while each has its own store, so the heap keeps one handle per store
-//! that reaches it and grows through whichever handle belongs to the store
-//! being lent.
+//! that reaches it and grows through whichever handle belongs to the explicitly
+//! supplied store.
 //!
-//! Nothing guarantees a store is available: a V8 background thread, or a
-//! bridge call that does not park, will find none. So the heap keeps an arena
-//! ahead of demand — pre-claimed at instantiation and topped up from import
-//! boundaries ([`GuestHeap::maybe_refill`]), where a store is in hand without
-//! any parking — and an allocation that arrives store-less is served from it.
+//! Nothing guarantees a store is available: a V8 background thread has none.
+//! So the heap keeps an arena ahead of demand — pre-claimed at instantiation
+//! and topped up from import boundaries ([`GuestHeap::maybe_refill`]) — and an
+//! allocation that arrives store-less is served from it.
 //!
 //! ## Concurrency
 //!
@@ -68,7 +67,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
+use wasmer::{AsStoreMut, AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -82,8 +81,8 @@ const WASM_PAGE: u32 = wasmer::WASM_PAGE_SIZE as u32;
 /// Minimum bytes claimed per grow, to amortize grow calls and chunk overhead.
 const MIN_CHUNK_BYTES: u32 = 1024 * 1024;
 
-/// Bytes pre-claimed at heap creation, so an allocation that arrives with no
-/// store lent has somewhere to come from.
+/// Bytes pre-claimed at heap creation, so an allocation that arrives without a
+/// store has somewhere to come from.
 const PREFUND_BYTES: u32 = 16 * 1024 * 1024;
 
 /// When free space drops below this, the next [`GuestHeap::maybe_refill`]
@@ -179,30 +178,6 @@ const MAX_CHUNK_ALLOCS: u32 = 32 * 1024;
 /// fragmentation rather than correctness.
 fn chunk_max_allocs(len: u32) -> u32 {
     (len / BYTES_PER_NODE).clamp(MIN_CHUNK_ALLOCS, MAX_CHUNK_ALLOCS)
-}
-
-/// Grow the guest's linear memory by `delta` through the store lent to this
-/// thread, returning the size it had beforehand and its base address re-read
-/// afterwards.
-///
-/// The store arrives by way of [`Store::with_current`], because the caller
-/// usually has none: V8 invokes the array-buffer allocator from inside its own
-/// frames, below the N-API import that entered it, and the import lends its
-/// store across that boundary by parking. `None` means nothing was lent — a V8
-/// background thread, or a bridge call that does not park — and the caller
-/// falls back to the arena.
-fn grow_lent_memory(memories: &[Memory], delta: Pages) -> Option<(Pages, *mut u8)> {
-    Store::with_current(|store| {
-        // Handles are store-scoped: WASIX worker threads share one linear
-        // memory but each has its own store, and using another store's handle
-        // would panic rather than grow the right memory.
-        let memory = memories
-            .iter()
-            .find(|memory| memory.is_from_store(&*store))?;
-        let prev = memory.grow(&mut *store, delta).ok()?;
-        Some((prev, memory.view(&*store).data_ptr()))
-    })
-    .flatten()
 }
 
 /// Log a heap-integrity complaint, at most a handful of times per process.
@@ -324,7 +299,7 @@ impl GuestHeap {
 
         {
             // Claim a working arena while a store is unambiguously in hand.
-            // Best effort: an allocation that arrives with a store lent can
+            // Best effort: an allocation that arrives with a store can
             // still claim for itself, so an unfunded heap is slower, not
             // broken. One that arrives without one has only this to draw on.
             let mut inner = heap.inner.lock().expect("guest-heap mutex poisoned");
@@ -372,7 +347,7 @@ impl GuestHeap {
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        let offset = match self.alloc_locked(&mut inner, units) {
+        let offset = match Self::try_chunks(&mut inner, units) {
             Some(offset) => offset,
             None => {
                 // Remember what we needed so a store-side refill can size
@@ -391,16 +366,45 @@ impl GuestHeap {
         Some(offset)
     }
 
-    fn alloc_locked(&self, inner: &mut HeapInner, units: u32) -> Option<u32> {
-        // Try existing chunks first.
-        if let Some(offset) = Self::try_chunks(inner, units) {
-            return Some(offset);
+    /// Allocate with explicit access to the store that owns this heap's memory.
+    /// Existing arena space remains the fast path; only exhaustion grows the
+    /// memory. This is used directly by import handlers and, through the scoped
+    /// callback token, by synchronous foreground V8 allocator calls.
+    pub(crate) fn alloc_with_store(
+        &self,
+        store: &mut StoreMut<'_>,
+        len: usize,
+        zero: bool,
+    ) -> Option<u32> {
+        if len > self.max_bytes as usize {
+            return None;
         }
-        // Claim more memory, which needs the store lent to this thread. With
-        // none lent, the arena is all there is.
-        let needed_bytes = units.checked_mul(UNIT)?;
-        self.claim_chunk_locked(inner, needed_bytes)?;
-        Self::try_chunks(inner, units)
+        let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
+
+        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let offset = if let Some(offset) = Self::try_chunks(&mut inner, units) {
+            offset
+        } else {
+            let needed_bytes = units.checked_mul(UNIT)?;
+            if !self.refill_with_store_locked(&mut inner, store, needed_bytes) {
+                inner.pending_want = inner.pending_want.max(needed_bytes);
+                return None;
+            }
+            match Self::try_chunks(&mut inner, units) {
+                Some(offset) => offset,
+                None => {
+                    inner.pending_want = inner.pending_want.max(needed_bytes);
+                    return None;
+                }
+            }
+        };
+        drop(inner);
+
+        if zero {
+            // SAFETY: `offset..offset+len` lies within a chunk this heap owns.
+            unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len) };
+        }
+        Some(offset)
     }
 
     fn try_chunks(inner: &mut HeapInner, units: u32) -> Option<u32> {
@@ -437,43 +441,10 @@ impl GuestHeap {
         None
     }
 
-    /// Claim at least `min_bytes` of fresh linear memory as a new chunk,
-    /// growing through the store lent to this thread. `None` when nothing was
-    /// lent, or when the grow itself failed.
-    fn claim_chunk_locked(&self, inner: &mut HeapInner, min_bytes: u32) -> Option<()> {
-        let want_bytes = chunk_size_for(min_bytes);
-        let delta_pages = want_bytes.div_ceil(WASM_PAGE);
-        let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
-
-        // Growth goes through the store, so an embedder metering it through
-        // its own tunables charges these bytes itself; see
-        // `wasm_is_externally_accounted`. Standing alone, the heap reserves
-        // first, exactly like a guest-issued grow: a denied charge must look
-        // like hitting the memory's maximum.
-        let charge = if self.budget.wasm_is_externally_accounted() {
-            0
-        } else {
-            if self
-                .budget
-                .try_charge(Pool::WasmLinear, delta_bytes)
-                .is_err()
-            {
-                return None;
-            }
-            delta_bytes
-        };
-
-        let Some((prev, base_now)) = grow_lent_memory(&inner.memories, Pages(delta_pages)) else {
-            self.budget.uncharge(Pool::WasmLinear, charge);
-            return None;
-        };
-        self.finish_claim(inner, prev, delta_pages, base_now, charge)
-    }
-
     /// Top the arena up when free space is low or an allocation recently came
     /// up short. Called from import boundaries, where the store is in hand
     /// without any parking, so the arena stays ahead of allocations that
-    /// arrive with no store lent.
+    /// arrive without a store.
     pub(crate) fn maybe_refill(&self, store: &mut StoreMut<'_>) {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
         if inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
@@ -501,7 +472,7 @@ impl GuestHeap {
         };
         let want_bytes = chunk_size_for(min_bytes);
         let delta_pages = want_bytes.div_ceil(WASM_PAGE);
-        // Same rule as the lent-store lane above: only charge when no embedder
+        // Only charge here when no embedder
         // is already accounting for growth through its tunables.
         let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
         let charge = if self.budget.wasm_is_externally_accounted() {
@@ -728,7 +699,14 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    match heap.alloc(length, zero != 0) {
+    let offset = crate::guest::callback::with_active_callback_env(|active_env| {
+        let Some(active_env) = active_env else {
+            return heap.alloc(length, zero != 0);
+        };
+        let mut store = active_env.as_store_mut();
+        heap.alloc_with_store(&mut store, length, zero != 0)
+    });
+    match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
     }
@@ -960,17 +938,14 @@ mod tests {
         let charged_after_prefund = budget.memory_charged();
         assert!(charged_after_prefund <= 8 * 1024 * 1024);
 
-        let a = store
-            .as_store_mut()
-            .parked(|| heap.alloc(1024, false))
+        let a = heap
+            .alloc_with_store(&mut store.as_store_mut(), 1024, false)
             .expect("alloc under budget");
         assert!(budget.memory_charged() >= 1024 * 1024); // at least one chunk claimed
 
         // A request beyond the budget is denied without corrupting state.
         assert!(
-            store
-                .as_store_mut()
-                .parked(|| heap.alloc(64 * 1024 * 1024, false))
+            heap.alloc_with_store(&mut store.as_store_mut(), 64 * 1024 * 1024, false)
                 .is_none()
         );
         assert!(heap.free_offset(a));
@@ -979,34 +954,33 @@ mod tests {
         assert_eq!(budget.memory_charged(), 0);
     }
 
-    /// The heap grows through the store lent to the thread. Without one it is
+    /// The heap grows through an explicitly supplied store. Without one it is
     /// limited to the arena it already claimed — which is the case the prefund
     /// and [`GuestHeap::maybe_refill`] exist to cover.
     #[test]
-    fn growth_needs_a_lent_store_and_the_arena_covers_the_rest() {
+    fn growth_needs_an_explicit_store_and_the_arena_covers_the_rest() {
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
 
-        // Served from the prefunded arena, with no store lent at all: this is
+        // Served from the prefunded arena, with no store at all: this is
         // the V8-background-thread case.
         let from_arena = heap.alloc(1024, false).expect("served from the arena");
         assert!(heap.free_offset(from_arena));
 
-        // Past what the arena holds, and with no store lent, the allocation
+        // Past what the arena holds, and with no store, the allocation
         // fails rather than growing the guest's memory behind its back.
         let past_arena = (PREFUND_BYTES as usize) * 2;
         assert!(heap.alloc(past_arena, false).is_none());
 
-        // Lend one, and the same request claims the pages it needs.
-        let grown = store
-            .as_store_mut()
-            .parked(|| heap.alloc(past_arena, false))
-            .expect("claims with a store lent");
+        // Supply one, and the same request claims the pages it needs.
+        let grown = heap
+            .alloc_with_store(&mut store.as_store_mut(), past_arena, false)
+            .expect("claims with an explicit store");
         assert!(heap.free_offset(grown));
     }
 
     /// A store that has not registered a handle on this heap's memory cannot
-    /// grow it, however current it is.
+    /// grow it even when supplied explicitly.
     #[test]
     fn an_unregistered_store_does_not_grow_the_memory() {
         let mut store = Store::default();
@@ -1015,9 +989,7 @@ mod tests {
         let mut stranger = Store::default();
         let past_arena = (PREFUND_BYTES as usize) * 2;
         assert!(
-            stranger
-                .as_store_mut()
-                .parked(|| heap.alloc(past_arena, false))
+            heap.alloc_with_store(&mut stranger.as_store_mut(), past_arena, false)
                 .is_none(),
             "another store's handle must not be used to grow this memory"
         );

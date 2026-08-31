@@ -74,20 +74,20 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     memory.view(&store).data_size()
 }
 
-/// Allocate `len` bytes of guest memory, lending the store for the duration so
+/// Allocate `len` bytes of guest memory, passing the import's store directly so
 /// the heap can claim more from the guest when its arena is short.
 ///
-/// The heap grows through whichever store is lent to the thread (see
-/// [`crate::guest_heap`]), which is how the V8 allocator hooks reach one from
-/// inside V8's frames. Import handlers hold the store instead of lending it,
-/// so they park it here for the same effect.
+/// V8 allocator hooks use a separate scoped foreground token when they arrive
+/// through C++ frames; imports already have the store and should not publish
+/// and rediscover it through runtime TLS.
 pub fn alloc_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
     heap: &crate::guest_heap::GuestHeap,
     len: usize,
     zero: bool,
 ) -> Option<u32> {
-    env.as_store_mut().parked(|| heap.alloc(len, zero))
+    let mut store = env.as_store_mut();
+    heap.alloc_with_store(&mut store, len, zero)
 }
 
 pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {

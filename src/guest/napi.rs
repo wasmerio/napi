@@ -1751,20 +1751,13 @@ fn guest_napi_get_boolean(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, 
     s
 }
 
-fn guest_napi_get_global(
-    mut env: FunctionEnvMut<NapiEnv>,
-    e: i32,
-    rp: i32,
-) -> Result<i32, WasiError> {
+fn guest_napi_get_global(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let snapi = snapi_env(&env, e);
-    let s = with_cb_context(&mut env, e, || unsafe {
-        snapi_bridge_get_global(snapi, &mut out)
-    })?;
+    let s = unsafe { snapi_bridge_get_global(snapi_env(&env, e), &mut out) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
-    Ok(s)
+    s
 }
 
 // --- Value creation ---
