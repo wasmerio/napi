@@ -4,7 +4,7 @@
 
 // --- Init ---
 
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 use wasmer_wasix::WasiError;
@@ -2032,7 +2032,7 @@ fn guest_napi_get_value_string_utf8(
     if hbs as u64 > guest_data_size(&mut env) {
         return 1;
     }
-    let mut hb = vec![0i8; hbs];
+    let mut hb = vec![0 as c_char; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
         snapi_bridge_get_value_string_utf8(
@@ -2073,7 +2073,7 @@ fn guest_napi_get_value_string_latin1(
     if hbs as u64 > guest_data_size(&mut env) {
         return 1;
     }
-    let mut hb = vec![0i8; hbs];
+    let mut hb = vec![0 as c_char; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
         snapi_bridge_get_value_string_latin1(
