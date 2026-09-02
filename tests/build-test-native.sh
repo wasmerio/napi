@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREBUILT_V8_VERSION="11.9.7"
+PREBUILT_V8_VERSION="11.9.8"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <test-name>" >&2
@@ -83,6 +83,9 @@ resolve_cached_prebuilt_v8() {
       ;;
     linux/x86_64)
       platform_name="linux-amd64"
+      ;;
+    linux/aarch64)
+      platform_name="linux-arm64"
       ;;
     *)
       return 1
