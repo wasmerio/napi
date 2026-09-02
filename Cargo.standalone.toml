@@ -1,6 +1,6 @@
 [package]
 name = "wasmer-napi"
-version = "0.703.0"
+version = "0.704.0"
 description = "NAPI library for Wasmer WebAssembly runtime"
 edition = "2024"
 license = "MIT"

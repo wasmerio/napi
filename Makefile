@@ -19,7 +19,7 @@ NAPI_NATIVE_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/native)
 NAPI_WASIX_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/wasm32-wasix/release)
 NAPI_V8_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
 NAPI_QUICKJS_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
-NAPI_V8_PREBUILT_VERSION ?= 11.9.7
+NAPI_V8_PREBUILT_VERSION ?= 11.9.8
 NAPI_V8_PLATFORM :=
 NAPI_V8_DIST_ROOT ?=
 NAPI_V8_CARGO_DIST_ROOT ?=
@@ -37,6 +37,8 @@ endif
 else ifeq ($(UNAME_S),Linux)
 ifeq ($(UNAME_M),x86_64)
 NAPI_V8_PLATFORM := linux-amd64
+else ifeq ($(UNAME_M),aarch64)
+NAPI_V8_PLATFORM := linux-arm64
 endif
 endif
 ifeq ($(NAPI_V8_DIST_ROOT),)
