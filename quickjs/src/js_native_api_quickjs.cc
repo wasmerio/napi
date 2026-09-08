@@ -2880,6 +2880,22 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
+    // QuickJS frees reference cycles in two passes, so a finalizer can still
+    // see other members of its cycle as zombies (hence JS_IsLiveObject). A weak
+    // slot pointing at one has not been cleared yet -- reset_weak_ref only runs
+    // in that object's own free_object -- so dup_inner() here would resurrect
+    // memory the collector is about to release, and the scope that owns the
+    // resulting napi_value would later free it again. Report it as gone.
+    // Objects only: JS_IsLiveObject reports every non-object (strings, symbols,
+    // bigints) as "not live", which would make every reference to one read back
+    // as empty.
+    JSValueConst inner = slot->get_inner();
+    if (JS_IsObject(inner) && slot->context() != nullptr &&
+        !JS_IsLiveObject(JS_GetRuntime(slot->context()), inner))
+    {
+      *result = nullptr;
+      return napi_ok;
+    }
     *result = env->wrap_value_in_current_scope(slot->context(), slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
