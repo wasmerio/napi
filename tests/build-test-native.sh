@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREBUILT_V8_VERSION="11.9.8"
+PREBUILT_V8_VERSION="11.9.9"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <test-name>" >&2
