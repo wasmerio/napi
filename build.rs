@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PREBUILT_V8_VERSION: &str = "11.9.8";
+const PREBUILT_V8_VERSION: &str = "11.9.9";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V8Method {
@@ -219,6 +219,9 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=pthread");
         println!("cargo:rustc-link-lib=dylib=rt");
+        if target_os == "linux" && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+            println!("cargo:rustc-link-lib=dylib=atomic");
+        }
     }
 }
 
