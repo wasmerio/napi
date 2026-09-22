@@ -28,9 +28,6 @@ struct napi_external_backing_store_hint__
   napi_external_backing_store_hint__ &operator=(napi_external_backing_store_hint__ &&other) = delete;
 
   void invoke_finalizer();
-  void begin_detach();
-  void end_detach();
-  bool is_detaching() const;
   napi_env env() const;
   JSRuntime *runtime() const;
   void *external_data() const;
@@ -49,8 +46,7 @@ private:
   void *finalize_hint_ = nullptr;
   bool finalize_invoked_ = false;
 
-  // Detach/finalizer coordination.
-  bool detaching_ = false;
+  // Optional JavaScript target for wrapped-object finalizers.
   JSValue weak_target_ = JS_UNDEFINED;
 };
 

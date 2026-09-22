@@ -23,7 +23,6 @@ napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
   finalize_cb_ = nullptr;
   finalize_hint_ = nullptr;
   finalize_invoked_ = false;
-  detaching_ = false;
   weak_target_ = JS_UNDEFINED;
 }
 
@@ -66,21 +65,6 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   finalize_invoked_ = true;
   if (finalize_cb_ != nullptr)
     finalize_cb_(env_, external_data_, finalize_hint_);
-}
-
-void napi_external_backing_store_hint__::begin_detach()
-{
-  detaching_ = true;
-}
-
-void napi_external_backing_store_hint__::end_detach()
-{
-  detaching_ = false;
-}
-
-bool napi_external_backing_store_hint__::is_detaching() const
-{
-  return detaching_;
 }
 
 napi_env napi_external_backing_store_hint__::env() const
