@@ -108,16 +108,19 @@ const char *napi_external__::finalizer_property()
   return k_finalizer_property;
 }
 
-void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr)
+void *napi_external__::realloc_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size)
 {
   (void)ptr;
+  // The embedder owns this memory and its allocator is unknown. Reject a
+  // transfer to a different nonzero size without releasing the backing store.
+  if (size != 0)
+    return nullptr;
   auto *hint = reinterpret_cast<napi_external_backing_store_hint__ *>(opaque);
   if (hint == nullptr)
-    return;
+    return nullptr;
   hint->invoke_finalizer();
-  if (hint->is_detaching())
-    return;
   napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
+  return nullptr;
 }
 
 void napi_external__::finalizer(JSRuntime *rt, JSValue value)
