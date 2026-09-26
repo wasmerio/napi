@@ -738,6 +738,7 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
   }
   if (state == JS_PROMISE_REJECTED)
   {
+    JS_PromiseMarkAsHandled(ctx_, promise);
     JSValue reason = JS_PromiseResult(ctx_, promise);
     JS_FreeValue(ctx_, promise);
     env_->set_last_exception(reason);
