@@ -447,6 +447,9 @@ export function wasmer_napi_validate_script(source, filename) {
   });
 }
 export function wasmer_napi_compile_module(scope, source, filename) {
+  // Module bodies execute through Function below, which rejects hashbangs.
+  // Keep offsets intact for Acorn's replacements and diagnostics.
+  if (source.startsWith('#!')) source = '//' + source.slice(2);
   const program = wasmerNapiParse(source, {
     ecmaVersion: 'latest',
     sourceType: 'module',
@@ -568,7 +571,8 @@ export function wasmer_napi_compile_module(scope, source, filename) {
     if (node == null || typeof node !== 'object') continue;
     const isFunction = /Function(?:Declaration|Expression)$/.test(node.type) || node.type === 'ArrowFunctionExpression';
     const childDepth = functionDepth + (isFunction ? 1 : 0);
-    if (node.type === 'AwaitExpression' && functionDepth === 0) hasTopLevelAwait = true;
+    if (functionDepth === 0 && (node.type === 'AwaitExpression' ||
+        (node.type === 'ForOfStatement' && node.await))) hasTopLevelAwait = true;
     if (node.type === 'ImportExpression') {
       const options = node.options == null ? '' : `, ${text(node.options)}`;
       syntaxReplacements.push({
@@ -628,19 +632,51 @@ export function wasmer_napi_compile_module(scope, source, filename) {
   return { requests, exportNames, hasTopLevelAwait, execute };
 }
 export function wasmer_napi_create_module_evaluation() {
-  let resolve;
-  let reject;
-  const promise = new wasmerNapiHostPromise((resolveValue, rejectValue) => {
-    resolve = resolveValue;
-    reject = rejectValue;
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new wasmerNapiHostPromise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
   });
-  return { promise, resolve, reject };
+  // Unlike arbitrary host promises, this promise is owned by the provider.
+  // Record settlement when it happens, not on the next observer microtask:
+  // a require(ESM) during another module's body needs the current status.
+  const details = { state: 0, result: undefined, hasResult: false };
+  wasmerNapiPromiseDetails.set(promise, details);
+  return {
+    promise,
+    resolve() {
+      details.state = 1;
+      details.result = undefined;
+      details.hasResult = true;
+      resolvePromise(undefined);
+    },
+    reject(error) {
+      details.state = 2;
+      details.result = error;
+      details.hasResult = true;
+      rejectPromise(error);
+    },
+  };
 }
 export function wasmer_napi_finish_module_evaluation(
   evaluation, dependencies, execute, imports, namespace, importMeta) {
   wasmerNapiHostPromise.all(dependencies)
     .then(() => execute(imports, namespace, importMeta))
     .then(() => evaluation.resolve(undefined), evaluation.reject);
+}
+export function wasmer_napi_create_module_facade(namespace) {
+  const facade = Object.create(null);
+  for (const name of Object.keys(namespace)) {
+    if (name === '__esModule') continue;
+    Object.defineProperty(facade, name, { enumerable: true, get: () => namespace[name] });
+  }
+  Object.defineProperty(facade, '__esModule', { enumerable: true, value: true });
+  Object.defineProperty(facade, Symbol.toStringTag, { value: 'Module' });
+  return Object.preventExtensions(facade);
+}
+export function wasmer_napi_resolve_module_evaluation(evaluation) {
+  evaluation.resolve();
 }
 export function wasmer_napi_reject_module_evaluation(evaluation, error) {
   evaluation.reject(error);
@@ -946,6 +982,9 @@ extern "C" {
         namespace: &Object,
         import_meta: &Object,
     );
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_create_module_facade(namespace: &Object) -> Result<Object, JsValue>;
+    fn wasmer_napi_resolve_module_evaluation(evaluation: &Object);
     fn wasmer_napi_reject_module_evaluation(evaluation: &Object, error: &JsValue);
     #[wasm_bindgen(catch)]
     fn wasmer_napi_typed_array(
@@ -4628,6 +4667,32 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_link(
         .linked_handles = linked;
     NAPI_OK
 }
+fn collect_module_graph(
+    state: &HostJsEnv,
+    handle_id: u32,
+    graph: &mut Vec<u32>,
+) -> Result<(), i32> {
+    if graph.contains(&handle_id) {
+        return Ok(());
+    }
+    if state.synthetic_modules.contains_key(&handle_id) {
+        graph.push(handle_id);
+        return Ok(());
+    }
+    let module = state
+        .source_text_modules
+        .get(&handle_id)
+        .ok_or(NAPI_INVALID_ARG)?;
+    if module.linked_handles.len() != module.requests.length() as usize {
+        return Err(NAPI_INVALID_ARG);
+    }
+    graph.push(handle_id);
+    for linked_handle in &module.linked_handles {
+        collect_module_graph(state, *linked_handle, graph)?;
+    }
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_instantiate(
     env: SnapiEnv,
@@ -4636,20 +4701,22 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_instantiate(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-        if module.status < 2 {
-            module.status = 2;
+    // Node's loader instantiates only the root and expects the entire graph
+    // to advance together, including dependencies later reused by require().
+    let mut graph = Vec::new();
+    if let Err(error) = collect_module_graph(state, handle_id, &mut graph) {
+        return error;
+    }
+    for handle in graph {
+        if let Some(module) = state.synthetic_modules.get_mut(&handle) {
+            if module.status < 2 {
+                module.status = 2;
+            }
+        } else if let Some(module) = state.source_text_modules.get_mut(&handle) {
+            if module.status < 2 {
+                module.status = 2;
+            }
         }
-        return NAPI_OK;
-    }
-    let Some(module) = state.source_text_modules.get_mut(&handle_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    if module.linked_handles.len() != module.requests.length() as usize {
-        return NAPI_INVALID_ARG;
-    }
-    if module.status < 2 {
-        module.status = 2;
     }
     NAPI_OK
 }
@@ -4680,50 +4747,51 @@ fn module_evaluation(state: &HostJsEnv, handle_id: u32) -> Option<JsValue> {
         })
 }
 
+fn set_module_status(state: &mut HostJsEnv, handle_id: u32, status: i32, error: Option<JsValue>) {
+    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
+        module.status = status;
+        module.error = error;
+    } else if let Some(module) = state.source_text_modules.get_mut(&handle_id) {
+        module.status = status;
+        module.error = error;
+    }
+}
+
 fn start_module_evaluation(state: &mut HostJsEnv, handle_id: u32) -> Result<JsValue, JsValue> {
     if let Some(evaluation) = module_evaluation(state, handle_id) {
         return Ok(evaluation);
     }
-
-    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-        module.status = 3;
-        let evaluate = module.evaluate.clone();
-        let wrapper = module.wrapper.clone();
-        match evaluate.apply(&wrapper, &Array::new()) {
-            Ok(_) => {
-                let promise: JsValue = Promise::resolve(&JsValue::UNDEFINED).into();
-                let module = state
-                    .synthetic_modules
-                    .get_mut(&handle_id)
-                    .expect("synthetic module disappeared during evaluation");
-                module.status = 4;
-                module.evaluation = Some(promise.clone());
-                return Ok(promise);
-            }
-            Err(error) => {
-                let module = state
-                    .synthetic_modules
-                    .get_mut(&handle_id)
-                    .expect("synthetic module disappeared during evaluation");
-                module.status = 5;
-                module.error = Some(error.clone());
-                return Err(error);
-            }
-        }
-    }
-
+    let has_async_graph = module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+        .ok_or_else(|| JsValue::from(TypeError::new("Unknown module handle")))?;
     let evaluation = wasmer_napi_create_module_evaluation();
     let promise = Reflect::get(&evaluation, &JsValue::from_str("promise"))?;
+    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
+        module.evaluation = Some(promise.clone());
+    } else if let Some(module) = state.source_text_modules.get_mut(&handle_id) {
+        module.evaluation = Some(promise.clone());
+    }
+
+    // Evaluate() returns a promise, but a synchronous graph must finish before
+    // it returns. Deferring its execution makes an ordinary require(ESM) of
+    // an already imported dependency look like a forbidden require cycle.
+    if !has_async_graph {
+        match evaluate_module_sync(state, handle_id, &mut Vec::new()) {
+            Ok(_) => wasmer_napi_resolve_module_evaluation(&evaluation),
+            Err(error) => wasmer_napi_reject_module_evaluation(&evaluation, &error),
+        }
+        return Ok(promise);
+    }
 
     let (linked_handles, execute, namespace, url) = {
-        let Some(module) = state.source_text_modules.get_mut(&handle_id) else {
-            return Err(TypeError::new("Unknown module handle").into());
-        };
+        let module = state.source_text_modules.get_mut(&handle_id).unwrap();
+        if let Some(error) = module.error.clone() {
+            wasmer_napi_reject_module_evaluation(&evaluation, &error);
+            return Ok(promise);
+        }
         if module.linked_handles.len() != module.requests.length() as usize {
             return Err(TypeError::new("Module must be linked before evaluation").into());
         }
         module.status = 3;
-        module.evaluation = Some(promise.clone());
         (
             module.linked_handles.clone(),
             module.execute.clone(),
@@ -4768,18 +4836,24 @@ fn start_module_evaluation(state: &mut HostJsEnv, handle_id: u32) -> Result<JsVa
 }
 
 fn refresh_module_status(state: &mut HostJsEnv, handle_id: u32) -> Result<i32, i32> {
+    let current = state
+        .synthetic_modules
+        .get(&handle_id)
+        .map(|module| module.status)
+        .or_else(|| {
+            state
+                .source_text_modules
+                .get(&handle_id)
+                .map(|module| module.status)
+        })
+        .ok_or(NAPI_INVALID_ARG)?;
+    // Synchronous execution owns these terminal states. Promise inspection
+    // must not move a completed module backwards to "evaluating".
+    if current != 3 {
+        return Ok(current);
+    }
     let Some(evaluation) = module_evaluation(state, handle_id) else {
-        return state
-            .synthetic_modules
-            .get(&handle_id)
-            .map(|module| module.status)
-            .or_else(|| {
-                state
-                    .source_text_modules
-                    .get(&handle_id)
-                    .map(|module| module.status)
-            })
-            .ok_or(NAPI_INVALID_ARG);
+        return Ok(current);
     };
     let details = wasmer_napi_get_promise_details(&evaluation);
     let promise_state = details.get(0).as_f64().unwrap_or(0.0) as i32;
@@ -4814,66 +4888,101 @@ fn evaluate_module_sync(
         return module_namespace(state, handle_id)
             .ok_or_else(|| TypeError::new("Unknown module handle").into());
     }
+    let status = refresh_module_status(state, handle_id)
+        .map_err(|_| JsValue::from(TypeError::new("Unknown module handle")))?;
+    if status == 5 {
+        return Err(state
+            .synthetic_modules
+            .get(&handle_id)
+            .and_then(|module| module.error.clone())
+            .or_else(|| {
+                state
+                    .source_text_modules
+                    .get(&handle_id)
+                    .and_then(|module| module.error.clone())
+            })
+            .unwrap_or_else(|| TypeError::new("Module evaluation failed").into()));
+    }
+    if status == 3 {
+        let error = TypeError::new("Cannot require() an ES module while it is evaluating");
+        Reflect::set(
+            &error,
+            &JsValue::from_str("code"),
+            &JsValue::from_str("ERR_REQUIRE_CYCLE_MODULE"),
+        )?;
+        return Err(error.into());
+    }
+    // Check the entire graph before executing any of it: a rejected require
+    // must leave the graph available for a later asynchronous import.
+    if module_graph_has_top_level_await(state, handle_id, &mut Vec::new()).unwrap_or(false) {
+        let error =
+            TypeError::new("Cannot synchronously evaluate a module graph with top-level await");
+        Reflect::set(
+            &error,
+            &JsValue::from_str("code"),
+            &JsValue::from_str("ERR_REQUIRE_ASYNC_MODULE"),
+        )?;
+        return Err(error.into());
+    }
+    if status == 4 {
+        return Ok(module_namespace(state, handle_id).unwrap());
+    }
     if let Some(module) = state.synthetic_modules.get(&handle_id) {
-        if module.status == 4 {
-            return Ok(module.namespace.clone());
-        }
         let evaluate = module.evaluate.clone();
         let wrapper = module.wrapper.clone();
         let namespace = module.namespace.clone();
-        state.synthetic_modules.get_mut(&handle_id).unwrap().status = 3;
-        evaluate.apply(&wrapper, &Array::new())?;
-        state.synthetic_modules.get_mut(&handle_id).unwrap().status = 4;
-        return Ok(namespace);
+        set_module_status(state, handle_id, 3, None);
+        return match evaluate.apply(&wrapper, &Array::new()) {
+            Ok(_) => {
+                set_module_status(state, handle_id, 4, None);
+                Ok(namespace)
+            }
+            Err(error) => {
+                set_module_status(state, handle_id, 5, Some(error.clone()));
+                Err(error)
+            }
+        };
     }
 
-    let (linked_handles, execute, namespace, url, has_top_level_await) = {
-        let Some(module) = state.source_text_modules.get(&handle_id) else {
-            return Err(TypeError::new("Unknown module handle").into());
-        };
+    let (linked_handles, execute, namespace, url) = {
+        let module = state.source_text_modules.get(&handle_id).unwrap();
+        if module.linked_handles.len() != module.requests.length() as usize {
+            return Err(TypeError::new("Module must be linked before evaluation").into());
+        }
         (
             module.linked_handles.clone(),
             module.execute.clone(),
             module.namespace.clone(),
             module.url.clone(),
-            module.has_top_level_await,
         )
     };
-    if has_top_level_await {
-        return Err(TypeError::new(
-            "Cannot synchronously evaluate a module graph with top-level await",
-        )
-        .into());
-    }
-    state
-        .source_text_modules
-        .get_mut(&handle_id)
-        .unwrap()
-        .status = 3;
+    set_module_status(state, handle_id, 3, None);
     visiting.push(handle_id);
-    let imports = Array::new();
-    for (index, linked_handle) in linked_handles.into_iter().enumerate() {
-        let dependency_namespace = evaluate_module_sync(state, linked_handle, visiting)?;
-        imports.set(index as u32, dependency_namespace.into());
-    }
+    let result: Result<Object, JsValue> = (|| {
+        let imports = Array::new();
+        for (index, linked_handle) in linked_handles.into_iter().enumerate() {
+            let dependency_namespace = evaluate_module_sync(state, linked_handle, visiting)?;
+            imports.set(index as u32, dependency_namespace.into());
+        }
+        let import_meta = Object::new();
+        Reflect::set(
+            &import_meta,
+            &JsValue::from_str("url"),
+            &JsValue::from_str(&url),
+        )?;
+        let args = Array::new();
+        args.push(&imports);
+        args.push(&namespace);
+        args.push(&import_meta);
+        execute.apply(&JsValue::UNDEFINED, &args)?;
+        Ok(namespace)
+    })();
     visiting.pop();
-    let import_meta = Object::new();
-    Reflect::set(
-        &import_meta,
-        &JsValue::from_str("url"),
-        &JsValue::from_str(&url),
-    )?;
-    let args = Array::new();
-    args.push(&imports);
-    args.push(&namespace);
-    args.push(&import_meta);
-    execute.apply(&JsValue::UNDEFINED, &args)?;
-    state
-        .source_text_modules
-        .get_mut(&handle_id)
-        .unwrap()
-        .status = 4;
-    Ok(namespace)
+    match &result {
+        Ok(_) => set_module_status(state, handle_id, 4, None),
+        Err(error) => set_module_status(state, handle_id, 5, Some(error.clone())),
+    }
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -4917,13 +5026,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate_sync(
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-                module.status = 5;
-                module.error = Some(error.clone());
-            } else if let Some(module) = state.source_text_modules.get_mut(&handle_id) {
-                module.status = 5;
-                module.error = Some(error.clone());
-            }
             state.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
@@ -5127,12 +5229,20 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_required_mod
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(namespace) = module_namespace(state, handle_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    let id = state.insert(namespace.into());
-    unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
+    match evaluate_module_sync(state, handle_id, &mut Vec::new())
+        .and_then(|namespace| wasmer_napi_create_module_facade(&namespace))
+    {
+        Ok(facade) => {
+            let id = state.insert(facade.into());
+            unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_instanceof(
     env: SnapiEnv,
