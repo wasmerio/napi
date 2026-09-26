@@ -2161,13 +2161,13 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
             env_handle,
             handle as u32,
             &mut result_id,
         )
-    };
+    });
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
