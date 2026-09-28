@@ -25,9 +25,11 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
   g_last_released_guest_heap_ctx = ctx;
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 // Provider-internal accounting hook, intentionally absent from guest imports.
 extern "C" size_t unofficial_napi_message_retained_bytes(
     unofficial_napi_message message);
+#endif
 
 class Test21General : public FixtureTestBase {};
 
@@ -301,7 +303,9 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   unofficial_napi_message message = nullptr;
   ASSERT_EQ(unofficial_napi_message_create(s.env, source, &message), napi_ok);
   ASSERT_NE(message, nullptr);
+#if defined(NAPI_TEST_ENGINE_V8)
   EXPECT_GT(unofficial_napi_message_retained_bytes(message), 0u);
+#endif
 
   // A worker receives the payload in its own isolate, not the sender's.
   EnvScope receiver(runtime_.get());
@@ -320,6 +324,7 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   unofficial_napi_message_drop(dropped);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test21General, MessageSerializerRejectsOversizedPayload) {
   EnvScope s(runtime_.get());
   std::string bytes(5 * 1024 * 1024, 'x');
@@ -341,6 +346,7 @@ TEST_F(Test21General, StructuredCloneRejectsOversizedPayload) {
             napi_pending_exception);
   EXPECT_EQ(cloned, nullptr);
 }
+#endif
 
 TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {
   EnvScope s(runtime_.get());
