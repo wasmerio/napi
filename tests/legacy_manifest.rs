@@ -266,7 +266,7 @@ fn released_edgejs_atom_runs_esm_when_provided() {
     )
     .unwrap();
     assert_eq!(exit, 0, "{stderr}");
-    assert!(stdout.contains("LEGACY_ESM_b"), "{stdout}\n{stderr}");
+    assert!(stdout.contains("LEGACY_ESM_7"), "{stdout}\n{stderr}");
 }
 
 #[cfg(feature = "cli")]
