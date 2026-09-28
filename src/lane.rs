@@ -411,7 +411,7 @@ mod tests {
     fn stop_wins_a_pending_first_call() {
         let (scheduled_tx, scheduled_rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
         let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
-            scheduled_tx.send(work)?;
+            scheduled_tx.send(work).map_err(|_| anyhow::anyhow!("worker receiver closed"))?;
             Ok(())
         });
         let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);

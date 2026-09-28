@@ -83,8 +83,19 @@ fn main() {
         v8.library_path.display()
     );
 
-    let v8_defines = read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
-        .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
+    let mut v8_defines =
+        read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
+            .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
+    if let Some(sandbox_enabled) = read_sandbox_build_flag(&v8.library_path) {
+        let embedder_enabled = v8_defines
+            .split(&[';', ',', ' '][..])
+            .any(|define| matches!(define, "V8_ENABLE_SANDBOX" | "V8_ENABLE_SANDBOX=1"));
+        if sandbox_enabled && !embedder_enabled {
+            v8_defines.push_str(",V8_ENABLE_SANDBOX");
+        } else if !sandbox_enabled && embedder_enabled {
+            panic!("V8_ENABLE_SANDBOX is set for a sandbox-disabled V8 archive");
+        }
+    }
 
     let mut build = cc::Build::new();
     build
@@ -222,6 +233,21 @@ fn main() {
         if target_os == "linux" && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
             println!("cargo:rustc-link-lib=dylib=atomic");
         }
+    }
+}
+
+fn read_sandbox_build_flag(library_path: &Path) -> Option<bool> {
+    let config_path = library_path.parent()?.parent()?.join("build-config.txt");
+    println!("cargo:rerun-if-changed={}", config_path.display());
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => panic!("failed to read {}: {err}", config_path.display()),
+    };
+    match config.lines().find_map(|line| line.strip_prefix("v8_enable_sandbox=")) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => panic!("{} lacks a valid v8_enable_sandbox flag", config_path.display()),
     }
 }
 
