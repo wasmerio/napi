@@ -15,7 +15,7 @@
 // quiesced. A null current lane preserves the standalone provider behavior.
 extern "C" void* snapi_v8_lane_new(void* scope_context,
                                      void* (*enter_scope)(void*),
-                                     void (*leave_scope)(void*, void*));
+                                     bool (*leave_scope)(void*, void*));
 extern "C" void snapi_v8_lane_run(void* handle);
 extern "C" void snapi_v8_lane_stop(void* handle);
 extern "C" void snapi_v8_lane_delete(void* handle);

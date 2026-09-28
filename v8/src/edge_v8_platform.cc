@@ -26,7 +26,7 @@ class BackgroundLane {
   static constexpr size_t kMaxQueuedTasks = 256;
 
   BackgroundLane(void* scope_context, void* (*enter_scope)(void*),
-                 void (*leave_scope)(void*, void*))
+                 bool (*leave_scope)(void*, void*))
       : scope_context_(scope_context), enter_scope_(enter_scope),
         leave_scope_(leave_scope) {}
 
@@ -84,7 +84,12 @@ class BackgroundLane {
       // pkeys default to access-disabled on an already-running thread.
       v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
       task->Run();
-      if (leave_scope_ != nullptr) leave_scope_(scope_context_, scope);
+      if (leave_scope_ != nullptr && !leave_scope_(scope_context_, scope)) {
+        lock.lock();
+        overloaded_ = true;
+        stopped_ = true;
+        break;
+      }
       lock.lock();
     }
     queue_.clear();
@@ -121,7 +126,7 @@ class BackgroundLane {
   bool overloaded_ = false;
   void* scope_context_ = nullptr;
   void* (*enter_scope_)(void*) = nullptr;
-  void (*leave_scope_)(void*, void*) = nullptr;
+  bool (*leave_scope_)(void*, void*) = nullptr;
 };
 
 thread_local BackgroundLane* current_background_lane = nullptr;
@@ -192,7 +197,7 @@ void CleanupForegroundTaskRecord(napi_env /*env*/, void* data);
 
 extern "C" void* snapi_v8_lane_new(void* scope_context,
                                      void* (*enter_scope)(void*),
-                                     void (*leave_scope)(void*, void*)) {
+                                     bool (*leave_scope)(void*, void*)) {
   return new (std::nothrow)
       BackgroundLane(scope_context, enter_scope, leave_scope);
 }

@@ -29,7 +29,7 @@ unsafe extern "C" {
     fn snapi_v8_lane_new(
         scope_context: *mut c_void,
         enter_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-        leave_scope: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        leave_scope: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     ) -> *mut c_void;
     fn snapi_v8_lane_run(handle: *mut c_void);
     fn snapi_v8_lane_stop(handle: *mut c_void);
@@ -92,9 +92,12 @@ impl BackgroundLane {
         unsafe { snapi_v8_lane_overloaded(self.handle.as_ptr()) }
     }
 
-    fn enter(&self) -> LaneScope {
+    fn enter(self: &Arc<Self>) -> LaneScope {
         let previous = unsafe { snapi_v8_lane_swap_current(self.handle.as_ptr()) };
-        LaneScope { previous }
+        LaneScope {
+            previous,
+            _lane: Arc::clone(self),
+        }
     }
 }
 
@@ -119,17 +122,19 @@ unsafe extern "C" fn enter_task_scope(context: *mut c_void) -> *mut c_void {
     }
 }
 
-unsafe extern "C" fn leave_task_scope(_context: *mut c_void, scope: *mut c_void) {
+unsafe extern "C" fn leave_task_scope(_context: *mut c_void, scope: *mut c_void) -> bool {
     if scope.is_null() {
-        return;
+        return false;
     }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drop(unsafe { Box::from_raw(scope.cast::<Box<dyn Send>>()) });
-    }));
+    }))
+    .is_ok()
 }
 
 pub(crate) struct LaneScope {
     previous: *mut c_void,
+    _lane: Arc<BackgroundLane>,
 }
 
 impl Drop for LaneScope {
@@ -224,7 +229,8 @@ impl LazyBackgroundLane {
                 let _ = ready_tx.send(());
                 worker_lane.run();
                 if worker_lane.overloaded() {
-                    on_overload();
+                    let _ =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_overload()));
                 }
                 worker_lane.release_reservation();
             }))?;
