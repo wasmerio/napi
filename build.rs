@@ -261,10 +261,10 @@ fn standalone_legacy_wait() -> bool {
             in_napi_metadata = line == "[package.metadata.napi]";
         } else if in_napi_metadata {
             let declaration = line.split('#').next().unwrap_or("").trim();
-            if let Some((key, value)) = declaration.split_once('=') {
-                if key.trim() == "standalone_legacy_wait" {
-                    return value.trim() == "true";
-                }
+            if let Some((key, value)) = declaration.split_once('=')
+                && key.trim() == "standalone_legacy_wait"
+            {
+                return value.trim() == "true";
             }
         }
     }
