@@ -193,10 +193,13 @@ struct SnapiEnvState {
   uint32_t next_cb_reg_id = 1;
   std::vector<std::unique_ptr<CallbackBinding>> callback_bindings;
 
-  // Cap on live per-value host handles / callback registrations, bounding the
-  // host-side bookkeeping RSS that the byte budget pools do not otherwise see.
-  // 0 means unlimited. Set from the resource budget at env creation.
-  size_t value_limit = kMaxGuestNativeHandles;
+  // Managed embedders set this from their finite resource budget at env
+  // creation. Standalone providers are deliberately unlimited: their caller
+  // owns the whole process and existing workloads can retain more than 4096
+  // transient values in one scope (for example a large HTTP write batch).
+  // Use max rather than zero because several category checks compare against
+  // this field directly without a separate "unlimited" branch.
+  size_t value_limit = std::numeric_limits<size_t>::max();
 };
 
 struct GuestFinalizerRecord {

@@ -44,6 +44,35 @@ fn two_guest_isolates_run_sequentially() {
 }
 
 #[test]
+fn standalone_unlimited_context_does_not_apply_managed_value_cap() {
+    let wasm = build_wasix_test("test_unlimited_value_handles");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("UNLIMITED_VALUE_HANDLES_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn finite_managed_context_keeps_value_cap() {
+    let wasm = build_wasix_test("test_unlimited_value_handles");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_ne!(
+        exit_code, 0,
+        "managed value cap was bypassed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("value handle was refused"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn guest_fatal_error_exits_only_its_workload() {
     let fatal_wasm = build_wasix_test("test_guest_fatal_error");
     let hello_wasm = build_wasix_test("hello_napi_test");
