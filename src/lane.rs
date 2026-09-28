@@ -126,7 +126,7 @@ impl Drop for LaneScope {
 
 enum State {
     Uninitialized,
-    Initializing,
+    Initializing(Option<Arc<BackgroundLane>>),
     Ready(Arc<BackgroundLane>),
     // Keep the native lane allocation until all N-API sessions drop. The C++
     // env state retains a raw lane pointer even after stop is requested.
@@ -176,11 +176,11 @@ impl LazyBackgroundLane {
             match &*state {
                 State::Ready(lane) => return Ok(Arc::clone(lane)),
                 State::Stopped(_) => bail!("V8 background lane is stopped"),
-                State::Initializing => {
+                State::Initializing(_) => {
                     state = self.changed.wait(state).expect("poisoned V8 lane state");
                 }
                 State::Uninitialized => {
-                    *state = State::Initializing;
+                    *state = State::Initializing(None);
                     break;
                 }
             }
@@ -192,6 +192,17 @@ impl LazyBackgroundLane {
                 Arc::clone(&self.budget),
                 Arc::clone(&self.task_scope),
             )?);
+            {
+                let mut state = self.state.lock().expect("poisoned V8 lane state");
+                match &mut *state {
+                    State::Initializing(slot) => *slot = Some(Arc::clone(&lane)),
+                    State::Stopped(_) => {
+                        lane.stop();
+                        bail!("V8 background lane stopped during initialization");
+                    }
+                    _ => unreachable!("lane initializer lost ownership"),
+                }
+            }
             let worker_lane = Arc::clone(&lane);
             let on_overload = Arc::clone(&self.on_overload);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -212,19 +223,19 @@ impl LazyBackgroundLane {
 
         let mut state = self.state.lock().expect("poisoned V8 lane state");
         let outcome = match result {
-            Ok(lane) if matches!(*state, State::Initializing) => {
+            Ok(lane) if matches!(*state, State::Initializing(_)) => {
                 *state = State::Ready(Arc::clone(&lane));
                 Ok(lane)
             }
             Ok(lane) => {
                 lane.stop();
-                if let State::Stopped(slot) = &mut *state {
-                    *slot = Some(lane);
-                }
+                // `stop()` already retained the allocation if this init
+                // raced it; the local `Arc` may now be released.
+                drop(lane);
                 bail!("V8 background lane stopped during initialization")
             }
             Err(error) => {
-                if matches!(*state, State::Initializing) {
+                if matches!(*state, State::Initializing(_)) {
                     *state = State::Uninitialized;
                 }
                 Err(error)
@@ -243,6 +254,10 @@ impl LazyBackgroundLane {
                 State::Stopped(Some(lane))
             }
             State::Stopped(lane) => State::Stopped(lane),
+            State::Initializing(lane) => {
+                if let Some(lane) = &lane { lane.stop(); }
+                State::Stopped(lane)
+            }
             _ => State::Stopped(None),
         };
         self.changed.notify_all();
@@ -259,7 +274,7 @@ impl LazyBackgroundLane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::atomic::{AtomicUsize, Ordering}, thread};
+    use std::{sync::{Barrier, atomic::{AtomicUsize, Ordering}}, thread};
 
     unsafe extern "C" {
         fn snapi_v8_lane_post_test_task(
@@ -353,5 +368,75 @@ mod tests {
         assert_eq!(exited.load(Ordering::SeqCst), 2);
         assert_eq!(first_budget.snapshot().v8_background_lane, 0);
         assert_eq!(second_budget.snapshot().v8_background_lane, 0);
+    }
+
+    #[test]
+    fn concurrent_first_calls_admit_exactly_one_lane() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let spawner: BackgroundThreadSpawner = {
+            let spawns = Arc::clone(&spawns);
+            Arc::new(move |work| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let finished_tx = finished_tx.clone();
+                thread::Builder::new().spawn(move || {
+                    work();
+                    let _ = finished_tx.send(());
+                })?;
+                Ok(())
+            })
+        };
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let lane = Arc::new(LazyBackgroundLane::new(
+            spawner, Arc::new(|| {}), Arc::clone(&budget), Arc::new(|| Box::new(())),
+        ));
+        let start = Arc::new(Barrier::new(16));
+        let callers: Vec<_> = (0..16).map(|_| {
+            let lane = Arc::clone(&lane);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                drop(lane.enter().expect("first call admitted"));
+            })
+        }).collect();
+        for caller in callers { caller.join().unwrap(); }
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.snapshot().v8_background_lane, LANE_RESERVATION_BYTES);
+        lane.stop();
+        finished_rx.recv_timeout(Duration::from_secs(2)).expect("lane exits");
+        assert_eq!(budget.snapshot().v8_background_lane, 0);
+    }
+
+    #[test]
+    fn stop_wins_a_pending_first_call() {
+        let (scheduled_tx, scheduled_rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
+            scheduled_tx.send(work)?;
+            Ok(())
+        });
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let lane = Arc::new(LazyBackgroundLane::new(
+            spawner, Arc::new(|| {}), Arc::clone(&budget), Arc::new(|| Box::new(())),
+        ));
+        let caller_lane = Arc::clone(&lane);
+        let caller = thread::spawn(move || caller_lane.enter().is_err());
+        let scheduled = scheduled_rx.recv_timeout(Duration::from_secs(2)).expect("worker accepted");
+        lane.stop();
+        scheduled();
+        assert!(caller.join().unwrap(), "stopped lane must reject first call");
+        assert!(!lane.is_initialized());
+        assert_eq!(budget.snapshot().v8_background_lane, 0);
+    }
+
+    #[test]
+    fn admission_failure_releases_partial_lane() {
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let lane = LazyBackgroundLane::new(
+            Arc::new(|_work| anyhow::bail!("global lane admission full")),
+            Arc::new(|| {}), Arc::clone(&budget), Arc::new(|| Box::new(())),
+        );
+        assert!(lane.enter().is_err());
+        assert!(!lane.is_initialized());
+        assert_eq!(budget.snapshot().v8_background_lane, 0);
     }
 }
