@@ -199,6 +199,13 @@ if [[ -f "$V8_BUILD_CONFIG" ]]; then
     exit 1
   fi
 fi
+IFS=',; ' read -r -a V8_DEFINE_LIST <<< "$V8_DEFINES"
+V8_DEFINE_ARGS=()
+for define in "${V8_DEFINE_LIST[@]}"; do
+  if [[ -n "$define" ]]; then
+    V8_DEFINE_ARGS+=("-D$define")
+  fi
+done
 
 TEST_SRC=""
 for ext in c cc cpp; do
@@ -294,7 +301,7 @@ esac
   -w \
   -DNAPI_EXTERN= \
   -DNAPI_VERSION=8 \
-  $(echo "$V8_DEFINES" | tr ';,' '\n' | sed '/^[[:space:]]*$/d; s/^[[:space:]]*/-D/; s/[[:space:]]*$//' | tr '\n' ' ') \
+  "${V8_DEFINE_ARGS[@]}" \
   -I"$NAPI_INCLUDE_DIR" \
   -I"$NAPI_LIB_SRC" \
   -I"$NAPI_V8_INCLUDE" \
