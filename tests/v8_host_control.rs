@@ -44,6 +44,27 @@ fn two_guest_isolates_run_sequentially() {
 }
 
 #[test]
+fn guest_fatal_error_exits_only_its_workload() {
+    let fatal_wasm = build_wasix_test("test_guest_fatal_error");
+    let hello_wasm = build_wasix_test("hello_napi_test");
+
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &fatal_wasm).expect("fatal guest run failed");
+    assert_ne!(
+        exit_code, 0,
+        "fatal guest unexpectedly survived: {stdout}\n{stderr}"
+    );
+
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &hello_wasm).expect("next guest run failed");
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(
+        stdout.contains("HELLO_NAPI_TEST_OK=1"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let sleeping_wasm = build_wasix_test("test_env_sleep");
     let hello_wasm = build_wasix_test("hello_napi_test");
