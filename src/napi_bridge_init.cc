@@ -28,6 +28,10 @@
 #include "node_api.h"
 #include "unofficial_napi.h"
 
+// Private V8 provider accounting hook. It is never imported by WASIX guests.
+extern "C" size_t unofficial_napi_message_retained_bytes(
+    unofficial_napi_message message);
+
 namespace {
 
 std::recursive_mutex g_mu;

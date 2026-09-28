@@ -363,11 +363,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_create(
     napi_value value,
     unofficial_napi_message* message_out);
 
-// Host bytes retained by a queued serialized message, excluding V8 objects and
-// ArrayBuffer backing stores already charged to their owning environments.
-NAPI_EXTENSION_WASMER_EXTERN size_t unofficial_napi_message_retained_bytes(
-    unofficial_napi_message message);
-
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_take(
     napi_env env,
     unofficial_napi_message message,
