@@ -86,6 +86,27 @@ fn guest_property_descriptor_count_is_bounded_before_read() {
 }
 
 #[test]
+fn explicit_length_names_preserve_embedded_nul_without_native_overread() {
+    let wasm = build_wasix_test("test_embedded_nul_names");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("EMBEDDED_NUL_NAMES_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn guest_cannot_allocate_unmetered_v8_webassembly_memory() {
+    let wasm = build_wasix_test("test_js_wasm_disabled");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
+}
+
+#[test]
 fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let sleeping_wasm = build_wasix_test("test_env_sleep");
     let hello_wasm = build_wasix_test("hello_napi_test");

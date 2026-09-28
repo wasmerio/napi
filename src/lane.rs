@@ -308,6 +308,16 @@ impl LazyBackgroundLane {
     }
 }
 
+impl Drop for LazyBackgroundLane {
+    fn drop(&mut self) {
+        // The worker owns an Arc<BackgroundLane> while it waits for work. If
+        // the embedding context is dropped without an explicit shutdown,
+        // dropping our Arc alone cannot wake that worker or release its lane
+        // reservation. Stop is idempotent and lets the worker quiesce.
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +366,33 @@ mod tests {
             drop(unsafe { Box::from_raw(data) });
             panic!("task admission rejected");
         }
+    }
+
+    #[test]
+    fn dropping_hooks_stops_an_idle_lane_and_releases_its_charge() {
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
+            let finished_tx = finished_tx.clone();
+            thread::spawn(move || {
+                work();
+                let _ = finished_tx.send(());
+            });
+            Ok(())
+        });
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let lane = LazyBackgroundLane::new(
+            spawner,
+            Arc::new(|| {}),
+            Arc::clone(&budget),
+            Arc::new(|| Box::new(())),
+        );
+        drop(lane.enter().unwrap());
+        assert_eq!(budget.snapshot().v8_background_lane, LANE_RESERVATION_BYTES);
+        drop(lane);
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle worker exits when its owner drops");
+        assert_eq!(budget.snapshot().v8_background_lane, 0);
     }
 
     #[test]

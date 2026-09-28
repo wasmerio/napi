@@ -28,6 +28,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "internal/restricted_context.h"
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
@@ -1990,6 +1991,16 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
+  if (context.IsEmpty() || !RemoveUnmeteredWebAssembly(context)) {
+    delete scope;
+    DisposeIsolateAndWait(platform, isolate);
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_tracking_allocators.erase(allocator.get());
+    }
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);

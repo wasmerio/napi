@@ -22,6 +22,32 @@ use crate::{
 
 use super::{abi, util::*};
 
+/// Keep explicit-length guest names as raw bytes. `CString::new` rejects an
+/// embedded NUL and its empty fallback would leave C++ reading the original
+/// nonzero length past that fallback allocation. Only AUTO_LENGTH needs an
+/// owned NUL-terminated copy.
+struct GuestName<'a> {
+    bytes: &'a HostCopy<u8>,
+    terminated: Option<CString>,
+}
+
+impl<'a> GuestName<'a> {
+    fn new(bytes: &'a HostCopy<u8>, length: u32) -> Option<Self> {
+        if length != u32::MAX && bytes.len() != length as usize {
+            return None;
+        }
+        let terminated = (length == u32::MAX || length == 0)
+            .then(|| CString::new(bytes.as_slice()).unwrap_or_default());
+        Some(Self { bytes, terminated })
+    }
+
+    fn as_ptr(&self) -> *const c_char {
+        self.terminated
+            .as_ref()
+            .map_or_else(|| self.bytes.as_ptr().cast(), |name| name.as_ptr())
+    }
+}
+
 macro_rules! reserve_property_array {
     ($env:expr, $count:expr, $ty:ty) => {
         match HostCopy::<$ty>::with_capacity($env.data().budget.clone(), $count) {
@@ -556,10 +582,12 @@ fn guest_unofficial_napi_create_private_symbol(
     let Some(desc) = desc else {
         return 1;
     };
-    let cs = CString::new(desc.as_slice()).unwrap_or_default();
+    let Some(name) = GuestName::new(&desc, wl) else {
+        return 1;
+    };
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
+        snapi_bridge_unofficial_create_private_symbol(env_handle, name.as_ptr(), wl, &mut out)
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
@@ -3371,6 +3399,9 @@ fn guest_napi_create_function(
     } else {
         HostCopy::default()
     };
+    let Some(name) = GuestName::new(&name_bytes, wl) else {
+        return 1;
+    };
 
     // Allocate a registration ID in the C++ callback registry
     let snapi = snapi_env(&env, e);
@@ -3382,9 +3413,8 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
-    let c_name = CString::new(name_bytes.as_slice()).unwrap_or_default();
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
+    let s = unsafe { snapi_bridge_create_function(snapi, name.as_ptr(), wl, reg_id, &mut out) };
     if s != 0 {
         return s;
     }
@@ -3542,6 +3572,9 @@ fn guest_napi_define_class(
     if prop_count < 0 || prop_count as usize > MAX_NAPI_PROPERTY_DESCRIPTORS {
         return 1;
     }
+    let Some(name) = GuestName::new(&name_bytes, wl) else {
+        return 1;
+    };
 
     // Register the constructor callback
     let snapi = snapi_env(&env, e);
@@ -3557,7 +3590,6 @@ fn guest_napi_define_class(
     };
 
     let pc = prop_count as u32;
-    let c_name = CString::new(name_bytes.as_slice()).unwrap_or_default();
 
     if pc == 0 {
         // No properties — simple case
@@ -3565,7 +3597,7 @@ fn guest_napi_define_class(
         let s = unsafe {
             snapi_bridge_define_class(
                 snapi_env(&env, e),
-                c_name.as_ptr(),
+                name.as_ptr(),
                 wl,
                 ctor_reg_id,
                 0,
@@ -3726,7 +3758,7 @@ fn guest_napi_define_class(
     let s = unsafe {
         snapi_bridge_define_class(
             snapi_env(&env, e),
-            c_name.as_ptr(),
+            name.as_ptr(),
             wl,
             ctor_reg_id,
             pc,
@@ -5127,4 +5159,29 @@ pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
         "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
         guest_env_ossl_set_max_threads
     );
+}
+
+#[cfg(test)]
+mod guest_name_tests {
+    use super::*;
+    use crate::ResourceBudget;
+
+    #[test]
+    fn explicit_names_keep_embedded_nul_and_reject_missing_bytes() {
+        let mut bytes = HostCopy::<u8>::zeroed(ResourceBudget::with_memory_limit(64), 3).unwrap();
+        bytes.as_mut_slice().copy_from_slice(b"a\0b");
+        let explicit = GuestName::new(&bytes, 3).unwrap();
+        assert!(explicit.terminated.is_none());
+        let received = unsafe { std::slice::from_raw_parts(explicit.as_ptr().cast::<u8>(), 3) };
+        assert_eq!(received, b"a\0b");
+        assert!(GuestName::new(&bytes, 4).is_none());
+
+        let missing = HostCopy::<u8>::empty();
+        assert!(GuestName::new(&missing, 1).is_none());
+        let auto = GuestName::new(&bytes, u32::MAX).unwrap();
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(auto.as_ptr()) }.to_bytes(),
+            b""
+        );
+    }
 }

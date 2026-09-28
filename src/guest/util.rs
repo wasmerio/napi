@@ -56,6 +56,10 @@ impl<T> HostCopy<T> {
         self.data.as_mut_ptr()
     }
 
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        self.data.as_mut_slice()
+    }
+
     pub(crate) fn push(&mut self, value: T) {
         assert!(self.data.len() < self.reserved_elements);
         self.data.push(value);

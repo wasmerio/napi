@@ -32,6 +32,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "internal/restricted_context.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -1756,6 +1757,10 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
             isolate, context, key_object, saved_properties)) {
       return napi_pending_exception;
     }
+  }
+
+  if (!RemoveUnmeteredWebAssembly(context)) {
+    return napi_pending_exception;
   }
 
   napi_value key_napi = napi_v8_wrap_value(env, handle_scope.Escape(key_object));
