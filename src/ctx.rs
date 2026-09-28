@@ -539,15 +539,18 @@ impl NapiSession {
                 .context("missing runtime function env during instance setup")?
         };
 
-        // Imported memory is already available to a start section. A module
-        // can also define and export its own memory; bind that after
-        // instantiation so a later N-API call can use it. Keep the guest heap
-        // lazy in either case.
-        let instance_memory = imported_memory
-            .cloned()
-            .or_else(|| instance.exports.get_memory("memory").ok().cloned());
-        if let Some(memory) = instance_memory {
-            func_env.as_mut(&mut *store).memory = Some(memory);
+        // Imports may already have bound a memory and a start section may
+        // already have created its guest heap from it. Never replace that
+        // memory with a different exported one in a multi-memory module.
+        // Otherwise a module-defined export can be bound after instantiation
+        // for a later first N-API call. Keep the guest heap lazy either way.
+        if func_env.as_ref(&*store).memory.is_none() {
+            let instance_memory = imported_memory
+                .cloned()
+                .or_else(|| instance.exports.get_memory("memory").ok().cloned());
+            if let Some(memory) = instance_memory {
+                func_env.as_mut(&mut *store).memory = Some(memory);
+            }
         }
 
         // Keep import-only modules cheap, including those with no linear
@@ -951,6 +954,7 @@ mod tests {
                 (import "napi" "napi_wasm_init_env" (func $init (result i32)))
                 (import "env" "memory" (memory 1 512))
                 (import "env" "uv_get_free_memory" (func $free_memory (result i64)))
+                (memory (export "memory") 1 512)
                 (global $result (mut i32) (i32.const 0))
                 (func $start call $init global.set $result)
                 (start $start)
@@ -970,7 +974,7 @@ mod tests {
         let state = hooks
             .add_imports(&module, &mut store.as_store_mut(), &mut imports)
             .unwrap();
-        let bound_memory = state
+        let func_env = state
             .session
             .as_ref()
             .unwrap()
@@ -980,24 +984,38 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .as_ref(&store)
-            .memory
-            .clone()
-            .unwrap();
+            .clone();
+        let bound_memory = func_env.as_ref(&store).memory.clone().unwrap();
         assert_eq!(
             bound_memory.view(&store).data_ptr(),
             memory.view(&store).data_ptr()
         );
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        assert_ne!(
+            instance
+                .exports
+                .get_memory("memory")
+                .unwrap()
+                .view(&store)
+                .data_ptr(),
+            memory.view(&store).data_ptr(),
+            "the exported memory must be distinct from imported env.memory"
+        );
         hooks
-            .configure_instance(
-                &module,
-                &mut store.as_store_mut(),
-                &instance,
-                Some(&memory),
-                state,
-            )
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
             .unwrap();
+        assert!(func_env.as_ref(&store).guest_heap.is_some());
+        assert_eq!(
+            func_env
+                .as_ref(&store)
+                .memory
+                .as_ref()
+                .unwrap()
+                .view(&store)
+                .data_ptr(),
+            memory.view(&store).data_ptr(),
+            "configure_instance must retain the memory used by the start-section heap"
+        );
         assert!(
             instance
                 .exports
