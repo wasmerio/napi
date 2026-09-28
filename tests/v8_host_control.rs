@@ -97,6 +97,48 @@ fn terminate_all_stops_running_js() {
     );
 }
 
+/// A busy isolate cannot hold the bridge's process-wide registry lock while
+/// another workload creates its isolate and requests GC.
+#[test]
+fn another_guest_can_collect_gc_while_js_is_spinning() {
+    let spinning_wasm = build_wasix_test("test_js_infinite_loop");
+    let gc_wasm = build_wasix_test("test_gc_once");
+    let busy_ctx = NapiCtx::default();
+    let control = busy_ctx.runtime_control();
+    let (busy_tx, busy_rx) = mpsc::channel();
+    let busy = thread::spawn(move || {
+        let result = run_guest(&busy_ctx, &spinning_wasm);
+        let _ = busy_tx.send(());
+        result
+    });
+
+    // The guest prints its marker before entering the loop. The captured
+    // stdout is only returned at completion, so allow startup time here.
+    thread::sleep(Duration::from_secs(2));
+
+    let (gc_tx, gc_rx) = mpsc::channel();
+    let gc_guest = thread::spawn(move || {
+        let result = run_guest(&NapiCtx::default(), &gc_wasm);
+        let _ = gc_tx.send(());
+        result
+    });
+    let gc_finished = gc_rx.recv_timeout(Duration::from_secs(15));
+    control.terminate_all();
+    busy_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("spinning guest survived termination");
+
+    gc_finished.expect("second guest stalled behind busy isolate");
+    let (exit_code, stdout, stderr) = gc_guest.join().unwrap().unwrap();
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(stdout.contains("GC_DONE"), "{stdout}\n{stderr}");
+    let (_, busy_stdout, busy_stderr) = busy.join().unwrap().unwrap();
+    assert!(
+        busy_stdout.contains("JS_LOOP_ENTERED"),
+        "busy guest never entered JS: {busy_stdout}\n{busy_stderr}"
+    );
+}
+
 /// Every byte an isolate reserves has to come back when it goes away,
 /// otherwise a long-lived app leaks budget until it can't start an isolate at
 /// all. Charging is by reservation, so this covers creation and teardown of a
