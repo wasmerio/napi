@@ -65,6 +65,15 @@ fn guest_fatal_error_exits_only_its_workload() {
 }
 
 #[test]
+fn guest_cannot_set_process_wide_v8_flags_with_embedded_nul() {
+    let wasm = build_wasix_test("test_guest_runtime_flags");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("FLAGS_REJECTED"), "{stdout}\n{stderr}");
+}
+
+#[test]
 fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let sleeping_wasm = build_wasix_test("test_env_sleep");
     let hello_wasm = build_wasix_test("hello_napi_test");
