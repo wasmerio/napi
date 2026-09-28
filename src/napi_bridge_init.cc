@@ -482,13 +482,9 @@ EnvLease RequireEnvState(SnapiEnvState *env_state) {
 napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   if (state == nullptr)
     return napi_ok;
-  // Withdraw the environment before releasing native V8 state. A control
-  // call already admitted through the registry can still terminate a spinning
-  // isolate; wait for it without holding the process-wide registry lock.
-  {
-    std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
-    g_envs.erase(state);
-  }
+  // Stop admitting control calls. Keep the state in the registry through V8
+  // release: finalizer callbacks can reenter the bridge on this same thread.
+  // Other callers wait on the per-env mutex and find a null env afterward.
   {
     std::unique_lock<std::mutex> control_lock(state->control_mutex);
     state->disposing = true;
@@ -531,16 +527,18 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->cb_registry.clear();
   state->next_cb_reg_id = 1;
   state->callback_bindings.clear();
+  napi_status release_status = napi_ok;
   if (state->owner != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->owner, nullptr);
-    state->active_callback_ctx.store(nullptr, std::memory_order_release);
-    state->owner = nullptr;
-    state->env = nullptr;
-    return s;
+    release_status = unofficial_napi_release_env(state->owner, nullptr);
   }
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
+  state->owner = nullptr;
   state->env = nullptr;
-  return napi_ok;
+  {
+    std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    g_envs.erase(state);
+  }
+  return release_status;
 }
 
 } // namespace
