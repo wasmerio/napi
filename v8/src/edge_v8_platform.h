@@ -2,6 +2,7 @@
 #define NAPI_V8_EDGE_V8_PLATFORM_H_
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -13,7 +14,8 @@
 
 // An embedder-owned background execution lane. The returned handle is owned by
 // the embedder until Stop, Run and all associated N-API environments have
-// quiesced. A null current lane preserves the standalone provider behavior.
+// quiesced. A null current lane uses the process-wide worker pool only after a
+// standalone environment explicitly enables it.
 extern "C" void* snapi_v8_lane_new(size_t max_queued_tasks,
                                      void* scope_context,
                                      void* (*enter_scope)(void*),
@@ -32,7 +34,8 @@ class EdgeV8Platform final : public v8::Platform {
   struct FinishedCallback;
   struct IsolateState;
 
-  static std::unique_ptr<EdgeV8Platform> Create();
+  static std::unique_ptr<EdgeV8Platform> Create(bool standalone_workers);
+  bool EnableStandaloneWorkers();
 
   // Sets how many background worker threads the platform gets. Zero restores
   // V8's own default, which sizes the pool from the host's processor count --
@@ -40,8 +43,9 @@ class EdgeV8Platform final : public v8::Platform {
   // many, where those threads compete with every tenant's foreground JS and
   // their work is not attributed to anyone.
   //
-  // The pool is process-wide and built when the first isolate is created, so
-  // this has no effect afterwards; it returns false in that case.
+  // The standalone pool is process-wide and built only when a standalone
+  // environment is configured. The setting freezes with V8 platform creation,
+  // even when the first environment is managed.
   static bool SetWorkerThreadCount(int count);
 
   ~EdgeV8Platform() override;
@@ -96,6 +100,7 @@ class EdgeV8Platform final : public v8::Platform {
   class ForegroundTaskRunner;
 
   explicit EdgeV8Platform(std::unique_ptr<v8::Platform> fallback);
+  v8::Platform* StandaloneWorkers();
 
   std::shared_ptr<IsolateState> EnsureState(v8::Isolate* isolate);
   std::shared_ptr<ForegroundTaskRunner> EnsureRunner(v8::Isolate* isolate);
@@ -105,6 +110,11 @@ class EdgeV8Platform final : public v8::Platform {
                           bool begin_shutdown);
 
   std::unique_ptr<v8::Platform> fallback_;
+  // Managed isolates dispatch every worker task to their instance lane. The
+  // process-wide V8 pool exists only when a standalone environment is used.
+  std::mutex standalone_workers_mutex_;
+  std::unique_ptr<v8::Platform> standalone_workers_;
+  std::atomic<v8::Platform*> standalone_workers_ptr_{nullptr};
   std::mutex mutex_;
   std::unordered_map<v8::Isolate*, std::shared_ptr<IsolateState>> isolates_;
 };

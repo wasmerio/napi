@@ -703,12 +703,17 @@ napi_status ConfigureRuntime(const char* engine_flags,
   }
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform != nullptr) {
-    return g_runtime.engine_flags.size() == engine_flags_length &&
-                   (engine_flags_length == 0 ||
-                    std::memcmp(g_runtime.engine_flags.data(), engine_flags,
-                                engine_flags_length) == 0)
-               ? napi_ok
-               : napi_invalid_arg;
+    const bool flags_match =
+        g_runtime.engine_flags.size() == engine_flags_length &&
+        (engine_flags_length == 0 ||
+         std::memcmp(g_runtime.engine_flags.data(), engine_flags,
+                     engine_flags_length) == 0);
+    if (!flags_match) return napi_invalid_arg;
+    if (snapi_v8_lane_current() == nullptr &&
+        !g_runtime.platform->EnableStandaloneWorkers()) {
+      return napi_generic_failure;
+    }
+    return napi_ok;
   }
 
   ApplyDefaultV8Flags();
@@ -718,7 +723,8 @@ napi_status ConfigureRuntime(const char* engine_flags,
   }
   v8::V8::InitializeICUDefaultLocation("");
   v8::V8::InitializeExternalStartupData("");
-  g_runtime.platform = EdgeV8Platform::Create();
+  g_runtime.platform = EdgeV8Platform::Create(
+      snapi_v8_lane_current() == nullptr);
   if (g_runtime.platform == nullptr) return napi_generic_failure;
   v8::V8::InitializePlatform(g_runtime.platform.get());
   v8::V8::Initialize();
@@ -731,6 +737,10 @@ napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform == nullptr) return napi_invalid_arg;
+  if (snapi_v8_lane_current() == nullptr &&
+      !g_runtime.platform->EnableStandaloneWorkers()) {
+    return napi_generic_failure;
+  }
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;

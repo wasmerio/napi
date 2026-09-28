@@ -71,12 +71,15 @@ macro_rules! reserve_property_array {
 }
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
-    if !ensure_guest_heap(&mut env) {
+    if env.data().memory.is_none() {
         return 0;
     }
     let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
         return 0;
     };
+    if !ensure_guest_heap(&mut env) {
+        return 0;
+    }
     let _ = unsafe { snapi_bridge_init() };
     // Legacy N-API modules without an embedder-owned runtime configuration use
     // the provider default. If Edge configured flags first, this conflicting
@@ -290,7 +293,13 @@ fn guest_unofficial_napi_configure_runtime(
     if has_flags {
         return 1;
     }
-    unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }
+    if env.data().host_stopped() {
+        return 1;
+    }
+    // Configuration has no per-guest mutable options. Defer native V8
+    // platform creation until env creation has activated the embedder's
+    // metered lane and admitted this instance.
+    0
 }
 
 fn guest_unofficial_napi_create_env(
@@ -300,12 +309,18 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
-    if !ensure_guest_heap(&mut env) {
+    if env.data().memory.is_none() {
         return 1;
     }
     let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
         return 1;
     };
+    if !ensure_guest_heap(&mut env) {
+        return 1;
+    }
+    if unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) } != 0 {
+        return 1;
+    }
     let (
         total_memory,
         constrained_memory,
@@ -386,9 +401,11 @@ fn guest_unofficial_napi_release_env(
     let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
-    if status.as_ref().is_ok_and(|code| *code == 0)
-        && let Some((guest_env, snapi_env_state)) =
-            env.data_mut().begin_unregister_napi_scope(scope_id)
+    if status.as_ref().is_ok_and(|code| {
+        *code == 0
+            || unsafe { crate::snapi::snapi_bridge_unofficial_env_alive(snapi_env_state) == 0 }
+    }) && let Some((guest_env, snapi_env_state)) =
+        env.data_mut().begin_unregister_napi_scope(scope_id)
     {
         env.data_mut()
             .finish_unregister_napi_env(guest_env, snapi_env_state);
@@ -5219,7 +5236,9 @@ fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
 pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     macro_rules! reg_env {
         ($name:expr, $func:expr) => {
-            io.define("env", $name, Function::new_typed(store, $func));
+            if io.get_export("env", $name).is_none() {
+                io.define("env", $name, Function::new_typed(store, $func));
+            }
         };
     }
 

@@ -16,6 +16,8 @@ use crate::budget::{
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use crate::lane::{ManagedV8Lane, ManagedV8LaneActivator, ManagedV8LaneScope};
 use crate::message::PendingMessages;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::snapi::snapi_bridge_unofficial_env_alive;
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
@@ -543,10 +545,8 @@ impl NapiEnv {
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
             let granted = if handle.tracker != 0 {
                 // SAFETY: reclaim the box created in `commit_isolate`. The
-                // near-heap-limit callback holding this pointer only runs during
-                // JS execution, and no JS runs between here and the paired env
-                // release that removes the callback and disposes the isolate, so
-                // freeing it now is safe.
+                // native release has already removed the callback and disposed
+                // the isolate, so it cannot call through this pointer again.
                 let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
                 boxed.granted.load(Ordering::Acquire)
             } else {
@@ -564,6 +564,7 @@ impl NapiEnv {
         self.napi_state_to_guest_env.remove(&(env as usize));
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
         self.finish_unregister_napi_env(env_id, env);
@@ -581,20 +582,61 @@ impl NapiEnv {
             .map(|env| *env as SnapiEnv)
             .unwrap_or(std::ptr::null_mut())
     }
+
+    fn release_registered_envs(&mut self, mut release: impl FnMut(SnapiEnv) -> bool) -> bool {
+        let mut all_quiesced = true;
+        let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
+        for scope_id in scope_ids {
+            let Some((env_id, env)) = self.begin_unregister_napi_scope(scope_id) else {
+                continue;
+            };
+            // Native release can wait for V8 background work and finalizers.
+            // Keep the isolate's full reservation in the shared accountant
+            // until that work is quiescent; another WASIX worker may try to
+            // create an environment concurrently.
+            if release(env) {
+                self.finish_unregister_napi_env(env_id, env);
+            } else {
+                all_quiesced = false;
+                // A failed native release has not proved that the isolate is
+                // gone. Retain the charge and heap-limit callback backing
+                // rather than making its bytes available to a sibling.
+                eprintln!("[wasmer-napi] env {env_id} release failed during drop; retaining quota");
+                self.host_stopped.store(true, Ordering::Release);
+                self.env_registry
+                    .lock()
+                    .expect("poisoned N-API env registry")
+                    .insert(env as usize);
+                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
+                }
+                std::mem::forget(Arc::clone(&self.budget));
+            }
+        }
+        all_quiesced
+    }
 }
 
 impl Drop for NapiEnv {
     fn drop(&mut self) {
-        let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
-        for scope_id in scope_ids {
-            if let Some(env) = self.unregister_napi_scope(scope_id) {
-                unsafe {
-                    let _ = snapi_bridge_unofficial_release_env(env);
-                }
+        let all_quiesced = self.release_registered_envs(|env| {
+            let status = unsafe { snapi_bridge_unofficial_release_env(env) };
+            if status == 0 {
+                return true;
             }
-        }
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            {
+                // A finalizer error can be returned after complete native
+                // disposal. Only a still-registered bridge requires keeping
+                // the reservation charged.
+                unsafe { snapi_bridge_unofficial_env_alive(env) == 0 }
+            }
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            false
+        });
         // Release any external memory the guest declared but did not take back.
-        if self.external_declared > 0 {
+        if all_quiesced && self.external_declared > 0 {
             self.budget
                 .uncharge(Pool::V8External, self.external_declared);
             self.external_declared = 0;
@@ -605,6 +647,8 @@ impl Drop for NapiEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::{sync::mpsc, thread};
 
     const MIB: u64 = 1024 * 1024;
 
@@ -660,6 +704,58 @@ mod tests {
             0,
             "drop releases declared external"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropping_env_keeps_quota_reserved_until_native_release_finishes() {
+        let budget = ResourceBudget::with_memory_limit(110 * MIB);
+        let mut env = NapiEnv::new(
+            Arc::clone(&budget),
+            PendingMessages::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let reservation = env.reserve_isolate(RequestedHeap::default()).unwrap();
+        // The release callback below is deliberately substituted so the
+        // cross-thread check can pause at the native quiescence boundary.
+        let fake_env = 1usize as SnapiEnv;
+        let (env_id, _) = env.register_napi_env(fake_env);
+        env.env_heap_charges.insert(
+            env_id,
+            EnvHeapChargeHandle {
+                ceiling: reservation.ceiling_bytes,
+                tracker: 0,
+            },
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            env.release_registered_envs(|_| {
+                entered_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                true
+            });
+        });
+        entered_rx.recv().unwrap();
+        assert_eq!(
+            budget.snapshot().v8_heap_reserved,
+            reservation.ceiling_bytes
+        );
+        assert!(
+            budget
+                .try_reserve_env(RequestedHeap::default(), None)
+                .is_err()
+        );
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        let later = budget
+            .try_reserve_env(RequestedHeap::default(), None)
+            .unwrap();
+        budget.release_env(later.ceiling_bytes);
     }
 
     #[test]

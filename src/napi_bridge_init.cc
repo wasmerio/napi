@@ -3856,6 +3856,13 @@ extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState *env_state) {
   return DisposeBridgeStateLocked(lease.get());
 }
 
+// A release may report an error from a guest finalizer after the isolate was
+// nevertheless disposed. Query registry membership without dereferencing a
+// stale guest handle so Rust can retain quota only for a live native env.
+extern "C" int snapi_bridge_unofficial_env_alive(SnapiEnvState *env_state) {
+  return LookupEnvState(env_state) != nullptr ? 1 : 0;
+}
+
 extern "C" int
 snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState *env_state,
                                               uint32_t loop_id) {

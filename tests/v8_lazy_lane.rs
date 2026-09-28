@@ -17,6 +17,9 @@ use common::build_wasix_test;
 
 unsafe extern "C" {
     fn snapi_v8_fallback_worker_posts() -> u64;
+    fn snapi_v8_platform_created() -> bool;
+    fn snapi_v8_standalone_pool_created() -> bool;
+    fn snapi_v8_unattributed_worker_posts() -> u64;
 }
 
 struct TaskGuard(Arc<AtomicUsize>);
@@ -29,6 +32,7 @@ impl Drop for TaskGuard {
 
 #[test]
 fn embedder_lane_starts_on_first_env_and_routes_gc_tasks() {
+    let configure_only = build_wasix_test("test_configure_without_env");
     let wasm = build_wasix_test("test_gc_once");
     let spawns = Arc::new(AtomicUsize::new(0));
     let scopes = Arc::new(AtomicUsize::new(0));
@@ -71,8 +75,19 @@ fn embedder_lane_starts_on_first_env_and_routes_gc_tasks() {
         });
     let budget = hooks.budget();
     let fallback_before = unsafe { snapi_v8_fallback_worker_posts() };
+    let unattributed_before = unsafe { snapi_v8_unattributed_worker_posts() };
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
     assert_eq!(budget.snapshot().v8_background_lane, 0);
+    assert!(!unsafe { snapi_v8_platform_created() });
+    let (exit_code, stdout, stderr) =
+        run_wasix_main_capture_stdio_with_hooks(&hooks, &configure_only, &[], &[]).unwrap();
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(
+        stdout.contains("CONFIGURED_WITHOUT_ENV"),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    assert!(!unsafe { snapi_v8_platform_created() });
 
     let (exit_code, stdout, stderr) =
         run_wasix_main_capture_stdio_with_hooks(&hooks, &wasm, &[], &[]).unwrap();
@@ -80,6 +95,8 @@ fn embedder_lane_starts_on_first_env_and_routes_gc_tasks() {
     assert!(stdout.contains("GC_DONE"), "{stdout}\n{stderr}");
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
     assert!(lane_slot.lock().unwrap().is_some());
+    assert!(unsafe { snapi_v8_platform_created() });
+    assert!(!unsafe { snapi_v8_standalone_pool_created() });
     assert_eq!(
         budget.snapshot().v8_background_lane,
         0,
@@ -95,6 +112,11 @@ fn embedder_lane_starts_on_first_env_and_routes_gc_tasks() {
         unsafe { snapi_v8_fallback_worker_posts() },
         fallback_before,
         "a managed V8 task escaped to the process-wide fallback pool"
+    );
+    assert_eq!(
+        unsafe { snapi_v8_unattributed_worker_posts() },
+        unattributed_before,
+        "managed V8 posted work without its instance lane"
     );
     let started = scopes.load(Ordering::SeqCst);
     assert!(started > 0, "GC did not exercise the metered V8 lane");

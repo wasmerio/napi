@@ -525,33 +525,14 @@ impl NapiSession {
 
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         {
-            // Stand up the host-side guest-memory allocator now that the memory is
-            // final. All bridge allocations of guest memory go through it, AND it
-            // is the only backing store for V8 ArrayBuffers/Buffers/TypedArrays
-            // (see TrackingArrayBufferAllocator in unofficial_napi.cc) — the
-            // guest's own malloc is never called from the host, and host-heap
-            // allocation is never used for guest-visible V8 memory. A module that
-            // requests N-API imports without usable linear memory, or whose
-            // memory can't support a GuestHeap, cannot run under this bridge: we
-            // fail instantiation here rather than let allocation silently fall
-            // back to unbudgeted, non-guest-shared host memory later.
-            let memory = func_env
-                .as_ref(&*store)
-                .memory
-                .clone()
-                .context("N-API imports require the guest to have linear memory")?;
-            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            // A start section may already have installed the guest heap from
-            // imported env.memory. Keep that exact heap: creating a second
-            // allocator for non-shared memory could reuse live offsets.
-            let heap = if let Some(heap) = func_env.as_ref(&*store).guest_heap.clone() {
-                heap
-            } else {
-                crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget).context(
-                    "failed to initialize the guest-heap allocator over the guest's linear memory",
-                )?
-            };
-            func_env.as_mut(&mut *store).guest_heap = Some(heap);
+            // Keep import-only modules cheap. The allocator is constructed by
+            // ensure_guest_heap on the first env-creation call, after Edge has
+            // admitted the lane. A start section may already have installed
+            // its heap; never replace that allocator here.
+            anyhow::ensure!(
+                func_env.as_ref(&*store).memory.is_some(),
+                "N-API imports require the guest to have linear memory"
+            );
         }
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
@@ -722,6 +703,22 @@ mod tests {
         let (imports, state) = hooks
             .additional_imports(&import_only, &mut store.as_store_mut())
             .unwrap();
+        let memory = state
+            .session
+            .as_ref()
+            .unwrap()
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .memory
+            .clone()
+            .unwrap();
+        let pages_before = memory.size(&store);
+        let charge_before = hooks.budget().snapshot().mem_charged;
         let instance = Instance::new(&mut store, &import_only, &imports).unwrap();
         hooks
             .configure_instance(
@@ -734,6 +731,8 @@ mod tests {
             .unwrap();
         assert!(!lane_slot.lock().unwrap().is_some());
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(memory.size(&store), pages_before);
+        assert_eq!(hooks.budget().snapshot().mem_charged, charge_before);
 
         let invoked = compile_wat(
             &store,
@@ -762,6 +761,92 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("lane stops");
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn managed_imports_bind_the_existing_wasix_memory_before_start() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (import "env" "uv_get_free_memory" (func $free_memory (result i64)))
+                (global $result (mut i32) (i32.const 0))
+                (func $start call $init global.set $result)
+                (start $start)
+                (func (export "start_result") (result i32) global.get $result)
+                (func (export "helper_result") (result i64) call $free_memory)
+            )"#,
+        );
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(512), false)).unwrap();
+        let mut imports = wasmer::Imports::new();
+        imports.define("env", "memory", memory.clone());
+        imports.define(
+            "env",
+            "uv_get_free_memory",
+            wasmer::Function::new_typed(&mut store, || 123_i64),
+        );
+        let state = hooks
+            .add_imports(&module, &mut store.as_store_mut(), &mut imports)
+            .unwrap();
+        let bound_memory = state
+            .session
+            .as_ref()
+            .unwrap()
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .memory
+            .clone()
+            .unwrap();
+        assert_eq!(
+            bound_memory.view(&store).data_ptr(),
+            memory.view(&store).data_ptr()
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &module,
+                &mut store.as_store_mut(),
+                &instance,
+                Some(&memory),
+                state,
+            )
+            .unwrap();
+        assert!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&store, "start_result")
+                .unwrap()
+                .call(&mut store)
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i64>(&store, "helper_result")
+                .unwrap()
+                .call(&mut store)
+                .unwrap(),
+            123
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        drop(imports);
+        drop(instance);
+        drop(store);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
