@@ -74,6 +74,18 @@ fn guest_cannot_set_process_wide_v8_flags_with_embedded_nul() {
 }
 
 #[test]
+fn guest_property_descriptor_count_is_bounded_before_read() {
+    let wasm = build_wasix_test("test_property_descriptor_cap");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("PROPERTY_CAP_REJECTED"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let sleeping_wasm = build_wasix_test("test_env_sleep");
     let hello_wasm = build_wasix_test("hello_napi_test");

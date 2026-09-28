@@ -291,5 +291,16 @@ mod tests {
         let unlimited = ResourceBudget::unlimited();
         assert!(HostCopy::<u8>::zeroed(Arc::clone(&unlimited), usize::MAX).is_none());
         assert_eq!(unlimited.snapshot().host_transient, 0);
+
+        let array_bytes = 2 * std::mem::size_of::<CString>() as u64;
+        let names_budget = ResourceBudget::with_memory_limit(array_bytes + 5);
+        let mut names = HostCopy::<CString>::with_capacity(Arc::clone(&names_budget), 2).unwrap();
+        assert_eq!(names_budget.snapshot().host_transient, array_bytes);
+        assert!(names.push_cstring(b"ab").is_some());
+        assert_eq!(names_budget.snapshot().host_transient, array_bytes + 3);
+        assert!(names.push_cstring(b"too long").is_none());
+        assert_eq!(names_budget.snapshot().host_transient, array_bytes + 3);
+        drop(names);
+        assert_eq!(names_budget.snapshot().host_transient, 0);
     }
 }
