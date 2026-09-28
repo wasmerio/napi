@@ -53,6 +53,11 @@ NAPI_EDGEJS_0_0_1_ATOM=/path/to/edgejs \
   retain buffers or samples without a workload budget, or have no equivalent
   in the current provider. Calling `node:v8` serialization therefore needs a
   metered implementation before it can be supported.
+- Both module-wrap `create_cached_data` imports fail before entering V8.
+  `CreateCodeCache` allocates native `CachedData` before reporting its size;
+  the provider needs an enforced allocation limit before this path can be
+  charged to a workload. This is separate from the legacy contextify cache
+  entry described above.
 - A V8 fatal or out-of-memory callback records a workload stop if control
   returns to the N-API import boundary. V8 can terminate the host process
   before returning from a native fatal error; the callback alone cannot

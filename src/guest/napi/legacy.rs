@@ -317,11 +317,12 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[3].unwrap_i32(),
         )),
         "unofficial_napi_mark_promise_as_handled" => {
-            Ok(super::guest_unofficial_napi_mark_promise_as_handled(
+            super::guest_unofficial_napi_mark_promise_as_handled(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_create_cached_data" => {
             Ok(super::guest_unofficial_napi_module_wrap_create_cached_data(
@@ -479,11 +480,12 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             ),
         ),
         "unofficial_napi_preserve_error_source_message" => {
-            Ok(super::guest_unofficial_napi_preserve_error_source_message(
+            super::guest_unofficial_napi_preserve_error_source_message(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_process_microtasks" => {
             super::guest_unofficial_napi_event_loop_checkpoint(env, args[0].unwrap_i32(), 0, 0, 0)

@@ -1031,7 +1031,10 @@ fn guest_unofficial_napi_get_error_metadata(
     error: i32,
     mode: i32,
     metadata_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
+    if metadata_ptr <= 0 || read_guest_bytes(&mut env, metadata_ptr, 28).is_none() {
+        return Ok(1);
+    }
     let env_handle = snapi_env(&env, napi_env);
     let error_id = if error > 0 { error as u32 } else { 0 };
     let mut source_line_id = 0u32;
@@ -1041,7 +1044,7 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
@@ -1054,20 +1057,18 @@ fn guest_unofficial_napi_get_error_metadata(
             &mut start_column,
             &mut end_column,
         )
-    };
+    })?;
     if status != 0 {
-        return status;
+        return Ok(status);
     }
-    if metadata_ptr > 0 {
-        write_guest_u32(&mut env, metadata_ptr as u32, source_line_id);
-        write_guest_u32(&mut env, metadata_ptr as u32 + 4, script_resource_name_id);
-        write_guest_u32(&mut env, metadata_ptr as u32 + 8, stderr_line_id);
-        write_guest_u32(&mut env, metadata_ptr as u32 + 12, thrown_at_id);
-        write_guest_i32(&mut env, metadata_ptr as u32 + 16, line_number);
-        write_guest_i32(&mut env, metadata_ptr as u32 + 20, start_column);
-        write_guest_i32(&mut env, metadata_ptr as u32 + 24, end_column);
-    }
-    0
+    let wrote = write_guest_u32(&mut env, metadata_ptr as u32, source_line_id)
+        && write_guest_u32(&mut env, metadata_ptr as u32 + 4, script_resource_name_id)
+        && write_guest_u32(&mut env, metadata_ptr as u32 + 8, stderr_line_id)
+        && write_guest_u32(&mut env, metadata_ptr as u32 + 12, thrown_at_id)
+        && write_guest_i32(&mut env, metadata_ptr as u32 + 16, line_number)
+        && write_guest_i32(&mut env, metadata_ptr as u32 + 20, start_column)
+        && write_guest_i32(&mut env, metadata_ptr as u32 + 24, end_column);
+    Ok(i32::from(!wrote))
 }
 
 fn guest_unofficial_napi_configure_source_maps(
@@ -1082,23 +1083,27 @@ fn guest_unofficial_napi_configure_source_maps(
 }
 
 fn guest_unofficial_napi_preserve_error_source_message(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     error: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let error_id = if error > 0 { error as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id)
+    })
 }
 
 fn guest_unofficial_napi_mark_promise_as_handled(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     promise: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let promise_id = if promise > 0 { promise as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
+    })
 }
 
 fn guest_unofficial_napi_get_heap_statistics(
@@ -1851,24 +1856,14 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
 }
 
 fn guest_unofficial_napi_module_wrap_create_cached_data(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    handle: i32,
-    result_ptr: i32,
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _handle: i32,
+    _result_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_create_cached_data(
-            env_handle,
-            handle as u32,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
-    }
-    status
+    // CreateCodeCache allocates native CachedData before a size can be read.
+    // Keep this import closed until the native allocation has an enforced cap.
+    1
 }
 
 fn guest_unofficial_napi_module_wrap_set_hooks(

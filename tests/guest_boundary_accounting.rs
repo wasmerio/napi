@@ -349,3 +349,156 @@ fn large_sparse_message_retains_charge_through_deserialization() {
     assert_eq!(budget.snapshot().serialized_message, 0);
     assert_eq!(budget.snapshot().host_transient, 0);
 }
+
+#[test]
+fn promise_rejection_callback_exit_crosses_both_import_namespaces() {
+    // Adapted from the fresh review's direct-WASM proof. Registering the
+    // callback after rejection makes mark_promise_as_handled invoke it.
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+      (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_reject_callback" (func $set_cb (param i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_mark_promise_as_handled" (func $mark_legacy (param i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_mark_promise_as_handled" (func $mark_current (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+      (elem (i32.const 0) $callback)
+      (data (i32.const 100) "exitNow\00")
+      (data (i32.const 150) "Promise.reject(7)\00")
+      (func $callback (param i32 i32) (result i32)
+        (call $exit (i32.const 23))
+        (i32.const 0))
+      (func (export "run") (param $mode i32) (result i32)
+        (local $env i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 1))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $function (local.get $env) (i32.const 100) (i32.const -1)
+                            (i32.const 0) (i32.const 0) (i32.const 12))
+          (then (return (i32.const 2))))
+        (if (call $global (local.get $env) (i32.const 16))
+          (then (return (i32.const 3))))
+        (if (call $set (local.get $env) (i32.load (i32.const 16))
+                       (i32.const 100) (i32.load (i32.const 12)))
+          (then (return (i32.const 4))))
+        (if (call $string (local.get $env) (i32.const 150) (i32.const -1) (i32.const 20))
+          (then (return (i32.const 5))))
+        (if (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24))
+          (then (return (i32.const 6))))
+        (if (call $set_cb (local.get $env) (i32.load (i32.const 12)))
+          (then (return (i32.const 7))))
+        (if (result i32) (i32.eqz (local.get $mode))
+          (then (call $mark_legacy (local.get $env) (i32.load (i32.const 24))))
+          (else (call $mark_current (local.get $env) (i32.load (i32.const 24)))))))"#;
+
+    for mode in 0..2 {
+        let ctx = NapiCtx::default();
+        let mut store = Store::default();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+        let session = ctx.new_session(&module).unwrap();
+        let mut imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        imports.define(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
+                Err(RuntimeError::user(Box::new(WasiError::Exit(
+                    ExitCode::from(code),
+                ))))
+            }),
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        session
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
+            .unwrap();
+        let run = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "run")
+            .unwrap();
+        let error = run.call(&mut store, mode).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<WasiError>(),
+                Some(WasiError::Exit(code)) if *code == ExitCode::from(23)
+            ),
+            "mode {mode}: {error}"
+        );
+        assert_eq!(ctx.budget().snapshot().host_transient, 0);
+    }
+}
+
+#[test]
+fn module_code_cache_imports_fail_before_native_allocation() {
+    // Use a live source-text module: an enabled import would reach V8's
+    // CreateCodeCache path, rather than fail on an invalid module handle.
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_release_env" (func $release (param i32) (result i32)))
+      (import "napi" "napi_create_object" (func $object (param i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_create_source_text" (func $module
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_destroy" (func $destroy (param i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_create_cached_data" (func $legacy
+        (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create_cached_data" (func $current
+        (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "test:cache-module")
+      (data (i32.const 140) "export const x = 1;")
+      (func (export "run") (param $mode i32) (result i32)
+        (local $env i32) (local $handle i32) (local $status i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 2))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $object (local.get $env) (i32.const 12))
+          (then (return (i32.const 3))))
+        (if (call $string (local.get $env) (i32.const 100) (i32.const 17) (i32.const 16))
+          (then (return (i32.const 4))))
+        (if (call $string (local.get $env) (i32.const 140) (i32.const 19) (i32.const 20))
+          (then (return (i32.const 5))))
+        (if (call $module (local.get $env) (i32.load (i32.const 12))
+              (i32.load (i32.const 16)) (i32.const 0) (i32.load (i32.const 20))
+              (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 24))
+          (then (return (i32.const 6))))
+        (local.set $handle (i32.load (i32.const 24)))
+        (i32.store (i32.const 40) (i32.const 123456))
+        (local.set $status (if (result i32) (i32.eqz (local.get $mode))
+          (then (call $legacy (local.get $env) (local.get $handle) (i32.const 40)))
+          (else (call $current (local.get $env) (local.get $handle) (i32.const 40)))))
+        (if (call $destroy (local.get $env) (local.get $handle))
+          (then (return (i32.const 7))))
+        (if (call $release (i32.load (i32.const 8)))
+          (then (return (i32.const 8))))
+        (local.get $status))
+      (func (export "output") (result i32) (i32.load (i32.const 40))))"#;
+
+    for mode in 0..2 {
+        let ctx = NapiCtx::default();
+        let budget = ctx.budget();
+        let mut store = Store::default();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+        let session = ctx.new_session(&module).unwrap();
+        let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        session
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
+            .unwrap();
+        let run = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "run")
+            .unwrap();
+        assert_eq!(run.call(&mut store, mode).unwrap(), 1, "mode {mode}");
+        let output = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "output")
+            .unwrap();
+        assert_eq!(output.call(&mut store).unwrap(), 123456);
+        assert_eq!(budget.snapshot().host_transient, 0);
+        assert_eq!(budget.snapshot().serialized_message, 0);
+    }
+}
