@@ -17,6 +17,7 @@ use crate::{
         MAX_NAPI_PROPERTY_DESCRIPTORS,
         callback::{take_pending_guest_exit, with_callback_state},
     },
+    message::{MessageCharge, SERIALIZATION_RESERVATION},
     snapi::*,
 };
 
@@ -658,13 +659,7 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    if env.data().host_stopped() {
-        unsafe {
-            snapi_bridge_unofficial_terminate_execution(env_handle);
-        }
-        return 1;
-    }
-    unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
+    env.data().cancel_guest_termination(env_handle)
 }
 
 fn guest_unofficial_napi_request_interrupt(
@@ -719,15 +714,36 @@ fn guest_unofficial_napi_message_create(
     if payload_out_ptr <= 0 {
         return 1;
     }
+    let pending = env.data().pending_messages.clone();
+    let Ok(mut charge) =
+        MessageCharge::reserve(env.data().budget.clone(), SERIALIZATION_RESERVATION)
+    else {
+        return 1;
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut message = 0u32;
+    let mut retained_bytes = 0u64;
     let status = unsafe {
-        snapi_bridge_unofficial_message_create(env_handle, value.max(0) as u32, &mut message)
+        snapi_bridge_unofficial_message_create_metered(
+            env_handle,
+            value.max(0) as u32,
+            &mut message,
+            &mut retained_bytes,
+        )
     };
-    if status == 0 {
-        write_guest_u32(&mut env, payload_out_ptr as u32, message);
+    if status != 0 {
+        return status;
     }
-    status
+    if !charge.shrink(retained_bytes) || pending.insert(message, charge).is_err() {
+        unsafe { snapi_bridge_unofficial_message_drop(message) };
+        return 1;
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr as u32, message) {
+        drop(pending.take(message));
+        unsafe { snapi_bridge_unofficial_message_drop(message) };
+        return 1;
+    }
+    0
 }
 
 fn guest_unofficial_napi_message_take(
@@ -739,6 +755,9 @@ fn guest_unofficial_napi_message_take(
     if payload <= 0 {
         return 1;
     }
+    let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
+        return 1;
+    };
     if result_out_ptr <= 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
         return 1;
@@ -753,8 +772,13 @@ fn guest_unofficial_napi_message_take(
     status
 }
 
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: i32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload.max(0) as u32) };
+fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: i32) {
+    if payload > 0 {
+        let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
+            return;
+        };
+        unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
+    }
 }
 
 fn guest_unofficial_napi_enqueue_microtask(
@@ -1051,28 +1075,15 @@ fn guest_unofficial_napi_configure_near_heap_limit_callback(
 }
 
 fn guest_unofficial_napi_profile_start(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    kind: i32,
-    result_ptr: i32,
-    profile_ptr: i32,
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _kind: i32,
+    _result_ptr: i32,
+    _profile_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut result = 0i32;
-    let mut profile = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_profile_start(env_handle, kind, &mut result, &mut profile)
-    };
-    if status != 0 {
-        return status;
-    }
-    if result_ptr > 0 {
-        write_guest_i32(&mut env, result_ptr as u32, result);
-    }
-    if profile_ptr > 0 {
-        write_guest_u32(&mut env, profile_ptr as u32, profile);
-    }
-    0
+    // V8's CPU and heap profilers retain native samples outside the per-app
+    // budget. Do not let a guest start an unbounded profiling session.
+    1
 }
 
 fn guest_unofficial_napi_profile_stop(
@@ -1252,6 +1263,12 @@ fn guest_unofficial_napi_contextify_run_script(
     host_defined_option_id: i32,
     result_ptr: i32,
 ) -> Result<i32, WasiError> {
+    // V8's contextify timeout and SIGINT options start unmanaged OS threads
+    // and can cancel a host-initiated isolate termination. The instance's
+    // own workload manager is the only authority for execution deadlines.
+    if timeout != -1 || break_on_sigint != 0 {
+        return Ok(1);
+    }
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };

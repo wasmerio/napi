@@ -53,7 +53,7 @@ struct HandleTable {
   uint32_t next_id = 1;
 
   uint32_t Store(void *handle) {
-    if (handle == nullptr)
+    if (handle == nullptr || next_id == 0)
       return 0;
     const uint32_t id = next_id++;
     handles[id] = handle;
@@ -197,9 +197,8 @@ struct CallbackBinding {
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>> &g_envs =
     *new std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>>();
-// Message resources cross environment boundaries, so their guest-visible IDs
-// cannot belong to either the source or destination environment. The table is
-// process-wide and each entry is removed atomically by take or drop.
+// Message resources cross worker environments. Rust validates each guest ID
+// against the owning NapiCtx before calling into this process-wide table.
 HandleTable &g_message_handles = *new HandleTable();
 
 CallbackBinding *RegisterCallbackBinding(SnapiEnvState *state,
@@ -512,6 +511,12 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
     state->control_cv.wait(control_lock,
                            [&] { return state->active_control_calls == 0; });
   }
+  // Env destruction runs native finalizers. Never let those callbacks reenter
+  // guest Wasm or JS: Rust has already removed this env from the host kill
+  // registry, and provider teardown clears its heap-limit hook before the
+  // finalizer drain. A finalizer that executes JS here would be unmetered and
+  // impossible for the workload manager to interrupt safely.
+  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   for (const auto &entry : state->buffer_lease_handles.handles) {
     (void)unofficial_napi_release_buffer_lease(
         state->env, static_cast<unofficial_napi_buffer_lease>(entry.second),
@@ -4393,9 +4398,9 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
-                                                      uint32_t value_id,
-                                                      uint32_t *message_out) {
+extern "C" int snapi_bridge_unofficial_message_create_metered(
+    SnapiEnvState *env_state, uint32_t value_id, uint32_t *message_out,
+    uint64_t *retained_bytes_out) {
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr || message_out == nullptr)
@@ -4408,6 +4413,14 @@ extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
       unofficial_napi_message_create(bridge_state->env, value, &message);
   if (status != napi_ok)
     return status;
+  // The guest reserved 32 MiB before entering V8. Reject any unexpected
+  // retained representation that would exceed that reservation.
+  const size_t retained_bytes =
+      unofficial_napi_message_retained_bytes(message) + 4096;
+  if (retained_bytes > 32 * 1024 * 1024) {
+    unofficial_napi_message_drop(message);
+    return napi_generic_failure;
+  }
   uint32_t message_id;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
@@ -4418,7 +4431,16 @@ extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
     return napi_generic_failure;
   }
   *message_out = message_id;
+  if (retained_bytes_out != nullptr)
+    *retained_bytes_out = retained_bytes;
   return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
+                                                      uint32_t value_id,
+                                                      uint32_t *message_out) {
+  return snapi_bridge_unofficial_message_create_metered(env_state, value_id,
+                                                       message_out, nullptr);
 }
 
 extern "C" int snapi_bridge_unofficial_message_take(SnapiEnvState *env_state,

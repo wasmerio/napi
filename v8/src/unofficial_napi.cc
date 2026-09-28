@@ -1427,6 +1427,8 @@ namespace {
 using v8impl::detail::DeserializerContext;
 using v8impl::detail::SerializerContext;
 
+void ThrowCloneTransferError(v8::Isolate* isolate, const char* message);
+
 void SetProtoMethod(v8::Isolate* isolate,
                     v8::Local<v8::FunctionTemplate> tmpl,
                     const char* name,
@@ -1448,8 +1450,24 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate)
-      : isolate_(isolate) {}
+  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate,
+                                             size_t max_buffer_bytes = 0)
+      : isolate_(isolate), max_buffer_bytes_(max_buffer_bytes) {}
+
+  void* ReallocateBufferMemory(void* old_buffer, size_t size,
+                               size_t* actual_size) override {
+    if (max_buffer_bytes_ != 0 && size > max_buffer_bytes_) return nullptr;
+    void* buffer = std::realloc(old_buffer, size);
+    if (buffer != nullptr) {
+      *actual_size = size;
+      buffer_capacity_ = size;
+    }
+    return buffer;
+  }
+
+  void FreeBufferMemory(void* buffer) override { std::free(buffer); }
+
+  size_t buffer_capacity() const { return buffer_capacity_; }
 
   void ThrowDataCloneError(v8::Local<v8::String> message) override {
     isolate_->ThrowException(v8::Exception::Error(message));
@@ -1465,6 +1483,11 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
         return v8::Just(i);
       }
     }
+    // Bound side-table metadata as well as the serialized byte buffer.
+    if (max_buffer_bytes_ != 0 && shared_array_buffers_.size() >= 65536) {
+      ThrowCloneTransferError(isolate_, "Too many shared buffers in message");
+      return v8::Nothing<uint32_t>();
+    }
     shared_array_buffers_.push_back(std::move(backing_store));
     return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
   }
@@ -1472,6 +1495,10 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
   v8::Maybe<uint32_t> GetWasmModuleTransferId(
       v8::Isolate* /*isolate*/,
       v8::Local<v8::WasmModuleObject> module) override {
+    if (max_buffer_bytes_ != 0 && wasm_modules_.size() >= 64) {
+      ThrowCloneTransferError(isolate_, "Too many Wasm modules in message");
+      return v8::Nothing<uint32_t>();
+    }
     wasm_modules_.push_back(module->GetCompiledModule());
     return v8::Just(static_cast<uint32_t>(wasm_modules_.size() - 1));
   }
@@ -1490,6 +1517,8 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
 
  private:
   v8::Isolate* isolate_ = nullptr;
+  size_t max_buffer_bytes_ = 0;
+  size_t buffer_capacity_ = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
   std::vector<v8::CompiledWasmModule> wasm_modules_;
 };
@@ -1525,7 +1554,9 @@ class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::
 };
 
 struct SerializedClonePayload {
-  std::vector<uint8_t> bytes;
+  std::unique_ptr<uint8_t, decltype(&std::free)> bytes{nullptr, &std::free};
+  size_t bytes_size = 0;
+  size_t bytes_capacity = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> array_buffers;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
   std::vector<v8::CompiledWasmModule> wasm_modules;
@@ -1596,7 +1627,8 @@ napi_status DetachTransferredArrayBuffers(
 
 napi_status DeserializeTransferredClone(
     napi_env env,
-    const std::vector<uint8_t>& bytes,
+    const uint8_t* bytes,
+    size_t bytes_size,
     const std::vector<std::shared_ptr<v8::BackingStore>>& array_buffers,
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
@@ -1611,8 +1643,8 @@ napi_status DeserializeTransferredClone(
       isolate, shared_array_buffers, wasm_modules);
   v8::ValueDeserializer deserializer(
       isolate,
-      bytes.data(),
-      bytes.size(),
+      bytes,
+      bytes_size,
       &deserializer_delegate);
 
   for (uint32_t i = 0; i < array_buffers.size(); ++i) {
@@ -1679,7 +1711,8 @@ napi_status StructuredCloneImpl(
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      bytes,
+      bytes.data(),
+      bytes.size(),
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
@@ -2282,7 +2315,10 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  // Worker messages are retained outside the V8 heap until another worker
+  // consumes them. Bound the native serializer buffer before it allocates.
+  constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, kMaxMessageBytes);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   serializer.WriteHeader();
@@ -2298,12 +2334,23 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
     std::free(released.first);
     return napi_generic_failure;
   }
-  payload->bytes.assign(released.first, released.first + released.second);
-  std::free(released.first);
+  payload->bytes.reset(released.first);
+  payload->bytes_size = released.second;
+  payload->bytes_capacity = serializer_delegate.buffer_capacity();
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
+}
+
+size_t unofficial_napi_message_retained_bytes(unofficial_napi_message message) {
+  auto* payload = reinterpret_cast<SerializedClonePayload*>(message);
+  if (payload == nullptr) return 0;
+  return sizeof(*payload) + payload->bytes_capacity +
+         payload->array_buffers.capacity() * sizeof(payload->array_buffers[0]) +
+         payload->shared_array_buffers.capacity() *
+             sizeof(payload->shared_array_buffers[0]) +
+         payload->wasm_modules.capacity() * sizeof(payload->wasm_modules[0]);
 }
 
 napi_status NAPI_CDECL unofficial_napi_message_take(
@@ -2326,7 +2373,8 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      payload->bytes,
+      payload->bytes.get(),
+      payload->bytes_size,
       payload->array_buffers,
       payload->shared_array_buffers,
       payload->wasm_modules,

@@ -297,6 +297,7 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   unofficial_napi_message message = nullptr;
   ASSERT_EQ(unofficial_napi_message_create(s.env, source, &message), napi_ok);
   ASSERT_NE(message, nullptr);
+  EXPECT_GT(unofficial_napi_message_retained_bytes(message), 0u);
 
   napi_value result = nullptr;
   ASSERT_EQ(unofficial_napi_message_take(s.env, message, &result), napi_ok);
@@ -311,6 +312,17 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   ASSERT_EQ(unofficial_napi_message_create(s.env, source, &dropped), napi_ok);
   ASSERT_NE(dropped, nullptr);
   unofficial_napi_message_drop(dropped);
+}
+
+TEST_F(Test21General, MessageSerializerRejectsOversizedPayload) {
+  EnvScope s(runtime_.get());
+  std::string bytes(5 * 1024 * 1024, 'x');
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, bytes.data(), bytes.size(), &value), napi_ok);
+  unofficial_napi_message message = nullptr;
+  EXPECT_EQ(unofficial_napi_message_create(s.env, value, &message),
+            napi_pending_exception);
+  EXPECT_EQ(message, nullptr);
 }
 
 TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {

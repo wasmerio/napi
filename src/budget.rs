@@ -103,6 +103,8 @@ pub enum Pool {
     /// Short-lived host snapshots of guest bytes and argument arrays. These
     /// are charged before allocation and released with their owning buffer.
     HostTransient,
+    /// Serialized worker messages retained between a sender and a receiver.
+    SerializedMessage,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -159,6 +161,7 @@ pub struct ResourceUsage {
     pub v8_background_lane: u64,
     /// Live bytes in host snapshots of guest data.
     pub host_transient: u64,
+    pub serialized_message: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -213,6 +216,7 @@ pub struct ResourceBudget {
     v8_external: AtomicU64,
     v8_background_lane: AtomicU64,
     host_transient: AtomicU64,
+    serialized_message: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -235,6 +239,10 @@ impl std::fmt::Debug for ResourceBudget {
             .field(
                 "host_transient",
                 &self.host_transient.load(Ordering::Acquire),
+            )
+            .field(
+                "serialized_message",
+                &self.serialized_message.load(Ordering::Acquire),
             )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
@@ -274,6 +282,7 @@ impl ResourceBudget {
             v8_external: AtomicU64::new(0),
             v8_background_lane: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -288,6 +297,7 @@ impl ResourceBudget {
             v8_external: AtomicU64::new(0),
             v8_background_lane: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -390,6 +400,7 @@ impl ResourceBudget {
             Pool::V8External => &self.v8_external,
             Pool::V8BackgroundLane => &self.v8_background_lane,
             Pool::HostTransient => &self.host_transient,
+            Pool::SerializedMessage => &self.serialized_message,
         }
     }
 
@@ -403,6 +414,7 @@ impl ResourceBudget {
             v8_external: self.v8_external.load(Ordering::Acquire),
             v8_background_lane: self.v8_background_lane.load(Ordering::Acquire),
             host_transient: self.host_transient.load(Ordering::Acquire),
+            serialized_message: self.serialized_message.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }

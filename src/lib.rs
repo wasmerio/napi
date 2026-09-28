@@ -8,6 +8,7 @@ mod guest;
 mod guest_heap;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod lane;
+mod message;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;

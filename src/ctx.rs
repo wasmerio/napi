@@ -15,6 +15,7 @@ use crate::{
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
+    message::PendingMessages,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +130,7 @@ struct NapiCtxInner {
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
     /// tunables and the V8 heap, external-memory, and lane reservations.
     budget: Arc<ResourceBudget>,
+    pending_messages: Arc<PendingMessages>,
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -265,6 +267,7 @@ impl NapiCtxBuilder {
             limits: self.limits,
             active_sessions: AtomicUsize::new(0),
             budget,
+            pending_messages: PendingMessages::new(),
             envs,
             host_stopped,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -510,6 +513,7 @@ impl NapiSession {
 
         let napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
+            Arc::clone(&self.inner.ctx.pending_messages),
             self.inner.ctx.limits.max_envs,
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),

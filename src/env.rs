@@ -15,6 +15,7 @@ use crate::budget::{
 };
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use crate::lane::{LaneScope, LazyBackgroundLane};
+use crate::message::PendingMessages;
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
@@ -94,6 +95,7 @@ pub(crate) struct NapiEnv {
     /// `max_envs` isolate count are charged against it; workers share the same
     /// `Arc` so the app-wide budget stays honest across stores.
     pub(crate) budget: Arc<ResourceBudget>,
+    pub(crate) pending_messages: Arc<PendingMessages>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
     pub(crate) max_envs: Option<usize>,
     env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
@@ -171,6 +173,7 @@ pub(crate) struct NapiEnv {
 impl NapiEnv {
     pub(crate) fn new(
         budget: Arc<ResourceBudget>,
+        pending_messages: Arc<PendingMessages>,
         max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
         host_stopped: Arc<AtomicBool>,
@@ -180,6 +183,7 @@ impl NapiEnv {
     ) -> Self {
         Self {
             budget,
+            pending_messages,
             max_envs,
             env_registry,
             host_stopped,
@@ -385,6 +389,27 @@ impl NapiEnv {
         self.host_stopped.load(Ordering::Acquire)
     }
 
+    /// Serialize guest cancellation with host termination. The host sets its
+    /// sticky flag before taking this registry lock and terminates every live
+    /// isolate while holding it. If a kill races this call, either cancellation
+    /// is refused or the kill's termination happens after cancellation.
+    pub(crate) fn cancel_guest_termination(&self, env: SnapiEnv) -> i32 {
+        let _registry = self
+            .env_registry
+            .lock()
+            .expect("poisoned N-API env registry");
+        if self.host_stopped() {
+            if !env.is_null() {
+                unsafe { crate::snapi::snapi_bridge_unofficial_terminate_execution(env) };
+            }
+            return 1;
+        }
+        if env.is_null() {
+            return 1;
+        }
+        unsafe { crate::snapi::snapi_bridge_unofficial_cancel_terminate_execution(env) }
+    }
+
     /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
     /// callback must be refused) once [`MAX_CALLBACK_DEPTH`] is reached, so a
     /// runaway recursion across the FFI boundary cannot overflow the host native
@@ -565,6 +590,7 @@ mod tests {
         let budget = ResourceBudget::with_memory_limit(10 * MIB);
         let mut env = NapiEnv::new(
             Arc::clone(&budget),
+            PendingMessages::new(),
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -596,6 +622,7 @@ mod tests {
         {
             let mut env = NapiEnv::new(
                 Arc::clone(&budget),
+                PendingMessages::new(),
                 None,
                 Arc::new(std::sync::Mutex::new(HashSet::new())),
                 Arc::new(AtomicBool::new(false)),
@@ -616,6 +643,7 @@ mod tests {
     fn callback_reentrancy_is_bounded() {
         let mut env = NapiEnv::new(
             ResourceBudget::unlimited(),
+            PendingMessages::new(),
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
