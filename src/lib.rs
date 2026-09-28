@@ -35,7 +35,7 @@ pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy};
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-pub use lane::{BackgroundTaskScope, BackgroundThreadSpawner};
+pub use lane::{BackgroundTaskScope, ManagedV8Lane, ManagedV8LaneActivator, ManagedV8LaneScope};
 
 /// Host capabilities required by the JavaScript-backed N-API implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

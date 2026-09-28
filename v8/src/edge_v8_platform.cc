@@ -23,12 +23,11 @@ namespace {
 // from accumulating unbounded host-side Task objects while the lane is busy.
 class BackgroundLane {
  public:
-  static constexpr size_t kMaxQueuedTasks = 256;
-
-  BackgroundLane(void* scope_context, void* (*enter_scope)(void*),
+  BackgroundLane(size_t max_queued_tasks,
+                 void* scope_context, void* (*enter_scope)(void*),
                  bool (*leave_scope)(void*, void*),
                  void (*on_overload)(void*))
-      : scope_context_(scope_context), enter_scope_(enter_scope),
+      : max_queued_tasks_(max_queued_tasks), scope_context_(scope_context), enter_scope_(enter_scope),
         leave_scope_(leave_scope), on_overload_(on_overload) {}
 
   bool Post(std::unique_ptr<v8::Task> task, double delay_seconds) {
@@ -41,7 +40,7 @@ class BackgroundLane {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopped_) return false;
-      if (queue_.size() < kMaxQueuedTasks) {
+      if (queue_.size() < max_queued_tasks_) {
         Item item{Clock::now() + delay, std::move(task)};
         auto it = queue_.begin();
         while (it != queue_.end() && it->due <= item.due) ++it;
@@ -140,6 +139,7 @@ class BackgroundLane {
   bool running_ = false;
   bool stopped_ = false;
   bool overloaded_ = false;
+  size_t max_queued_tasks_ = 0;
   void* scope_context_ = nullptr;
   void* (*enter_scope_)(void*) = nullptr;
   bool (*leave_scope_)(void*, void*) = nullptr;
@@ -212,12 +212,14 @@ void CleanupForegroundTaskRecord(napi_env /*env*/, void* data);
 
 }  // namespace
 
-extern "C" void* snapi_v8_lane_new(void* scope_context,
+extern "C" void* snapi_v8_lane_new(size_t max_queued_tasks,
+                                     void* scope_context,
                                      void* (*enter_scope)(void*),
                                      bool (*leave_scope)(void*, void*),
                                      void (*on_overload)(void*)) {
+  if (max_queued_tasks == 0) return nullptr;
   return new (std::nothrow)
-      BackgroundLane(scope_context, enter_scope, leave_scope, on_overload);
+      BackgroundLane(max_queued_tasks, scope_context, enter_scope, leave_scope, on_overload);
 }
 
 extern "C" void snapi_v8_lane_run(void* handle) {

@@ -132,7 +132,7 @@ fn guest_messages_remain_charged_until_instance_shutdown() {
         budget.snapshot().serialized_message > 0,
         "queued message escaped memory accounting"
     );
-    ctx.runtime_control().shutdown_background_lane();
+    ctx.runtime_control().terminate_all();
     assert_eq!(budget.snapshot().serialized_message, 0);
     drop(ctx);
 }

@@ -14,7 +14,7 @@ use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-use crate::lane::{LaneScope, LazyBackgroundLane};
+use crate::lane::{ManagedV8Lane, ManagedV8LaneActivator, ManagedV8LaneScope};
 use crate::message::PendingMessages;
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
@@ -101,7 +101,9 @@ pub(crate) struct NapiEnv {
     env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    background_lane: Option<Arc<LazyBackgroundLane>>,
+    managed_lane_activator: Option<ManagedV8LaneActivator>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    managed_lane: Option<Arc<ManagedV8Lane>>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
@@ -177,8 +179,8 @@ impl NapiEnv {
         max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
         host_stopped: Arc<AtomicBool>,
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] background_lane: Option<
-            Arc<LazyBackgroundLane>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] managed_lane_activator: Option<
+            ManagedV8LaneActivator,
         >,
     ) -> Self {
         Self {
@@ -188,7 +190,9 @@ impl NapiEnv {
             env_registry,
             host_stopped,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            background_lane,
+            managed_lane_activator,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            managed_lane: None,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
             callback_depth: 0,
@@ -237,14 +241,23 @@ impl NapiEnv {
     }
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) fn enter_background_lane(&self) -> anyhow::Result<Option<LaneScope>> {
+    pub(crate) fn enter_background_lane(&mut self) -> anyhow::Result<Option<ManagedV8LaneScope>> {
         if self.host_stopped.load(Ordering::Acquire) {
             anyhow::bail!("N-API instance has been stopped");
         }
-        self.background_lane
-            .as_ref()
-            .map(|lane| lane.enter())
-            .transpose()
+        let Some(activate) = &self.managed_lane_activator else {
+            return Ok(None);
+        };
+        if self.managed_lane.is_none() {
+            let lane = activate()?;
+            // Activation can race a host stop. Edge rejects late activation,
+            // and the provider rechecks its own sticky stop flag before V8.
+            if self.host_stopped.load(Ordering::Acquire) {
+                anyhow::bail!("N-API instance stopped during activation");
+            }
+            self.managed_lane = Some(lane);
+        }
+        Ok(self.managed_lane.as_ref().map(ManagedV8Lane::enter))
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]

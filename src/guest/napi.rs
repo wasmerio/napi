@@ -74,7 +74,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     if !ensure_guest_heap(&mut env) {
         return 0;
     }
-    let Ok(_lane_scope) = env.data().enter_background_lane() else {
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
         return 0;
     };
     let _ = unsafe { snapi_bridge_init() };
@@ -303,7 +303,7 @@ fn guest_unofficial_napi_create_env(
     if !ensure_guest_heap(&mut env) {
         return 1;
     }
-    let Ok(_lane_scope) = env.data().enter_background_lane() else {
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
         return 1;
     };
     let (

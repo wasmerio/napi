@@ -9,7 +9,7 @@ use std::{
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-use crate::lane::{BackgroundTaskScope, BackgroundThreadSpawner, LazyBackgroundLane};
+use crate::lane::ManagedV8LaneActivator;
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
@@ -42,15 +42,11 @@ impl NapiLimits {
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    background_thread_spawner: Option<BackgroundThreadSpawner>,
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    background_task_scope: Option<BackgroundTaskScope>,
 }
 
 #[derive(Clone, Debug)]
 pub struct NapiCtx {
-    inner: Arc<NapiCtxInner>,
+    inner: Arc<NapiProviderBindings>,
 }
 
 #[derive(Clone)]
@@ -74,7 +70,7 @@ pub struct NapiInstantiationState {
 // the shared state below owns only instance-wide accounting and stop control.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
-    inner: Arc<NapiCtxInner>,
+    inner: Arc<NapiProviderBindings>,
 }
 
 /// Opaque control surface for stopping every V8 isolate owned by a context.
@@ -83,8 +79,6 @@ pub struct NapiRuntimeControl {
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
     pending_messages: Arc<PendingMessages>,
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    background_lane: Option<Arc<LazyBackgroundLane>>,
 }
 
 impl NapiRuntimeControl {
@@ -110,24 +104,13 @@ impl NapiRuntimeControl {
             }
         }
         drop(envs);
-        self.shutdown_background_lane();
-    }
-
-    /// Close admission to the instance's V8 background lane and wake its
-    /// worker. The embedder waits for that worker's activity lease before
-    /// final instance drain. Safe to call before the first N-API invocation.
-    pub fn shutdown_background_lane(&self) {
-        self.host_stopped.store(true, Ordering::Release);
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        if let Some(lane) = &self.background_lane {
-            lane.stop();
-        }
         self.pending_messages.close_and_clear();
     }
 }
 
-#[derive(Debug)]
-struct NapiCtxInner {
+/// Lightweight import bindings. Managed embedders construct these while
+/// linking a module; no NapiCtx, V8 isolate, or background queue exists yet.
+struct NapiProviderBindings {
     limits: NapiLimits,
     active_sessions: AtomicUsize,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
@@ -137,11 +120,18 @@ struct NapiCtxInner {
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    background_lane: Option<Arc<LazyBackgroundLane>>,
+    managed_lane_activator: Option<ManagedV8LaneActivator>,
+}
+
+impl std::fmt::Debug for NapiProviderBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NapiProviderBindings")
+            .finish_non_exhaustive()
+    }
 }
 
 struct NapiSessionInner {
-    ctx: Arc<NapiCtxInner>,
+    ctx: Arc<NapiProviderBindings>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
     func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
@@ -193,33 +183,15 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Build lightweight import bindings for a managed embedder. The embedder
+    /// owns lazy instance activation and must return its managed V8 task queue
+    /// when a guest first creates an environment. Importing functions does not
+    /// invoke the callback or allocate a NapiCtx, V8 isolate, or queue.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn background_thread_spawner(mut self, spawner: BackgroundThreadSpawner) -> Self {
-        self.background_thread_spawner = Some(spawner);
-        self
-    }
-
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn background_task_scope(mut self, scope: BackgroundTaskScope) -> Self {
-        self.background_task_scope = Some(scope);
-        self
-    }
-
-    /// Build hooks without constructing a public `NapiCtx`, V8 isolate, or
-    /// native thread. The lane starts only when a guest calls an env-creation
-    /// import; merely importing the function does not start it.
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn build_lazy_hooks(self) -> Result<NapiRuntimeHooks> {
-        let spawner = self
-            .background_thread_spawner
-            .clone()
-            .context("lazy N-API hooks require a background thread spawner")?;
-        let task_scope = self
-            .background_task_scope
-            .clone()
-            .context("lazy N-API hooks require a background task scope")?;
-        let inner = self.build_inner(Some((spawner, task_scope)));
-        Ok(NapiRuntimeHooks { inner })
+    pub fn build_managed_imports(self, activator: ManagedV8LaneActivator) -> NapiRuntimeHooks {
+        NapiRuntimeHooks {
+            inner: self.build_inner(Some(activator)),
+        }
     }
 
     pub fn build(self) -> NapiCtx {
@@ -230,12 +202,11 @@ impl NapiCtxBuilder {
 
     fn build_inner(
         self,
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] background: Option<(
-            BackgroundThreadSpawner,
-            BackgroundTaskScope,
-        )>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] managed_lane_activator: Option<
+            ManagedV8LaneActivator,
+        >,
         #[cfg(all(target_arch = "wasm32", feature = "js"))] _background: Option<()>,
-    ) -> Arc<NapiCtxInner> {
+    ) -> Arc<NapiProviderBindings> {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
             None => match self.limits.memory_budget_bytes() {
@@ -245,28 +216,7 @@ impl NapiCtxBuilder {
         };
         let envs = Arc::new(Mutex::new(HashSet::new()));
         let host_stopped = Arc::new(AtomicBool::new(false));
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        let background_lane = background.map(|(spawner, task_scope)| {
-            let envs_for_stop = Arc::clone(&envs);
-            let stopped_for_stop = Arc::clone(&host_stopped);
-            Arc::new(LazyBackgroundLane::new(
-                spawner,
-                Arc::new(move || {
-                    stopped_for_stop.store(true, Ordering::Release);
-                    let live = envs_for_stop.lock().expect("poisoned N-API env registry");
-                    for env in live.iter().copied() {
-                        unsafe {
-                            crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                                env as crate::snapi::SnapiEnv,
-                            );
-                        }
-                    }
-                }),
-                Arc::clone(&budget),
-                task_scope,
-            ))
-        });
-        Arc::new(NapiCtxInner {
+        Arc::new(NapiProviderBindings {
             limits: self.limits,
             active_sessions: AtomicUsize::new(0),
             budget,
@@ -274,7 +224,7 @@ impl NapiCtxBuilder {
             envs,
             host_stopped,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            background_lane,
+            managed_lane_activator,
         })
     }
 }
@@ -356,7 +306,7 @@ impl NapiCtx {
     }
 }
 
-fn new_session(ctx: &Arc<NapiCtxInner>, module: &Module) -> Result<NapiSession> {
+fn new_session(ctx: &Arc<NapiProviderBindings>, module: &Module) -> Result<NapiSession> {
     let previous = ctx.active_sessions.fetch_add(1, Ordering::AcqRel);
     if let Some(max_sessions) = ctx.limits.max_sessions
         && previous >= max_sessions
@@ -396,13 +346,11 @@ fn new_session(ctx: &Arc<NapiCtxInner>, module: &Module) -> Result<NapiSession> 
 }
 
 impl NapiRuntimeControl {
-    fn from_inner(inner: &Arc<NapiCtxInner>) -> Self {
+    fn from_inner(inner: &Arc<NapiProviderBindings>) -> Self {
         Self {
             envs: Arc::clone(&inner.envs),
             host_stopped: Arc::clone(&inner.host_stopped),
             pending_messages: Arc::clone(&inner.pending_messages),
-            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            background_lane: inner.background_lane.clone(),
         }
     }
 }
@@ -417,20 +365,6 @@ impl NapiRuntimeHooks {
         NapiRuntimeControl::from_inner(&self.inner)
     }
 
-    /// Whether this instance has started its dedicated V8 background lane.
-    pub fn is_initialized(&self) -> bool {
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        {
-            self.inner
-                .background_lane
-                .as_ref()
-                .is_some_and(|lane| lane.is_initialized())
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        {
-            false
-        }
-    }
     /// Creates N-API imports when `module` requests them.
     pub fn additional_imports(
         &self,
@@ -522,7 +456,7 @@ impl NapiSession {
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            self.inner.ctx.background_lane.clone(),
+            self.inner.ctx.managed_lane_activator.clone(),
         );
         let func_env = FunctionEnv::new(store, napi_env);
         {
@@ -738,22 +672,37 @@ mod tests {
     }
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    fn lazy_hooks(spawns: Arc<AtomicUsize>, finished: mpsc::Sender<()>) -> super::NapiRuntimeHooks {
-        NapiCtx::builder()
-            .background_thread_spawner(Arc::new(move |work| {
-                spawns.fetch_add(1, Ordering::SeqCst);
+    fn managed_hooks(
+        spawns: Arc<AtomicUsize>,
+        finished: mpsc::Sender<()>,
+    ) -> (
+        super::NapiRuntimeHooks,
+        Arc<std::sync::Mutex<Option<Arc<crate::ManagedV8Lane>>>>,
+    ) {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let activator = {
+            let slot = Arc::clone(&slot);
+            Arc::new(move || {
+                let mut guard = slot.lock().unwrap();
+                if let Some(lane) = &*guard {
+                    return Ok(Arc::clone(lane));
+                }
+                let lane =
+                    crate::ManagedV8Lane::new(256, Arc::new(|| Box::new(())), Arc::new(|| {}))?;
+                let worker_lane = Arc::clone(&lane);
                 let finished = finished.clone();
                 thread::Builder::new()
                     .name("test-v8-lane".into())
                     .spawn(move || {
-                        work();
+                        worker_lane.run();
                         let _ = finished.send(());
                     })?;
-                Ok(())
-            }))
-            .background_task_scope(Arc::new(|| Box::new(())))
-            .build_lazy_hooks()
-            .expect("lazy hooks")
+                spawns.fetch_add(1, Ordering::SeqCst);
+                *guard = Some(Arc::clone(&lane));
+                Ok(lane)
+            })
+        };
+        (NapiCtx::builder().build_managed_imports(activator), slot)
     }
 
     #[test]
@@ -761,7 +710,7 @@ mod tests {
     fn lazy_hooks_start_lane_only_when_guest_calls_napi() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, finished_rx) = mpsc::channel();
-        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
         let mut store = Store::default();
         let import_only = compile_wat(
             &store,
@@ -783,7 +732,7 @@ mod tests {
                 state,
             )
             .unwrap();
-        assert!(!hooks.is_initialized());
+        assert!(!lane_slot.lock().unwrap().is_some());
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
         let invoked = compile_wat(
@@ -804,12 +753,12 @@ mod tests {
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
         let invoke = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .get_typed_function::<(), i32>(&store, "invoke")
             .unwrap();
         assert!(invoke.call(&mut store).unwrap() > 0);
-        assert!(hooks.is_initialized());
+        assert!(lane_slot.lock().unwrap().is_some());
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
-        hooks.runtime_control().shutdown_background_lane();
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
         finished_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("lane stops");
@@ -820,7 +769,7 @@ mod tests {
     fn start_section_initialization_requires_a_guest_heap() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, finished_rx) = mpsc::channel();
-        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
         let mut store = Store::default();
 
         // A module-defined memory cannot be reached by imports until after
@@ -842,11 +791,11 @@ mod tests {
         let instance = Instance::new(&mut store, &unavailable, &imports).unwrap();
         let result = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .get_typed_function::<(), i32>(&store, "start_result")
             .unwrap();
         assert_eq!(result.call(&mut store).unwrap(), 0);
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        assert!(!hooks.is_initialized());
+        assert!(!lane_slot.lock().unwrap().is_some());
 
         let unavailable_extension = compile_wat(
             &store,
@@ -868,11 +817,11 @@ mod tests {
         let instance = Instance::new(&mut store, &unavailable_extension, &imports).unwrap();
         let result = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .get_typed_function::<(), i32>(&store, "start_result")
             .unwrap();
         assert_ne!(result.call(&mut store).unwrap(), 0);
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        assert!(!hooks.is_initialized());
+        assert!(!lane_slot.lock().unwrap().is_some());
 
         // Imported memory is available during start. The first call installs
         // the guest heap before V8, and setup retains that same allocator.
@@ -927,17 +876,17 @@ mod tests {
         assert!(Arc::ptr_eq(&heap_before, &heap_after));
         let result = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .get_typed_function::<(), i32>(&store, "start_result")
             .unwrap();
         let start_id = result.call(&mut store).unwrap();
         assert!(start_id > 0);
         let invoke = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .get_typed_function::<(), i32>(&store, "invoke")
             .unwrap();
         assert_eq!(invoke.call(&mut store).unwrap(), start_id);
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
-        hooks.runtime_control().shutdown_background_lane();
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
         finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
@@ -946,7 +895,7 @@ mod tests {
     fn stopped_lazy_hooks_never_start_lane() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, _finished_rx) = mpsc::channel();
-        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
         hooks.runtime_control().terminate_all();
         let mut store = Store::default();
         let module = compile_wat(
@@ -966,11 +915,11 @@ mod tests {
             .unwrap();
         let invoke = instance
             .exports
-            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .get_typed_function::<(), i32>(&store, "invoke")
             .unwrap();
         assert_eq!(invoke.call(&mut store).unwrap(), 0);
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        assert!(!hooks.is_initialized());
+        assert!(!lane_slot.lock().unwrap().is_some());
     }
 
     #[test]

@@ -1,32 +1,20 @@
-//! One bounded V8 background execution lane per embedding context.
+//! Opaque V8 background task queue for an embedder-managed execution lane.
 
-use std::{
-    ffi::c_void,
-    ptr::NonNull,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Duration,
-};
+use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-use crate::budget::{Pool, ResourceBudget};
 use anyhow::{Result, bail};
-
-const LANE_RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
-
-/// The embedder schedules one dedicated, instance-accounted native thread.
-/// Returning an error must mean the closure was not accepted for execution.
-pub type BackgroundThreadSpawner =
-    Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> Result<()> + Send + Sync>;
 
 /// Called for each actual V8 background task. Dropping the returned guard
 /// ends that task's metered active interval.
 pub type BackgroundTaskScope = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
+/// Called by the provider on the first guest environment creation. The
+/// embedder owns lazy admission, worker startup, stop, and completion.
+pub type ManagedV8LaneActivator = Arc<dyn Fn() -> Result<Arc<ManagedV8Lane>> + Send + Sync>;
+
 unsafe extern "C" {
     fn snapi_v8_lane_new(
+        max_queued_tasks: usize,
         scope_context: *mut c_void,
         enter_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
         leave_scope: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
@@ -38,11 +26,9 @@ unsafe extern "C" {
     fn snapi_v8_lane_swap_current(handle: *mut c_void) -> *mut c_void;
 }
 
-struct BackgroundLane {
+pub struct ManagedV8Lane {
     handle: NonNull<c_void>,
     _callbacks: Box<LaneCallbacks>,
-    budget: Arc<ResourceBudget>,
-    charged: AtomicBool,
 }
 
 struct LaneCallbacks {
@@ -52,22 +38,30 @@ struct LaneCallbacks {
 
 // The C++ lane synchronizes all queue access. Its handle remains allocated
 // while either the context or its dedicated worker owns this Arc.
-unsafe impl Send for BackgroundLane {}
-unsafe impl Sync for BackgroundLane {}
+unsafe impl Send for ManagedV8Lane {}
+unsafe impl Sync for ManagedV8Lane {}
 
-impl BackgroundLane {
-    fn new(
-        budget: Arc<ResourceBudget>,
+impl std::fmt::Debug for ManagedV8Lane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedV8Lane").finish_non_exhaustive()
+    }
+}
+
+impl ManagedV8Lane {
+    /// Allocate only the provider queue adapter. The embedder must first
+    /// reserve its memory charge and native-thread admission.
+    pub fn new(
+        max_queued_tasks: usize,
         task_scope: BackgroundTaskScope,
         on_overload: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<Self> {
-        budget.try_charge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES)?;
+    ) -> Result<Arc<Self>> {
         let callbacks = Box::new(LaneCallbacks {
             task_scope,
             on_overload,
         });
         let handle = NonNull::new(unsafe {
             snapi_v8_lane_new(
+                max_queued_tasks,
                 (&*callbacks as *const LaneCallbacks).cast_mut().cast(),
                 enter_task_scope,
                 leave_task_scope,
@@ -75,48 +69,43 @@ impl BackgroundLane {
             )
         });
         let Some(handle) = handle else {
-            budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
             bail!("failed to allocate V8 background lane");
         };
-        Ok(Self {
+        Ok(Arc::new(Self {
             handle,
             _callbacks: callbacks,
-            budget,
-            charged: AtomicBool::new(true),
-        })
+        }))
     }
 
-    fn stop(&self) {
+    /// Close queue admission and wake the worker. Idempotent.
+    pub fn stop(&self) {
         unsafe { snapi_v8_lane_stop(self.handle.as_ptr()) }
     }
 
-    fn run(&self) {
+    /// Run the queue on the embedder's dedicated, instance-accounted thread.
+    /// Returns once `stop` is called and the current task finishes.
+    pub fn run(&self) {
         unsafe { snapi_v8_lane_run(self.handle.as_ptr()) }
     }
 
-    fn release_reservation(&self) {
-        if self.charged.swap(false, Ordering::AcqRel) {
-            self.budget
-                .uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
-        }
-    }
-
-    fn enter(self: &Arc<Self>) -> LaneScope {
+    /// Bind this queue to the calling thread while V8 creates or enters an
+    /// isolate. The guard restores the previous binding on drop.
+    pub fn enter(self: &Arc<Self>) -> ManagedV8LaneScope {
         let previous = unsafe { snapi_v8_lane_swap_current(self.handle.as_ptr()) };
-        LaneScope {
+        ManagedV8LaneScope {
             previous,
             _lane: Arc::clone(self),
+            _thread_bound: std::marker::PhantomData,
         }
     }
 }
 
-impl Drop for BackgroundLane {
+impl Drop for ManagedV8Lane {
     fn drop(&mut self) {
         unsafe {
             snapi_v8_lane_stop(self.handle.as_ptr());
             snapi_v8_lane_delete(self.handle.as_ptr());
         }
-        self.release_reservation();
     }
 }
 
@@ -151,183 +140,31 @@ unsafe extern "C" fn leave_task_scope(_context: *mut c_void, scope: *mut c_void)
     .is_ok()
 }
 
-pub(crate) struct LaneScope {
+pub struct ManagedV8LaneScope {
     previous: *mut c_void,
-    _lane: Arc<BackgroundLane>,
+    _lane: Arc<ManagedV8Lane>,
+    // Restoring a V8 platform binding is meaningful only on the thread that
+    // entered it. Keep this scope statically non-Send even if pointer auto
+    // traits change in a future compiler.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl Drop for LaneScope {
+impl Drop for ManagedV8LaneScope {
     fn drop(&mut self) {
         unsafe { snapi_v8_lane_swap_current(self.previous) };
-    }
-}
-
-enum State {
-    Uninitialized,
-    Initializing(Option<Arc<BackgroundLane>>),
-    Ready(Arc<BackgroundLane>),
-    // Keep the native lane allocation until all N-API sessions drop. The C++
-    // env state retains a raw lane pointer even after stop is requested.
-    Stopped(Option<Arc<BackgroundLane>>),
-}
-
-pub(crate) struct LazyBackgroundLane {
-    spawner: BackgroundThreadSpawner,
-    state: Mutex<State>,
-    changed: Condvar,
-    on_overload: Arc<dyn Fn() + Send + Sync>,
-    budget: Arc<ResourceBudget>,
-    task_scope: BackgroundTaskScope,
-}
-
-impl std::fmt::Debug for LazyBackgroundLane {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LazyBackgroundLane").finish_non_exhaustive()
-    }
-}
-
-impl LazyBackgroundLane {
-    pub(crate) fn new(
-        spawner: BackgroundThreadSpawner,
-        on_overload: Arc<dyn Fn() + Send + Sync>,
-        budget: Arc<ResourceBudget>,
-        task_scope: BackgroundTaskScope,
-    ) -> Self {
-        Self {
-            spawner,
-            state: Mutex::new(State::Uninitialized),
-            changed: Condvar::new(),
-            on_overload,
-            budget,
-            task_scope,
-        }
-    }
-
-    pub(crate) fn enter(&self) -> Result<LaneScope> {
-        let lane = self.ensure_started()?;
-        Ok(lane.enter())
-    }
-
-    fn ensure_started(&self) -> Result<Arc<BackgroundLane>> {
-        let mut state = self.state.lock().expect("poisoned V8 lane state");
-        loop {
-            match &*state {
-                State::Ready(lane) => return Ok(Arc::clone(lane)),
-                State::Stopped(_) => bail!("V8 background lane is stopped"),
-                State::Initializing(_) => {
-                    state = self.changed.wait(state).expect("poisoned V8 lane state");
-                }
-                State::Uninitialized => {
-                    *state = State::Initializing(None);
-                    break;
-                }
-            }
-        }
-        drop(state);
-
-        let result = (|| {
-            let lane = Arc::new(BackgroundLane::new(
-                Arc::clone(&self.budget),
-                Arc::clone(&self.task_scope),
-                Arc::clone(&self.on_overload),
-            )?);
-            {
-                let mut state = self.state.lock().expect("poisoned V8 lane state");
-                match &mut *state {
-                    State::Initializing(slot) => *slot = Some(Arc::clone(&lane)),
-                    State::Stopped(_) => {
-                        lane.stop();
-                        bail!("V8 background lane stopped during initialization");
-                    }
-                    _ => unreachable!("lane initializer lost ownership"),
-                }
-            }
-            let worker_lane = Arc::clone(&lane);
-            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-            (self.spawner)(Box::new(move || {
-                let _ = ready_tx.send(());
-                worker_lane.run();
-                worker_lane.release_reservation();
-            }))?;
-            if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-                lane.stop();
-                bail!("V8 background lane did not start within five seconds");
-            }
-            Ok::<_, anyhow::Error>(lane)
-        })();
-
-        let mut state = self.state.lock().expect("poisoned V8 lane state");
-        let outcome = match result {
-            Ok(lane) if matches!(*state, State::Initializing(_)) => {
-                *state = State::Ready(Arc::clone(&lane));
-                Ok(lane)
-            }
-            Ok(lane) => {
-                lane.stop();
-                // `stop()` already retained the allocation if this init
-                // raced it; the local `Arc` may now be released.
-                drop(lane);
-                bail!("V8 background lane stopped during initialization")
-            }
-            Err(error) => {
-                if matches!(*state, State::Initializing(_)) {
-                    *state = State::Uninitialized;
-                }
-                Err(error)
-            }
-        };
-        self.changed.notify_all();
-        outcome
-    }
-
-    pub(crate) fn stop(&self) {
-        let mut state = self.state.lock().expect("poisoned V8 lane state");
-        let previous = std::mem::replace(&mut *state, State::Stopped(None));
-        *state = match previous {
-            State::Ready(lane) => {
-                lane.stop();
-                State::Stopped(Some(lane))
-            }
-            State::Stopped(lane) => State::Stopped(lane),
-            State::Initializing(lane) => {
-                if let Some(lane) = &lane {
-                    lane.stop();
-                }
-                State::Stopped(lane)
-            }
-            _ => State::Stopped(None),
-        };
-        self.changed.notify_all();
-    }
-
-    pub(crate) fn is_initialized(&self) -> bool {
-        matches!(
-            *self.state.lock().expect("poisoned V8 lane state"),
-            State::Ready(_)
-        )
-    }
-}
-
-impl Drop for LazyBackgroundLane {
-    fn drop(&mut self) {
-        // The worker owns an Arc<BackgroundLane> while it waits for work. If
-        // the embedding context is dropped without an explicit shutdown,
-        // dropping our Arc alone cannot wake that worker or release its lane
-        // reservation. Stop is idempotent and lets the worker quiesce.
-        self.stop();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{
-            Barrier,
-            atomic::{AtomicUsize, Ordering},
-        },
-        thread,
+    use std::sync::{
+        Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
+    use std::thread;
+    use std::time::Duration;
 
     unsafe extern "C" {
         fn snapi_v8_lane_post_test_task(
@@ -356,47 +193,23 @@ mod tests {
 
     unsafe extern "C" fn run_noop_task(_data: *mut c_void) {}
 
-    fn post(lane: &LazyBackgroundLane, task: TestTask) {
-        let handle = match &*lane.state.lock().unwrap() {
-            State::Ready(lane) => lane.handle.as_ptr(),
-            _ => panic!("lane not ready"),
-        };
+    #[test]
+    fn zero_queue_capacity_is_rejected() {
+        assert!(ManagedV8Lane::new(0, Arc::new(|| Box::new(())), Arc::new(|| {})).is_err());
+    }
+
+    fn post(lane: &ManagedV8Lane, task: TestTask) {
         let data = Box::into_raw(Box::new(task));
-        if !unsafe { snapi_v8_lane_post_test_task(handle, run_test_task, data.cast()) } {
+        if !unsafe {
+            snapi_v8_lane_post_test_task(lane.handle.as_ptr(), run_test_task, data.cast())
+        } {
             drop(unsafe { Box::from_raw(data) });
             panic!("task admission rejected");
         }
     }
 
     #[test]
-    fn dropping_hooks_stops_an_idle_lane_and_releases_its_charge() {
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
-            let finished_tx = finished_tx.clone();
-            thread::spawn(move || {
-                work();
-                let _ = finished_tx.send(());
-            });
-            Ok(())
-        });
-        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
-        let lane = LazyBackgroundLane::new(
-            spawner,
-            Arc::new(|| {}),
-            Arc::clone(&budget),
-            Arc::new(|| Box::new(())),
-        );
-        drop(lane.enter().unwrap());
-        assert_eq!(budget.snapshot().v8_background_lane, LANE_RESERVATION_BYTES);
-        drop(lane);
-        finished_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("idle worker exits when its owner drops");
-        assert_eq!(budget.snapshot().v8_background_lane, 0);
-    }
-
-    #[test]
-    fn a_blocked_instance_lane_does_not_stall_another() {
+    fn blocked_lane_does_not_stall_another_and_scopes_are_balanced() {
         let entered = Arc::new(AtomicUsize::new(0));
         let exited = Arc::new(AtomicUsize::new(0));
         struct Guard(Arc<AtomicUsize>);
@@ -406,15 +219,6 @@ mod tests {
             }
         }
         let make_lane = || {
-            let (finished_tx, finished_rx) = mpsc::channel();
-            let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
-                let finished_tx = finished_tx.clone();
-                thread::Builder::new().spawn(move || {
-                    work();
-                    let _ = finished_tx.send(());
-                })?;
-                Ok(())
-            });
             let scope: BackgroundTaskScope = {
                 let entered = Arc::clone(&entered);
                 let exited = Arc::clone(&exited);
@@ -423,17 +227,18 @@ mod tests {
                     Box::new(Guard(Arc::clone(&exited)))
                 })
             };
-            let budget = ResourceBudget::with_memory_limit(16 * 1024 * 1024);
-            (
-                LazyBackgroundLane::new(spawner, Arc::new(|| {}), Arc::clone(&budget), scope),
-                budget,
-                finished_rx,
-            )
+            ManagedV8Lane::new(256, scope, Arc::new(|| {})).unwrap()
         };
-        let (first, first_budget, first_finished) = make_lane();
-        let (second, second_budget, second_finished) = make_lane();
-        drop(first.enter().unwrap());
-        drop(second.enter().unwrap());
+        let first = make_lane();
+        let second = make_lane();
+        let first_worker = {
+            let lane = Arc::clone(&first);
+            thread::spawn(move || lane.run())
+        };
+        let second_worker = {
+            let lane = Arc::clone(&second);
+            thread::spawn(move || lane.run())
+        };
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (first_tx, first_rx) = mpsc::channel();
         post(
@@ -456,7 +261,7 @@ mod tests {
         );
         second_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("second instance progresses independently");
+            .expect("second instance progresses");
         first.stop();
         second.stop();
         {
@@ -464,43 +269,26 @@ mod tests {
             *lock.lock().unwrap() = true;
             changed.notify_all();
         }
-        first_finished
-            .recv_timeout(Duration::from_secs(2))
-            .expect("first worker stops");
-        second_finished
-            .recv_timeout(Duration::from_secs(2))
-            .expect("second worker stops");
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
         assert_eq!(entered.load(Ordering::SeqCst), 2);
         assert_eq!(exited.load(Ordering::SeqCst), 2);
-        assert_eq!(first_budget.snapshot().v8_background_lane, 0);
-        assert_eq!(second_budget.snapshot().v8_background_lane, 0);
     }
 
     #[test]
-    fn queue_overload_signals_termination_before_blocked_task_returns() {
+    fn queue_overload_signals_embedder_before_blocked_task_returns() {
         let overloads = Arc::new(AtomicUsize::new(0));
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
-            let finished_tx = finished_tx.clone();
-            thread::spawn(move || {
-                work();
-                let _ = finished_tx.send(());
-            });
-            Ok(())
-        });
-        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
-        let lane = LazyBackgroundLane::new(
-            spawner,
-            {
-                let overloads = Arc::clone(&overloads);
-                Arc::new(move || {
-                    overloads.fetch_add(1, Ordering::SeqCst);
-                })
-            },
-            Arc::clone(&budget),
-            Arc::new(|| Box::new(())),
-        );
-        drop(lane.enter().unwrap());
+        let lane = ManagedV8Lane::new(256, Arc::new(|| Box::new(())), {
+            let overloads = Arc::clone(&overloads);
+            Arc::new(move || {
+                overloads.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .unwrap();
+        let worker = {
+            let lane = Arc::clone(&lane);
+            thread::spawn(move || lane.run())
+        };
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel();
         post(
@@ -511,17 +299,17 @@ mod tests {
             },
         );
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let handle = match &*lane.state.lock().unwrap() {
-            State::Ready(lane) => lane.handle.as_ptr(),
-            _ => panic!("lane not ready"),
-        };
         for _ in 0..256 {
             assert!(unsafe {
-                snapi_v8_lane_post_test_task(handle, run_noop_task, std::ptr::null_mut())
+                snapi_v8_lane_post_test_task(
+                    lane.handle.as_ptr(),
+                    run_noop_task,
+                    std::ptr::null_mut(),
+                )
             });
         }
         assert!(!unsafe {
-            snapi_v8_lane_post_test_task(handle, run_noop_task, std::ptr::null_mut())
+            snapi_v8_lane_post_test_task(lane.handle.as_ptr(), run_noop_task, std::ptr::null_mut())
         });
         assert_eq!(overloads.load(Ordering::SeqCst), 1);
         {
@@ -529,98 +317,6 @@ mod tests {
             *lock.lock().unwrap() = true;
             changed.notify_all();
         }
-        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(budget.snapshot().v8_background_lane, 0);
-    }
-
-    #[test]
-    fn concurrent_first_calls_admit_exactly_one_lane() {
-        let spawns = Arc::new(AtomicUsize::new(0));
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let spawner: BackgroundThreadSpawner = {
-            let spawns = Arc::clone(&spawns);
-            Arc::new(move |work| {
-                spawns.fetch_add(1, Ordering::SeqCst);
-                let finished_tx = finished_tx.clone();
-                thread::Builder::new().spawn(move || {
-                    work();
-                    let _ = finished_tx.send(());
-                })?;
-                Ok(())
-            })
-        };
-        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
-        let lane = Arc::new(LazyBackgroundLane::new(
-            spawner,
-            Arc::new(|| {}),
-            Arc::clone(&budget),
-            Arc::new(|| Box::new(())),
-        ));
-        let start = Arc::new(Barrier::new(16));
-        let callers: Vec<_> = (0..16)
-            .map(|_| {
-                let lane = Arc::clone(&lane);
-                let start = Arc::clone(&start);
-                thread::spawn(move || {
-                    start.wait();
-                    drop(lane.enter().expect("first call admitted"));
-                })
-            })
-            .collect();
-        for caller in callers {
-            caller.join().unwrap();
-        }
-        assert_eq!(spawns.load(Ordering::SeqCst), 1);
-        assert_eq!(budget.snapshot().v8_background_lane, LANE_RESERVATION_BYTES);
-        lane.stop();
-        finished_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("lane exits");
-        assert_eq!(budget.snapshot().v8_background_lane, 0);
-    }
-
-    #[test]
-    fn stop_wins_a_pending_first_call() {
-        let (scheduled_tx, scheduled_rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
-        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
-            scheduled_tx
-                .send(work)
-                .map_err(|_| anyhow::anyhow!("worker receiver closed"))?;
-            Ok(())
-        });
-        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
-        let lane = Arc::new(LazyBackgroundLane::new(
-            spawner,
-            Arc::new(|| {}),
-            Arc::clone(&budget),
-            Arc::new(|| Box::new(())),
-        ));
-        let caller_lane = Arc::clone(&lane);
-        let caller = thread::spawn(move || caller_lane.enter().is_err());
-        let scheduled = scheduled_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("worker accepted");
-        lane.stop();
-        scheduled();
-        assert!(
-            caller.join().unwrap(),
-            "stopped lane must reject first call"
-        );
-        assert!(!lane.is_initialized());
-        assert_eq!(budget.snapshot().v8_background_lane, 0);
-    }
-
-    #[test]
-    fn admission_failure_releases_partial_lane() {
-        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
-        let lane = LazyBackgroundLane::new(
-            Arc::new(|_work| anyhow::bail!("global lane admission full")),
-            Arc::new(|| {}),
-            Arc::clone(&budget),
-            Arc::new(|| Box::new(())),
-        );
-        assert!(lane.enter().is_err());
-        assert!(!lane.is_initialized());
-        assert_eq!(budget.snapshot().v8_background_lane, 0);
+        worker.join().unwrap();
     }
 }

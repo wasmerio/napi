@@ -1,6 +1,7 @@
 #ifndef NAPI_V8_EDGE_V8_PLATFORM_H_
 #define NAPI_V8_EDGE_V8_PLATFORM_H_
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -13,7 +14,8 @@
 // An embedder-owned background execution lane. The returned handle is owned by
 // the embedder until Stop, Run and all associated N-API environments have
 // quiesced. A null current lane preserves the standalone provider behavior.
-extern "C" void* snapi_v8_lane_new(void* scope_context,
+extern "C" void* snapi_v8_lane_new(size_t max_queued_tasks,
+                                     void* scope_context,
                                      void* (*enter_scope)(void*),
                                      bool (*leave_scope)(void*, void*),
                                      void (*on_overload)(void*));
