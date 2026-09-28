@@ -127,8 +127,7 @@ struct NapiCtxInner {
     limits: NapiLimits,
     active_sessions: AtomicUsize,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
-    /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
-    /// external-memory, and CPU paths.
+    /// tunables and the V8 heap, external-memory, and lane reservations.
     budget: Arc<ResourceBudget>,
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,

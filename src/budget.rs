@@ -5,11 +5,10 @@
 //! host-native V8. To keep an embedder-imposed memory budget honest across
 //! *both*, every pool charges against one shared [`ResourceBudget`] per app.
 //!
-//! This module implements **Phase 1** of that design: the accountant itself
-//! plus exact, deterministic charging of **guest wasm linear memory**. Later
-//! phases charge the V8 heap, external memory, and host transients against the
-//! same budget, and add CPU metering; the [`Pool`] enum and the budget API are
-//! the insertion points for them.
+//! The accountant reserves guest wasm linear memory, V8 heap ceilings,
+//! declared external memory, and a bounded background lane against one shared
+//! limit. These reservations enforce a limit; callers must not mistake them
+//! for observed resident memory. The Edge task manager meters CPU separately.
 //!
 //! ## Native sys install path
 //!
@@ -83,8 +82,6 @@ fn round_up_to_page(bytes: u64) -> u64 {
 }
 
 /// A distinct byte pool metered against the budget.
-///
-/// Later phases add external-memory and host-transient pools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pool {
     /// Guest wasm linear memory (wasmer `WasmMmap`).
@@ -195,10 +192,10 @@ pub enum EnvRejected {
 
 /// One shared accountant per app, `Arc`-shared into every pool that allocates.
 ///
-/// Charging is **reserve-based**: bytes are charged before (or exactly at) the
-/// moment they become live, so `actual usage <= mem_charged <= mem_total`
-/// always holds and enforcement never races a garbage collector. All state is
-/// atomic, so worker threads (each its own store + isolate) share one budget.
+/// Charging is **reserve-based** for the pools listed above. The charged total
+/// is an admission limit for those pools, not an RSS measurement: temporary
+/// host copies and some V8 native allocations are outside these reservations.
+/// All state is atomic so worker threads share one application budget.
 pub struct ResourceBudget {
     /// Total byte budget. `UNLIMITED` disables enforcement (tracking only).
     mem_total: u64,
