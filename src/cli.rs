@@ -308,7 +308,10 @@ fn run_wasix_main_with_runner_hooks(
         ) {
             Ok(()) => 0,
             Err(err) => {
-                if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
+                if let Some(WasiError::Exit(code)) = err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<WasiError>())
+                {
                     i32::from(*code)
                 } else {
                     return Err(err).context("failed to run WASIX module through WasiRunner");
