@@ -11,6 +11,10 @@ use wasmer_napi::{NapiCtx, cli::run_wasix_main_capture_stdio_with_hooks};
 mod common;
 use common::build_wasix_test;
 
+unsafe extern "C" {
+    fn snapi_v8_fallback_worker_posts() -> u64;
+}
+
 struct TaskGuard(Arc<AtomicUsize>);
 
 impl Drop for TaskGuard {
@@ -51,6 +55,7 @@ fn one_instance_lane_runs_and_releases_its_budget() {
         .build_lazy_hooks()
         .unwrap();
     let budget = hooks.budget();
+    let fallback_before = unsafe { snapi_v8_fallback_worker_posts() };
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
     assert_eq!(budget.snapshot().v8_background_lane, 0);
 
@@ -66,6 +71,8 @@ fn one_instance_lane_runs_and_releases_its_budget() {
     finished_rx.recv_timeout(Duration::from_secs(5)).expect("lane worker exits");
     drop(hooks);
     assert_eq!(budget.snapshot().v8_background_lane, 0);
+    assert_eq!(unsafe { snapi_v8_fallback_worker_posts() }, fallback_before,
+        "a managed V8 task escaped to the process-wide fallback pool");
     let started = scopes.load(Ordering::SeqCst);
     assert!(started > 0, "GC did not exercise the metered V8 lane");
     assert_eq!(scope_exits.load(Ordering::SeqCst), started);

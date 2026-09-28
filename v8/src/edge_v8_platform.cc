@@ -125,6 +125,7 @@ class BackgroundLane {
 };
 
 thread_local BackgroundLane* current_background_lane = nullptr;
+std::atomic<uint64_t> fallback_worker_posts{0};
 
 struct WorkerWarmupState {
   std::mutex mutex;
@@ -229,6 +230,10 @@ extern "C" bool snapi_v8_lane_is_running(void* handle) {
 
 extern "C" bool snapi_v8_lane_overloaded(void* handle) {
   return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsOverloaded();
+}
+
+extern "C" uint64_t snapi_v8_fallback_worker_posts() {
+  return fallback_worker_posts.load(std::memory_order_acquire);
 }
 
 // Native-only regression hook. It is not reachable through guest imports.
@@ -776,6 +781,7 @@ void EdgeV8Platform::PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,
     return;
   }
   if (fallback_ != nullptr) {
+    fallback_worker_posts.fetch_add(1, std::memory_order_relaxed);
     fallback_->PostTaskOnWorkerThread(priority, std::move(task), location);
   }
 }
@@ -790,6 +796,7 @@ void EdgeV8Platform::PostDelayedTaskOnWorkerThreadImpl(
     return;
   }
   if (fallback_ != nullptr) {
+    fallback_worker_posts.fetch_add(1, std::memory_order_relaxed);
     fallback_->PostDelayedTaskOnWorkerThread(priority, std::move(task), delay_in_seconds, location);
   }
 }
