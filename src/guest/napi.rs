@@ -12,6 +12,7 @@ use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
+    budget::Pool,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         MAX_NAPI_PROPERTY_DESCRIPTORS,
@@ -688,6 +689,16 @@ fn guest_unofficial_napi_structured_clone(
     transfer_list: i32,
     result_ptr: i32,
 ) -> i32 {
+    if result_ptr <= 0 {
+        return 1;
+    }
+    let budget = env.data().budget.clone();
+    if budget
+        .try_charge(Pool::HostTransient, SERIALIZATION_RESERVATION)
+        .is_err()
+    {
+        return 1;
+    }
     let env_handle = snapi_env(&env, napi_env);
     let value_id = if value > 0 { value as u32 } else { 0 };
     let transfer_list_id = if transfer_list > 0 {
@@ -699,7 +710,8 @@ fn guest_unofficial_napi_structured_clone(
     let status = unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
     };
-    if status == 0 && result_ptr > 0 {
+    budget.uncharge(Pool::HostTransient, SERIALIZATION_RESERVATION);
+    if status == 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
     }
     status

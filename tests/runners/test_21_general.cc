@@ -299,13 +299,15 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   ASSERT_NE(message, nullptr);
   EXPECT_GT(unofficial_napi_message_retained_bytes(message), 0u);
 
+  // A worker receives the payload in its own isolate, not the sender's.
+  EnvScope receiver(runtime_.get());
   napi_value result = nullptr;
-  ASSERT_EQ(unofficial_napi_message_take(s.env, message, &result), napi_ok);
+  ASSERT_EQ(unofficial_napi_message_take(receiver.env, message, &result), napi_ok);
   ASSERT_NE(result, nullptr);
   napi_value answer = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, result, "answer", &answer), napi_ok);
+  ASSERT_EQ(napi_get_named_property(receiver.env, result, "answer", &answer), napi_ok);
   uint32_t actual = 0;
-  ASSERT_EQ(napi_get_value_uint32(s.env, answer, &actual), napi_ok);
+  ASSERT_EQ(napi_get_value_uint32(receiver.env, answer, &actual), napi_ok);
   EXPECT_EQ(actual, 42u);
 
   unofficial_napi_message dropped = nullptr;
@@ -323,6 +325,17 @@ TEST_F(Test21General, MessageSerializerRejectsOversizedPayload) {
   EXPECT_EQ(unofficial_napi_message_create(s.env, value, &message),
             napi_pending_exception);
   EXPECT_EQ(message, nullptr);
+}
+
+TEST_F(Test21General, StructuredCloneRejectsOversizedPayload) {
+  EnvScope s(runtime_.get());
+  std::string bytes(5 * 1024 * 1024, 'x');
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, bytes.data(), bytes.size(), &value), napi_ok);
+  napi_value cloned = nullptr;
+  EXPECT_EQ(unofficial_napi_structured_clone(s.env, value, nullptr, &cloned),
+            napi_pending_exception);
+  EXPECT_EQ(cloned, nullptr);
 }
 
 TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {

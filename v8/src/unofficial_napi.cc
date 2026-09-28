@@ -1602,6 +1602,10 @@ napi_status CollectTransferArrayBuffers(
       ThrowCloneTransferError(isolate, "Transfer list contains duplicate ArrayBuffer");
       return napi_pending_exception;
     }
+    if (out->size() >= 65536) {
+      ThrowCloneTransferError(isolate, "Too many ArrayBuffers in transfer list");
+      return napi_pending_exception;
+    }
     serializer->TransferArrayBuffer(static_cast<uint32_t>(out->size()), array_buffer);
     out->push_back(array_buffer);
   }
@@ -1682,7 +1686,8 @@ napi_status StructuredCloneImpl(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  // The guest reserves native transient memory before entering this call.
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, 4 * 1024 * 1024);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   std::vector<v8::Local<v8::ArrayBuffer>> array_buffers;
@@ -1707,12 +1712,11 @@ napi_status StructuredCloneImpl(
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
 
-  std::vector<uint8_t> bytes(buffer.get(), buffer.get() + released.second);
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      bytes.data(),
-      bytes.size(),
+      buffer.get(),
+      released.second,
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
