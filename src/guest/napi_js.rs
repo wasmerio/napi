@@ -52,7 +52,10 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, _scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 0;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
@@ -550,7 +553,10 @@ fn guest_unofficial_napi_create_env(
     }
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 1;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);

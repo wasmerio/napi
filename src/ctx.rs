@@ -3,7 +3,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
@@ -115,6 +115,9 @@ impl NapiRuntimeControl {
 struct NapiProviderBindings {
     limits: NapiLimits,
     active_sessions: Arc<AtomicUsize>,
+    /// Guest-visible native env IDs span all worker sessions of this instance.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    next_native_env_id: Arc<AtomicU32>,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
     /// tunables and the V8 heap, external-memory, and lane reservations.
     budget: Arc<ResourceBudget>,
@@ -229,6 +232,8 @@ impl NapiCtxBuilder {
         Arc::new(NapiProviderBindings {
             limits: self.limits,
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            next_native_env_id: Arc::new(AtomicU32::new(1)),
             budget,
             pending_messages: PendingMessages::new(),
             envs,
@@ -477,6 +482,8 @@ impl NapiSession {
             self.inner.ctx.limits.max_envs,
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            Arc::clone(&self.inner.ctx.next_native_env_id),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             self.inner.ctx.managed_lane_activator.clone(),
         );

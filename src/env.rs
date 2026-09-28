@@ -1,10 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-#[cfg(all(target_arch = "wasm32", feature = "js"))]
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasmer::TypedFunction;
@@ -74,13 +71,12 @@ pub(crate) struct NativeBufferLease {
 static NEXT_NAPI_ENV_ID: AtomicU32 = AtomicU32::new(1);
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn next_js_napi_env_id() -> u32 {
-    loop {
-        let id = NEXT_NAPI_ENV_ID.fetch_add(1, AtomicOrdering::Relaxed);
-        if id != 0 {
-            return id;
-        }
-    }
+fn next_js_napi_env_id() -> Option<u32> {
+    NEXT_NAPI_ENV_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id <= i32::MAX as u32).then_some(id + 1)
+        })
+        .ok()
 }
 
 /// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
@@ -141,7 +137,8 @@ pub(crate) struct NapiEnv {
     /// unconditional store growth. See `guest::callback::call_guest_callback`.
     pub(crate) func_cache: HashMap<u32, Function>,
     pub(crate) default_napi_env_id: Option<u32>,
-    pub(crate) next_napi_env_id: u32,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    next_native_env_id: Arc<AtomicU32>,
     pub(crate) next_napi_scope_id: u32,
     pub(crate) napi_envs: HashMap<u32, usize>,
     pub(crate) napi_state_to_guest_env: HashMap<usize, u32>,
@@ -183,6 +180,7 @@ impl NapiEnv {
         max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
         host_stopped: Arc<AtomicBool>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] next_native_env_id: Arc<AtomicU32>,
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))] managed_lane_activator: Option<
             ManagedV8LaneActivator,
         >,
@@ -209,8 +207,9 @@ impl NapiEnv {
             table: None,
             func_cache: HashMap::new(),
             default_napi_env_id: None,
-            next_napi_env_id: 0,
-            next_napi_scope_id: 0,
+            next_napi_scope_id: 1,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            next_native_env_id,
             napi_envs: HashMap::new(),
             napi_state_to_guest_env: HashMap::new(),
             napi_scopes: HashMap::new(),
@@ -312,8 +311,8 @@ impl NapiEnv {
         &mut self,
         env: SnapiEnv,
         reservation: &HeapReservation,
-    ) -> (u32, u32) {
-        let (env_id, scope_id) = self.register_napi_env(env);
+    ) -> Option<(u32, u32)> {
+        let (env_id, scope_id) = self.register_napi_env(env)?;
         {
             let mut registry = self
                 .env_registry
@@ -374,7 +373,7 @@ impl NapiEnv {
                 tracker,
             },
         );
-        (env_id, scope_id)
+        Some((env_id, scope_id))
     }
 
     /// Release a reservation whose env creation failed after [`reserve_isolate`].
@@ -475,23 +474,27 @@ impl NapiEnv {
         Some((env_id, env))
     }
 
-    pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
+    pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> Option<(u32, u32)> {
+        if self.next_napi_scope_id > i32::MAX as u32 {
+            return None;
+        }
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        let env_id = {
-            let env_id = self.next_napi_env_id.max(1);
-            self.next_napi_env_id = env_id.saturating_add(1);
-            env_id
-        };
+        let env_id = self
+            .next_native_env_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                (id <= i32::MAX as u32).then_some(id + 1)
+            })
+            .ok()?;
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        let env_id = next_js_napi_env_id();
+        let env_id = next_js_napi_env_id()?;
 
-        let scope_id = self.next_napi_scope_id.max(1);
-        self.next_napi_scope_id = scope_id.saturating_add(1);
+        let scope_id = self.next_napi_scope_id;
+        self.next_napi_scope_id += 1;
 
         self.napi_envs.insert(env_id, env as usize);
         self.napi_state_to_guest_env.insert(env as usize, env_id);
         self.napi_scopes.insert(scope_id, env_id);
-        (env_id, scope_id)
+        Some((env_id, scope_id))
     }
 
     fn discard_buffer_leases_for_env(&mut self, env_id: u32) {
@@ -683,6 +686,65 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[test]
+    fn native_env_ids_are_unique_across_concurrent_instance_sessions() {
+        let next_id = Arc::new(AtomicU32::new(1));
+        let budget = ResourceBudget::unlimited();
+        let pending = PendingMessages::new();
+        let registry = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(24));
+        let mut joins = Vec::new();
+        for index in 0..24usize {
+            let next_id = Arc::clone(&next_id);
+            let budget = Arc::clone(&budget);
+            let pending = Arc::clone(&pending);
+            let registry = Arc::clone(&registry);
+            let stopped = Arc::clone(&stopped);
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                let mut session =
+                    NapiEnv::new(budget, pending, None, registry, stopped, next_id, None);
+                barrier.wait();
+                let (id, _) = session.register_napi_env((index + 1) as SnapiEnv).unwrap();
+                // The fake pointer only exercises ID allocation; never pass it
+                // through the native release path in NapiEnv::drop.
+                session.napi_envs.clear();
+                session.napi_state_to_guest_env.clear();
+                session.napi_scopes.clear();
+                id
+            }));
+        }
+        let mut ids: Vec<u32> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=24).collect::<Vec<_>>());
+        assert_eq!(next_id.load(Ordering::Relaxed), 25);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[test]
+    fn native_env_ids_reject_exhaustion_without_reuse() {
+        let next_id = Arc::new(AtomicU32::new(i32::MAX as u32));
+        let mut session = NapiEnv::new(
+            ResourceBudget::unlimited(),
+            PendingMessages::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&next_id),
+            None,
+        );
+        assert_eq!(
+            session.register_napi_env(1usize as SnapiEnv).unwrap().0,
+            i32::MAX as u32
+        );
+        assert!(session.register_napi_env(2usize as SnapiEnv).is_none());
+        session.napi_envs.clear();
+        session.napi_state_to_guest_env.clear();
+        session.napi_scopes.clear();
+    }
+
     #[test]
     fn declared_external_charges_denies_and_clamps() {
         let budget = ResourceBudget::with_memory_limit(10 * MIB);
@@ -692,6 +754,8 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            Arc::new(AtomicU32::new(1)),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             None,
         );
@@ -725,6 +789,8 @@ mod tests {
                 Arc::new(std::sync::Mutex::new(HashSet::new())),
                 Arc::new(AtomicBool::new(false)),
                 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+                Arc::new(AtomicU32::new(1)),
+                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
                 None,
             );
             assert!(env.charge_declared_external(4 * MIB));
@@ -747,13 +813,14 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(1)),
             None,
         );
         let reservation = env.reserve_isolate(RequestedHeap::default()).unwrap();
         // The release callback below is deliberately substituted so the
         // cross-thread check can pause at the native quiescence boundary.
         let fake_env = 1usize as SnapiEnv;
-        let (env_id, _) = env.register_napi_env(fake_env);
+        let (env_id, _) = env.register_napi_env(fake_env).unwrap();
         env.env_heap_charges.insert(
             env_id,
             EnvHeapChargeHandle {
@@ -797,6 +864,8 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            Arc::new(AtomicU32::new(1)),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             None,
         );

@@ -48,6 +48,9 @@ unofficial_napi_module CreateSourceModule(napi_env env, const char* url, const c
 #endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
+extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynamically(
+    napi_env env, size_t argc, napi_value* argv, napi_value* result_out);
+
 constexpr char kPreparedStack[] =
     "Error: sentinel\n"
     "    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)\n"
@@ -681,6 +684,89 @@ TEST_F(Test65UnofficialContextify, InvalidatedParentCanRelinkReplacement) {
 #endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, PrivateDynamicImportShortCallsKeepResultsAlive) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.internalBinding = name => name === 'symbols' ? "
+                    "{vm_dynamic_import_default_internal: Symbol.for('default-import-id')} : {};"
+                    "globalThis.shortImportArgs = [];"
+                    "(...args) => { shortImportArgs.push(args); return {marker: 42}; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  napi_value argv[2] = {Str(s.env, "node:test"), Str(s.env, "parent.js")};
+  ASSERT_NE(argv[0], nullptr);
+  ASSERT_NE(argv[1], nullptr);
+  for (size_t argc : {1u, 2u}) {
+    napi_value result = nullptr;
+    ASSERT_EQ(snapi_private_module_wrap_import_module_dynamically(
+                  s.env, argc, argv, &result), napi_ok);
+    ASSERT_NE(result, nullptr);
+    for (size_t i = 0; i < 2048; ++i) {
+      napi_value churn = nullptr;
+      ASSERT_EQ(napi_create_object(s.env, &churn), napi_ok);
+    }
+    napi_value marker = nullptr;
+    int32_t value = 0;
+    ASSERT_EQ(napi_get_named_property(s.env, result, "marker", &marker), napi_ok);
+    ASSERT_EQ(napi_get_value_int32(s.env, marker, &value), napi_ok);
+    EXPECT_EQ(value, 42);
+  }
+
+  napi_value args = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "shortImportArgs"), &args), napi_ok);
+  napi_value first = nullptr;
+  napi_value second = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, args, 0, &first), napi_ok);
+  ASSERT_EQ(napi_get_element(s.env, args, 1, &second), napi_ok);
+  napi_value first_referrer = nullptr;
+  napi_value second_referrer = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, first, 4, &first_referrer), napi_ok);
+  ASSERT_EQ(napi_get_element(s.env, second, 4, &second_referrer), napi_ok);
+  napi_valuetype type = napi_object;
+  ASSERT_EQ(napi_typeof(s.env, first_referrer, &type), napi_ok);
+  EXPECT_EQ(type, napi_undefined);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, second_referrer, argv[1], &same), napi_ok);
+  EXPECT_TRUE(same);
+}
+
+TEST_F(Test65UnofficialContextify, PrivateDynamicImportRejectsMissingRequiredSymbol) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.internalBinding = () => ({});"
+                    "globalThis.shortImportCalls = 0;"
+                    "() => { ++shortImportCalls; return {}; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+  napi_value specifier = Str(s.env, "node:test");
+  napi_value result = reinterpret_cast<napi_value>(1);
+  EXPECT_EQ(snapi_private_module_wrap_import_module_dynamically(
+                s.env, 1, &specifier, &result), napi_generic_failure);
+  EXPECT_EQ(result, nullptr);
+  napi_value calls = nullptr;
+  int32_t count = -1;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "shortImportCalls"), &calls), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, calls, &count), napi_ok);
+  EXPECT_EQ(count, 0);
+}
+
 TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
   EnvScope s(runtime_.get());
   napi_value wrapper = nullptr;

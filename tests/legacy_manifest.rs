@@ -1,8 +1,9 @@
 //! Frozen N-API import contract of wasmer/edgejs@0.0.1.
 //! Source atom SHA-256: ca6467e67c8503474cb4204cd2dbbae387c8fa19cad6f6c23131844143e27ccc.
 
-use wasmer::{AsStoreMut, Extern, Instance, Module, Store, Type};
+use wasmer::{AsStoreMut, Extern, Function, Instance, Module, RuntimeError, Store, Type};
 use wasmer_napi::NapiCtx;
+use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
 
 unsafe extern "C" {
     fn snapi_bridge_unofficial_legacy_message_is_live(message_id: u32) -> i32;
@@ -101,6 +102,201 @@ fn released_edgejs_napi_imports_have_exact_types_and_link() {
     session
         .configure_instance(&mut store.as_store_mut(), &instance, None)
         .unwrap();
+}
+
+#[test]
+fn guest_getter_proc_exit_propagates_through_clone_and_message() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+      (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_structured_clone" (func $clone (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_message_create" (func $message (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+      (elem (i32.const 0) $getter)
+      (data (i32.const 100) "exitNow\00")
+      (data (i32.const 150) "Object.defineProperty({}, 'x', {enumerable:true, get() { return exitNow() }})\00")
+      (func $getter (param i32 i32) (result i32)
+        (call $exit (i32.const 23))
+        (i32.const 0))
+      (func (export "run") (param $mode i32) (result i32)
+        (local $env i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 1))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $function (local.get $env) (i32.const 100) (i32.const -1)
+                            (i32.const 0) (i32.const 0) (i32.const 12))
+          (then (return (i32.const 2))))
+        (if (call $global (local.get $env) (i32.const 16))
+          (then (return (i32.const 3))))
+        (if (call $set (local.get $env) (i32.load (i32.const 16))
+                       (i32.const 100) (i32.load (i32.const 12)))
+          (then (return (i32.const 4))))
+        (if (call $string (local.get $env) (i32.const 150) (i32.const -1) (i32.const 20))
+          (then (return (i32.const 5))))
+        (if (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24))
+          (then (return (i32.const 6))))
+        (if (result i32) (i32.eqz (local.get $mode))
+          (then (call $clone (local.get $env) (i32.load (i32.const 24)) (i32.const 28)))
+          (else (call $message (local.get $env) (i32.load (i32.const 24)) (i32.const 28))))))"#;
+
+    for mode in [0, 1] {
+        let mut store = Store::default();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+        let ctx = NapiCtx::default();
+        let session = ctx.new_session(&module).unwrap();
+        let mut imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        imports.define(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
+                Err(RuntimeError::user(Box::new(WasiError::Exit(
+                    ExitCode::from(code),
+                ))))
+            }),
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        session
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
+            .unwrap();
+        let run = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "run")
+            .unwrap();
+        let error = run.call(&mut store, mode).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<WasiError>(),
+            Some(WasiError::Exit(code)) if *code == ExitCode::from(23)
+        ));
+        assert_eq!(ctx.budget().snapshot().serialized_message, 0);
+        assert_eq!(ctx.budget().snapshot().host_transient, 0);
+    }
+}
+
+#[test]
+fn guest_getter_proc_exit_propagates_through_compile_and_module_create() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_object" (func $object (param i32 i32) (result i32)))
+      (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+      (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_contextify_compile_function" (func $compile
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_create_synthetic" (func $module
+        (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_compile_function" (func $compile_current
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create" (func $module_current
+        (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+      (elem (i32.const 0) $getter)
+      (data (i32.const 100) "exitNow\00")
+      (data (i32.const 150) "Object.defineProperty(['x'], '0', {get() { return exitNow() }})\00")
+      (data (i32.const 300) "return x;\00")
+      (data (i32.const 320) "getter.js\00")
+      (func $getter (param i32 i32) (result i32)
+        (call $exit (i32.const 29))
+        (i32.const 0))
+      (func (export "run") (param $mode i32) (result i32)
+        (local $env i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 1))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $function (local.get $env) (i32.const 100) (i32.const -1)
+                            (i32.const 0) (i32.const 0) (i32.const 12))
+          (then (return (i32.const 2))))
+        (if (call $global (local.get $env) (i32.const 16))
+          (then (return (i32.const 3))))
+        (if (call $set (local.get $env) (i32.load (i32.const 16))
+                       (i32.const 100) (i32.load (i32.const 12)))
+          (then (return (i32.const 4))))
+        (if (call $string (local.get $env) (i32.const 150) (i32.const -1) (i32.const 20))
+          (then (return (i32.const 5))))
+        (if (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24))
+          (then (return (i32.const 6))))
+        (if (call $string (local.get $env) (i32.const 320) (i32.const -1) (i32.const 28))
+          (then (return (i32.const 7))))
+        (if (result i32) (i32.eqz (local.get $mode))
+          (then
+            (if (call $string (local.get $env) (i32.const 300) (i32.const -1) (i32.const 32))
+              (then (return (i32.const 8))))
+            (call $compile (local.get $env) (i32.load (i32.const 32))
+              (i32.load (i32.const 28)) (i32.const 0) (i32.const 0)
+              (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+              (i32.load (i32.const 24)) (i32.const 0) (i32.const 40)))
+          (else (if (result i32) (i32.eq (local.get $mode) (i32.const 1))
+           (then
+            (if (call $object (local.get $env) (i32.const 36))
+              (then (return (i32.const 9))))
+            (call $module (local.get $env) (i32.load (i32.const 36))
+              (i32.load (i32.const 28)) (i32.const 0)
+              (i32.load (i32.const 24)) (i32.load (i32.const 12))
+              (i32.const 40)))
+           (else (if (result i32) (i32.eq (local.get $mode) (i32.const 2))
+             (then
+               (if (call $string (local.get $env) (i32.const 300) (i32.const -1) (i32.const 32))
+                 (then (return (i32.const 10))))
+               (i32.store (i32.const 400) (i32.const 0))
+               (i32.store (i32.const 404) (i32.load (i32.const 32)))
+               (i32.store (i32.const 408) (i32.const 0))
+               (call $compile_current (local.get $env) (i32.const 400)
+                 (i32.load (i32.const 28)) (i32.const 0) (i32.const 0)
+                 (i32.const 0) (i32.const 0) (i32.load (i32.const 24))
+                 (i32.const 0) (i32.const 480)))
+             (else
+               (if (call $object (local.get $env) (i32.const 36))
+                 (then (return (i32.const 11))))
+               (i32.store (i32.const 420) (i32.const 40))
+               (i32.store (i32.const 424) (i32.const 1))
+               (i32.store (i32.const 428) (i32.const 2))
+               (i32.store (i32.const 432) (i32.load (i32.const 36)))
+               (i32.store (i32.const 436) (i32.load (i32.const 28)))
+               (i32.store (i32.const 440) (i32.const 0))
+               (i32.store (i32.const 444) (i32.load (i32.const 24)))
+               (i32.store (i32.const 448) (i32.load (i32.const 12)))
+               (call $module_current (local.get $env) (i32.const 420)
+                 (i32.const 480))))))))))"#;
+
+    for mode in [0, 1, 2, 3] {
+        let mut store = Store::default();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+        let ctx = NapiCtx::default();
+        let session = ctx.new_session(&module).unwrap();
+        let mut imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        imports.define(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
+                Err(RuntimeError::user(Box::new(WasiError::Exit(
+                    ExitCode::from(code),
+                ))))
+            }),
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        session
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
+            .unwrap();
+        let run = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "run")
+            .unwrap();
+        let error = run.call(&mut store, mode).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<WasiError>(),
+            Some(WasiError::Exit(code)) if *code == ExitCode::from(29)
+        ));
+        assert_eq!(ctx.budget().snapshot().host_transient, 0);
+    }
 }
 
 #[test]
@@ -430,7 +626,6 @@ fn released_edgejs_atom_runs_esm_when_provided() {
 
 #[cfg(feature = "cli")]
 #[test]
-#[ignore = "released atom's worker cleanup requires a stable native owning thread"]
 fn released_edgejs_atom_runs_worker_when_provided() {
     let Some(path) = std::env::var_os("NAPI_EDGEJS_0_0_1_ATOM") else {
         return;

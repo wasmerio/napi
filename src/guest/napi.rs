@@ -124,7 +124,12 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     }
 
-    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
+    let Some((env_id, _scope_id)) = env.data_mut().commit_isolate(snapi_env_state, &reservation)
+    else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        env.data().abort_isolate(&reservation);
+        return 0;
+    };
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -391,7 +396,12 @@ fn create_env_with_options(
         env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
+    let Some((env_id, scope_id)) = env.data_mut().commit_isolate(snapi_env_state, &reservation)
+    else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        env.data().abort_isolate(&reservation);
+        return 1;
+    };
     write_guest_u32(&mut env, env_out_ptr as u32, env_id);
     write_guest_u32(&mut env, scope_out_ptr as u32, scope_id);
     0
@@ -762,16 +772,16 @@ fn guest_unofficial_napi_structured_clone(
     value: i32,
     transfer_list: i32,
     result_ptr: i32,
-) -> i32 {
-    if result_ptr <= 0 {
-        return 1;
+) -> Result<i32, WasiError> {
+    if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 4).is_none() {
+        return Ok(1);
     }
     let budget = env.data().budget.clone();
     if budget
         .try_charge(Pool::HostTransient, SERIALIZATION_RESERVATION)
         .is_err()
     {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let value_id = if value > 0 { value as u32 } else { 0 };
@@ -781,14 +791,15 @@ fn guest_unofficial_napi_structured_clone(
         0
     };
     let mut out = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
-    };
+    });
     budget.uncharge(Pool::HostTransient, SERIALIZATION_RESERVATION);
-    if status == 0 {
-        write_guest_u32(&mut env, result_ptr as u32, out);
+    let status = status?;
+    if status == 0 && !write_guest_u32(&mut env, result_ptr as u32, out) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_message_create(
@@ -796,40 +807,52 @@ fn guest_unofficial_napi_message_create(
     napi_env: i32,
     value: i32,
     payload_out_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     if payload_out_ptr <= 0 {
-        return 1;
+        return Ok(1);
     }
     let pending = env.data().pending_messages.clone();
     let Ok(mut charge) =
         MessageCharge::reserve(env.data().budget.clone(), SERIALIZATION_RESERVATION)
     else {
-        return 1;
+        return Ok(1);
     };
     let env_handle = snapi_env(&env, napi_env);
     let mut message = 0u32;
     let mut retained_bytes = 0u64;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_message_create_metered(
             env_handle,
             value.max(0) as u32,
             &mut message,
             &mut retained_bytes,
         )
+    });
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if message != 0 {
+                unsafe { snapi_bridge_unofficial_message_drop(message) };
+            }
+            return Err(error);
+        }
     };
     if status != 0 {
-        return status;
+        if message != 0 {
+            unsafe { snapi_bridge_unofficial_message_drop(message) };
+        }
+        return Ok(status);
     }
     if !charge.shrink(retained_bytes) || pending.insert(message, charge).is_err() {
         unsafe { snapi_bridge_unofficial_message_drop(message) };
-        return 1;
+        return Ok(1);
     }
     if !write_guest_u32(&mut env, payload_out_ptr as u32, message) {
         drop(pending.take(message));
         unsafe { snapi_bridge_unofficial_message_drop(message) };
-        return 1;
+        return Ok(1);
     }
-    0
+    Ok(0)
 }
 
 fn guest_unofficial_napi_message_take(
@@ -1359,7 +1382,7 @@ fn guest_unofficial_napi_contextify_run_script(
             &mut result_id,
         )
     })?;
-    if status == 0 && result_ptr > 0 {
+    if status == 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     Ok(status)
@@ -1378,13 +1401,16 @@ fn guest_unofficial_napi_contextify_compile_function(
     params_or_undefined: i32,
     host_defined_option_id: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
-        return 1;
+        return Ok(1);
     };
+    if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 4).is_none() {
+        return Ok(1);
+    }
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
             source_text,
@@ -1414,11 +1440,11 @@ fn guest_unofficial_napi_contextify_compile_function(
             },
             &mut result_id,
         )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    })?;
+    if status == 0 && !write_guest_u32(&mut env, result_ptr as u32, result_id) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_bytecode_open(
@@ -1463,18 +1489,18 @@ fn guest_unofficial_napi_module_wrap_create(
     napi_env: i32,
     options_ptr: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
-        return 1;
+        return Ok(1);
     };
-    if result_ptr <= 0 {
-        return 1;
+    if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 9).is_none() {
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1492,13 +1518,25 @@ fn guest_unofficial_napi_module_wrap_create(
             &mut requests_id,
             &mut has_top_level_await,
         )
+    });
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if handle_id != 0 {
+                unsafe { snapi_bridge_unofficial_module_wrap_destroy(env_handle, handle_id) };
+            }
+            return Err(error);
+        }
     };
-    if status == 0 {
-        write_guest_u32(&mut env, result_ptr as u32, handle_id);
-        write_guest_u32(&mut env, result_ptr as u32 + 4, requests_id);
-        write_guest_bytes(&mut env, result_ptr as u32 + 8, &[has_top_level_await]);
+    if status == 0
+        && (!write_guest_u32(&mut env, result_ptr as u32, handle_id)
+            || !write_guest_u32(&mut env, result_ptr as u32 + 4, requests_id)
+            || !write_guest_bytes(&mut env, result_ptr as u32 + 8, &[has_top_level_await]))
+    {
+        unsafe { snapi_bridge_unofficial_module_wrap_destroy(env_handle, handle_id) };
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_destroy(

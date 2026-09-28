@@ -41,16 +41,13 @@ NAPI_EDGEJS_0_0_1_ATOM=/path/to/edgejs \
   `module_wrap_create` host call. The ESM test is ignored until the released
   guest's binding path and the remaining legacy module-wrap operations are
   resolved.
-- The worker probe passes legacy message serialization and creates a worker
-  environment, but exits 127 before posting a message. The released guest
-  asserts `state->owning_thread == std::this_thread::get_id()` in
-  `edge_runtime_platform_v8.cc:134`. A bounded host trace showed worker env
-  creation, foreground-hook installation, and near-heap callback removal on
-  the same host thread. No `release_env_with_loop` import occurs before the
-  assertion. Historical `binding_worker.cc` calls
-  `EdgeWorkerEnvRunCleanupPreserveLoop` between near-heap removal and release;
-  its runtime-platform cleanup stage contains this assertion. The test is
-  ignored pending a guest thread-identity diagnosis.
+- The frozen worker probe now creates a worker, receives its posted message,
+  and exits cleanly. The regression test runs whenever
+  `NAPI_EDGEJS_0_0_1_ATOM` points to the exact released atom. Native environment
+  IDs are allocated across all sessions of the instance, including WASIX
+  workers; this prevents one worker's environment from resolving to another
+  worker's native V8 environment. The earlier owning-thread assertion has not
+  recurred in this probe.
 - The frozen serdes binding, profiler/snapshot operations, and several stack
   introspection calls fail explicitly. Their existing native implementations
   retain buffers or samples without a workload budget, or have no equivalent

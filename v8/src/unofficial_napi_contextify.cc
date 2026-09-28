@@ -2183,19 +2183,40 @@ extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynami
     return napi_call_function(env, global, callback, 5, argv, result_out);
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
+  v8::EscapableHandleScope scope(isolate);
   napi_value phase = nullptr;
   if (napi_create_int32(env, 2, &phase) != napi_ok)
     return napi_generic_failure;
+  napi_value default_symbol = GetVmDynamicImportDefaultInternalSymbol(env);
+  napi_valuetype symbol_type = napi_undefined;
+  if (default_symbol == nullptr ||
+      napi_typeof(env, default_symbol, &symbol_type) != napi_ok ||
+      symbol_type != napi_symbol)
+    return napi_generic_failure;
+  napi_value referrer = argc >= 2 ? argv[1] : nullptr;
+  if (referrer == nullptr && napi_get_undefined(env, &referrer) != napi_ok)
+    return napi_generic_failure;
   std::vector<v8::Local<v8::Name>> empty_names;
   std::vector<v8::Local<v8::Value>> empty_values;
-  napi_value attributes = napi_v8_wrap_value(
-      env, CreateFrozenNullProtoObject(env, empty_names, empty_values));
+  v8::Local<v8::Object> attributes_object =
+      CreateFrozenNullProtoObject(env, empty_names, empty_values);
+  if (attributes_object.IsEmpty())
+    return napi_generic_failure;
+  napi_value attributes = napi_v8_wrap_value(env, attributes_object);
+  if (attributes == nullptr)
+    return napi_generic_failure;
   napi_value call_argv[5] = {
-      GetVmDynamicImportDefaultInternalSymbol(env),
-      argv[0], phase, attributes, argc >= 2 ? argv[1] : nullptr,
+      default_symbol, argv[0], phase, attributes, referrer,
   };
-  return napi_call_function(env, global, callback, 5, call_argv, result_out);
+  napi_value result = nullptr;
+  napi_status status = napi_call_function(env, global, callback, 5, call_argv, &result);
+  if (status != napi_ok)
+    return status;
+  v8::Local<v8::Value> raw_result = napi_v8_unwrap_value(result);
+  if (raw_result.IsEmpty())
+    return napi_generic_failure;
+  *result_out = napi_v8_wrap_value(env, scope.Escape(raw_result));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_contextify_run_script(

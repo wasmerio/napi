@@ -208,7 +208,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[5].unwrap_i32(),
             ),
         ),
-        "unofficial_napi_contextify_compile_function" => Ok(legacy_compile_function(env, args)),
+        "unofficial_napi_contextify_compile_function" => legacy_compile_function(env, args),
         "unofficial_napi_contextify_compile_function_for_cjs_loader" => {
             legacy_compile_cjs(env, args)
         }
@@ -520,21 +520,23 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 super::snapi_env(&env, args[0].unwrap_i32()).is_null(),
             ))
         }
-        "unofficial_napi_structured_clone" => Ok(super::guest_unofficial_napi_structured_clone(
+        "unofficial_napi_structured_clone" => super::guest_unofficial_napi_structured_clone(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
             0,
             args[2].unwrap_i32(),
-        )),
+        )
+        .map_err(|error| RuntimeError::user(Box::new(error))),
         "unofficial_napi_structured_clone_with_transfer" => {
-            Ok(super::guest_unofficial_napi_structured_clone(
+            super::guest_unofficial_napi_structured_clone(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_set_continuation_preserved_embedder_data" => Ok(
             super::guest_unofficial_napi_set_continuation_preserved_embedder_data(
@@ -669,8 +671,18 @@ fn legacy_module_create(
             },
             &mut handle,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    });
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if handle != 0 {
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle)
+                };
+            }
+            return Err(RuntimeError::user(Box::new(error)));
+        }
+    };
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, handle) {
         unsafe { crate::snapi::snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle) };
         return Ok(1);
@@ -973,18 +985,21 @@ fn legacy_set_fatal_error_callbacks(
     unsafe { crate::snapi::snapi_bridge_unofficial_attach_legacy_env(snapi_env) }
 }
 
-fn legacy_compile_function(mut env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> i32 {
+fn legacy_compile_function(
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+) -> Result<i32, RuntimeError> {
     let guest_env = args[0].unwrap_i32();
     let result_ptr = args[11].unwrap_i32();
     if guest_env <= 0 || result_ptr <= 0 {
-        return 1;
+        return Ok(1);
     }
     let snapi_env = super::snapi_env(&env, guest_env);
     if snapi_env.is_null() || super::read_guest_bytes(&mut env, result_ptr, 4).is_none() {
-        return 1;
+        return Ok(1);
     }
     let mut result = 0;
-    let status = unsafe {
+    let status = super::with_cb_context(&mut env, guest_env, || unsafe {
         crate::snapi::snapi_bridge_unofficial_contextify_compile_function_legacy(
             snapi_env,
             args[1].unwrap_i32().max(0) as u32,
@@ -999,11 +1014,12 @@ fn legacy_compile_function(mut env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> 
             args[10].unwrap_i32().max(0) as u32,
             &mut result,
         )
-    };
+    })
+    .map_err(|error| RuntimeError::user(Box::new(error)))?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
-        return 1;
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn legacy_compile_cjs(
