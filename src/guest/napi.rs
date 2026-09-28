@@ -4652,7 +4652,7 @@ fn guest_napi_fatal_error(
     loc_len: i32,
     msg_ptr: i32,
     msg_len: i32,
-) -> Result<i32, WasiError> {
+) -> Result<(), WasiError> {
     let loc = read_guest_fatal_text(&mut env, loc_ptr, loc_len);
     let msg = read_guest_fatal_text(&mut env, msg_ptr, msg_len);
     eprintln!("FATAL ERROR: location={}, message={}", loc, msg);
