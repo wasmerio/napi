@@ -56,6 +56,7 @@ impl<T> HostCopy<T> {
         self.data.as_mut_ptr()
     }
 
+    #[cfg(test)]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         self.data.as_mut_slice()
     }
@@ -63,6 +64,23 @@ impl<T> HostCopy<T> {
     pub(crate) fn push(&mut self, value: T) {
         assert!(self.data.len() < self.reserved_elements);
         self.data.push(value);
+    }
+}
+
+impl HostCopy<u8> {
+    /// Produce a NUL-terminated host copy while keeping its second allocation
+    /// charged for as long as native code can read it.
+    pub(crate) fn terminated_copy(&self) -> Option<Self> {
+        let budget = Arc::clone(self.budget.as_ref()?);
+        let mut terminated = Self::with_capacity(budget, self.data.len().checked_add(1)?)?;
+        for &byte in &self.data {
+            if byte == 0 {
+                return None;
+            }
+            terminated.push(byte);
+        }
+        terminated.push(0);
+        Some(terminated)
     }
 }
 

@@ -28,7 +28,7 @@ use super::{abi, util::*};
 /// owned NUL-terminated copy.
 struct GuestName<'a> {
     bytes: &'a HostCopy<u8>,
-    terminated: Option<CString>,
+    terminated: Option<HostCopy<u8>>,
 }
 
 impl<'a> GuestName<'a> {
@@ -36,15 +36,22 @@ impl<'a> GuestName<'a> {
         if length != u32::MAX && bytes.len() != length as usize {
             return None;
         }
-        let terminated = (length == u32::MAX || length == 0)
-            .then(|| CString::new(bytes.as_slice()).unwrap_or_default());
+        let terminated = if length == u32::MAX && !bytes.is_empty() {
+            Some(bytes.terminated_copy()?)
+        } else {
+            None
+        };
         Some(Self { bytes, terminated })
     }
 
     fn as_ptr(&self) -> *const c_char {
-        self.terminated
-            .as_ref()
-            .map_or_else(|| self.bytes.as_ptr().cast(), |name| name.as_ptr())
+        if let Some(terminated) = &self.terminated {
+            terminated.as_ptr().cast()
+        } else if self.bytes.is_empty() {
+            c"".as_ptr()
+        } else {
+            self.bytes.as_ptr().cast()
+        }
     }
 }
 
@@ -5178,10 +5185,19 @@ mod guest_name_tests {
 
         let missing = HostCopy::<u8>::empty();
         assert!(GuestName::new(&missing, 1).is_none());
-        let auto = GuestName::new(&bytes, u32::MAX).unwrap();
+        assert!(GuestName::new(&bytes, u32::MAX).is_none());
+
+        let budget = ResourceBudget::with_memory_limit(64);
+        let mut plain = HostCopy::<u8>::zeroed(budget.clone(), 3).unwrap();
+        plain.as_mut_slice().copy_from_slice(b"abc");
+        let before = budget.snapshot().host_transient;
+        let auto = GuestName::new(&plain, u32::MAX).unwrap();
+        assert_eq!(budget.snapshot().host_transient, before + 4);
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(auto.as_ptr()) }.to_bytes(),
-            b""
+            b"abc"
         );
+        drop(auto);
+        assert_eq!(budget.snapshot().host_transient, before);
     }
 }
