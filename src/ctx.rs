@@ -539,21 +539,21 @@ impl NapiSession {
                 .context("missing runtime function env during instance setup")?
         };
 
-        if let Some(memory) = imported_memory {
-            func_env.as_mut(&mut *store).memory = Some(memory.clone());
+        // Imported memory is already available to a start section. A module
+        // can also define and export its own memory; bind that after
+        // instantiation so a later N-API call can use it. Keep the guest heap
+        // lazy in either case.
+        let instance_memory = imported_memory
+            .cloned()
+            .or_else(|| instance.exports.get_memory("memory").ok().cloned());
+        if let Some(memory) = instance_memory {
+            func_env.as_mut(&mut *store).memory = Some(memory);
         }
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        {
-            // Keep import-only modules cheap. The allocator is constructed by
-            // ensure_guest_heap on the first env-creation call, after Edge has
-            // admitted the lane. A start section may already have installed
-            // its heap; never replace that allocator here.
-            anyhow::ensure!(
-                func_env.as_ref(&*store).memory.is_some(),
-                "N-API imports require the guest to have linear memory"
-            );
-        }
+        // Keep import-only modules cheap, including those with no linear
+        // memory. The first environment creation validates memory and installs
+        // the allocator after Edge has admitted the lane. A start section may
+        // already have installed its heap; never replace it here.
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
         // Memory. Keep its established guest allocator: exported malloc owns
@@ -861,6 +861,81 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("lane stops");
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn memoryless_import_only_module_stays_inert() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (func (export "invoke") (result i32) call $init)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, 0);
+
+        // Actual N-API use fails without guest memory before activation.
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn exported_memory_is_bound_without_initializing_napi() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (memory (export "memory") 1 512)
+                (func (export "invoke") (result i32) call $init)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let memory = instance.exports.get_memory("memory").unwrap().clone();
+        let pages_before = memory.size(&store);
+        let charge_before = hooks.budget().snapshot().mem_charged;
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(memory.size(&store), pages_before);
+        assert_eq!(hooks.budget().snapshot().mem_charged, charge_before);
+
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert!(invoke.call(&mut store).unwrap() > 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
