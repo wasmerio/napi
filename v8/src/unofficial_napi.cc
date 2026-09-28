@@ -2378,13 +2378,12 @@ size_t unofficial_napi_message_retained_bytes(unofficial_napi_message message) {
          payload->wasm_modules.capacity() * sizeof(payload->wasm_modules[0]);
 }
 
-napi_status NAPI_CDECL unofficial_napi_message_take(
+napi_status ReadSerializedMessage(
     napi_env env,
     unofficial_napi_message message,
     napi_value* result_out) {
   if (message == nullptr) return napi_invalid_arg;
-  std::unique_ptr<SerializedClonePayload> payload(
-      reinterpret_cast<SerializedClonePayload*>(message));
+  auto* payload = reinterpret_cast<SerializedClonePayload*>(message);
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2408,6 +2407,20 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(output));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+extern "C" napi_status unofficial_napi_message_read_legacy(
+    napi_env env, unofficial_napi_message message, napi_value* result_out) {
+  return ReadSerializedMessage(env, message, result_out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_message_take(
+    napi_env env,
+    unofficial_napi_message message,
+    napi_value* result_out) {
+  std::unique_ptr<SerializedClonePayload> owner(
+      reinterpret_cast<SerializedClonePayload*>(message));
+  return ReadSerializedMessage(env, message, result_out);
 }
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {

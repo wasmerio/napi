@@ -271,6 +271,17 @@ unsafe extern "C" {
         payload_out: *mut u32,
         retained_bytes_out: *mut u64,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_message_create_legacy_metered(
+        env: SnapiEnv,
+        value_id: u32,
+        message_out: *mut u32,
+        retained_bytes_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_message_read_legacy(
+        env: SnapiEnv,
+        message_id: u32,
+        value_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,
         payload: u32,

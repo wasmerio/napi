@@ -54,8 +54,14 @@ impl Drop for MessageCharge {
 
 #[derive(Debug)]
 pub(crate) struct PendingMessages {
-    handles: Mutex<HashMap<u32, MessageCharge>>,
+    handles: Mutex<HashMap<u32, MessageEntry>>,
     closed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct MessageEntry {
+    charge: Arc<MessageCharge>,
+    legacy: bool,
 }
 
 impl PendingMessages {
@@ -69,6 +75,23 @@ impl PendingMessages {
     /// Takes ownership after the bridge has created a message. The caller
     /// drops the bridge handle itself if insertion fails.
     pub(crate) fn insert(&self, id: u32, charge: MessageCharge) -> Result<(), MessageCharge> {
+        self.insert_kind(id, charge, false)
+    }
+
+    pub(crate) fn insert_legacy(
+        &self,
+        id: u32,
+        charge: MessageCharge,
+    ) -> Result<(), MessageCharge> {
+        self.insert_kind(id, charge, true)
+    }
+
+    fn insert_kind(
+        &self,
+        id: u32,
+        charge: MessageCharge,
+        legacy: bool,
+    ) -> Result<(), MessageCharge> {
         if id == 0 {
             return Err(charge);
         }
@@ -79,17 +102,43 @@ impl PendingMessages {
         if handles.contains_key(&id) || handles.try_reserve(1).is_err() {
             return Err(charge);
         }
-        handles.insert(id, charge);
+        handles.insert(
+            id,
+            MessageEntry {
+                charge: Arc::new(charge),
+                legacy,
+            },
+        );
         Ok(())
     }
 
     /// An atomic ownership check and removal. The charge remains live in the
     /// returned guard until the native take/drop operation has completed.
-    pub(crate) fn take(&self, id: u32) -> Option<MessageCharge> {
+    pub(crate) fn take(&self, id: u32) -> Option<Arc<MessageCharge>> {
+        self.take_kind(id, false)
+    }
+
+    pub(crate) fn take_legacy(&self, id: u32) -> Option<Arc<MessageCharge>> {
+        self.take_kind(id, true)
+    }
+
+    fn take_kind(&self, id: u32, legacy: bool) -> Option<Arc<MessageCharge>> {
+        let mut handles = self.handles.lock().expect("poisoned message registry");
+        if handles.get(&id)?.legacy != legacy {
+            return None;
+        }
+        handles.remove(&id).map(|entry| entry.charge)
+    }
+
+    /// Legacy deserialization borrows a payload; only explicit release
+    /// consumes it. The native bridge holds a shared lease across the read,
+    /// so a concurrent release cannot free the bytes underneath V8.
+    pub(crate) fn lease_legacy(&self, id: u32) -> Option<Arc<MessageCharge>> {
         self.handles
             .lock()
             .expect("poisoned message registry")
-            .remove(&id)
+            .get(&id)
+            .and_then(|entry| entry.legacy.then(|| Arc::clone(&entry.charge)))
     }
 
     /// Discard queued payloads once the instance has stopped and guest work

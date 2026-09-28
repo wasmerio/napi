@@ -2,7 +2,11 @@
 //! The fixture is derived from atom SHA-256
 //! ca6467e67c8503474cb4204cd2dbbae387c8fa19cad6f6c23131844143e27ccc.
 
-use crate::{NAPI_MODULE_NAME, NapiEnv, budget::Pool};
+use crate::{
+    NAPI_MODULE_NAME, NapiEnv,
+    budget::Pool,
+    message::{MessageCharge, SERIALIZATION_RESERVATION},
+};
 use wasmer::{
     AsStoreMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Imports, RuntimeError, Type,
     Value,
@@ -86,6 +90,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
     if env.data().host_stopped()
         && name != "unofficial_napi_release_env"
         && name != "unofficial_napi_release_env_with_loop"
+        && name != "unofficial_napi_release_serialized_value"
     {
         return Ok(1);
     }
@@ -110,6 +115,22 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 return Ok(1);
             };
             Ok(i32::from(!legacy_default_flags(bytes.as_slice())))
+        }
+        "unofficial_napi_serialize_value" => legacy_serialize_value(env, args),
+        "unofficial_napi_deserialize_value" => legacy_deserialize_value(env, args),
+        "unofficial_napi_release_serialized_value" => {
+            let id = args[0].unwrap_i32();
+            if id == 0 {
+                return Ok(0);
+            }
+            if id < 0 {
+                return Err(RuntimeError::new("invalid legacy serialized payload"));
+            }
+            let Some(_charge) = env.data().pending_messages.take_legacy(id as u32) else {
+                return Err(RuntimeError::new("invalid legacy serialized payload"));
+            };
+            unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(id as u32) };
+            Ok(0)
         }
         "unofficial_napi_create_env" => Ok(super::guest_unofficial_napi_create_env(
             env,
@@ -416,9 +437,9 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
         // Every released import has an exact type and a host function. An
         // operation with no safe compatibility path reports failure rather
         // than pretending that an irreversible state transition succeeded.
-        "unofficial_napi_free_buffer" | "unofficial_napi_release_serialized_value" => Err(
-            RuntimeError::new(format!("unsupported legacy release: {name}")),
-        ),
+        "unofficial_napi_free_buffer" => Err(RuntimeError::new(format!(
+            "unsupported legacy release: {name}"
+        ))),
         _ => Ok(1),
     }
 }
@@ -653,6 +674,94 @@ fn legacy_module_hook(
             kind,
         )
     }
+}
+
+fn legacy_serialize_value(
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+) -> Result<i32, RuntimeError> {
+    let guest_env = args[0].unwrap_i32();
+    let value = args[1].unwrap_i32();
+    let result_ptr = args[2].unwrap_i32();
+    if guest_env <= 0 || value <= 0 || result_ptr <= 0 {
+        return Ok(1);
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() || super::read_guest_bytes(&mut env, result_ptr, 4).is_none() {
+        return Ok(1);
+    }
+    let pending = env.data().pending_messages.clone();
+    let Ok(mut charge) =
+        MessageCharge::reserve(env.data().budget.clone(), SERIALIZATION_RESERVATION)
+    else {
+        return Ok(1);
+    };
+    let mut message = 0;
+    let mut retained_bytes = 0;
+    let status = super::with_cb_context(&mut env, guest_env, || unsafe {
+        crate::snapi::snapi_bridge_unofficial_message_create_legacy_metered(
+            snapi_env,
+            value as u32,
+            &mut message,
+            &mut retained_bytes,
+        )
+    });
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if message != 0 {
+                unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+            }
+            return Err(RuntimeError::user(Box::new(error)));
+        }
+    };
+    if status != 0 {
+        return Ok(status);
+    }
+    if !charge.shrink(retained_bytes) || pending.insert_legacy(message, charge).is_err() {
+        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        return Ok(1);
+    }
+    if !super::write_guest_u32(&mut env, result_ptr as u32, message) {
+        drop(pending.take_legacy(message));
+        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+fn legacy_deserialize_value(
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+) -> Result<i32, RuntimeError> {
+    let guest_env = args[0].unwrap_i32();
+    let message = args[1].unwrap_i32();
+    let result_ptr = args[2].unwrap_i32();
+    if guest_env <= 0 || message <= 0 || result_ptr <= 0 {
+        return Ok(1);
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() || super::read_guest_bytes(&mut env, result_ptr, 4).is_none() {
+        return Ok(1);
+    }
+    // A concurrent explicit release removes the registry entry, while this
+    // lease keeps the app charge until the native reader has finished.
+    let Some(_charge) = env.data().pending_messages.lease_legacy(message as u32) else {
+        return Ok(1);
+    };
+    let mut value = 0;
+    let status = super::with_cb_context(&mut env, guest_env, || unsafe {
+        crate::snapi::snapi_bridge_unofficial_message_read_legacy(
+            snapi_env,
+            message as u32,
+            &mut value,
+        )
+    })
+    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, value) {
+        return Ok(1);
+    }
+    Ok(status)
 }
 
 fn legacy_default_flags(bytes: &[u8]) -> bool {

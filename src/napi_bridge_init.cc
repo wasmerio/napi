@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +39,9 @@ extern "C" size_t unofficial_napi_bytecode_size_legacy(
     unofficial_napi_bytecode bytecode);
 extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
     napi_env env, napi_value callback, int32_t kind);
+extern "C" napi_status unofficial_napi_message_read_legacy(
+    napi_env env, unofficial_napi_message message, napi_value *result_out);
+extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id);
 
 namespace {
 
@@ -232,6 +236,15 @@ std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>> &g_envs =
 // Message resources cross worker environments. Rust validates each guest ID
 // against the owning NapiCtx before calling into this process-wide table.
 HandleTable &g_message_handles = *new HandleTable();
+struct LegacyMessageHolder {
+  explicit LegacyMessageHolder(unofficial_napi_message value) : message(value) {}
+  ~LegacyMessageHolder() { unofficial_napi_message_drop(message); }
+  unofficial_napi_message message;
+};
+// A legacy payload may be deserialized repeatedly until explicit release.
+// An in-flight read keeps its holder alive even if another worker releases it.
+std::unordered_map<uint32_t, std::shared_ptr<LegacyMessageHolder>> &g_legacy_message_holders =
+    *new std::unordered_map<uint32_t, std::shared_ptr<LegacyMessageHolder>>();
 
 CallbackBinding *RegisterCallbackBinding(SnapiEnvState *state,
                                          uint32_t reg_id) {
@@ -4579,12 +4592,68 @@ extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
                                                        message_out, nullptr);
 }
 
+extern "C" int snapi_bridge_unofficial_message_create_legacy_metered(
+    SnapiEnvState *env_state, uint32_t value_id, uint32_t *message_out,
+    uint64_t *retained_bytes_out) {
+  if (message_out == nullptr || retained_bytes_out == nullptr)
+    return napi_invalid_arg;
+  uint32_t id = 0;
+  const int status = snapi_bridge_unofficial_message_create_metered(
+      env_state, value_id, &id, retained_bytes_out);
+  if (status != napi_ok)
+    return status;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    auto message = reinterpret_cast<unofficial_napi_message>(
+        g_message_handles.Load(id));
+    if (message != nullptr) {
+      try {
+        g_legacy_message_holders.emplace(
+            id, std::make_shared<LegacyMessageHolder>(message));
+        *message_out = id;
+        return napi_ok;
+      } catch (const std::bad_alloc&) {
+      }
+    }
+  }
+  snapi_bridge_unofficial_message_drop(id);
+  return napi_generic_failure;
+}
+
+extern "C" int snapi_bridge_unofficial_message_read_legacy(
+    SnapiEnvState *env_state, uint32_t message_id, uint32_t *value_out) {
+  if (value_out == nullptr)
+    return napi_invalid_arg;
+  std::shared_ptr<LegacyMessageHolder> holder;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    auto it = g_legacy_message_holders.find(message_id);
+    if (it != g_legacy_message_holders.end())
+      holder = it->second;
+  }
+  if (holder == nullptr)
+    return napi_invalid_arg;
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr)
+    return napi_invalid_arg;
+  napi_value value = nullptr;
+  napi_status status = unofficial_napi_message_read_legacy(
+      state->env, holder->message, &value);
+  if (status != napi_ok)
+    return status;
+  *value_out = StoreValue(*state, value);
+  return *value_out == 0 ? napi_generic_failure : napi_ok;
+}
+
 extern "C" int snapi_bridge_unofficial_message_take(SnapiEnvState *env_state,
                                                     uint32_t message_id,
                                                     uint32_t *value_out) {
   unofficial_napi_message message;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    if (g_legacy_message_holders.contains(message_id))
+      return napi_invalid_arg;
     message = reinterpret_cast<unofficial_napi_message>(
         g_message_handles.Take(message_id));
   }
@@ -4610,13 +4679,27 @@ extern "C" int snapi_bridge_unofficial_message_take(SnapiEnvState *env_state,
 
 extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id) {
   unofficial_napi_message message;
+  std::shared_ptr<LegacyMessageHolder> holder;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    auto it = g_legacy_message_holders.find(message_id);
+    if (it != g_legacy_message_holders.end()) {
+      holder = std::move(it->second);
+      g_legacy_message_holders.erase(it);
+    }
     message = reinterpret_cast<unofficial_napi_message>(
         g_message_handles.Take(message_id));
   }
-  if (message != nullptr)
+  if (message != nullptr && holder == nullptr)
     unofficial_napi_message_drop(message);
+}
+
+// Native ownership probe for the host-stop regression. This is not a guest
+// import; it verifies that cleanup removes the holder as well as its budget.
+extern "C" int snapi_bridge_unofficial_legacy_message_is_live(
+    uint32_t message_id) {
+  std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+  return g_legacy_message_holders.contains(message_id) ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
@@ -5477,8 +5560,15 @@ extern "C" void snapi_bridge_dispose() {
     (void)DisposeBridgeStateLocked(lease.get());
   }
   std::vector<void *> handles;
+  std::vector<std::shared_ptr<LegacyMessageHolder>> legacy_holders;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    legacy_holders.reserve(g_legacy_message_holders.size());
+    for (auto &entry : g_legacy_message_holders) {
+      g_message_handles.Remove(entry.first);
+      legacy_holders.push_back(std::move(entry.second));
+    }
+    g_legacy_message_holders.clear();
     handles = g_message_handles.TakeAll();
   }
   for (void *handle : handles) {
