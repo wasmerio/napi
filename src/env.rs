@@ -122,11 +122,10 @@ pub(crate) struct NapiEnv {
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
-    /// Host-side allocator over the guest's linear memory. `None` only before
-    /// `NapiSession::configure_instance` runs; that call fails instantiation
-    /// outright if a `GuestHeap` can't be built, so any env reachable from
-    /// guest code is guaranteed to have one — it is the only allocation path
-    /// for guest-visible V8 memory, never a best-effort fallback.
+    /// Host-side allocator over the guest's linear memory. Created on first
+    /// environment use, so importing N-API alone does not grow guest memory.
+    /// Environment creation fails if the heap cannot be built; once created,
+    /// this is the only allocation path for guest-visible V8 memory.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
