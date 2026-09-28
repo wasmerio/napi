@@ -1,3 +1,7 @@
+// WASIX import handlers must return WasiError directly so Wasmer preserves
+// guest exits and traps. Boxing it would change the host-function ABI.
+#![allow(clippy::result_large_err)]
+
 // ============================================================
 // WASM import handlers for "napi" module
 // ============================================================
@@ -346,13 +350,12 @@ fn guest_unofficial_napi_release_env(
     let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
-    if status.as_ref().is_ok_and(|code| *code == 0) {
-        if let Some((guest_env, snapi_env_state)) =
+    if status.as_ref().is_ok_and(|code| *code == 0)
+        && let Some((guest_env, snapi_env_state)) =
             env.data_mut().begin_unregister_napi_scope(scope_id)
-        {
-            env.data_mut()
-                .finish_unregister_napi_env(guest_env, snapi_env_state);
-        }
+    {
+        env.data_mut()
+            .finish_unregister_napi_env(guest_env, snapi_env_state);
     }
     status
 }
@@ -3291,9 +3294,7 @@ fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i3
     s
 }
 fn guest_napi_close_handle_scope(env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
-    let s = unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) };
-    if s == 0 {}
-    s
+    unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) }
 }
 
 fn guest_napi_open_escapable_handle_scope(
@@ -4415,6 +4416,7 @@ fn guest_napi_get_buffer_info(
     0
 }
 
+#[allow(clippy::too_many_arguments)] // The imported C ABI has eight operands.
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,

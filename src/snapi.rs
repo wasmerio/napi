@@ -50,6 +50,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
+// The bridge ABI is shared with the browser-hosted backend and optional
+// extension imports, so a native build does not reference every declaration.
+#[allow(dead_code)]
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;

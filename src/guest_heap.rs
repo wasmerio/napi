@@ -653,25 +653,23 @@ impl GuestHeap {
     /// The receiver takes ownership (released via
     /// [`napi_host_guest_heap_release`]).
     pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
-        let p = Box::into_raw(Box::new(GuestHeapCtx {
+        Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
             heap: Arc::downgrade(self),
         }))
-        .cast();
-        p
+        .cast()
     }
 
     /// Box a finalizer context for one allocation. The bridge takes ownership
     /// on success (released via [`napi_host_guest_heap_buffer_finalize`]);
     /// reclaim with [`GuestHeap::reclaim_finalize_ctx`] on failure.
     pub(crate) fn make_finalize_ctx(self: &Arc<Self>, offset: u32) -> *mut c_void {
-        let p = Box::into_raw(Box::new(GuestHeapFinalizeCtx {
+        Box::into_raw(Box::new(GuestHeapFinalizeCtx {
             heap: Arc::downgrade(self),
             offset,
         }))
-        .cast();
-        p
+        .cast()
     }
 
     /// Take back a finalize ctx that was never handed to a live buffer.

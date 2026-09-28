@@ -233,6 +233,9 @@ pub fn alloc_guest(
     heap.alloc_with_store(&mut store, len, zero)
 }
 
+// Used by optional guest import paths; the current V8 path allocates through
+// the charged host-copy helpers instead.
+#[allow(dead_code)]
 pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
     let heap = env.data().guest_heap.clone()?;
     let guest_ptr = alloc_guest(env, &heap, data.len(), false)?;

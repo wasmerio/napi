@@ -260,6 +260,8 @@ pub(crate) fn read_js_source(
     }
 }
 
+// Kept alongside the versioned ABI while bytecode imports fail closed.
+#[allow(dead_code)]
 pub(crate) struct BytecodeOpen {
     pub source_text: u32,
     pub filename: u32,
@@ -273,6 +275,7 @@ pub(crate) struct BytecodeOpen {
     pub cache_policy: u8,
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_bytecode_open(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
