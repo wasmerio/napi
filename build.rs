@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -37,6 +37,12 @@ enum ExtraLink {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(napi_standalone_legacy_wait)");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    if standalone_legacy_wait() {
+        println!("cargo:rustc-cfg=napi_standalone_legacy_wait");
+    }
+
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "wasm32" {
         if env::var_os("CARGO_FEATURE_JS").is_none() {
@@ -241,6 +247,28 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=atomic");
         }
     }
+}
+
+fn standalone_legacy_wait() -> bool {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .expect("failed to read N-API Cargo.toml");
+    let mut in_napi_metadata = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_napi_metadata = line == "[package.metadata.napi]";
+        } else if in_napi_metadata {
+            let declaration = line.split('#').next().unwrap_or("").trim();
+            if let Some((key, value)) = declaration.split_once('=') {
+                if key.trim() == "standalone_legacy_wait" {
+                    return value.trim() == "true";
+                }
+            }
+        }
+    }
+    false
 }
 
 fn read_sandbox_build_flag(library_path: &Path) -> Option<bool> {

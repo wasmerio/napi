@@ -37,10 +37,12 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(all(not(target_arch = "wasm32"), not(napi_standalone_legacy_wait)))]
+use wasmer::sys::vm::StoreId;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::vm::{
-    ExpectedValue, LinearMemory, MemoryError, StoreId, ThreadConditions, VMMemory,
-    VMMemoryDefinition, VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
+    ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
+    VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::{BaseTunables, Tunables};
@@ -858,6 +860,7 @@ impl LinearMemory for BudgetedMemory {
         wasmer::sys::vm::on_host_stack(|| unsafe { self.inner.do_wait(dst, expected, timeout) })
     }
 
+    #[cfg(not(napi_standalone_legacy_wait))]
     unsafe fn do_wait_interruptible(
         &mut self,
         dst: u32,
@@ -1016,6 +1019,7 @@ mod tests {
 
     const PAGE: u64 = WASM_PAGE_SIZE as u64;
 
+    #[cfg(not(napi_standalone_legacy_wait))]
     #[derive(Debug)]
     struct InterruptWaitProbe {
         inner: VMMemory,
@@ -1023,6 +1027,7 @@ mod tests {
         expected_store: StoreId,
     }
 
+    #[cfg(not(napi_standalone_legacy_wait))]
     impl LinearMemory for InterruptWaitProbe {
         fn ty(&self) -> MemoryType {
             self.inner.ty()
@@ -1259,6 +1264,7 @@ mod tests {
         assert_eq!(budget.snapshot().wasm_linear, 0);
     }
 
+    #[cfg(not(napi_standalone_legacy_wait))]
     #[test]
     fn interruptible_wait_preserves_the_store_identity() {
         let budget = ResourceBudget::with_memory_limit(PAGE);

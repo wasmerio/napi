@@ -6,6 +6,12 @@ edition = "2024"
 license = "MIT"
 resolver = "2"
 
+[package.metadata.napi]
+# The pinned public Wasmer SDK predates LinearMemory::do_wait_interruptible.
+# build.rs uses this marker so the compatibility path cannot be changed by
+# --no-default-features or --all-features.
+standalone_legacy_wait = true
+
 [features]
 js = [
   "dep:js-sys",
