@@ -296,6 +296,13 @@ fn isolate_reservations_are_released_when_the_guest_exits() {
         "guest did not report success\n--- stdout ---\n{stdout}"
     );
 
+    // WASIX releases the final store on an asynchronous cleanup turn after
+    // the main guest reports exit. Mirror the workload manager's quiescence
+    // wait before asserting that the isolate reservation is gone.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ctx.budget().snapshot().live_isolates != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
     let usage = ctx.budget().snapshot();
     assert_eq!(
         usage.live_isolates, 0,
