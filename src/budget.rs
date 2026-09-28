@@ -39,8 +39,8 @@ use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::vm::{
-    ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
-    VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
+    ExpectedValue, LinearMemory, MemoryError, StoreId, ThreadConditions, VMMemory,
+    VMMemoryDefinition, VMSharedMemory, VMTable, VMTableDefinition, WaiterError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::{BaseTunables, Tunables};
@@ -858,6 +858,21 @@ impl LinearMemory for BudgetedMemory {
         wasmer::sys::vm::on_host_stack(|| unsafe { self.inner.do_wait(dst, expected, timeout) })
     }
 
+    unsafe fn do_wait_interruptible(
+        &mut self,
+        dst: u32,
+        expected: ExpectedValue,
+        timeout: Option<Duration>,
+        store_id: StoreId,
+    ) -> Result<u32, WaiterError> {
+        // Preserve the store identity so force-stop can wake an infinite
+        // atomic.wait registered by the underlying shared memory.
+        wasmer::sys::vm::on_host_stack(|| unsafe {
+            self.inner
+                .do_wait_interruptible(dst, expected, timeout, store_id)
+        })
+    }
+
     fn do_notify(&mut self, dst: u32, count: u32) -> u32 {
         wasmer::sys::vm::on_host_stack(|| self.inner.do_notify(dst, count))
     }
@@ -1000,6 +1015,72 @@ mod tests {
     use wasmer::{Imports, Instance, Memory, MemoryType, Module, Pages, Store, WASM_PAGE_SIZE};
 
     const PAGE: u64 = WASM_PAGE_SIZE as u64;
+
+    #[derive(Debug)]
+    struct InterruptWaitProbe {
+        inner: VMMemory,
+        seen: Arc<AtomicBool>,
+        expected_store: StoreId,
+    }
+
+    impl LinearMemory for InterruptWaitProbe {
+        fn ty(&self) -> MemoryType {
+            self.inner.ty()
+        }
+
+        fn size(&self) -> Pages {
+            self.inner.size()
+        }
+
+        fn style(&self) -> MemoryStyle {
+            self.inner.style()
+        }
+
+        fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
+            self.inner.grow(delta)
+        }
+
+        fn vmmemory(&self) -> std::ptr::NonNull<VMMemoryDefinition> {
+            self.inner.vmmemory()
+        }
+
+        fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync>, MemoryError> {
+            Ok(Box::new(Self {
+                inner: self.inner.try_clone()?,
+                seen: Arc::clone(&self.seen),
+                expected_store: self.expected_store,
+            }))
+        }
+
+        fn copy(&self) -> Result<Box<dyn LinearMemory + Send + Sync>, MemoryError> {
+            Ok(Box::new(Self {
+                inner: VMMemory::from(self.inner.copy()?),
+                seen: Arc::clone(&self.seen),
+                expected_store: self.expected_store,
+            }))
+        }
+
+        unsafe fn do_wait(
+            &mut self,
+            _dst: u32,
+            _expected: ExpectedValue,
+            _timeout: Option<Duration>,
+        ) -> Result<u32, WaiterError> {
+            panic!("interruptible wait must not be downgraded to a plain wait")
+        }
+
+        unsafe fn do_wait_interruptible(
+            &mut self,
+            _dst: u32,
+            _expected: ExpectedValue,
+            _timeout: Option<Duration>,
+            store_id: StoreId,
+        ) -> Result<u32, WaiterError> {
+            assert_eq!(store_id, self.expected_store);
+            self.seen.store(true, Ordering::Release);
+            Ok(7)
+        }
+    }
 
     /// A store whose engine charges guest wasm linear memory against `budget`.
     fn budgeted_store(budget: Arc<ResourceBudget>) -> Store {
@@ -1176,6 +1257,33 @@ mod tests {
         assert_eq!(budget.snapshot().wasm_linear, PAGE);
         drop(wrapped);
         assert_eq!(budget.snapshot().wasm_linear, 0);
+    }
+
+    #[test]
+    fn interruptible_wait_preserves_the_store_identity() {
+        let budget = ResourceBudget::with_memory_limit(PAGE);
+        let ty = MemoryType::new(1, Some(1), true);
+        let base = BaseTunables::new();
+        let style = base.memory_style(&ty);
+        let inner = base.create_host_memory(&ty, &style).unwrap();
+        let seen = Arc::new(AtomicBool::new(false));
+        let store_id = StoreId::default();
+        let probe = InterruptWaitProbe {
+            inner,
+            seen: Arc::clone(&seen),
+            expected_store: store_id,
+        };
+        let mut memory = BudgetedMemory::new(
+            VMMemory::from(Box::new(probe) as Box<dyn LinearMemory + Send + Sync>),
+            budget,
+        )
+        .unwrap();
+        let result = unsafe {
+            LinearMemory::do_wait_interruptible(&mut memory, 0, ExpectedValue::None, None, store_id)
+        }
+        .unwrap();
+        assert_eq!(result, 7);
+        assert!(seen.load(Ordering::Acquire));
     }
 
     #[test]
