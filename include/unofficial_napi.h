@@ -727,6 +727,16 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_mod
     bool cjs_var_in_scope,
     bool* result_out);
 
+// Compile a classic script solely to validate its syntax. The compiled code is
+// discarded without running it or retaining bytecode/cache buffers.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_validate_script(
+    napi_env env,
+    napi_value source_text,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value host_defined_option_id);
+
 // Unofficial helpers for implementing internalBinding('module_wrap') on embedders.
 // These keep V8 module objects behind an opaque native handle so bindings stay N-API only.
 typedef struct unofficial_napi_module__* unofficial_napi_module;

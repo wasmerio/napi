@@ -71,6 +71,31 @@ pub fn read_guest_bytes(
     Some(out)
 }
 
+/// Copy a bounded diagnostic string supplied to `napi_fatal_error`.
+/// Explicit lengths may include NUL bytes; `-1` requests NUL termination.
+pub(crate) fn read_guest_fatal_text(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    len: i32,
+) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if guest_ptr <= 0 {
+        return "(null)".to_owned();
+    }
+    let bytes = if len == -1 {
+        read_guest_c_string(env, guest_ptr)
+    } else {
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| read_guest_bytes(env, guest_ptr, len.min(MAX_DIAGNOSTIC_BYTES)))
+    };
+    bytes
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+        })
+        .unwrap_or_else(|| "(invalid guest string)".to_owned())
+}
+
 pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     let Some(memory) = env.data().memory.clone() else {
         return 0;

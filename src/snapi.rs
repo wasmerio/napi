@@ -280,6 +280,14 @@ unsafe extern "C" {
         cjs_var_in_scope: i32,
         result_out: *mut i32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_validate_script(
+        env: SnapiEnv,
+        source_text_id: u32,
+        filename_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        host_defined_option_id: u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_make_context(
         env: SnapiEnv,
         sandbox_or_symbol_id: u32,

@@ -4617,6 +4617,26 @@ extern "C" int snapi_bridge_unofficial_contextify_contains_module_syntax(
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_contextify_validate_script(
+    SnapiEnvState *env_state, uint32_t source_text_id, uint32_t filename_id,
+    int32_t line_offset, int32_t column_offset, uint32_t host_defined_option_id) {
+  auto bridge_state_lease = RequireEnvState(env_state);
+  auto *bridge_state = bridge_state_lease.get();
+  if (bridge_state == nullptr)
+    return napi_invalid_arg;
+  napi_value source_text = LoadValue(*bridge_state, source_text_id);
+  napi_value filename = LoadValue(*bridge_state, filename_id);
+  napi_value host_id = host_defined_option_id == 0
+                           ? nullptr
+                           : LoadValue(*bridge_state, host_defined_option_id);
+  if (source_text == nullptr || filename == nullptr ||
+      (host_defined_option_id != 0 && host_id == nullptr))
+    return napi_invalid_arg;
+  return unofficial_napi_contextify_validate_script(
+      bridge_state->env, source_text, filename, line_offset, column_offset,
+      host_id);
+}
+
 extern "C" int snapi_bridge_unofficial_contextify_make_context(
     SnapiEnvState *env_state, uint32_t sandbox_or_symbol_id, uint32_t name_id,
     uint32_t origin_id, int allow_code_gen_strings, int allow_code_gen_wasm,

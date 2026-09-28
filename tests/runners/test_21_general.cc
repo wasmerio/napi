@@ -25,6 +25,10 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
   g_last_released_guest_heap_ctx = ctx;
 }
 
+// Provider-internal accounting hook, intentionally absent from guest imports.
+extern "C" size_t unofficial_napi_message_retained_bytes(
+    unofficial_napi_message message);
+
 class Test21General : public FixtureTestBase {};
 
 namespace {

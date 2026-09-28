@@ -2110,6 +2110,58 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_release(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_contextify_validate_script(
+    napi_env env,
+    napi_value source_text,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value host_defined_option_id) {
+  if (env == nullptr || source_text == nullptr || filename == nullptr) {
+    return napi_invalid_arg;
+  }
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Value> source_value = napi_v8_unwrap_value(source_text);
+  v8::Local<v8::Value> filename_value = napi_v8_unwrap_value(filename);
+  if (source_value.IsEmpty() || filename_value.IsEmpty()) return napi_invalid_arg;
+  if (!source_value->IsString() || !filename_value->IsString()) {
+    return napi_string_expected;
+  }
+
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (host_defined_option_id != nullptr) {
+    v8::Local<v8::Value> host_id = napi_v8_unwrap_value(host_defined_option_id);
+    if (!host_id.IsEmpty() && host_id->IsSymbol()) {
+      host_id_symbol = host_id.As<v8::Symbol>();
+    }
+  }
+  v8::Context::Scope context_scope(env->context());
+  v8::TryCatch try_catch(isolate);
+  v8::ScriptOrigin origin(filename_value,
+                          line_offset,
+                          column_offset,
+                          true,
+                          -1,
+                          v8::Local<v8::Value>(),
+                          false,
+                          false,
+                          false,
+                          HostDefinedOptions(isolate, host_id_symbol));
+  v8::ScriptCompiler::Source source(source_value.As<v8::String>(), origin);
+  v8::Local<v8::UnboundScript> compiled;
+  if (!v8::ScriptCompiler::CompileUnboundScript(
+           isolate, &source, v8::ScriptCompiler::kNoCompileOptions,
+           v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason)
+           .ToLocal(&compiled)) {
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      return ThrowTryCatchException(env, try_catch);
+    }
+    return try_catch.HasTerminated() ? napi_pending_exception : napi_generic_failure;
+  }
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
     napi_env env,
     napi_value sandbox_or_null,
