@@ -603,12 +603,20 @@ napi_env GetModuleWrapEnvForIsolate(v8::Isolate* isolate) {
 
 ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
   if (env == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
   return &g_module_wrap_states[env];
+}
+
+ModuleWrapBindingState* FindModuleWrapState(napi_env env) {
+  if (env == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  auto it = g_module_wrap_states.find(env);
+  return it == g_module_wrap_states.end() ? nullptr : &it->second;
 }
 
 void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
   if (env == nullptr || record == nullptr) return;
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return;
   auto& modules = state->modules;
   modules.erase(std::remove(modules.begin(), modules.end(), record), modules.end());
@@ -784,12 +792,16 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
 
 void CleanupContextRecords(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  g_context_cleanup_hooks.erase(env);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-  for (auto& rec : it->second) {
+  std::vector<ContextRecord> records;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    g_context_cleanup_hooks.erase(env);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    records = std::move(it->second);
+    g_context_records.erase(it);
+  }
+  for (auto& rec : records) {
     if (rec.key_ref != nullptr && env->context_token_unassign_callback != nullptr) {
       env->context_token_unassign_callback(
           env, rec.key_ref, env->context_token_callback_data);
@@ -801,7 +813,6 @@ void CleanupContextRecords(void* arg) {
     rec.context.Reset();
     rec.own_microtask_queue.reset();
   }
-  g_context_records.erase(it);
 }
 
 void EnsureContextCleanupHook(napi_env env) {
@@ -814,13 +825,18 @@ void EnsureContextCleanupHook(napi_env env) {
 
 void CleanupModuleWrapState(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  g_module_wrap_cleanup_hooks.erase(env);
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
-
-  for (ModuleWrapRecord* record : it->second.modules) {
+  ModuleWrapBindingState state;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    g_module_wrap_cleanup_hooks.erase(env);
+    auto it = g_module_wrap_states.find(env);
+    if (it == g_module_wrap_states.end()) return;
+    state = std::move(it->second);
+    g_module_wrap_states.erase(it);
+  }
+  // Releasing refs and modules enters V8. Keep the registry lock out of that
+  // work so teardown of one isolate cannot stall another isolate's lookup.
+  for (ModuleWrapRecord* record : state.modules) {
     if (record == nullptr) continue;
     ResetRef(env, &record->wrapper_ref);
     ResetRef(env, &record->synthetic_eval_steps_ref);
@@ -831,18 +847,21 @@ void CleanupModuleWrapState(void* arg) {
     env->release(record);
   }
 
-  ResetRef(env, &it->second.import_module_dynamically_ref);
-  ResetRef(env, &it->second.initialize_import_meta_ref);
-  for (auto& promise : it->second.pending_dynamic_imports) promise.value.Reset();
-  it->second.pending_dynamic_imports.clear();
-  g_module_wrap_states.erase(it);
+  ResetRef(env, &state.import_module_dynamically_ref);
+  ResetRef(env, &state.initialize_import_meta_ref);
+  for (auto& promise : state.pending_dynamic_imports) promise.value.Reset();
 }
 
 void EnsureModuleWrapCleanupHook(napi_env env) {
-  auto [it, inserted] = g_module_wrap_cleanup_hooks.emplace(env);
+  bool inserted;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    inserted = g_module_wrap_cleanup_hooks.emplace(env).second;
+  }
   if (!inserted) return;
   if (napi_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
-    g_module_wrap_cleanup_hooks.erase(it);
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    g_module_wrap_cleanup_hooks.erase(env);
   }
 }
 
@@ -922,7 +941,7 @@ void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const st
 }
 
 ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> module) {
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr || module.IsEmpty()) return nullptr;
   for (ModuleWrapRecord* record : state->modules) {
     if (record == nullptr || record->module.IsEmpty()) continue;
@@ -934,7 +953,7 @@ ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> 
 ModuleWrapRecord* FindModuleRecordForHandle(napi_env env,
                                             unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return nullptr;
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return nullptr;
   ModuleWrapRecord* candidate = ModuleRecord(module);
   auto it = std::find(state->modules.begin(), state->modules.end(), candidate);
@@ -1194,7 +1213,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return v8::MaybeLocal<v8::Promise>();
 
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return v8::MaybeLocal<v8::Promise>();
   napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
   if (callback == nullptr) return v8::MaybeLocal<v8::Promise>();
@@ -1277,12 +1296,12 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
                                     v8::Local<v8::Object> meta) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return;
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return;
   ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
   if (record == nullptr) return;
 
-  napi_value callback = GetRefValue(env, it->second.initialize_import_meta_ref);
+  napi_value callback = GetRefValue(env, state->initialize_import_meta_ref);
   napi_value wrapper = GetRefValue(env, record->wrapper_ref);
   napi_value id_value = GetRefValue(env, record->host_defined_option_ref);
   if (callback == nullptr || wrapper == nullptr || id_value == nullptr) return;
@@ -1301,7 +1320,7 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
                                                       v8::Local<v8::Module> /*referrer*/) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return v8::MaybeLocal<v8::Module>();
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr || state->temporary_required_module_facade_original == nullptr ||
       state->temporary_required_module_facade_original->module.IsEmpty()) {
     return v8::MaybeLocal<v8::Module>();
@@ -1491,10 +1510,18 @@ bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<s
   if (value.IsEmpty() || !value->IsArray()) return false;
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Array> array = value.As<v8::Array>();
+  constexpr uint32_t kMaxParams = 1024;
+  constexpr size_t kMaxParamBytes = 1024 * 1024;
+  if (array->Length() > kMaxParams) return false;
   out->reserve(array->Length());
+  size_t total_bytes = 0;
   for (uint32_t i = 0; i < array->Length(); ++i) {
     v8::Local<v8::Value> item;
     if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
+    const int bytes = item.As<v8::String>()->Utf8Length(env->isolate);
+    if (bytes < 0 || static_cast<size_t>(bytes) > kMaxParamBytes - total_bytes)
+      return false;
+    total_bytes += static_cast<size_t>(bytes);
     out->push_back(V8ValueToUtf8(env->isolate, item));
   }
   return true;
@@ -1646,17 +1673,21 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
 
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
-    if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(env, context);
+  v8::HandleScope scope(env->isolate);
+  std::vector<v8::Local<v8::Context>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    contexts.reserve(it->second.size());
+    for (auto& rec : it->second) {
+      v8::Local<v8::Context> context = rec.context.Get(env->isolate);
+      if (!context.IsEmpty()) contexts.push_back(context);
     }
   }
+  // Applying hooks touches g_runtime_mu and can enter V8. Never hold the
+  // process-wide context registry mutex across either operation.
+  for (auto context : contexts) NapiV8ApplyPromiseHooksToContext(env, context);
 }
 
 extern "C" {
@@ -2182,8 +2213,17 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     return napi_invalid_arg;
   }
 
-  std::string source_text = bytecode_record != nullptr ? bytecode_record->source_utf8
-                                                       : ToUtf8String(env, source->text, "");
+  std::string source_text;
+  if (bytecode_record != nullptr) {
+    source_text = bytecode_record->source_utf8;
+  } else {
+    v8::Local<v8::String> source_string = ToV8String(env, source->text, "");
+    const int source_bytes = source_string->Utf8Length(isolate);
+    if (source_bytes < 0 || source_bytes > 4 * 1024 * 1024)
+      return napi_invalid_arg;
+    source_text = V8ValueToUtf8(isolate, source_string);
+  }
+  if (source_text.size() > 4 * 1024 * 1024) return napi_invalid_arg;
   if (StartsWithBomHashbang(source_text)) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(
         isolate, "Invalid or unexpected token");
@@ -2212,6 +2252,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     v8::Local<v8::Value> value = napi_v8_unwrap_value(context_extensions_or_undefined);
     if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
     v8::Local<v8::Array> array = value.As<v8::Array>();
+    if (array->Length() > 1024) return napi_invalid_arg;
     context_extensions.reserve(array->Length());
     for (uint32_t i = 0; i < array->Length(); ++i) {
       v8::Local<v8::Value> item;
@@ -2508,10 +2549,7 @@ static napi_status CreateSourceTextModule(
     return napi_generic_failure;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
-  }
+  GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;
 }
@@ -2544,6 +2582,7 @@ static napi_status CreateSyntheticModule(
 
   uint32_t export_count = 0;
   napi_get_array_length(env, export_names, &export_count);
+  if (export_count > 1024) return napi_invalid_arg;
   std::vector<v8::Local<v8::String>> export_names_v8;
   export_names_v8.reserve(export_count);
   for (uint32_t i = 0; i < export_count; ++i) {
@@ -2567,10 +2606,7 @@ static napi_status CreateSyntheticModule(
   napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
   napi_create_reference(env, synthetic_eval_steps, 1, &record->synthetic_eval_steps_ref);
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
-  }
+  GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;
 }
@@ -2631,14 +2667,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
     unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    auto it = g_module_wrap_states.find(env);
-    if (it == g_module_wrap_states.end()) return napi_ok;
-    auto& modules = it->second.modules;
-    if (std::find(modules.begin(), modules.end(), record) == modules.end()) {
-      return napi_ok;
-    }
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr ||
+      std::find(state->modules.begin(), state->modules.end(), record) == state->modules.end()) {
+    return napi_ok;
   }
   DestroyModuleRecord(record);
   return napi_ok;
@@ -3011,7 +3043,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
   }
 
   EnsureModuleWrapCleanupHook(env);
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
   auto* state = GetModuleWrapState(env);
   ResetRef(env, &state->import_module_dynamically_ref);
   ResetRef(env, &state->initialize_import_meta_ref);
@@ -3051,15 +3082,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     return napi_pending_exception;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = record;
-  }
+  GetModuleWrapState(env)->temporary_required_module_facade_original = record;
   const bool instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = nullptr;
-  }
+  GetModuleWrapState(env)->temporary_required_module_facade_original = nullptr;
   if (!instantiated) return napi_pending_exception;
 
   v8::Local<v8::Value> evaluated;
@@ -3075,20 +3100,18 @@ void NapiV8TrackProviderPromise(v8::Isolate* isolate,
   if (isolate == nullptr || promise.IsEmpty()) return;
   napi_env env = GetModuleWrapEnvForIsolate(isolate);
   if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto it = g_module_wrap_states.find(env);
-  if (it != g_module_wrap_states.end()) {
-    it->second.pending_dynamic_imports.emplace_back(isolate, promise);
+  auto* state = FindModuleWrapState(env);
+  if (state != nullptr) {
+    state->pending_dynamic_imports.emplace_back(isolate, promise);
   }
 }
 
 bool NapiV8HasPendingProviderWork(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return false;
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return false;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return false;
 
-  auto& imports = it->second.pending_dynamic_imports;
+  auto& imports = state->pending_dynamic_imports;
   size_t write_index = 0;
   for (size_t index = 0; index < imports.size(); ++index) {
     auto& tracked = imports[index];

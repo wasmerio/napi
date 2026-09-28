@@ -664,22 +664,16 @@ fn guest_unofficial_napi_cancel_terminate_execution(
 }
 
 fn guest_unofficial_napi_request_interrupt(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    callback: i32,
-    data: i32,
-) -> Result<i32, WasiError> {
-    let env_handle = snapi_env(&env, napi_env);
-    let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    let data_val = if data > 0 { data as u32 } else { 0 };
-    with_cb_context(&mut env, napi_env, || unsafe {
-        snapi_bridge_unofficial_request_interrupt(
-            env_handle,
-            napi_env as u32,
-            callback_id,
-            data_val,
-        )
-    })
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _callback: i32,
+    _data: i32,
+) -> i32 {
+    // V8 queues an opaque native request pointer until JS reaches an
+    // interrupt point. A guest can enqueue indefinitely without entering JS;
+    // teardown does not reclaim that pointer. Host stop uses its own control
+    // path, so guest requests must wait for a tracked, bounded implementation.
+    1
 }
 
 fn guest_unofficial_napi_structured_clone(
@@ -1119,50 +1113,24 @@ fn guest_unofficial_napi_profile_stop(
 }
 
 fn guest_unofficial_napi_take_heap_snapshot(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    options_ptr: i32,
-    json_ptr: i32,
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _options_ptr: i32,
+    _json_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let (expose_internals, expose_numeric_values) = if options_ptr > 0 {
-        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, 2) else {
-            return 1;
-        };
-        ((bytes[0] != 0) as i32, (bytes[1] != 0) as i32)
-    } else {
-        (0, 0)
-    };
-    let mut json = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_take_heap_snapshot(
-            env_handle,
-            expose_internals,
-            expose_numeric_values,
-            &mut json,
-        )
-    };
-    if status != 0 {
-        return status;
-    }
-    if json_ptr > 0 && !write_guest_u32(&mut env, json_ptr as u32, json) {
-        return 1;
-    }
-    0
+    // V8 builds both the snapshot and its retained external ArrayBuffer in
+    // native memory that is invisible to the instance memory accountant.
+    1
 }
 
 fn guest_unofficial_napi_create_serdes_binding(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    result_ptr: i32,
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _result_ptr: i32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut out = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_create_serdes_binding(env_handle, &mut out) };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, out);
-    }
-    status
+    // Serializer and Deserializer retain native buffers without a budget
+    // owner. Refuse the guest binding until both paths are accounted.
+    1
 }
 
 fn guest_napi_add_env_cleanup_hook(
@@ -1374,48 +1342,14 @@ fn guest_unofficial_napi_contextify_compile_function(
 }
 
 fn guest_unofficial_napi_bytecode_open(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    options_ptr: i32,
-    result_ptr: i32,
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: i32,
+    _options_ptr: i32,
+    _result_ptr: i32,
 ) -> i32 {
-    let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
-        return 1;
-    };
-    if result_ptr <= 0 {
-        return 1;
-    }
-    let env_handle = snapi_env(&env, napi_env);
-    let mut bytecode_id = 0u32;
-    let mut cache_rejected = 0u8;
-    let mut can_parse_as_module = 0u8;
-    let status = unsafe {
-        snapi_bridge_unofficial_bytecode_open(
-            env_handle,
-            options.source_text,
-            options.filename,
-            options.shape,
-            options.params_or_undefined,
-            options.host_defined_option_id,
-            options.line_offset,
-            options.column_offset,
-            if options.has_cache != 0 {
-                options.cache.as_ptr()
-            } else {
-                std::ptr::null()
-            },
-            options.cache.len(),
-            options.has_cache,
-            options.cache_policy,
-            &mut bytecode_id,
-            &mut cache_rejected,
-            &mut can_parse_as_module,
-        )
-    };
-    write_guest_u32(&mut env, result_ptr as u32, bytecode_id);
-    write_guest_u8(&mut env, result_ptr as u32 + 4, cache_rejected);
-    write_guest_u8(&mut env, result_ptr as u32 + 5, can_parse_as_module);
-    status
+    // Bytecode handles own persistent native source and cache copies. The
+    // guest cannot create them until those copies have a lasting budget charge.
+    1
 }
 
 fn guest_unofficial_napi_bytecode_serialize(
@@ -4837,6 +4771,11 @@ fn guest_napi_new_instance(
 // ============================================================
 
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
+    // EdgeJS binaries built before the extension namespace was versioned
+    // imported these existing functions from the core `napi` namespace.
+    if name.starts_with("unofficial_napi_") {
+        return true;
+    }
     matches!(
         name,
         "napi_wasm_init_env"
@@ -4975,7 +4914,7 @@ pub fn register_napi_imports(
     fe: &FunctionEnv<NapiEnv>,
     io: &mut Imports,
 ) {
-    let napi_namespace = namespace! {
+    let mut napi_namespace = namespace! {
         "napi_wasm_init_env" => Function::new_typed_with_env(store, fe, guest_napi_wasm_init_env),
         "napi_get_undefined" => Function::new_typed_with_env(store, fe, guest_napi_get_undefined),
         "napi_get_null" => Function::new_typed_with_env(store, fe, guest_napi_get_null),
@@ -5176,6 +5115,9 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 
+    for (name, export) in napi_extension_wasmer_namespace.iter() {
+        napi_namespace.insert(name.as_str(), export.clone());
+    }
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);
     io.register_namespace(
         NAPI_EXTENSION_WASMER_MODULE_NAME,

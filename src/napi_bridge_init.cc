@@ -153,6 +153,12 @@ struct SnapiEnvState {
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
   uint32_t next_ref_id = 1;
+  // The fixed per-isolate metadata reservation covers at most this many
+  // guest-created host objects in each category. No category may grow with
+  // the same single JS value or with empty handle scopes without a bound.
+  static constexpr size_t kMaxGuestNativeHandles = 4096;
+  std::unordered_set<void *> guest_finalizer_records;
+  size_t native_finalizer_count = 0;
 
   // Handle table for napi_deferred (promise deferreds).
   std::unordered_map<uint32_t, napi_deferred> deferreds;
@@ -185,7 +191,15 @@ struct SnapiEnvState {
   // Cap on live per-value host handles / callback registrations, bounding the
   // host-side bookkeeping RSS that the byte budget pools do not otherwise see.
   // 0 means unlimited. Set from the resource budget at env creation.
-  size_t value_limit = 0;
+  size_t value_limit = kMaxGuestNativeHandles;
+};
+
+struct GuestFinalizerRecord {
+  SnapiEnvState *state;
+  uint32_t guest_env;
+  uint32_t wasm_fn_ptr;
+  uint32_t data;
+  uint32_t hint;
 };
 
 struct CallbackBinding {
@@ -423,6 +437,8 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
 uint32_t StoreRef(SnapiEnvState &state, napi_ref ref) {
   if (ref == nullptr)
     return 0;
+  if (state.refs.size() >= state.value_limit || state.next_ref_id == 0)
+    return 0;
   uint32_t id = state.next_ref_id++;
   state.refs[id] = ref;
   return id;
@@ -439,6 +455,8 @@ void RemoveRef(SnapiEnvState &state, uint32_t id) { state.refs.erase(id); }
 
 uint32_t StoreDeferred(SnapiEnvState &state, napi_deferred d) {
   if (d == nullptr)
+    return 0;
+  if (state.deferreds.size() >= state.value_limit || state.next_deferred_id == 0)
     return 0;
   uint32_t id = state.next_deferred_id++;
   state.deferreds[id] = d;
@@ -557,6 +575,12 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   if (state->owner != nullptr) {
     release_status = unofficial_napi_release_env(state->owner, nullptr);
   }
+  // remove_wrap/delete_reference can cancel provider finalizers without
+  // calling our trampoline. Reclaim their bridge records after the provider
+  // has finished draining every callback for this environment.
+  for (void *record : state->guest_finalizer_records)
+    delete static_cast<GuestFinalizerRecord *>(record);
+  state->guest_finalizer_records.clear();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->owner = nullptr;
   state->env = nullptr;
@@ -1774,6 +1798,9 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState *env_state,
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  if (bridge_state->deferreds.size() >= bridge_state->value_limit ||
+      bridge_state->next_deferred_id == 0)
+    return napi_generic_failure;
   napi_deferred deferred;
   napi_value promise;
   napi_status s = napi_create_promise(env, &deferred, &promise);
@@ -1875,14 +1902,6 @@ namespace {
 // backing-store deleter for the guest finalizer — those run synchronously in
 // GC, with no way back into the guest — they attach via napi_add_finalizer
 // instead.) Allocated on registration, freed exactly once when it fires.
-struct GuestFinalizerRecord {
-  SnapiEnvState *state;
-  uint32_t guest_env;
-  uint32_t wasm_fn_ptr;
-  uint32_t data;
-  uint32_t hint;
-};
-
 void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
                               void *hint) {
   auto *record = static_cast<GuestFinalizerRecord *>(hint);
@@ -1890,6 +1909,11 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
     return;
   auto bridge_state_lease = LookupEnvState(record->state);
   auto *bridge_state = bridge_state_lease.get();
+  std::unique_lock<std::recursive_mutex> state_lock;
+  if (bridge_state != nullptr) {
+    state_lock = std::unique_lock<std::recursive_mutex>(bridge_state->mutex);
+    bridge_state->guest_finalizer_records.erase(record);
+  }
   void *callback_ctx =
       bridge_state != nullptr
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
@@ -1924,10 +1948,23 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
   delete record;
 }
 
+void DropGuestFinalizerRecord(GuestFinalizerRecord *record) {
+  if (record == nullptr) return;
+  auto *state = record->state;
+  if (state != nullptr) {
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+    state->guest_finalizer_records.erase(record);
+  }
+  delete record;
+}
+
 GuestFinalizerRecord *MakeGuestFinalizerRecord(SnapiEnvState *state,
                                                uint32_t guest_env,
                                                uint32_t wasm_fn_ptr,
                                                uint32_t data, uint32_t hint) {
+  if (state == nullptr ||
+      state->guest_finalizer_records.size() >= state->value_limit)
+    return nullptr;
   auto *record = new (std::nothrow) GuestFinalizerRecord();
   if (record != nullptr) {
     record->state = state;
@@ -1935,6 +1972,7 @@ GuestFinalizerRecord *MakeGuestFinalizerRecord(SnapiEnvState *state,
     record->wasm_fn_ptr = wasm_fn_ptr;
     record->data = data;
     record->hint = hint;
+    state->guest_finalizer_records.insert(record);
   }
   return record;
 }
@@ -1966,7 +2004,7 @@ extern "C" int snapi_bridge_create_external_arraybuffer_guest_finalized(
   s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
                          nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (backing_store_token_out) {
@@ -2001,7 +2039,7 @@ extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
   s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
                          nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (backing_store_token_out) {
@@ -2420,6 +2458,9 @@ extern "C" int snapi_bridge_create_reference(SnapiEnvState *env_state,
   napi_value val = LoadValue(*bridge_state, value_id);
   if (!val)
     return napi_invalid_arg;
+  if (bridge_state->refs.size() >= bridge_state->value_limit ||
+      bridge_state->next_ref_id == 0)
+    return napi_generic_failure;
   napi_ref ref;
   napi_status s = napi_create_reference(env, val, initial_refcount, &ref);
   if (s != napi_ok)
@@ -2501,6 +2542,9 @@ extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
+  if (bridge_state->scope_frames.size() >= bridge_state->value_limit ||
+      bridge_state->next_scope_id == 0)
+    return napi_generic_failure;
   napi_handle_scope scope = nullptr;
   napi_status s = napi_open_handle_scope(env, &scope);
   if (s != napi_ok)
@@ -2543,6 +2587,9 @@ snapi_bridge_open_escapable_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
+  if (bridge_state->scope_frames.size() >= bridge_state->value_limit ||
+      bridge_state->next_scope_id == 0)
+    return napi_generic_failure;
   napi_escapable_handle_scope scope = nullptr;
   napi_status s = napi_open_escapable_handle_scope(env, &scope);
   if (s != napi_ok)
@@ -3015,6 +3062,10 @@ extern "C" int snapi_bridge_wrap(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr &&
+      (bridge_state->refs.size() >= bridge_state->value_limit ||
+       bridge_state->next_ref_id == 0))
+    return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void *)(uintptr_t)native_data, nullptr,
                             nullptr, ref_out ? &ref : nullptr);
@@ -3041,6 +3092,10 @@ snapi_bridge_wrap_finalized(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr &&
+      (bridge_state->refs.size() >= bridge_state->value_limit ||
+       bridge_state->next_ref_id == 0))
+    return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
   if (record == nullptr)
@@ -3050,7 +3105,7 @@ snapi_bridge_wrap_finalized(SnapiEnvState *env_state, uint32_t obj_id,
       napi_wrap(env, obj, (void *)(uintptr_t)native_data,
                 GuestFinalizerTrampoline, record, ref_out ? &ref : nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (ref_out)
@@ -3107,6 +3162,11 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState *env_state,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (bridge_state->native_finalizer_count >= bridge_state->value_limit ||
+      (ref_out != nullptr &&
+       (bridge_state->refs.size() >= bridge_state->value_limit ||
+        bridge_state->next_ref_id == 0)))
+    return napi_generic_failure;
   // No actual WASM callback for finalizer; just register with nullptr callback
   napi_ref ref = nullptr;
   napi_status s =
@@ -3114,6 +3174,7 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState *env_state,
                          nullptr, ref_out ? &ref : nullptr);
   if (s != napi_ok)
     return s;
+  bridge_state->native_finalizer_count++;
   if (ref_out)
     *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -3134,6 +3195,10 @@ snapi_bridge_add_finalizer_cb(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr &&
+      (bridge_state->refs.size() >= bridge_state->value_limit ||
+       bridge_state->next_ref_id == 0))
+    return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
   if (record == nullptr)
@@ -3143,7 +3208,7 @@ snapi_bridge_add_finalizer_cb(SnapiEnvState *env_state, uint32_t obj_id,
                                      GuestFinalizerTrampoline, record,
                                      ref_out ? &ref : nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (ref_out)
@@ -3764,7 +3829,10 @@ extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState *env_state,
   if (state == nullptr) {
     return napi_invalid_arg;
   }
-  state->value_limit = static_cast<size_t>(limit);
+  state->value_limit =
+      limit == 0 ? SnapiEnvState::kMaxGuestNativeHandles
+                 : static_cast<size_t>(std::min<uint64_t>(
+                       limit, SnapiEnvState::kMaxGuestNativeHandles));
   return napi_ok;
 }
 

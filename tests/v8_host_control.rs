@@ -119,6 +119,24 @@ fn guest_cannot_start_unmanaged_v8_workers_or_profiler() {
 }
 
 #[test]
+fn guest_messages_remain_charged_until_context_cleanup() {
+    let wasm = build_wasix_test("test_guest_message_budget");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let budget = ctx.budget();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("MESSAGE_BUDGET_OK"), "{stdout}\n{stderr}");
+    assert!(
+        budget.snapshot().serialized_message > 0,
+        "queued message escaped memory accounting"
+    );
+    drop(ctx);
+    assert_eq!(budget.snapshot().serialized_message, 0);
+}
+
+#[test]
 fn named_properties_and_throw_errors_use_charged_guest_strings() {
     let wasm = build_wasix_test("test_charged_cstring_bridge");
     let (exit_code, stdout, stderr) =

@@ -350,7 +350,8 @@ void ResetPrepareStackTraceState(PrepareStackTraceState* state) {
 }
 
 v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
-                                                        v8::Local<v8::Context> context) {
+                                                        v8::Local<v8::Context> context,
+                                                        bool is_contextify_context) {
   if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) {
     return v8::Local<v8::Function>();
   }
@@ -364,7 +365,7 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
   v8::Local<v8::Context> principal_context = env->context();
   const bool use_principal_callback =
       !principal_context.IsEmpty() &&
-      (context == principal_context || NapiV8IsContextifyContext(env, context));
+      (context == principal_context || is_contextify_context);
 
   if (use_principal_callback) {
     return state.principal_callback.Get(context->GetIsolate());
@@ -397,9 +398,13 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   }
 
   v8::Local<v8::Function> callback;
+  // Contextify membership takes g_context_mu. Resolve it before g_runtime_mu
+  // so promise-hook updates cannot take the two locks in the opposite order.
+  const bool is_contextify_context = NapiV8IsContextifyContext(env, context);
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
-    callback = LookupPrepareStackTraceCallback(env, context);
+    callback = LookupPrepareStackTraceCallback(env, context,
+                                               is_contextify_context);
   }
 
   if (callback.IsEmpty()) {
@@ -2115,6 +2120,8 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
   if (current_context.IsEmpty()) {
     current_context = env->context();
   }
+  const bool is_contextify_context =
+      !current_context.IsEmpty() && NapiV8IsContextifyContext(env, current_context);
 
   bool has_prepare_stack_trace_callback = false;
   {
@@ -2125,7 +2132,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
         current_context.IsEmpty() ||
         (!principal_context.IsEmpty() &&
          (current_context == principal_context ||
-          NapiV8IsContextifyContext(env, current_context)));
+          is_contextify_context));
 
     if (use_principal_callback) {
       state.principal_callback.Reset();

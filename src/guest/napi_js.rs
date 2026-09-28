@@ -5685,6 +5685,9 @@ fn guest_napi_new_instance(
 // ============================================================
 
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
+    if name.starts_with("unofficial_napi_") {
+        return true;
+    }
     matches!(
         name,
         "napi_wasm_init_env"
@@ -5823,7 +5826,7 @@ pub fn register_napi_imports(
     fe: &FunctionEnv<NapiEnv>,
     io: &mut Imports,
 ) {
-    let napi_namespace = namespace! {
+    let mut napi_namespace = namespace! {
         "napi_wasm_init_env" => Function::new_typed_with_env(store, fe, guest_napi_wasm_init_env),
         "napi_get_undefined" => Function::new_typed_with_env(store, fe, guest_napi_get_undefined),
         "napi_get_null" => Function::new_typed_with_env(store, fe, guest_napi_get_null),
@@ -6024,6 +6027,9 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 
+    for (name, export) in napi_extension_wasmer_namespace.iter() {
+        napi_namespace.insert(name.as_str(), export.clone());
+    }
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);
     io.register_namespace(
         NAPI_EXTENSION_WASMER_MODULE_NAME,

@@ -946,6 +946,22 @@ mod tests {
     }
 
     #[test]
+    fn module_needs_napi_accepts_legacy_core_extension_import() {
+        let store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "unofficial_napi_get_hash_seed" (func))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (Some(NapiVersion::V10), None)
+        );
+    }
+
+    #[test]
     fn module_needs_napi_detects_unknown_core_napi() {
         let store = Store::default();
         let module = compile_wat(
