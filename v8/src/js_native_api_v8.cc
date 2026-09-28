@@ -60,6 +60,8 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
     v8::Local<v8::FixedArray> /*import_attributes*/) {
   v8::Isolate* isolate = context->GetIsolate();
   v8::EscapableHandleScope handle_scope(isolate);
+  NapiV8ProviderPromiseReservation reservation(isolate);
+  if (!reservation.acquired()) return v8::MaybeLocal<v8::Promise>();
   v8::TryCatch try_catch(isolate);
 
   v8::Local<v8::Promise::Resolver> resolver;
@@ -85,7 +87,10 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
-    NapiV8TrackProviderPromise(isolate, promise);
+    if (!NapiV8TrackProviderPromise(isolate, promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(promise);
   }
 
@@ -100,18 +105,27 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
       resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     }
-    NapiV8TrackProviderPromise(isolate, promise);
+    if (!NapiV8TrackProviderPromise(isolate, promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(promise);
   }
 
   if (result->IsPromise()) {
     v8::Local<v8::Promise> result_promise = result.As<v8::Promise>();
-    NapiV8TrackProviderPromise(isolate, result_promise);
+    if (!NapiV8TrackProviderPromise(isolate, result_promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(result_promise);
   }
 
   resolver->Resolve(context, result).FromMaybe(false);
-  NapiV8TrackProviderPromise(isolate, promise);
+  if (!NapiV8TrackProviderPromise(isolate, promise)) {
+    try_catch.ReThrow();
+    return v8::MaybeLocal<v8::Promise>();
+  }
   return handle_scope.Escape(promise);
 }
 

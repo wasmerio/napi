@@ -36,6 +36,8 @@
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
 
+bool NapiV8HasPendingProviderWork(napi_env env);
+
 namespace {
 
 constexpr int kHostDefinedOptionsId = 8;
@@ -87,6 +89,7 @@ struct ModuleWrapBindingState {
   napi_ref initialize_import_meta_ref = nullptr;
   std::vector<ModuleWrapRecord*> modules;
   std::vector<PendingProviderPromise> pending_dynamic_imports;
+  size_t pending_dynamic_imports_in_flight = 0;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
   size_t request_metadata_bytes = 0;
 };
@@ -96,6 +99,8 @@ struct ModuleWrapBindingState {
 constexpr size_t kMaxLiveModuleWraps = 2048;
 constexpr size_t kMaxModuleRequests = 4096;
 constexpr size_t kMaxModuleRequestMetadata = 4 * 1024 * 1024;
+constexpr size_t kMaxPendingProviderPromises = 4096;
+constexpr int kMaxDynamicImportAttributeEntries = 2048;
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
 napi_value GetSourceTextModuleDefaultHdoSymbol(napi_env env);
@@ -1255,6 +1260,15 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
     v8::Local<v8::FixedArray> import_attributes) {
   v8::Isolate* isolate = env->isolate;
   v8::Local<v8::Context> context = env->context();
+  // Four native vectors are materialized below and in
+  // CreateFrozenNullProtoObject. Bound this transient metadata before reserve.
+  if (import_attributes->Length() < 0 ||
+      import_attributes->Length() > kMaxDynamicImportAttributeEntries ||
+      import_attributes->Length() % 2 != 0) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        OneByteString(isolate, "too many dynamic import attributes")));
+    return {};
+  }
   std::vector<v8::Local<v8::Name>> names;
   std::vector<v8::Local<v8::Value>> values;
   names.reserve(import_attributes->Length() / 2);
@@ -1287,6 +1301,8 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   v8::Isolate* isolate = context->GetIsolate();
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(context);
+  NapiV8ProviderPromiseReservation reservation(isolate);
+  if (!reservation.acquired()) return v8::MaybeLocal<v8::Promise>();
 
   v8::Local<v8::Value> id = v8::Undefined(isolate);
   bool have_host_defined_options = false;
@@ -1313,11 +1329,14 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
 
   napi_value phase_value = nullptr;
   napi_create_int32(env, phase == v8::ModuleImportPhase::kSource ? 1 : 2, &phase_value);
+  v8::Local<v8::Object> attributes =
+      CreateDynamicImportAttributesObject(env, import_attributes);
+  if (attributes.IsEmpty()) return v8::MaybeLocal<v8::Promise>();
   napi_value argv[5] = {
       napi_v8_wrap_value(env, id),
       napi_v8_wrap_value(env, specifier),
       phase_value,
-      napi_v8_wrap_value(env, CreateDynamicImportAttributesObject(env, import_attributes)),
+      napi_v8_wrap_value(env, attributes),
       napi_v8_wrap_value(env, resource_name),
   };
 
@@ -1343,7 +1362,9 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     return v8::MaybeLocal<v8::Promise>();
   }
   v8::Local<v8::Promise> promise = resolver->GetPromise();
-  NapiV8TrackProviderPromise(isolate, promise);
+  if (!NapiV8TrackProviderPromise(isolate, promise)) {
+    return v8::MaybeLocal<v8::Promise>();
+  }
   return handle_scope.Escape(promise);
 }
 
@@ -3175,15 +3196,60 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 
 }  // extern "C"
 
-void NapiV8TrackProviderPromise(v8::Isolate* isolate,
-                                v8::Local<v8::Promise> promise) {
-  if (isolate == nullptr || promise.IsEmpty()) return;
+NapiV8ProviderPromiseReservation::NapiV8ProviderPromiseReservation(
+    v8::Isolate* isolate)
+    : isolate_(isolate), acquired_(true), reserved_(false) {
+  if (isolate == nullptr) return;
   napi_env env = GetModuleWrapEnvForIsolate(isolate);
   if (env == nullptr) return;
   auto* state = FindModuleWrapState(env);
-  if (state != nullptr) {
-    state->pending_dynamic_imports.emplace_back(isolate, promise);
+  if (state == nullptr) return;
+  if (state->pending_dynamic_imports.size() +
+          state->pending_dynamic_imports_in_flight >=
+      kMaxPendingProviderPromises) {
+    NapiV8HasPendingProviderWork(env);
+    if (state->pending_dynamic_imports.size() +
+            state->pending_dynamic_imports_in_flight >=
+        kMaxPendingProviderPromises) {
+      acquired_ = false;
+      isolate->ThrowException(v8::Exception::RangeError(
+          OneByteString(isolate, "too many pending dynamic imports")));
+      return;
+    }
   }
+  ++state->pending_dynamic_imports_in_flight;
+  reserved_ = true;
+}
+
+NapiV8ProviderPromiseReservation::~NapiV8ProviderPromiseReservation() {
+  if (!reserved_) return;
+  napi_env env = GetModuleWrapEnvForIsolate(isolate_);
+  if (env == nullptr) return;
+  auto* state = FindModuleWrapState(env);
+  if (state != nullptr && state->pending_dynamic_imports_in_flight != 0) {
+    --state->pending_dynamic_imports_in_flight;
+  }
+}
+
+bool NapiV8TrackProviderPromise(v8::Isolate* isolate,
+                                v8::Local<v8::Promise> promise) {
+  if (isolate == nullptr || promise.IsEmpty()) return true;
+  napi_env env = GetModuleWrapEnvForIsolate(isolate);
+  if (env == nullptr) return true;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return true;
+  if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
+    NapiV8HasPendingProviderWork(env);
+    if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
+      // Dropping tracking would let the instance report quiescence with guest
+      // module work still alive. End this isolate instead.
+      isolate->ThrowException(v8::Exception::RangeError(
+          OneByteString(isolate, "too many pending dynamic imports")));
+      return false;
+    }
+  }
+  state->pending_dynamic_imports.emplace_back(isolate, promise);
+  return true;
 }
 
 bool NapiV8HasPendingProviderWork(napi_env env) {

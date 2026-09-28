@@ -527,6 +527,39 @@ TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
   for (unofficial_napi_module module : modules)
     ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
+
+TEST_F(Test65UnofficialContextify, PendingDynamicImportsCannotGrowWithoutBound) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.neverImport = new Promise(() => {});"
+                    "globalThis.dynamicImportCalls = 0;"
+                    "() => { ++dynamicImportCalls; return neverImport; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  napi_value ignored = nullptr;
+  ASSERT_EQ(napi_run_script(
+      s.env,
+      Str(s.env, "for (let i = 0; i < 5000; ++i) import('never').catch(() => {});"
+                 "dynamicImportCalls"),
+      &ignored), napi_pending_exception);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_NE(exception, nullptr);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "dynamicImportCalls"), &ignored),
+            napi_ok);
+  uint32_t calls = 0;
+  ASSERT_EQ(napi_get_value_uint32(s.env, ignored, &calls), napi_ok);
+  EXPECT_EQ(calls, 4096u);
+}
 #endif
 
 TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
