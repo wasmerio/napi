@@ -174,8 +174,9 @@ impl NapiEnv {
         max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
         host_stopped: Arc<AtomicBool>,
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        background_lane: Option<Arc<LazyBackgroundLane>>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] background_lane: Option<
+            Arc<LazyBackgroundLane>,
+        >,
     ) -> Self {
         Self {
             budget,
@@ -236,7 +237,10 @@ impl NapiEnv {
         if self.host_stopped.load(Ordering::Acquire) {
             anyhow::bail!("N-API instance has been stopped");
         }
-        self.background_lane.as_ref().map(|lane| lane.enter()).transpose()
+        self.background_lane
+            .as_ref()
+            .map(|lane| lane.enter())
+            .transpose()
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]

@@ -8,14 +8,14 @@ use std::{
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::lane::{BackgroundTaskScope, BackgroundThreadSpawner, LazyBackgroundLane};
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-use crate::lane::{BackgroundTaskScope, BackgroundThreadSpawner, LazyBackgroundLane};
 
 #[derive(Debug, Clone, Default)]
 pub struct NapiLimits {
@@ -67,11 +67,10 @@ pub struct NapiInstantiationState {
 }
 
 /// Runtime hooks that provide N-API imports for WASIX guests.
-// The import phase creates a per-instantiation session holding the function
-// env backing the imported host functions, and hands it to the caller as
-// opaque state. The hooks themselves are stateless, so concurrent
-// instantiations — same module or not, same store or not — cannot receive
-// each other's sessions.
+// The import phase creates a lightweight per-instantiation binding for the
+// WASM host functions. V8 and the dedicated background lane start only when a
+// guest invokes an env-creation import. Each binding stays tied to its store;
+// the shared state below owns only instance-wide accounting and stop control.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
     inner: Arc<NapiCtxInner>,
@@ -202,28 +201,36 @@ impl NapiCtxBuilder {
         self
     }
 
-    /// Build hooks without constructing a `NapiCtx`, session, V8 isolate, or
-    /// native thread. The lane starts only on the first env-creation import.
+    /// Build hooks without constructing a public `NapiCtx`, V8 isolate, or
+    /// native thread. The lane starts only when a guest calls an env-creation
+    /// import; merely importing the function does not start it.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn build_lazy_hooks(self) -> Result<NapiRuntimeHooks> {
-        let spawner = self.background_thread_spawner.clone()
+        let spawner = self
+            .background_thread_spawner
+            .clone()
             .context("lazy N-API hooks require a background thread spawner")?;
-        let task_scope = self.background_task_scope.clone()
+        let task_scope = self
+            .background_task_scope
+            .clone()
             .context("lazy N-API hooks require a background task scope")?;
         let inner = self.build_inner(Some((spawner, task_scope)));
         Ok(NapiRuntimeHooks { inner })
     }
 
     pub fn build(self) -> NapiCtx {
-        NapiCtx { inner: self.build_inner(None) }
+        NapiCtx {
+            inner: self.build_inner(None),
+        }
     }
 
     fn build_inner(
         self,
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        background: Option<(BackgroundThreadSpawner, BackgroundTaskScope)>,
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        _background: Option<()>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] background: Option<(
+            BackgroundThreadSpawner,
+            BackgroundTaskScope,
+        )>,
+        #[cfg(all(target_arch = "wasm32", feature = "js"))] _background: Option<()>,
     ) -> Arc<NapiCtxInner> {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
@@ -244,9 +251,11 @@ impl NapiCtxBuilder {
                     stopped_for_stop.store(true, Ordering::Release);
                     let live = envs_for_stop.lock().expect("poisoned N-API env registry");
                     for env in live.iter().copied() {
-                        unsafe { crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                            env as crate::snapi::SnapiEnv,
-                        ); }
+                        unsafe {
+                            crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                                env as crate::snapi::SnapiEnv,
+                            );
+                        }
                     }
                 }),
                 Arc::clone(&budget),
@@ -254,14 +263,14 @@ impl NapiCtxBuilder {
             ))
         });
         Arc::new(NapiCtxInner {
-                limits: self.limits,
-                active_sessions: AtomicUsize::new(0),
-                budget,
-                envs,
-                host_stopped,
-                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-                background_lane,
-            })
+            limits: self.limits,
+            active_sessions: AtomicUsize::new(0),
+            budget,
+            envs,
+            host_stopped,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            background_lane,
+        })
     }
 }
 
@@ -328,7 +337,9 @@ impl NapiCtx {
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
-        NapiRuntimeHooks { inner: Arc::clone(&self.inner) }
+        NapiRuntimeHooks {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     pub fn runtime_control(&self) -> NapiRuntimeControl {
@@ -341,42 +352,42 @@ impl NapiCtx {
 }
 
 fn new_session(ctx: &Arc<NapiCtxInner>, module: &Module) -> Result<NapiSession> {
-        let previous = ctx.active_sessions.fetch_add(1, Ordering::AcqRel);
-        if let Some(max_sessions) = ctx.limits.max_sessions
-            && previous >= max_sessions
+    let previous = ctx.active_sessions.fetch_add(1, Ordering::AcqRel);
+    if let Some(max_sessions) = ctx.limits.max_sessions
+        && previous >= max_sessions
+    {
+        ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
+        bail!("refusing to create more than {max_sessions} active N-API sessions");
+    }
+
+    let imported_memory_type = module.imports().find_map(|import| {
+        if import.module() == "env"
+            && import.name() == "memory"
+            && let ExternType::Memory(ty) = import.ty()
         {
-            ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
-            bail!("refusing to create more than {max_sessions} active N-API sessions");
+            return Some(*ty);
         }
+        None
+    });
 
-        let imported_memory_type = module.imports().find_map(|import| {
-            if import.module() == "env"
-                && import.name() == "memory"
-                && let ExternType::Memory(ty) = import.ty()
-            {
-                return Some(*ty);
-            }
-            None
-        });
+    let imported_table_type = module.imports().find_map(|import| {
+        if import.module() == "env"
+            && import.name() == "__indirect_function_table"
+            && let ExternType::Table(ty) = import.ty()
+        {
+            return Some(*ty);
+        }
+        None
+    });
 
-        let imported_table_type = module.imports().find_map(|import| {
-            if import.module() == "env"
-                && import.name() == "__indirect_function_table"
-                && let ExternType::Table(ty) = import.ty()
-            {
-                return Some(*ty);
-            }
-            None
-        });
-
-        Ok(NapiSession {
-            inner: Arc::new(NapiSessionInner {
-                ctx: Arc::clone(ctx),
-                imported_memory_type,
-                imported_table_type,
-                func_env: Mutex::new(None),
-            }),
-        })
+    Ok(NapiSession {
+        inner: Arc::new(NapiSessionInner {
+            ctx: Arc::clone(ctx),
+            imported_memory_type,
+            imported_table_type,
+            func_env: Mutex::new(None),
+        }),
+    })
 }
 
 impl NapiRuntimeControl {
@@ -403,9 +414,16 @@ impl NapiRuntimeHooks {
     /// Whether this instance has started its dedicated V8 background lane.
     pub fn is_initialized(&self) -> bool {
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        { self.inner.background_lane.as_ref().is_some_and(|lane| lane.is_initialized()) }
+        {
+            self.inner
+                .background_lane
+                .as_ref()
+                .is_some_and(|lane| lane.is_initialized())
+        }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        { false }
+        {
+            false
+        }
     }
     /// Creates N-API imports when `module` requests them.
     pub fn additional_imports(
@@ -630,10 +648,18 @@ fn napi_wasmer_extension_version_from_namespace(
 mod tests {
     use super::NapiCtx;
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
     use wasmer::{AsStoreMut, Instance, Module, Store};
     use wat::parse_str;
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}, thread, time::Duration};
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
@@ -704,10 +730,12 @@ mod tests {
             .background_thread_spawner(Arc::new(move |work| {
                 spawns.fetch_add(1, Ordering::SeqCst);
                 let finished = finished.clone();
-                thread::Builder::new().name("test-v8-lane".into()).spawn(move || {
-                    work();
-                    let _ = finished.send(());
-                })?;
+                thread::Builder::new()
+                    .name("test-v8-lane".into())
+                    .spawn(move || {
+                        work();
+                        let _ = finished.send(());
+                    })?;
                 Ok(())
             }))
             .background_task_scope(Arc::new(|| Box::new(())))
@@ -722,31 +750,56 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
         let mut store = Store::default();
-        let import_only = compile_wat(&store, r#"(module
+        let import_only = compile_wat(
+            &store,
+            r#"(module
             (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
             (import "env" "memory" (memory 1 512))
-        )"#);
-        let (imports, state) = hooks.additional_imports(&import_only, &mut store.as_store_mut()).unwrap();
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&import_only, &mut store.as_store_mut())
+            .unwrap();
         let instance = Instance::new(&mut store, &import_only, &imports).unwrap();
-        hooks.configure_instance(&import_only, &mut store.as_store_mut(), &instance, None, state).unwrap();
+        hooks
+            .configure_instance(
+                &import_only,
+                &mut store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
         assert!(!hooks.is_initialized());
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
-        let invoked = compile_wat(&store, r#"(module
+        let invoked = compile_wat(
+            &store,
+            r#"(module
             (import "napi" "napi_wasm_init_env" (func $init (result i32)))
             (import "env" "memory" (memory 1 512))
             (func (export "invoke") (result i32) call $init)
-        )"#);
-        let (imports, state) = hooks.additional_imports(&invoked, &mut store.as_store_mut()).unwrap();
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&invoked, &mut store.as_store_mut())
+            .unwrap();
         let instance = Instance::new(&mut store, &invoked, &imports).unwrap();
-        hooks.configure_instance(&invoked, &mut store.as_store_mut(), &instance, None, state).unwrap();
+        hooks
+            .configure_instance(&invoked, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        let invoke = instance.exports.get_typed_function::<(), i32>(&mut store, "invoke").unwrap();
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .unwrap();
         assert!(invoke.call(&mut store).unwrap() > 0);
         assert!(hooks.is_initialized());
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         hooks.runtime_control().shutdown_background_lane();
-        finished_rx.recv_timeout(Duration::from_secs(5)).expect("lane stops");
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lane stops");
     }
 
     #[test]
@@ -757,15 +810,25 @@ mod tests {
         let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
         hooks.runtime_control().terminate_all();
         let mut store = Store::default();
-        let module = compile_wat(&store, r#"(module
+        let module = compile_wat(
+            &store,
+            r#"(module
             (import "napi" "napi_wasm_init_env" (func $init (result i32)))
             (import "env" "memory" (memory 1 512))
             (func (export "invoke") (result i32) call $init)
-        )"#);
-        let (imports, state) = hooks.additional_imports(&module, &mut store.as_store_mut()).unwrap();
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
-        hooks.configure_instance(&module, &mut store.as_store_mut(), &instance, None, state).unwrap();
-        let invoke = instance.exports.get_typed_function::<(), i32>(&mut store, "invoke").unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .unwrap();
         assert_eq!(invoke.call(&mut store).unwrap(), 0);
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
         assert!(!hooks.is_initialized());

@@ -225,7 +225,10 @@ impl std::fmt::Debug for ResourceBudget {
                 &self.v8_heap_reserved.load(Ordering::Acquire),
             )
             .field("v8_external", &self.v8_external.load(Ordering::Acquire))
-            .field("v8_background_lane", &self.v8_background_lane.load(Ordering::Acquire))
+            .field(
+                "v8_background_lane",
+                &self.v8_background_lane.load(Ordering::Acquire),
+            )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
     }

@@ -167,9 +167,7 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
     args: &[String],
     extra_mounts: &[GuestMount],
 ) -> Result<(i32, String, String)> {
-    run_wasix_main_capture_stdio_with_hooks(
-        &ctx.runtime_hooks(), wasm_path, args, extra_mounts,
-    )
+    run_wasix_main_capture_stdio_with_hooks(&ctx.runtime_hooks(), wasm_path, args, extra_mounts)
 }
 
 /// Test and embedder entry point using hooks that initialize V8 lazily.
@@ -245,8 +243,13 @@ fn run_wasix_main_with_runner(
     use_system_tty: bool,
 ) -> Result<i32> {
     run_wasix_main_with_runner_hooks(
-        &ctx.runtime_hooks(), wasm_path, program_name, args, extra_mounts,
-        configure_runner, use_system_tty,
+        &ctx.runtime_hooks(),
+        wasm_path,
+        program_name,
+        args,
+        extra_mounts,
+        configure_runner,
+        use_system_tty,
     )
 }
 

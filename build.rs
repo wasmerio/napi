@@ -83,9 +83,8 @@ fn main() {
         v8.library_path.display()
     );
 
-    let mut v8_defines =
-        read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
-            .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
+    let mut v8_defines = read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
+        .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
     if let Some(sandbox_enabled) = read_sandbox_build_flag(&v8.library_path) {
         let embedder_enabled = v8_defines
             .split(&[';', ',', ' '][..])
@@ -244,10 +243,16 @@ fn read_sandbox_build_flag(library_path: &Path) -> Option<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => panic!("failed to read {}: {err}", config_path.display()),
     };
-    match config.lines().find_map(|line| line.strip_prefix("v8_enable_sandbox=")) {
+    match config
+        .lines()
+        .find_map(|line| line.strip_prefix("v8_enable_sandbox="))
+    {
         Some("true") => Some(true),
         Some("false") => Some(false),
-        _ => panic!("{} lacks a valid v8_enable_sandbox flag", config_path.display()),
+        _ => panic!(
+            "{} lacks a valid v8_enable_sandbox flag",
+            config_path.display()
+        ),
     }
 }
 

@@ -1,7 +1,11 @@
 #![cfg(feature = "cli")]
 
 use std::{
-    sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -37,10 +41,12 @@ fn one_instance_lane_runs_and_releases_its_budget() {
             Arc::new(move |work| {
                 spawns.fetch_add(1, Ordering::SeqCst);
                 let finished_tx = finished_tx.clone();
-                thread::Builder::new().name("napi-test-lane".into()).spawn(move || {
-                    work();
-                    let _ = finished_tx.send(());
-                })?;
+                thread::Builder::new()
+                    .name("napi-test-lane".into())
+                    .spawn(move || {
+                        work();
+                        let _ = finished_tx.send(());
+                    })?;
                 Ok(())
             })
         })
@@ -68,11 +74,16 @@ fn one_instance_lane_runs_and_releases_its_budget() {
     assert_eq!(budget.snapshot().v8_background_lane, 8 * 1024 * 1024);
 
     hooks.runtime_control().shutdown_background_lane();
-    finished_rx.recv_timeout(Duration::from_secs(5)).expect("lane worker exits");
+    finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("lane worker exits");
     drop(hooks);
     assert_eq!(budget.snapshot().v8_background_lane, 0);
-    assert_eq!(unsafe { snapi_v8_fallback_worker_posts() }, fallback_before,
-        "a managed V8 task escaped to the process-wide fallback pool");
+    assert_eq!(
+        unsafe { snapi_v8_fallback_worker_posts() },
+        fallback_before,
+        "a managed V8 task escaped to the process-wide fallback pool"
+    );
     let started = scopes.load(Ordering::SeqCst);
     assert!(started > 0, "GC did not exercise the metered V8 lane");
     assert_eq!(scope_exits.load(Ordering::SeqCst), started);

@@ -5,9 +5,9 @@ mod ctx;
 mod env;
 mod guest;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-mod lane;
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod guest_heap;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+mod lane;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;
@@ -29,12 +29,12 @@ pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeControl,
     NapiRuntimeHooks, NapiSession,
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-pub use lane::{BackgroundTaskScope, BackgroundThreadSpawner};
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub use lane::{BackgroundTaskScope, BackgroundThreadSpawner};
 
 /// Host capabilities required by the JavaScript-backed N-API implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

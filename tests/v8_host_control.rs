@@ -36,7 +36,10 @@ fn two_guest_isolates_run_sequentially() {
         let (exit_code, stdout, stderr) =
             run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
         assert_eq!(exit_code, 0, "{stderr}");
-        assert!(stdout.contains("HELLO_NAPI_TEST_OK=1"), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("HELLO_NAPI_TEST_OK=1"),
+            "{stdout}\n{stderr}"
+        );
     }
 }
 
@@ -49,7 +52,10 @@ fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let (exit_code, stdout, stderr) =
         run_guest(&NapiCtx::default(), &hello_wasm).expect("second guest failed");
     assert_eq!(exit_code, 0, "{stderr}");
-    assert!(stdout.contains("HELLO_NAPI_TEST_OK=1"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("HELLO_NAPI_TEST_OK=1"),
+        "{stdout}\n{stderr}"
+    );
     let (exit_code, stdout, stderr) = sleeping.join().unwrap().unwrap();
     assert_eq!(exit_code, 0, "{stderr}");
     assert!(stdout.contains("ENV_READY"), "{stdout}\n{stderr}");
