@@ -112,7 +112,7 @@ impl NapiRuntimeControl {
 /// linking a module; no NapiCtx, V8 isolate, or background queue exists yet.
 struct NapiProviderBindings {
     limits: NapiLimits,
-    active_sessions: AtomicUsize,
+    active_sessions: Arc<AtomicUsize>,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
     /// tunables and the V8 heap, external-memory, and lane reservations.
     budget: Arc<ResourceBudget>,
@@ -132,6 +132,7 @@ impl std::fmt::Debug for NapiProviderBindings {
 
 struct NapiSessionInner {
     ctx: Arc<NapiProviderBindings>,
+    lease: Arc<SessionLease>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
     func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
@@ -143,9 +144,16 @@ impl std::fmt::Debug for NapiSession {
     }
 }
 
-impl Drop for NapiSessionInner {
+/// One admission slot shared by the temporary import session and every
+/// FunctionEnv it installs. The slot stays occupied for the store lifetime,
+/// including after `configure_instance` consumes its setup state.
+pub(crate) struct SessionLease {
+    active_sessions: Arc<AtomicUsize>,
+}
+
+impl Drop for SessionLease {
     fn drop(&mut self) {
-        self.ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
+        self.active_sessions.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -218,7 +226,7 @@ impl NapiCtxBuilder {
         let host_stopped = Arc::new(AtomicBool::new(false));
         Arc::new(NapiProviderBindings {
             limits: self.limits,
-            active_sessions: AtomicUsize::new(0),
+            active_sessions: Arc::new(AtomicUsize::new(0)),
             budget,
             pending_messages: PendingMessages::new(),
             envs,
@@ -307,13 +315,19 @@ impl NapiCtx {
 }
 
 fn new_session(ctx: &Arc<NapiProviderBindings>, module: &Module) -> Result<NapiSession> {
-    let previous = ctx.active_sessions.fetch_add(1, Ordering::AcqRel);
-    if let Some(max_sessions) = ctx.limits.max_sessions
-        && previous >= max_sessions
+    let max_sessions = ctx.limits.max_sessions.unwrap_or(usize::MAX);
+    if ctx
+        .active_sessions
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < max_sessions).then(|| current + 1)
+        })
+        .is_err()
     {
-        ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
         bail!("refusing to create more than {max_sessions} active N-API sessions");
     }
+    let lease = Arc::new(SessionLease {
+        active_sessions: Arc::clone(&ctx.active_sessions),
+    });
 
     let imported_memory_type = module.imports().find_map(|import| {
         if import.module() == "env"
@@ -338,6 +352,7 @@ fn new_session(ctx: &Arc<NapiProviderBindings>, module: &Module) -> Result<NapiS
     Ok(NapiSession {
         inner: Arc::new(NapiSessionInner {
             ctx: Arc::clone(ctx),
+            lease,
             imported_memory_type,
             imported_table_type,
             func_env: Mutex::new(None),
@@ -499,6 +514,11 @@ impl NapiSession {
             func_env.as_mut(&mut *store).table = Some(table);
         }
 
+        // Wasmer owns this FunctionEnv until its store is destroyed. Retain
+        // the admission slot with it; the setup session is consumed by
+        // configure_instance long before the guest module stops running.
+        func_env.as_mut(&mut *store).session_lease = Some(Arc::clone(&self.inner.lease));
+
         Ok(())
     }
 
@@ -645,6 +665,86 @@ mod tests {
             .prepare_module(&module)
             .expect("session slot should be released after drop");
         assert_eq!(ctx.active_sessions(), 1);
+    }
+
+    #[test]
+    fn configured_store_keeps_its_session_slot_until_drop() {
+        let mut first_store = Store::default();
+        let mut second_store = Store::new(first_store.engine().clone());
+        let module = compile_wat(
+            &first_store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (import "env" "memory" (memory 1))
+            )"#,
+        );
+        let ctx = NapiCtx::builder().max_sessions(1).build();
+        let hooks = ctx.runtime_hooks();
+
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut first_store.as_store_mut())
+            .expect("first session should be admitted");
+        let instance = Instance::new(&mut first_store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &module,
+                &mut first_store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
+        assert_eq!(ctx.active_sessions(), 1);
+        assert!(
+            hooks
+                .additional_imports(&module, &mut second_store.as_store_mut())
+                .is_err(),
+            "a live store must retain its session slot"
+        );
+
+        drop(instance);
+        drop(imports);
+        drop(first_store);
+        assert_eq!(ctx.active_sessions(), 0);
+        let (_imports, _state) = hooks
+            .additional_imports(&module, &mut second_store.as_store_mut())
+            .expect("dropping the first store releases the session slot");
+    }
+
+    #[test]
+    fn failed_import_setup_releases_its_session_slot() {
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (import "env" "memory" (memory 1))
+            )"#,
+        );
+        let ctx = NapiCtx::builder().max_sessions(1).build();
+        let hooks = ctx.runtime_hooks();
+        let mut invalid = wasmer::Imports::new();
+        invalid.define(
+            "env",
+            "memory",
+            wasmer::Function::new_typed(&mut store, || 0_i32),
+        );
+        assert!(
+            hooks
+                .add_imports(&module, &mut store.as_store_mut(), &mut invalid)
+                .is_err()
+        );
+        assert_eq!(ctx.active_sessions(), 0);
+
+        let mut valid = wasmer::Imports::new();
+        let state = hooks
+            .add_imports(&module, &mut store.as_store_mut(), &mut valid)
+            .expect("a failed setup must not consume the live-session limit");
+        drop(state);
+        assert_eq!(ctx.active_sessions(), 1);
+        drop(valid);
+        drop(store);
+        assert_eq!(ctx.active_sessions(), 0);
     }
 
     fn compile_wat(store: &Store, wat: &str) -> Module {

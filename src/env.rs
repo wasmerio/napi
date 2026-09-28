@@ -100,6 +100,9 @@ pub(crate) struct NapiEnv {
     pub(crate) pending_messages: Arc<PendingMessages>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
     pub(crate) max_envs: Option<usize>,
+    /// Holds the import-session admission slot for as long as this store owns
+    /// its host-function environment, even after import setup has returned.
+    pub(crate) session_lease: Option<Arc<crate::ctx::SessionLease>>,
     env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -189,6 +192,7 @@ impl NapiEnv {
             budget,
             pending_messages,
             max_envs,
+            session_lease: None,
             env_registry,
             host_stopped,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -640,6 +644,19 @@ impl Drop for NapiEnv {
             self.budget
                 .uncharge(Pool::V8External, self.external_declared);
             self.external_declared = 0;
+        }
+        if !all_quiesced {
+            // A still-registered native env keeps a raw pointer to its V8
+            // queue. Preserve that owner and its session admission slot along
+            // with the quota retained above; dropping either would let later
+            // work touch freed memory or admit another live session.
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            if let Some(lane) = self.managed_lane.take() {
+                std::mem::forget(lane);
+            }
+            if let Some(lease) = self.session_lease.take() {
+                std::mem::forget(lease);
+            }
         }
     }
 }
