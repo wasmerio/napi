@@ -391,6 +391,11 @@ impl NapiRuntimeControl {
 }
 
 impl NapiRuntimeHooks {
+    /// Shared resource budget for the guest store and all V8 environments.
+    pub fn budget(&self) -> Arc<ResourceBudget> {
+        Arc::clone(&self.inner.budget)
+    }
+
     pub fn runtime_control(&self) -> NapiRuntimeControl {
         NapiRuntimeControl::from_inner(&self.inner)
     }

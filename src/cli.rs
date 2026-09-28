@@ -15,7 +15,8 @@ use wasmer_wasix::{
 };
 
 use crate::{
-    NapiCtx, budget::ResourceBudget, budget::budgeted_tunables, guest::napi::register_env_imports,
+    NapiCtx, NapiRuntimeHooks, budget::ResourceBudget, budget::budgeted_tunables,
+    guest::napi::register_env_imports,
 };
 use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 
@@ -166,12 +167,24 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
     args: &[String],
     extra_mounts: &[GuestMount],
 ) -> Result<(i32, String, String)> {
+    run_wasix_main_capture_stdio_with_hooks(
+        &ctx.runtime_hooks(), wasm_path, args, extra_mounts,
+    )
+}
+
+/// Test and embedder entry point using hooks that initialize V8 lazily.
+pub fn run_wasix_main_capture_stdio_with_hooks(
+    hooks: &NapiRuntimeHooks,
+    wasm_path: &Path,
+    args: &[String],
+    extra_mounts: &[GuestMount],
+) -> Result<(i32, String, String)> {
     let (stdout_tx, stdout_rx) = Pipe::channel();
     let (stderr_tx, stderr_rx) = Pipe::channel();
     let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
     let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
-    let exit_code = run_wasix_main_with_runner(
-        ctx,
+    let exit_code = run_wasix_main_with_runner_hooks(
+        hooks,
         wasm_path,
         "guest-test",
         args,
@@ -231,6 +244,21 @@ fn run_wasix_main_with_runner(
     configure_runner: impl FnOnce(&mut WasiRunner),
     use_system_tty: bool,
 ) -> Result<i32> {
+    run_wasix_main_with_runner_hooks(
+        &ctx.runtime_hooks(), wasm_path, program_name, args, extra_mounts,
+        configure_runner, use_system_tty,
+    )
+}
+
+fn run_wasix_main_with_runner_hooks(
+    hooks: &NapiRuntimeHooks,
+    wasm_path: &Path,
+    program_name: &str,
+    args: &[String],
+    extra_mounts: &[GuestMount],
+    configure_runner: impl FnOnce(&mut WasiRunner),
+    use_system_tty: bool,
+) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -238,7 +266,7 @@ fn run_wasix_main_with_runner(
     let guard = runtime.enter();
 
     let exit_code = {
-        let loaded = load_wasix_module_with_budget(wasm_path, ctx.budget())?;
+        let loaded = load_wasix_module_with_budget(wasm_path, hooks.budget())?;
         let engine = loaded.store.engine().clone();
         let module = loaded.module;
         let module_hash = loaded.module_hash;
@@ -261,7 +289,7 @@ fn run_wasix_main_with_runner(
                 .enable_asynchronous_threading = false;
         }
         runtime
-            .with_instantiation_hook(ctx.runtime_hooks())
+            .with_instantiation_hook(hooks.clone())
             .with_instantiation_hook(WasmCapiRuntimeHooks::new())
             .with_additional_imports(|_module, store| {
                 let mut imports = wasmer::Imports::new();
