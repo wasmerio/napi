@@ -28,6 +28,12 @@ use crate::{
 
 use super::{abi, util::*};
 
+mod legacy;
+
+pub(crate) fn frozen_napi_type_matches(name: &str, actual: &wasmer::FunctionType) -> Option<bool> {
+    legacy::frozen_type_matches(name, actual)
+}
+
 /// Keep explicit-length guest names as raw bytes. `CString::new` rejects an
 /// embedded NUL and its empty fallback would leave C++ reading the original
 /// nonzero length past that fallback allocation. Only AUTO_LENGTH needs an
@@ -309,6 +315,35 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    let options = if options_ptr == 0 {
+        abi::EnvCreate::default()
+    } else if options_ptr > 0 {
+        let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
+            return 1;
+        };
+        options
+    } else {
+        return 1;
+    };
+    create_env_with_options(env, module_api_version, options, env_out_ptr, scope_out_ptr)
+}
+
+fn create_env_with_options(
+    mut env: FunctionEnvMut<NapiEnv>,
+    module_api_version: i32,
+    options: abi::EnvCreate,
+    env_out_ptr: i32,
+    scope_out_ptr: i32,
+) -> i32 {
+    // Reject malformed output pointers before creating a V8 isolate. A bad
+    // result address would otherwise leave the guest with an unreachable env.
+    if env_out_ptr <= 0
+        || scope_out_ptr <= 0
+        || read_guest_bytes(&mut env, env_out_ptr, 4).is_none()
+        || read_guest_bytes(&mut env, scope_out_ptr, 4).is_none()
+    {
+        return 1;
+    }
     if env.data().memory.is_none() {
         return 1;
     }
@@ -321,33 +356,10 @@ fn guest_unofficial_napi_create_env(
     if unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) } != 0 {
         return 1;
     }
-    let (
-        total_memory,
-        constrained_memory,
-        max_young_generation_size_in_bytes,
-        max_old_generation_size_in_bytes,
-        code_range_size_in_bytes,
-        stack_limit,
-    ) = if options_ptr > 0 {
-        let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
-            return 1;
-        };
-        (
-            options.total_memory,
-            options.constrained_memory,
-            options.max_young_generation_size_in_bytes,
-            options.max_old_generation_size_in_bytes,
-            options.code_range_size_in_bytes,
-            options.stack_limit,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0)
-    };
-
     let requested = RequestedHeap {
-        max_young: max_young_generation_size_in_bytes,
-        max_old: max_old_generation_size_in_bytes,
-        code_range: code_range_size_in_bytes,
+        max_young: options.max_young_generation_size_in_bytes,
+        max_old: options.max_old_generation_size_in_bytes,
+        code_range: options.code_range_size_in_bytes,
     };
     let reservation = match env.data().reserve_isolate(requested) {
         Ok(reservation) => reservation,
@@ -359,12 +371,12 @@ fn guest_unofficial_napi_create_env(
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
             module_api_version,
-            total_memory,
-            constrained_memory,
+            options.total_memory,
+            options.constrained_memory,
             reservation.max_young,
             reservation.max_old,
             reservation.code_range,
-            stack_limit,
+            options.stack_limit,
             guest_heap_ctx,
             &mut snapi_env_state,
         )
@@ -374,12 +386,8 @@ fn guest_unofficial_napi_create_env(
         return status;
     }
     let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    if env_out_ptr > 0 {
-        write_guest_u32(&mut env, env_out_ptr as u32, env_id);
-    }
-    if scope_out_ptr > 0 {
-        write_guest_u32(&mut env, scope_out_ptr as u32, scope_id);
-    }
+    write_guest_u32(&mut env, env_out_ptr as u32, env_id);
+    write_guest_u32(&mut env, scope_out_ptr as u32, scope_id);
     0
 }
 
@@ -4858,6 +4866,9 @@ fn guest_napi_new_instance(
 // ============================================================
 
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
+    if legacy::is_known(name) {
+        return true;
+    }
     matches!(
         name,
         "napi_wasm_init_env"
@@ -5203,6 +5214,7 @@ pub fn register_napi_imports(
         NAPI_EXTENSION_WASMER_MODULE_NAME,
         napi_extension_wasmer_namespace,
     );
+    legacy::register(store, fe, io);
 }
 
 fn guest_env_uv_cpu_info(_cpu_infos_out: i32, _count_out: i32) -> i32 {

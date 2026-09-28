@@ -1,0 +1,186 @@
+napi.napi_add_env_cleanup_hook (i32, i32, i32) -> i32
+napi.napi_add_finalizer (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_adjust_external_memory (i32, i64, i32) -> i32
+napi.napi_call_function (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_check_object_type_tag (i32, i32, i32, i32) -> i32
+napi.napi_coerce_to_bool (i32, i32, i32) -> i32
+napi.napi_coerce_to_number (i32, i32, i32) -> i32
+napi.napi_coerce_to_object (i32, i32, i32) -> i32
+napi.napi_coerce_to_string (i32, i32, i32) -> i32
+napi.napi_create_array (i32, i32) -> i32
+napi.napi_create_array_with_length (i32, i32, i32) -> i32
+napi.napi_create_arraybuffer (i32, i32, i32, i32) -> i32
+napi.napi_create_bigint_uint64 (i32, i64, i32) -> i32
+napi.napi_create_buffer (i32, i32, i32, i32) -> i32
+napi.napi_create_buffer_copy (i32, i32, i32, i32, i32) -> i32
+napi.napi_create_date (i32, f64, i32) -> i32
+napi.napi_create_double (i32, f64, i32) -> i32
+napi.napi_create_error (i32, i32, i32, i32) -> i32
+napi.napi_create_external (i32, i32, i32, i32, i32) -> i32
+napi.napi_create_external_arraybuffer (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_create_external_buffer (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_create_function (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_create_int32 (i32, i32, i32) -> i32
+napi.napi_create_int64 (i32, i64, i32) -> i32
+napi.napi_create_object (i32, i32) -> i32
+napi.napi_create_promise (i32, i32, i32) -> i32
+napi.napi_create_range_error (i32, i32, i32, i32) -> i32
+napi.napi_create_reference (i32, i32, i32, i32) -> i32
+napi.napi_create_string_latin1 (i32, i32, i32, i32) -> i32
+napi.napi_create_string_utf16 (i32, i32, i32, i32) -> i32
+napi.napi_create_string_utf8 (i32, i32, i32, i32) -> i32
+napi.napi_create_symbol (i32, i32, i32) -> i32
+napi.napi_create_type_error (i32, i32, i32, i32) -> i32
+napi.napi_create_typedarray (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_create_uint32 (i32, i32, i32) -> i32
+napi.napi_define_class (i32, i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_define_properties (i32, i32, i32, i32) -> i32
+napi.napi_delete_property (i32, i32, i32, i32) -> i32
+napi.napi_delete_reference (i32, i32) -> i32
+napi.napi_get_all_property_names (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_get_and_clear_last_exception (i32, i32) -> i32
+napi.napi_get_array_length (i32, i32, i32) -> i32
+napi.napi_get_arraybuffer_info (i32, i32, i32, i32) -> i32
+napi.napi_get_boolean (i32, i32, i32) -> i32
+napi.napi_get_buffer_info (i32, i32, i32, i32) -> i32
+napi.napi_get_cb_info (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_get_dataview_info (i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_get_element (i32, i32, i32, i32) -> i32
+napi.napi_get_global (i32, i32) -> i32
+napi.napi_get_named_property (i32, i32, i32, i32) -> i32
+napi.napi_get_new_target (i32, i32, i32) -> i32
+napi.napi_get_null (i32, i32) -> i32
+napi.napi_get_property (i32, i32, i32, i32) -> i32
+napi.napi_get_property_names (i32, i32, i32) -> i32
+napi.napi_get_prototype (i32, i32, i32) -> i32
+napi.napi_get_reference_value (i32, i32, i32) -> i32
+napi.napi_get_typedarray_info (i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.napi_get_undefined (i32, i32) -> i32
+napi.napi_get_value_bigint_int64 (i32, i32, i32, i32) -> i32
+napi.napi_get_value_bool (i32, i32, i32) -> i32
+napi.napi_get_value_double (i32, i32, i32) -> i32
+napi.napi_get_value_external (i32, i32, i32) -> i32
+napi.napi_get_value_int32 (i32, i32, i32) -> i32
+napi.napi_get_value_int64 (i32, i32, i32) -> i32
+napi.napi_get_value_string_latin1 (i32, i32, i32, i32, i32) -> i32
+napi.napi_get_value_string_utf16 (i32, i32, i32, i32, i32) -> i32
+napi.napi_get_value_string_utf8 (i32, i32, i32, i32, i32) -> i32
+napi.napi_get_value_uint32 (i32, i32, i32) -> i32
+napi.napi_has_named_property (i32, i32, i32, i32) -> i32
+napi.napi_has_own_property (i32, i32, i32, i32) -> i32
+napi.napi_has_property (i32, i32, i32, i32) -> i32
+napi.napi_instanceof (i32, i32, i32, i32) -> i32
+napi.napi_is_array (i32, i32, i32) -> i32
+napi.napi_is_arraybuffer (i32, i32, i32) -> i32
+napi.napi_is_buffer (i32, i32, i32) -> i32
+napi.napi_is_dataview (i32, i32, i32) -> i32
+napi.napi_is_date (i32, i32, i32) -> i32
+napi.napi_is_detached_arraybuffer (i32, i32, i32) -> i32
+napi.napi_is_error (i32, i32, i32) -> i32
+napi.napi_is_exception_pending (i32, i32) -> i32
+napi.napi_is_promise (i32, i32, i32) -> i32
+napi.napi_is_typedarray (i32, i32, i32) -> i32
+napi.napi_new_instance (i32, i32, i32, i32, i32) -> i32
+napi.napi_object_freeze (i32, i32) -> i32
+napi.napi_reference_ref (i32, i32, i32) -> i32
+napi.napi_reference_unref (i32, i32, i32) -> i32
+napi.napi_reject_deferred (i32, i32, i32) -> i32
+napi.napi_remove_env_cleanup_hook (i32, i32, i32) -> i32
+napi.napi_remove_wrap (i32, i32, i32) -> i32
+napi.napi_resolve_deferred (i32, i32, i32) -> i32
+napi.napi_run_script (i32, i32, i32) -> i32
+napi.napi_set_element (i32, i32, i32, i32) -> i32
+napi.napi_set_named_property (i32, i32, i32, i32) -> i32
+napi.napi_set_property (i32, i32, i32, i32) -> i32
+napi.napi_strict_equals (i32, i32, i32, i32) -> i32
+napi.napi_throw (i32, i32) -> i32
+napi.napi_throw_error (i32, i32, i32) -> i32
+napi.napi_throw_range_error (i32, i32, i32) -> i32
+napi.napi_throw_type_error (i32, i32, i32) -> i32
+napi.napi_type_tag_object (i32, i32, i32) -> i32
+napi.napi_typeof (i32, i32, i32) -> i32
+napi.napi_unwrap (i32, i32, i32) -> i32
+napi.napi_wrap (i32, i32, i32, i32, i32, i32) -> i32
+napi.node_api_create_sharedarraybuffer (i32, i32, i32, i32) -> i32
+napi.node_api_is_sharedarraybuffer (i32, i32, i32) -> i32
+napi.node_api_set_prototype (i32, i32, i32) -> i32
+napi.unofficial_napi_arraybuffer_view_has_buffer (i32, i32, i32) -> i32
+napi.unofficial_napi_cancel_terminate_execution (i32) -> i32
+napi.unofficial_napi_contextify_compile_function (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_contextify_compile_function_for_cjs_loader (i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_contextify_contains_module_syntax (i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_contextify_create_cached_data (i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_contextify_make_context (i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_contextify_run_script (i32, i32, i32, i32, i32, i32, i64, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_create_env (i32, i32, i32) -> i32
+napi.unofficial_napi_create_env_with_options (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_create_private_symbol (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_create_serdes_binding (i32, i32) -> i32
+napi.unofficial_napi_deserialize_value (i32, i32, i32) -> i32
+napi.unofficial_napi_free_buffer (i32) -> nil
+napi.unofficial_napi_get_call_sites (i32, i32, i32) -> i32
+napi.unofficial_napi_get_caller_location (i32, i32) -> i32
+napi.unofficial_napi_get_constructor_name (i32, i32, i32) -> i32
+napi.unofficial_napi_get_continuation_preserved_embedder_data (i32, i32) -> i32
+napi.unofficial_napi_get_current_stack_trace (i32, i32, i32) -> i32
+napi.unofficial_napi_get_error_source_positions (i32, i32, i32) -> i32
+napi.unofficial_napi_get_hash_seed (i32, i32) -> i32
+napi.unofficial_napi_get_heap_code_statistics (i32, i32) -> i32
+napi.unofficial_napi_get_heap_space_count (i32, i32) -> i32
+napi.unofficial_napi_get_heap_space_statistics (i32, i32, i32) -> i32
+napi.unofficial_napi_get_heap_statistics (i32, i32) -> i32
+napi.unofficial_napi_get_own_non_index_properties (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_get_process_memory_info (i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_get_promise_details (i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_get_proxy_details (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_low_memory_notification (i32) -> i32
+napi.unofficial_napi_mark_promise_as_handled (i32, i32) -> i32
+napi.unofficial_napi_module_wrap_check_unsettled_top_level_await (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_create_cached_data (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_create_required_module_facade (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_create_source_text (i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_create_synthetic (i32, i32, i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_destroy (i32, i32) -> i32
+napi.unofficial_napi_module_wrap_evaluate (i32, i32, i64, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_evaluate_sync (i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_get_error (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_get_module_requests (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_get_module_source_object (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_get_namespace (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_get_status (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_has_async_graph (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_has_top_level_await (i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_import_module_dynamically (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_instantiate (i32, i32) -> i32
+napi.unofficial_napi_module_wrap_link (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_set_export (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_module_wrap_set_import_module_dynamically_callback (i32, i32) -> i32
+napi.unofficial_napi_module_wrap_set_initialize_import_meta_object_callback (i32, i32) -> i32
+napi.unofficial_napi_module_wrap_set_module_source_object (i32, i32, i32) -> i32
+napi.unofficial_napi_notify_datetime_configuration_change (i32) -> i32
+napi.unofficial_napi_preserve_error_source_message (i32, i32) -> i32
+napi.unofficial_napi_preview_entries (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_process_microtasks (i32) -> i32
+napi.unofficial_napi_release_env (i32) -> i32
+napi.unofficial_napi_release_env_with_loop (i32, i32) -> i32
+napi.unofficial_napi_release_serialized_value (i32) -> nil
+napi.unofficial_napi_remove_near_heap_limit_callback (i32, i32) -> i32
+napi.unofficial_napi_request_gc_for_testing (i32) -> i32
+napi.unofficial_napi_request_interrupt (i32, i32, i32) -> i32
+napi.unofficial_napi_serialize_value (i32, i32, i32) -> i32
+napi.unofficial_napi_set_continuation_preserved_embedder_data (i32, i32) -> i32
+napi.unofficial_napi_set_enqueue_foreground_task_callback (i32, i32, i32) -> i32
+napi.unofficial_napi_set_fatal_error_callbacks (i32, i32, i32) -> i32
+napi.unofficial_napi_set_flags_from_string (i32, i32) -> i32
+napi.unofficial_napi_set_near_heap_limit_callback (i32, i32, i32) -> i32
+napi.unofficial_napi_set_prepare_stack_trace_callback (i32, i32) -> i32
+napi.unofficial_napi_set_promise_hooks (i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_set_stack_limit (i32, i32) -> i32
+napi.unofficial_napi_start_cpu_profile (i32, i32, i32) -> i32
+napi.unofficial_napi_start_heap_profile (i32, i32) -> i32
+napi.unofficial_napi_stop_cpu_profile (i32, i32, i32, i32, i32) -> i32
+napi.unofficial_napi_stop_heap_profile (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_structured_clone (i32, i32, i32) -> i32
+napi.unofficial_napi_structured_clone_with_transfer (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_take_heap_snapshot (i32, i32, i32, i32) -> i32
+napi.unofficial_napi_terminate_execution (i32) -> i32

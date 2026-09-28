@@ -164,6 +164,7 @@ pub(crate) fn read_output_header(
         .then_some(size)
 }
 
+#[derive(Default)]
 pub(crate) struct EnvCreate {
     pub total_memory: u64,
     pub constrained_memory: u64,
@@ -171,6 +172,23 @@ pub(crate) struct EnvCreate {
     pub max_old_generation_size_in_bytes: u32,
     pub code_range_size_in_bytes: u32,
     pub stack_limit: u32,
+}
+
+/// The 0.0.1 atom passes four raw wasm32 fields, without a size/version
+/// header. Its stack address is validated as wire data but never installed as
+/// a native V8 thread stack limit.
+pub(crate) fn read_legacy_env_create(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<EnvCreate> {
+    let bytes = read_guest_bytes(env, guest_ptr, 16)?;
+    Some(EnvCreate {
+        max_young_generation_size_in_bytes: u32_at(&bytes, 0)?,
+        max_old_generation_size_in_bytes: u32_at(&bytes, 4)?,
+        code_range_size_in_bytes: u32_at(&bytes, 8)?,
+        stack_limit: u32_at(&bytes, 12)?,
+        ..EnvCreate::default()
+    })
 }
 
 /// Decode only whether the guest requested process-wide V8 flags. Guests are

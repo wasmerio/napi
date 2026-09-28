@@ -14,7 +14,9 @@ use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
-    guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
+    guest::napi::{
+        frozen_napi_type_matches, is_known_napi_import, register_env_imports, register_napi_imports,
+    },
     message::PendingMessages,
 };
 
@@ -277,6 +279,11 @@ impl NapiCtx {
             if import.module() == NAPI_MODULE_NAME {
                 napi_version = Some(match napi_version {
                     Some(NapiVersion::Unknown) => NapiVersion::Unknown,
+                    _ if matches!(import.ty(), ExternType::Function(actual)
+                        if frozen_napi_type_matches(import.name(), actual) == Some(false)) =>
+                    {
+                        NapiVersion::Unknown
+                    }
                     _ if is_known_napi_import(import.name()) => NapiVersion::V10,
                     _ => NapiVersion::Unknown,
                 });
@@ -868,6 +875,54 @@ mod tests {
 
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn legacy_flags_and_malformed_create_leave_lane_and_heap_lazy() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "unofficial_napi_set_flags_from_string"
+                    (func $flags (param i32 i32) (result i32)))
+                (import "napi" "unofficial_napi_create_env_with_options"
+                    (func $create (param i32 i32 i32 i32) (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (data (i32.const 64) "--js-source-phase-imports --harmony-import-attributes")
+                (func (export "defaults") (result i32)
+                    i32.const 64 i32.const 53 call $flags)
+                (func (export "other_flags") (result i32)
+                    i32.const 64 i32.const 8 call $flags)
+                (func (export "bad_create") (result i32)
+                    i32.const 8 i32.const 65528 i32.const 8 i32.const 12 call $create)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let charged = hooks.budget().snapshot().mem_charged;
+        let call = |store: &mut Store, name: &str| {
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&*store, name)
+                .unwrap()
+                .call(store)
+                .unwrap()
+        };
+        assert_eq!(call(&mut store, "defaults"), 0);
+        assert_eq!(call(&mut store, "other_flags"), 1);
+        assert_eq!(call(&mut store, "bad_create"), 1);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, charged);
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     fn memoryless_import_only_module_stays_inert() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, _finished_rx) = mpsc::channel();
@@ -1298,13 +1353,35 @@ mod tests {
         let module = compile_wat(
             &store,
             r#"(module
-                (import "napi" "napi_get_undefined" (func))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
             )"#,
         );
 
         assert_eq!(
             NapiCtx::module_needs_napi(&module),
             (Some(NapiVersion::V10), None)
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_rejects_wrong_frozen_signature() {
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "unofficial_napi_create_env" (func (param i32 i32) (result i32)))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (Some(NapiVersion::Unknown), None)
+        );
+        assert!(
+            NapiCtx::default()
+                .runtime_hooks()
+                .additional_imports(&module, &mut store.as_store_mut())
+                .is_err()
         );
     }
 
@@ -1362,7 +1439,7 @@ mod tests {
         let module = compile_wat(
             &store,
             r#"(module
-                (import "napi" "napi_get_undefined" (func))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
                 (import "napi_extension_wasmer_v0" "unofficial_napi_get_hash_seed" (func))
             )"#,
         );
