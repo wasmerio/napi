@@ -2,7 +2,7 @@ use wasmer::FunctionEnvMut;
 
 use crate::NapiEnv;
 
-use super::util::read_guest_bytes;
+use super::util::{HostCopy, read_guest_bytes};
 
 #[repr(C)]
 struct Wasm32VersionedHeader {
@@ -138,7 +138,7 @@ fn read_versioned(
     guest_ptr: i32,
     prefix_size: usize,
     version: u32,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy<u8>> {
     if guest_ptr <= 0 {
         return None;
     }
@@ -268,7 +268,7 @@ pub(crate) struct BytecodeOpen {
     pub host_defined_option_id: u32,
     pub line_offset: i32,
     pub column_offset: i32,
-    pub cache: Vec<u8>,
+    pub cache: HostCopy<u8>,
     pub has_cache: u8,
     pub cache_policy: u8,
 }
@@ -297,7 +297,7 @@ pub(crate) fn read_bytecode_open(
         }
         read_guest_bytes(env, cache_ptr, cache_length)?
     } else {
-        Vec::new()
+        HostCopy::default()
     };
     Some(BytecodeOpen {
         source_text: u32_at(

@@ -8,6 +8,9 @@ use crate::{
     GuestBackingStoreMapping, HostBufferCopy, NapiEnv, snapi::snapi_bridge_create_reference,
 };
 
+/// The JavaScript-hosted guest backend has no native host snapshot budget.
+pub(crate) type HostCopy<T> = Vec<T>;
+
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 

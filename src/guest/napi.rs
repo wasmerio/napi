@@ -14,12 +14,22 @@ use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
+        MAX_NAPI_PROPERTY_DESCRIPTORS,
         callback::{take_pending_guest_exit, with_callback_state},
     },
     snapi::*,
 };
 
 use super::{abi, util::*};
+
+macro_rules! reserve_property_array {
+    ($env:expr, $count:expr, $ty:ty) => {
+        match HostCopy::<$ty>::with_capacity($env.data().budget.clone(), $count) {
+            Some(array) => array,
+            None => return 1,
+        }
+    };
+}
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let Ok(_lane_scope) = env.data().enter_background_lane() else {
@@ -541,12 +551,12 @@ fn guest_unofficial_napi_create_private_symbol(
             read_guest_bytes(&mut env, desc_ptr, wl as usize)
         }
     } else {
-        Some(Vec::new())
+        Some(HostCopy::default())
     };
     let Some(desc) = desc else {
         return 1;
     };
-    let cs = CString::new(desc).unwrap_or_default();
+    let cs = CString::new(desc.as_slice()).unwrap_or_default();
     let mut out = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
@@ -1437,7 +1447,7 @@ fn guest_unofficial_napi_module_wrap_link(
         };
         ids
     } else {
-        Vec::new()
+        HostCopy::default()
     };
     unsafe {
         snapi_bridge_unofficial_module_wrap_link(
@@ -2039,7 +2049,9 @@ fn guest_napi_get_value_string_utf8(
     if hbs as u64 > guest_data_size(&mut env) {
         return 1;
     }
-    let mut hb = vec![0 as c_char; hbs];
+    let Some(mut hb) = HostCopy::<c_char>::zeroed(env.data().budget.clone(), hbs) else {
+        return 1;
+    };
     let mut rl: usize = 0;
     let s = unsafe {
         snapi_bridge_get_value_string_utf8(
@@ -2080,7 +2092,9 @@ fn guest_napi_get_value_string_latin1(
     if hbs as u64 > guest_data_size(&mut env) {
         return 1;
     }
-    let mut hb = vec![0 as c_char; hbs];
+    let Some(mut hb) = HostCopy::<c_char>::zeroed(env.data().budget.clone(), hbs) else {
+        return 1;
+    };
     let mut rl: usize = 0;
     let s = unsafe {
         snapi_bridge_get_value_string_latin1(
@@ -2379,7 +2393,7 @@ fn guest_napi_set_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
+    let cn = CString::new(nb.as_slice()).unwrap_or_default();
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_named_property(snapi, o as u32, cn.as_ptr(), v as u32)
@@ -2396,7 +2410,7 @@ fn guest_napi_get_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
+    let cn = CString::new(nb.as_slice()).unwrap_or_default();
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2418,7 +2432,7 @@ fn guest_napi_has_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
+    let cn = CString::new(nb.as_slice()).unwrap_or_default();
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2600,8 +2614,10 @@ fn guest_napi_throw_error(
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes
+        .as_ref()
+        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
+    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
     unsafe {
         snapi_bridge_throw_error(
             snapi_env(&env, e),
@@ -2625,8 +2641,10 @@ fn guest_napi_throw_type_error(
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes
+        .as_ref()
+        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
+    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
     unsafe {
         snapi_bridge_throw_type_error(
             snapi_env(&env, e),
@@ -2650,8 +2668,10 @@ fn guest_napi_throw_range_error(
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes
+        .as_ref()
+        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
+    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
     unsafe {
         snapi_bridge_throw_range_error(
             snapi_env(&env, e),
@@ -3305,7 +3325,7 @@ fn guest_napi_call_function(
         };
         ids
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     let snapi = snapi_env(&env, e);
@@ -3340,7 +3360,7 @@ fn guest_napi_create_function(
 ) -> i32 {
     // Read function name
     let wl = name_len as u32;
-    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
+    let name_bytes: HostCopy<u8> = if wl == 0xFFFFFFFFu32 {
         // NAPI_AUTO_LENGTH: read null-terminated string
         read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
@@ -3349,7 +3369,7 @@ fn guest_napi_create_function(
         };
         bytes
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     // Allocate a registration ID in the C++ callback registry
@@ -3362,7 +3382,7 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let c_name = CString::new(name_bytes.as_slice()).unwrap_or_default();
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
     if s != 0 {
@@ -3408,7 +3428,10 @@ fn guest_napi_get_cb_info(
 
     // Query the bridge for callback context
     let mut actual_argc: u32 = wanted;
-    let mut argv_ids = vec![0u32; wanted as usize];
+    let Some(mut argv_ids) = HostCopy::<u32>::zeroed(env.data().budget.clone(), wanted as usize)
+    else {
+        return 1;
+    };
     let mut this_id: u32 = 0;
     let mut data_val: u64 = 0;
 
@@ -3505,7 +3528,7 @@ fn guest_napi_define_class(
 ) -> i32 {
     // Read class name
     let wl = name_len as u32;
-    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
+    let name_bytes: HostCopy<u8> = if wl == 0xFFFFFFFFu32 {
         read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
@@ -3513,8 +3536,12 @@ fn guest_napi_define_class(
         };
         bytes
     } else {
-        vec![]
+        HostCopy::default()
     };
+
+    if prop_count < 0 || prop_count as usize > MAX_NAPI_PROPERTY_DESCRIPTORS {
+        return 1;
+    }
 
     // Register the constructor callback
     let snapi = snapi_env(&env, e);
@@ -3530,7 +3557,7 @@ fn guest_napi_define_class(
     };
 
     let pc = prop_count as u32;
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let c_name = CString::new(name_bytes.as_slice()).unwrap_or_default();
 
     if pc == 0 {
         // No properties — simple case
@@ -3566,15 +3593,15 @@ fn guest_napi_define_class(
         return 1;
     };
 
-    let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
-    let mut prop_names_ptrs: Vec<*const std::ffi::c_char> = Vec::with_capacity(pc as usize);
-    let mut prop_name_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_types: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_value_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_method_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_getter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_setter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_attributes: Vec<i32> = Vec::with_capacity(pc as usize);
+    let mut prop_names_c = reserve_property_array!(env, pc as usize, CString);
+    let mut prop_names_ptrs = reserve_property_array!(env, pc as usize, *const c_char);
+    let mut prop_name_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_types = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_value_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_method_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_getter_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_setter_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_attributes = reserve_property_array!(env, pc as usize, i32);
 
     for i in 0..pc as usize {
         let base = i * PROP_DESC_SIZE;
@@ -3619,9 +3646,8 @@ fn guest_napi_define_class(
         let pname = if utf8name_guest != 0 {
             read_guest_c_string(&mut env, utf8name_guest as i32).unwrap_or_default()
         } else {
-            vec![]
+            HostCopy::default()
         };
-        let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
 
         // Determine property type and register callbacks as needed
@@ -3686,11 +3712,13 @@ fn guest_napi_define_class(
         }
 
         prop_attributes.push(attrs);
-        prop_names_c.push(c_pname);
+        if prop_names_c.push_cstring(pname.as_slice()).is_none() {
+            return 1;
+        }
     }
 
     // Build pointer array (must live as long as the FFI call)
-    for cn in &prop_names_c {
+    for cn in prop_names_c.iter() {
         prop_names_ptrs.push(cn.as_ptr());
     }
 
@@ -3727,6 +3755,9 @@ fn guest_napi_define_properties(
     prop_count: i32,
     props_ptr: i32,
 ) -> i32 {
+    if prop_count < 0 || prop_count as usize > MAX_NAPI_PROPERTY_DESCRIPTORS {
+        return 1;
+    }
     let snapi = snapi_env(&env, e);
     let pc = prop_count as u32;
     if pc == 0 {
@@ -3752,15 +3783,15 @@ fn guest_napi_define_properties(
         return 1;
     };
 
-    let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
-    let mut prop_names_ptrs: Vec<*const std::ffi::c_char> = Vec::with_capacity(pc as usize);
-    let mut prop_name_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_types: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_value_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_method_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_getter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_setter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
-    let mut prop_attributes: Vec<i32> = Vec::with_capacity(pc as usize);
+    let mut prop_names_c = reserve_property_array!(env, pc as usize, CString);
+    let mut prop_names_ptrs = reserve_property_array!(env, pc as usize, *const c_char);
+    let mut prop_name_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_types = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_value_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_method_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_getter_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_setter_reg_ids = reserve_property_array!(env, pc as usize, u32);
+    let mut prop_attributes = reserve_property_array!(env, pc as usize, i32);
 
     for i in 0..pc as usize {
         let base = i * PROP_DESC_SIZE;
@@ -3804,9 +3835,8 @@ fn guest_napi_define_properties(
         let pname = if utf8name_guest != 0 {
             read_guest_c_string(&mut env, utf8name_guest as i32).unwrap_or_default()
         } else {
-            vec![]
+            HostCopy::default()
         };
-        let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
 
         if method_ptr != 0 {
@@ -3865,10 +3895,12 @@ fn guest_napi_define_properties(
         }
 
         prop_attributes.push(attrs);
-        prop_names_c.push(c_pname);
+        if prop_names_c.push_cstring(pname.as_slice()).is_none() {
+            return 1;
+        }
     }
 
-    for cn in &prop_names_c {
+    for cn in prop_names_c.iter() {
         prop_names_ptrs.push(cn.as_ptr());
     }
 
@@ -3982,7 +4014,9 @@ fn guest_napi_get_value_string_utf16(
     if byte_len as u64 > guest_data_size(&mut env) {
         return 1;
     }
-    let mut hb = vec![0u16; hbs];
+    let Some(mut hb) = HostCopy::<u16>::zeroed(env.data().budget.clone(), hbs) else {
+        return 1;
+    };
     let mut rl: usize = 0;
     let s = unsafe {
         snapi_bridge_get_value_string_utf16(
@@ -4053,7 +4087,7 @@ fn guest_napi_get_value_bigint_words(
     let Some(wc_bytes) = read_guest_bytes(&mut env, wc_ptr, 4) else {
         return 1;
     };
-    let mut word_count = u32::from_le_bytes(wc_bytes.try_into().unwrap()) as usize;
+    let mut word_count = u32::from_le_bytes(wc_bytes.as_slice().try_into().unwrap()) as usize;
 
     if words_ptr <= 0 {
         // Query mode: just get the word count
@@ -4080,7 +4114,9 @@ fn guest_napi_get_value_bigint_words(
     }
 
     let mut sign: i32 = 0;
-    let mut words = vec![0u64; word_count];
+    let Some(mut words) = HostCopy::<u64>::zeroed(env.data().budget.clone(), word_count) else {
+        return 1;
+    };
     let s = unsafe {
         snapi_bridge_get_value_bigint_words(
             snapi_env(&env, e),
@@ -4676,7 +4712,7 @@ fn guest_napi_new_instance(
         };
         ids
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     let snapi = snapi_env(&env, e);

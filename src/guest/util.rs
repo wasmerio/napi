@@ -2,9 +2,106 @@
 // Guest memory helpers
 // ============================================================
 
+use std::{ffi::CString, ops::Deref, sync::Arc};
+
 use wasmer::{AsStoreMut, FunctionEnvMut};
 
-use crate::NapiEnv;
+use crate::{
+    NapiEnv,
+    budget::{Pool, ResourceBudget},
+};
+
+/// A host copy of guest data whose budget charge survives for its full lifetime.
+/// Keeping the owner with the bytes makes nested and concurrent N-API calls
+/// account their peak copies instead of briefly charging only the read itself.
+pub(crate) struct HostCopy<T> {
+    data: Vec<T>,
+    budget: Option<Arc<ResourceBudget>>,
+    charged: u64,
+    reserved_elements: usize,
+}
+
+impl<T: Default> HostCopy<T> {
+    pub(crate) fn zeroed(budget: Arc<ResourceBudget>, count: usize) -> Option<Self> {
+        let mut copy = Self::with_capacity(budget, count)?;
+        copy.data.resize_with(count, T::default);
+        Some(copy)
+    }
+}
+
+impl<T> HostCopy<T> {
+    pub(crate) fn with_capacity(budget: Arc<ResourceBudget>, count: usize) -> Option<Self> {
+        let charged = u64::try_from(count.checked_mul(std::mem::size_of::<T>())?).ok()?;
+        budget.try_charge(Pool::HostTransient, charged).ok()?;
+        let mut copy = Self {
+            data: Vec::new(),
+            budget: Some(budget),
+            charged,
+            reserved_elements: count,
+        };
+        copy.data.try_reserve_exact(count).ok()?;
+        Some(copy)
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            budget: None,
+            charged: 0,
+            reserved_elements: 0,
+        }
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr()
+    }
+
+    pub(crate) fn push(&mut self, value: T) {
+        assert!(self.data.len() < self.reserved_elements);
+        self.data.push(value);
+    }
+}
+
+impl HostCopy<CString> {
+    /// Keep copied property names charged while the descriptor array holds
+    /// them; each name may be as long as MAX_GUEST_CSTRING_SCAN.
+    pub(crate) fn push_cstring(&mut self, bytes: &[u8]) -> Option<()> {
+        if self.data.len() == self.reserved_elements {
+            return None;
+        }
+        let additional = u64::try_from(bytes.len().checked_add(1)?).ok()?;
+        let budget = self.budget.as_ref()?;
+        budget.try_charge(Pool::HostTransient, additional).ok()?;
+        self.charged += additional;
+        self.data.push(CString::new(bytes).unwrap_or_default());
+        Some(())
+    }
+}
+
+impl<T> Default for HostCopy<T> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<T> Deref for HostCopy<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<T> Drop for HostCopy<T> {
+    fn drop(&mut self) {
+        // Release the allocation before its budget charge so a concurrent
+        // reservation cannot observe bytes that are still live as free.
+        drop(std::mem::take(&mut self.data));
+        if let Some(budget) = &self.budget {
+            budget.uncharge(Pool::HostTransient, self.charged);
+        }
+    }
+}
 
 pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
     let (state, store) = env.data_and_store_mut();
@@ -43,7 +140,7 @@ pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
     len: usize,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy<u8>> {
     if guest_ptr < 0 {
         return None;
     }
@@ -56,10 +153,8 @@ pub fn read_guest_bytes(
     if (guest_ptr as u64).checked_add(u64::try_from(len).ok()?)? > view.data_size() {
         return None;
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(len).ok()?;
-    out.resize(len, 0);
-    view.read(guest_ptr as u64, &mut out).ok()?;
+    let mut out = HostCopy::zeroed(Arc::clone(&state.budget), len)?;
+    view.read(guest_ptr as u64, &mut out.data).ok()?;
     Some(out)
 }
 
@@ -142,36 +237,59 @@ pub fn read_guest_u32_array(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
     count: usize,
-) -> Option<Vec<u32>> {
+) -> Option<HostCopy<u32>> {
     // Guard the byte-length multiply against overflow; the read below is then
     // clamped to the guest's memory size by `read_guest_bytes`.
     let byte_len = count.checked_mul(4)?;
     let bytes = read_guest_bytes(env, guest_ptr, byte_len)?;
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).ok()?;
-    for chunk in bytes.chunks_exact(4) {
-        result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    let mut result = HostCopy::zeroed(Arc::clone(&env.data().budget), count)?;
+    for (slot, chunk) in result.data.iter_mut().zip(bytes.chunks_exact(4)) {
+        *slot = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     Some(result)
 }
 
-pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) -> Option<Vec<u8>> {
+pub fn read_guest_c_string(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<HostCopy<u8>> {
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
-    let mut out = Vec::new();
-    let mut offset = guest_ptr as u64;
-    for _ in 0..super::MAX_GUEST_CSTRING_SCAN {
-        let mut b = [0u8; 1];
-        view.read(offset, &mut b).ok()?;
-        if b[0] == 0 {
-            return Some(out);
+    let len = {
+        let (state, store) = env.data_and_store_mut();
+        let memory = state.memory.clone()?;
+        let view = memory.view(&store);
+        let mut len = None;
+        for i in 0..super::MAX_GUEST_CSTRING_SCAN {
+            let mut b = [0u8; 1];
+            view.read(guest_ptr as u64 + i as u64, &mut b).ok()?;
+            if b[0] == 0 {
+                len = Some(i);
+                break;
+            }
         }
-        out.push(b[0]);
-        offset += 1;
+        len?
+    };
+    read_guest_bytes(env, guest_ptr, len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_copies_charge_for_their_lifetime_and_rollback_failed_allocations() {
+        let budget = ResourceBudget::with_memory_limit(8);
+        let first = HostCopy::<u8>::zeroed(Arc::clone(&budget), 6).unwrap();
+        assert_eq!(budget.snapshot().host_transient, 6);
+        assert!(HostCopy::<u32>::zeroed(Arc::clone(&budget), 1).is_none());
+        assert_eq!(budget.snapshot().host_transient, 6);
+        drop(first);
+        assert_eq!(budget.snapshot().host_transient, 0);
+
+        let unlimited = ResourceBudget::unlimited();
+        assert!(HostCopy::<u8>::zeroed(Arc::clone(&unlimited), usize::MAX).is_none());
+        assert_eq!(unlimited.snapshot().host_transient, 0);
     }
-    None
 }
