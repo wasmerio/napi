@@ -8,6 +8,7 @@ use std::ffi::{CString, c_char};
 
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 use wasmer_wasix::WasiError;
+use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
@@ -199,12 +200,12 @@ fn guest_unofficial_napi_configure_runtime(
     let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
         return 1;
     };
-    let Ok(flags) = CString::new(flags) else {
+    // V8 flags are process-wide. A guest must not change flags for other
+    // tenants or make the first caller decide the host's security policy.
+    if !flags.is_empty() {
         return 1;
-    };
-    unsafe {
-        snapi_bridge_unofficial_configure_runtime(flags.as_ptr(), flags.as_bytes().len() as u32)
     }
+    unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }
 }
 
 fn guest_unofficial_napi_create_env(
@@ -4645,38 +4646,11 @@ fn guest_napi_fatal_error(
     loc_len: i32,
     msg_ptr: i32,
     msg_len: i32,
-) -> i32 {
-    // Read location and message from guest memory
-    let loc = if loc_ptr > 0 {
-        let len = if loc_len as u32 == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, loc_ptr)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        } else {
-            loc_len as usize
-        };
-        read_guest_bytes(&mut env, loc_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
-    } else {
-        None
-    };
-    let msg = if msg_ptr > 0 {
-        let len = if msg_len as u32 == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, msg_ptr)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        } else {
-            msg_len as usize
-        };
-        read_guest_bytes(&mut env, msg_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
-    } else {
-        None
-    };
-    eprintln!(
-        "FATAL ERROR: location={}, message={}",
-        loc.as_deref().unwrap_or("(null)"),
-        msg.as_deref().unwrap_or("(null)")
-    );
-    std::process::abort();
+) -> Result<i32, WasiError> {
+    let loc = read_guest_fatal_text(&mut env, loc_ptr, loc_len);
+    let msg = read_guest_fatal_text(&mut env, msg_ptr, msg_len);
+    eprintln!("FATAL ERROR: location={}, message={}", loc, msg);
+    Err(WasiError::Exit(ExitCode::from(1)))
 }
 
 // --- Constructor ---

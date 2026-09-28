@@ -63,6 +63,32 @@ pub fn read_guest_bytes(
     Some(out)
 }
 
+/// Copy a bounded diagnostic string supplied to `napi_fatal_error`.
+/// `NAPI_AUTO_LENGTH` is a NUL-terminated string; explicit lengths may
+/// include NUL bytes and are deliberately kept intact in the diagnostic.
+pub(crate) fn read_guest_fatal_text(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    len: i32,
+) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if guest_ptr <= 0 {
+        return "(null)".to_owned();
+    }
+    let bytes = if len == -1 {
+        read_guest_c_string(env, guest_ptr)
+    } else {
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| read_guest_bytes(env, guest_ptr, len.min(MAX_DIAGNOSTIC_BYTES)))
+    };
+    bytes
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+        })
+        .unwrap_or_else(|| "(invalid guest string)".to_owned())
+}
+
 /// Live size of the guest's linear memory in bytes, or 0 if it has none. Used
 /// to bound host allocations sized by a guest-supplied length: a guest can
 /// never reference more than its own memory holds.
