@@ -2,7 +2,7 @@
 
 The frozen guest is the `edgejs` atom from `wasmer/edgejs@0.0.1`, SHA-256
 `ca6467e67c8503474cb4204cd2dbbae387c8fa19cad6f6c23131844143e27ccc`.
-`tests/fixtures/edgejs-0.0.1-napi-imports.txt` records its import section;
+`tests/fixtures/edgejs-0.0.1-imports.txt` records its import section;
 `tests/fixtures/edgejs-0.0.1-napi-signatures.txt` records all 186 `napi`
 function types. Linking rejects a changed signature. The legacy names use the
 same provider environment, resource budget, lane admission, and sticky stop as
@@ -18,6 +18,13 @@ the versioned extension.
   release. Deserialization may read the same handle repeatedly. Release,
   stale-handle access, double release, and host-stop cleanup are covered by
   `tests/legacy_manifest.rs`; host stop removes the native holder and charge.
+- The legacy module creation and state queries use the provider's bounded
+  module handles. Its old heap-statistics layout is translated from one
+  provider observation. Structured clone uses the existing transient budget.
+- The old contextify cache entry compiles source without executing it and
+  returns an empty guest-owned Buffer. It retains no code cache. The released
+  guest reports `cachedDataProduced` as true when requested even though the
+  buffer is empty; this legacy ABI does not pass that request to the host.
 
 The exact atom probes require a local copy and are intentionally opt in:
 
@@ -44,10 +51,15 @@ NAPI_EDGEJS_0_0_1_ATOM=/path/to/edgejs \
   `EdgeWorkerEnvRunCleanupPreserveLoop` between near-heap removal and release;
   its runtime-platform cleanup stage contains this assertion. The test is
   ignored pending a guest thread-identity diagnosis.
-- Some frozen legacy imports still return failure because their behavior has
-  no implemented provider adapter. In particular, legacy module-wrap creation
-  and the serdes binding remain incomplete. The exact manifest test proves
-  type and link compatibility, not behavioral coverage of every import.
+- The frozen serdes binding, profiler/snapshot operations, and several stack
+  introspection calls fail explicitly. Their existing native implementations
+  retain buffers or samples without a workload budget, or have no equivalent
+  in the current provider. Calling `node:v8` serialization therefore needs a
+  metered implementation before it can be supported.
+- A V8 fatal or out-of-memory callback records a workload stop if control
+  returns to the N-API import boundary. V8 can terminate the host process
+  before returning from a native fatal error; the callback alone cannot
+  provide process-level fault containment.
 
 These limitations are recorded so a successful import-only link or zero exit
 from an ESM flag probe is not mistaken for application compatibility.

@@ -1104,7 +1104,7 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_validate_script(
+    napi_status NAPI_CDECL snapi_private_validate_script(
         napi_env env,
         napi_value source_text,
         napi_value filename,

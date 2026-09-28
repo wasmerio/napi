@@ -192,30 +192,6 @@ TEST_F(Test65UnofficialContextify, NativeEnvironmentsRetainWebAssemblyInAllConte
 }
 #endif
 
-TEST_F(Test65UnofficialContextify, ValidateScriptDoesNotExecuteOrRetainBytecode) {
-  EnvScope s(runtime_.get());
-  napi_value result = nullptr;
-  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "globalThis.syntaxProbe = 0"), &result),
-            napi_ok);
-  ASSERT_EQ(unofficial_napi_contextify_validate_script(
-                s.env, Str(s.env, "globalThis.syntaxProbe++"),
-                Str(s.env, "syntax-probe.js"), 0, 0, nullptr),
-            napi_ok);
-  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "globalThis.syntaxProbe"), &result),
-            napi_ok);
-  int32_t probe = -1;
-  ASSERT_EQ(napi_get_value_int32(s.env, result, &probe), napi_ok);
-  EXPECT_EQ(probe, 0);
-
-  ASSERT_EQ(unofficial_napi_contextify_validate_script(
-                s.env, Str(s.env, ")"), Str(s.env, "syntax-probe.js"),
-                0, 0, nullptr),
-            napi_pending_exception);
-  napi_value error = nullptr;
-  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
-  ASSERT_NE(error, nullptr);
-}
-
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test65UnofficialContextify, MakeContextPreservesThrownProxyException) {
   EnvScope s(runtime_.get());

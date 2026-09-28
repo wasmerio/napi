@@ -2105,12 +2105,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
   return *buffer_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
-extern "C" size_t unofficial_napi_bytecode_size_legacy(
-    unofficial_napi_bytecode bytecode) {
-  if (bytecode == nullptr) return 0;
-  return reinterpret_cast<BytecodeRecord*>(bytecode)->bytes.size();
-}
-
 napi_status NAPI_CDECL unofficial_napi_bytecode_release(
     napi_env env, unofficial_napi_bytecode bytecode) {
   if (env == nullptr || bytecode == nullptr) return napi_invalid_arg;
@@ -2118,7 +2112,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_release(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_validate_script(
+extern "C" napi_status NAPI_CDECL snapi_private_validate_script(
     napi_env env,
     napi_value source_text,
     napi_value filename,
@@ -2168,6 +2162,40 @@ napi_status NAPI_CDECL unofficial_napi_contextify_validate_script(
     return try_catch.HasTerminated() ? napi_pending_exception : napi_generic_failure;
   }
   return napi_ok;
+}
+
+extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynamically(
+    napi_env env, size_t argc, napi_value* argv, napi_value* result_out) {
+  if (env == nullptr || argv == nullptr || result_out == nullptr || argc == 0 || argc > 5)
+    return napi_invalid_arg;
+  *result_out = nullptr;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr)
+    return napi_generic_failure;
+  napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
+  if (callback == nullptr)
+    return napi_invalid_arg;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok)
+    return napi_generic_failure;
+  if (argc >= 5)
+    return napi_call_function(env, global, callback, 5, argv, result_out);
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope scope(isolate);
+  napi_value phase = nullptr;
+  if (napi_create_int32(env, 2, &phase) != napi_ok)
+    return napi_generic_failure;
+  std::vector<v8::Local<v8::Name>> empty_names;
+  std::vector<v8::Local<v8::Value>> empty_values;
+  napi_value attributes = napi_v8_wrap_value(
+      env, CreateFrozenNullProtoObject(env, empty_names, empty_values));
+  napi_value call_argv[5] = {
+      GetVmDynamicImportDefaultInternalSymbol(env),
+      argv[0], phase, attributes, argc >= 2 ? argv[1] : nullptr,
+  };
+  return napi_call_function(env, global, callback, 5, call_argv, result_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_contextify_run_script(

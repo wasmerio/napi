@@ -238,31 +238,6 @@ int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
 
-  // Syntax validation must compile without executing code or retaining a
-  // cache handle. Invalid source must leave a real pending SyntaxError.
-  int32_t syntax_probe = -1;
-  NAPI_CALL(env, RunInt32Script(env, "globalThis.__syntax_probe = 0", &syntax_probe));
-  napi_value syntax_source = NULL;
-  napi_value syntax_filename = NULL;
-  NAPI_CALL(env, napi_create_string_utf8(
-                     env, "globalThis.__syntax_probe++", NAPI_AUTO_LENGTH,
-                     &syntax_source));
-  NAPI_CALL(env, napi_create_string_utf8(
-                     env, "syntax-probe.js", NAPI_AUTO_LENGTH,
-                     &syntax_filename));
-  NAPI_CALL(env, unofficial_napi_contextify_validate_script(
-                     env, syntax_source, syntax_filename, 0, 0, NULL));
-  NAPI_CALL(env, RunInt32Script(env, "globalThis.__syntax_probe", &syntax_probe));
-  CHECK_OR_FAIL(syntax_probe == 0, "syntax validation executed the script");
-  NAPI_CALL(env, napi_create_string_utf8(env, ")", NAPI_AUTO_LENGTH,
-                                         &syntax_source));
-  CHECK_OR_FAIL(unofficial_napi_contextify_validate_script(
-                    env, syntax_source, syntax_filename, 0, 0, NULL) ==
-                    napi_pending_exception,
-                "invalid script passed syntax validation");
-  napi_value syntax_error = NULL;
-  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &syntax_error));
-  CHECK_OR_FAIL(syntax_error != NULL, "syntax validation lost its exception");
 
   // Run a simple script that returns a string
   napi_value script_str;

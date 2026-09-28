@@ -35,8 +35,12 @@ extern "C" size_t unofficial_napi_message_retained_bytes(
 extern "C" napi_status unofficial_napi_contextify_compile_cjs_legacy(
     napi_env env, napi_value code, napi_value filename, bool is_sea_main,
     bool should_detect_module, napi_value *result_out);
-extern "C" size_t unofficial_napi_bytecode_size_legacy(
-    unofficial_napi_bytecode bytecode);
+extern "C" napi_status NAPI_CDECL snapi_private_validate_script(
+    napi_env env, napi_value source_text, napi_value filename,
+    int32_t line_offset, int32_t column_offset,
+    napi_value host_defined_option_id);
+extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynamically(
+    napi_env env, size_t argc, napi_value *argv, napi_value *result_out);
 extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
     napi_env env, napi_value callback, int32_t kind);
 extern "C" napi_status unofficial_napi_message_read_legacy(
@@ -182,6 +186,13 @@ struct SnapiEnvState {
 
   // Handle table for opaque module_wrap handles.
   HandleTable module_wrap_handles;
+  struct LegacyModuleInfo {
+    napi_ref requests = nullptr;
+    bool has_top_level_await = false;
+  };
+  // The released ABI queried these immutable fields after creation. Retain a
+  // reference because the creation callback's value scope may close first.
+  std::unordered_map<uint32_t, LegacyModuleInfo> legacy_modules;
 
   // Handle table for opaque bytecode handles (unofficial_napi_bytecode_*).
   HandleTable bytecode_handles;
@@ -237,14 +248,23 @@ std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>> &g_envs =
 // against the owning NapiCtx before calling into this process-wide table.
 HandleTable &g_message_handles = *new HandleTable();
 struct LegacyMessageHolder {
-  explicit LegacyMessageHolder(unofficial_napi_message value) : message(value) {}
-  ~LegacyMessageHolder() { unofficial_napi_message_drop(message); }
-  unofficial_napi_message message;
+  ~LegacyMessageHolder() {
+    if (message != nullptr)
+      unofficial_napi_message_drop(message);
+  }
+  unofficial_napi_message message = nullptr;
 };
 // A legacy payload may be deserialized repeatedly until explicit release.
 // An in-flight read keeps its holder alive even if another worker releases it.
 std::unordered_map<uint32_t, std::shared_ptr<LegacyMessageHolder>> &g_legacy_message_holders =
     *new std::unordered_map<uint32_t, std::shared_ptr<LegacyMessageHolder>>();
+// Private deterministic fault injection for the ownership regression test.
+// Thread locality keeps unrelated concurrent workloads out of the probe.
+thread_local bool g_fail_next_legacy_message_registration = false;
+
+extern "C" void snapi_bridge_test_fail_next_legacy_message_registration() {
+  g_fail_next_legacy_message_registration = true;
+}
 
 CallbackBinding *RegisterCallbackBinding(SnapiEnvState *state,
                                          uint32_t reg_id) {
@@ -592,6 +612,17 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->next_ref_id = 1;
   state->deferreds.clear();
   state->next_deferred_id = 1;
+  for (auto &entry : state->legacy_modules) {
+    if (entry.second.requests != nullptr)
+      (void)napi_delete_reference(state->env, entry.second.requests);
+  }
+  state->legacy_modules.clear();
+  for (const auto &entry : state->module_wrap_handles.handles) {
+    if (entry.second != nullptr) {
+      (void)unofficial_napi_module_wrap_destroy(
+          state->env, reinterpret_cast<unofficial_napi_module>(entry.second));
+    }
+  }
   state->module_wrap_handles.Reset();
   // Bytecode handles own engine resources outside any napi scope (V8
   // Globals / QuickJS JSValue refcounts), so they must be released
@@ -4564,16 +4595,22 @@ extern "C" int snapi_bridge_unofficial_message_create_metered(
     return status;
   // The guest reserved 32 MiB before entering V8. Reject any unexpected
   // retained representation that would exceed that reservation.
-  const size_t retained_bytes =
-      unofficial_napi_message_retained_bytes(message) + 4096;
-  if (retained_bytes > 32 * 1024 * 1024) {
+  constexpr size_t kMaxRetainedBytes = 32 * 1024 * 1024;
+  const size_t payload_bytes = unofficial_napi_message_retained_bytes(message);
+  if (payload_bytes > kMaxRetainedBytes - 4096) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
   }
+  const size_t retained_bytes = payload_bytes + 4096;
   uint32_t message_id;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
-    message_id = g_message_handles.Store(reinterpret_cast<void *>(message));
+    try {
+      message_id = g_message_handles.Store(reinterpret_cast<void *>(message));
+    } catch (const std::bad_alloc &) {
+      unofficial_napi_message_drop(message);
+      return napi_generic_failure;
+    }
   }
   if (message_id == 0) {
     unofficial_napi_message_drop(message);
@@ -4608,10 +4645,20 @@ extern "C" int snapi_bridge_unofficial_message_create_legacy_metered(
         g_message_handles.Load(id));
     if (message != nullptr) {
       try {
-        g_legacy_message_holders.emplace(
-            id, std::make_shared<LegacyMessageHolder>(message));
-        *message_out = id;
-        return napi_ok;
+        // The handle table retains ownership until insertion succeeds. An
+        // allocation failure while constructing the holder or map node must
+        // leave exactly one owner for the fallback drop below.
+        auto holder = std::make_shared<LegacyMessageHolder>();
+        if (g_fail_next_legacy_message_registration) {
+          g_fail_next_legacy_message_registration = false;
+          throw std::bad_alloc();
+        }
+        auto [it, inserted] = g_legacy_message_holders.emplace(id, holder);
+        if (inserted) {
+          it->second->message = message;
+          *message_out = id;
+          return napi_ok;
+        }
       } catch (const std::bad_alloc&) {
       }
     }
@@ -4754,26 +4801,6 @@ extern "C" int snapi_bridge_unofficial_contextify_contains_module_syntax(
   if (result_out != nullptr)
     *result_out = result ? 1 : 0;
   return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_validate_script(
-    SnapiEnvState *env_state, uint32_t source_text_id, uint32_t filename_id,
-    int32_t line_offset, int32_t column_offset, uint32_t host_defined_option_id) {
-  auto bridge_state_lease = RequireEnvState(env_state);
-  auto *bridge_state = bridge_state_lease.get();
-  if (bridge_state == nullptr)
-    return napi_invalid_arg;
-  napi_value source_text = LoadValue(*bridge_state, source_text_id);
-  napi_value filename = LoadValue(*bridge_state, filename_id);
-  napi_value host_id = host_defined_option_id == 0
-                           ? nullptr
-                           : LoadValue(*bridge_state, host_defined_option_id);
-  if (source_text == nullptr || filename == nullptr ||
-      (host_defined_option_id != 0 && host_id == nullptr))
-    return napi_invalid_arg;
-  return unofficial_napi_contextify_validate_script(
-      bridge_state->env, source_text, filename, line_offset, column_offset,
-      host_id);
 }
 
 extern "C" int snapi_bridge_unofficial_contextify_make_context(
@@ -4990,30 +5017,17 @@ extern "C" int snapi_bridge_unofficial_contextify_create_cached_data_legacy(
       code_bytes > 4 * 1024 * 1024 || filename_bytes > 1024 * 1024)
     return napi_invalid_arg;
 
-  unofficial_napi_bytecode_open_options options{};
-  options.size = sizeof(options);
-  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
-  options.source_text = code;
-  options.filename = filename;
-  options.shape = unofficial_napi_bytecode_shape_script;
-  options.host_defined_option_id = host_id;
-  options.line_offset = line_offset;
-  options.column_offset = column_offset;
-  options.cache_policy = unofficial_napi_bytecode_cache_compile_on_reject;
-  unofficial_napi_bytecode_open_result opened{};
-  napi_status status = unofficial_napi_bytecode_open(state->env, &options, &opened);
-  if (status != napi_ok || opened.bytecode == nullptr) {
-    if (opened.bytecode != nullptr)
-      (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
-    return status == napi_ok ? napi_generic_failure : status;
-  }
-  if (unofficial_napi_bytecode_size_legacy(opened.bytecode) > 8 * 1024 * 1024) {
-    (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
-    return napi_invalid_arg;
-  }
+  // The released guest calls this entry even when it only wants syntax
+  // validation. Producing and retaining real V8 code cache here cannot be
+  // covered by the fixed transient reservation in the legacy ABI. Compile
+  // without running the script, then return an empty guest-owned Buffer.
+  napi_status status = snapi_private_validate_script(
+      state->env, code, filename, line_offset, column_offset, host_id);
+  if (status != napi_ok)
+    return status;
   napi_value buffer = nullptr;
-  status = unofficial_napi_bytecode_serialize(state->env, opened.bytecode, &buffer);
-  (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
+  void *data = nullptr;
+  status = napi_create_buffer(state->env, 0, &data, &buffer);
   if (status != napi_ok)
     return status;
   *result_out = StoreValue(*state, buffer);
@@ -5196,16 +5210,133 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
     }
     return napi_generic_failure;
   }
-  if (handle_out != nullptr) {
-    *handle_out = StoreModuleWrapHandle(*bridge_state, result.module);
+  uint32_t handle_id = 0;
+  uint32_t requests_id = 0;
+  try {
+    if (handle_out != nullptr)
+      handle_id = StoreModuleWrapHandle(*bridge_state, result.module);
+    if (requests_out != nullptr)
+      requests_id = StoreValue(*bridge_state, result.module_requests);
+  } catch (const std::bad_alloc &) {
+    if (handle_id != 0)
+      RemoveModuleWrapHandle(*bridge_state, handle_id);
+    (void)unofficial_napi_module_wrap_destroy(env, result.module);
+    return napi_generic_failure;
   }
-  if (requests_out != nullptr) {
-    *requests_out = StoreValue(*bridge_state, result.module_requests);
+  if ((handle_out != nullptr && handle_id == 0) ||
+      (requests_out != nullptr && requests_id == 0)) {
+    if (handle_id != 0)
+      RemoveModuleWrapHandle(*bridge_state, handle_id);
+    (void)unofficial_napi_module_wrap_destroy(env, result.module);
+    return napi_generic_failure;
   }
+  if (handle_out != nullptr)
+    *handle_out = handle_id;
+  if (requests_out != nullptr)
+    *requests_out = requests_id;
   if (has_top_level_await_out != nullptr) {
     *has_top_level_await_out = result.has_top_level_await ? 1 : 0;
   }
   return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_module_wrap_destroy(
+    SnapiEnvState *env_state, uint32_t handle_id);
+
+extern "C" int snapi_bridge_unofficial_module_wrap_create_legacy(
+    SnapiEnvState *env_state, int32_t kind, uint32_t wrapper_id,
+    uint32_t url_id, uint32_t context_id, uint32_t source_text_id,
+    int32_t line_offset, int32_t column_offset, uint32_t host_defined_option_id,
+    uint32_t export_names_id,
+    uint32_t synthetic_eval_steps_id, uint32_t *handle_out) {
+  if (handle_out == nullptr)
+    return napi_invalid_arg;
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr ||
+      state->legacy_modules.size() >= SnapiEnvState::kMaxGuestNativeHandles)
+    return napi_generic_failure;
+  uint32_t handle = 0;
+  uint32_t requests = 0;
+  uint8_t has_tla = 0;
+  const int status = snapi_bridge_unofficial_module_wrap_create(
+      env_state, kind, wrapper_id, url_id, context_id, source_text_id,
+      /*source_bytecode_id=*/0, line_offset, column_offset,
+      host_defined_option_id, export_names_id, synthetic_eval_steps_id,
+      &handle, &requests, &has_tla);
+  if (status != napi_ok)
+    return status;
+  napi_value requests_value = LoadValue(*state, requests);
+  napi_ref requests_ref = nullptr;
+  if (handle == 0 || requests_value == nullptr ||
+      napi_create_reference(state->env, requests_value, 1, &requests_ref) !=
+          napi_ok) {
+    (void)snapi_bridge_unofficial_module_wrap_destroy(env_state, handle);
+    return napi_generic_failure;
+  }
+  try {
+    const auto [_, inserted] = state->legacy_modules.emplace(
+        handle, SnapiEnvState::LegacyModuleInfo{requests_ref, has_tla != 0});
+    if (!inserted) {
+      (void)napi_delete_reference(state->env, requests_ref);
+      (void)snapi_bridge_unofficial_module_wrap_destroy(env_state, handle);
+      return napi_generic_failure;
+    }
+  } catch (const std::bad_alloc &) {
+    (void)napi_delete_reference(state->env, requests_ref);
+    (void)snapi_bridge_unofficial_module_wrap_destroy(env_state, handle);
+    return napi_generic_failure;
+  }
+  *handle_out = handle;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
+    SnapiEnvState *env_state, uint32_t handle_id, uint32_t *requests_out,
+    int *has_top_level_await_out) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr || (requests_out == nullptr && has_top_level_await_out == nullptr))
+    return napi_invalid_arg;
+  auto it = state->legacy_modules.find(handle_id);
+  if (it == state->legacy_modules.end())
+    return napi_invalid_arg;
+  if (requests_out != nullptr) {
+    napi_value requests = nullptr;
+    const napi_status status =
+        napi_get_reference_value(state->env, it->second.requests, &requests);
+    if (status != napi_ok || requests == nullptr)
+      return napi_generic_failure;
+    *requests_out = StoreValue(*state, requests);
+    if (*requests_out == 0)
+      return napi_generic_failure;
+  }
+  if (has_top_level_await_out != nullptr)
+    *has_top_level_await_out = it->second.has_top_level_await ? 1 : 0;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_module_wrap_import_module_dynamically_legacy(
+    SnapiEnvState *env_state, uint32_t argc, const uint32_t *argv_ids,
+    uint32_t *result_out) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr || result_out == nullptr || argv_ids == nullptr ||
+      argc == 0 || argc > 5)
+    return napi_invalid_arg;
+  napi_value argv[5] = {};
+  for (uint32_t i = 0; i < argc; ++i) {
+    argv[i] = LoadValue(*state, argv_ids[i]);
+    if (argv[i] == nullptr)
+      return napi_invalid_arg;
+  }
+  napi_value result = nullptr;
+  const napi_status status = snapi_private_module_wrap_import_module_dynamically(
+      state->env, argc, argv, &result);
+  if (status != napi_ok)
+    return status;
+  *result_out = StoreValue(*state, result);
+  return *result_out == 0 ? napi_generic_failure : napi_ok;
 }
 
 extern "C" int
@@ -5221,8 +5352,14 @@ snapi_bridge_unofficial_module_wrap_destroy(SnapiEnvState *env_state,
   if (module == nullptr)
     return napi_invalid_arg;
   napi_status s = unofficial_napi_module_wrap_destroy(env, module);
-  if (s == napi_ok)
+  if (s == napi_ok) {
+    auto it = bridge_state->legacy_modules.find(handle_id);
+    if (it != bridge_state->legacy_modules.end()) {
+      (void)napi_delete_reference(env, it->second.requests);
+      bridge_state->legacy_modules.erase(it);
+    }
     RemoveModuleWrapHandle(*bridge_state, handle_id);
+  }
   return s;
 }
 

@@ -6,6 +6,7 @@ use wasmer_napi::NapiCtx;
 
 unsafe extern "C" {
     fn snapi_bridge_unofficial_legacy_message_is_live(message_id: u32) -> i32;
+    fn snapi_bridge_test_fail_next_legacy_message_registration();
 }
 
 const SIGNATURES: &str = include_str!("fixtures/edgejs-0.0.1-napi-signatures.txt");
@@ -210,6 +211,164 @@ fn legacy_serialized_payload_is_cleared_on_host_stop() {
         unsafe { snapi_bridge_unofficial_legacy_message_is_live(message as u32) },
         0
     );
+}
+
+#[test]
+fn legacy_message_registration_failure_drops_exactly_one_owner() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_release_env" (func $release (param i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_serialize_value" (func $serialize (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "failure probe")
+      (func (export "run") (result i32)
+        (local $status i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 1))))
+        (if (call $string (i32.load (i32.const 4)) (i32.const 100) (i32.const 13) (i32.const 12))
+          (then (return (i32.const 2))))
+        (local.set $status (call $serialize (i32.load (i32.const 4)) (i32.load (i32.const 12)) (i32.const 16)))
+        (if (i32.eqz (local.get $status)) (then (return (i32.const 3))))
+        (if (i32.load (i32.const 16)) (then (return (i32.const 4))))
+        (if (call $release (i32.load (i32.const 8))) (then (return (i32.const 5))))
+        (i32.const 0)))"#;
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let ctx = NapiCtx::default();
+    let session = ctx.new_session(&module).unwrap();
+    let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    unsafe { snapi_bridge_test_fail_next_legacy_message_registration() };
+    let run = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "run")
+        .unwrap();
+    assert_eq!(run.call(&mut store).unwrap(), 0);
+    assert_eq!(ctx.budget().snapshot().serialized_message, 0);
+}
+
+#[test]
+fn legacy_cache_entry_validates_without_execution_or_retained_bytecode() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_release_env" (func $release (param i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_buffer_info" (func $buffer (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_and_clear_last_exception" (func $clear (param i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_contextify_create_cached_data" (func $cache (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "throw new Error('must not run')")
+      (data (i32.const 160) "legacy-cache.js")
+      (data (i32.const 200) ")")
+      (func (export "run") (result i32)
+        (local $env i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8))
+          (then (return (i32.const 1))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $string (local.get $env) (i32.const 100) (i32.const 31) (i32.const 12))
+          (then (return (i32.const 2))))
+        (if (call $string (local.get $env) (i32.const 160) (i32.const 15) (i32.const 16))
+          (then (return (i32.const 3))))
+        (if (call $cache (local.get $env) (i32.load (i32.const 12))
+              (i32.load (i32.const 16)) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 20))
+          (then (return (i32.const 4))))
+        (if (i32.eqz (i32.load (i32.const 20))) (then (return (i32.const 5))))
+        (if (call $buffer (local.get $env) (i32.load (i32.const 20))
+              (i32.const 24) (i32.const 28))
+          (then (return (i32.const 6))))
+        (if (i32.load (i32.const 28)) (then (return (i32.const 7))))
+        (if (call $string (local.get $env) (i32.const 200) (i32.const 1) (i32.const 32))
+          (then (return (i32.const 8))))
+        (if (i32.eqz (call $cache (local.get $env) (i32.load (i32.const 32))
+              (i32.load (i32.const 16)) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 36)))
+          (then (return (i32.const 9))))
+        (if (call $clear (local.get $env) (i32.const 40))
+          (then (return (i32.const 10))))
+        (if (i32.eqz (i32.load (i32.const 40))) (then (return (i32.const 11))))
+        (if (call $release (i32.load (i32.const 8))) (then (return (i32.const 12))))
+        (i32.const 0)))"#;
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let ctx = NapiCtx::default();
+    let session = ctx.new_session(&module).unwrap();
+    let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "run")
+        .unwrap();
+    assert_eq!(run.call(&mut store).unwrap(), 0);
+    assert_eq!(ctx.budget().snapshot().host_transient, 0);
+}
+
+#[test]
+fn legacy_module_creation_retains_metadata_until_destroy() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_release_env" (func $release (param i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_object" (func $object (param i32 i32) (result i32)))
+      (import "napi" "napi_is_array" (func $is_array (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_create_source_text" (func $module (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_get_module_requests" (func $requests (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_has_top_level_await" (func $has_tla (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_get_status" (func $status (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_destroy" (func $destroy (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "test:legacy-module")
+      (data (i32.const 140) "export const x = 1;")
+      (func (export "run") (result i32)
+        (local $env i32) (local $handle i32)
+        (if (call $create (i32.const 8) (i32.const 4) (i32.const 8)) (then (return (i32.const 1))))
+        (local.set $env (i32.load (i32.const 4)))
+        (if (call $object (local.get $env) (i32.const 12)) (then (return (i32.const 2))))
+        (if (call $string (local.get $env) (i32.const 100) (i32.const 18) (i32.const 16))
+          (then (return (i32.const 3))))
+        (if (call $string (local.get $env) (i32.const 140) (i32.const 19) (i32.const 20))
+          (then (return (i32.const 4))))
+        (if (call $module (local.get $env) (i32.load (i32.const 12))
+              (i32.load (i32.const 16)) (i32.const 0) (i32.load (i32.const 20))
+              (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 24))
+          (then (return (i32.const 5))))
+        (local.set $handle (i32.load (i32.const 24)))
+        (if (i32.eqz (local.get $handle)) (then (return (i32.const 6))))
+        (if (call $requests (local.get $env) (local.get $handle) (i32.const 28))
+          (then (return (i32.const 7))))
+        (if (call $is_array (local.get $env) (i32.load (i32.const 28)) (i32.const 32))
+          (then (return (i32.const 8))))
+        (if (i32.eqz (i32.load8_u (i32.const 32))) (then (return (i32.const 9))))
+        (if (call $has_tla (local.get $env) (local.get $handle) (i32.const 36))
+          (then (return (i32.const 10))))
+        (if (i32.load8_u (i32.const 36)) (then (return (i32.const 11))))
+        (if (call $status (local.get $env) (local.get $handle) (i32.const 40))
+          (then (return (i32.const 12))))
+        (if (call $destroy (local.get $env) (local.get $handle))
+          (then (return (i32.const 13))))
+        (if (i32.eqz (call $requests (local.get $env) (local.get $handle) (i32.const 28)))
+          (then (return (i32.const 14))))
+        (if (call $release (i32.load (i32.const 8))) (then (return (i32.const 15))))
+        (i32.const 0)))"#;
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let ctx = NapiCtx::default();
+    let session = ctx.new_session(&module).unwrap();
+    let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "run")
+        .unwrap();
+    assert_eq!(run.call(&mut store).unwrap(), 0);
 }
 
 /// Opt in with the immutable released atom path. The manifest test above runs

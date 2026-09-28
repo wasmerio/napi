@@ -6,6 +6,7 @@ use crate::{
     NAPI_MODULE_NAME, NapiEnv,
     budget::Pool,
     message::{MessageCharge, SERIALIZATION_RESERVATION},
+    snapi::{SnapiUnofficialHeapSpaceStatistics, SnapiUnofficialHeapStatistics},
 };
 use wasmer::{
     AsStoreMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Imports, RuntimeError, Type,
@@ -269,6 +270,23 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
             ))
         }
+        "unofficial_napi_get_heap_statistics" => Ok(legacy_heap_statistics(
+            env,
+            args[0].unwrap_i32(),
+            args[1].unwrap_i32(),
+        )),
+        "unofficial_napi_get_heap_space_count" => Ok(legacy_heap_space_count(
+            env,
+            args[0].unwrap_i32(),
+            args[1].unwrap_i32(),
+        )),
+        "unofficial_napi_get_heap_space_statistics" => Ok(legacy_heap_space_statistics(
+            env,
+            args[0].unwrap_i32(),
+            args[1].unwrap_i32(),
+            args[2].unwrap_i32(),
+        )),
+        "unofficial_napi_get_process_memory_info" => Ok(legacy_process_memory_info(env, args)),
         "unofficial_napi_get_own_non_index_properties" => {
             Ok(super::guest_unofficial_napi_get_own_non_index_properties(
                 env,
@@ -310,6 +328,8 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
             ))
         }
+        "unofficial_napi_module_wrap_create_source_text" => legacy_module_create(env, args, false),
+        "unofficial_napi_module_wrap_create_synthetic" => legacy_module_create(env, args, true),
         "unofficial_napi_module_wrap_create_required_module_facade" => {
             super::guest_unofficial_napi_module_wrap_create_required_module_facade(
                 env,
@@ -341,6 +361,76 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
             ))
+        }
+        "unofficial_napi_module_wrap_get_module_requests" => {
+            Ok(legacy_module_metadata(env, args, true))
+        }
+        "unofficial_napi_module_wrap_has_top_level_await" => {
+            Ok(legacy_module_metadata(env, args, false))
+        }
+        "unofficial_napi_module_wrap_get_status" => {
+            Ok(super::guest_unofficial_napi_module_wrap_get_state(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                args[2].unwrap_i32(),
+                0,
+                0,
+            ))
+        }
+        "unofficial_napi_module_wrap_get_error" => {
+            Ok(super::guest_unofficial_napi_module_wrap_get_state(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                0,
+                args[2].unwrap_i32(),
+                0,
+            ))
+        }
+        "unofficial_napi_module_wrap_has_async_graph" => {
+            Ok(super::guest_unofficial_napi_module_wrap_get_state(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                0,
+                0,
+                args[2].unwrap_i32(),
+            ))
+        }
+        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Ok(
+            super::guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                args[2].unwrap_i32(),
+                args[3].unwrap_i32(),
+            ),
+        ),
+        "unofficial_napi_module_wrap_evaluate" => {
+            super::guest_unofficial_napi_module_wrap_evaluate(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                args[2].unwrap_i64(),
+                args[3].unwrap_i32(),
+                args[4].unwrap_i32(),
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
+        }
+        "unofficial_napi_module_wrap_evaluate_sync" => {
+            super::guest_unofficial_napi_module_wrap_evaluate_sync(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                args[2].unwrap_i32(),
+                args[3].unwrap_i32(),
+                args[4].unwrap_i32(),
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
+        }
+        "unofficial_napi_module_wrap_import_module_dynamically" => {
+            legacy_import_module_dynamically(env, args)
         }
         "unofficial_napi_module_wrap_instantiate" => {
             Ok(super::guest_unofficial_napi_module_wrap_instantiate(
@@ -409,6 +499,43 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
         )),
+        "unofficial_napi_low_memory_notification" | "unofficial_napi_request_gc_for_testing" => {
+            let mut env = env;
+            let guest_env = args[0].unwrap_i32();
+            let snapi_env = super::snapi_env(&env, guest_env);
+            if snapi_env.is_null() {
+                return Ok(1);
+            }
+            super::with_cb_context(&mut env, guest_env, || unsafe {
+                crate::snapi::snapi_bridge_unofficial_collect_garbage(snapi_env)
+            })
+            .map_err(|error| RuntimeError::user(Box::new(error)))
+        }
+        "unofficial_napi_set_near_heap_limit_callback"
+        | "unofficial_napi_remove_near_heap_limit_callback"
+        | "unofficial_napi_set_stack_limit" => {
+            // A wasm32 stack pointer is not a native V8 stack limit. The
+            // provider owns this isolate's heap limit and stop control.
+            Ok(i32::from(
+                super::snapi_env(&env, args[0].unwrap_i32()).is_null(),
+            ))
+        }
+        "unofficial_napi_structured_clone" => Ok(super::guest_unofficial_napi_structured_clone(
+            env,
+            args[0].unwrap_i32(),
+            args[1].unwrap_i32(),
+            0,
+            args[2].unwrap_i32(),
+        )),
+        "unofficial_napi_structured_clone_with_transfer" => {
+            Ok(super::guest_unofficial_napi_structured_clone(
+                env,
+                args[0].unwrap_i32(),
+                args[1].unwrap_i32(),
+                args[2].unwrap_i32(),
+                args[3].unwrap_i32(),
+            ))
+        }
         "unofficial_napi_set_continuation_preserved_embedder_data" => Ok(
             super::guest_unofficial_napi_set_continuation_preserved_embedder_data(
                 env,
@@ -437,10 +564,21 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
         // Every released import has an exact type and a host function. An
         // operation with no safe compatibility path reports failure rather
         // than pretending that an irreversible state transition succeeded.
-        "unofficial_napi_free_buffer" => Err(RuntimeError::new(format!(
-            "unsupported legacy release: {name}"
+        // This is a wasm32 address returned by a guest-side copy. Native
+        // free() must never see it; its guest allocator owns the memory.
+        "unofficial_napi_free_buffer" => Ok(0),
+        "unofficial_napi_create_serdes_binding"
+        | "unofficial_napi_get_caller_location"
+        | "unofficial_napi_get_current_stack_trace"
+        | "unofficial_napi_get_error_source_positions"
+        | "unofficial_napi_start_cpu_profile"
+        | "unofficial_napi_start_heap_profile"
+        | "unofficial_napi_stop_cpu_profile"
+        | "unofficial_napi_stop_heap_profile"
+        | "unofficial_napi_take_heap_snapshot" => Ok(1),
+        _ => Err(RuntimeError::new(format!(
+            "unclassified frozen N-API import: {name}"
         ))),
-        _ => Ok(1),
     }
 }
 
@@ -473,11 +611,331 @@ fn legacy_set_foreground_task_callback(
     if function.ty(&store) != expected {
         return 1;
     }
-    // The provider's fallback foreground queue is pumped by every event-loop
-    // checkpoint. This is the approved execution path for imported guests:
-    // V8 tasks still run on the admitted lane and never call a WASM function
-    // from an unmanaged V8 worker thread. The guest hook is validated above;
-    // its requested scheduling is supplied by that provider queue.
+    // The guest callback is not installed. V8's fallback foreground queue is
+    // drained when this environment reaches an event-loop checkpoint; queued
+    // tasks remain pending if the guest does not drive that checkpoint.
+    0
+}
+
+fn legacy_module_create(
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+    synthetic: bool,
+) -> Result<i32, RuntimeError> {
+    let guest_env = args[0].unwrap_i32();
+    let result_ptr = args[if synthetic { 6 } else { 8 }].unwrap_i32();
+    if guest_env <= 0
+        || result_ptr <= 0
+        || super::read_guest_bytes(&mut env, result_ptr, 4).is_none()
+    {
+        return Ok(1);
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return Ok(1);
+    }
+    // The released source-text entry accepts either a host-option symbol or
+    // cached-data bytes. Preserve the symbol and compile from source without
+    // retaining guest cache bytes.
+    let mut handle = 0u32;
+    let status = super::with_cb_context(&mut env, guest_env, || unsafe {
+        crate::snapi::snapi_bridge_unofficial_module_wrap_create_legacy(
+            snapi_env,
+            if synthetic { 2 } else { 1 },
+            args[1].unwrap_i32().max(0) as u32,
+            args[2].unwrap_i32().max(0) as u32,
+            args[3].unwrap_i32().max(0) as u32,
+            if synthetic {
+                0
+            } else {
+                args[4].unwrap_i32().max(0) as u32
+            },
+            if synthetic { 0 } else { args[5].unwrap_i32() },
+            if synthetic { 0 } else { args[6].unwrap_i32() },
+            if synthetic {
+                0
+            } else {
+                args[7].unwrap_i32().max(0) as u32
+            },
+            if synthetic {
+                args[4].unwrap_i32().max(0) as u32
+            } else {
+                0
+            },
+            if synthetic {
+                args[5].unwrap_i32().max(0) as u32
+            } else {
+                0
+            },
+            &mut handle,
+        )
+    })
+    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, handle) {
+        unsafe { crate::snapi::snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle) };
+        return Ok(1);
+    }
+    Ok(status)
+}
+
+fn legacy_module_metadata(mut env: FunctionEnvMut<NapiEnv>, args: &[Value], requests: bool) -> i32 {
+    let guest_env = args[0].unwrap_i32();
+    let handle = args[1].unwrap_i32();
+    let result_ptr = args[2].unwrap_i32();
+    if guest_env <= 0
+        || handle <= 0
+        || result_ptr <= 0
+        || super::read_guest_bytes(&mut env, result_ptr, if requests { 4 } else { 1 }).is_none()
+    {
+        return 1;
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return 1;
+    }
+    let mut result_id = 0u32;
+    let mut has_tla = 0i32;
+    let status = unsafe {
+        crate::snapi::snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
+            snapi_env,
+            handle as u32,
+            if requests {
+                &mut result_id
+            } else {
+                std::ptr::null_mut()
+            },
+            if requests {
+                std::ptr::null_mut()
+            } else {
+                &mut has_tla
+            },
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    if requests {
+        i32::from(!super::write_guest_u32(
+            &mut env,
+            result_ptr as u32,
+            result_id,
+        ))
+    } else {
+        i32::from(!super::write_guest_u8(
+            &mut env,
+            result_ptr as u32,
+            u8::from(has_tla != 0),
+        ))
+    }
+}
+
+fn legacy_import_module_dynamically(
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+) -> Result<i32, RuntimeError> {
+    let guest_env = args[0].unwrap_i32();
+    let argc = args[1].unwrap_i32();
+    let result_ptr = args[3].unwrap_i32();
+    if guest_env <= 0
+        || !(1..=5).contains(&argc)
+        || result_ptr <= 0
+        || super::read_guest_bytes(&mut env, result_ptr, 4).is_none()
+    {
+        return Ok(1);
+    }
+    let Some(ids) = super::read_guest_u32_array(&mut env, args[2].unwrap_i32(), argc as usize)
+    else {
+        return Ok(1);
+    };
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return Ok(1);
+    }
+    let mut result = 0u32;
+    let status = super::with_cb_context(&mut env, guest_env, || unsafe {
+        crate::snapi::snapi_bridge_unofficial_module_wrap_import_module_dynamically_legacy(
+            snapi_env,
+            argc as u32,
+            ids.as_ptr(),
+            &mut result,
+        )
+    })
+    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
+        return Ok(1);
+    }
+    Ok(status)
+}
+
+fn legacy_heap_statistics(
+    mut env: FunctionEnvMut<NapiEnv>,
+    guest_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    const FIELDS: usize = 14;
+    if guest_env <= 0
+        || result_ptr <= 0
+        || super::read_guest_bytes(&mut env, result_ptr, FIELDS * 8).is_none()
+    {
+        return 1;
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return 1;
+    }
+    let mut stats = SnapiUnofficialHeapStatistics {
+        size: std::mem::size_of::<SnapiUnofficialHeapStatistics>() as u32,
+        version: 1,
+        ..Default::default()
+    };
+    let status =
+        unsafe { crate::snapi::snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats) };
+    if status != 0 {
+        return status;
+    }
+    let values = [
+        stats.total_heap_size,
+        stats.total_heap_size_executable,
+        stats.total_physical_size,
+        stats.total_available_size,
+        stats.used_heap_size,
+        stats.heap_size_limit,
+        stats.does_zap_garbage,
+        stats.malloced_memory,
+        stats.peak_malloced_memory,
+        stats.number_of_native_contexts,
+        stats.number_of_detached_contexts,
+        stats.total_global_handles_size,
+        stats.used_global_handles_size,
+        stats.external_memory,
+    ];
+    let mut normalized = [0u64; FIELDS];
+    for (index, value) in values.into_iter().enumerate() {
+        if stats.valid_fields & (1u64 << index) != 0 {
+            normalized[index] = value;
+        }
+    }
+    i32::from(!super::write_guest_pod(&mut env, result_ptr, &normalized))
+}
+
+fn legacy_heap_space_count(
+    mut env: FunctionEnvMut<NapiEnv>,
+    guest_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    if guest_env <= 0
+        || result_ptr <= 0
+        || super::read_guest_bytes(&mut env, result_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return 1;
+    }
+    let mut count = 0u32;
+    let status = unsafe {
+        crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics(
+            snapi_env,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, count) {
+        return 1;
+    }
+    status
+}
+
+fn legacy_heap_space_statistics(
+    mut env: FunctionEnvMut<NapiEnv>,
+    guest_env: i32,
+    index: i32,
+    result_ptr: i32,
+) -> i32 {
+    // Keep the same bounded maximum as the versioned heap-space adapter.
+    if guest_env <= 0
+        || !(0..1024).contains(&index)
+        || result_ptr <= 0
+        || super::read_guest_bytes(
+            &mut env,
+            result_ptr,
+            std::mem::size_of::<SnapiUnofficialHeapSpaceStatistics>(),
+        )
+        .is_none()
+    {
+        return 1;
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return 1;
+    }
+    let capacity = index as usize + 1;
+    let mut stats: Vec<SnapiUnofficialHeapSpaceStatistics> =
+        (0..capacity).map(|_| Default::default()).collect();
+    let mut count = 0u32;
+    let status = unsafe {
+        crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics(
+            snapi_env,
+            stats.as_mut_ptr(),
+            capacity as u32,
+            &mut count,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    if index as u32 >= count {
+        return 1;
+    }
+    i32::from(!super::write_guest_pod(
+        &mut env,
+        result_ptr,
+        &stats[index as usize],
+    ))
+}
+
+fn legacy_process_memory_info(mut env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> i32 {
+    let guest_env = args[0].unwrap_i32();
+    if guest_env <= 0 {
+        return 1;
+    }
+    for arg in &args[1..] {
+        let pointer = arg.unwrap_i32();
+        if pointer < 0 || (pointer > 0 && super::read_guest_bytes(&mut env, pointer, 8).is_none()) {
+            return 1;
+        }
+    }
+    let snapi_env = super::snapi_env(&env, guest_env);
+    if snapi_env.is_null() {
+        return 1;
+    }
+    let mut stats = SnapiUnofficialHeapStatistics {
+        size: std::mem::size_of::<SnapiUnofficialHeapStatistics>() as u32,
+        version: 1,
+        ..Default::default()
+    };
+    let status =
+        unsafe { crate::snapi::snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats) };
+    if status != 0 {
+        return status;
+    }
+    let values = [
+        (0, stats.total_heap_size),
+        (4, stats.used_heap_size),
+        (13, stats.external_memory),
+        (14, stats.array_buffer_memory),
+    ];
+    for (arg, (bit, value)) in args[1..].iter().zip(values) {
+        let pointer = arg.unwrap_i32();
+        if pointer > 0
+            && (stats.valid_fields & (1u64 << bit) == 0
+                || !super::write_guest_pod(&mut env, pointer, &(value as f64)))
+        {
+            return 1;
+        }
+    }
     0
 }
 
@@ -509,8 +967,9 @@ fn legacy_set_fatal_error_callbacks(
             return 1;
         }
     }
-    // The published guest's callbacks end in abort(). The provider owns the
-    // fatal hooks so an engine failure stops this workload, not the host.
+    // The published guest's callbacks abort the process. A provider hook
+    // records a workload-local stop if V8 returns to the import boundary.
+    // Native fatal errors can still abort inside V8 before control returns.
     unsafe { crate::snapi::snapi_bridge_unofficial_attach_legacy_env(snapi_env) }
 }
 

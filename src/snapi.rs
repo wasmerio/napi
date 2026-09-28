@@ -12,6 +12,7 @@ pub struct SnapiEnvState {
 pub type SnapiEnv = *mut SnapiEnvState;
 
 #[repr(C)]
+#[derive(Default)]
 pub struct SnapiUnofficialHeapStatistics {
     pub size: u32,
     pub version: u32,
@@ -40,6 +41,18 @@ pub struct SnapiUnofficialHeapSpaceStatistics {
     pub space_used_size: u64,
     pub space_available_size: u64,
     pub physical_space_size: u64,
+}
+
+impl Default for SnapiUnofficialHeapSpaceStatistics {
+    fn default() -> Self {
+        Self {
+            space_name: [0; 64],
+            space_size: 0,
+            space_used_size: 0,
+            space_available_size: 0,
+            physical_space_size: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -298,14 +311,6 @@ unsafe extern "C" {
         cjs_var_in_scope: i32,
         result_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_validate_script(
-        env: SnapiEnv,
-        source_text_id: u32,
-        filename_id: u32,
-        line_offset: i32,
-        column_offset: i32,
-        host_defined_option_id: u32,
-    ) -> i32;
     pub fn snapi_bridge_unofficial_contextify_make_context(
         env: SnapiEnv,
         sandbox_or_symbol_id: u32,
@@ -420,6 +425,32 @@ unsafe extern "C" {
         handle_out: *mut u32,
         requests_out: *mut u32,
         has_top_level_await_out: *mut u8,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_create_legacy(
+        env: SnapiEnv,
+        kind: i32,
+        wrapper_id: u32,
+        url_id: u32,
+        context_id: u32,
+        source_text_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        host_defined_option_id: u32,
+        export_names_id: u32,
+        synthetic_eval_steps_id: u32,
+        handle_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
+        env: SnapiEnv,
+        handle_id: u32,
+        requests_out: *mut u32,
+        has_top_level_await_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_import_module_dynamically_legacy(
+        env: SnapiEnv,
+        argc: u32,
+        argv_ids: *const u32,
+        result_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_destroy(env: SnapiEnv, handle_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_link(
