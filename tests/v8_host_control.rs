@@ -29,6 +29,17 @@ const NAPI_PENDING_EXCEPTION: i32 = 10;
 /// ceiling is clamped.
 const BUDGET_BELOW_ISOLATE_FLOOR: u64 = 20 * 1024 * 1024;
 
+#[test]
+fn two_guest_isolates_run_sequentially() {
+    let wasm = build_wasix_test("hello_napi_test");
+    for _ in 0..2 {
+        let (exit_code, stdout, stderr) =
+            run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+        assert_eq!(exit_code, 0, "{stderr}");
+        assert!(stdout.contains("HELLO_NAPI_TEST_OK=1"), "{stdout}\n{stderr}");
+    }
+}
+
 /// The kill path Edge relies on: a JS loop that never returns on its own has
 /// to stop when the host says so. Nothing in the guest cooperates here — the
 /// isolate is executing JS when the request arrives.
