@@ -186,6 +186,12 @@ fn with_cb_context<R>(
 ) -> Result<R, WasiError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
+    if !snapi_env.is_null()
+        && unsafe { snapi_bridge_unofficial_take_fatal_requested(snapi_env) } != 0
+    {
+        env.data().terminate_all();
+        return Err(WasiError::Exit(ExitCode::from(1)));
+    }
     if let Some(code) = take_pending_guest_exit() {
         return Err(WasiError::Exit(code));
     }

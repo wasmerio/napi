@@ -185,6 +185,8 @@ unsafe extern "C" {
         oom_callback_id: u32,
         accepted_hooks_out: *mut u64,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_attach_legacy_env(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_take_fatal_requested(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
@@ -331,6 +333,42 @@ unsafe extern "C" {
         params_id: u32,
         host_defined_option_id: u32,
         result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_compile_function_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        cached_data_id: u32,
+        produce_cached_data: i32,
+        parsing_context_id: u32,
+        context_extensions_id: u32,
+        params_id: u32,
+        host_defined_option_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_compile_cjs_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        is_sea_main: i32,
+        should_detect_module: i32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_create_cached_data_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        host_defined_option_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_set_legacy_hook(
+        env: SnapiEnv,
+        callback_id: u32,
+        kind: i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_open(
         env: SnapiEnv,

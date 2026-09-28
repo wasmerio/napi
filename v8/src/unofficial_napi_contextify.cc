@@ -2105,6 +2105,12 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
   return *buffer_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
+extern "C" size_t unofficial_napi_bytecode_size_legacy(
+    unofficial_napi_bytecode bytecode) {
+  if (bytecode == nullptr) return 0;
+  return reinterpret_cast<BytecodeRecord*>(bytecode)->bytes.size();
+}
+
 napi_status NAPI_CDECL unofficial_napi_bytecode_release(
     napi_env env, unofficial_napi_bytecode bytecode) {
   if (env == nullptr || bytecode == nullptr) return napi_invalid_arg;
@@ -2518,6 +2524,81 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+// Private bridge entry for the published wasm32 EdgeJS CJS loader. Keep its
+// result object and ESM retry decision stable without adding an import to the
+// versioned guest surface.
+extern "C" napi_status unofficial_napi_contextify_compile_cjs_legacy(
+    napi_env env, napi_value code, napi_value filename, bool is_sea_main,
+    bool should_detect_module, napi_value* result_out) {
+  if (env == nullptr || code == nullptr || filename == nullptr || result_out == nullptr)
+    return napi_invalid_arg;
+  (void)is_sea_main;
+  v8::Isolate* isolate = env->isolate;
+  v8::EscapableHandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  v8::Local<v8::String> code_str = ToV8String(env, code, "");
+  if (code_str->Utf8Length(isolate) > 4 * 1024 * 1024)
+    return napi_invalid_arg;
+  v8::Local<v8::String> filename_str = ToV8String(env, filename, "[eval]");
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (napi_value host_id = GetVmDynamicImportDefaultInternalSymbol(env)) {
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(host_id);
+    if (!raw.IsEmpty() && raw->IsSymbol()) host_id_symbol = raw.As<v8::Symbol>();
+  }
+
+  v8::Local<v8::Function> fn;
+  v8::Local<v8::Value> cjs_exception;
+  v8::Local<v8::Message> cjs_message;
+  bool cjs_ok = false;
+  {
+    v8::TryCatch try_catch(isolate);
+    cjs_ok = CompileCjsFunction(context, code_str, filename_str, true,
+                                host_id_symbol).ToLocal(&fn);
+    if (!cjs_ok && try_catch.HasCaught()) {
+      cjs_exception = try_catch.Exception();
+      cjs_message = try_catch.Message();
+    }
+  }
+  bool can_parse_as_esm = false;
+  if (!cjs_ok) {
+    if (!cjs_message.IsEmpty()) {
+      can_parse_as_esm = ShouldRetryAsEsm(isolate, context, env,
+                                         cjs_message->Get(), code_str, filename_str);
+    }
+    if (!can_parse_as_esm || !should_detect_module) {
+      if (!cjs_exception.IsEmpty()) {
+        unofficial_napi_internal::AttachSyntaxArrowMessage(
+            isolate, context, cjs_exception, cjs_message);
+        isolate->ThrowException(cjs_exception);
+      }
+      return cjs_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
+    }
+  }
+  v8::Local<v8::Object> out = v8::Object::New(isolate);
+  if (!SetNamed(context, out, "cachedDataRejected", v8::Boolean::New(isolate, false)) ||
+      !SetNamed(context, out, "canParseAsESM", v8::Boolean::New(isolate, can_parse_as_esm)))
+    return napi_generic_failure;
+  if (cjs_ok) {
+    if (!host_id_symbol.IsEmpty()) {
+      SetApiPrivate(context, fn.As<v8::Object>(),
+                    "node:host_defined_option_symbol", host_id_symbol.As<v8::Value>());
+    }
+    v8::ScriptOrigin origin = fn->GetScriptOrigin();
+    if (!SetNamed(context, out, "sourceMapURL", origin.SourceMapUrl()) ||
+        !SetNamed(context, out, "sourceURL", origin.ResourceName()) ||
+        !SetNamed(context, out, "function", fn))
+      return napi_generic_failure;
+  } else {
+    if (!SetNamed(context, out, "sourceMapURL", v8::Undefined(isolate)) ||
+        !SetNamed(context, out, "sourceURL", v8::Undefined(isolate)) ||
+        !SetNamed(context, out, "function", v8::Undefined(isolate)))
+      return napi_generic_failure;
+  }
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
@@ -3203,6 +3284,29 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
   ResetRef(env, &state->initialize_import_meta_ref);
   state->import_module_dynamically_ref = import_ref;
   state->initialize_import_meta_ref = import_meta_ref;
+  env->isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
+  env->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(ImportModuleDynamicallyWithPhase);
+  env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);
+  return napi_ok;
+}
+
+extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
+    napi_env env, napi_value callback, int32_t kind) {
+  if (env == nullptr || (kind != 0 && kind != 1)) return napi_invalid_arg;
+  napi_ref new_ref = nullptr;
+  if (callback != nullptr) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, callback, &type) != napi_ok || type != napi_function)
+      return napi_invalid_arg;
+    napi_status status = napi_create_reference(env, callback, 1, &new_ref);
+    if (status != napi_ok) return status;
+  }
+  EnsureModuleWrapCleanupHook(env);
+  auto* state = GetModuleWrapState(env);
+  napi_ref* target = kind == 0 ? &state->import_module_dynamically_ref
+                                : &state->initialize_import_meta_ref;
+  ResetRef(env, target);
+  *target = new_ref;
   env->isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
   env->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(ImportModuleDynamicallyWithPhase);
   env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);

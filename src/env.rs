@@ -407,6 +407,21 @@ impl NapiEnv {
         self.host_stopped.load(Ordering::Acquire)
     }
 
+    pub(crate) fn terminate_all(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        let envs = self
+            .env_registry
+            .lock()
+            .expect("poisoned N-API env registry");
+        for env in envs.iter().copied() {
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_terminate_execution(env as SnapiEnv);
+            }
+        }
+        drop(envs);
+        self.pending_messages.close_and_clear();
+    }
+
     /// Serialize guest cancellation with host termination. The host sets its
     /// sticky flag before taking this registry lock and terminates every live
     /// isolate while holding it. If a kill races this call, either cancellation

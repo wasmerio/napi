@@ -31,6 +31,13 @@
 // Private V8 provider accounting hook. It is never imported by WASIX guests.
 extern "C" size_t unofficial_napi_message_retained_bytes(
     unofficial_napi_message message);
+extern "C" napi_status unofficial_napi_contextify_compile_cjs_legacy(
+    napi_env env, napi_value code, napi_value filename, bool is_sea_main,
+    bool should_detect_module, napi_value *result_out);
+extern "C" size_t unofficial_napi_bytecode_size_legacy(
+    unofficial_napi_bytecode bytecode);
+extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
+    napi_env env, napi_value callback, int32_t kind);
 
 namespace {
 
@@ -187,6 +194,9 @@ struct SnapiEnvState {
   // Current guest invocation driving this env. This is only valid while the
   // driving host import remains on the stack.
   std::atomic<void *> active_callback_ctx{nullptr};
+  // Set by the provider's native fatal/OOM hooks. The Rust import boundary
+  // converts it into the context's sticky workload stop after V8 unwinds.
+  std::atomic<bool> fatal_requested{false};
   std::unordered_map<uint32_t, CallbackInvocation> callback_invocations;
   uint32_t next_callback_invocation_id = 1;
   std::unordered_map<uint32_t, CbRegistration> cb_registry;
@@ -4112,6 +4122,42 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
 }
 
+void LegacyFatalErrorCallback(napi_env env, const char*, const char*) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  for (const auto &entry : g_envs) {
+    if (entry.second->env == env) {
+      entry.second->fatal_requested.store(true, std::memory_order_release);
+      return;
+    }
+  }
+}
+
+void LegacyOomErrorCallback(napi_env env, const char*, bool, const char*) {
+  LegacyFatalErrorCallback(env, nullptr, nullptr);
+}
+
+extern "C" int
+snapi_bridge_unofficial_attach_legacy_env(SnapiEnvState *env_state) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr)
+    return napi_invalid_arg;
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.fatal_error_callback = LegacyFatalErrorCallback;
+  hooks.oom_error_callback = LegacyOomErrorCallback;
+  uint64_t accepted = 0;
+  return unofficial_napi_attach_env(state->env, &hooks, &accepted);
+}
+
+extern "C" int
+snapi_bridge_unofficial_take_fatal_requested(SnapiEnvState *env_state) {
+  auto state = LookupEnvState(env_state);
+  return state != nullptr &&
+         state->fatal_requested.exchange(false, std::memory_order_acq_rel);
+}
+
 extern "C" int
 snapi_bridge_unofficial_terminate_execution(SnapiEnvState *env_state) {
   // Termination must be able to run while the guest holds the environment
@@ -4784,6 +4830,113 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_contextify_compile_function_legacy(
+    SnapiEnvState *env_state, uint32_t code_id, uint32_t filename_id,
+    int32_t line_offset, int32_t column_offset, uint32_t cached_data_id,
+    int32_t produce_cached_data, uint32_t parsing_context_id,
+    uint32_t context_extensions_id, uint32_t params_id,
+    uint32_t host_defined_option_id, uint32_t *result_out) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr || result_out == nullptr || produce_cached_data != 0)
+    return napi_invalid_arg;
+  if (cached_data_id != 0) {
+    napi_value cached_data = LoadValue(*state, cached_data_id);
+    if (cached_data == nullptr)
+      return napi_invalid_arg;
+    napi_value undefined = nullptr;
+    napi_value null_value = nullptr;
+    bool is_undefined = false;
+    bool is_null = false;
+    if (napi_get_undefined(state->env, &undefined) != napi_ok ||
+        napi_get_null(state->env, &null_value) != napi_ok ||
+        napi_strict_equals(state->env, cached_data, undefined, &is_undefined) != napi_ok ||
+        napi_strict_equals(state->env, cached_data, null_value, &is_null) != napi_ok ||
+        (!is_undefined && !is_null))
+      return napi_invalid_arg;
+  }
+  // The released code-only path has the same result object shape as the
+  // provider's current source-text compilation. Cache production/consumption
+  // requires a retained-bytecode owner and is rejected until one exists.
+  return snapi_bridge_unofficial_contextify_compile_function(
+      env_state, code_id, 0, filename_id, line_offset, column_offset,
+      parsing_context_id, context_extensions_id, params_id,
+      host_defined_option_id, result_out);
+}
+
+extern "C" int snapi_bridge_unofficial_contextify_compile_cjs_legacy(
+    SnapiEnvState *env_state, uint32_t code_id, uint32_t filename_id,
+    int32_t is_sea_main, int32_t should_detect_module, uint32_t *result_out) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr || result_out == nullptr)
+    return napi_invalid_arg;
+  napi_value code = LoadValue(*state, code_id);
+  napi_value filename = LoadValue(*state, filename_id);
+  if (code == nullptr || filename == nullptr)
+    return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status status = unofficial_napi_contextify_compile_cjs_legacy(
+      state->env, code, filename, is_sea_main != 0,
+      should_detect_module != 0, &result);
+  if (status != napi_ok)
+    return status;
+  *result_out = StoreValue(*state, result);
+  return *result_out == 0 ? napi_generic_failure : napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_contextify_create_cached_data_legacy(
+    SnapiEnvState *env_state, uint32_t code_id, uint32_t filename_id,
+    int32_t line_offset, int32_t column_offset, uint32_t host_defined_option_id,
+    uint32_t *result_out) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr || result_out == nullptr)
+    return napi_invalid_arg;
+  napi_value code = LoadValue(*state, code_id);
+  napi_value filename = LoadValue(*state, filename_id);
+  napi_value host_id = host_defined_option_id == 0
+                           ? nullptr : LoadValue(*state, host_defined_option_id);
+  if (code == nullptr || filename == nullptr ||
+      (host_defined_option_id != 0 && host_id == nullptr))
+    return napi_invalid_arg;
+  size_t code_bytes = 0;
+  size_t filename_bytes = 0;
+  if (napi_get_value_string_utf8(state->env, code, nullptr, 0, &code_bytes) != napi_ok ||
+      napi_get_value_string_utf8(state->env, filename, nullptr, 0, &filename_bytes) != napi_ok ||
+      code_bytes > 4 * 1024 * 1024 || filename_bytes > 1024 * 1024)
+    return napi_invalid_arg;
+
+  unofficial_napi_bytecode_open_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  options.source_text = code;
+  options.filename = filename;
+  options.shape = unofficial_napi_bytecode_shape_script;
+  options.host_defined_option_id = host_id;
+  options.line_offset = line_offset;
+  options.column_offset = column_offset;
+  options.cache_policy = unofficial_napi_bytecode_cache_compile_on_reject;
+  unofficial_napi_bytecode_open_result opened{};
+  napi_status status = unofficial_napi_bytecode_open(state->env, &options, &opened);
+  if (status != napi_ok || opened.bytecode == nullptr) {
+    if (opened.bytecode != nullptr)
+      (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
+    return status == napi_ok ? napi_generic_failure : status;
+  }
+  if (unofficial_napi_bytecode_size_legacy(opened.bytecode) > 8 * 1024 * 1024) {
+    (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
+    return napi_invalid_arg;
+  }
+  napi_value buffer = nullptr;
+  status = unofficial_napi_bytecode_serialize(state->env, opened.bytecode, &buffer);
+  (void)unofficial_napi_bytecode_release(state->env, opened.bytecode);
+  if (status != napi_ok)
+    return status;
+  *result_out = StoreValue(*state, buffer);
+  return *result_out == 0 ? napi_generic_failure : napi_ok;
+}
+
 extern "C" int snapi_bridge_unofficial_bytecode_open(
     SnapiEnvState *env_state, uint32_t source_text_id, uint32_t filename_id,
     int32_t shape, uint32_t params_id, uint32_t host_defined_option_id,
@@ -5271,6 +5424,18 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_hooks(
       import_meta_callback,
   };
   return unofficial_napi_module_wrap_set_hooks(env, &hooks);
+}
+
+extern "C" int snapi_bridge_unofficial_module_wrap_set_legacy_hook(
+    SnapiEnvState *env_state, uint32_t callback_id, int32_t kind) {
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr)
+    return napi_invalid_arg;
+  napi_value callback = callback_id == 0 ? nullptr : LoadValue(*state, callback_id);
+  if (callback_id != 0 && callback == nullptr)
+    return napi_invalid_arg;
+  return unofficial_napi_module_wrap_set_legacy_hook(state->env, callback, kind);
 }
 
 extern "C" int
