@@ -2033,7 +2033,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
-  if (context.IsEmpty() || !RemoveUnmeteredWebAssembly(context)) {
+  if (context.IsEmpty() ||
+      (guest_heap != nullptr && !RemoveUnmeteredWebAssembly(context))) {
     delete scope;
     DisposeIsolateAndWait(platform, isolate);
     {
@@ -2043,6 +2044,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return napi_generic_failure;
   }
+  SetWasmCodeGenerationAllowed(context, guest_heap == nullptr);
+  isolate->SetAllowWasmCodeGenerationCallback(AllowWasmCodeGeneration);
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
@@ -2056,6 +2059,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
+  scope->env->restrict_unmetered_webassembly = guest_heap != nullptr;
 
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);

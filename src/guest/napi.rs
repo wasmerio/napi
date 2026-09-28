@@ -71,6 +71,9 @@ macro_rules! reserve_property_array {
 }
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+    if !ensure_guest_heap(&mut env) {
+        return 0;
+    }
     let Ok(_lane_scope) = env.data().enter_background_lane() else {
         return 0;
     };
@@ -115,6 +118,36 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
+}
+
+// A Wasm start section can call N-API before configure_instance runs. An
+// imported env.memory is already available then, so install its guest heap on
+// first use. If no usable memory exists, fail before spawning V8: a null heap
+// would make this guest look like an unrestricted native embedder.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+fn ensure_guest_heap(env: &mut FunctionEnvMut<NapiEnv>) -> bool {
+    if env.data().host_stopped() {
+        return false;
+    }
+    if env.data().guest_heap.is_some() {
+        return true;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return false;
+    };
+    let budget = std::sync::Arc::clone(&env.data().budget);
+    let Some(heap) =
+        crate::guest_heap::GuestHeap::get_or_create(&mut env.as_store_mut(), &memory, budget)
+    else {
+        return false;
+    };
+    env.data_mut().guest_heap = Some(heap);
+    true
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn ensure_guest_heap(_env: &mut FunctionEnvMut<NapiEnv>) -> bool {
+    true
 }
 
 /// Boxed guest-heap context for env creation, or null when no heap exists.
@@ -267,6 +300,9 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    if !ensure_guest_heap(&mut env) {
+        return 1;
+    }
     let Ok(_lane_scope) = env.data().enter_background_lane() else {
         return 1;
     };

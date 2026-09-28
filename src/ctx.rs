@@ -607,10 +607,16 @@ impl NapiSession {
                 .clone()
                 .context("N-API imports require the guest to have linear memory")?;
             let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget)
-                .context(
+            // A start section may already have installed the guest heap from
+            // imported env.memory. Keep that exact heap: creating a second
+            // allocator for non-shared memory could reuse live offsets.
+            let heap = if let Some(heap) = func_env.as_ref(&*store).guest_heap.clone() {
+                heap
+            } else {
+                crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget).context(
                     "failed to initialize the guest-heap allocator over the guest's linear memory",
-                )?;
+                )?
+            };
             func_env.as_mut(&mut *store).guest_heap = Some(heap);
         }
 
@@ -807,6 +813,132 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("lane stops");
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn start_section_initialization_requires_a_guest_heap() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+
+        // A module-defined memory cannot be reached by imports until after
+        // instantiation, so its start section must fail before V8 starts.
+        let unavailable = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (memory 1 512)
+            (global $result (mut i32) (i32.const -1))
+            (func $start call $init global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+        )"#,
+        );
+        let (imports, _state) = hooks
+            .additional_imports(&unavailable, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &unavailable, &imports).unwrap();
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .unwrap();
+        assert_eq!(result.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!hooks.is_initialized());
+
+        let unavailable_extension = compile_wat(
+            &store,
+            r#"(module
+            (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
+              (func $create (param i32 i32 i32 i32) (result i32)))
+            (memory 1 512)
+            (global $result (mut i32) (i32.const -1))
+            (func $start
+              i32.const 8 i32.const 0 i32.const 4 i32.const 8
+              call $create global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+        )"#,
+        );
+        let (imports, _state) = hooks
+            .additional_imports(&unavailable_extension, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &unavailable_extension, &imports).unwrap();
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .unwrap();
+        assert_ne!(result.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!hooks.is_initialized());
+
+        // Imported memory is available during start. The first call installs
+        // the guest heap before V8, and setup retains that same allocator.
+        let available = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (global $result (mut i32) (i32.const -1))
+            (func $start call $init global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+            (func (export "invoke") (result i32) call $init)
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&available, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session.as_ref().unwrap().clone();
+        let instance = Instance::new(&mut store, &available, &imports).unwrap();
+        let heap_before = session
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .guest_heap
+            .clone()
+            .expect("start section installs guest heap");
+        hooks
+            .configure_instance(
+                &available,
+                &mut store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
+        let heap_after = session
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .guest_heap
+            .clone()
+            .unwrap();
+        assert!(Arc::ptr_eq(&heap_before, &heap_after));
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "start_result")
+            .unwrap();
+        let start_id = result.call(&mut store).unwrap();
+        assert!(start_id > 0);
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&mut store, "invoke")
+            .unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), start_id);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        hooks.runtime_control().shutdown_background_lane();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]

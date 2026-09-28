@@ -133,6 +133,65 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
 
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, NativeEnvironmentsRetainWebAssemblyInAllContexts) {
+  EnvScope s(runtime_.get());
+  constexpr char kCompileEmptyModule[] =
+      "new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))";
+  napi_value source = Str(s.env, "typeof WebAssembly");
+  ASSERT_NE(source, nullptr);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &result), napi_ok);
+  char type[16] = {};
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "object");
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, kCompileEmptyModule), &result), napi_ok);
+  napi_valuetype value_type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, result, &value_type), napi_ok);
+  EXPECT_EQ(value_type, napi_object);
+
+  napi_value sandbox = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value context = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_make_context(
+                s.env, sandbox, undefined, undefined, true, true, true,
+                undefined, &context), napi_ok);
+  const unofficial_napi_js_source context_source =
+      unofficial_napi_js_source_from_text(source);
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &context_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "object");
+  const unofficial_napi_js_source compile_source =
+      unofficial_napi_js_source_from_text(Str(s.env, kCompileEmptyModule));
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &compile_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_typeof(s.env, result, &value_type), napi_ok);
+  EXPECT_EQ(value_type, napi_object);
+
+  napi_value disabled_sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &disabled_sandbox), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_make_context(
+                s.env, disabled_sandbox, undefined, undefined, true, false,
+                true, undefined, &context), napi_ok);
+  const unofficial_napi_js_source denied_source =
+      unofficial_napi_js_source_from_text(Str(
+          s.env,
+          "try { new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])); "
+          "'allowed' } catch (error) { error.name }"));
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &denied_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "CompileError");
+}
+#endif
+
 TEST_F(Test65UnofficialContextify, ValidateScriptDoesNotExecuteOrRetainBytecode) {
   EnvScope s(runtime_.get());
   napi_value result = nullptr;

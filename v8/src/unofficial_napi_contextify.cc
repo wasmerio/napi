@@ -1793,7 +1793,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   if (env == nullptr || sandbox_or_symbol == nullptr || name == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
-  (void)allow_code_gen_wasm;
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
@@ -1865,6 +1864,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
 
   context->SetSecurityToken(current->GetSecurityToken());
   context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
+  SetWasmCodeGenerationAllowed(
+      context, !env->restrict_unmetered_webassembly && allow_code_gen_wasm);
   NapiV8ApplyPromiseHooksToContext(env, context);
 
   v8::Local<v8::Object> key_object;
@@ -1878,7 +1879,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
     }
   }
 
-  if (!RemoveUnmeteredWebAssembly(context)) {
+  if (env->restrict_unmetered_webassembly &&
+      !RemoveUnmeteredWebAssembly(context)) {
     return napi_pending_exception;
   }
 
