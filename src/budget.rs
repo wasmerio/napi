@@ -844,6 +844,17 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
+        // The pinned public Wasmer used by the standalone CLI still detaches
+        // shared memories through this raw VMSharedMemory API. Its WASIX
+        // pthreads need that detach path for libuv's async workers. A raw
+        // handle drops our charge wrapper, so only permit it when accounting
+        // is explicitly unlimited. Managed Edge uses a newer Wasmer API that
+        // preserves the wrapper and never takes this compatibility path.
+        #[cfg(napi_standalone_legacy_wait)]
+        if self.charge.budget.accountant.is_none() && self.charge.budget.mem_total == UNLIMITED {
+            return self.inner.as_shared();
+        }
+
         Err(MemoryError::UnsupportedOperation {
             message: "budgeted memory requires wrapper-preserving shared detachment".into(),
         })
@@ -1014,6 +1025,8 @@ pub fn budgeted_tunables(budget: Arc<ResourceBudget>) -> BudgetedTunables<BaseTu
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(napi_standalone_legacy_wait)]
+    use wasmer::MemoryLocation;
     use wasmer::sys::{Cranelift, EngineBuilder};
     use wasmer::{Imports, Instance, Memory, MemoryType, Module, Pages, Store, WASM_PAGE_SIZE};
 
@@ -1226,6 +1239,10 @@ mod tests {
         assert_eq!(budget.snapshot().wasm_linear, 0);
     }
 
+    // Public standalone Wasmer detaches copies through a raw shared-memory
+    // handle. Finite-budget copies fail closed there; this quota-preserving
+    // copy test applies to the newer wrapper-preserving managed Wasmer API.
+    #[cfg(not(napi_standalone_legacy_wait))]
     #[test]
     fn reset_keeps_backing_charged_and_copy_reserves_it() {
         let budget = ResourceBudget::with_memory_limit(2 * PAGE);
@@ -1262,6 +1279,36 @@ mod tests {
         assert_eq!(budget.snapshot().wasm_linear, PAGE);
         drop(wrapped);
         assert_eq!(budget.snapshot().wasm_linear, 0);
+
+        #[cfg(napi_standalone_legacy_wait)]
+        {
+            let mut store = budgeted_store(Arc::clone(&budget));
+            let memory = Memory::new(&mut store, ty).unwrap();
+            assert!(
+                memory.as_shared(&store).is_none(),
+                "legacy Wasmer must reject raw detachment under a finite quota"
+            );
+        }
+    }
+
+    #[cfg(napi_standalone_legacy_wait)]
+    #[test]
+    fn standalone_unlimited_budget_keeps_wasix_shared_memory_detachable() {
+        let budget = ResourceBudget::unlimited();
+        let mut store = budgeted_store(Arc::clone(&budget));
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+        let shared = memory
+            .as_shared(&store)
+            .expect("legacy Wasmer must be able to detach WASIX pthread memory");
+        assert_eq!(
+            shared
+                .wait(MemoryLocation::new_32(0), Some(Duration::ZERO))
+                .unwrap(),
+            2,
+        );
+        let mut worker_store = Store::new(store.engine().clone());
+        let attached = shared.attach(&mut worker_store);
+        assert_eq!(attached.size(&worker_store), Pages(1));
     }
 
     #[cfg(not(napi_standalone_legacy_wait))]
@@ -1576,5 +1623,23 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8HeapReserved, 60);
         assert_eq!(accountant.memory_charged(), 40);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+
+    #[cfg(all(napi_standalone_legacy_wait, not(target_arch = "wasm32")))]
+    #[test]
+    fn external_accountant_cannot_use_legacy_raw_detachment() {
+        let accountant = TestAccountant::new(UNLIMITED);
+        let external: Arc<dyn NapiMemoryAccountant> = accountant.clone();
+        let budget = ResourceBudget::with_accountant(external);
+        let ty = MemoryType::new(1, Some(1), true);
+        let base = BaseTunables::new();
+        let inner = base
+            .create_host_memory(&ty, &base.memory_style(&ty))
+            .unwrap();
+        let wrapped = BudgetedMemory::new(inner, budget).unwrap();
+
+        assert!(LinearMemory::as_shared(&wrapped).is_err());
+        drop(wrapped);
+        assert_eq!(accountant.memory_charged(), 0);
     }
 }
