@@ -3,7 +3,7 @@
 use std::{
     ffi::c_void,
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
@@ -38,6 +38,7 @@ struct BackgroundLane {
     handle: NonNull<c_void>,
     _scope: Box<BackgroundTaskScope>,
     budget: Arc<ResourceBudget>,
+    charged: AtomicBool,
 }
 
 // The C++ lane synchronizes all queue access. Its handle remains allocated
@@ -60,7 +61,7 @@ impl BackgroundLane {
             budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
             bail!("failed to allocate V8 background lane");
         };
-        Ok(Self { handle, _scope: scope, budget })
+        Ok(Self { handle, _scope: scope, budget, charged: AtomicBool::new(true) })
     }
 
     fn stop(&self) {
@@ -69,6 +70,12 @@ impl BackgroundLane {
 
     fn run(&self) {
         unsafe { snapi_v8_lane_run(self.handle.as_ptr()) }
+    }
+
+    fn release_reservation(&self) {
+        if self.charged.swap(false, Ordering::AcqRel) {
+            self.budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
+        }
     }
 
     fn overloaded(&self) -> bool {
@@ -87,7 +94,7 @@ impl Drop for BackgroundLane {
             snapi_v8_lane_stop(self.handle.as_ptr());
             snapi_v8_lane_delete(self.handle.as_ptr());
         }
-        self.budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
+        self.release_reservation();
     }
 }
 
@@ -194,6 +201,7 @@ impl LazyBackgroundLane {
                 if worker_lane.overloaded() {
                     on_overload();
                 }
+                worker_lane.release_reservation();
             }))?;
             if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
                 lane.stop();
