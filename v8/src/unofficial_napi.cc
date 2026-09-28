@@ -1926,6 +1926,13 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     return status != napi_ok ? status : napi_generic_failure;
   }
 
+  // Linux gives newly created threads the PKRU state of their creator. A
+  // worker thread that predates V8's process-wide JIT protection key may
+  // still have access disabled for that key. V8's dispatch table is then
+  // unreadable even though its page mapping is readable. Restore V8's
+  // documented default (read-only) permissions on this execution thread.
+  v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);

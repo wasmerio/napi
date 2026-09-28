@@ -127,6 +127,9 @@ struct SnapiEnvState {
   // independently of every other environment. Reentrant guest callbacks may
   // enter the same environment on the same OS thread.
   std::recursive_mutex mutex;
+  // Owned by the Rust NapiCtx while this env is live. EnvLease reinstalls its
+  // provenance on each bridge entry, including reentrant guest callbacks.
+  void* background_lane = nullptr;
   std::mutex control_mutex;
   std::condition_variable control_cv;
   size_t active_control_calls = 0;
@@ -228,7 +231,23 @@ struct EnvLease {
       : state(std::move(value)),
         lock(state != nullptr
                  ? std::unique_lock<std::recursive_mutex>(state->mutex)
-                 : std::unique_lock<std::recursive_mutex>()) {}
+                 : std::unique_lock<std::recursive_mutex>()) {
+    if (state != nullptr) {
+      // WASIX workers may predate V8's Linux protection key allocation.
+      // Re-enable only V8's default read-only access on this thread before
+      // touching any isolate-owned memory.
+      v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+      previous_lane = snapi_v8_lane_swap_current(state->background_lane);
+      lane_bound = true;
+    }
+  }
+
+  ~EnvLease() {
+    if (lane_bound) snapi_v8_lane_swap_current(previous_lane);
+  }
+
+  EnvLease(const EnvLease&) = delete;
+  EnvLease& operator=(const EnvLease&) = delete;
 
   SnapiEnvState *get() const {
     return state != nullptr && state->env != nullptr ? state.get() : nullptr;
@@ -236,6 +255,8 @@ struct EnvLease {
 
   std::shared_ptr<SnapiEnvState> state;
   std::unique_lock<std::recursive_mutex> lock;
+  void* previous_lane = nullptr;
+  bool lane_bound = false;
 };
 
 uint32_t RegisterCallbackInvocation(SnapiEnvState *state,
@@ -3611,6 +3632,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   }
   state->env = env;
   state->owner = owner;
+  state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.emplace(state.get(), state);
@@ -3672,6 +3694,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   }
   state->env = env;
   state->owner = owner;
+  state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.emplace(state.get(), state);
