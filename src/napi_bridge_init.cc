@@ -3582,8 +3582,11 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState *env_state,
 }
 
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
-                                                  const void *guest_heap_ctx,
-                                                  SnapiEnvState **env_out) {
+                                                   const void *guest_heap_ctx,
+                                                   SnapiEnvState **env_out) {
+  // V8's isolate initialization touches process-wide state. Serialize only
+  // construction, never execution or GC of an existing environment.
+  std::lock_guard<std::recursive_mutex> init_lock(g_mu);
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   napi_status s;
@@ -3635,6 +3638,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t max_old_generation_size_in_bytes,
     uint32_t code_range_size_in_bytes, uint32_t /*stack_limit*/,
     const void *guest_heap_ctx, SnapiEnvState **env_out) {
+  std::lock_guard<std::recursive_mutex> init_lock(g_mu);
   unofficial_napi_env_create_options options{};
   const bool has_options = max_young_generation_size_in_bytes > 0 ||
                            max_old_generation_size_in_bytes > 0 ||
