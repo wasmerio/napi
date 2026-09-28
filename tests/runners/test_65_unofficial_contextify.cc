@@ -531,6 +531,9 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   ASSERT_EQ(napi_typeof(s.env, error, &error_type), napi_ok);
   EXPECT_EQ(error_type, napi_undefined);
 
+  // Reject before allocating or copying the caller's oversized link list.
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, module, 4097, nullptr),
+            napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
   ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
   status = -1;

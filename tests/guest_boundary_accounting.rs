@@ -502,3 +502,36 @@ fn module_code_cache_imports_fail_before_native_allocation() {
         assert_eq!(budget.snapshot().serialized_message, 0);
     }
 }
+
+#[test]
+fn module_link_rejects_oversized_counts_before_guest_copy() {
+    let wat = r#"(module
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_link" (func $link
+        (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run") (param $count i32) (result i32)
+        (call $link (i32.const 1) (i32.const 1) (local.get $count) (i32.const 2147483647))))"#;
+
+    let ctx = NapiCtx::builder().total_memory_bytes(8 * MIB).build();
+    let budget = ctx.budget();
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let session = ctx.new_session(&module).unwrap();
+    let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "run")
+        .unwrap();
+    for count in [-1, 4097, i32::MAX] {
+        assert_eq!(run.call(&mut store, count).unwrap(), 1);
+        assert_eq!(budget.snapshot().host_transient, 0);
+    }
+    // An in-range count reaches input validation, then releases its scratch
+    // reservation when the guest pointer is invalid.
+    assert_eq!(run.call(&mut store, 4096).unwrap(), 1);
+    assert_eq!(budget.snapshot().host_transient, 0);
+}

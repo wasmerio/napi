@@ -155,6 +155,11 @@ struct SnapiEnvState {
   size_t active_control_calls = 0;
   bool disposing = false;
   napi_env env = nullptr;
+  // Published before registry insertion and never mutated. Fatal/OOM hooks
+  // compare this identity while holding g_mu; env itself is cleared under the
+  // per-env mutex during teardown and cannot be read from that callback.
+  napi_env native_env_identity = nullptr;
+  std::atomic<bool> legacy_fatal_hook_live{false};
   unofficial_napi_env_owner owner = nullptr;
 
   // Value slot table: maps generation-tagged u32 IDs to scope-bound raw
@@ -640,6 +645,7 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->cb_registry.clear();
   state->next_cb_reg_id = 1;
   state->callback_bindings.clear();
+  state->legacy_fatal_hook_live.store(false, std::memory_order_release);
   napi_status release_status = napi_ok;
   if (state->owner != nullptr) {
     release_status = unofficial_napi_release_env(state->owner, nullptr);
@@ -3319,6 +3325,9 @@ extern "C" int snapi_bridge_new_instance(SnapiEnvState *env_state,
 // napi_define_properties
 // ============================================================
 
+static_assert(sizeof(napi_property_descriptor) <= 128,
+              "update the guest native-descriptor reservation");
+
 // Forward declaration (defined below in callback system section)
 static napi_value generic_wasm_callback(napi_env env, napi_callback_info info);
 
@@ -3336,39 +3345,49 @@ extern "C" int snapi_bridge_define_properties(
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  std::vector<napi_property_descriptor> descs(prop_count);
-  for (uint32_t i = 0; i < prop_count; i++) {
-    memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = utf8names != nullptr ? utf8names[i] : nullptr;
-    descs[i].name = (name_ids != nullptr && name_ids[i] != 0)
-                        ? LoadValue(*bridge_state, name_ids[i])
-                        : nullptr;
-    descs[i].attributes = (napi_property_attributes)attributes[i];
+  if (prop_count > 4096 ||
+      (prop_count != 0 &&
+       (prop_types == nullptr || value_ids == nullptr ||
+        method_reg_ids == nullptr || getter_reg_ids == nullptr ||
+        setter_reg_ids == nullptr || attributes == nullptr)))
+    return napi_invalid_arg;
+  try {
+    std::vector<napi_property_descriptor> descs(prop_count);
+    for (uint32_t i = 0; i < prop_count; i++) {
+      memset(&descs[i], 0, sizeof(napi_property_descriptor));
+      descs[i].utf8name = utf8names != nullptr ? utf8names[i] : nullptr;
+      descs[i].name = (name_ids != nullptr && name_ids[i] != 0)
+                          ? LoadValue(*bridge_state, name_ids[i])
+                          : nullptr;
+      descs[i].attributes = (napi_property_attributes)attributes[i];
 
-    switch (prop_types[i]) {
-    case 0:
-      descs[i].value = LoadValue(*bridge_state, value_ids[i]);
-      break;
-    case 1:
-      descs[i].method = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
-      break;
-    case 2:
-      descs[i].getter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
-      break;
-    case 3:
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
-      break;
-    case 4:
-      descs[i].getter = generic_wasm_callback;
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
-      break;
+      switch (prop_types[i]) {
+      case 0:
+        descs[i].value = LoadValue(*bridge_state, value_ids[i]);
+        break;
+      case 1:
+        descs[i].method = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
+        break;
+      case 2:
+        descs[i].getter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
+        break;
+      case 3:
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
+        break;
+      case 4:
+        descs[i].getter = generic_wasm_callback;
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
+        break;
+      }
     }
+    return napi_define_properties(env, obj, prop_count, descs.data());
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
-  return napi_define_properties(env, obj, prop_count, descs.data());
 }
 
 // ============================================================
@@ -3397,57 +3416,67 @@ extern "C" int snapi_bridge_define_class(
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  if (prop_count > 4096 ||
+      (prop_count != 0 &&
+       (prop_types == nullptr || prop_value_ids == nullptr ||
+        prop_method_reg_ids == nullptr || prop_getter_reg_ids == nullptr ||
+        prop_setter_reg_ids == nullptr || prop_attributes == nullptr)))
+    return napi_invalid_arg;
 
   // Build property descriptors
-  std::vector<napi_property_descriptor> descs(prop_count);
-  for (uint32_t i = 0; i < prop_count; i++) {
-    memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = prop_names != nullptr ? prop_names[i] : nullptr;
-    descs[i].name = (prop_name_ids != nullptr && prop_name_ids[i] != 0)
-                        ? LoadValue(*bridge_state, prop_name_ids[i])
-                        : nullptr;
-    descs[i].attributes = (napi_property_attributes)prop_attributes[i];
+  try {
+    std::vector<napi_property_descriptor> descs(prop_count);
+    for (uint32_t i = 0; i < prop_count; i++) {
+      memset(&descs[i], 0, sizeof(napi_property_descriptor));
+      descs[i].utf8name = prop_names != nullptr ? prop_names[i] : nullptr;
+      descs[i].name = (prop_name_ids != nullptr && prop_name_ids[i] != 0)
+                          ? LoadValue(*bridge_state, prop_name_ids[i])
+                          : nullptr;
+      descs[i].attributes = (napi_property_attributes)prop_attributes[i];
 
-    switch (prop_types[i]) {
-    case 0: // value
-      descs[i].value = LoadValue(*bridge_state, prop_value_ids[i]);
-      break;
-    case 1: // method
-      descs[i].method = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
-      break;
-    case 2: // getter only
-      descs[i].getter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
-      break;
-    case 3: // setter only
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
-      break;
-    case 4: // getter + setter
-      descs[i].getter = generic_wasm_callback;
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
-      // Note: N-API uses the same data pointer for both getter and setter.
-      // The setter_reg_id is stored in the getter_reg_id for now.
-      break;
+      switch (prop_types[i]) {
+      case 0: // value
+        descs[i].value = LoadValue(*bridge_state, prop_value_ids[i]);
+        break;
+      case 1: // method
+        descs[i].method = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
+        break;
+      case 2: // getter only
+        descs[i].getter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
+        break;
+      case 3: // setter only
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
+        break;
+      case 4: // getter + setter
+        descs[i].getter = generic_wasm_callback;
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
+        // Note: N-API uses the same data pointer for both getter and setter.
+        // The setter_reg_id is stored in the getter_reg_id for now.
+        break;
+      }
     }
-  }
 
-  napi_value result;
-  napi_status s = napi_define_class(
-      env, utf8name,
-      name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
-      generic_wasm_callback, RegisterCallbackBinding(bridge_state, ctor_reg_id),
-      prop_count, descs.data(), &result);
-  if (s != napi_ok)
-    return s;
-  *out_id = StoreValue(*bridge_state, result);
-  return napi_ok;
+    napi_value result;
+    napi_status s = napi_define_class(
+        env, utf8name,
+        name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
+        generic_wasm_callback, RegisterCallbackBinding(bridge_state, ctor_reg_id),
+        prop_count, descs.data(), &result);
+    if (s != napi_ok)
+      return s;
+    *out_id = StoreValue(*bridge_state, result);
+    return napi_ok;
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
+  }
 }
 
 // ============================================================
@@ -3770,6 +3799,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
     return napi_generic_failure;
   }
   state->env = env;
+  state->native_env_identity = env;
   state->owner = owner;
   state->background_lane = snapi_v8_lane_current();
   {
@@ -3832,6 +3862,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     return napi_generic_failure;
   }
   state->env = env;
+  state->native_env_identity = env;
   state->owner = owner;
   state->background_lane = snapi_v8_lane_current();
   {
@@ -4169,7 +4200,8 @@ extern "C" int snapi_bridge_unofficial_attach_env(
 void LegacyFatalErrorCallback(napi_env env, const char*, const char*) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   for (const auto &entry : g_envs) {
-    if (entry.second->env == env) {
+    if (entry.second->native_env_identity == env &&
+        entry.second->legacy_fatal_hook_live.load(std::memory_order_acquire)) {
       entry.second->fatal_requested.store(true, std::memory_order_release);
       return;
     }
@@ -4192,7 +4224,22 @@ snapi_bridge_unofficial_attach_legacy_env(SnapiEnvState *env_state) {
   hooks.fatal_error_callback = LegacyFatalErrorCallback;
   hooks.oom_error_callback = LegacyOomErrorCallback;
   uint64_t accepted = 0;
-  return unofficial_napi_attach_env(state->env, &hooks, &accepted);
+  const napi_status status = unofficial_napi_attach_env(state->env, &hooks, &accepted);
+  if (status == napi_ok)
+    state->legacy_fatal_hook_live.store(true, std::memory_order_release);
+  return status;
+}
+
+// Drives the production lookup path concurrently with teardown in a Rust
+// regression test. The identity is an opaque comparison token, never a
+// dereferenced pointer.
+extern "C" uintptr_t snapi_bridge_test_native_env_identity(SnapiEnvState *env_state) {
+  auto state = LookupEnvState(env_state);
+  return state == nullptr ? 0 : reinterpret_cast<uintptr_t>(state->native_env_identity);
+}
+
+extern "C" void snapi_bridge_test_signal_legacy_fatal(uintptr_t identity) {
+  LegacyFatalErrorCallback(reinterpret_cast<napi_env>(identity), nullptr, nullptr);
 }
 
 extern "C" int
@@ -5367,6 +5414,10 @@ extern "C" int
 snapi_bridge_unofficial_module_wrap_link(SnapiEnvState *env_state,
                                          uint32_t handle_id, uint32_t count,
                                          const uint32_t *linked_handle_ids) {
+  // Bound this before allocating the bridge vector even for callers that
+  // bypass the Rust import layer.
+  if (count > 4096 || (count != 0 && linked_handle_ids == nullptr))
+    return napi_invalid_arg;
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr)
@@ -5376,18 +5427,20 @@ snapi_bridge_unofficial_module_wrap_link(SnapiEnvState *env_state,
       LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr)
     return napi_invalid_arg;
-  std::vector<unofficial_napi_module> linked_modules(count, nullptr);
-  for (uint32_t i = 0; i < count; ++i) {
-    unofficial_napi_module linked =
-        linked_handle_ids != nullptr
-            ? LoadModuleWrapHandle(*bridge_state, linked_handle_ids[i])
-            : nullptr;
-    if (linked == nullptr)
-      return napi_invalid_arg;
-    linked_modules[i] = linked;
+  try {
+    std::vector<unofficial_napi_module> linked_modules(count, nullptr);
+    for (uint32_t i = 0; i < count; ++i) {
+      unofficial_napi_module linked =
+          LoadModuleWrapHandle(*bridge_state, linked_handle_ids[i]);
+      if (linked == nullptr)
+        return napi_invalid_arg;
+      linked_modules[i] = linked;
+    }
+    return unofficial_napi_module_wrap_link(
+        env, module, count, count == 0 ? nullptr : linked_modules.data());
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
-  return unofficial_napi_module_wrap_link(
-      env, module, count, count == 0 ? nullptr : linked_modules.data());
 }
 
 extern "C" int

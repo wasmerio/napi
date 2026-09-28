@@ -3022,29 +3022,36 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     const unofficial_napi_module* linked_modules) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (count > kMaxModuleRequests) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
   }
 
-  record->linked_requests.assign(count, nullptr);
-  for (size_t i = 0; i < count; ++i) {
-    ModuleWrapRecord* linked =
-        linked_modules != nullptr ? ModuleRecord(linked_modules[i]) : nullptr;
-    if (linked == nullptr) {
-      ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
-      return napi_pending_exception;
+  try {
+    std::vector<ModuleWrapRecord*> linked_requests(count, nullptr);
+    for (size_t i = 0; i < count; ++i) {
+      ModuleWrapRecord* linked =
+          linked_modules != nullptr ? ModuleRecord(linked_modules[i]) : nullptr;
+      if (linked == nullptr) {
+        ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
+        return napi_pending_exception;
+      }
+      linked_requests[i] = linked;
+      const std::string key = SerializeModuleRequestKey(
+          record->module_requests[i].specifier, record->module_requests[i].attributes);
+      auto it = record->resolve_cache.find(key);
+      if (it != record->resolve_cache.end() && it->second < i &&
+          linked_requests[it->second] != linked) {
+        ThrowCodeError(env,
+                       "ERR_MODULE_LINK_MISMATCH",
+                       "Module request '" + record->module_requests[i].specifier + "' must be linked to the same module");
+        return napi_pending_exception;
+      }
     }
-    record->linked_requests[i] = linked;
-    const std::string key =
-        SerializeModuleRequestKey(record->module_requests[i].specifier, record->module_requests[i].attributes);
-    auto it = record->resolve_cache.find(key);
-    if (it != record->resolve_cache.end() && it->second < i && record->linked_requests[it->second] != linked) {
-      ThrowCodeError(env,
-                     "ERR_MODULE_LINK_MISMATCH",
-                     "Module request '" + record->module_requests[i].specifier + "' must be linked to the same module");
-      return napi_pending_exception;
-    }
+    record->linked_requests.swap(linked_requests);
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
   return napi_ok;
 }
