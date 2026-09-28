@@ -8,7 +8,10 @@
 
 // --- Init ---
 
-use std::ffi::{CString, c_char};
+use std::{
+    ffi::{CString, c_char},
+    sync::Arc,
+};
 
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 use wasmer_wasix::WasiError;
@@ -16,7 +19,7 @@ use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
-    budget::Pool,
+    budget::{Pool, ResourceBudget},
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         MAX_NAPI_PROPERTY_DESCRIPTORS,
@@ -29,6 +32,34 @@ use crate::{
 use super::{abi, util::*};
 
 mod legacy;
+
+// The provider caps source text at 4 MiB, parameters at 1 MiB total, and
+// filenames at 1 MiB. Each UTF-8 conversion can hold a temporary buffer and
+// an owned string at once: 8 + 2 + 2 MiB. The remaining 4 MiB covers vector
+// capacity, allocator slack, and a bytecode-source copy. Nested callbacks
+// retain each invocation's reservation until its bridge call has unwound.
+const COMPILE_SCRATCH_RESERVATION: u64 = 16 * 1024 * 1024;
+// SnapshotOwnProperties caps the sandbox at 16,384 own keys. The native
+// vector and its persistent V8 handles remain live across getter callbacks.
+const CONTEXT_SNAPSHOT_RESERVATION: u64 = 2 * 1024 * 1024;
+
+struct HostTransientReservation {
+    budget: Arc<ResourceBudget>,
+    bytes: u64,
+}
+
+impl HostTransientReservation {
+    fn reserve(budget: Arc<ResourceBudget>, bytes: u64) -> Option<Self> {
+        budget.try_charge(Pool::HostTransient, bytes).ok()?;
+        Some(Self { budget, bytes })
+    }
+}
+
+impl Drop for HostTransientReservation {
+    fn drop(&mut self) {
+        self.budget.uncharge(Pool::HostTransient, self.bytes);
+    }
+}
 
 pub(crate) fn frozen_napi_type_matches(name: &str, actual: &wasmer::FunctionType) -> Option<bool> {
     legacy::frozen_type_matches(name, actual)
@@ -843,13 +874,19 @@ fn guest_unofficial_napi_message_create(
         }
         return Ok(status);
     }
-    if !charge.shrink(retained_bytes) || pending.insert(message, charge).is_err() {
+    if !charge.shrink(retained_bytes) {
         unsafe { snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }
-    if !write_guest_u32(&mut env, payload_out_ptr as u32, message) {
-        drop(pending.take(message));
+    if let Err(rejected_charge) = pending.insert(message, charge) {
         unsafe { snapi_bridge_unofficial_message_drop(message) };
+        drop(rejected_charge);
+        return Ok(1);
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr as u32, message) {
+        let charge = pending.take(message);
+        unsafe { snapi_bridge_unofficial_message_drop(message) };
+        drop(charge);
         return Ok(1);
     }
     Ok(0)
@@ -860,25 +897,26 @@ fn guest_unofficial_napi_message_take(
     napi_env: i32,
     payload: i32,
     result_out_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     if payload <= 0 {
-        return 1;
+        return Ok(1);
     }
     let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
-        return 1;
+        return Ok(1);
     };
-    if result_out_ptr <= 0 {
+    if result_out_ptr <= 0 || read_guest_bytes(&mut env, result_out_ptr, 4).is_none() {
         unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut value = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_message_take(env_handle, payload as u32, &mut value) };
-    if status == 0 {
-        write_guest_u32(&mut env, result_out_ptr as u32, value);
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_message_take(env_handle, payload as u32, &mut value)
+    })?;
+    if status == 0 && !write_guest_u32(&mut env, result_out_ptr as u32, value) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: i32) {
@@ -916,24 +954,25 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     value: i32,
     filter_bits: i32,
     result_out_ptr: i32,
-) -> i32 {
-    if value <= 0 || result_out_ptr <= 0 {
-        return 1;
+) -> Result<i32, WasiError> {
+    if value <= 0 || result_out_ptr <= 0 || read_guest_bytes(&mut env, result_out_ptr, 4).is_none()
+    {
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value as u32,
             filter_bits.max(0) as u32,
             &mut out,
         )
-    };
-    if status == 0 {
-        write_guest_u32(&mut env, result_out_ptr as u32, out);
+    })?;
+    if status == 0 && !write_guest_u32(&mut env, result_out_ptr as u32, out) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_set_promise_hooks(
@@ -1262,7 +1301,10 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
     resource_name_or_undefined: i32,
     cjs_var_in_scope: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
+    if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 1).is_none() {
+        return Ok(1);
+    }
     let env_handle = snapi_env(&env, napi_env);
     let code_id = if code > 0 { code as u32 } else { 0 };
     let filename_id = if filename > 0 { filename as u32 } else { 0 };
@@ -1272,7 +1314,7 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
         0
     };
     let mut result = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_contextify_contains_module_syntax(
             env_handle,
             code_id,
@@ -1281,11 +1323,11 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
             cjs_var_in_scope,
             &mut result,
         )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
+    })?;
+    if status == 0 && !write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1300,10 +1342,19 @@ fn guest_unofficial_napi_contextify_make_context(
     own_microtask_queue: i32,
     host_defined_option_id: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, WasiError> {
+    if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 4).is_none() {
+        return Ok(1);
+    }
+    let Some(_snapshot_charge) = HostTransientReservation::reserve(
+        Arc::clone(&env.data().budget),
+        CONTEXT_SNAPSHOT_RESERVATION,
+    ) else {
+        return Ok(1);
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_contextify_make_context(
             env_handle,
             sandbox_or_symbol as u32,
@@ -1323,11 +1374,11 @@ fn guest_unofficial_napi_contextify_make_context(
             },
             &mut result_id,
         )
-    };
-    if status == 0 && result_ptr > 0 {
-        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    })?;
+    if status == 0 && !write_guest_u32(&mut env, result_ptr as u32, result_id) {
+        return Ok(1);
     }
-    status
+    Ok(status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1408,6 +1459,12 @@ fn guest_unofficial_napi_contextify_compile_function(
     if result_ptr <= 0 || read_guest_bytes(&mut env, result_ptr, 4).is_none() {
         return Ok(1);
     }
+    let Some(_scratch_charge) = HostTransientReservation::reserve(
+        Arc::clone(&env.data().budget),
+        COMPILE_SCRATCH_RESERVATION,
+    ) else {
+        return Ok(1);
+    };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {

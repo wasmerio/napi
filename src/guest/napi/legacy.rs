@@ -197,7 +197,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
         "unofficial_napi_cancel_terminate_execution" => Ok(
             super::guest_unofficial_napi_cancel_terminate_execution(env, args[0].unwrap_i32()),
         ),
-        "unofficial_napi_contextify_contains_module_syntax" => Ok(
+        "unofficial_napi_contextify_contains_module_syntax" => {
             super::guest_unofficial_napi_contextify_contains_module_syntax(
                 env,
                 args[0].unwrap_i32(),
@@ -206,15 +206,16 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[3].unwrap_i32(),
                 args[4].unwrap_i32(),
                 args[5].unwrap_i32(),
-            ),
-        ),
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
+        }
         "unofficial_napi_contextify_compile_function" => legacy_compile_function(env, args),
         "unofficial_napi_contextify_compile_function_for_cjs_loader" => {
             legacy_compile_cjs(env, args)
         }
         "unofficial_napi_contextify_create_cached_data" => legacy_create_cached_data(env, args),
         "unofficial_napi_contextify_make_context" => {
-            Ok(super::guest_unofficial_napi_contextify_make_context(
+            super::guest_unofficial_napi_contextify_make_context(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
@@ -225,7 +226,8 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[6].unwrap_i32(),
                 args[7].unwrap_i32(),
                 args[8].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_contextify_run_script" => legacy_run_script(env, args),
         "unofficial_napi_create_private_symbol" => {
@@ -288,13 +290,14 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
         )),
         "unofficial_napi_get_process_memory_info" => Ok(legacy_process_memory_info(env, args)),
         "unofficial_napi_get_own_non_index_properties" => {
-            Ok(super::guest_unofficial_napi_get_own_non_index_properties(
+            super::guest_unofficial_napi_get_own_non_index_properties(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_get_promise_details" => {
             Ok(super::guest_unofficial_napi_get_promise_details(
@@ -998,6 +1001,12 @@ fn legacy_compile_function(
     if snapi_env.is_null() || super::read_guest_bytes(&mut env, result_ptr, 4).is_none() {
         return Ok(1);
     }
+    let Some(_scratch_charge) = super::HostTransientReservation::reserve(
+        env.data().budget.clone(),
+        super::COMPILE_SCRATCH_RESERVATION,
+    ) else {
+        return Ok(1);
+    };
     let mut result = 0;
     let status = super::with_cb_context(&mut env, guest_env, || unsafe {
         crate::snapi::snapi_bridge_unofficial_contextify_compile_function_legacy(
@@ -1191,15 +1200,24 @@ fn legacy_serialize_value(
         }
     };
     if status != 0 {
+        if message != 0 {
+            unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        }
         return Ok(status);
     }
-    if !charge.shrink(retained_bytes) || pending.insert_legacy(message, charge).is_err() {
+    if !charge.shrink(retained_bytes) {
         unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }
-    if !super::write_guest_u32(&mut env, result_ptr as u32, message) {
-        drop(pending.take_legacy(message));
+    if let Err(rejected_charge) = pending.insert_legacy(message, charge) {
         unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        drop(rejected_charge);
+        return Ok(1);
+    }
+    if !super::write_guest_u32(&mut env, result_ptr as u32, message) {
+        let charge = pending.take_legacy(message);
+        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        drop(charge);
         return Ok(1);
     }
     Ok(0)

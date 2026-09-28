@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use std::sync::atomic::AtomicU32;
 use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};

@@ -5690,6 +5690,15 @@ fn guest_napi_new_instance(
 // Wasmer-specific "napi_extension_wasmer_v0" extension module.
 // ============================================================
 
+/// The browser backend has no frozen native EdgeJS compatibility imports.
+/// Signature discrimination belongs to the native legacy provider only.
+pub(crate) fn frozen_napi_type_matches(
+    _name: &str,
+    _actual: &wasmer::FunctionType,
+) -> Option<bool> {
+    None
+}
+
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
     matches!(
         name,

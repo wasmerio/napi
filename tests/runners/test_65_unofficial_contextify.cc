@@ -137,6 +137,26 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, MakeContextBoundsNativeOwnPropertySnapshot) {
+  EnvScope s(runtime_.get());
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "(() => { const object = {}; for (let i = 0; i < 16385; ++i) "
+                    "object['k' + i] = i; return object; })()"),
+                &sandbox),
+            napi_ok);
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_make_context(
+                s.env, sandbox, Str(s.env, "many-properties"), undefined,
+                true, true, false, undefined, &result),
+            napi_generic_failure);
+  EXPECT_EQ(result, nullptr);
+}
+
 TEST_F(Test65UnofficialContextify, NativeEnvironmentsRetainWebAssemblyInAllContexts) {
   EnvScope s(runtime_.get());
   constexpr char kCompileEmptyModule[] =
@@ -765,6 +785,23 @@ TEST_F(Test65UnofficialContextify, PrivateDynamicImportRejectsMissingRequiredSym
   ASSERT_EQ(napi_run_script(s.env, Str(s.env, "shortImportCalls"), &calls), napi_ok);
   ASSERT_EQ(napi_get_value_int32(s.env, calls, &count), napi_ok);
   EXPECT_EQ(count, 0);
+}
+
+TEST_F(Test65UnofficialContextify, CompileFunctionBoundsNativeFilenameScratch) {
+  EnvScope s(runtime_.get());
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "return 1;"));
+  std::string large_filename(1024 * 1024 + 1, 'a');
+  napi_value filename = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, large_filename.data(),
+                                    large_filename.size(), &filename), napi_ok);
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_compile_function(
+                s.env, &source, filename, 0, 0, undefined, undefined,
+                undefined, undefined, &result), napi_invalid_arg);
+  EXPECT_EQ(result, nullptr);
 }
 
 TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {

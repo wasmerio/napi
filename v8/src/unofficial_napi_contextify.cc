@@ -785,21 +785,29 @@ bool SnapshotOwnProperties(v8::Isolate* isolate,
     return false;
   }
 
-  out->reserve(names->Length());
-  for (uint32_t i = 0; i < names->Length(); ++i) {
-    v8::Local<v8::Value> key_value;
-    if (!names->Get(context, i).ToLocal(&key_value) || !key_value->IsName()) {
-      continue;
+  // The Rust import reserves for this vector and its persistent handles
+  // before V8 can invoke a sandbox getter or Proxy trap.
+  if (names->Length() > 16 * 1024) return false;
+  try {
+    out->reserve(names->Length());
+    for (uint32_t i = 0; i < names->Length(); ++i) {
+      v8::Local<v8::Value> key_value;
+      if (!names->Get(context, i).ToLocal(&key_value) || !key_value->IsName()) {
+        continue;
+      }
+      v8::Local<v8::Name> key = key_value.As<v8::Name>();
+      v8::Local<v8::Value> value;
+      if (!object->Get(context, key).ToLocal(&value)) {
+        return false;
+      }
+      SavedOwnProperty saved;
+      saved.key.Reset(isolate, key);
+      saved.value.Reset(isolate, value);
+      out->push_back(std::move(saved));
     }
-    v8::Local<v8::Name> key = key_value.As<v8::Name>();
-    v8::Local<v8::Value> value;
-    if (!object->Get(context, key).ToLocal(&value)) {
-      return false;
-    }
-    SavedOwnProperty saved;
-    saved.key.Reset(isolate, key);
-    saved.value.Reset(isolate, value);
-    out->push_back(std::move(saved));
+  } catch (const std::bad_alloc&) {
+    out->clear();
+    return false;
   }
   return true;
 }
@@ -1845,7 +1853,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
         napi_v8_set_last_exception(
             env, try_catch.Exception(), try_catch.Message());
       }
-      return napi_pending_exception;
+      return try_catch.HasCaught() ? napi_pending_exception : napi_generic_failure;
     }
     maybe_global_object = sandbox_value;
   }
@@ -2435,6 +2443,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   }
 
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
+  if (filename_str->Utf8Length(isolate) > 1024 * 1024)
+    return napi_invalid_arg;
 
   v8::Local<v8::Symbol> host_id_symbol;
   if (host_defined_option_id != nullptr) {
