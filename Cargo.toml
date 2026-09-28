@@ -49,6 +49,7 @@ virtual-fs = { version = "=0.704.0", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
+parking_lot = "0.12"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }
