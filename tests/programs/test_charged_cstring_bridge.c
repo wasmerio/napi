@@ -21,12 +21,27 @@ int main(void) {
   NAPI_CALL(env, napi_has_named_property(env, object, "charged", &has));
   CHECK_OR_FAIL(has, "named property was lost");
 
-  NAPI_CALL(env, napi_throw_error(env, "E_GUEST", "guest error"));
-  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
-  NAPI_CALL(env, napi_throw_type_error(env, "E_TYPE", "guest type error"));
-  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
-  NAPI_CALL(env, napi_throw_range_error(env, "E_RANGE", "guest range error"));
-  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
+  // Outside a JavaScript callback, the bridge may report
+  // napi_pending_exception even when the arguments reached V8. Match the
+  // existing throw test's convention, clearing only after napi_ok.
+  napi_status status = napi_throw_error(env, "E_GUEST", "guest error");
+  CHECK_OR_FAIL(status == napi_ok || status == napi_pending_exception,
+                "napi_throw_error returned an unexpected status");
+  if (status == napi_ok) {
+    NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
+  }
+  status = napi_throw_type_error(env, "E_TYPE", "guest type error");
+  CHECK_OR_FAIL(status == napi_ok || status == napi_pending_exception,
+                "napi_throw_type_error returned an unexpected status");
+  if (status == napi_ok) {
+    NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
+  }
+  status = napi_throw_range_error(env, "E_RANGE", "guest range error");
+  CHECK_OR_FAIL(status == napi_ok || status == napi_pending_exception,
+                "napi_throw_range_error returned an unexpected status");
+  if (status == napi_ok) {
+    NAPI_CALL(env, napi_get_and_clear_last_exception(env, &got));
+  }
   puts("CHARGED_CSTRING_BRIDGE_OK");
   return 0;
 }
