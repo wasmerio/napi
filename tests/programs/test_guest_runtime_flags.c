@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 
 #include "unofficial_napi.h"
 
@@ -14,6 +15,13 @@ int main(void) {
   };
   if (unofficial_napi_configure_runtime(&options) != napi_invalid_arg) {
     return 1;
+  }
+  // No host copy should be attempted for a guest-controlled length. The
+  // request is forbidden before its pointer or payload need to be examined.
+  options.engine_flags = (const char*)1;
+  options.engine_flags_length = UINT32_MAX;
+  if (unofficial_napi_configure_runtime(&options) != napi_invalid_arg) {
+    return 2;
   }
   puts("FLAGS_REJECTED");
   return 0;

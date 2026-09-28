@@ -491,10 +491,10 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: i32,
 ) -> i32 {
-    let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
+    let Some(has_flags) = abi::read_runtime_options(&mut env, options_ptr) else {
         return 1;
     };
-    if !flags.is_empty() {
+    if has_flags {
         return 1;
     }
     unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }

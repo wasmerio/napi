@@ -173,29 +173,22 @@ pub(crate) struct EnvCreate {
     pub stack_limit: u32,
 }
 
+/// Decode only whether the guest requested process-wide V8 flags. Guests are
+/// never permitted to set them, so copying the pointed-to bytes would create
+/// an unnecessary, uncharged host allocation controlled by the guest.
 pub(crate) fn read_runtime_options(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
-) -> Option<Vec<u8>> {
+) -> Option<bool> {
     if guest_ptr == 0 {
-        return Some(Vec::new());
+        return Some(false);
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
-    let flags_ptr = u32_at(
-        &bytes,
-        std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
-    )? as i32;
     let flags_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
-    )? as usize;
-    if flags_length == 0 {
-        return Some(Vec::new());
-    }
-    if flags_ptr <= 0 {
-        return None;
-    }
-    read_guest_bytes(env, flags_ptr, flags_length)
+    )?;
+    Some(flags_length != 0)
 }
 
 pub(crate) fn read_env_create(
