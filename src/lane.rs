@@ -8,14 +8,25 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use crate::budget::{Pool, ResourceBudget};
+
+const LANE_RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The embedder schedules one dedicated, instance-accounted native thread.
 /// Returning an error must mean the closure was not accepted for execution.
 pub type BackgroundThreadSpawner =
     Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> Result<()> + Send + Sync>;
 
+/// Called for each actual V8 background task. Dropping the returned guard
+/// ends that task's metered active interval.
+pub type BackgroundTaskScope = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
+
 unsafe extern "C" {
-    fn snapi_v8_lane_new() -> *mut c_void;
+    fn snapi_v8_lane_new(
+        scope_context: *mut c_void,
+        enter_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        leave_scope: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    ) -> *mut c_void;
     fn snapi_v8_lane_run(handle: *mut c_void);
     fn snapi_v8_lane_stop(handle: *mut c_void);
     fn snapi_v8_lane_delete(handle: *mut c_void);
@@ -25,6 +36,8 @@ unsafe extern "C" {
 
 struct BackgroundLane {
     handle: NonNull<c_void>,
+    scope: Box<BackgroundTaskScope>,
+    budget: Arc<ResourceBudget>,
 }
 
 // The C++ lane synchronizes all queue access. Its handle remains allocated
@@ -33,10 +46,21 @@ unsafe impl Send for BackgroundLane {}
 unsafe impl Sync for BackgroundLane {}
 
 impl BackgroundLane {
-    fn new() -> Result<Self> {
-        let handle = NonNull::new(unsafe { snapi_v8_lane_new() })
-            .ok_or_else(|| anyhow!("failed to allocate V8 background lane"))?;
-        Ok(Self { handle })
+    fn new(budget: Arc<ResourceBudget>, scope: BackgroundTaskScope) -> Result<Self> {
+        budget.try_charge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES)?;
+        let scope = Box::new(scope);
+        let handle = NonNull::new(unsafe {
+            snapi_v8_lane_new(
+                (&*scope as *const BackgroundTaskScope).cast_mut().cast(),
+                enter_task_scope,
+                leave_task_scope,
+            )
+        });
+        let Some(handle) = handle else {
+            budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
+            bail!("failed to allocate V8 background lane");
+        };
+        Ok(Self { handle, scope, budget })
     }
 
     fn stop(&self) {
@@ -63,7 +87,24 @@ impl Drop for BackgroundLane {
             snapi_v8_lane_stop(self.handle.as_ptr());
             snapi_v8_lane_delete(self.handle.as_ptr());
         }
+        self.budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
     }
+}
+
+unsafe extern "C" fn enter_task_scope(context: *mut c_void) -> *mut c_void {
+    if context.is_null() { return std::ptr::null_mut(); }
+    let callback = unsafe { &*context.cast::<BackgroundTaskScope>() };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback())) {
+        Ok(guard) => Box::into_raw(Box::new(guard)).cast(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn leave_task_scope(_context: *mut c_void, scope: *mut c_void) {
+    if scope.is_null() { return; }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(unsafe { Box::from_raw(scope.cast::<Box<dyn Send>>()) });
+    }));
 }
 
 pub(crate) struct LaneScope {
@@ -88,6 +129,8 @@ pub(crate) struct LazyBackgroundLane {
     state: Mutex<State>,
     changed: Condvar,
     on_overload: Arc<dyn Fn() + Send + Sync>,
+    budget: Arc<ResourceBudget>,
+    task_scope: BackgroundTaskScope,
 }
 
 impl std::fmt::Debug for LazyBackgroundLane {
@@ -100,12 +143,16 @@ impl LazyBackgroundLane {
     pub(crate) fn new(
         spawner: BackgroundThreadSpawner,
         on_overload: Arc<dyn Fn() + Send + Sync>,
+        budget: Arc<ResourceBudget>,
+        task_scope: BackgroundTaskScope,
     ) -> Self {
         Self {
             spawner,
             state: Mutex::new(State::Uninitialized),
             changed: Condvar::new(),
             on_overload,
+            budget,
+            task_scope,
         }
     }
 
@@ -132,7 +179,10 @@ impl LazyBackgroundLane {
         drop(state);
 
         let result = (|| {
-            let lane = Arc::new(BackgroundLane::new()?);
+            let lane = Arc::new(BackgroundLane::new(
+                Arc::clone(&self.budget),
+                Arc::clone(&self.task_scope),
+            )?);
             let worker_lane = Arc::clone(&lane);
             let on_overload = Arc::clone(&self.on_overload);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -143,9 +193,10 @@ impl LazyBackgroundLane {
                     on_overload();
                 }
             }))?;
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|_| anyhow!("V8 background lane did not start within five seconds"))?;
+            if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                lane.stop();
+                bail!("V8 background lane did not start within five seconds");
+            }
             Ok::<_, anyhow::Error>(lane)
         })();
 

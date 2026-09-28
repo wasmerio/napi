@@ -100,6 +100,9 @@ pub enum Pool {
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].
     V8External,
+    /// Fixed reservation for one dedicated V8 background lane, including its
+    /// native thread stack and bounded pending task queue.
+    V8BackgroundLane,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -153,6 +156,7 @@ pub struct ResourceUsage {
     pub v8_heap_reserved: u64,
     /// Currently-charged V8 external memory (ArrayBuffer/Buffer) bytes.
     pub v8_external: u64,
+    pub v8_background_lane: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -205,6 +209,7 @@ pub struct ResourceBudget {
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
     v8_external: AtomicU64,
+    v8_background_lane: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -220,6 +225,7 @@ impl std::fmt::Debug for ResourceBudget {
                 &self.v8_heap_reserved.load(Ordering::Acquire),
             )
             .field("v8_external", &self.v8_external.load(Ordering::Acquire))
+            .field("v8_background_lane", &self.v8_background_lane.load(Ordering::Acquire))
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
     }
@@ -256,6 +262,7 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            v8_background_lane: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -268,6 +275,7 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            v8_background_lane: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -368,6 +376,7 @@ impl ResourceBudget {
             Pool::WasmLinear => &self.wasm_linear,
             Pool::V8HeapReserved => &self.v8_heap_reserved,
             Pool::V8External => &self.v8_external,
+            Pool::V8BackgroundLane => &self.v8_background_lane,
         }
     }
 
@@ -379,6 +388,7 @@ impl ResourceBudget {
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
             v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
             v8_external: self.v8_external.load(Ordering::Acquire),
+            v8_background_lane: self.v8_background_lane.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }

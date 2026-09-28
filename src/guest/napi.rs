@@ -22,6 +22,9 @@ use crate::{
 use super::{abi, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+    let Ok(_lane_scope) = env.data().enter_background_lane() else {
+        return 0;
+    };
     let _ = unsafe { snapi_bridge_init() };
     // Legacy N-API modules without an embedder-owned runtime configuration use
     // the provider default. If Edge configured flags first, this conflicting
@@ -215,6 +218,9 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    let Ok(_lane_scope) = env.data().enter_background_lane() else {
+        return 1;
+    };
     let (
         total_memory,
         constrained_memory,

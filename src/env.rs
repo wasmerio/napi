@@ -13,6 +13,8 @@ use wasmer::{Function, Memory, Table};
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::lane::{LaneScope, LazyBackgroundLane};
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
@@ -96,6 +98,8 @@ pub(crate) struct NapiEnv {
     pub(crate) max_envs: Option<usize>,
     env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    background_lane: Option<Arc<LazyBackgroundLane>>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
@@ -170,12 +174,16 @@ impl NapiEnv {
         max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
         host_stopped: Arc<AtomicBool>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        background_lane: Option<Arc<LazyBackgroundLane>>,
     ) -> Self {
         Self {
             budget,
             max_envs,
             env_registry,
             host_stopped,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            background_lane,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
             callback_depth: 0,
@@ -221,6 +229,14 @@ impl NapiEnv {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_buffer_leases: HashMap::new(),
         }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn enter_background_lane(&self) -> anyhow::Result<Option<LaneScope>> {
+        if self.host_stopped.load(Ordering::Acquire) {
+            anyhow::bail!("N-API instance has been stopped");
+        }
+        self.background_lane.as_ref().map(|lane| lane.enter()).transpose()
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -548,6 +564,8 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            None,
         );
 
         assert!(env.charge_declared_external(6 * MIB));
@@ -577,6 +595,8 @@ mod tests {
                 None,
                 Arc::new(std::sync::Mutex::new(HashSet::new())),
                 Arc::new(AtomicBool::new(false)),
+                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+                None,
             );
             assert!(env.charge_declared_external(4 * MIB));
             assert_eq!(budget.snapshot().v8_external, 4 * MIB);
@@ -595,6 +615,8 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            None,
         );
         let max = crate::guest::MAX_CALLBACK_DEPTH;
 

@@ -14,6 +14,8 @@ use crate::{
     budget::{NapiMemoryAccountant, ResourceBudget},
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::lane::{BackgroundTaskScope, BackgroundThreadSpawner, LazyBackgroundLane};
 
 #[derive(Debug, Clone, Default)]
 pub struct NapiLimits {
@@ -39,6 +41,10 @@ impl NapiLimits {
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    background_thread_spawner: Option<BackgroundThreadSpawner>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    background_task_scope: Option<BackgroundTaskScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +74,7 @@ pub struct NapiInstantiationState {
 // each other's sessions.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
-    ctx: NapiCtx,
+    inner: Arc<NapiCtxInner>,
 }
 
 /// Opaque control surface for stopping every V8 isolate owned by a context.
@@ -76,6 +82,8 @@ pub struct NapiRuntimeHooks {
 pub struct NapiRuntimeControl {
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    background_lane: Option<Arc<LazyBackgroundLane>>,
 }
 
 impl NapiRuntimeControl {
@@ -100,6 +108,18 @@ impl NapiRuntimeControl {
                 );
             }
         }
+        drop(envs);
+        self.shutdown_background_lane();
+    }
+
+    /// Close admission to the instance's V8 background lane and wake its
+    /// worker. The embedder waits for that worker's activity lease before
+    /// final instance drain. Safe to call before the first N-API invocation.
+    pub fn shutdown_background_lane(&self) {
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if let Some(lane) = &self.background_lane {
+            lane.stop();
+        }
     }
 }
 
@@ -113,6 +133,8 @@ struct NapiCtxInner {
     budget: Arc<ResourceBudget>,
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    background_lane: Option<Arc<LazyBackgroundLane>>,
 }
 
 struct NapiSessionInner {
@@ -168,7 +190,41 @@ impl NapiCtxBuilder {
         self
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn background_thread_spawner(mut self, spawner: BackgroundThreadSpawner) -> Self {
+        self.background_thread_spawner = Some(spawner);
+        self
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn background_task_scope(mut self, scope: BackgroundTaskScope) -> Self {
+        self.background_task_scope = Some(scope);
+        self
+    }
+
+    /// Build hooks without constructing a `NapiCtx`, session, V8 isolate, or
+    /// native thread. The lane starts only on the first env-creation import.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn build_lazy_hooks(self) -> Result<NapiRuntimeHooks> {
+        let spawner = self.background_thread_spawner.clone()
+            .context("lazy N-API hooks require a background thread spawner")?;
+        let task_scope = self.background_task_scope.clone()
+            .context("lazy N-API hooks require a background task scope")?;
+        let inner = self.build_inner(Some((spawner, task_scope)));
+        Ok(NapiRuntimeHooks { inner })
+    }
+
     pub fn build(self) -> NapiCtx {
+        NapiCtx { inner: self.build_inner(None) }
+    }
+
+    fn build_inner(
+        self,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        background: Option<(BackgroundThreadSpawner, BackgroundTaskScope)>,
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        _background: Option<()>,
+    ) -> Arc<NapiCtxInner> {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
             None => match self.limits.memory_budget_bytes() {
@@ -176,15 +232,36 @@ impl NapiCtxBuilder {
                 None => ResourceBudget::unlimited(),
             },
         };
-        NapiCtx {
-            inner: Arc::new(NapiCtxInner {
+        let envs = Arc::new(Mutex::new(HashSet::new()));
+        let host_stopped = Arc::new(AtomicBool::new(false));
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let background_lane = background.map(|(spawner, task_scope)| {
+            let envs_for_stop = Arc::clone(&envs);
+            let stopped_for_stop = Arc::clone(&host_stopped);
+            Arc::new(LazyBackgroundLane::new(
+                spawner,
+                Arc::new(move || {
+                    stopped_for_stop.store(true, Ordering::Release);
+                    let live = envs_for_stop.lock().expect("poisoned N-API env registry");
+                    for env in live.iter().copied() {
+                        unsafe { crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                            env as crate::snapi::SnapiEnv,
+                        ); }
+                    }
+                }),
+                Arc::clone(&budget),
+                task_scope,
+            ))
+        });
+        Arc::new(NapiCtxInner {
                 limits: self.limits,
                 active_sessions: AtomicUsize::new(0),
                 budget,
-                envs: Arc::new(Mutex::new(HashSet::new())),
-                host_stopped: Arc::new(AtomicBool::new(false)),
-            }),
-        }
+                envs,
+                host_stopped,
+                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+                background_lane,
+            })
     }
 }
 
@@ -251,22 +328,24 @@ impl NapiCtx {
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
-        NapiRuntimeHooks { ctx: self.clone() }
+        NapiRuntimeHooks { inner: Arc::clone(&self.inner) }
     }
 
     pub fn runtime_control(&self) -> NapiRuntimeControl {
-        NapiRuntimeControl {
-            envs: Arc::clone(&self.inner.envs),
-            host_stopped: Arc::clone(&self.inner.host_stopped),
-        }
+        NapiRuntimeControl::from_inner(&self.inner)
     }
 
     pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
-        let previous = self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
-        if let Some(max_sessions) = self.inner.limits.max_sessions
+        new_session(&self.inner, module)
+    }
+}
+
+fn new_session(ctx: &Arc<NapiCtxInner>, module: &Module) -> Result<NapiSession> {
+        let previous = ctx.active_sessions.fetch_add(1, Ordering::AcqRel);
+        if let Some(max_sessions) = ctx.limits.max_sessions
             && previous >= max_sessions
         {
-            self.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
             bail!("refusing to create more than {max_sessions} active N-API sessions");
         }
 
@@ -292,16 +371,37 @@ impl NapiCtx {
 
         Ok(NapiSession {
             inner: Arc::new(NapiSessionInner {
-                ctx: Arc::clone(&self.inner),
+                ctx: Arc::clone(ctx),
                 imported_memory_type,
                 imported_table_type,
                 func_env: Mutex::new(None),
             }),
         })
+}
+
+impl NapiRuntimeControl {
+    fn from_inner(inner: &Arc<NapiCtxInner>) -> Self {
+        Self {
+            envs: Arc::clone(&inner.envs),
+            host_stopped: Arc::clone(&inner.host_stopped),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            background_lane: inner.background_lane.clone(),
+        }
     }
 }
 
 impl NapiRuntimeHooks {
+    pub fn runtime_control(&self) -> NapiRuntimeControl {
+        NapiRuntimeControl::from_inner(&self.inner)
+    }
+
+    /// Whether this instance has started its dedicated V8 background lane.
+    pub fn is_initialized(&self) -> bool {
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        { self.inner.background_lane.as_ref().is_some_and(|lane| lane.is_initialized()) }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        { false }
+    }
     /// Creates N-API imports when `module` requests them.
     pub fn additional_imports(
         &self,
@@ -342,7 +442,7 @@ impl NapiRuntimeHooks {
             bail!("unsupported Wasmer N-API extension version: {version:?}");
         }
 
-        let session = self.ctx.prepare_module(module)?;
+        let session = new_session(&self.inner, module)?;
         session.add_imports(store, imports)?;
         Ok(NapiInstantiationState {
             session: Some(session),
@@ -391,6 +491,8 @@ impl NapiSession {
             self.inner.ctx.limits.max_envs,
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            self.inner.ctx.background_lane.clone(),
         );
         let func_env = FunctionEnv::new(store, napi_env);
         {
