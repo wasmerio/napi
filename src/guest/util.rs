@@ -50,15 +50,15 @@ pub fn read_guest_bytes(
     let (state, store) = env.data_and_store_mut();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
-    // A guest cannot legitimately reference more bytes than its own linear
-    // memory holds, so reject a length that exceeds it before allocating. This
-    // bounds the host copy to memory the guest was already charged for and
-    // stops a bogus guest-supplied length from allocating gigabytes here (the
-    // subsequent bounds-checked read would fail, but only after the `vec!`).
-    if len as u64 > view.data_size() {
+    // Validate the entire range before allocating. Checking only `len` lets a
+    // guest point near the end of memory and request a huge host allocation
+    // that the subsequent bounds-checked read would reject too late.
+    if (guest_ptr as u64).checked_add(u64::try_from(len).ok()?)? > view.data_size() {
         return None;
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
 }
@@ -147,7 +147,8 @@ pub fn read_guest_u32_array(
     // clamped to the guest's memory size by `read_guest_bytes`.
     let byte_len = count.checked_mul(4)?;
     let bytes = read_guest_bytes(env, guest_ptr, byte_len)?;
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).ok()?;
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }

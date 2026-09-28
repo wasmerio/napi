@@ -61,7 +61,9 @@ pub fn read_guest_bytes(
     if (guest_ptr as u64).checked_add(len as u64)? > view.data_size() {
         return None;
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
 }
@@ -317,7 +319,8 @@ pub fn read_guest_u32_array(
     count: usize,
 ) -> Option<Vec<u32>> {
     let bytes = read_guest_bytes(env, guest_ptr, count.checked_mul(4)?)?;
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).ok()?;
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }

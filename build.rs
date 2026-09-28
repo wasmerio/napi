@@ -83,17 +83,25 @@ fn main() {
         v8.library_path.display()
     );
 
-    let mut v8_defines = read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
+    let v8_defines = read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
         .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
-    if let Some(sandbox_enabled) = read_sandbox_build_flag(&v8.library_path) {
-        let embedder_enabled = v8_defines
-            .split(&[';', ',', ' '][..])
-            .any(|define| matches!(define, "V8_ENABLE_SANDBOX" | "V8_ENABLE_SANDBOX=1"));
-        if sandbox_enabled && !embedder_enabled {
-            v8_defines.push_str(",V8_ENABLE_SANDBOX");
-        } else if !sandbox_enabled && embedder_enabled {
-            panic!("V8_ENABLE_SANDBOX is set for a sandbox-disabled V8 archive");
-        }
+    let sandbox_define = v8_defines
+        .split(&[';', ',', ' '][..])
+        .any(|define| matches!(define, "V8_ENABLE_SANDBOX" | "V8_ENABLE_SANDBOX=1"));
+    if sandbox_define {
+        panic!(
+            "V8_ENABLE_SANDBOX is unsupported: N-API backing stores can reside outside the V8 sandbox"
+        );
+    }
+    // The bridge exposes Wasmer linear memory and other embedder-owned
+    // allocations as V8 ArrayBuffer backing stores. V8's sandbox requires
+    // every such store to reside inside its sandbox address range. Until the
+    // bridge has a sandbox-resident backing-store implementation, accepting
+    // this archive would make ordinary guest code abort the host process.
+    if read_sandbox_build_flag(&v8.library_path) == Some(true) {
+        panic!(
+            "sandbox-enabled V8 archives are unsupported: N-API backing stores can reside outside the V8 sandbox"
+        );
     }
 
     let mut build = cc::Build::new();
