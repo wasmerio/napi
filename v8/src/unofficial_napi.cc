@@ -579,9 +579,9 @@ void ApplyNodeIsolateCreateParams(
 }
 
 v8::IsolateGroup GetOrCreateIsolateGroup() {
-  if (v8::IsolateGroup::CanCreateNewGroups()) {
-    return v8::IsolateGroup::Create();
-  }
+  // The prebuilt V8 snapshot initializes its JS dispatch table in the
+  // default group's cage. Constructing a second group while the first isolate
+  // is live currently crashes in InitializeBuiltinJSDispatchTable.
   return v8::IsolateGroup::GetDefault();
 }
 
