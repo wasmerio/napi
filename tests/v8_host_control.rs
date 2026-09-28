@@ -107,6 +107,18 @@ fn guest_cannot_allocate_unmetered_v8_webassembly_memory() {
 }
 
 #[test]
+fn named_properties_and_throw_errors_use_charged_guest_strings() {
+    let wasm = build_wasix_test("test_charged_cstring_bridge");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("CHARGED_CSTRING_BRIDGE_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn two_guest_isolates_can_coexist_while_one_sleeps() {
     let sleeping_wasm = build_wasix_test("test_env_sleep");
     let hello_wasm = build_wasix_test("hello_napi_test");

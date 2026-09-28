@@ -2428,7 +2428,9 @@ fn guest_napi_set_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb.as_slice()).unwrap_or_default();
+    let Some(cn) = GuestName::new(&nb, u32::MAX) else {
+        return Ok(1);
+    };
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_named_property(snapi, o as u32, cn.as_ptr(), v as u32)
@@ -2445,7 +2447,9 @@ fn guest_napi_get_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb.as_slice()).unwrap_or_default();
+    let Some(cn) = GuestName::new(&nb, u32::MAX) else {
+        return Ok(1);
+    };
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2467,7 +2471,9 @@ fn guest_napi_has_named_property(
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb.as_slice()).unwrap_or_default();
+    let Some(cn) = GuestName::new(&nb, u32::MAX) else {
+        return Ok(1);
+    };
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2642,17 +2648,27 @@ fn guest_napi_throw_error(
     msg_ptr: i32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        let Some(bytes) = read_guest_c_string(&mut env, code_ptr) else {
+            return 1;
+        };
+        Some(bytes)
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes
-        .as_ref()
-        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
+    let c_code = if let Some(bytes) = code_bytes.as_ref() {
+        let Some(name) = GuestName::new(bytes, u32::MAX) else {
+            return 1;
+        };
+        Some(name)
+    } else {
+        None
+    };
+    let Some(c_msg) = GuestName::new(&msg_bytes, u32::MAX) else {
+        return 1;
+    };
     unsafe {
         snapi_bridge_throw_error(
             snapi_env(&env, e),
@@ -2669,17 +2685,27 @@ fn guest_napi_throw_type_error(
     msg_ptr: i32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        let Some(bytes) = read_guest_c_string(&mut env, code_ptr) else {
+            return 1;
+        };
+        Some(bytes)
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes
-        .as_ref()
-        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
+    let c_code = if let Some(bytes) = code_bytes.as_ref() {
+        let Some(name) = GuestName::new(bytes, u32::MAX) else {
+            return 1;
+        };
+        Some(name)
+    } else {
+        None
+    };
+    let Some(c_msg) = GuestName::new(&msg_bytes, u32::MAX) else {
+        return 1;
+    };
     unsafe {
         snapi_bridge_throw_type_error(
             snapi_env(&env, e),
@@ -2696,17 +2722,27 @@ fn guest_napi_throw_range_error(
     msg_ptr: i32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        let Some(bytes) = read_guest_c_string(&mut env, code_ptr) else {
+            return 1;
+        };
+        Some(bytes)
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
         return 1;
     };
-    let c_code = code_bytes
-        .as_ref()
-        .map(|b| CString::new(b.as_slice()).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes.as_slice()).unwrap_or_default();
+    let c_code = if let Some(bytes) = code_bytes.as_ref() {
+        let Some(name) = GuestName::new(bytes, u32::MAX) else {
+            return 1;
+        };
+        Some(name)
+    } else {
+        None
+    };
+    let Some(c_msg) = GuestName::new(&msg_bytes, u32::MAX) else {
+        return 1;
+    };
     unsafe {
         snapi_bridge_throw_range_error(
             snapi_env(&env, e),
