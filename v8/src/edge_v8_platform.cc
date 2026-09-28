@@ -26,9 +26,10 @@ class BackgroundLane {
   static constexpr size_t kMaxQueuedTasks = 256;
 
   BackgroundLane(void* scope_context, void* (*enter_scope)(void*),
-                 bool (*leave_scope)(void*, void*))
+                 bool (*leave_scope)(void*, void*),
+                 void (*on_overload)(void*))
       : scope_context_(scope_context), enter_scope_(enter_scope),
-        leave_scope_(leave_scope) {}
+        leave_scope_(leave_scope), on_overload_(on_overload) {}
 
   bool Post(std::unique_ptr<v8::Task> task, double delay_seconds) {
     if (!task) return true;
@@ -37,22 +38,25 @@ class BackgroundLane {
         ? std::clamp(delay_seconds, 0.0, 86400.0) : 0.0;
     const auto delay = std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>(bounded_delay));
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopped_ || queue_.size() >= kMaxQueuedTasks) {
-      // Never route a managed task to another tenant's process-wide pool.
-      // A saturated lane fails closed; the embedder's stop path terminates
-      // isolates and drains the active task before disposing the lane.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopped_) return false;
+      if (queue_.size() < kMaxQueuedTasks) {
+        Item item{Clock::now() + delay, std::move(task)};
+        auto it = queue_.begin();
+        while (it != queue_.end() && it->due <= item.due) ++it;
+        queue_.insert(it, std::move(item));
+        cv_.notify_one();
+        return true;
+      }
+      // Stop admission before signaling the embedder. It may need to acquire
+      // other V8 locks to terminate the isolates, so never call it under ours.
       overloaded_ = true;
       stopped_ = true;
       cv_.notify_all();
-      return false;
     }
-    Item item{Clock::now() + delay, std::move(task)};
-    auto it = queue_.begin();
-    while (it != queue_.end() && it->due <= item.due) ++it;
-    queue_.insert(it, std::move(item));
-    cv_.notify_one();
-    return true;
+    if (on_overload_ != nullptr) on_overload_(scope_context_);
+    return false;
   }
 
   void Run() {
@@ -75,9 +79,8 @@ class BackgroundLane {
       lock.unlock();
       void* scope = enter_scope_ != nullptr ? enter_scope_(scope_context_) : nullptr;
       if (enter_scope_ != nullptr && scope == nullptr) {
+        SignalOverload();
         lock.lock();
-        overloaded_ = true;
-        stopped_ = true;
         break;
       }
       // The lane can be created before V8 allocates its Linux JIT pkey. New
@@ -85,9 +88,8 @@ class BackgroundLane {
       v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
       task->Run();
       if (leave_scope_ != nullptr && !leave_scope_(scope_context_, scope)) {
+        SignalOverload();
         lock.lock();
-        overloaded_ = true;
-        stopped_ = true;
         break;
       }
       lock.lock();
@@ -112,6 +114,20 @@ class BackgroundLane {
     return overloaded_;
   }
 
+  void SignalOverload() {
+    bool notify = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!overloaded_) {
+        overloaded_ = true;
+        notify = true;
+      }
+      stopped_ = true;
+      cv_.notify_all();
+    }
+    if (notify && on_overload_ != nullptr) on_overload_(scope_context_);
+  }
+
  private:
   using Clock = std::chrono::steady_clock;
   struct Item {
@@ -127,6 +143,7 @@ class BackgroundLane {
   void* scope_context_ = nullptr;
   void* (*enter_scope_)(void*) = nullptr;
   bool (*leave_scope_)(void*, void*) = nullptr;
+  void (*on_overload_)(void*) = nullptr;
 };
 
 thread_local BackgroundLane* current_background_lane = nullptr;
@@ -197,9 +214,10 @@ void CleanupForegroundTaskRecord(napi_env /*env*/, void* data);
 
 extern "C" void* snapi_v8_lane_new(void* scope_context,
                                      void* (*enter_scope)(void*),
-                                     bool (*leave_scope)(void*, void*)) {
+                                     bool (*leave_scope)(void*, void*),
+                                     void (*on_overload)(void*)) {
   return new (std::nothrow)
-      BackgroundLane(scope_context, enter_scope, leave_scope);
+      BackgroundLane(scope_context, enter_scope, leave_scope, on_overload);
 }
 
 extern "C" void snapi_v8_lane_run(void* handle) {
@@ -402,23 +420,27 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
     if (enqueue != nullptr && target != nullptr) {
       ForegroundTaskRecord* record = new (std::nothrow) ForegroundTaskRecord();
       if (record != nullptr) {
-        record->isolate_state.reset();
+        // The embedder may run and clean up the task before enqueue returns.
+        // Publish all record state and charge pending work first.
+        if (isolate_state != nullptr && isolate_state->platform != nullptr) {
+          isolate_state->platform->AddPendingForegroundTask(isolate_state);
+          record->isolate_state = isolate_state;
+        }
         record->task = std::move(task);
         if (enqueue(target,
                     RunForegroundTaskRecord,
                     record,
                     CleanupForegroundTaskRecord,
                     delay_ms) == napi_ok) {
-          if (isolate_state != nullptr &&
-              isolate_state->platform != nullptr) {
-            isolate_state->platform->AddPendingForegroundTask(isolate_state);
-            record->isolate_state = isolate_state;
-          }
           return;
         }
         task = std::move(record->task);
-        record->isolate_state.reset();
+        std::shared_ptr<IsolateState> pending_state =
+            std::move(record->isolate_state);
         delete record;
+        if (pending_state != nullptr && pending_state->platform != nullptr) {
+          pending_state->platform->CompletePendingForegroundTask(pending_state);
+        }
       }
     }
 

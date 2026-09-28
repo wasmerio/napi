@@ -30,19 +30,24 @@ unsafe extern "C" {
         scope_context: *mut c_void,
         enter_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
         leave_scope: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
+        on_overload: unsafe extern "C" fn(*mut c_void),
     ) -> *mut c_void;
     fn snapi_v8_lane_run(handle: *mut c_void);
     fn snapi_v8_lane_stop(handle: *mut c_void);
     fn snapi_v8_lane_delete(handle: *mut c_void);
     fn snapi_v8_lane_swap_current(handle: *mut c_void) -> *mut c_void;
-    fn snapi_v8_lane_overloaded(handle: *mut c_void) -> bool;
 }
 
 struct BackgroundLane {
     handle: NonNull<c_void>,
-    _scope: Box<BackgroundTaskScope>,
+    _callbacks: Box<LaneCallbacks>,
     budget: Arc<ResourceBudget>,
     charged: AtomicBool,
+}
+
+struct LaneCallbacks {
+    task_scope: BackgroundTaskScope,
+    on_overload: Arc<dyn Fn() + Send + Sync>,
 }
 
 // The C++ lane synchronizes all queue access. Its handle remains allocated
@@ -51,14 +56,22 @@ unsafe impl Send for BackgroundLane {}
 unsafe impl Sync for BackgroundLane {}
 
 impl BackgroundLane {
-    fn new(budget: Arc<ResourceBudget>, scope: BackgroundTaskScope) -> Result<Self> {
+    fn new(
+        budget: Arc<ResourceBudget>,
+        task_scope: BackgroundTaskScope,
+        on_overload: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self> {
         budget.try_charge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES)?;
-        let scope = Box::new(scope);
+        let callbacks = Box::new(LaneCallbacks {
+            task_scope,
+            on_overload,
+        });
         let handle = NonNull::new(unsafe {
             snapi_v8_lane_new(
-                (&*scope as *const BackgroundTaskScope).cast_mut().cast(),
+                (&*callbacks as *const LaneCallbacks).cast_mut().cast(),
                 enter_task_scope,
                 leave_task_scope,
+                signal_overload,
             )
         });
         let Some(handle) = handle else {
@@ -67,7 +80,7 @@ impl BackgroundLane {
         };
         Ok(Self {
             handle,
-            _scope: scope,
+            _callbacks: callbacks,
             budget,
             charged: AtomicBool::new(true),
         })
@@ -86,10 +99,6 @@ impl BackgroundLane {
             self.budget
                 .uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
         }
-    }
-
-    fn overloaded(&self) -> bool {
-        unsafe { snapi_v8_lane_overloaded(self.handle.as_ptr()) }
     }
 
     fn enter(self: &Arc<Self>) -> LaneScope {
@@ -115,11 +124,21 @@ unsafe extern "C" fn enter_task_scope(context: *mut c_void) -> *mut c_void {
     if context.is_null() {
         return std::ptr::null_mut();
     }
-    let callback = unsafe { &*context.cast::<BackgroundTaskScope>() };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback())) {
+    let callbacks = unsafe { &*context.cast::<LaneCallbacks>() };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (callbacks.task_scope)())) {
         Ok(guard) => Box::into_raw(Box::new(guard)).cast(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+unsafe extern "C" fn signal_overload(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    let callbacks = unsafe { &*context.cast::<LaneCallbacks>() };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (callbacks.on_overload)();
+    }));
 }
 
 unsafe extern "C" fn leave_task_scope(_context: *mut c_void, scope: *mut c_void) -> bool {
@@ -210,6 +229,7 @@ impl LazyBackgroundLane {
             let lane = Arc::new(BackgroundLane::new(
                 Arc::clone(&self.budget),
                 Arc::clone(&self.task_scope),
+                Arc::clone(&self.on_overload),
             )?);
             {
                 let mut state = self.state.lock().expect("poisoned V8 lane state");
@@ -223,15 +243,10 @@ impl LazyBackgroundLane {
                 }
             }
             let worker_lane = Arc::clone(&lane);
-            let on_overload = Arc::clone(&self.on_overload);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             (self.spawner)(Box::new(move || {
                 let _ = ready_tx.send(());
                 worker_lane.run();
-                if worker_lane.overloaded() {
-                    let _ =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_overload()));
-                }
                 worker_lane.release_reservation();
             }))?;
             if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
@@ -329,6 +344,8 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn run_noop_task(_data: *mut c_void) {}
+
     fn post(lane: &LazyBackgroundLane, task: TestTask) {
         let handle = match &*lane.state.lock().unwrap() {
             State::Ready(lane) => lane.handle.as_ptr(),
@@ -420,6 +437,63 @@ mod tests {
         assert_eq!(exited.load(Ordering::SeqCst), 2);
         assert_eq!(first_budget.snapshot().v8_background_lane, 0);
         assert_eq!(second_budget.snapshot().v8_background_lane, 0);
+    }
+
+    #[test]
+    fn queue_overload_signals_termination_before_blocked_task_returns() {
+        let overloads = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
+            let finished_tx = finished_tx.clone();
+            thread::spawn(move || {
+                work();
+                let _ = finished_tx.send(());
+            });
+            Ok(())
+        });
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let lane = LazyBackgroundLane::new(
+            spawner,
+            {
+                let overloads = Arc::clone(&overloads);
+                Arc::new(move || {
+                    overloads.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+            Arc::clone(&budget),
+            Arc::new(|| Box::new(())),
+        );
+        drop(lane.enter().unwrap());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        post(
+            &lane,
+            TestTask {
+                started: started_tx,
+                release: Some(Arc::clone(&release)),
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let handle = match &*lane.state.lock().unwrap() {
+            State::Ready(lane) => lane.handle.as_ptr(),
+            _ => panic!("lane not ready"),
+        };
+        for _ in 0..256 {
+            assert!(unsafe {
+                snapi_v8_lane_post_test_task(handle, run_noop_task, std::ptr::null_mut())
+            });
+        }
+        assert!(!unsafe {
+            snapi_v8_lane_post_test_task(handle, run_noop_task, std::ptr::null_mut())
+        });
+        assert_eq!(overloads.load(Ordering::SeqCst), 1);
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(budget.snapshot().v8_background_lane, 0);
     }
 
     #[test]
