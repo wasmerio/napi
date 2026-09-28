@@ -25,6 +25,18 @@ int main(void) {
   CHECK_OR_FAIL(check_undefined(env, result),
                 "V8 WebAssembly is available in the root context");
 
+  // A fresh realm would reinstate the constructor if V8 ever enables
+  // ShadowRealm by default. Keep that escape path in this regression.
+  napi_value realm_source;
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "typeof ShadowRealm === 'undefined' ? 'undefined' : "
+                     "new ShadowRealm().evaluate('typeof WebAssembly')",
+                     NAPI_AUTO_LENGTH, &realm_source));
+  NAPI_CALL(env, napi_run_script(env, realm_source, &result));
+  CHECK_OR_FAIL(check_undefined(env, result),
+                "V8 WebAssembly is available through a fresh realm");
+
   napi_value undefined_value;
   napi_value sandbox;
   napi_value context;
