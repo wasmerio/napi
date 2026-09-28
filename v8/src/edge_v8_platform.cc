@@ -80,6 +80,9 @@ class BackgroundLane {
         stopped_ = true;
         break;
       }
+      // The lane can be created before V8 allocates its Linux JIT pkey. New
+      // pkeys default to access-disabled on an already-running thread.
+      v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
       task->Run();
       if (leave_scope_ != nullptr) leave_scope_(scope_context_, scope);
       lock.lock();

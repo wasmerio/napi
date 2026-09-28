@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use crate::budget::{Pool, ResourceBudget};
 
 const LANE_RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
@@ -36,7 +36,7 @@ unsafe extern "C" {
 
 struct BackgroundLane {
     handle: NonNull<c_void>,
-    scope: Box<BackgroundTaskScope>,
+    _scope: Box<BackgroundTaskScope>,
     budget: Arc<ResourceBudget>,
 }
 
@@ -60,7 +60,7 @@ impl BackgroundLane {
             budget.uncharge(Pool::V8BackgroundLane, LANE_RESERVATION_BYTES);
             bail!("failed to allocate V8 background lane");
         };
-        Ok(Self { handle, scope, budget })
+        Ok(Self { handle, _scope: scope, budget })
     }
 
     fn stop(&self) {
@@ -121,7 +121,9 @@ enum State {
     Uninitialized,
     Initializing,
     Ready(Arc<BackgroundLane>),
-    Stopped,
+    // Keep the native lane allocation until all N-API sessions drop. The C++
+    // env state retains a raw lane pointer even after stop is requested.
+    Stopped(Option<Arc<BackgroundLane>>),
 }
 
 pub(crate) struct LazyBackgroundLane {
@@ -166,7 +168,7 @@ impl LazyBackgroundLane {
         loop {
             match &*state {
                 State::Ready(lane) => return Ok(Arc::clone(lane)),
-                State::Stopped => bail!("V8 background lane is stopped"),
+                State::Stopped(_) => bail!("V8 background lane is stopped"),
                 State::Initializing => {
                     state = self.changed.wait(state).expect("poisoned V8 lane state");
                 }
@@ -208,10 +210,15 @@ impl LazyBackgroundLane {
             }
             Ok(lane) => {
                 lane.stop();
+                if let State::Stopped(slot) = &mut *state {
+                    *slot = Some(lane);
+                }
                 bail!("V8 background lane stopped during initialization")
             }
             Err(error) => {
-                *state = State::Stopped;
+                if matches!(*state, State::Initializing) {
+                    *state = State::Uninitialized;
+                }
                 Err(error)
             }
         };
@@ -221,10 +228,15 @@ impl LazyBackgroundLane {
 
     pub(crate) fn stop(&self) {
         let mut state = self.state.lock().expect("poisoned V8 lane state");
-        let previous = std::mem::replace(&mut *state, State::Stopped);
-        if let State::Ready(lane) = previous {
-            lane.stop();
-        }
+        let previous = std::mem::replace(&mut *state, State::Stopped(None));
+        *state = match previous {
+            State::Ready(lane) => {
+                lane.stop();
+                State::Stopped(Some(lane))
+            }
+            State::Stopped(lane) => State::Stopped(lane),
+            _ => State::Stopped(None),
+        };
         self.changed.notify_all();
     }
 

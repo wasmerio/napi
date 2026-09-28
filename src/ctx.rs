@@ -627,6 +627,8 @@ mod tests {
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
     use wasmer::{AsStoreMut, Instance, Module, Store};
     use wat::parse_str;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}, thread, time::Duration};
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
@@ -689,6 +691,79 @@ mod tests {
     fn compile_wat(store: &Store, wat: &str) -> Module {
         let wasm = parse_str(wat).expect("wat module parses");
         Module::new(store, wasm).expect("wat module compiles")
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn lazy_hooks(spawns: Arc<AtomicUsize>, finished: mpsc::Sender<()>) -> super::NapiRuntimeHooks {
+        NapiCtx::builder()
+            .background_thread_spawner(Arc::new(move |work| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let finished = finished.clone();
+                thread::Builder::new().name("test-v8-lane".into()).spawn(move || {
+                    work();
+                    let _ = finished.send(());
+                })?;
+                Ok(())
+            }))
+            .background_task_scope(Arc::new(|| Box::new(())))
+            .build_lazy_hooks()
+            .expect("lazy hooks")
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn lazy_hooks_start_lane_only_when_guest_calls_napi() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let import_only = compile_wat(&store, r#"(module
+            (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            (import "env" "memory" (memory 1 512))
+        )"#);
+        let (imports, state) = hooks.additional_imports(&import_only, &mut store.as_store_mut()).unwrap();
+        let instance = Instance::new(&mut store, &import_only, &imports).unwrap();
+        hooks.configure_instance(&import_only, &mut store.as_store_mut(), &instance, None, state).unwrap();
+        assert!(!hooks.is_initialized());
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+
+        let invoked = compile_wat(&store, r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (func (export "invoke") (result i32) call $init)
+        )"#);
+        let (imports, state) = hooks.additional_imports(&invoked, &mut store.as_store_mut()).unwrap();
+        let instance = Instance::new(&mut store, &invoked, &imports).unwrap();
+        hooks.configure_instance(&invoked, &mut store.as_store_mut(), &instance, None, state).unwrap();
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        let invoke = instance.exports.get_typed_function::<(), i32>(&mut store, "invoke").unwrap();
+        assert!(invoke.call(&mut store).unwrap() > 0);
+        assert!(hooks.is_initialized());
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        hooks.runtime_control().shutdown_background_lane();
+        finished_rx.recv_timeout(Duration::from_secs(5)).expect("lane stops");
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn stopped_lazy_hooks_never_start_lane() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let hooks = lazy_hooks(Arc::clone(&spawns), finished_tx);
+        hooks.runtime_control().terminate_all();
+        let mut store = Store::default();
+        let module = compile_wat(&store, r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (func (export "invoke") (result i32) call $init)
+        )"#);
+        let (imports, state) = hooks.additional_imports(&module, &mut store.as_store_mut()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks.configure_instance(&module, &mut store.as_store_mut(), &instance, None, state).unwrap();
+        let invoke = instance.exports.get_typed_function::<(), i32>(&mut store, "invoke").unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!hooks.is_initialized());
     }
 
     #[test]
