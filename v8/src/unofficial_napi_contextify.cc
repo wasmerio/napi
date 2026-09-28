@@ -88,7 +88,14 @@ struct ModuleWrapBindingState {
   std::vector<ModuleWrapRecord*> modules;
   std::vector<PendingProviderPromise> pending_dynamic_imports;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
+  size_t request_metadata_bytes = 0;
 };
+
+// These native copies sit outside V8's heap accounting. Keep their maximum
+// below the fixed per-isolate overhead reserved by the host budget.
+constexpr size_t kMaxLiveModuleWraps = 2048;
+constexpr size_t kMaxModuleRequests = 4096;
+constexpr size_t kMaxModuleRequestMetadata = 4 * 1024 * 1024;
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
 napi_value GetSourceTextModuleDefaultHdoSymbol(napi_env env);
@@ -626,6 +633,10 @@ void DestroyModuleRecord(ModuleWrapRecord* record) {
   if (record == nullptr || record->env == nullptr) return;
   napi_env env = record->env;
   if (auto* state = FindModuleWrapState(env)) {
+    if (record->request_metadata_bytes != 0) {
+      state->request_metadata_bytes -= record->request_metadata_bytes;
+      record->request_metadata_bytes = 0;
+    }
     // Other modules keep raw dependency pointers for V8's resolve callback.
     // Invalidate every incoming link before freeing this record.
     for (ModuleWrapRecord* dependent : state->modules) {
@@ -1047,10 +1058,53 @@ bool PopulateModuleRequests(napi_env env,
                             v8::Local<v8::Context> context,
                             v8::Local<v8::Module> module) {
   if (env == nullptr || record == nullptr || module.IsEmpty()) return false;
+  auto* state = GetModuleWrapState(env);
+  if (state == nullptr || state->request_metadata_bytes > kMaxModuleRequestMetadata)
+    return false;
   record->module_requests.clear();
   record->resolve_cache.clear();
 
   v8::Local<v8::FixedArray> raw_requests = module->GetModuleRequests();
+  if (raw_requests->Length() < 0 ||
+      static_cast<size_t>(raw_requests->Length()) > kMaxModuleRequests)
+    return false;
+  const size_t available = kMaxModuleRequestMetadata - state->request_metadata_bytes;
+  size_t estimated_bytes = 0;
+  auto consume = [&](size_t bytes) {
+    if (bytes > available - estimated_bytes) return false;
+    estimated_bytes += bytes;
+    return true;
+  };
+  auto consume_string = [&](v8::Local<v8::Value> value) {
+    if (value.IsEmpty() || !value->IsString()) return false;
+    int length = value.As<v8::String>()->Utf8Length(env->isolate);
+    return length >= 0 &&
+           static_cast<size_t>(length) <= (available - estimated_bytes) / 4 &&
+           consume(static_cast<size_t>(length) * 4);
+  };
+  // Count all metadata before allocating any retained std::string or map
+  // entry. The factor of four covers the request text, serialized lookup key,
+  // temporary conversion, and allocator capacity; fixed overhead covers nodes
+  // and vector slack. The per-env sum includes every still-live module.
+  for (int i = 0; i < raw_requests->Length(); ++i) {
+    v8::Local<v8::Value> value = raw_requests->Get(context, i).As<v8::Value>();
+    if (value.IsEmpty() || !value->IsModuleRequest() || !consume(256))
+      return false;
+    v8::Local<v8::ModuleRequest> request = value.As<v8::ModuleRequest>();
+    if (!consume_string(request->GetSpecifier())) return false;
+    v8::Local<v8::FixedArray> attributes = request->GetImportAttributes();
+    if (attributes->Length() < 0 || attributes->Length() % 3 != 0 ||
+        static_cast<size_t>(attributes->Length() / 3) > kMaxModuleRequests)
+      return false;
+    for (int j = 0; j < attributes->Length(); j += 3) {
+      if (!consume(128) ||
+          !consume_string(attributes->Get(context, j).As<v8::Value>()) ||
+          !consume_string(attributes->Get(context, j + 1).As<v8::Value>()))
+        return false;
+    }
+  }
+  record->request_metadata_bytes = estimated_bytes;
+  state->request_metadata_bytes += estimated_bytes;
   record->module_requests.reserve(raw_requests->Length());
   for (int i = 0; i < raw_requests->Length(); ++i) {
     v8::Local<v8::Value> request_value = raw_requests->Get(context, i).As<v8::Value>();
@@ -2453,6 +2507,8 @@ static napi_status CreateSourceTextModule(
   *module_out = nullptr;
 
   EnsureModuleWrapCleanupHook(env);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+    return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
@@ -2563,6 +2619,10 @@ static napi_status CreateSourceTextModule(
     return napi_generic_failure;
   }
 
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+    DestroyModuleRecord(record);
+    return napi_generic_failure;
+  }
   GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;
@@ -2586,6 +2646,8 @@ static napi_status CreateSyntheticModule(
   if (napi_is_array(env, export_names, &is_array) != napi_ok || !is_array) return napi_invalid_arg;
 
   EnsureModuleWrapCleanupHook(env);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+    return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
@@ -2620,6 +2682,10 @@ static napi_status CreateSyntheticModule(
   napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
   napi_create_reference(env, synthetic_eval_steps, 1, &record->synthetic_eval_steps_ref);
 
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+    DestroyModuleRecord(record);
+    return napi_generic_failure;
+  }
   GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;

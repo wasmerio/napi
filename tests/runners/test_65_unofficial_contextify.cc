@@ -477,6 +477,58 @@ TEST_F(Test65UnofficialContextify, DestroyedDependencyInvalidatesIncomingLinks) 
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, parent), napi_ok);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
+  EnvScope s(runtime_.get());
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+
+  // Reuse one V8 source string: V8 can intern the specifier while each module
+  // record otherwise retains two uncharged native copies of it.
+  const std::string source_text = "import '" + std::string(256 * 1024, 'a') + "';";
+  napi_value source_value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, source_text.data(), source_text.size(),
+                                   &source_value), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(source_value);
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "same.mjs");
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+
+  std::vector<unofficial_napi_module> modules;
+  bool denied = false;
+  for (size_t i = 0; i < 32; ++i) {
+    unofficial_napi_module_create_result created{};
+    const napi_status status = unofficial_napi_module_wrap_create(s.env, &options, &created);
+    if (status != napi_ok) {
+      EXPECT_EQ(status, napi_generic_failure);
+      denied = true;
+      break;
+    }
+    modules.push_back(created.module);
+  }
+  ASSERT_TRUE(denied);
+  ASSERT_FALSE(modules.empty());
+  EXPECT_LT(modules.size(), 16u);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, modules.back()), napi_ok);
+  modules.pop_back();
+  unofficial_napi_module_create_result retry{};
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &retry), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, retry.module), napi_ok);
+  for (unofficial_napi_module module : modules)
+    ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+#endif
+
 TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
   EnvScope s(runtime_.get());
 
