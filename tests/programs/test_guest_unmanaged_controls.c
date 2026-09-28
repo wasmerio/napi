@@ -8,6 +8,24 @@ static void NAPI_CDECL UnmanagedInterrupt(napi_env env, void* data) {
   (void)data;
 }
 
+static void NAPI_CDECL WrapFinalizer(napi_env env, void* data, void* hint) {
+  (void)env;
+  (void)data;
+  (void)hint;
+}
+
+static unofficial_napi_env_owner callback_owner = NULL;
+static napi_status callback_release_status = napi_ok;
+
+static napi_value NAPI_CDECL ReleaseEnteredEnv(napi_env env,
+                                               napi_callback_info info) {
+  (void)info;
+  callback_release_status = unofficial_napi_release_env(callback_owner, NULL);
+  napi_value undefined_value = NULL;
+  if (napi_get_undefined(env, &undefined_value) != napi_ok) return NULL;
+  return undefined_value;
+}
+
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -51,6 +69,38 @@ int main(void) {
                 "guest created an uncharged native bytecode handle");
   CHECK_OR_FAIL(bytecode_result.bytecode == NULL,
                 "rejected bytecode open returned a handle");
+
+  napi_value wrapped;
+  napi_ref user_ref = NULL;
+  void* unwrapped = NULL;
+  NAPI_CALL(env, napi_create_object(env, &wrapped));
+  NAPI_CALL(env, napi_wrap(env, wrapped, (void*)0x1234, WrapFinalizer,
+                           NULL, &user_ref));
+  NAPI_CALL(env, napi_delete_reference(env, user_ref));
+  NAPI_CALL(env, napi_unwrap(env, wrapped, &unwrapped));
+  CHECK_OR_FAIL(unwrapped == (void*)0x1234,
+                "deleted user ref invalidated wrapped object");
+  NAPI_CALL(env, napi_remove_wrap(env, wrapped, &unwrapped));
+  CHECK_OR_FAIL(unwrapped == (void*)0x1234,
+                "remove_wrap read a deleted user ref");
+
+  napi_env callback_env = NULL;
+  NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &callback_env,
+                                             &callback_owner));
+  napi_value callback = NULL;
+  napi_value callback_global = NULL;
+  NAPI_CALL(callback_env, napi_create_function(callback_env, "release",
+                                               NAPI_AUTO_LENGTH,
+                                               ReleaseEnteredEnv, NULL,
+                                               &callback));
+  NAPI_CALL(callback_env, napi_get_global(callback_env, &callback_global));
+  napi_value callback_result = NULL;
+  NAPI_CALL(callback_env, napi_call_function(callback_env, callback_global,
+                                             callback, 0, NULL,
+                                             &callback_result));
+  CHECK_OR_FAIL(callback_release_status != napi_ok,
+                "guest disposed an entered V8 isolate");
+  NAPI_CALL(callback_env, unofficial_napi_release_env(callback_owner, NULL));
 
   napi_value source;
   napi_value undefined_value;

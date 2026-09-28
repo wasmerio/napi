@@ -2581,40 +2581,39 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
-  napi_ref ref = nullptr;
+  // The object's private slot must own its tracker independently of the
+  // optional user reference. Deleting a user reference must never free the
+  // tracker that napi_unwrap/napi_remove_wrap later read from that slot.
+  napi_ref wrapped_ref = finalize_cb != nullptr
+                             ? static_cast<napi_ref>(napi_ref_with_finalizer__::New(
+                                   env, object, 0, napi_ref_ownership__::kRuntime,
+                                   finalize_cb, native_object, finalize_hint))
+                             : static_cast<napi_ref>(napi_ref_with_data__::New(
+                                   env, object, 0, napi_ref_ownership__::kRuntime,
+                                   native_object));
+  if (wrapped_ref == nullptr) return napi_generic_failure;
+  napi_ref user_ref = nullptr;
   if (result != nullptr) {
-    ref = napi_ref_with_finalizer__::New(env,
-                                         object,
-                                         0,
-                                         napi_ref_ownership__::kUserland,
-                                         finalize_cb,
-                                         native_object,
-                                         finalize_hint);
-  } else if (finalize_cb != nullptr) {
-    ref = napi_ref_with_finalizer__::New(env,
-                                         object,
-                                         0,
-                                         napi_ref_ownership__::kRuntime,
-                                         finalize_cb,
-                                         native_object,
-                                         finalize_hint);
-  } else {
-    ref = napi_ref_with_data__::New(
-        env, object, 0, napi_ref_ownership__::kRuntime, native_object);
+    user_ref = napi_ref__::New(env, object, 0,
+                               napi_ref_ownership__::kUserland);
+    if (user_ref == nullptr) {
+      wrapped_ref->Destroy();
+      return napi_generic_failure;
+    }
   }
-  if (ref == nullptr) return napi_generic_failure;
 
   if (!object
            ->SetPrivate(env->context(),
                         wrapKey,
-                        v8::External::New(env->isolate, ref))
+                        v8::External::New(env->isolate, wrapped_ref))
            .FromMaybe(false)) {
-    ref->Destroy();
+    if (user_ref != nullptr) user_ref->Destroy();
+    wrapped_ref->Destroy();
     return napi_generic_failure;
   }
 
   if (result != nullptr) {
-    *result = ref;
+    *result = user_ref;
   }
   return napi_ok;
 }

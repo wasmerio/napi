@@ -119,7 +119,7 @@ fn guest_cannot_start_unmanaged_v8_workers_or_profiler() {
 }
 
 #[test]
-fn guest_messages_remain_charged_until_context_cleanup() {
+fn guest_messages_remain_charged_until_instance_shutdown() {
     let wasm = build_wasix_test("test_guest_message_budget");
     let ctx = NapiCtx::builder()
         .total_memory_bytes(GENEROUS_BUDGET)
@@ -132,8 +132,9 @@ fn guest_messages_remain_charged_until_context_cleanup() {
         budget.snapshot().serialized_message > 0,
         "queued message escaped memory accounting"
     );
-    drop(ctx);
+    ctx.runtime_control().shutdown_background_lane();
     assert_eq!(budget.snapshot().serialized_message, 0);
+    drop(ctx);
 }
 
 #[test]

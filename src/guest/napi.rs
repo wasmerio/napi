@@ -333,17 +333,27 @@ fn guest_unofficial_napi_release_env(
     scope_ptr: i32,
     loop_ptr: i32,
 ) -> Result<i32, WasiError> {
+    // Disposing an entered V8 isolate from its own JS/Wasm callback aborts
+    // the shared host. Leave all registries intact when this is attempted.
+    if env.data().in_callback() {
+        return Ok(1);
+    }
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
-    let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
-    else {
+    let Some((guest_env, snapi_env_state)) = env.data().scope_env(scope_id) else {
         return Ok(1);
     };
     let loop_id = if loop_ptr > 0 { loop_ptr as u32 } else { 0 };
     let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
-    env.data_mut()
-        .finish_unregister_napi_env(guest_env, snapi_env_state);
+    if status.as_ref().is_ok_and(|code| *code == 0) {
+        if let Some((guest_env, snapi_env_state)) =
+            env.data_mut().begin_unregister_napi_scope(scope_id)
+        {
+            env.data_mut()
+                .finish_unregister_napi_env(guest_env, snapi_env_state);
+        }
+    }
     status
 }
 
@@ -4771,11 +4781,6 @@ fn guest_napi_new_instance(
 // ============================================================
 
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
-    // EdgeJS binaries built before the extension namespace was versioned
-    // imported these existing functions from the core `napi` namespace.
-    if name.starts_with("unofficial_napi_") {
-        return true;
-    }
     matches!(
         name,
         "napi_wasm_init_env"
@@ -4914,7 +4919,7 @@ pub fn register_napi_imports(
     fe: &FunctionEnv<NapiEnv>,
     io: &mut Imports,
 ) {
-    let mut napi_namespace = namespace! {
+    let napi_namespace = namespace! {
         "napi_wasm_init_env" => Function::new_typed_with_env(store, fe, guest_napi_wasm_init_env),
         "napi_get_undefined" => Function::new_typed_with_env(store, fe, guest_napi_get_undefined),
         "napi_get_null" => Function::new_typed_with_env(store, fe, guest_napi_get_null),
@@ -5115,9 +5120,6 @@ pub fn register_napi_imports(
         "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 
-    for (name, export) in napi_extension_wasmer_namespace.iter() {
-        napi_namespace.insert(name.as_str(), export.clone());
-    }
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);
     io.register_namespace(
         NAPI_EXTENSION_WASMER_MODULE_NAME,

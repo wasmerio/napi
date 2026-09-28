@@ -435,6 +435,48 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
 
+TEST_F(Test65UnofficialContextify, DestroyedDependencyInvalidatesIncomingLinks) {
+  EnvScope s(runtime_.get());
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+
+  auto create_module = [&](const char* url, const char* text) {
+    napi_value wrapper = nullptr;
+    EXPECT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_text(Str(s.env, text));
+    unofficial_napi_module_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+    options.kind = unofficial_napi_module_source_text;
+    options.wrapper = wrapper;
+    options.url = Str(s.env, url);
+    options.context_or_undefined = undefined;
+    options.payload.source_text.source = &source;
+    options.payload.source_text.host_defined_option_id = undefined;
+    unofficial_napi_module_create_result created{};
+    EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+    return created.module;
+  };
+
+  unofficial_napi_module dependency =
+      create_module("dep.mjs", "export const dep = 2;");
+  unofficial_napi_module parent =
+      create_module("parent.mjs", "import './dep.mjs'; export const value = 1;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, parent, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, parent),
+            napi_pending_exception);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  EXPECT_NE(exception, nullptr);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, parent), napi_ok);
+}
+
 TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
   EnvScope s(runtime_.get());
 

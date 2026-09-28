@@ -82,6 +82,7 @@ pub struct NapiRuntimeHooks {
 pub struct NapiRuntimeControl {
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    pending_messages: Arc<PendingMessages>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     background_lane: Option<Arc<LazyBackgroundLane>>,
 }
@@ -116,10 +117,12 @@ impl NapiRuntimeControl {
     /// worker. The embedder waits for that worker's activity lease before
     /// final instance drain. Safe to call before the first N-API invocation.
     pub fn shutdown_background_lane(&self) {
+        self.host_stopped.store(true, Ordering::Release);
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         if let Some(lane) = &self.background_lane {
             lane.stop();
         }
+        self.pending_messages.close_and_clear();
     }
 }
 
@@ -397,6 +400,7 @@ impl NapiRuntimeControl {
         Self {
             envs: Arc::clone(&inner.envs),
             host_stopped: Arc::clone(&inner.host_stopped),
+            pending_messages: Arc::clone(&inner.pending_messages),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             background_lane: inner.background_lane.clone(),
         }
@@ -936,22 +940,6 @@ mod tests {
             &store,
             r#"(module
                 (import "napi" "napi_get_undefined" (func))
-            )"#,
-        );
-
-        assert_eq!(
-            NapiCtx::module_needs_napi(&module),
-            (Some(NapiVersion::V10), None)
-        );
-    }
-
-    #[test]
-    fn module_needs_napi_accepts_legacy_core_extension_import() {
-        let store = Store::default();
-        let module = compile_wat(
-            &store,
-            r#"(module
-                (import "napi" "unofficial_napi_get_hash_seed" (func))
             )"#,
         );
 

@@ -625,6 +625,18 @@ void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
 void DestroyModuleRecord(ModuleWrapRecord* record) {
   if (record == nullptr || record->env == nullptr) return;
   napi_env env = record->env;
+  if (auto* state = FindModuleWrapState(env)) {
+    // Other modules keep raw dependency pointers for V8's resolve callback.
+    // Invalidate every incoming link before freeing this record.
+    for (ModuleWrapRecord* dependent : state->modules) {
+      if (dependent == nullptr || dependent == record) continue;
+      for (ModuleWrapRecord*& linked : dependent->linked_requests) {
+        if (linked == record) linked = nullptr;
+      }
+    }
+    if (state->temporary_required_module_facade_original == record)
+      state->temporary_required_module_facade_original = nullptr;
+  }
   RemoveModuleRecord(env, record);
   ResetRef(env, &record->wrapper_ref);
   ResetRef(env, &record->synthetic_eval_steps_ref);
@@ -1512,10 +1524,11 @@ bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<s
   v8::Local<v8::Array> array = value.As<v8::Array>();
   constexpr uint32_t kMaxParams = 1024;
   constexpr size_t kMaxParamBytes = 1024 * 1024;
-  if (array->Length() > kMaxParams) return false;
-  out->reserve(array->Length());
+  const uint32_t length = array->Length();
+  if (length > kMaxParams) return false;
+  out->reserve(length);
   size_t total_bytes = 0;
-  for (uint32_t i = 0; i < array->Length(); ++i) {
+  for (uint32_t i = 0; i < length; ++i) {
     v8::Local<v8::Value> item;
     if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
     const int bytes = item.As<v8::String>()->Utf8Length(env->isolate);
@@ -2252,9 +2265,10 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     v8::Local<v8::Value> value = napi_v8_unwrap_value(context_extensions_or_undefined);
     if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
     v8::Local<v8::Array> array = value.As<v8::Array>();
-    if (array->Length() > 1024) return napi_invalid_arg;
-    context_extensions.reserve(array->Length());
-    for (uint32_t i = 0; i < array->Length(); ++i) {
+    const uint32_t length = array->Length();
+    if (length > 1024) return napi_invalid_arg;
+    context_extensions.reserve(length);
+    for (uint32_t i = 0; i < length; ++i) {
       v8::Local<v8::Value> item;
       if (!array->Get(current, i).ToLocal(&item) || !item->IsObject()) return napi_invalid_arg;
       context_extensions.push_back(item.As<v8::Object>());

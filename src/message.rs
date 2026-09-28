@@ -6,7 +6,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
@@ -52,12 +55,14 @@ impl Drop for MessageCharge {
 #[derive(Debug)]
 pub(crate) struct PendingMessages {
     handles: Mutex<HashMap<u32, MessageCharge>>,
+    closed: AtomicBool,
 }
 
 impl PendingMessages {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             handles: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -68,6 +73,9 @@ impl PendingMessages {
             return Err(charge);
         }
         let mut handles = self.handles.lock().expect("poisoned message registry");
+        if self.closed.load(Ordering::Acquire) {
+            return Err(charge);
+        }
         if handles.contains_key(&id) || handles.try_reserve(1).is_err() {
             return Err(charge);
         }
@@ -83,15 +91,28 @@ impl PendingMessages {
             .expect("poisoned message registry")
             .remove(&id)
     }
+
+    /// Discard queued payloads once the instance has stopped and guest work
+    /// has drained. Cloned Wasmer hooks may otherwise retain the context.
+    pub(crate) fn close_and_clear(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.clear();
+    }
+
+    fn clear(&self) {
+        let handles = {
+            let mut guard = self.handles.lock().expect("poisoned message registry");
+            std::mem::take(&mut *guard)
+        };
+        for id in handles.keys().copied() {
+            unsafe { snapi_bridge_unofficial_message_drop(id) };
+        }
+    }
 }
 
 impl Drop for PendingMessages {
     fn drop(&mut self) {
-        let handles = self.handles.get_mut().expect("poisoned message registry");
-        for id in handles.keys().copied() {
-            unsafe { snapi_bridge_unofficial_message_drop(id) };
-        }
-        handles.clear();
+        self.clear();
     }
 }
 

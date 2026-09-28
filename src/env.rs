@@ -432,6 +432,16 @@ impl NapiEnv {
         self.callback_depth = self.callback_depth.saturating_sub(1);
     }
 
+    pub(crate) fn in_callback(&self) -> bool {
+        self.callback_depth != 0
+    }
+
+    pub(crate) fn scope_env(&self, scope_id: u32) -> Option<(u32, SnapiEnv)> {
+        let env_id = *self.napi_scopes.get(&scope_id)?;
+        let env = *self.napi_envs.get(&env_id)? as SnapiEnv;
+        Some((env_id, env))
+    }
+
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         let env_id = {

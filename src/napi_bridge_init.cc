@@ -127,6 +127,7 @@ struct SnapiEnvState {
   // independently of every other environment. Reentrant guest callbacks may
   // enter the same environment on the same OS thread.
   std::recursive_mutex mutex;
+  size_t active_bridge_calls = 0;
   // Owned by the Rust NapiCtx while this env is live. EnvLease reinstalls its
   // provenance on each bridge entry, including reentrant guest callbacks.
   void* background_lane = nullptr;
@@ -246,6 +247,7 @@ struct EnvLease {
                  ? std::unique_lock<std::recursive_mutex>(state->mutex)
                  : std::unique_lock<std::recursive_mutex>()) {
     if (state != nullptr) {
+      ++state->active_bridge_calls;
       // WASIX workers may predate V8's Linux protection key allocation.
       // Re-enable only V8's default read-only access on this thread before
       // touching any isolate-owned memory.
@@ -256,6 +258,7 @@ struct EnvLease {
   }
 
   ~EnvLease() {
+    if (state != nullptr) --state->active_bridge_calls;
     if (lane_bound) snapi_v8_lane_swap_current(previous_lane);
   }
 
@@ -520,6 +523,11 @@ EnvLease RequireEnvState(SnapiEnvState *env_state) {
 napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   if (state == nullptr)
     return napi_ok;
+  // The release import itself owns one lease. A second one means this call
+  // reentered from an active N-API operation and disposing the entered V8
+  // isolate would leave its outer stack with freed native state.
+  if (state->active_bridge_calls != 1 || !state->callback_invocations.empty())
+    return napi_generic_failure;
   // Stop admitting control calls. Keep the state in the registry through V8
   // release: finalizer callbacks can reenter the bridge on this same thread.
   // Other callers wait on the per-env mutex and find a null env afterward.
