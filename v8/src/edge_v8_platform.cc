@@ -231,6 +231,25 @@ extern "C" bool snapi_v8_lane_overloaded(void* handle) {
   return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsOverloaded();
 }
 
+// Native-only regression hook. It is not reachable through guest imports.
+// Exercising the actual V8 Task queue catches accidental process-wide pool
+// routing that a Rust-only state-machine test cannot detect.
+extern "C" bool snapi_v8_lane_post_test_task(void* handle,
+                                               void (*callback)(void*), void* data) {
+  if (handle == nullptr || callback == nullptr) return false;
+  class CallbackTask final : public v8::Task {
+   public:
+    CallbackTask(void (*callback)(void*), void* data)
+        : callback_(callback), data_(data) {}
+    void Run() override { callback_(data_); }
+   private:
+    void (*callback_)(void*);
+    void* data_;
+  };
+  return static_cast<BackgroundLane*>(handle)->Post(
+      std::make_unique<CallbackTask>(callback, data), 0.0);
+}
+
 struct EdgeV8Platform::FinishedCallback {
   void (*callback)(void*) = nullptr;
   void* data = nullptr;

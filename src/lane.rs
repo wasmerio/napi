@@ -255,3 +255,103 @@ impl LazyBackgroundLane {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::atomic::{AtomicUsize, Ordering}, thread};
+
+    unsafe extern "C" {
+        fn snapi_v8_lane_post_test_task(
+            handle: *mut c_void,
+            callback: unsafe extern "C" fn(*mut c_void),
+            data: *mut c_void,
+        ) -> bool;
+    }
+
+    struct TestTask {
+        started: mpsc::Sender<()>,
+        release: Option<Arc<(Mutex<bool>, Condvar)>>,
+    }
+
+    unsafe extern "C" fn run_test_task(data: *mut c_void) {
+        let task = unsafe { Box::from_raw(data.cast::<TestTask>()) };
+        let _ = task.started.send(());
+        if let Some(release) = &task.release {
+            let (lock, changed) = &**release;
+            let mut ready = lock.lock().unwrap();
+            while !*ready { ready = changed.wait(ready).unwrap(); }
+        }
+    }
+
+    fn post(lane: &LazyBackgroundLane, task: TestTask) {
+        let handle = match &*lane.state.lock().unwrap() {
+            State::Ready(lane) => lane.handle.as_ptr(),
+            _ => panic!("lane not ready"),
+        };
+        let data = Box::into_raw(Box::new(task));
+        if !unsafe { snapi_v8_lane_post_test_task(handle, run_test_task, data.cast()) } {
+            drop(unsafe { Box::from_raw(data) });
+            panic!("task admission rejected");
+        }
+    }
+
+    #[test]
+    fn a_blocked_instance_lane_does_not_stall_another() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let exited = Arc::new(AtomicUsize::new(0));
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let make_lane = || {
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let spawner: BackgroundThreadSpawner = Arc::new(move |work| {
+                let finished_tx = finished_tx.clone();
+                thread::Builder::new().spawn(move || {
+                    work();
+                    let _ = finished_tx.send(());
+                })?;
+                Ok(())
+            });
+            let scope: BackgroundTaskScope = {
+                let entered = Arc::clone(&entered);
+                let exited = Arc::clone(&exited);
+                Arc::new(move || {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    Box::new(Guard(Arc::clone(&exited)))
+                })
+            };
+            let budget = ResourceBudget::with_memory_limit(16 * 1024 * 1024);
+            (
+                LazyBackgroundLane::new(spawner, Arc::new(|| {}), Arc::clone(&budget), scope),
+                budget,
+                finished_rx,
+            )
+        };
+        let (first, first_budget, first_finished) = make_lane();
+        let (second, second_budget, second_finished) = make_lane();
+        drop(first.enter().unwrap());
+        drop(second.enter().unwrap());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_tx, first_rx) = mpsc::channel();
+        post(&first, TestTask { started: first_tx, release: Some(Arc::clone(&release)) });
+        first_rx.recv_timeout(Duration::from_secs(2)).expect("first task starts");
+        let (second_tx, second_rx) = mpsc::channel();
+        post(&second, TestTask { started: second_tx, release: None });
+        second_rx.recv_timeout(Duration::from_secs(2)).expect("second instance progresses independently");
+        first.stop();
+        second.stop();
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        first_finished.recv_timeout(Duration::from_secs(2)).expect("first worker stops");
+        second_finished.recv_timeout(Duration::from_secs(2)).expect("second worker stops");
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+        assert_eq!(exited.load(Ordering::SeqCst), 2);
+        assert_eq!(first_budget.snapshot().v8_background_lane, 0);
+        assert_eq!(second_budget.snapshot().v8_background_lane, 0);
+    }
+}
