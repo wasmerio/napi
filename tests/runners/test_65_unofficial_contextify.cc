@@ -20,6 +20,33 @@ napi_value Sym(napi_env env, const char* value) {
   return out;
 }
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+unofficial_napi_module CreateSourceModule(napi_env env, const char* url, const char* text) {
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  if (napi_create_object(env, &wrapper) != napi_ok ||
+      napi_get_undefined(env, &undefined) != napi_ok) {
+    return nullptr;
+  }
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(env, text));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(env, url);
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  if (unofficial_napi_module_wrap_create(env, &options, &created) != napi_ok) {
+    return nullptr;
+  }
+  return created.module;
+}
+#endif
+
 #if defined(NAPI_TEST_ENGINE_V8)
 constexpr char kPreparedStack[] =
     "Error: sentinel\n"
@@ -500,6 +527,123 @@ TEST_F(Test65UnofficialContextify, DestroyedDependencyInvalidatesIncomingLinks) 
   EXPECT_NE(exception, nullptr);
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, parent), napi_ok);
 }
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test65UnofficialContextify, TransitiveDestroyedDependencyBlocksImplicitLinking) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency =
+      CreateSourceModule(s.env, "dep.mjs", "export const dep = 2;");
+  unofficial_napi_module middle =
+      CreateSourceModule(s.env, "middle.mjs", "import './dep.mjs'; export const middle = 3;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import './middle.mjs'; export const root = 4;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(middle, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, middle, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &middle), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+
+  auto assert_pending = [&](napi_status status) {
+    EXPECT_EQ(status, napi_pending_exception);
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+    EXPECT_NE(exception, nullptr);
+  };
+  assert_pending(unofficial_napi_module_wrap_instantiate(s.env, root));
+  napi_value result = nullptr;
+  assert_pending(unofficial_napi_module_wrap_evaluate(s.env, root, -1, false, &result));
+  assert_pending(unofficial_napi_module_wrap_evaluate_sync(
+      s.env, root, Str(s.env, "root.mjs"), Str(s.env, "parent.mjs"), &result));
+  assert_pending(unofficial_napi_module_wrap_create_required_module_facade(s.env, root, &result));
+
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, middle), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, LinkedGraphSurvivesDestroyedDependencyWrapper) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency =
+      CreateSourceModule(s.env, "dep.mjs", "export const dep = 2;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import { dep } from './dep.mjs'; export const root = dep + 2;");
+  unofficial_napi_module outer =
+      CreateSourceModule(s.env, "outer.mjs", "import { root } from './root.mjs'; export const outer = root + 1;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_NE(outer, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, outer, 1, &root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, outer), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(
+                s.env, outer, Str(s.env, "outer.mjs"), Str(s.env, "parent.mjs"), &result),
+            napi_ok);
+  EXPECT_NE(result, nullptr);
+  napi_value namespace_value = nullptr;
+  napi_value exported_value = nullptr;
+  int32_t exported = 0;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, outer, &namespace_value), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, namespace_value, "outer", &exported_value), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, exported_value, &exported), napi_ok);
+  EXPECT_EQ(exported, 5);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, outer), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, CyclicGraphLinksWithoutRecursion) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module a =
+      CreateSourceModule(s.env, "a.mjs", "import './b.mjs'; export const a = 1;");
+  unofficial_napi_module b =
+      CreateSourceModule(s.env, "b.mjs", "import './a.mjs'; export const b = 2;");
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, a, 1, &b), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, b, 1, &a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, b), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, InvalidatedParentCanRelinkReplacement) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module old_dependency =
+      CreateSourceModule(s.env, "old.mjs", "export const dep = 1;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import { dep } from './dep.mjs'; export const root = dep + 2;");
+  ASSERT_NE(old_dependency, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, old_dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &old_dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, old_dependency), napi_ok);
+
+  unofficial_napi_module replacement =
+      CreateSourceModule(s.env, "new.mjs", "export const dep = 2;");
+  ASSERT_NE(replacement, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, replacement, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &replacement), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(
+                s.env, root, Str(s.env, "root.mjs"), Str(s.env, "parent.mjs"), &result),
+            napi_ok);
+  napi_value namespace_value = nullptr;
+  napi_value exported_value = nullptr;
+  int32_t exported = 0;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, root, &namespace_value), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, namespace_value, "root", &exported_value), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, exported_value, &exported), napi_ok);
+  EXPECT_EQ(exported, 4);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, replacement), napi_ok);
+}
+#endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
