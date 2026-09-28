@@ -40,6 +40,21 @@ fn two_guest_isolates_run_sequentially() {
     }
 }
 
+#[test]
+fn two_guest_isolates_can_coexist_while_one_sleeps() {
+    let sleeping_wasm = build_wasix_test("test_env_sleep");
+    let hello_wasm = build_wasix_test("hello_napi_test");
+    let sleeping = thread::spawn(move || run_guest(&NapiCtx::default(), &sleeping_wasm));
+    thread::sleep(Duration::from_secs(1));
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &hello_wasm).expect("second guest failed");
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(stdout.contains("HELLO_NAPI_TEST_OK=1"), "{stdout}\n{stderr}");
+    let (exit_code, stdout, stderr) = sleeping.join().unwrap().unwrap();
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(stdout.contains("ENV_READY"), "{stdout}\n{stderr}");
+}
+
 /// The kill path Edge relies on: a JS loop that never returns on its own has
 /// to stop when the host says so. Nothing in the guest cooperates here — the
 /// isolate is executing JS when the request arrives.
