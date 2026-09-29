@@ -161,3 +161,61 @@ fn serialized_sab_survives_producer_teardown_and_message_release_in_same_memory(
         assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
     }
 }
+
+#[cfg(target_os = "linux")]
+fn has_mapping_at(address: usize) -> bool {
+    // Query the kernel's mapping table. After every Store has dropped, this
+    // test never dereferences the guest address just to check its lifetime.
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|range| range.split_once('-'))
+        .filter_map(|(start, end)| {
+            Some((
+                usize::from_str_radix(start, 16).ok()?,
+                usize::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .any(|(start, end)| start <= address && address < end)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queued_sab_alone_pins_mapping_until_release_or_host_stop() {
+    for (produce, stop_host) in [("produce_legacy", false), ("produce_current", true)] {
+        let ctx = NapiCtx::default();
+        let budget = ctx.budget();
+        let (base, shared) = {
+            let mut origin_store = Store::default();
+            let memory =
+                Memory::new(&mut origin_store, MemoryType::new(1, Some(1024), true)).unwrap();
+            let base = memory.view(&origin_store).data_ptr() as usize;
+            let shared = memory.as_shared(&origin_store).unwrap();
+            (base, shared)
+        };
+        let message_id = {
+            let (mut producer, instance) = setup(&ctx, Some(shared.clone()));
+            call0(&mut producer, &instance, produce)
+        };
+        assert!(message_id > 0);
+        drop(shared);
+
+        // The queued payload is now the sole owner of its detached mapping
+        // and GuestHeap charge. No Store or external SharedMemory remains.
+        assert!(has_mapping_at(base));
+        let queued = budget.snapshot();
+        assert!(queued.wasm_linear > 0);
+        assert!(queued.serialized_message > 0);
+
+        if stop_host {
+            ctx.runtime_control().terminate_all();
+        } else {
+            drop(ctx);
+        }
+        assert!(!has_mapping_at(base));
+        let released = budget.snapshot();
+        assert_eq!(released.wasm_linear, 0);
+        assert_eq!(released.serialized_message, 0);
+    }
+}

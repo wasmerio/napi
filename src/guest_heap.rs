@@ -136,9 +136,13 @@ pub(crate) struct GuestHeap {
     inner: Mutex<HeapInner>,
 }
 
-// SAFETY: `base` points into a mapping that outlives the heap: the instance's
-// store keeps it alive, and the heap is dropped with the env. All mutable
-// state is behind the mutex or atomics.
+// SAFETY: `base` is an address token, not an owned pointer. A serialized
+// message can retain a nonshared GuestHeap after its Store has unmapped that
+// address. Allocation requires a live registered memory; after the final
+// registration leaves, message teardown only compares addresses and frees
+// allocator metadata, without dereferencing `base`. Shared messages also
+// retain a detached SharedMemory handle until their native payload is gone.
+// Mutable allocator state is behind `inner`; charges use atomics.
 unsafe impl Send for GuestHeap {}
 unsafe impl Sync for GuestHeap {}
 
@@ -353,8 +357,10 @@ impl GuestHeap {
     }
 
     pub(crate) fn offset_to_host(&self, offset: u32) -> *mut u8 {
-        // SAFETY: callers only pass offsets inside the (reserved) range.
-        unsafe { self.base.add(offset as usize) }
+        // Address arithmetic alone is valid even when a message has retained
+        // the heap after its nonshared mapping was torn down. Callers may use
+        // the result only while a live memory registration owns the mapping.
+        self.base.wrapping_add(offset as usize)
     }
 
     /// Allocate `len` bytes of guest memory, 16-byte aligned. Returns the
@@ -368,6 +374,9 @@ impl GuestHeap {
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        if inner.memories.is_empty() {
+            return None;
+        }
         let offset = match Self::try_chunks(&mut inner, units) {
             Some(offset) => offset,
             None => {
@@ -403,6 +412,13 @@ impl GuestHeap {
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        if !inner
+            .memories
+            .iter()
+            .any(|(_, memory)| memory.is_from_store(store))
+        {
+            return None;
+        }
         let offset = if let Some(offset) = Self::try_chunks(&mut inner, units) {
             offset
         } else {
@@ -814,6 +830,7 @@ mod tests {
             "a different workload must not reuse this heap's accounting"
         );
         old.unregister_memory(registration);
+        assert!(old.alloc(8, true).is_none());
         let (fresh, registration) =
             GuestHeap::get_or_create(&mut store.as_store_mut(), &memory, budget).unwrap();
         assert!(!Arc::ptr_eq(&old, &fresh));
