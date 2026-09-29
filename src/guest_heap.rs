@@ -67,7 +67,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
+use wasmer::{Memory, MemoryStyle, Pages, Store, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -112,7 +112,8 @@ struct HeapInner {
     /// One handle to this heap's linear memory per store that has reached it.
     /// A handle only works with the store that made it, so growing means
     /// finding the one belonging to the store currently lent.
-    memories: Vec<Memory>,
+    memories: Vec<(u64, Memory)>,
+    next_memory_registration: u64,
     chunks: Vec<Chunk>,
     live: HashMap<u32, LiveAlloc>,
     /// Free bytes across all chunks (maintained on alloc/free/claim).
@@ -209,48 +210,67 @@ impl GuestHeap {
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
         budget: Arc<ResourceBudget>,
-    ) -> Option<Arc<Self>> {
+    ) -> Option<(Arc<Self>, u64)> {
         let base = memory.view(store).data_ptr() as usize;
         if base == 0 {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget).map(|heap| (heap, 0));
         }
         // Shared memories: one heap per base, reused across threads/envs.
         // Non-shared memories are single-threaded (conformance lane) — a fresh
         // heap each time is fine and avoids cross-instance base-key collisions.
         if !memory.ty(store).shared {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget).map(|heap| (heap, 0));
         }
         let mut reg = shared_registry()
             .lock()
             .expect("guest-heap registry poisoned");
         if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
-            // This store reaches the heap for the first time; its handle is
-            // the only one that can grow the memory while it is the store
-            // being lent.
-            existing.register_memory(store, memory);
-            return Some(existing);
+            match existing.register_memory_if_active(memory, &budget) {
+                Ok(Some(registration)) => return Some((existing, registration)),
+                Ok(None) => {} // a message may retain a heap with no live env
+                Err(()) => return None,
+            }
         }
         let heap = Self::new(store, memory, budget)?;
         reg.insert(base, Arc::downgrade(&heap));
         // Opportunistically drop dead entries so the map cannot grow unbounded
         // across many short-lived instances that reuse addresses.
         reg.retain(|_, w| w.strong_count() > 0);
-        Some(heap)
+        Some((heap, 0))
     }
 
-    /// Record the handle `store` uses for this heap's linear memory, if it has
-    /// not already. Only the handle belonging to the store being lent can grow
-    /// the memory, so every store that reaches a shared heap contributes one.
-    fn register_memory(&self, store: &impl AsStoreRef, memory: &Memory) {
+    /// Record one environment's store handle; registration is released when
+    /// that environment drops, even if a queued message retains the heap.
+    /// The alive check and registration share one lock so a final teardown
+    /// cannot slip between them. Another budget may never reuse this heap.
+    fn register_memory_if_active(
+        &self,
+        memory: &Memory,
+        budget: &Arc<ResourceBudget>,
+    ) -> Result<Option<u64>, ()> {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        if inner
+        if inner.memories.is_empty() {
+            return Ok(None);
+        }
+        if !Arc::ptr_eq(&self.budget, budget) {
+            return Err(());
+        }
+        let id = inner.next_memory_registration;
+        inner.next_memory_registration = id.checked_add(1).ok_or(())?;
+        inner.memories.try_reserve(1).map_err(|_| ())?;
+        inner.memories.push((id, memory.clone()));
+        Ok(Some(id))
+    }
+
+    pub(crate) fn unregister_memory(&self, registration: u64) {
+        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        if let Some(index) = inner
             .memories
             .iter()
-            .any(|known| known.is_from_store(store))
+            .position(|(id, _)| *id == registration)
         {
-            return;
+            inner.memories.swap_remove(index);
         }
-        inner.memories.push(memory.clone());
     }
 
     /// Build a fresh heap over the instance's imported memory. Prefer
@@ -289,7 +309,8 @@ impl GuestHeap {
             budget,
             charged: AtomicU64::new(0),
             inner: Mutex::new(HeapInner {
-                memories: vec![memory.clone()],
+                memories: vec![(0, memory.clone())],
+                next_memory_registration: 1,
                 chunks: Vec::new(),
                 live: HashMap::new(),
                 free_bytes: 0,
@@ -463,8 +484,8 @@ impl GuestHeap {
         let Some(memory) = inner
             .memories
             .iter()
-            .find(|memory| memory.is_from_store(store))
-            .cloned()
+            .find(|(_, memory)| memory.is_from_store(store))
+            .map(|(_, memory)| memory.clone())
         else {
             // This store has no handle on the heap's memory, so it is not the
             // store that owns it.
@@ -773,6 +794,30 @@ mod tests {
             GuestHeap::new(&mut store_mut, &memory, budget).expect("guest heap")
         };
         (memory, heap)
+    }
+
+    #[test]
+    fn message_retained_heap_is_not_reused_after_its_last_env_detaches() {
+        let budget = ResourceBudget::unlimited();
+        let mut store = Store::default();
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages(1), Some(Pages(1024)), true),
+        )
+        .unwrap();
+        let (old, registration) =
+            GuestHeap::get_or_create(&mut store.as_store_mut(), &memory, Arc::clone(&budget))
+                .unwrap();
+        let other_budget = ResourceBudget::unlimited();
+        assert!(
+            GuestHeap::get_or_create(&mut store.as_store_mut(), &memory, other_budget).is_none(),
+            "a different workload must not reuse this heap's accounting"
+        );
+        old.unregister_memory(registration);
+        let (fresh, registration) =
+            GuestHeap::get_or_create(&mut store.as_store_mut(), &memory, budget).unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        fresh.unregister_memory(registration);
     }
 
     #[test]

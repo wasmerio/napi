@@ -23,16 +23,57 @@ use crate::{
 /// the measured native bytes retained until the receiver consumes the handle.
 pub(crate) const SERIALIZATION_RESERVATION: u64 = 32 * 1024 * 1024;
 
-#[derive(Debug)]
 pub(crate) struct MessageCharge {
     budget: Arc<ResourceBudget>,
     bytes: u64,
+    // Native serialized messages can retain SharedArrayBuffer backing in this
+    // heap's guest memory. Keep its allocation metadata and WasmLinear charge
+    // alive until the native payload is destroyed.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    memory: Option<Arc<crate::guest_heap::GuestHeap>>,
+    // A detached shared handle pins the exact mapping independently of any
+    // producer Store. Native payloads may retain backing-store pointers until
+    // release, including after their producing worker has exited.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    shared_memory: Option<wasmer::SharedMemory>,
+}
+
+impl std::fmt::Debug for MessageCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageCharge")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MessageCharge {
     pub(crate) fn reserve(budget: Arc<ResourceBudget>, bytes: u64) -> Result<Self, OverBudget> {
         budget.try_charge(Pool::SerializedMessage, bytes)?;
-        Ok(Self { budget, bytes })
+        Ok(Self {
+            budget,
+            bytes,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            memory: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            shared_memory: None,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn bind_memory(
+        &mut self,
+        memory: Arc<crate::guest_heap::GuestHeap>,
+        shared_memory: Option<wasmer::SharedMemory>,
+    ) {
+        self.memory = Some(memory);
+        self.shared_memory = shared_memory;
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn belongs_to_memory(&self, memory: &Arc<crate::guest_heap::GuestHeap>) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, memory))
     }
 
     pub(crate) fn shrink(&mut self, retained_bytes: u64) -> bool {
@@ -118,6 +159,23 @@ impl PendingMessages {
         self.take_kind(id, false)
     }
 
+    /// Deserialization may only access native backing stores while an env
+    /// attached to the producer's exact memory is alive. Leave a mismatched
+    /// payload queued so the producer can still release it.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn take_for_memory(
+        &self,
+        id: u32,
+        memory: &Arc<crate::guest_heap::GuestHeap>,
+    ) -> Option<Arc<MessageCharge>> {
+        let mut handles = self.handles.lock().expect("poisoned message registry");
+        let entry = handles.get(&id)?;
+        if entry.legacy || !entry.charge.belongs_to_memory(memory) {
+            return None;
+        }
+        handles.remove(&id).map(|entry| entry.charge)
+    }
+
     pub(crate) fn take_legacy(&self, id: u32) -> Option<Arc<MessageCharge>> {
         self.take_kind(id, true)
     }
@@ -133,12 +191,20 @@ impl PendingMessages {
     /// Legacy deserialization borrows a payload; only explicit release
     /// consumes it. The native bridge holds a shared lease across the read,
     /// so a concurrent release cannot free the bytes underneath V8.
-    pub(crate) fn lease_legacy(&self, id: u32) -> Option<Arc<MessageCharge>> {
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn lease_legacy_for_memory(
+        &self,
+        id: u32,
+        memory: &Arc<crate::guest_heap::GuestHeap>,
+    ) -> Option<Arc<MessageCharge>> {
         self.handles
             .lock()
             .expect("poisoned message registry")
             .get(&id)
-            .and_then(|entry| entry.legacy.then(|| Arc::clone(&entry.charge)))
+            .and_then(|entry| {
+                (entry.legacy && entry.charge.belongs_to_memory(memory))
+                    .then(|| Arc::clone(&entry.charge))
+            })
     }
 
     /// Discard queued payloads once the instance has stopped and guest work

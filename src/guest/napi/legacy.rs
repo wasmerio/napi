@@ -1180,6 +1180,9 @@ fn legacy_serialize_value(
     if snapi_env.is_null() || super::read_guest_bytes(&mut env, result_ptr, 4).is_none() {
         return Ok(1);
     }
+    let Some((memory, shared_memory)) = super::message_memory_lease(&env) else {
+        return Ok(1);
+    };
     let pending = env.data().pending_messages.clone();
     let Ok(mut charge) =
         MessageCharge::reserve(env.data().budget.clone(), SERIALIZATION_RESERVATION)
@@ -1215,6 +1218,7 @@ fn legacy_serialize_value(
         unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }
+    charge.bind_memory(memory, shared_memory);
     if let Err(rejected_charge) = pending.insert_legacy(message, charge) {
         unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
         drop(rejected_charge);
@@ -1245,7 +1249,14 @@ fn legacy_deserialize_value(
     }
     // A concurrent explicit release removes the registry entry, while this
     // lease keeps the app charge until the native reader has finished.
-    let Some(_charge) = env.data().pending_messages.lease_legacy(message as u32) else {
+    let Some(memory) = env.data().guest_heap.as_ref() else {
+        return Ok(1);
+    };
+    let Some(_charge) = env
+        .data()
+        .pending_messages
+        .lease_legacy_for_memory(message as u32, memory)
+    else {
         return Ok(1);
     };
     let mut value = 0;

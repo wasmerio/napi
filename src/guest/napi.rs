@@ -185,12 +185,13 @@ fn ensure_guest_heap(env: &mut FunctionEnvMut<NapiEnv>) -> bool {
         return false;
     };
     let budget = std::sync::Arc::clone(&env.data().budget);
-    let Some(heap) =
+    let Some((heap, registration)) =
         crate::guest_heap::GuestHeap::get_or_create(&mut env.as_store_mut(), &memory, budget)
     else {
         return false;
     };
     env.data_mut().guest_heap = Some(heap);
+    env.data_mut().guest_heap_registration = Some(registration);
     true
 }
 
@@ -837,6 +838,27 @@ fn guest_unofficial_napi_structured_clone(
     Ok(status)
 }
 
+/// Bind every queued native message to this guest memory. The serializer can
+/// retain SharedArrayBuffer and transferred ArrayBuffer backing stores, and
+/// does not expose a complete backing-store ownership flag. A detached shared
+/// handle keeps the mapping alive after the producer Store exits; if the
+/// public runtime cannot provide one, serialization fails before native work.
+fn message_memory_lease(
+    env: &FunctionEnvMut<NapiEnv>,
+) -> Option<(
+    Arc<crate::guest_heap::GuestHeap>,
+    Option<wasmer::SharedMemory>,
+)> {
+    let heap = Arc::clone(env.data().guest_heap.as_ref()?);
+    let memory = env.data().memory.as_ref()?;
+    let shared = if memory.ty(env).shared {
+        Some(memory.as_shared(env)?)
+    } else {
+        None
+    };
+    Some((heap, shared))
+}
+
 fn guest_unofficial_napi_message_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -846,6 +868,9 @@ fn guest_unofficial_napi_message_create(
     if payload_out_ptr <= 0 {
         return Ok(1);
     }
+    let Some((memory, shared_memory)) = message_memory_lease(&env) else {
+        return Ok(1);
+    };
     let pending = env.data().pending_messages.clone();
     let Ok(mut charge) =
         MessageCharge::reserve(env.data().budget.clone(), SERIALIZATION_RESERVATION)
@@ -882,6 +907,7 @@ fn guest_unofficial_napi_message_create(
         unsafe { snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }
+    charge.bind_memory(memory, shared_memory);
     if let Err(rejected_charge) = pending.insert(message, charge) {
         unsafe { snapi_bridge_unofficial_message_drop(message) };
         drop(rejected_charge);
@@ -905,7 +931,14 @@ fn guest_unofficial_napi_message_take(
     if payload <= 0 {
         return Ok(1);
     }
-    let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
+    let Some(memory) = env.data().guest_heap.as_ref() else {
+        return Ok(1);
+    };
+    let Some(_charge) = env
+        .data()
+        .pending_messages
+        .take_for_memory(payload as u32, memory)
+    else {
         return Ok(1);
     };
     if result_out_ptr <= 0 || read_guest_bytes(&mut env, result_out_ptr, 4).is_none() {

@@ -124,6 +124,8 @@ pub(crate) struct NapiEnv {
     /// this is the only allocation path for guest-visible V8 memory.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) guest_heap_registration: Option<u64>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -202,6 +204,8 @@ impl NapiEnv {
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             guest_heap: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            guest_heap_registration: None,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             malloc_fn: None,
             table: None,
@@ -674,6 +678,12 @@ impl Drop for NapiEnv {
             if let Some(lease) = self.session_lease.take() {
                 std::mem::forget(lease);
             }
+        }
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if let (Some(heap), Some(registration)) =
+            (&self.guest_heap, self.guest_heap_registration.take())
+        {
+            heap.unregister_memory(registration);
         }
     }
 }
