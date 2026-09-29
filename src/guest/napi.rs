@@ -338,14 +338,11 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: i32,
 ) -> i32 {
-    let Some(has_flags) = abi::read_runtime_options(&mut env, options_ptr) else {
-        return 1;
-    };
     // V8 flags are process-wide. A guest must not change flags for other
     // tenants or make the first caller decide the host's security policy.
-    if has_flags {
+    let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
         return 1;
-    }
+    };
     if env.data().host_stopped() {
         return 1;
     }

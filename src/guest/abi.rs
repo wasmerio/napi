@@ -191,22 +191,61 @@ pub(crate) fn read_legacy_env_create(
     })
 }
 
-/// Decode only whether the guest requested process-wide V8 flags. Guests are
-/// never permitted to set them, so copying the pointed-to bytes would create
-/// an unnecessary, uncharged host allocation controlled by the guest.
-pub(crate) fn read_runtime_options(
+/// Longest engine flag string that is read from the guest. Every inert
+/// default is shorter, so longer strings are rejected without a host copy.
+const MAX_ENGINE_FLAGS_LENGTH: u32 = 64;
+
+/// Whether guest runtime options only request inert engine flags. Guests are
+/// never permitted to set process-wide V8 flags, but EdgeJS unconditionally
+/// passes its fixed defaults before it creates an env; those are accepted
+/// without being forwarded. `None` means the options are malformed.
+pub(crate) fn runtime_options_are_inert(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
 ) -> Option<bool> {
     if guest_ptr == 0 {
-        return Some(false);
+        return Some(true);
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
+    let flags = i32::try_from(u32_at(
+        &bytes,
+        std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
+    )?)
+    .ok()?;
     let flags_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
     )?;
-    Some(flags_length != 0)
+    engine_flags_are_inert(env, flags, flags_length)
+}
+
+/// Whether a guest engine flag string only holds EdgeJS's fixed defaults.
+/// `None` means the string cannot be read.
+pub(crate) fn engine_flags_are_inert(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    length: u32,
+) -> Option<bool> {
+    if length == 0 {
+        return Some(true);
+    }
+    if length > MAX_ENGINE_FLAGS_LENGTH {
+        return Some(false);
+    }
+    if guest_ptr <= 0 {
+        return None;
+    }
+    let bytes = read_guest_bytes(env, guest_ptr, length as usize)?;
+    Some(is_default_engine_flags(&bytes))
+}
+
+fn is_default_engine_flags(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"" | b"--js-source-phase-imports"
+            | b"--harmony-import-attributes"
+            | b"--js-source-phase-imports --harmony-import-attributes"
+    )
 }
 
 pub(crate) fn read_env_create(
@@ -537,5 +576,27 @@ impl Wasm32EnvHooksV1 {
     }
     const fn oom_error_callback_offset() -> usize {
         std::mem::offset_of!(Self, oom_error_callback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_default_engine_flags;
+
+    #[test]
+    fn only_edgejs_default_engine_flags_are_inert() {
+        assert!(is_default_engine_flags(
+            b"--js-source-phase-imports --harmony-import-attributes"
+        ));
+        assert!(is_default_engine_flags(b"--js-source-phase-imports"));
+        assert!(is_default_engine_flags(b"--harmony-import-attributes"));
+        assert!(is_default_engine_flags(b""));
+        assert!(!is_default_engine_flags(b"--allow-natives-syntax"));
+        assert!(!is_default_engine_flags(
+            b"--js-source-phase-imports --allow-natives-syntax"
+        ));
+        assert!(!is_default_engine_flags(
+            b"--harmony-import-attributes --js-source-phase-imports"
+        ));
     }
 }

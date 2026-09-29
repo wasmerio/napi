@@ -932,6 +932,71 @@ mod tests {
 
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn runtime_options_accept_only_default_flags_and_leave_lane_lazy() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        // Runtime options are `{ size, version, engine_flags, engine_flags_length }`.
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi_extension_wasmer_v0" "unofficial_napi_configure_runtime"
+                    (func $configure (param i32) (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (data (i32.const 64) "--js-source-phase-imports --harmony-import-attributes")
+                (func $options (param $flags i32) (param $length i32) (result i32)
+                    (i32.store (i32.const 16) (i32.const 16))
+                    (i32.store (i32.const 20) (i32.const 1))
+                    (i32.store (i32.const 24) (local.get $flags))
+                    (i32.store (i32.const 28) (local.get $length))
+                    (call $configure (i32.const 16)))
+                (func (export "no_options") (result i32)
+                    i32.const 0 call $configure)
+                (func (export "no_flags") (result i32)
+                    i32.const 0 i32.const 0 call $options)
+                (func (export "defaults") (result i32)
+                    i32.const 64 i32.const 53 call $options)
+                (func (export "one_default") (result i32)
+                    i32.const 64 i32.const 25 call $options)
+                (func (export "other_flags") (result i32)
+                    i32.const 64 i32.const 8 call $options)
+                (func (export "too_long") (result i32)
+                    i32.const 64 i32.const 65 call $options)
+                (func (export "out_of_bounds") (result i32)
+                    i32.const 33554400 i32.const 53 call $options)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let charged = hooks.budget().snapshot().mem_charged;
+        let call = |store: &mut Store, name: &str| {
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&*store, name)
+                .unwrap()
+                .call(store)
+                .unwrap()
+        };
+        assert_eq!(call(&mut store, "no_options"), 0);
+        assert_eq!(call(&mut store, "no_flags"), 0);
+        assert_eq!(call(&mut store, "defaults"), 0);
+        assert_eq!(call(&mut store, "one_default"), 0);
+        assert_eq!(call(&mut store, "other_flags"), 1);
+        assert_eq!(call(&mut store, "too_long"), 1);
+        assert_eq!(call(&mut store, "out_of_bounds"), 1);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, charged);
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     fn memoryless_import_only_module_stays_inert() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, _finished_rx) = mpsc::channel();

@@ -97,25 +97,16 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
     }
     match name {
         "unofficial_napi_set_flags_from_string" => {
-            // The released CLI passes these two fixed defaults before it
-            // creates an env. Read a bounded guest slice, but never forward
-            // guest flags into the process-wide V8 runtime.
-            let length = args[1].unwrap_i32();
-            if !(0..=64).contains(&length) {
-                return Ok(1);
-            }
-            if length == 0 {
-                return Ok(0);
-            }
-            let mut env = env;
-            let pointer = args[0].unwrap_i32();
-            if pointer <= 0 {
-                return Ok(1);
-            }
-            let Some(bytes) = super::read_guest_bytes(&mut env, pointer, length as usize) else {
+            // The released CLI passes its fixed default flags before it
+            // creates an env. They are accepted, but guest flags are never
+            // forwarded into the process-wide V8 runtime.
+            let Ok(length) = u32::try_from(args[1].unwrap_i32()) else {
                 return Ok(1);
             };
-            Ok(i32::from(!legacy_default_flags(bytes.as_slice())))
+            let mut env = env;
+            let inert =
+                super::super::abi::engine_flags_are_inert(&mut env, args[0].unwrap_i32(), length);
+            Ok(i32::from(inert != Some(true)))
         }
         "unofficial_napi_serialize_value" => legacy_serialize_value(env, args),
         "unofficial_napi_deserialize_value" => legacy_deserialize_value(env, args),
@@ -1272,35 +1263,4 @@ fn legacy_deserialize_value(
         return Ok(1);
     }
     Ok(status)
-}
-
-fn legacy_default_flags(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"" | b"--js-source-phase-imports"
-            | b"--harmony-import-attributes"
-            | b"--js-source-phase-imports --harmony-import-attributes"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::legacy_default_flags;
-
-    #[test]
-    fn only_released_edgejs_default_flags_are_inert() {
-        assert!(legacy_default_flags(
-            b"--js-source-phase-imports --harmony-import-attributes"
-        ));
-        assert!(legacy_default_flags(b"--js-source-phase-imports"));
-        assert!(legacy_default_flags(b"--harmony-import-attributes"));
-        assert!(legacy_default_flags(b""));
-        assert!(!legacy_default_flags(b"--allow-natives-syntax"));
-        assert!(!legacy_default_flags(
-            b"--js-source-phase-imports --allow-natives-syntax"
-        ));
-        assert!(!legacy_default_flags(
-            b"--harmony-import-attributes --js-source-phase-imports"
-        ));
-    }
 }
