@@ -66,13 +66,6 @@ pub const DEFAULT_UNWIND_SLACK: u64 = 16 * MIB;
 /// and V8's own malloc'd metadata without sampling.
 pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 
-/// Estimated host-side bytes held per N-API value handle crossed to the guest:
-/// the `napi_ref` struct, the handle-map node, and a V8 global-handle slot. The
-/// referenced JS value itself lives in the (separately charged) V8 heap. Used
-/// only to derive a per-env cap on live handles — see
-/// [`ResourceBudget::value_handle_limit`].
-pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
-
 #[cfg(not(target_arch = "wasm32"))]
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
@@ -109,6 +102,10 @@ pub enum Pool {
     HostTransient,
     /// Serialized worker messages retained between a sender and a receiver.
     SerializedMessage,
+    /// Host-side bookkeeping the bridge keeps per guest handle (refs, value
+    /// slots, finalizer records, deferreds, scope frames, callback
+    /// registrations), granted in chunks by [`napi_host_bookkeeping_charge`].
+    HostBookkeeping,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -166,6 +163,8 @@ pub struct ResourceUsage {
     /// Live bytes in host snapshots of guest data.
     pub host_transient: u64,
     pub serialized_message: u64,
+    /// Bytes granted to the bridge for per-handle host bookkeeping.
+    pub host_bookkeeping: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -221,6 +220,7 @@ pub struct ResourceBudget {
     v8_background_lane: AtomicU64,
     host_transient: AtomicU64,
     serialized_message: AtomicU64,
+    host_bookkeeping: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -247,6 +247,10 @@ impl std::fmt::Debug for ResourceBudget {
             .field(
                 "serialized_message",
                 &self.serialized_message.load(Ordering::Acquire),
+            )
+            .field(
+                "host_bookkeeping",
+                &self.host_bookkeeping.load(Ordering::Acquire),
             )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
@@ -287,6 +291,7 @@ impl ResourceBudget {
             v8_background_lane: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
             serialized_message: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -302,6 +307,7 @@ impl ResourceBudget {
             v8_background_lane: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
             serialized_message: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -405,6 +411,7 @@ impl ResourceBudget {
             Pool::V8BackgroundLane => &self.v8_background_lane,
             Pool::HostTransient => &self.host_transient,
             Pool::SerializedMessage => &self.serialized_message,
+            Pool::HostBookkeeping => &self.host_bookkeeping,
         }
     }
 
@@ -419,6 +426,7 @@ impl ResourceBudget {
             v8_background_lane: self.v8_background_lane.load(Ordering::Acquire),
             host_transient: self.host_transient.load(Ordering::Acquire),
             serialized_message: self.serialized_message.load(Ordering::Acquire),
+            host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -426,18 +434,6 @@ impl ResourceBudget {
     /// Number of live V8 isolates counted against `max_envs`.
     pub fn live_isolates(&self) -> usize {
         self.live_isolates.load(Ordering::Acquire)
-    }
-
-    /// Cap on the number of live per-value host handles an env may hold, derived
-    /// from the memory budget so this bookkeeping (which the byte pools don't
-    /// see) cannot grow the host RSS without bound. `None` under an unlimited
-    /// budget.
-    pub fn value_handle_limit(&self) -> Option<u64> {
-        if self.is_unlimited() {
-            None
-        } else {
-            Some((self.memory_limit() / EST_HOST_BYTES_PER_VALUE).max(1))
-        }
     }
 
     /// Reserve budget for a new V8 env: acquire an isolate slot against
@@ -555,10 +551,10 @@ impl ResourceBudget {
     }
 }
 
-/// Per-V8-env heap-growth tracker shared with the host-owned near-heap-limit
-/// callback.
+/// Per-V8-env budget tracker shared with the host-owned near-heap-limit
+/// callback and the bridge's bookkeeping hooks.
 ///
-/// Boxed at env creation and handed to the callback as an opaque pointer; the
+/// Boxed at env creation and handed to the bridge as an opaque pointer; the
 /// owning [`crate::env::NapiEnv`] reclaims it at env teardown to release the
 /// bytes granted beyond the initial ceiling.
 pub(crate) struct EnvHeapCharge {
@@ -568,6 +564,72 @@ pub(crate) struct EnvHeapCharge {
     pub(crate) unwind_slack_available: AtomicBool,
     /// Bytes granted beyond the initial ceiling by grow-step grants.
     pub(crate) granted: AtomicU64,
+    /// Bytes granted to [`Pool::HostBookkeeping`] and not yet returned.
+    pub(crate) bookkeeping_granted: AtomicU64,
+}
+
+impl EnvHeapCharge {
+    /// The budget refused: stop this env the way a host kill does. The sticky
+    /// flag keeps later imports out and termination unwinds any running JS.
+    fn deny(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        if self.env != 0 {
+            // SAFETY: the tracker is only reachable while its env is live.
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                    self.env as crate::snapi::SnapiEnv,
+                );
+            }
+        }
+    }
+}
+
+/// Host-owned bookkeeping grant for a budgeted V8 isolate: the bridge asks for
+/// `bytes` more of per-handle host bookkeeping. Returns nonzero when granted;
+/// a denial stops the env exactly like an exhausted heap-growth grant.
+///
+/// # Safety
+/// As for [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_bookkeeping_charge(data: *const c_void, bytes: u64) -> i32 {
+    if data.is_null() {
+        return 1;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    match tracker.budget.try_charge(Pool::HostBookkeeping, bytes) {
+        Ok(()) => {
+            tracker
+                .bookkeeping_granted
+                .fetch_add(bytes, Ordering::AcqRel);
+            1
+        }
+        Err(_) => {
+            tracker.deny();
+            0
+        }
+    }
+}
+
+/// Returns bookkeeping the bridge no longer needs, clamped to what it was
+/// granted. The bridge serializes calls per env, so a plain load/store cannot
+/// race.
+///
+/// # Safety
+/// As for [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_bookkeeping_uncharge(data: *const c_void, bytes: u64) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let granted = tracker.bookkeeping_granted.load(Ordering::Acquire);
+    let release = bytes.min(granted);
+    tracker
+        .bookkeeping_granted
+        .store(granted - release, Ordering::Release);
+    tracker.budget.uncharge(Pool::HostBookkeeping, release);
 }
 
 /// Host-owned near-heap-limit callback for a budgeted V8 isolate.
@@ -602,14 +664,7 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
             current_limit.saturating_add(step as usize)
         }
         Err(_) => {
-            tracker.host_stopped.store(true, Ordering::Release);
-            if tracker.env != 0 {
-                unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                        tracker.env as crate::snapi::SnapiEnv,
-                    );
-                }
-            }
+            tracker.deny();
             if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
                 current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
             } else {
@@ -1460,6 +1515,7 @@ mod tests {
             host_stopped: Arc::clone(&host_stopped),
             unwind_slack_available: AtomicBool::new(true),
             granted: AtomicU64::new(0),
+            bookkeeping_granted: AtomicU64::new(0),
         }));
         let data = ptr as *const c_void;
         let base = 100 * 1024 * 1024usize;
@@ -1518,17 +1574,44 @@ mod tests {
     }
 
     #[test]
-    fn value_handle_limit_scales_with_budget() {
-        // Limit = budget / EST_HOST_BYTES_PER_VALUE.
-        let budget = ResourceBudget::with_memory_limit(1000 * EST_HOST_BYTES_PER_VALUE);
-        assert_eq!(budget.value_handle_limit(), Some(1000));
-        // Unlimited budget imposes no cap.
-        assert_eq!(ResourceBudget::unlimited().value_handle_limit(), None);
-        // A tiny budget still allows at least one handle.
-        assert_eq!(
-            ResourceBudget::with_memory_limit(1).value_handle_limit(),
-            Some(1)
+    fn bookkeeping_grants_until_budget_exhausted_then_stops_the_env() {
+        let budget = ResourceBudget::with_memory_limit(3 * MIB);
+        let host_stopped = Arc::new(AtomicBool::new(false));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
+            budget: Arc::clone(&budget),
+            env: 0,
+            host_stopped: Arc::clone(&host_stopped),
+            unwind_slack_available: AtomicBool::new(true),
+            granted: AtomicU64::new(0),
+            bookkeeping_granted: AtomicU64::new(0),
+        }));
+        let data = ptr as *const c_void;
+
+        assert_eq!(napi_host_bookkeeping_charge(data, 2 * MIB), 1);
+        assert_eq!(budget.snapshot().host_bookkeeping, 2 * MIB);
+        assert!(!host_stopped.load(Ordering::Acquire));
+
+        // Over budget: denied, nothing charged, and the env is stopped.
+        assert_eq!(napi_host_bookkeeping_charge(data, 2 * MIB), 0);
+        assert_eq!(budget.snapshot().host_bookkeeping, 2 * MIB);
+        assert!(host_stopped.load(Ordering::Acquire));
+
+        // Returns are clamped to what was granted, so the pool cannot underflow.
+        napi_host_bookkeeping_uncharge(data, MIB);
+        napi_host_bookkeeping_uncharge(data, 10 * MIB);
+        assert_eq!(budget.snapshot().host_bookkeeping, 0);
+
+        // Teardown releases whatever the bridge still held.
+        assert_eq!(napi_host_bookkeeping_charge(data, MIB), 1);
+        let tracker = unsafe { Box::from_raw(ptr) };
+        budget.uncharge(
+            Pool::HostBookkeeping,
+            tracker.bookkeeping_granted.load(Ordering::Acquire),
         );
+        assert_eq!(budget.snapshot().host_bookkeeping, 0);
+
+        // A null tracker (unbudgeted env) always grants.
+        assert_eq!(napi_host_bookkeeping_charge(std::ptr::null(), MIB), 1);
     }
 
     #[test]

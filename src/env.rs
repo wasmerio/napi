@@ -16,9 +16,7 @@ use crate::message::PendingMessages;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use crate::snapi::snapi_bridge_unofficial_env_alive;
 use crate::snapi::{
-    SnapiEnv, snapi_bridge_unofficial_release_env,
-    snapi_bridge_unofficial_set_host_near_heap_limit_callback,
-    snapi_bridge_unofficial_set_value_limit,
+    SnapiEnv, snapi_bridge_unofficial_release_env, snapi_bridge_unofficial_set_host_budget,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -308,9 +306,10 @@ impl NapiEnv {
     }
 
     /// Register a successfully-created env, attach its heap charge, and — under
-    /// a limited budget — install the host-owned near-heap-limit callback so V8
-    /// heap growth for this isolate is charged against the budget. Teardown
-    /// releases both the initial ceiling and any granted growth.
+    /// a limited budget — install the host-owned budget tracker so V8 heap
+    /// growth and the bridge's per-handle bookkeeping for this isolate are
+    /// charged against the budget. Teardown releases the initial ceiling and
+    /// everything granted since.
     pub(crate) fn commit_isolate(
         &mut self,
         env: SnapiEnv,
@@ -345,26 +344,13 @@ impl NapiEnv {
                 host_stopped: Arc::clone(&self.host_stopped),
                 unwind_slack_available: std::sync::atomic::AtomicBool::new(true),
                 granted: AtomicU64::new(0),
+                bookkeeping_granted: AtomicU64::new(0),
             }));
             // SAFETY: `env` is the isolate just created; `boxed` outlives the
-            // callback (freed only at this env's teardown, below).
+            // bridge's hooks (freed only at this env's teardown, below).
             unsafe {
-                snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-                    env,
-                    boxed as *const c_void,
-                );
+                snapi_bridge_unofficial_set_host_budget(env, boxed as *const c_void);
             }
-
-            // Cap per-value host handles / callback registrations so the C++
-            // bookkeeping (invisible to the byte pools) cannot grow host RSS
-            // without bound; derived from the budget.
-            if let Some(limit) = self.budget.value_handle_limit() {
-                // SAFETY: `env` is the isolate just created.
-                unsafe {
-                    snapi_bridge_unofficial_set_value_limit(env, limit);
-                }
-            }
-
             boxed as usize
         } else {
             0
@@ -565,19 +551,21 @@ impl NapiEnv {
     }
 
     pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv) {
-        // Release the heap ceiling + any callback-granted growth + isolate slot
-        // this env reserved.
+        // Release the heap ceiling + any granted growth and bookkeeping +
+        // isolate slot this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
-            let granted = if handle.tracker != 0 {
+            if handle.tracker != 0 {
                 // SAFETY: reclaim the box created in `commit_isolate`. The
                 // native release has already removed the callback and disposed
                 // the isolate, so it cannot call through this pointer again.
                 let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
-                boxed.granted.load(Ordering::Acquire)
-            } else {
-                0
-            };
-            self.budget.uncharge(Pool::V8HeapReserved, granted);
+                self.budget
+                    .uncharge(Pool::V8HeapReserved, boxed.granted.load(Ordering::Acquire));
+                self.budget.uncharge(
+                    Pool::HostBookkeeping,
+                    boxed.bookkeeping_granted.load(Ordering::Acquire),
+                );
+            }
             self.budget.release_env(handle.ceiling);
         }
         self.napi_envs.remove(&env_id);

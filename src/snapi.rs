@@ -133,17 +133,10 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    /// Register a host-owned near-heap-limit callback that charges V8 heap
-    /// growth against the resource budget. `data` is an
-    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
-    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
+    /// Install `data` (an `*const crate::budget::EnvHeapCharge`) as this env's
+    /// budget tracker: V8 heap growth and the bridge's per-handle host
+    /// bookkeeping are charged against the resource budget through it.
+    pub fn snapi_bridge_unofficial_set_host_budget(env: SnapiEnv, data: *const c_void) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,

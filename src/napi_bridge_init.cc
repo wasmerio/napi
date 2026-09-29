@@ -8,11 +8,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -47,6 +47,12 @@ extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
 extern "C" napi_status unofficial_napi_message_read_legacy(
     napi_env env, unofficial_napi_message message, napi_value *result_out);
 extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id);
+// Rust-exported budget hooks (see budget.rs) for the tracker installed by
+// snapi_bridge_unofficial_set_host_budget. A denied charge has already
+// requested the env's termination.
+extern "C" int napi_host_bookkeeping_charge(const void *data, uint64_t bytes);
+extern "C" void napi_host_bookkeeping_uncharge(const void *data,
+                                               uint64_t bytes);
 
 namespace {
 
@@ -179,12 +185,7 @@ struct SnapiEnvState {
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
   uint32_t next_ref_id = 1;
-  // The fixed per-isolate metadata reservation covers at most this many
-  // guest-created host objects in each category. No category may grow with
-  // the same single JS value or with empty handle scopes without a bound.
-  static constexpr size_t kMaxGuestNativeHandles = 4096;
   std::unordered_set<void *> guest_finalizer_records;
-  size_t native_finalizer_count = 0;
 
   // Handle table for napi_deferred (promise deferreds).
   std::unordered_map<uint32_t, napi_deferred> deferreds;
@@ -198,6 +199,8 @@ struct SnapiEnvState {
   };
   // The released ABI queried these immutable fields after creation. Retain a
   // reference because the creation callback's value scope may close first.
+  // Each record pins a strong ref, so the table is capped outright.
+  static constexpr size_t kMaxLegacyModules = 4096;
   std::unordered_map<uint32_t, LegacyModuleInfo> legacy_modules;
 
   // Handle table for opaque bytecode handles (unofficial_napi_bytecode_*).
@@ -224,14 +227,36 @@ struct SnapiEnvState {
   uint32_t next_cb_reg_id = 1;
   std::vector<std::unique_ptr<CallbackBinding>> callback_bindings;
 
-  // Managed embedders set this from their finite resource budget at env
-  // creation. Standalone providers are deliberately unlimited: their caller
-  // owns the whole process and existing workloads can retain more than 4096
-  // transient values in one scope (for example a large HTTP write batch).
-  // Use max rather than zero because several category checks compare against
-  // this field directly without a separate "unlimited" branch.
-  size_t value_limit = std::numeric_limits<size_t>::max();
+  // Host memory this bridge keeps per guest handle (refs, value slots,
+  // finalizer records, deferreds, scope frames, callback registrations) is
+  // invisible to V8 and to the embedder's byte pools. It is estimated and
+  // charged to the embedder's budget through `host_budget` (null for an
+  // unbudgeted env) in kBookkeepingChunk steps, so a guest retaining many
+  // host handles hits the same out-of-memory path as one retaining many JS
+  // objects. `bk_reclaimable` is the part only a GC frees (refs and finalizer
+  // records die with their JS value); once it doubles since the last
+  // collection the bridge asks V8 to collect, because a small JS heap alone
+  // would never trigger the GC that releases it.
+  const void *host_budget = nullptr;
+  size_t bk_live = 0;
+  size_t bk_granted = 0;
+  size_t bk_reclaimable = 0;
+  size_t bk_reclaimable_floor = 0;
+  std::chrono::steady_clock::time_point bk_last_gc{};
+  bool bk_collecting = false;
 };
+
+// Estimated host bytes per bookkeeping entry: the bridge's record and
+// container node plus the engine-side object it owns.
+constexpr size_t kRefBytes = 192;
+constexpr size_t kValueSlotBytes = 32;
+constexpr size_t kFinalizerRecordBytes = 96;
+constexpr size_t kDeferredBytes = 64;
+constexpr size_t kScopeFrameBytes = 128;
+constexpr size_t kCallbackBytes = 96;
+constexpr size_t kBookkeepingChunk = 64 * 1024;
+constexpr size_t kBookkeepingGcMin = 1024 * 1024;
+constexpr auto kBookkeepingGcInterval = std::chrono::milliseconds(250);
 
 struct GuestFinalizerRecord {
   SnapiEnvState *state;
@@ -272,14 +297,73 @@ extern "C" void snapi_bridge_test_fail_next_legacy_message_registration() {
   g_fail_next_legacy_message_registration = true;
 }
 
+// Asks V8 to collect once the GC-reclaimable bookkeeping has doubled since
+// the last collection (at least kBookkeepingGcMin, at most once per
+// kBookkeepingGcInterval). Runs on the env's JS thread with V8 entered, like
+// every bridge call; weak callbacks only enqueue finalizers, so this cannot
+// re-enter the guest.
+void MaybeCollectBookkeeping(SnapiEnvState &state) {
+  const size_t threshold =
+      std::max(kBookkeepingGcMin, 2 * state.bk_reclaimable_floor);
+  if (state.bk_reclaimable < threshold || state.bk_collecting ||
+      state.env == nullptr)
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - state.bk_last_gc < kBookkeepingGcInterval)
+    return;
+  state.bk_collecting = true;
+  state.bk_last_gc = now;
+  state.bk_reclaimable_floor = state.bk_reclaimable;
+  (void)unofficial_napi_collect_garbage(state.env);
+  state.bk_collecting = false;
+}
+
+// Charges `bytes` of host bookkeeping, asking the embedder for another chunk
+// when the live estimate outgrows what it granted. Returns false when the
+// budget refused; the embedder has then already requested termination and the
+// caller fails the operation.
+bool ChargeBookkeeping(SnapiEnvState &state, size_t bytes, bool reclaimable) {
+  if (state.bk_live + bytes > state.bk_granted) {
+    const size_t needed = state.bk_live + bytes - state.bk_granted;
+    const size_t chunk =
+        (needed + kBookkeepingChunk - 1) / kBookkeepingChunk * kBookkeepingChunk;
+    if (state.host_budget != nullptr &&
+        !napi_host_bookkeeping_charge(state.host_budget, chunk))
+      return false;
+    state.bk_granted += chunk;
+  }
+  state.bk_live += bytes;
+  if (reclaimable) {
+    state.bk_reclaimable += bytes;
+    MaybeCollectBookkeeping(state);
+  }
+  return true;
+}
+
+// Returns whole unused chunks to the embedder, keeping one in hand so a
+// workload oscillating around a chunk boundary does not charge on every call.
+void UnchargeBookkeeping(SnapiEnvState &state, size_t bytes,
+                         bool reclaimable) {
+  state.bk_live -= bytes;
+  if (reclaimable) {
+    state.bk_reclaimable -= bytes;
+    state.bk_reclaimable_floor =
+        std::min(state.bk_reclaimable_floor, state.bk_reclaimable);
+  }
+  const size_t unused = state.bk_granted - state.bk_live;
+  if (unused < 2 * kBookkeepingChunk)
+    return;
+  const size_t release =
+      (unused - kBookkeepingChunk) / kBookkeepingChunk * kBookkeepingChunk;
+  state.bk_granted -= release;
+  if (state.host_budget != nullptr)
+    napi_host_bookkeeping_uncharge(state.host_budget, release);
+}
+
 CallbackBinding *RegisterCallbackBinding(SnapiEnvState *state,
                                          uint32_t reg_id) {
   if (state == nullptr || reg_id == 0)
     return nullptr;
-  if (state->value_limit != 0 &&
-      state->callback_bindings.size() >= state->value_limit) {
-    return nullptr;
-  }
   state->callback_bindings.push_back(
       std::make_unique<CallbackBinding>(CallbackBinding{state, reg_id}));
   return state->callback_bindings.back().get();
@@ -358,18 +442,17 @@ uint32_t StoreValueInFrame(SnapiEnvState &state, napi_value val,
     return 0;
   if (state.env == nullptr)
     return 0;
-  // Refuse once the per-env handle cap is reached: returning 0 surfaces as an
-  // N-API failure the guest can handle, instead of leaking host RSS unbounded.
-  if (state.value_limit != 0 && state.live_value_count >= state.value_limit) {
+  // Returning 0 surfaces as an N-API failure the guest can handle.
+  if (state.value_free_slots.empty() &&
+      state.value_slots.size() >= kValueIdMaxSlots)
     return 0;
-  }
+  if (!ChargeBookkeeping(state, kValueSlotBytes, /*reclaimable=*/false))
+    return 0;
   uint32_t index;
   if (!state.value_free_slots.empty()) {
     index = state.value_free_slots.back();
     state.value_free_slots.pop_back();
   } else {
-    if (state.value_slots.size() >= kValueIdMaxSlots)
-      return 0;
     index = static_cast<uint32_t>(state.value_slots.size());
     state.value_slots.emplace_back();
   }
@@ -415,6 +498,7 @@ void FreeValueSlot(SnapiEnvState &state, uint32_t index) {
       static_cast<uint16_t>((slot.generation + 1) & kValueIdGenMask);
   state.value_free_slots.push_back(index);
   --state.live_value_count;
+  UnchargeBookkeeping(state, kValueSlotBytes, /*reclaimable=*/false);
 }
 
 // Frees every slot the innermost frame owns and pops it. Closes the frame's
@@ -428,6 +512,10 @@ void PopCurrentFrame(SnapiEnvState &state, bool close_napi_scope) {
   for (uint32_t index : frame.owned_slots) {
     FreeValueSlot(state, index);
   }
+  // Only guest-opened frames are charged; implicit callback frames are
+  // bounded by the callback depth.
+  if (frame.id != 0)
+    UnchargeBookkeeping(state, kScopeFrameBytes, /*reclaimable=*/false);
   if (close_napi_scope && state.env != nullptr) {
     if (frame.esc_scope != nullptr) {
       (void)napi_close_escapable_handle_scope(state.env, frame.esc_scope);
@@ -493,11 +581,18 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   return 0;
 }
 
+// Charges one more napi_ref before the engine creates it. Pair with StoreRef,
+// or release it with UnchargeBookkeeping(kRefBytes) if creation fails.
+bool ReserveRef(SnapiEnvState &state) {
+  return state.next_ref_id != 0 &&
+         ChargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
+}
+
 uint32_t StoreRef(SnapiEnvState &state, napi_ref ref) {
-  if (ref == nullptr)
+  if (ref == nullptr) {
+    UnchargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
     return 0;
-  if (state.refs.size() >= state.value_limit || state.next_ref_id == 0)
-    return 0;
+  }
   uint32_t id = state.next_ref_id++;
   state.refs[id] = ref;
   return id;
@@ -510,13 +605,17 @@ napi_ref LoadRef(SnapiEnvState &state, uint32_t id) {
   return it != state.refs.end() ? it->second : nullptr;
 }
 
-void RemoveRef(SnapiEnvState &state, uint32_t id) { state.refs.erase(id); }
+void RemoveRef(SnapiEnvState &state, uint32_t id) {
+  if (state.refs.erase(id) != 0)
+    UnchargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
+}
 
+// The caller has charged kDeferredBytes (see snapi_bridge_create_promise).
 uint32_t StoreDeferred(SnapiEnvState &state, napi_deferred d) {
-  if (d == nullptr)
+  if (d == nullptr) {
+    UnchargeBookkeeping(state, kDeferredBytes, /*reclaimable=*/false);
     return 0;
-  if (state.deferreds.size() >= state.value_limit || state.next_deferred_id == 0)
-    return 0;
+  }
   uint32_t id = state.next_deferred_id++;
   state.deferreds[id] = d;
   return id;
@@ -530,7 +629,8 @@ napi_deferred LoadDeferred(SnapiEnvState &state, uint32_t id) {
 }
 
 void RemoveDeferred(SnapiEnvState &state, uint32_t id) {
-  state.deferreds.erase(id);
+  if (state.deferreds.erase(id) != 0)
+    UnchargeBookkeeping(state, kDeferredBytes, /*reclaimable=*/false);
 }
 
 // Finds the open frame with the given guest-visible id (innermost first).
@@ -660,6 +760,10 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->owner = nullptr;
   state->env = nullptr;
+  // The embedder releases everything it granted when it drops the tracker.
+  state->host_budget = nullptr;
+  state->bk_live = state->bk_granted = state->bk_reclaimable = 0;
+  state->bk_reclaimable_floor = 0;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.erase(state);
@@ -1874,14 +1978,16 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState *env_state,
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  if (bridge_state->deferreds.size() >= bridge_state->value_limit ||
-      bridge_state->next_deferred_id == 0)
+  if (bridge_state->next_deferred_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kDeferredBytes, /*reclaimable=*/false))
     return napi_generic_failure;
   napi_deferred deferred;
   napi_value promise;
   napi_status s = napi_create_promise(env, &deferred, &promise);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kDeferredBytes, /*reclaimable=*/false);
     return s;
+  }
   *deferred_out = StoreDeferred(*bridge_state, deferred);
   *out_id = StoreValue(*bridge_state, promise);
   return napi_ok;
@@ -1988,7 +2094,9 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
   std::unique_lock<std::recursive_mutex> state_lock;
   if (bridge_state != nullptr) {
     state_lock = std::unique_lock<std::recursive_mutex>(bridge_state->mutex);
-    bridge_state->guest_finalizer_records.erase(record);
+    if (bridge_state->guest_finalizer_records.erase(record) != 0)
+      UnchargeBookkeeping(*bridge_state, kFinalizerRecordBytes,
+                          /*reclaimable=*/true);
   }
   void *callback_ctx =
       bridge_state != nullptr
@@ -2029,7 +2137,8 @@ void DropGuestFinalizerRecord(GuestFinalizerRecord *record) {
   auto *state = record->state;
   if (state != nullptr) {
     std::lock_guard<std::recursive_mutex> lock(state->mutex);
-    state->guest_finalizer_records.erase(record);
+    if (state->guest_finalizer_records.erase(record) != 0)
+      UnchargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true);
   }
   delete record;
 }
@@ -2039,17 +2148,19 @@ GuestFinalizerRecord *MakeGuestFinalizerRecord(SnapiEnvState *state,
                                                uint32_t wasm_fn_ptr,
                                                uint32_t data, uint32_t hint) {
   if (state == nullptr ||
-      state->guest_finalizer_records.size() >= state->value_limit)
+      !ChargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true))
     return nullptr;
   auto *record = new (std::nothrow) GuestFinalizerRecord();
-  if (record != nullptr) {
-    record->state = state;
-    record->guest_env = guest_env;
-    record->wasm_fn_ptr = wasm_fn_ptr;
-    record->data = data;
-    record->hint = hint;
-    state->guest_finalizer_records.insert(record);
+  if (record == nullptr) {
+    UnchargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true);
+    return nullptr;
   }
+  record->state = state;
+  record->guest_env = guest_env;
+  record->wasm_fn_ptr = wasm_fn_ptr;
+  record->data = data;
+  record->hint = hint;
+  state->guest_finalizer_records.insert(record);
   return record;
 }
 } // namespace
@@ -2558,13 +2669,14 @@ extern "C" int snapi_bridge_create_reference(SnapiEnvState *env_state,
   napi_value val = LoadValue(*bridge_state, value_id);
   if (!val)
     return napi_invalid_arg;
-  if (bridge_state->refs.size() >= bridge_state->value_limit ||
-      bridge_state->next_ref_id == 0)
+  if (!ReserveRef(*bridge_state))
     return napi_generic_failure;
   napi_ref ref;
   napi_status s = napi_create_reference(env, val, initial_refcount, &ref);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
+  }
   *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
 }
@@ -2642,13 +2754,17 @@ extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
-  if (bridge_state->scope_frames.size() >= bridge_state->value_limit ||
-      bridge_state->next_scope_id == 0)
+  if (bridge_state->next_scope_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                         /*reclaimable=*/false))
     return napi_generic_failure;
   napi_handle_scope scope = nullptr;
   napi_status s = napi_open_handle_scope(env, &scope);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                        /*reclaimable=*/false);
     return s;
+  }
   ScopeFrame frame;
   frame.scope = scope;
   frame.id = bridge_state->next_scope_id++;
@@ -2687,13 +2803,17 @@ snapi_bridge_open_escapable_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
-  if (bridge_state->scope_frames.size() >= bridge_state->value_limit ||
-      bridge_state->next_scope_id == 0)
+  if (bridge_state->next_scope_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                         /*reclaimable=*/false))
     return napi_generic_failure;
   napi_escapable_handle_scope scope = nullptr;
   napi_status s = napi_open_escapable_handle_scope(env, &scope);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                        /*reclaimable=*/false);
     return s;
+  }
   ScopeFrame frame;
   frame.esc_scope = scope;
   frame.id = bridge_state->next_scope_id++;
@@ -3162,15 +3282,16 @@ extern "C" int snapi_bridge_wrap(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  if (ref_out != nullptr &&
-      (bridge_state->refs.size() >= bridge_state->value_limit ||
-       bridge_state->next_ref_id == 0))
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
     return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void *)(uintptr_t)native_data, nullptr,
                             nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
+  }
   if (ref_out)
     *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -3192,20 +3313,20 @@ snapi_bridge_wrap_finalized(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  if (ref_out != nullptr &&
-      (bridge_state->refs.size() >= bridge_state->value_limit ||
-       bridge_state->next_ref_id == 0))
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
     return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr)
-    return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s =
-      napi_wrap(env, obj, (void *)(uintptr_t)native_data,
-                GuestFinalizerTrampoline, record, ref_out ? &ref : nullptr);
+      record == nullptr
+          ? napi_generic_failure
+          : napi_wrap(env, obj, (void *)(uintptr_t)native_data,
+                      GuestFinalizerTrampoline, record, ref_out ? &ref : nullptr);
   if (s != napi_ok) {
     DropGuestFinalizerRecord(record);
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
   }
   if (ref_out)
@@ -3262,19 +3383,18 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState *env_state,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  if (bridge_state->native_finalizer_count >= bridge_state->value_limit ||
-      (ref_out != nullptr &&
-       (bridge_state->refs.size() >= bridge_state->value_limit ||
-        bridge_state->next_ref_id == 0)))
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
     return napi_generic_failure;
   // No actual WASM callback for finalizer; just register with nullptr callback
   napi_ref ref = nullptr;
   napi_status s =
       napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val, nullptr,
                          nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
-  bridge_state->native_finalizer_count++;
+  }
   if (ref_out)
     *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -3295,20 +3415,21 @@ snapi_bridge_add_finalizer_cb(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  if (ref_out != nullptr &&
-      (bridge_state->refs.size() >= bridge_state->value_limit ||
-       bridge_state->next_ref_id == 0))
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
     return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr)
-    return napi_generic_failure;
   napi_ref ref = nullptr;
-  napi_status s = napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val,
-                                     GuestFinalizerTrampoline, record,
-                                     ref_out ? &ref : nullptr);
+  napi_status s =
+      record == nullptr
+          ? napi_generic_failure
+          : napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val,
+                               GuestFinalizerTrampoline, record,
+                               ref_out ? &ref : nullptr);
   if (s != napi_ok) {
     DropGuestFinalizerRecord(record);
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
   }
   if (ref_out)
@@ -3737,15 +3858,15 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState *env_state) {
-  if (env_state == nullptr)
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr)
     return 0;
-  // Cap callback registrations alongside value handles: 0 signals failure so
-  // the registration chain aborts instead of growing cb_registry unbounded.
-  if (env_state->value_limit != 0 &&
-      env_state->cb_registry.size() >= env_state->value_limit) {
+  // Registrations live until env teardown. 0 signals failure so the
+  // registration chain aborts instead of growing cb_registry unbounded.
+  if (!ChargeBookkeeping(*state, kCallbackBytes, /*reclaimable=*/false))
     return 0;
-  }
-  return env_state->next_cb_reg_id++;
+  return state->next_cb_reg_id++;
 }
 
 // Register callback data for a registration ID
@@ -3915,13 +4036,17 @@ size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void *data,
 }
 } // namespace
 
-extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-    SnapiEnvState *env_state, const void *data) {
+// Installs the embedder's budget tracker: V8 heap growth is charged through
+// the near-heap-limit callback and the bridge's own host bookkeeping through
+// napi_host_bookkeeping_charge. `data` must outlive the env.
+extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState *env_state,
+                                                       const void *data) {
   auto lease = RequireEnvState(env_state);
   auto *state = lease.get();
   if (state == nullptr) {
     return napi_invalid_arg;
   }
+  state->host_budget = data;
   return unofficial_napi_configure_near_heap_limit_callback(
       state->env, HostNearHeapLimitTrampoline, const_cast<void *>(data), 0);
 }
@@ -3945,20 +4070,6 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState *env_state,
   if (bridge_state == nullptr)
     return 0;
   return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
-}
-
-extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState *env_state,
-                                                       uint64_t limit) {
-  auto lease = RequireEnvState(env_state);
-  auto *state = lease.get();
-  if (state == nullptr) {
-    return napi_invalid_arg;
-  }
-  state->value_limit =
-      limit == 0 ? SnapiEnvState::kMaxGuestNativeHandles
-                 : static_cast<size_t>(std::min<uint64_t>(
-                       limit, SnapiEnvState::kMaxGuestNativeHandles));
-  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState *env_state) {
@@ -5326,7 +5437,7 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_legacy(
   auto lease = RequireEnvState(env_state);
   auto *state = lease.get();
   if (state == nullptr ||
-      state->legacy_modules.size() >= SnapiEnvState::kMaxGuestNativeHandles)
+      state->legacy_modules.size() >= SnapiEnvState::kMaxLegacyModules)
     return napi_generic_failure;
   uint32_t handle = 0;
   uint32_t requests = 0;

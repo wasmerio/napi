@@ -29,6 +29,10 @@ const NAPI_PENDING_EXCEPTION: i32 = 10;
 /// ceiling is clamped.
 const BUDGET_BELOW_ISOLATE_FLOOR: u64 = 20 * 1024 * 1024;
 
+/// Admits a guest and a default isolate with only a few MiB to spare, which a
+/// guest holding tens of thousands of references exhausts.
+const BUDGET_STARVING_BOOKKEEPING: u64 = 144 * 1024 * 1024;
+
 #[test]
 fn two_guest_isolates_run_sequentially() {
     let wasm = build_wasix_test("hello_napi_test");
@@ -56,19 +60,67 @@ fn standalone_unlimited_context_does_not_apply_managed_value_cap() {
 }
 
 #[test]
-fn finite_managed_context_keeps_value_cap() {
+fn finite_budget_charges_value_handles_instead_of_capping_them() {
     let wasm = build_wasix_test("test_unlimited_value_handles");
     let ctx = NapiCtx::builder()
         .total_memory_bytes(GENEROUS_BUDGET)
         .build();
     let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
-    assert_ne!(
-        exit_code, 0,
-        "managed value cap was bypassed: {stdout}\n{stderr}"
-    );
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.contains("value handle was refused"),
+        stdout.contains("UNLIMITED_VALUE_HANDLES_OK"),
         "{stdout}\n{stderr}"
+    );
+}
+
+/// Waits for WASIX's asynchronous final-store cleanup, which is what releases
+/// an isolate's reservations, then returns the budget snapshot.
+fn usage_after_quiescence(ctx: &NapiCtx) -> wasmer_napi::ResourceUsage {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ctx.budget().snapshot().live_isolates != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ctx.budget().snapshot()
+}
+
+/// A workload holding a host handle per short-lived object used to fail past
+/// a fixed handle count, because the tiny JS objects never made V8 collect the
+/// handles' owners. The bookkeeping charge now asks for that collection.
+#[test]
+fn many_short_lived_refs_are_collected_under_a_finite_budget() {
+    let wasm = build_wasix_test("test_ref_churn");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REF_CHURN_OK"), "{stdout}\n{stderr}");
+    let usage = usage_after_quiescence(&ctx);
+    assert_eq!(
+        usage.host_bookkeeping, 0,
+        "bookkeeping outlived the guest: {usage:?}"
+    );
+}
+
+/// Bookkeeping the budget cannot cover is an out-of-memory condition: the env
+/// is stopped like one whose heap growth was refused, not left half-working.
+#[test]
+fn bookkeeping_exhaustion_stops_the_env() {
+    let wasm = build_wasix_test("test_ref_hold");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(BUDGET_STARVING_BOOKKEEPING)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REF_HOLD_REFUSED"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("JS_AFTER_REFUSAL status={NAPI_PENDING_EXCEPTION}")),
+        "the refusal did not terminate the isolate: {stdout}\n{stderr}"
+    );
+    let usage = usage_after_quiescence(&ctx);
+    assert_eq!(
+        usage.host_bookkeeping, 0,
+        "bookkeeping outlived the guest: {usage:?}"
     );
 }
 
@@ -325,14 +377,7 @@ fn isolate_reservations_are_released_when_the_guest_exits() {
         "guest did not report success\n--- stdout ---\n{stdout}"
     );
 
-    // WASIX releases the final store on an asynchronous cleanup turn after
-    // the main guest reports exit. Mirror the workload manager's quiescence
-    // wait before asserting that the isolate reservation is gone.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ctx.budget().snapshot().live_isolates != 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-    let usage = ctx.budget().snapshot();
+    let usage = usage_after_quiescence(&ctx);
     assert_eq!(
         usage.live_isolates, 0,
         "an isolate outlived the guest: {usage:?}"
