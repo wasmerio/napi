@@ -661,9 +661,9 @@ impl GuestHeap {
         .cast()
     }
 
-    /// Box a finalizer context for one allocation. The bridge takes ownership
-    /// on success (released via [`napi_host_guest_heap_buffer_finalize`]);
-    /// reclaim with [`GuestHeap::reclaim_finalize_ctx`] on failure.
+    /// Box a finalizer context for one allocation. The backing-store deleter
+    /// takes ownership when native creation reaches that point, even if a
+    /// later step fails. Reclaim only when the bridge reports no transfer.
     pub(crate) fn make_finalize_ctx(self: &Arc<Self>, offset: u32) -> *mut c_void {
         Box::into_raw(Box::new(GuestHeapFinalizeCtx {
             heap: Arc::downgrade(self),

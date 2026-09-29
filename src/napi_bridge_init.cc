@@ -25,6 +25,7 @@
 #endif
 
 #include "edge_v8_platform.h"
+#include "internal/napi_external_transfer_observer.h"
 #include "internal/napi_v8_env.h"
 #include "node_api.h"
 #include "unofficial_napi.h"
@@ -2127,11 +2128,13 @@ extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
 
 // Like snapi_bridge_create_external_arraybuffer, but the buffer's lifetime is
 // tied to the JS value: when V8 collects it, `finalize_hint` is handed to the
-// Rust guest-heap finalizer, which frees the guest allocation. Ownership of
-// `finalize_hint` transfers only on success.
+// Rust guest-heap finalizer, which frees the guest allocation. The ownership
+// output reports the actual backing-store transfer, including error returns.
 extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
     SnapiEnvState *env_state, uint64_t data_addr, uint32_t byte_length,
-    void *finalize_hint, uint64_t *backing_store_token_out, uint32_t *out_id) {
+    void *finalize_hint, uint64_t *backing_store_token_out, uint32_t *out_id,
+    int *ownership_transferred_out) {
+  if (ownership_transferred_out != nullptr) *ownership_transferred_out = 0;
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr)
@@ -2139,9 +2142,19 @@ extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
   napi_env env = bridge_state->env;
   void *data = (void *)(uintptr_t)data_addr;
   napi_value result;
-  napi_status s = napi_create_external_arraybuffer(
-      env, data, (size_t)byte_length, GuestHeapBufferFinalizeTrampoline,
-      finalize_hint, &result);
+  napi_v8_external_transfer_observer observer;
+  napi_v8_begin_external_transfer_observation(&observer, finalize_hint,
+                                              ownership_transferred_out);
+  napi_status s;
+  try {
+    s = napi_create_external_arraybuffer(
+        env, data, (size_t)byte_length, GuestHeapBufferFinalizeTrampoline,
+        finalize_hint, &result);
+  } catch (const std::bad_alloc&) {
+    napi_v8_end_external_transfer_observation(&observer);
+    return napi_generic_failure;
+  }
+  napi_v8_end_external_transfer_observation(&observer);
   if (s != napi_ok)
     return s;
   if (backing_store_token_out) {
@@ -2155,7 +2168,9 @@ extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
 // Buffer twin of snapi_bridge_create_external_arraybuffer_finalized.
 extern "C" int snapi_bridge_create_external_buffer_finalized(
     SnapiEnvState *env_state, uint64_t data_addr, uint32_t byte_length,
-    void *finalize_hint, uint64_t *backing_store_token_out, uint32_t *out_id) {
+    void *finalize_hint, uint64_t *backing_store_token_out, uint32_t *out_id,
+    int *ownership_transferred_out) {
+  if (ownership_transferred_out != nullptr) *ownership_transferred_out = 0;
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr)
@@ -2163,9 +2178,19 @@ extern "C" int snapi_bridge_create_external_buffer_finalized(
   napi_env env = bridge_state->env;
   void *data = (void *)(uintptr_t)data_addr;
   napi_value result;
-  napi_status s = napi_create_external_buffer(env, (size_t)byte_length, data,
-                                              GuestHeapBufferFinalizeTrampoline,
-                                              finalize_hint, &result);
+  napi_v8_external_transfer_observer observer;
+  napi_v8_begin_external_transfer_observation(&observer, finalize_hint,
+                                              ownership_transferred_out);
+  napi_status s;
+  try {
+    s = napi_create_external_buffer(env, (size_t)byte_length, data,
+                                    GuestHeapBufferFinalizeTrampoline,
+                                    finalize_hint, &result);
+  } catch (const std::bad_alloc&) {
+    napi_v8_end_external_transfer_observation(&observer);
+    return napi_generic_failure;
+  }
+  napi_v8_end_external_transfer_observation(&observer);
   if (s != napi_ok)
     return s;
   if (backing_store_token_out) {

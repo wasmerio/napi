@@ -758,6 +758,7 @@ unsafe extern "C" {
         finalize_hint: *mut core::ffi::c_void,
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
+        ownership_transferred_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_create_external_buffer_finalized(
         env: SnapiEnv,
@@ -766,6 +767,7 @@ unsafe extern "C" {
         finalize_hint: *mut core::ffi::c_void,
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
+        ownership_transferred_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_create_external_arraybuffer_guest_finalized(
         env: SnapiEnv,

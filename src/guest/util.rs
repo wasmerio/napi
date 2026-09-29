@@ -56,7 +56,6 @@ impl<T> HostCopy<T> {
         self.data.as_mut_ptr()
     }
 
-    #[cfg(test)]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         self.data.as_mut_slice()
     }
@@ -215,6 +214,16 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     };
     let (_, store) = env.data_and_store_mut();
     memory.view(&store).data_size()
+}
+
+/// Validate a guest-owned byte range without copying or allocating it. Native
+/// external backing stores keep this pointer after the import returns.
+pub fn guest_range_is_valid(env: &mut FunctionEnvMut<NapiEnv>, ptr: i32, len: usize) -> bool {
+    // A wasm32 pointer is an unsigned offset carried in an i32 host argument.
+    let Some(end) = u64::from(ptr as u32).checked_add(len as u64) else {
+        return false;
+    };
+    end <= guest_data_size(env)
 }
 
 /// Allocate `len` bytes of guest memory, passing the import's store directly so

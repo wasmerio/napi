@@ -359,12 +359,13 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             ),
         ),
         "unofficial_napi_module_wrap_get_namespace" => {
-            Ok(super::guest_unofficial_napi_module_wrap_get_namespace(
+            super::guest_unofficial_napi_module_wrap_get_namespace(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_get_module_requests" => {
             Ok(legacy_module_metadata(env, args, true))
@@ -402,15 +403,16 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
             ))
         }
-        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Ok(
+        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => {
             super::guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
-            ),
-        ),
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
+        }
         "unofficial_napi_module_wrap_evaluate" => {
             super::guest_unofficial_napi_module_wrap_evaluate(
                 env,
@@ -437,19 +439,21 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             legacy_import_module_dynamically(env, args)
         }
         "unofficial_napi_module_wrap_instantiate" => {
-            Ok(super::guest_unofficial_napi_module_wrap_instantiate(
+            super::guest_unofficial_napi_module_wrap_instantiate(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ))
+            )
+            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
-        "unofficial_napi_module_wrap_link" => Ok(super::guest_unofficial_napi_module_wrap_link(
+        "unofficial_napi_module_wrap_link" => super::guest_unofficial_napi_module_wrap_link(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
             args[3].unwrap_i32(),
-        )),
+        )
+        .map_err(|error| RuntimeError::user(Box::new(error))),
         "unofficial_napi_module_wrap_set_export" => {
             Ok(super::guest_unofficial_napi_module_wrap_set_export(
                 env,

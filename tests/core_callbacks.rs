@@ -5,6 +5,76 @@ use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
 fn core_callback_exit_probe() {
     let cases = [
         (
+            "create_buffer",
+            "(import \"napi\" \"napi_create_buffer\" (func $op (param i32 i32 i32 i32) (result i32)))",
+            "Object.defineProperty(globalThis, 'Buffer', {get(){exitNow();return undefined;}}); 0",
+            "",
+            "(call $op (local.get $env) (i32.const 8) (i32.const 28) (i32.const 32))",
+        ),
+        (
+            "create_buffer_copy",
+            "(import \"napi\" \"napi_create_buffer_copy\" (func $op (param i32 i32 i32 i32 i32) (result i32)))",
+            "Object.defineProperty(globalThis, 'Buffer', {get(){exitNow();return undefined;}}); 0",
+            "",
+            "(call $op (local.get $env) (i32.const 1) (i32.const 500) (i32.const 28) (i32.const 32))",
+        ),
+        (
+            "create_typedarray",
+            "(import \"napi\" \"napi_create_typedarray\" (func $op (param i32 i32 i32 i32 i32 i32) (result i32)))",
+            "globalThis.Uint8Array=function(){exitNow();}; new ArrayBuffer(8)",
+            "",
+            "(call $op (local.get $env) (i32.const 1) (i32.const 8) (i32.load (i32.const 24)) (i32.const 0) (i32.const 28))",
+        ),
+        (
+            "create_dataview",
+            "(import \"napi\" \"napi_create_dataview\" (func $op (param i32 i32 i32 i32 i32) (result i32)))",
+            "globalThis.DataView=function(){exitNow();}; new ArrayBuffer(8)",
+            "",
+            "(call $op (local.get $env) (i32.const 8) (i32.load (i32.const 24)) (i32.const 0) (i32.const 28))",
+        ),
+        (
+            "create_error",
+            "(import \"napi\" \"napi_create_error\" (func $op (param i32 i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.load (i32.const 24)) (i32.load (i32.const 24)) (i32.const 28))",
+        ),
+        (
+            "create_type_error",
+            "(import \"napi\" \"napi_create_type_error\" (func $op (param i32 i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.load (i32.const 24)) (i32.load (i32.const 24)) (i32.const 28))",
+        ),
+        (
+            "create_range_error",
+            "(import \"napi\" \"napi_create_range_error\" (func $op (param i32 i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.load (i32.const 24)) (i32.load (i32.const 24)) (i32.const 28))",
+        ),
+        (
+            "throw_error",
+            "(import \"napi\" \"napi_throw_error\" (func $op (param i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.const 500) (i32.const 500))",
+        ),
+        (
+            "throw_type_error",
+            "(import \"napi\" \"napi_throw_type_error\" (func $op (param i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.const 500) (i32.const 500))",
+        ),
+        (
+            "throw_range_error",
+            "(import \"napi\" \"napi_throw_range_error\" (func $op (param i32 i32 i32) (result i32)))",
+            "Object.defineProperty(Error.prototype, 'code', { set(v) {exitNow();} }); 'msg'",
+            "",
+            "(call $op (local.get $env) (i32.const 500) (i32.const 500))",
+        ),
+        (
             "coerce_number",
             "(import \"napi\" \"napi_coerce_to_number\" (func $op (param i32 i32 i32) (result i32)))",
             "({ valueOf() { exitNow(); return 7; } })",
@@ -136,4 +206,77 @@ fn core_callback_exit_probe() {
         }
     }
     assert!(failures.is_empty(), "Lost callback exits: {failures:?}");
+}
+
+#[test]
+fn module_error_construction_preserves_guest_exit_in_both_namespaces() {
+    let wat = r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+      (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_object" (func $object (param i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_create_source_text" (func $module
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "unofficial_napi_module_wrap_get_namespace" (func $legacy_namespace (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_get_namespace" (func $current_namespace (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+      (elem (i32.const 0) $callback)
+      (data (i32.const 100) "exitNow\00")
+      (data (i32.const 140) "Object.defineProperty(Error.prototype, 'code', {set(v){exitNow()}}); 0\00")
+      (data (i32.const 240) "test:module-error")
+      (data (i32.const 280) "export const x = 1;")
+      (func $callback (param i32 i32) (result i32)
+        (call $exit (i32.const 57)) (i32.const 0))
+      (func (export "run") (param $legacy i32) (result i32)
+        (local $env i32)
+        (drop (call $create (i32.const 8) (i32.const 4) (i32.const 8)))
+        (local.set $env (i32.load (i32.const 4)))
+        (drop (call $function (local.get $env) (i32.const 100) (i32.const -1) (i32.const 0) (i32.const 0) (i32.const 12)))
+        (drop (call $global (local.get $env) (i32.const 16)))
+        (drop (call $set (local.get $env) (i32.load (i32.const 16)) (i32.const 100) (i32.load (i32.const 12))))
+        (drop (call $string (local.get $env) (i32.const 140) (i32.const -1) (i32.const 20)))
+        (drop (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24)))
+        (drop (call $object (local.get $env) (i32.const 32)))
+        (drop (call $string (local.get $env) (i32.const 240) (i32.const 17) (i32.const 36)))
+        (drop (call $string (local.get $env) (i32.const 280) (i32.const 19) (i32.const 40)))
+        (drop (call $module (local.get $env) (i32.load (i32.const 32))
+          (i32.load (i32.const 36)) (i32.const 0) (i32.load (i32.const 40))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 44)))
+        (if (result i32) (local.get $legacy)
+          (then (call $legacy_namespace (local.get $env) (i32.load (i32.const 44)) (i32.const 52)))
+          (else (call $current_namespace (local.get $env) (i32.load (i32.const 44)) (i32.const 52))))))"#;
+    for legacy in [0, 1] {
+        let ctx = NapiCtx::default();
+        let mut store = Store::default();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+        let session = ctx.new_session(&module).unwrap();
+        let mut imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        imports.define(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
+                Err(RuntimeError::user(Box::new(WasiError::Exit(
+                    ExitCode::from(code),
+                ))))
+            }),
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        session
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
+            .unwrap();
+        let result = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "run")
+            .unwrap()
+            .call(&mut store, legacy);
+        assert!(
+            matches!(result, Err(ref error) if matches!(error.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if *code == ExitCode::from(57))),
+            "legacy={legacy}: {result:?}"
+        );
+    }
 }

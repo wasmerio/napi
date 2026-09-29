@@ -1,6 +1,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_callback_payload.h"
 #include "internal/napi_env_records.h"
+#include "internal/napi_external_transfer_observer.h"
 #include "internal/napi_escapable_handle_scope_wrapper.h"
 #include "internal/napi_external_wrapper.h"
 #include "internal/napi_function_callback_info.h"
@@ -235,6 +236,22 @@ std::mutex& ExternalHintsMutex() {
   return mutex;
 }
 
+// Private observation for the Wasm guest-heap bridge. The backing-store
+// deleter owns the guest allocation as soon as NewBackingStore succeeds,
+// including paths where a later Buffer record or value handle cannot be made.
+// A nested call restores the outer observer, and the transfer is marked before
+// Buffer prototype lookup can run guest JS.
+thread_local napi_v8_external_transfer_observer* g_external_transfer_observer = nullptr;
+thread_local bool g_test_fail_next_external_buffer_after_transfer = false;
+
+void MarkExternalBackingStoreTransferred(void* finalize_hint) {
+  auto* observer = g_external_transfer_observer;
+  if (observer != nullptr && observer->finalize_hint == finalize_hint &&
+      observer->transferred != nullptr) {
+    *observer->transferred = 1;
+  }
+}
+
 
 void ExternalBackingStoreDeleter(void* data,
                                  size_t /*length*/,
@@ -335,9 +352,8 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
   // type check, which fails when this runs inside a native libuv callback (e.g.
   // a UDP recv) — the call throws and every such buffer would silently degrade
   // to a plain Uint8Array (breaking msg.toString(), Buffer.isBuffer, etc.).
-  // Setting the prototype is a pure host-side V8 operation (Buffer and
-  // Buffer.prototype are ordinary JS objects), so it works regardless of the
-  // calling context and on the native-V8 lane alike.
+  // Looking up Buffer and its prototype can run JS getters, so the guest
+  // adapter installs callback context before entering this function.
   v8::Local<v8::Object> view = v8::Uint8Array::New(ab, offset, length);
 
   v8::Local<v8::String> buffer_name = v8::String::NewFromUtf8Literal(env->isolate, "Buffer");
@@ -514,6 +530,23 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 }
 
 }  // namespace
+
+extern "C" void napi_v8_begin_external_transfer_observation(
+    napi_v8_external_transfer_observer* observer, void* finalize_hint,
+    int* transferred) {
+  if (transferred != nullptr) *transferred = 0;
+  *observer = {finalize_hint, transferred, g_external_transfer_observer};
+  g_external_transfer_observer = observer;
+}
+
+extern "C" void napi_v8_end_external_transfer_observation(
+    napi_v8_external_transfer_observer* observer) {
+  g_external_transfer_observer = observer->previous;
+}
+
+extern "C" void napi_v8_test_fail_next_external_buffer_after_transfer() {
+  g_test_fail_next_external_buffer_after_transfer = true;
+}
 
 void napi_v8_set_last_exception(napi_env env,
                                 v8::Local<v8::Value> exception,
@@ -866,12 +899,28 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     if (!backing) {
       return napi_generic_failure;
     }
-    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-        record_create(env, hint.get());
-    {
+    // The backing-store deleter now owns the hint and will run its finalizer
+    // even if a later step fails to produce a napi_value.
+    hint.release();
+    MarkExternalBackingStoreTransferred(finalize_hint);
+    bool tracker_recorded = false;
+    try {
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_create(env, hint_ptr);
+      tracker_recorded = true;
       // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
       std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-      env->external_backing_store_hints.insert(hint.release());
+      env->external_backing_store_hints.insert(hint_ptr);
+    } catch (const std::bad_alloc&) {
+      {
+        std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+        hint_ptr->env = nullptr;
+      }
+      if (tracker_recorded) {
+        v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+            record_release(env, hint_ptr);
+      }
+      return napi_generic_failure;
     }
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
@@ -1326,10 +1375,10 @@ napi_status NAPI_CDECL napi_get_value_bigint_words(napi_env env,
   int wc = static_cast<int>(bigint->WordCount());
   if (words == nullptr) {
     if (sign_bit != nullptr) {
-      int tmp_count = wc;
-      uint64_t dummy_word = 0;
-      uint64_t* tmp_words = (tmp_count > 0) ? &dummy_word : nullptr;
-      bigint->ToWordsArray(&sign, &tmp_count, tmp_words);
+      // ToWordsArray writes up to the supplied capacity. A count query has
+      // no output storage, even when the BigInt has many words.
+      int tmp_count = 0;
+      bigint->ToWordsArray(&sign, &tmp_count, nullptr);
       *sign_bit = sign;
     }
     *word_count = static_cast<size_t>(wc);
@@ -3048,12 +3097,33 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   if (!backing) {
     return napi_generic_failure;
   }
-  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-      record_create(env, hint.get());
-  {
+  hint.release();
+  MarkExternalBackingStoreTransferred(finalize_hint);
+  bool tracker_recorded = false;
+  try {
+    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+        record_create(env, hint_ptr);
+    tracker_recorded = true;
     // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
     std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    env->external_backing_store_hints.insert(hint.release());
+    env->external_backing_store_hints.insert(hint_ptr);
+  } catch (const std::bad_alloc&) {
+    {
+      std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+      hint_ptr->env = nullptr;
+    }
+    if (tracker_recorded) {
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_release(env, hint_ptr);
+    }
+    return napi_generic_failure;
+  }
+
+  // Private deterministic regression hook for failure after ownership moves
+  // to the backing-store deleter but before a JS Buffer value is returned.
+  if (g_test_fail_next_external_buffer_after_transfer) {
+    g_test_fail_next_external_buffer_after_transfer = false;
+    return napi_generic_failure;
   }
 
   auto* record = env->allocate<napi_buffer_record__>(env);
