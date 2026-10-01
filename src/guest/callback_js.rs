@@ -5,7 +5,7 @@ use wasmer::{FunctionEnvMut, Table, Value};
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::future::Future;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::AsyncFunctionEnvMut;
+use wasmer::{AsyncFunctionEnvMut, FunctionEnvHandle};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -17,6 +17,21 @@ type RawFunctionEnvMut = FunctionEnvMut<'static, NapiEnv>;
 /// suspended through JSPI. The host bridge keeps their callback frame alive
 /// and retries them from the next synchronous guest checkpoint.
 pub(crate) const CALLBACK_DEFERRED: u32 = u32::MAX;
+
+/// Whether a callback that could not reach its store should be retried.
+///
+/// Deferring is only useful while there is still something to defer *to*: once
+/// the store has been turned back into an owned `Store` the handle is dead for
+/// good, and queueing the callback would leave work that no checkpoint can ever
+/// drain. Reporting failure instead lets the bridge discard the frame.
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn deferred_or_dead(handle: &FunctionEnvHandle<NapiEnv>) -> u32 {
+    if handle.is_alive() {
+        CALLBACK_DEFERRED
+    } else {
+        0
+    }
+}
 
 #[repr(C)]
 pub(crate) struct CallbackInvocationCtx {
@@ -30,8 +45,13 @@ unsafe impl Send for CallbackInvocationCtx {}
 
 enum CallbackEnv {
     Sync(*mut RawFunctionEnvMut),
+    /// A handle on the environment that outlives the call which registered it,
+    /// for a callback the host runtime invokes later. It reaches the store only
+    /// while no guest is holding it — which is to say while a guest is suspended,
+    /// and that is where this bridge's callbacks arrive, since the guest reaches
+    /// the host event loop by suspending into it.
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    Async(AsyncFunctionEnvMut<NapiEnv>),
+    Persistent(FunctionEnvHandle<NapiEnv>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -39,10 +59,10 @@ pub(crate) fn install_persistent_callback_state(
     env: &mut FunctionEnvMut<NapiEnv>,
     env_id: u32,
     snapi_env: SnapiEnv,
-    async_env: AsyncFunctionEnvMut<NapiEnv>,
+    handle: FunctionEnvHandle<NapiEnv>,
 ) {
     let mut ctx = Box::new(CallbackInvocationCtx {
-        env: CallbackEnv::Async(async_env),
+        env: CallbackEnv::Persistent(handle),
     });
     let ctx_ptr = (&mut *ctx as *mut CallbackInvocationCtx).cast::<c_void>();
     env.data_mut()
@@ -529,23 +549,8 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
             call_guest_callback_and_flush(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg)
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| {
-                let Some(table) = sync_env.data().table.clone() else {
-                    eprintln!("[callback trampoline] guest function table is not installed");
-                    return 0;
-                };
-                call_guest_callback_and_flush(
-                    &mut sync_env,
-                    &table,
-                    guest_env as i32,
-                    wasm_fn_ptr,
-                    callback_arg,
-                )
-            }) {
-                return result;
-            }
-            if let Some(mut locked) = env.try_write() {
+        CallbackEnv::Persistent(handle) => {
+            if let Some(mut locked) = handle.try_write() {
                 let mut sync_env = locked.as_function_env_mut();
                 if let Some(table) = sync_env.data().table.clone() {
                     return call_guest_callback_and_flush(
@@ -557,7 +562,10 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
                     );
                 }
             }
-            CALLBACK_DEFERRED
+            // The store is held by a running guest, so this callback waits for
+            // the next event-loop checkpoint — the guest suspends into it, which
+            // releases the store. A gone store never comes back, so stop asking.
+            deferred_or_dead(handle)
         }
     }
 }
@@ -603,15 +611,12 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
             invoke(unsafe { &mut *env.cast::<FunctionEnvMut<'_, NapiEnv>>() })
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| invoke(&mut sync_env)) {
-                return result;
-            }
-            if let Some(mut locked) = env.try_write() {
+        CallbackEnv::Persistent(handle) => {
+            if let Some(mut locked) = handle.try_write() {
                 let mut sync_env = locked.as_function_env_mut();
                 return invoke(&mut sync_env);
             }
-            CALLBACK_DEFERRED
+            deferred_or_dead(handle)
         }
     }
 }
