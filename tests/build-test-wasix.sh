@@ -68,7 +68,11 @@ fi
 WASIX_DRIVER="wasixcc"
 case "$TEST_SRC" in
   *.cc|*.cpp)
-    WASIX_DRIVER="wasixcc++"
+    # Recent wasixcc releases select the C++ driver from the input extension
+    # and do not install a separate wasixcc++ executable.
+    if command -v wasixcc++ >/dev/null 2>&1; then
+      WASIX_DRIVER="wasixcc++"
+    fi
     ;;
 esac
 

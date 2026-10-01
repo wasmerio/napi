@@ -11,6 +11,7 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -217,6 +218,19 @@ void napi_module_wrap__::free_record(record *entry)
   if (entry == nullptr)
     return;
 
+  // Links store record pointers for duplicate-request checks. Clear incoming
+  // links before freeing a record so a parent cannot instantiate through a
+  // destroyed dependency or mistake a later allocation for the old record.
+  for (record *dependent : records_)
+  {
+    if (dependent == entry)
+      continue;
+    for (record *&linked : dependent->linked_records)
+    {
+      if (linked == entry)
+        linked = nullptr;
+    }
+  }
   remove(entry);
   for (auto &request : entry->requests)
     JS_FreeValue(ctx_, request.attributes);
@@ -689,11 +703,44 @@ napi_status napi_module_wrap__::link(unofficial_napi_module module,
   return napi_ok;
 }
 
+napi_status napi_module_wrap__::validate_linked_graph(record *root)
+{
+  // QuickJS can link implicitly while evaluating a module or a require()
+  // facade. Verify the whole reachable, not-yet-linked graph before any of
+  // those entry points follow request pointers. Keep already-linked modules
+  // usable after their wrapper handles have been destroyed.
+  std::unordered_set<record *> live(records_.begin(), records_.end());
+  std::unordered_set<record *> visited;
+  std::vector<record *> pending{root};
+  while (!pending.empty())
+  {
+    record *entry = pending.back();
+    pending.pop_back();
+    if (!live.contains(entry))
+      return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Linked module is invalid");
+    if (!visited.insert(entry).second ||
+        JS_GetModuleStatus(ctx_, entry->module) != JS_MODULE_STATUS_UNLINKED)
+      continue;
+    if (entry->linked_records.size() != entry->requests.size())
+      return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Linked module is incomplete");
+    for (record *linked : entry->linked_records)
+    {
+      if (!live.contains(linked))
+        return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Linked module is invalid");
+      pending.push_back(linked);
+    }
+  }
+  return napi_ok;
+}
+
 napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
 {
   record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
+  napi_status validation = validate_linked_graph(entry);
+  if (validation != napi_ok)
+    return validation;
   if (JS_LinkModule(ctx_, entry->module) < 0)
     return return_pending_exception("Module linking failed");
   return napi_ok;
@@ -709,6 +756,9 @@ napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  napi_status validation = validate_linked_graph(entry);
+  if (validation != napi_ok)
+    return validation;
   JSValue promise = JS_EvaluateModule(ctx_, entry->module);
   if (JS_IsException(promise))
     return return_pending_exception("Failed to evaluate module");
@@ -725,6 +775,9 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  napi_status validation = validate_linked_graph(entry);
+  if (validation != napi_ok)
+    return validation;
 
   JSValue promise = JS_EvaluateModule(ctx_, entry->module);
   if (JS_IsException(promise))
@@ -1013,6 +1066,9 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  napi_status validation = validate_linked_graph(entry);
+  if (validation != napi_ok)
+    return validation;
 
   std::string filename = "<required-module-facade:" +
                          std::to_string(++facade_counter_) + ">";

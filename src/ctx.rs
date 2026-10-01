@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use std::sync::atomic::AtomicU32;
 use std::{
     collections::HashSet,
     sync::{
@@ -8,11 +10,16 @@ use std::{
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::lane::ManagedV8LaneActivator;
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
-    guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
+    guest::napi::{
+        frozen_napi_type_matches, is_known_napi_import, register_env_imports, register_napi_imports,
+    },
+    message::PendingMessages,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -43,7 +50,7 @@ pub struct NapiCtxBuilder {
 
 #[derive(Clone, Debug)]
 pub struct NapiCtx {
-    inner: Arc<NapiCtxInner>,
+    inner: Arc<NapiProviderBindings>,
 }
 
 #[derive(Clone)]
@@ -61,14 +68,13 @@ pub struct NapiInstantiationState {
 }
 
 /// Runtime hooks that provide N-API imports for WASIX guests.
-// The import phase creates a per-instantiation session holding the function
-// env backing the imported host functions, and hands it to the caller as
-// opaque state. The hooks themselves are stateless, so concurrent
-// instantiations — same module or not, same store or not — cannot receive
-// each other's sessions.
+// The import phase creates a lightweight per-instantiation binding for the
+// WASM host functions. V8 and the dedicated background lane start only when a
+// guest invokes an env-creation import. Each binding stays tied to its store;
+// the shared state below owns only instance-wide accounting and stop control.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeHooks {
-    ctx: NapiCtx,
+    inner: Arc<NapiProviderBindings>,
 }
 
 /// Opaque control surface for stopping every V8 isolate owned by a context.
@@ -76,6 +82,7 @@ pub struct NapiRuntimeHooks {
 pub struct NapiRuntimeControl {
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    pending_messages: Arc<PendingMessages>,
 }
 
 impl NapiRuntimeControl {
@@ -100,23 +107,39 @@ impl NapiRuntimeControl {
                 );
             }
         }
+        drop(envs);
+        self.pending_messages.close_and_clear();
     }
 }
 
-#[derive(Debug)]
-struct NapiCtxInner {
+/// Lightweight import bindings. Managed embedders construct these while
+/// linking a module; no NapiCtx, V8 isolate, or background queue exists yet.
+struct NapiProviderBindings {
     limits: NapiLimits,
-    active_sessions: AtomicUsize,
+    active_sessions: Arc<AtomicUsize>,
+    /// Guest-visible native env IDs span all worker sessions of this instance.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    next_native_env_id: Arc<AtomicU32>,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
-    /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
-    /// external-memory, and CPU paths.
+    /// tunables and the V8 heap, external-memory, and lane reservations.
     budget: Arc<ResourceBudget>,
+    pending_messages: Arc<PendingMessages>,
     envs: Arc<Mutex<HashSet<usize>>>,
     host_stopped: Arc<AtomicBool>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    managed_lane_activator: Option<ManagedV8LaneActivator>,
+}
+
+impl std::fmt::Debug for NapiProviderBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NapiProviderBindings")
+            .finish_non_exhaustive()
+    }
 }
 
 struct NapiSessionInner {
-    ctx: Arc<NapiCtxInner>,
+    ctx: Arc<NapiProviderBindings>,
+    lease: Arc<SessionLease>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
     func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
@@ -128,9 +151,16 @@ impl std::fmt::Debug for NapiSession {
     }
 }
 
-impl Drop for NapiSessionInner {
+/// One admission slot shared by the temporary import session and every
+/// FunctionEnv it installs. The slot stays occupied for the store lifetime,
+/// including after `configure_instance` consumes its setup state.
+pub(crate) struct SessionLease {
+    active_sessions: Arc<AtomicUsize>,
+}
+
+impl Drop for SessionLease {
     fn drop(&mut self) {
-        self.ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
+        self.active_sessions.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -168,7 +198,30 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Build lightweight import bindings for a managed embedder. The embedder
+    /// owns lazy instance activation and must return its managed V8 task queue
+    /// when a guest first creates an environment. Importing functions does not
+    /// invoke the callback or allocate a NapiCtx, V8 isolate, or queue.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn build_managed_imports(self, activator: ManagedV8LaneActivator) -> NapiRuntimeHooks {
+        NapiRuntimeHooks {
+            inner: self.build_inner(Some(activator)),
+        }
+    }
+
     pub fn build(self) -> NapiCtx {
+        NapiCtx {
+            inner: self.build_inner(None),
+        }
+    }
+
+    fn build_inner(
+        self,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] managed_lane_activator: Option<
+            ManagedV8LaneActivator,
+        >,
+        #[cfg(all(target_arch = "wasm32", feature = "js"))] _background: Option<()>,
+    ) -> Arc<NapiProviderBindings> {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
             None => match self.limits.memory_budget_bytes() {
@@ -176,15 +229,20 @@ impl NapiCtxBuilder {
                 None => ResourceBudget::unlimited(),
             },
         };
-        NapiCtx {
-            inner: Arc::new(NapiCtxInner {
-                limits: self.limits,
-                active_sessions: AtomicUsize::new(0),
-                budget,
-                envs: Arc::new(Mutex::new(HashSet::new())),
-                host_stopped: Arc::new(AtomicBool::new(false)),
-            }),
-        }
+        let envs = Arc::new(Mutex::new(HashSet::new()));
+        let host_stopped = Arc::new(AtomicBool::new(false));
+        Arc::new(NapiProviderBindings {
+            limits: self.limits,
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            next_native_env_id: Arc::new(AtomicU32::new(1)),
+            budget,
+            pending_messages: PendingMessages::new(),
+            envs,
+            host_stopped,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            managed_lane_activator,
+        })
     }
 }
 
@@ -228,6 +286,11 @@ impl NapiCtx {
             if import.module() == NAPI_MODULE_NAME {
                 napi_version = Some(match napi_version {
                     Some(NapiVersion::Unknown) => NapiVersion::Unknown,
+                    _ if matches!(import.ty(), ExternType::Function(actual)
+                        if frozen_napi_type_matches(import.name(), actual) == Some(false)) =>
+                    {
+                        NapiVersion::Unknown
+                    }
                     _ if is_known_napi_import(import.name()) => NapiVersion::V10,
                     _ => NapiVersion::Unknown,
                 });
@@ -251,57 +314,86 @@ impl NapiCtx {
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
-        NapiRuntimeHooks { ctx: self.clone() }
+        NapiRuntimeHooks {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     pub fn runtime_control(&self) -> NapiRuntimeControl {
-        NapiRuntimeControl {
-            envs: Arc::clone(&self.inner.envs),
-            host_stopped: Arc::clone(&self.inner.host_stopped),
-        }
+        NapiRuntimeControl::from_inner(&self.inner)
     }
 
     pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
-        let previous = self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
-        if let Some(max_sessions) = self.inner.limits.max_sessions
-            && previous >= max_sessions
-        {
-            self.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
-            bail!("refusing to create more than {max_sessions} active N-API sessions");
-        }
+        new_session(&self.inner, module)
+    }
+}
 
-        let imported_memory_type = module.imports().find_map(|import| {
-            if import.module() == "env"
-                && import.name() == "memory"
-                && let ExternType::Memory(ty) = import.ty()
-            {
-                return Some(*ty);
-            }
-            None
-        });
-
-        let imported_table_type = module.imports().find_map(|import| {
-            if import.module() == "env"
-                && import.name() == "__indirect_function_table"
-                && let ExternType::Table(ty) = import.ty()
-            {
-                return Some(*ty);
-            }
-            None
-        });
-
-        Ok(NapiSession {
-            inner: Arc::new(NapiSessionInner {
-                ctx: Arc::clone(&self.inner),
-                imported_memory_type,
-                imported_table_type,
-                func_env: Mutex::new(None),
-            }),
+fn new_session(ctx: &Arc<NapiProviderBindings>, module: &Module) -> Result<NapiSession> {
+    let max_sessions = ctx.limits.max_sessions.unwrap_or(usize::MAX);
+    if ctx
+        .active_sessions
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < max_sessions).then(|| current + 1)
         })
+        .is_err()
+    {
+        bail!("refusing to create more than {max_sessions} active N-API sessions");
+    }
+    let lease = Arc::new(SessionLease {
+        active_sessions: Arc::clone(&ctx.active_sessions),
+    });
+
+    let imported_memory_type = module.imports().find_map(|import| {
+        if import.module() == "env"
+            && import.name() == "memory"
+            && let ExternType::Memory(ty) = import.ty()
+        {
+            return Some(*ty);
+        }
+        None
+    });
+
+    let imported_table_type = module.imports().find_map(|import| {
+        if import.module() == "env"
+            && import.name() == "__indirect_function_table"
+            && let ExternType::Table(ty) = import.ty()
+        {
+            return Some(*ty);
+        }
+        None
+    });
+
+    Ok(NapiSession {
+        inner: Arc::new(NapiSessionInner {
+            ctx: Arc::clone(ctx),
+            lease,
+            imported_memory_type,
+            imported_table_type,
+            func_env: Mutex::new(None),
+        }),
+    })
+}
+
+impl NapiRuntimeControl {
+    fn from_inner(inner: &Arc<NapiProviderBindings>) -> Self {
+        Self {
+            envs: Arc::clone(&inner.envs),
+            host_stopped: Arc::clone(&inner.host_stopped),
+            pending_messages: Arc::clone(&inner.pending_messages),
+        }
     }
 }
 
 impl NapiRuntimeHooks {
+    /// Shared resource budget for the guest store and all V8 environments.
+    pub fn budget(&self) -> Arc<ResourceBudget> {
+        Arc::clone(&self.inner.budget)
+    }
+
+    pub fn runtime_control(&self) -> NapiRuntimeControl {
+        NapiRuntimeControl::from_inner(&self.inner)
+    }
+
     /// Creates N-API imports when `module` requests them.
     pub fn additional_imports(
         &self,
@@ -342,7 +434,7 @@ impl NapiRuntimeHooks {
             bail!("unsupported Wasmer N-API extension version: {version:?}");
         }
 
-        let session = self.ctx.prepare_module(module)?;
+        let session = new_session(&self.inner, module)?;
         session.add_imports(store, imports)?;
         Ok(NapiInstantiationState {
             session: Some(session),
@@ -388,9 +480,14 @@ impl NapiSession {
 
         let napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
+            Arc::clone(&self.inner.ctx.pending_messages),
             self.inner.ctx.limits.max_envs,
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            Arc::clone(&self.inner.ctx.next_native_env_id),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            self.inner.ctx.managed_lane_activator.clone(),
         );
         let func_env = FunctionEnv::new(store, napi_env);
         {
@@ -433,6 +530,11 @@ impl NapiSession {
             func_env.as_mut(&mut *store).table = Some(table);
         }
 
+        // Wasmer owns this FunctionEnv until its store is destroyed. Retain
+        // the admission slot with it; the setup session is consumed by
+        // configure_instance long before the guest module stops running.
+        func_env.as_mut(&mut *store).session_lease = Some(Arc::clone(&self.inner.lease));
+
         Ok(())
     }
 
@@ -453,34 +555,24 @@ impl NapiSession {
                 .context("missing runtime function env during instance setup")?
         };
 
-        if let Some(memory) = imported_memory {
-            func_env.as_mut(&mut *store).memory = Some(memory.clone());
+        // Imports may already have bound a memory and a start section may
+        // already have created its guest heap from it. Never replace that
+        // memory with a different exported one in a multi-memory module.
+        // Otherwise a module-defined export can be bound after instantiation
+        // for a later first N-API call. Keep the guest heap lazy either way.
+        if func_env.as_ref(&*store).memory.is_none() {
+            let instance_memory = imported_memory
+                .cloned()
+                .or_else(|| instance.exports.get_memory("memory").ok().cloned());
+            if let Some(memory) = instance_memory {
+                func_env.as_mut(&mut *store).memory = Some(memory);
+            }
         }
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        {
-            // Stand up the host-side guest-memory allocator now that the memory is
-            // final. All bridge allocations of guest memory go through it, AND it
-            // is the only backing store for V8 ArrayBuffers/Buffers/TypedArrays
-            // (see TrackingArrayBufferAllocator in unofficial_napi.cc) — the
-            // guest's own malloc is never called from the host, and host-heap
-            // allocation is never used for guest-visible V8 memory. A module that
-            // requests N-API imports without usable linear memory, or whose
-            // memory can't support a GuestHeap, cannot run under this bridge: we
-            // fail instantiation here rather than let allocation silently fall
-            // back to unbudgeted, non-guest-shared host memory later.
-            let memory = func_env
-                .as_ref(&*store)
-                .memory
-                .clone()
-                .context("N-API imports require the guest to have linear memory")?;
-            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget)
-                .context(
-                    "failed to initialize the guest-heap allocator over the guest's linear memory",
-                )?;
-            func_env.as_mut(&mut *store).guest_heap = Some(heap);
-        }
+        // Keep import-only modules cheap, including those with no linear
+        // memory. The first environment creation validates memory and installs
+        // the allocator after Edge has admitted the lane. A start section may
+        // already have installed its heap; never replace it here.
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
         // Memory. Keep its established guest allocator: exported malloc owns
@@ -523,6 +615,16 @@ fn napi_wasmer_extension_version_from_namespace(
 mod tests {
     use super::NapiCtx;
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
     use wasmer::{AsStoreMut, Instance, Module, Store};
     use wat::parse_str;
 
@@ -584,9 +686,647 @@ mod tests {
         assert_eq!(ctx.active_sessions(), 1);
     }
 
+    #[test]
+    fn configured_store_keeps_its_session_slot_until_drop() {
+        let mut first_store = Store::default();
+        let mut second_store = Store::new(first_store.engine().clone());
+        let module = compile_wat(
+            &first_store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (import "env" "memory" (memory 1))
+            )"#,
+        );
+        let ctx = NapiCtx::builder().max_sessions(1).build();
+        let hooks = ctx.runtime_hooks();
+
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut first_store.as_store_mut())
+            .expect("first session should be admitted");
+        let instance = Instance::new(&mut first_store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &module,
+                &mut first_store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
+        assert_eq!(ctx.active_sessions(), 1);
+        assert!(
+            hooks
+                .additional_imports(&module, &mut second_store.as_store_mut())
+                .is_err(),
+            "a live store must retain its session slot"
+        );
+
+        drop(instance);
+        drop(imports);
+        drop(first_store);
+        assert_eq!(ctx.active_sessions(), 0);
+        let (_imports, _state) = hooks
+            .additional_imports(&module, &mut second_store.as_store_mut())
+            .expect("dropping the first store releases the session slot");
+    }
+
+    #[test]
+    fn failed_import_setup_releases_its_session_slot() {
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (import "env" "memory" (memory 1))
+            )"#,
+        );
+        let ctx = NapiCtx::builder().max_sessions(1).build();
+        let hooks = ctx.runtime_hooks();
+        let mut invalid = wasmer::Imports::new();
+        invalid.define(
+            "env",
+            "memory",
+            wasmer::Function::new_typed(&mut store, || 0_i32),
+        );
+        assert!(
+            hooks
+                .add_imports(&module, &mut store.as_store_mut(), &mut invalid)
+                .is_err()
+        );
+        assert_eq!(ctx.active_sessions(), 0);
+
+        let mut valid = wasmer::Imports::new();
+        let state = hooks
+            .add_imports(&module, &mut store.as_store_mut(), &mut valid)
+            .expect("a failed setup must not consume the live-session limit");
+        drop(state);
+        assert_eq!(ctx.active_sessions(), 1);
+        drop(valid);
+        drop(store);
+        assert_eq!(ctx.active_sessions(), 0);
+    }
+
     fn compile_wat(store: &Store, wat: &str) -> Module {
         let wasm = parse_str(wat).expect("wat module parses");
         Module::new(store, wasm).expect("wat module compiles")
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn managed_hooks(
+        spawns: Arc<AtomicUsize>,
+        finished: mpsc::Sender<()>,
+    ) -> (
+        super::NapiRuntimeHooks,
+        Arc<std::sync::Mutex<Option<Arc<crate::ManagedV8Lane>>>>,
+    ) {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let activator = {
+            let slot = Arc::clone(&slot);
+            Arc::new(move || {
+                let mut guard = slot.lock().unwrap();
+                if let Some(lane) = &*guard {
+                    return Ok(Arc::clone(lane));
+                }
+                let lane =
+                    crate::ManagedV8Lane::new(256, Arc::new(|| Box::new(())), Arc::new(|| {}))?;
+                let worker_lane = Arc::clone(&lane);
+                let finished = finished.clone();
+                thread::Builder::new()
+                    .name("test-v8-lane".into())
+                    .spawn(move || {
+                        worker_lane.run();
+                        let _ = finished.send(());
+                    })?;
+                spawns.fetch_add(1, Ordering::SeqCst);
+                *guard = Some(Arc::clone(&lane));
+                Ok(lane)
+            })
+        };
+        (NapiCtx::builder().build_managed_imports(activator), slot)
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn lazy_hooks_start_lane_only_when_guest_calls_napi() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let import_only = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            (import "env" "memory" (memory 1 512))
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&import_only, &mut store.as_store_mut())
+            .unwrap();
+        let memory = state
+            .session
+            .as_ref()
+            .unwrap()
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .memory
+            .clone()
+            .unwrap();
+        let pages_before = memory.size(&store);
+        let charge_before = hooks.budget().snapshot().mem_charged;
+        let instance = Instance::new(&mut store, &import_only, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &import_only,
+                &mut store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
+        assert!(!lane_slot.lock().unwrap().is_some());
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(memory.size(&store), pages_before);
+        assert_eq!(hooks.budget().snapshot().mem_charged, charge_before);
+
+        let invoked = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (func (export "invoke") (result i32) call $init)
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&invoked, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &invoked, &imports).unwrap();
+        hooks
+            .configure_instance(&invoked, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert!(invoke.call(&mut store).unwrap() > 0);
+        assert!(lane_slot.lock().unwrap().is_some());
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lane stops");
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn legacy_flags_and_malformed_create_leave_lane_and_heap_lazy() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "unofficial_napi_set_flags_from_string"
+                    (func $flags (param i32 i32) (result i32)))
+                (import "napi" "unofficial_napi_create_env_with_options"
+                    (func $create (param i32 i32 i32 i32) (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (data (i32.const 64) "--js-source-phase-imports --harmony-import-attributes")
+                (func (export "defaults") (result i32)
+                    i32.const 64 i32.const 53 call $flags)
+                (func (export "other_flags") (result i32)
+                    i32.const 64 i32.const 8 call $flags)
+                (func (export "bad_create") (result i32)
+                    i32.const 8 i32.const 65528 i32.const 8 i32.const 12 call $create)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let charged = hooks.budget().snapshot().mem_charged;
+        let call = |store: &mut Store, name: &str| {
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&*store, name)
+                .unwrap()
+                .call(store)
+                .unwrap()
+        };
+        assert_eq!(call(&mut store, "defaults"), 0);
+        assert_eq!(call(&mut store, "other_flags"), 1);
+        assert_eq!(call(&mut store, "bad_create"), 1);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, charged);
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn runtime_options_accept_only_default_flags_and_leave_lane_lazy() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        // Runtime options are `{ size, version, engine_flags, engine_flags_length }`.
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi_extension_wasmer_v0" "unofficial_napi_configure_runtime"
+                    (func $configure (param i32) (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (data (i32.const 64) "--js-source-phase-imports --harmony-import-attributes")
+                (func $options (param $flags i32) (param $length i32) (result i32)
+                    (i32.store (i32.const 16) (i32.const 16))
+                    (i32.store (i32.const 20) (i32.const 1))
+                    (i32.store (i32.const 24) (local.get $flags))
+                    (i32.store (i32.const 28) (local.get $length))
+                    (call $configure (i32.const 16)))
+                (func (export "no_options") (result i32)
+                    i32.const 0 call $configure)
+                (func (export "no_flags") (result i32)
+                    i32.const 0 i32.const 0 call $options)
+                (func (export "defaults") (result i32)
+                    i32.const 64 i32.const 53 call $options)
+                (func (export "one_default") (result i32)
+                    i32.const 64 i32.const 25 call $options)
+                (func (export "other_flags") (result i32)
+                    i32.const 64 i32.const 8 call $options)
+                (func (export "too_long") (result i32)
+                    i32.const 64 i32.const 65 call $options)
+                (func (export "out_of_bounds") (result i32)
+                    i32.const 33554400 i32.const 53 call $options)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let charged = hooks.budget().snapshot().mem_charged;
+        let call = |store: &mut Store, name: &str| {
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&*store, name)
+                .unwrap()
+                .call(store)
+                .unwrap()
+        };
+        assert_eq!(call(&mut store, "no_options"), 0);
+        assert_eq!(call(&mut store, "no_flags"), 0);
+        assert_eq!(call(&mut store, "defaults"), 0);
+        assert_eq!(call(&mut store, "one_default"), 0);
+        assert_eq!(call(&mut store, "other_flags"), 1);
+        assert_eq!(call(&mut store, "too_long"), 1);
+        assert_eq!(call(&mut store, "out_of_bounds"), 1);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, charged);
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn memoryless_import_only_module_stays_inert() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (func (export "invoke") (result i32) call $init)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(hooks.budget().snapshot().mem_charged, 0);
+
+        // Actual N-API use fails without guest memory before activation.
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn exported_memory_is_bound_without_initializing_napi() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (memory (export "memory") 1 512)
+                (func (export "invoke") (result i32) call $init)
+            )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let memory = instance.exports.get_memory("memory").unwrap().clone();
+        let pages_before = memory.size(&store);
+        let charge_before = hooks.budget().snapshot().mem_charged;
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(lane_slot.lock().unwrap().is_none());
+        assert_eq!(memory.size(&store), pages_before);
+        assert_eq!(hooks.budget().snapshot().mem_charged, charge_before);
+
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert!(invoke.call(&mut store).unwrap() > 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn managed_imports_bind_the_existing_wasix_memory_before_start() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (import "env" "memory" (memory 1 512))
+                (import "env" "uv_get_free_memory" (func $free_memory (result i64)))
+                (memory (export "memory") 1 512)
+                (global $result (mut i32) (i32.const 0))
+                (func $start call $init global.set $result)
+                (start $start)
+                (func (export "start_result") (result i32) global.get $result)
+                (func (export "helper_result") (result i64) call $free_memory)
+            )"#,
+        );
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(512), false)).unwrap();
+        let mut imports = wasmer::Imports::new();
+        imports.define("env", "memory", memory.clone());
+        imports.define(
+            "env",
+            "uv_get_free_memory",
+            wasmer::Function::new_typed(&mut store, || 123_i64),
+        );
+        let state = hooks
+            .add_imports(&module, &mut store.as_store_mut(), &mut imports)
+            .unwrap();
+        let func_env = state
+            .session
+            .as_ref()
+            .unwrap()
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let bound_memory = func_env.as_ref(&store).memory.clone().unwrap();
+        assert_eq!(
+            bound_memory.view(&store).data_ptr(),
+            memory.view(&store).data_ptr()
+        );
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        assert_ne!(
+            instance
+                .exports
+                .get_memory("memory")
+                .unwrap()
+                .view(&store)
+                .data_ptr(),
+            memory.view(&store).data_ptr(),
+            "the exported memory must be distinct from imported env.memory"
+        );
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        assert!(func_env.as_ref(&store).guest_heap.is_some());
+        assert_eq!(
+            func_env
+                .as_ref(&store)
+                .memory
+                .as_ref()
+                .unwrap()
+                .view(&store)
+                .data_ptr(),
+            memory.view(&store).data_ptr(),
+            "configure_instance must retain the memory used by the start-section heap"
+        );
+        assert!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&store, "start_result")
+                .unwrap()
+                .call(&mut store)
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i64>(&store, "helper_result")
+                .unwrap()
+                .call(&mut store)
+                .unwrap(),
+            123
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        drop(imports);
+        drop(instance);
+        drop(store);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn start_section_initialization_requires_a_guest_heap() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        let mut store = Store::default();
+
+        // A module-defined memory cannot be reached by imports until after
+        // instantiation, so its start section must fail before V8 starts.
+        let unavailable = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (memory 1 512)
+            (global $result (mut i32) (i32.const -1))
+            (func $start call $init global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+        )"#,
+        );
+        let (imports, _state) = hooks
+            .additional_imports(&unavailable, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &unavailable, &imports).unwrap();
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "start_result")
+            .unwrap();
+        assert_eq!(result.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!lane_slot.lock().unwrap().is_some());
+
+        let unavailable_extension = compile_wat(
+            &store,
+            r#"(module
+            (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
+              (func $create (param i32 i32 i32 i32) (result i32)))
+            (memory 1 512)
+            (global $result (mut i32) (i32.const -1))
+            (func $start
+              i32.const 8 i32.const 0 i32.const 4 i32.const 8
+              call $create global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+        )"#,
+        );
+        let (imports, _state) = hooks
+            .additional_imports(&unavailable_extension, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &unavailable_extension, &imports).unwrap();
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "start_result")
+            .unwrap();
+        assert_ne!(result.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!lane_slot.lock().unwrap().is_some());
+
+        // Imported memory is available during start. The first call installs
+        // the guest heap before V8, and setup retains that same allocator.
+        let available = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (global $result (mut i32) (i32.const -1))
+            (func $start call $init global.set $result)
+            (start $start)
+            (func (export "start_result") (result i32) global.get $result)
+            (func (export "invoke") (result i32) call $init)
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&available, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session.as_ref().unwrap().clone();
+        let instance = Instance::new(&mut store, &available, &imports).unwrap();
+        let heap_before = session
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .guest_heap
+            .clone()
+            .expect("start section installs guest heap");
+        hooks
+            .configure_instance(
+                &available,
+                &mut store.as_store_mut(),
+                &instance,
+                None,
+                state,
+            )
+            .unwrap();
+        let heap_after = session
+            .inner
+            .func_env
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref(&store)
+            .guest_heap
+            .clone()
+            .unwrap();
+        assert!(Arc::ptr_eq(&heap_before, &heap_after));
+        let result = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "start_result")
+            .unwrap();
+        let start_id = result.call(&mut store).unwrap();
+        assert!(start_id > 0);
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), start_id);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        lane_slot.lock().unwrap().as_ref().unwrap().stop();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn stopped_lazy_hooks_never_start_lane() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, _finished_rx) = mpsc::channel();
+        let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
+        hooks.runtime_control().terminate_all();
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+            (import "env" "memory" (memory 1 512))
+            (func (export "invoke") (result i32) call $init)
+        )"#,
+        );
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
+            .unwrap();
+        let invoke = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "invoke")
+            .unwrap();
+        assert_eq!(invoke.call(&mut store).unwrap(), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(!lane_slot.lock().unwrap().is_some());
     }
 
     #[test]
@@ -687,13 +1427,35 @@ mod tests {
         let module = compile_wat(
             &store,
             r#"(module
-                (import "napi" "napi_get_undefined" (func))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
             )"#,
         );
 
         assert_eq!(
             NapiCtx::module_needs_napi(&module),
             (Some(NapiVersion::V10), None)
+        );
+    }
+
+    #[test]
+    fn module_needs_napi_rejects_wrong_frozen_signature() {
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "unofficial_napi_create_env" (func (param i32 i32) (result i32)))
+            )"#,
+        );
+
+        assert_eq!(
+            NapiCtx::module_needs_napi(&module),
+            (Some(NapiVersion::Unknown), None)
+        );
+        assert!(
+            NapiCtx::default()
+                .runtime_hooks()
+                .additional_imports(&module, &mut store.as_store_mut())
+                .is_err()
         );
     }
 
@@ -751,7 +1513,7 @@ mod tests {
         let module = compile_wat(
             &store,
             r#"(module
-                (import "napi" "napi_get_undefined" (func))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
                 (import "napi_extension_wasmer_v0" "unofficial_napi_get_hash_seed" (func))
             )"#,
         );

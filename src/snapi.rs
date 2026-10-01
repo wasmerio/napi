@@ -12,6 +12,7 @@ pub struct SnapiEnvState {
 pub type SnapiEnv = *mut SnapiEnvState;
 
 #[repr(C)]
+#[derive(Default)]
 pub struct SnapiUnofficialHeapStatistics {
     pub size: u32,
     pub version: u32,
@@ -42,6 +43,18 @@ pub struct SnapiUnofficialHeapSpaceStatistics {
     pub physical_space_size: u64,
 }
 
+impl Default for SnapiUnofficialHeapSpaceStatistics {
+    fn default() -> Self {
+        Self {
+            space_name: [0; 64],
+            space_size: 0,
+            space_used_size: 0,
+            space_available_size: 0,
+            physical_space_size: 0,
+        }
+    }
+}
+
 #[repr(C)]
 pub struct SnapiUnofficialHeapCodeStatistics {
     pub code_and_metadata_size: u64,
@@ -50,6 +63,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
+// The bridge ABI is shared with the browser-hosted backend and optional
+// extension imports, so a native build does not reference every declaration.
+#[allow(dead_code)]
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
@@ -74,6 +90,8 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_env_alive(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
@@ -115,17 +133,10 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    /// Register a host-owned near-heap-limit callback that charges V8 heap
-    /// growth against the resource budget. `data` is an
-    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
-    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
+    /// Install `data` (an `*const crate::budget::EnvHeapCharge`) as this env's
+    /// budget tracker: V8 heap growth and the bridge's per-handle host
+    /// bookkeeping are charged against the resource budget through it.
+    pub fn snapi_bridge_unofficial_set_host_budget(env: SnapiEnv, data: *const c_void) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -180,6 +191,8 @@ unsafe extern "C" {
         oom_callback_id: u32,
         accepted_hooks_out: *mut u64,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_attach_legacy_env(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_take_fatal_requested(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
@@ -258,6 +271,23 @@ unsafe extern "C" {
         value_id: u32,
         payload_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_message_create_metered(
+        env: SnapiEnv,
+        value_id: u32,
+        payload_out: *mut u32,
+        retained_bytes_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_message_create_legacy_metered(
+        env: SnapiEnv,
+        value_id: u32,
+        message_out: *mut u32,
+        retained_bytes_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_message_read_legacy(
+        env: SnapiEnv,
+        message_id: u32,
+        value_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,
         payload: u32,
@@ -313,6 +343,42 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_compile_function_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        cached_data_id: u32,
+        produce_cached_data: i32,
+        parsing_context_id: u32,
+        context_extensions_id: u32,
+        params_id: u32,
+        host_defined_option_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_compile_cjs_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        is_sea_main: i32,
+        should_detect_module: i32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_create_cached_data_legacy(
+        env: SnapiEnv,
+        code_id: u32,
+        filename_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        host_defined_option_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_set_legacy_hook(
+        env: SnapiEnv,
+        callback_id: u32,
+        kind: i32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_open(
         env: SnapiEnv,
         source_text_id: u32,
@@ -352,6 +418,32 @@ unsafe extern "C" {
         handle_out: *mut u32,
         requests_out: *mut u32,
         has_top_level_await_out: *mut u8,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_create_legacy(
+        env: SnapiEnv,
+        kind: i32,
+        wrapper_id: u32,
+        url_id: u32,
+        context_id: u32,
+        source_text_id: u32,
+        line_offset: i32,
+        column_offset: i32,
+        host_defined_option_id: u32,
+        export_names_id: u32,
+        synthetic_eval_steps_id: u32,
+        handle_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
+        env: SnapiEnv,
+        handle_id: u32,
+        requests_out: *mut u32,
+        has_top_level_await_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_module_wrap_import_module_dynamically_legacy(
+        env: SnapiEnv,
+        argc: u32,
+        argv_ids: *const u32,
+        result_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_destroy(env: SnapiEnv, handle_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_link(
@@ -659,6 +751,7 @@ unsafe extern "C" {
         finalize_hint: *mut core::ffi::c_void,
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
+        ownership_transferred_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_create_external_buffer_finalized(
         env: SnapiEnv,
@@ -667,6 +760,7 @@ unsafe extern "C" {
         finalize_hint: *mut core::ffi::c_void,
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
+        ownership_transferred_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_create_external_arraybuffer_guest_finalized(
         env: SnapiEnv,

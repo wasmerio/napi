@@ -1104,6 +1104,53 @@ extern "C"
                              : napi_invalid_arg;
     }
 
+    napi_status NAPI_CDECL snapi_private_validate_script(
+        napi_env env,
+        napi_value source_text,
+        napi_value filename,
+        int32_t line_offset,
+        int32_t column_offset,
+        napi_value host_defined_option_id)
+    {
+        (void)column_offset;
+        (void)host_defined_option_id;
+        if (!napi_util__::check_env(env) || source_text == nullptr || filename == nullptr)
+            return napi_invalid_arg;
+        JSContext *ctx = napi_util__::context(env);
+        JSValue source_value = napi_quickjs_value_inner(env, source_text);
+        JSValue filename_value = napi_quickjs_value_inner(env, filename);
+        if (!JS_IsString(source_value) || !JS_IsString(filename_value))
+            return napi_string_expected;
+        size_t source_length = 0;
+        const char *source = JS_ToCStringLen(ctx, &source_length, source_value);
+        if (source == nullptr)
+            return napi_util__::return_pending_if_caught(env, "Failed to read script source");
+        const char *name = JS_ToCString(ctx, filename_value);
+        if (name == nullptr)
+        {
+            JS_FreeCString(ctx, source);
+            return napi_util__::return_pending_if_caught(env, "Failed to read script filename");
+        }
+        JSEvalOptions options = {
+            .version = JS_EVAL_OPTIONS_VERSION,
+            .eval_flags = JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
+            .filename = name,
+            .line_num = line_offset >= 0 && line_offset < INT32_MAX
+                            ? line_offset + 1
+                            : 1,
+        };
+        JSValue compiled = JS_Eval2(ctx, source, source_length, &options);
+        JS_FreeCString(ctx, name);
+        JS_FreeCString(ctx, source);
+        if (JS_IsException(compiled))
+        {
+            napi_util__::set_last_exception(env, JS_GetException(ctx));
+            return napi_pending_exception;
+        }
+        JS_FreeValue(ctx, compiled);
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
         napi_env env,
         napi_value sandbox_or_null,
