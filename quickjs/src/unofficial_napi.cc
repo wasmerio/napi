@@ -474,6 +474,29 @@ extern "C"
         return napi_ok;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
+        napi_env env,
+        size_t *result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr)
+            return napi_invalid_arg;
+        // QuickJS has no generational heap; the figure is only consumed by
+        // near-heap-limit callbacks, which this engine never invokes.
+        *result = 0;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+        napi_env env,
+        bool *collected)
+    {
+        if (!napi_util__::check_env(env) || collected == nullptr)
+            return napi_invalid_arg;
+        // QuickJS enforces its memory limit at every allocation.
+        *collected = false;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_get_promise_details(napi_env env,
                                                                napi_value promise,
                                                                int32_t *state_out,

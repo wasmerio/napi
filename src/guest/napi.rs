@@ -227,6 +227,14 @@ fn with_cb_context<R>(
 ) -> Result<R, WasiError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
+    if !snapi_env.is_null() {
+        // JavaScript may have left a large young object above the heap limit
+        // that no collection has examined; settle it now so the heap budget
+        // sees it before the guest continues (see `budget.rs`).
+        unsafe {
+            snapi_bridge_unofficial_settle_heap_overshoot(snapi_env);
+        }
+    }
     if !snapi_env.is_null()
         && unsafe { snapi_bridge_unofficial_take_fatal_requested(snapi_env) } != 0
     {

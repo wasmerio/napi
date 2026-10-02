@@ -261,6 +261,29 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_near_heap_lim
     unofficial_napi_near_heap_limit_callback callback_or_null,
     void* data,
     size_t restored_heap_limit);
+
+// Committed bytes of the environment's old generation: every heap space the
+// engine's hard heap limit governs (everything but the young generation and
+// read-only space). Intended for near-heap-limit callbacks, which must return
+// a limit that covers this figure; the engine admits the first large young
+// object without consulting the limit and aborts the process after the next
+// collection if the limit still does not cover the promoted object. Engines
+// that do not expose the figure report zero.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_committed_old_generation(
+    napi_env env,
+    size_t* result);
+
+// Runs a full collection if the environment's heap holds committed memory
+// beyond its hard limit that no collection has examined yet. The engine admits
+// the first large young object without consulting the heap limit, so after a
+// script returns the heap may exceed the limit with no near-heap-limit
+// callback having run; an idle environment would keep that memory
+// unaccounted for indefinitely. Call from the environment's thread after
+// running JavaScript. `*collected` reports whether a collection ran. Engines
+// without the behaviour report `false`.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage_if_over_heap_limit(
+    napi_env env,
+    bool* collected);
 // Unofficial helpers used by util/options parity work in edge.
 // These expose engine-specific data that is not available in the public N-API.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_promise_details(napi_env env,
