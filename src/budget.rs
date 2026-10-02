@@ -118,9 +118,10 @@ pub enum Pool {
     /// `new WebAssembly.Memory` throw a `RangeError`.
     V8WasmMemory,
     /// Committed V8 WebAssembly code in contexts with metered WebAssembly.
-    /// Charged after V8 committed it, with [`ResourceBudget::try_charge`]
-    /// semantics: V8 cannot fail a code commit, so a refusal stops the
-    /// context instead.
+    /// Charged softly after V8 committed it (from inside V8's code allocator,
+    /// so the embedder must not stop the application there): V8 cannot fail
+    /// a code commit, so a refusal stops the context instead and is reported
+    /// as [`NapiLimitExceeded::WasmCodeMemory`].
     V8WasmCode,
 }
 
@@ -137,6 +138,15 @@ pub enum NapiLimitExceeded {
         committed: u64,
         /// The budget.
         budget: u64,
+    },
+    /// Committed wasm code did not fit the memory limit. The provider cannot
+    /// refuse a code commit, so it stopped the context; the embedder should
+    /// treat this like an exhausted memory limit.
+    WasmCodeMemory {
+        /// The context's committed (charged) wasm code at the time.
+        committed: u64,
+        /// The memory limit.
+        limit: u64,
     },
     /// A wasm code commit of this context took the process's metered wasm
     /// code past the hard process limit (twice
@@ -169,7 +179,8 @@ pub trait NapiMemoryAccountant: Send + Sync {
         self.try_charge(bytes)
     }
     /// [`try_charge_soft`](Self::try_charge_soft) with the N-API pool being
-    /// charged ([`Pool::V8BackingPages`] or [`Pool::V8WasmMemory`]), for
+    /// charged ([`Pool::V8BackingPages`], [`Pool::V8WasmMemory`] or
+    /// [`Pool::V8WasmCode`]), for
     /// embedders that label denials. Same contract; defaults to
     /// `try_charge_soft`.
     fn try_charge_soft_for(&self, pool: Pool, bytes: u64) -> bool {

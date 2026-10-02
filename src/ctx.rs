@@ -105,7 +105,7 @@ pub enum WasmPolicy {
     ///   ([`WasmEngineLimits::max_memory_pages`]) and per context
     ///   ([`WasmLimits::max_memories`], [`WasmLimits::max_reserved_bytes`]);
     ///   a reservation over a cap is a `RangeError`.
-    /// * Wasm code: committed code is charged to
+    /// * Wasm code: committed code is charged (softly) to
     ///   [`Pool::V8WasmCode`](crate::Pool::V8WasmCode) after V8 committed it
     ///   (V8 cannot fail a code commit). If that charge is refused, or the
     ///   context's committed code exceeds [`WasmLimits::code_budget_bytes`],

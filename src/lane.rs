@@ -46,6 +46,7 @@ unsafe extern "C" {
 
 /// `SNAPI_V8_WASM_CODE_LIMIT_*` in `edge_v8_platform.h`.
 const WASM_CODE_LIMIT_BUDGET: u32 = 1;
+const WASM_CODE_LIMIT_MEMORY: u32 = 2;
 const WASM_CODE_LIMIT_PROCESS: u32 = 3;
 
 /// Mirrors `snapi_v8_wasm_accounting` in `edge_v8_platform.h`.
@@ -312,11 +313,15 @@ unsafe extern "C" fn uncharge_wasm_memory(context: *mut c_void, bytes: u64) {
     guarded((), || budget.uncharge(Pool::V8WasmMemory, bytes));
 }
 
-// Terminal semantics: an embedder accountant stops the application when it
-// refuses. The provider then stops the context through `on_wasm_code_limit`.
+// Asked softly: this runs inside V8's code allocator with its locks held, so
+// the embedder must not stop the application here. A refusal stops the
+// context through `on_wasm_code_limit`, which reports it to the embedder
+// (`NapiLimitExceeded::WasmCodeMemory`) from a helper thread.
 unsafe extern "C" fn charge_wasm_code(context: *mut c_void, bytes: u64) -> bool {
     let budget = &lane_accountant(context).budget;
-    guarded(false, || budget.try_charge(Pool::V8WasmCode, bytes).is_ok())
+    guarded(false, || {
+        budget.try_charge_soft(Pool::V8WasmCode, bytes).is_ok()
+    })
 }
 
 unsafe extern "C" fn uncharge_wasm_code(context: *mut c_void, bytes: u64) {
@@ -325,10 +330,12 @@ unsafe extern "C" fn uncharge_wasm_code(context: *mut c_void, bytes: u64) {
 }
 
 /// Stops the context: its committed wasm code was refused by the budget,
-/// exceeded the code budget, or took the process past its hard code limit. Runs inside V8's allocator, possibly on the
-/// lane thread while another thread holds bridge locks and waits for the
-/// lane's current task, so it only sets the sticky stop flag here and
-/// terminates the isolates from a helper thread.
+/// exceeded the code budget, or took the process past its hard code limit.
+/// Runs inside V8's code allocator with its locks held, possibly on the lane
+/// thread while another thread holds bridge locks and waits for the lane's
+/// current task, so it only sets the sticky stop flag here; the isolates are
+/// terminated and the embedder is told from a helper thread, so embedder
+/// locks are never taken under V8's.
 unsafe extern "C" fn on_wasm_code_limit(
     context: *mut c_void,
     reason: u32,
@@ -351,26 +358,23 @@ unsafe extern "C" fn on_wasm_code_limit(
             }
             WASM_CODE_LIMIT_PROCESS => budget
                 .notify_limit_exceeded(NapiLimitExceeded::WasmProcessCode { committed, limit }),
-            // A refused charge already went through the embedder's
-            // terminal `try_charge`.
+            WASM_CODE_LIMIT_MEMORY => {
+                let limit = budget.memory_limit();
+                budget.notify_limit_exceeded(NapiLimitExceeded::WasmCodeMemory { committed, limit })
+            }
             _ => {}
         };
-        let stop = {
-            let notify = notify.clone();
-            move || {
-                control.terminate_all();
-                notify();
-            }
-        };
-        if std::thread::Builder::new()
-            .name("napi-wasm-stop".into())
-            .spawn(stop)
-            .is_err()
-        {
-            // The stop flag keeps imports and new isolates out; the embedder
-            // can still end the workload.
+        let stop = move || {
+            control.terminate_all();
             notify();
-        }
+        };
+        // If no thread can be started, the stop flag still keeps imports
+        // and new isolates out, and the isolate that committed the code was
+        // already terminated; reporting inline could take embedder locks
+        // under V8's, so it is skipped.
+        let _ = std::thread::Builder::new()
+            .name("napi-wasm-stop".into())
+            .spawn(stop);
     });
 }
 
@@ -519,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_callbacks_charge_their_pools_and_code_is_terminal() {
+    fn wasm_callbacks_charge_their_pools() {
         let budget = ResourceBudget::with_memory_limit(8 * 4096);
         let accountant = LaneAccountant {
             budget: Arc::clone(&budget),
@@ -542,6 +546,44 @@ mod tests {
             on_wasm_code_limit(context, WASM_CODE_LIMIT_BUDGET, 1, 1);
         }
         assert_eq!(budget.memory_charged(), 0);
+    }
+
+    /// Code is charged from inside V8's code allocator: an embedder's
+    /// terminal `try_charge` (which may stop the application and take
+    /// embedder locks) must never run there.
+    #[test]
+    fn wasm_code_is_charged_softly_with_its_pool() {
+        #[derive(Default)]
+        struct Embedder {
+            terminal: AtomicUsize,
+            soft: Mutex<Vec<(Pool, u64)>>,
+        }
+        impl crate::NapiMemoryAccountant for Embedder {
+            fn memory_limit(&self) -> u64 {
+                4096
+            }
+            fn memory_charged(&self) -> u64 {
+                0
+            }
+            fn try_charge(&self, _bytes: u64) -> bool {
+                self.terminal.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            fn try_charge_soft_for(&self, pool: Pool, bytes: u64) -> bool {
+                self.soft.lock().unwrap().push((pool, bytes));
+                false
+            }
+            fn uncharge(&self, _bytes: u64) {}
+        }
+        let embedder = Arc::new(Embedder::default());
+        let accountant = LaneAccountant {
+            budget: ResourceBudget::with_accountant(embedder.clone()),
+            control: None,
+        };
+        let context = (&accountant as *const LaneAccountant).cast_mut().cast();
+        assert!(!unsafe { charge_wasm_code(context, 8192) });
+        assert_eq!(embedder.terminal.load(Ordering::SeqCst), 0);
+        assert_eq!(*embedder.soft.lock().unwrap(), [(Pool::V8WasmCode, 8192)]);
     }
 
     #[test]
