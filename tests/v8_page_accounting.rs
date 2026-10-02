@@ -32,6 +32,7 @@ unsafe extern "C" {
     fn snapi_bridge_unofficial_create_env(
         api_version: i32,
         guest_heap: *const c_void,
+        webassembly_policy: u32,
         env_out: *mut *mut c_void,
     ) -> i32;
     fn snapi_bridge_unofficial_release_env(env: *mut c_void) -> i32;
@@ -207,7 +208,7 @@ impl Lane {
         );
         let mut env = ptr::null_mut();
         assert_eq!(
-            unsafe { snapi_bridge_unofficial_create_env(8, ptr::null(), &mut env) },
+            unsafe { snapi_bridge_unofficial_create_env(8, ptr::null(), 0, &mut env) },
             0
         );
         assert!(!env.is_null());
