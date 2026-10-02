@@ -1944,6 +1944,80 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
+    napi_env env, size_t* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  // Heap::OldGenerationCapacity() is what V8 compares against the hard limit
+  // (Heap::CanExpandOldGeneration): the paged old-generation spaces plus the
+  // old large-object spaces. It is not exported, so sum the committed memory
+  // of every space except the young generation and the read-only space; the
+  // committed figure is an upper bound of the capacity, so a limit raised to
+  // cover it always satisfies V8. Reading space statistics neither allocates
+  // nor collects, so this is safe from inside a near-heap-limit callback.
+  v8::Isolate* isolate = env->isolate;
+  size_t total = 0;
+  const size_t spaces = isolate->NumberOfHeapSpaces();
+  for (size_t index = 0; index < spaces; ++index) {
+    v8::HeapSpaceStatistics stats;
+    if (!isolate->GetHeapSpaceStatistics(&stats, index)) continue;
+    const char* name = stats.space_name();
+    if (name == nullptr || std::strcmp(name, "read_only_space") == 0 ||
+        std::strcmp(name, "new_space") == 0 ||
+        std::strcmp(name, "new_large_object_space") == 0) {
+      continue;
+    }
+    total += stats.space_size();
+  }
+  *result = total;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+    napi_env env, size_t old_generation_limit, bool* collected) {
+  if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
+    return napi_invalid_arg;
+  }
+  *collected = false;
+  v8::Isolate* isolate = env->isolate;
+  // The old generation can hold committed memory beyond the hard limit that
+  // no limit check has examined: NewLargeObjectSpace::AllocateRaw admits its
+  // first large object unconditionally, and a large object allocated on the
+  // retry-of-a-failed-allocation path takes a page from the OS directly
+  // (OldLargeObjectSpace::AllocateRaw via ShouldExpandOldGenerationOnSlowAllocation),
+  // in both cases without consulting the limit. An idle environment would
+  // keep that memory unaccounted for. If the old generation already exceeds
+  // the limit, run a collection: Heap::CollectGarbage promotes and frees,
+  // then compares the (post-GC, live) old generation against the limit and
+  // invokes the near-heap-limit callback if it is still exceeded, which
+  // charges the growth or stops the environment. So this terminates only an
+  // environment that *retains* memory beyond its budget, never one whose
+  // overshoot was transient garbage.
+  size_t committed_old = 0;
+  if (unofficial_napi_get_heap_committed_old_generation(env, &committed_old) !=
+      napi_ok) {
+    return napi_ok;
+  }
+  size_t limit = old_generation_limit;
+  if (limit == 0) {
+    // Unknown: fall back to the reported total limit (MaxReserved = old
+    // generation + young generation), which is looser than V8's own check by
+    // the young-generation allowance, so this under-triggers slightly.
+    v8::HeapStatistics heap;
+    isolate->GetHeapStatistics(&heap);
+    limit = heap.heap_size_limit();
+  }
+  if (committed_old <= limit) {
+    return napi_ok;
+  }
+  // The callback invoked during the collection may create handles.
+  v8::HandleScope handle_scope(isolate);
+  isolate->LowMemoryNotification();
+  *collected = true;
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
                                                            napi_value* result) {
