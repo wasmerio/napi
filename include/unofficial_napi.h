@@ -279,10 +279,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_committed_old_
 // script returns the heap may exceed the limit with no near-heap-limit
 // callback having run; an idle environment would keep that memory
 // unaccounted for indefinitely. Call from the environment's thread after
-// running JavaScript. `*collected` reports whether a collection ran. Engines
-// without the behaviour report `false`.
+// running JavaScript. `old_generation_limit` is the engine's current hard
+// old-generation limit as the embedder last set or answered it (the figure the
+// engine's own post-collection check uses); zero means unknown, in which case
+// the engine's reported total heap limit is used instead, which under-triggers
+// by the young-generation allowance. `*collected` reports whether a collection
+// ran. Engines without the behaviour report `false`.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage_if_over_heap_limit(
     napi_env env,
+    size_t old_generation_limit,
     bool* collected);
 // Unofficial helpers used by util/options parity work in edge.
 // These expose engine-specific data that is not available in the public N-API.

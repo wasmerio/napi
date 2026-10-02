@@ -4399,8 +4399,8 @@ snapi_bridge_unofficial_take_fatal_requested(SnapiEnvState *env_state) {
 // first large young object without a limit check). The collection routes the
 // figure through the near-heap-limit callback, which charges or stops the
 // env. Returns nonzero when a collection ran.
-extern "C" int
-snapi_bridge_unofficial_settle_heap_overshoot(SnapiEnvState *env_state) {
+extern "C" int snapi_bridge_unofficial_settle_heap_overshoot(
+    SnapiEnvState *env_state, uint64_t old_generation_limit) {
   auto state = LookupEnvState(env_state);
   if (state == nullptr)
     return 0;
@@ -4414,7 +4414,8 @@ snapi_bridge_unofficial_settle_heap_overshoot(SnapiEnvState *env_state) {
   }
   bool collected = false;
   const napi_status status =
-      unofficial_napi_collect_garbage_if_over_heap_limit(env, &collected);
+      unofficial_napi_collect_garbage_if_over_heap_limit(
+          env, static_cast<size_t>(old_generation_limit), &collected);
   {
     std::lock_guard<std::mutex> lock(state->control_mutex);
     --state->active_control_calls;

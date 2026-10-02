@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -669,6 +669,62 @@ pub(crate) struct EnvHeapCharge {
     pub(crate) granted: AtomicU64,
     /// Bytes granted to [`Pool::HostBookkeeping`] and not yet returned.
     pub(crate) bookkeeping_granted: AtomicU64,
+    /// The isolate's old-generation limit as last answered to V8
+    /// (`max_old_generation_size`): the ceiling forwarded at creation, then
+    /// every value the near-heap-limit callback returned. This is the exact
+    /// figure V8's post-collection check compares the committed old generation
+    /// against, so the settle hook needs no V8 query to know the limit.
+    pub(crate) old_limit: AtomicU64,
+    /// Set by the near-heap-limit callback, cleared by the settle hook: V8 was
+    /// near the limit since the last settle, so an off-limit retry allocation
+    /// may have happened and the next JS return must examine the heap.
+    pub(crate) settle_dirty: AtomicBool,
+    /// JS entries since the last settle sweep (see
+    /// [`EnvHeapCharge::take_settle_turn`]).
+    pub(crate) settle_entries: AtomicU32,
+}
+
+/// Without a near-limit signal the settle hook polls: a large young object can
+/// land above the limit with no callback at all, so every this-many JS entries
+/// the heap is examined regardless. The sweep closes V8's linear allocation
+/// areas and walks the spaces, so it must not run on every entry.
+pub(crate) const HEAP_SETTLE_EVERY: u32 = 16;
+
+impl EnvHeapCharge {
+    pub(crate) fn new(
+        budget: Arc<ResourceBudget>,
+        env: usize,
+        host_stopped: Arc<AtomicBool>,
+        old_limit: u64,
+    ) -> Self {
+        Self {
+            budget,
+            env,
+            host_stopped,
+            emergency_exposed: AtomicU64::new(0),
+            granted: AtomicU64::new(0),
+            bookkeeping_granted: AtomicU64::new(0),
+            old_limit: AtomicU64::new(old_limit),
+            settle_dirty: AtomicBool::new(true),
+            settle_entries: AtomicU32::new(0),
+        }
+    }
+
+    /// Whether this JS return should examine the heap for an off-limit
+    /// overshoot, and the old-generation limit to compare against. Lock-free
+    /// and V8-free: true on the first entry, whenever the near-heap-limit
+    /// callback fired since the last sweep, and every
+    /// [`HEAP_SETTLE_EVERY`] entries otherwise.
+    pub(crate) fn take_settle_turn(&self) -> Option<u64> {
+        let entries = self.settle_entries.fetch_add(1, Ordering::AcqRel);
+        let due = self.settle_dirty.swap(false, Ordering::AcqRel)
+            || entries.is_multiple_of(HEAP_SETTLE_EVERY);
+        if !due {
+            return None;
+        }
+        self.settle_entries.store(1, Ordering::Release);
+        Some(self.old_limit.load(Ordering::Acquire))
+    }
 }
 
 impl EnvHeapCharge {
@@ -793,7 +849,9 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
     // process if it is still exceeded, so every answer below covers it.
     let overshoot = committed_old_generation.saturating_sub(current_limit) as u64;
     let grant = overshoot.saturating_add(DEFAULT_HEAP_GROW_STEP);
-    match tracker.budget.try_charge(Pool::V8HeapReserved, grant) {
+    // V8 may now allocate off-limit on its retry; make the next JS return look.
+    tracker.settle_dirty.store(true, Ordering::Release);
+    let answer = match tracker.budget.try_charge(Pool::V8HeapReserved, grant) {
         Ok(()) => {
             tracker.granted.fetch_add(grant, Ordering::AcqRel);
             current_limit.saturating_add(usize::try_from(grant).unwrap_or(usize::MAX))
@@ -817,7 +875,9 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
                 current_limit
             }
         }
-    }
+    };
+    tracker.old_limit.store(answer as u64, Ordering::Release);
+    answer
 }
 
 /// The live charge for one physical wasm-memory allocation.
@@ -1655,14 +1715,12 @@ mod tests {
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
         let host_stopped = Arc::new(AtomicBool::new(false));
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::clone(&host_stopped),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::clone(&host_stopped),
+            0,
+        )));
         let data = ptr as *const c_void;
         let base = 100 * 1024 * 1024usize;
         let emergency = (DEFAULT_UNWIND_SLACK + DEFAULT_HEAP_EMERGENCY_HEADROOM) as usize;
@@ -1729,14 +1787,12 @@ mod tests {
         budget
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::new(AtomicBool::new(false)),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            0,
+        )));
         let base = 64 * MIB as usize;
         let raised = napi_host_near_heap_limit_grant(ptr as *const c_void, base, base, 0);
         assert!(raised >= base + largest_object as usize);
@@ -1752,14 +1808,12 @@ mod tests {
         budget
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::new(AtomicBool::new(false)),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            0,
+        )));
         let base = 64 * MIB as usize;
         assert_eq!(
             napi_host_near_heap_limit_grant(ptr as *const c_void, base, base, 0),
@@ -1785,14 +1839,12 @@ mod tests {
     fn bookkeeping_grants_until_budget_exhausted_then_stops_the_env() {
         let budget = ResourceBudget::with_memory_limit(3 * MIB);
         let host_stopped = Arc::new(AtomicBool::new(false));
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::clone(&host_stopped),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::clone(&host_stopped),
+            0,
+        )));
         let data = ptr as *const c_void;
 
         assert_eq!(napi_host_bookkeeping_charge(data, 2 * MIB), 1);
@@ -1943,14 +1995,12 @@ mod external_accountant_tests {
         budget
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::new(AtomicBool::new(false)),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            0,
+        )));
         let data = ptr as *const c_void;
         let limit = 64 * MIB as usize;
         let committed = limit + 120 * MIB as usize;
@@ -1973,14 +2023,12 @@ mod external_accountant_tests {
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
         let host_stopped = Arc::new(AtomicBool::new(false));
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::clone(&host_stopped),
-            emergency_exposed: AtomicU64::new(0),
-            granted: AtomicU64::new(0),
-            bookkeeping_granted: AtomicU64::new(0),
-        }));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::clone(&host_stopped),
+            0,
+        )));
         let data = ptr as *const c_void;
         let limit = 64 * MIB as usize;
         let committed = limit + 300 * MIB as usize;

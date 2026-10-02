@@ -488,10 +488,12 @@ extern "C"
 
     napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
         napi_env env,
+        size_t old_generation_limit,
         bool *collected)
     {
         if (!napi_util__::check_env(env) || collected == nullptr)
             return napi_invalid_arg;
+        (void)old_generation_limit;
         // QuickJS enforces its memory limit at every allocation.
         *collected = false;
         return napi_ok;
