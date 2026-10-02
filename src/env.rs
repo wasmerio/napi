@@ -264,7 +264,18 @@ impl NapiEnv {
             if self.host_stopped.load(Ordering::Acquire) {
                 anyhow::bail!("N-API instance stopped during activation");
             }
-            lane.attach_page_accountant(&self.budget);
+            let wasm = match self.webassembly {
+                crate::WasmPolicy::EnabledMetered(limits) => Some(crate::lane::LaneWasm {
+                    limits,
+                    control: crate::NapiRuntimeControl::new(
+                        Arc::clone(&self.env_registry),
+                        Arc::clone(&self.host_stopped),
+                        Arc::clone(&self.pending_messages),
+                    ),
+                }),
+                _ => None,
+            };
+            lane.attach_page_accountant(&self.budget, wasm);
             self.managed_lane = Some(lane);
         }
         Ok(self.managed_lane.as_ref().map(ManagedV8Lane::enter))

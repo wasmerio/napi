@@ -823,7 +823,8 @@ mod tests {
         let ctx = heap.make_alloc_ctx();
         assert_eq!(Arc::weak_count(&heap), weak_before + 1);
 
-        let unknown_policy = crate::WasmPolicy::EnabledUnmetered.bridge_code() + 1;
+        let unknown_policy =
+            crate::WasmPolicy::EnabledMetered(crate::WasmLimits::default()).bridge_code() + 1;
         let mut env: crate::snapi::SnapiEnv = std::ptr::null_mut();
         // napi_invalid_arg; rejected before the process-wide runtime is used.
         let status = unsafe {

@@ -47,9 +47,9 @@ impl NapiLimits {
 /// Guest environments allocate V8 array buffers in the guest's linear memory,
 /// where they count against the context's memory budget. V8 does not allocate
 /// WebAssembly memories and compiled wasm code that way: they come from V8's
-/// page allocator, outside the guest heap and outside every budget this crate
-/// enforces. The default therefore removes `WebAssembly` from guest
-/// environments.
+/// page allocator, outside the guest heap. The default therefore removes
+/// `WebAssembly` from guest environments; [`WasmPolicy::EnabledMetered`]
+/// exposes it with those allocations bounded and charged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WasmPolicy {
@@ -63,20 +63,22 @@ pub enum WasmPolicy {
     /// unrestricted, since their array buffers are not budgeted either.)
     #[default]
     Restricted,
-    /// Expose V8's `WebAssembly` in guest environments **without any resource
-    /// accounting**. Unsupported for untrusted code.
+    /// Expose V8's `WebAssembly` in guest environments **without wasm
+    /// limits**. Unsupported for untrusted code.
     ///
     /// With this policy, guest JavaScript can make V8:
     ///
-    /// * reserve address space for wasm memories (by default 4 GiB for each
-    ///   32-bit memory without a declared maximum) and commit memory as they
-    ///   grow,
+    /// * reserve address space for any number of wasm memories (by default
+    ///   4 GiB for each 32-bit memory without a declared maximum) and commit
+    ///   memory as they grow,
     /// * compile and commit executable wasm code, including on V8
     ///   background tasks (asynchronous compilation and tier-up),
-    /// * use compiler working memory that grows with the module size,
+    /// * use compiler working memory that grows with the module size.
     ///
-    /// and none of it is charged to [`NapiLimits::total_memory_bytes`], to a
-    /// [`NapiMemoryAccountant`], or to any other limit of the context. Only the
+    /// Nothing caps these and compiled code is not charged to
+    /// [`NapiLimits::total_memory_bytes`], to a [`NapiMemoryAccountant`] or to
+    /// any other limit of the context. (In a managed context, committed wasm
+    /// memory pages are charged like other page-backed buffers.) Only the
     /// process-wide V8 flags bound it. Enabling V8's wasm compilers also adds
     /// them to the attack surface reachable from guest code.
     ///
@@ -84,9 +86,44 @@ pub enum WasmPolicy {
     /// contexts not created by the provider (for example `ShadowRealm`
     /// realms) still refuse wasm code generation.
     ///
-    /// Intended for trusted workloads and for evaluation until wasm
-    /// allocations are accounted for.
+    /// Intended for trusted workloads and for evaluation.
     EnabledUnmetered,
+    /// Expose V8's `WebAssembly` in guest environments with wasm memory and
+    /// code bounded and charged to the context's budget.
+    ///
+    /// Requires a managed context ([`NapiCtxBuilder::build_managed_imports`]):
+    /// accounting is attributed through the context's V8 lane. It also
+    /// requires the process-wide engine limits ([`configure_wasm_engine`])
+    /// before the first environment of the process is created. Without
+    /// either, creating an environment fails.
+    ///
+    /// * Wasm memories: committed pages are charged softly to
+    ///   [`Pool::V8WasmMemory`](crate::Pool::V8WasmMemory): a refused commit
+    ///   makes `memory.grow` return `-1` and `new WebAssembly.Memory` throw a
+    ///   `RangeError`; the application keeps running. Reserved address space
+    ///   is not charged but bounded per memory
+    ///   ([`WasmEngineLimits::max_memory_pages`]) and per context
+    ///   ([`WasmLimits::max_memories`], [`WasmLimits::max_reserved_bytes`]);
+    ///   a reservation over a cap is a `RangeError`.
+    /// * Wasm code: committed code is charged to
+    ///   [`Pool::V8WasmCode`](crate::Pool::V8WasmCode) after V8 committed it
+    ///   (V8 cannot fail a code commit). If that charge is refused, or the
+    ///   context's committed code exceeds [`WasmLimits::code_budget_bytes`],
+    ///   the context is stopped like one whose heap growth was refused and
+    ///   the embedder is told through
+    ///   [`NapiMemoryAccountant::limit_exceeded`]. New compilations are
+    ///   refused with a `CompileError` while the context or the process
+    ///   ([`WasmEngineLimits::process_code_budget_bytes`]) is at its code
+    ///   budget. Module size and function count are capped by the engine
+    ///   limits.
+    ///
+    /// Not charged: compiler working memory (bounded by the module size cap),
+    /// V8's wasm metadata, and code pointer table entries (bounded by the
+    /// function cap). Import wrapper code is shared by all contexts of the
+    /// process; each wrapper page is charged to the context that first
+    /// committed it while that context lives. `vm` contexts and realms behave
+    /// as with [`WasmPolicy::EnabledUnmetered`].
+    EnabledMetered(WasmLimits),
 }
 
 impl WasmPolicy {
@@ -96,7 +133,112 @@ impl WasmPolicy {
         match self {
             Self::Restricted => 0,
             Self::EnabledUnmetered => 1,
+            Self::EnabledMetered(_) => 2,
         }
+    }
+}
+
+/// Per-context limits of [`WasmPolicy::EnabledMetered`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct WasmLimits {
+    /// Live wasm memories the context may have at once (default 64). Each
+    /// memory is a few kernel memory mappings, so this bounds the context's
+    /// share of the process's mappings.
+    pub max_memories: u32,
+    /// Address space all live wasm memories of the context may reserve
+    /// (`None`, the default: 8 times the context's memory limit, unbounded
+    /// for an unlimited budget). V8 retries a refused reservation with a
+    /// smaller maximum, so memories still get created while it fits.
+    pub max_reserved_bytes: Option<u64>,
+    /// Committed wasm code past which the context is stopped (default
+    /// 64 MiB).
+    pub code_budget_bytes: u64,
+}
+
+impl Default for WasmLimits {
+    fn default() -> Self {
+        Self {
+            max_memories: 64,
+            max_reserved_bytes: None,
+            code_budget_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl WasmLimits {
+    /// The reserved-address-space cap for a context with `memory_limit`.
+    pub(crate) fn reserved_bytes_cap(&self, memory_limit: u64) -> u64 {
+        self.max_reserved_bytes
+            .unwrap_or_else(|| memory_limit.saturating_mul(8))
+    }
+}
+
+/// Process-wide V8 WebAssembly limits, see [`configure_wasm_engine`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct WasmEngineLimits {
+    /// Maximum size of one wasm memory in 64 KiB pages, for 32- and 64-bit
+    /// memories (default 16384, 1 GiB; at most 65536). V8 reserves address
+    /// space for a memory's maximum up front, so this bounds every
+    /// reservation, and `memory.grow` past it returns `-1`.
+    pub max_memory_pages: u32,
+    /// Maximum wasm module size in bytes (default 16 MiB, between 16 bytes
+    /// and 1 GiB). Larger modules are refused with a `RangeError` before
+    /// compilation. This also bounds compiler working memory.
+    pub max_module_bytes: u64,
+    /// Maximum functions per module (default 100,000, at most 1,000,000).
+    pub max_functions: u32,
+    /// Compile with the baseline compiler only (default `true`): no
+    /// optimizing tier-up jobs on the context's background lane, whose
+    /// compile time and memory are not bounded per function.
+    pub liftoff_only: bool,
+    /// Committed wasm code in the whole process past which new compilations
+    /// in metered contexts are refused with a `CompileError` (default
+    /// 1 GiB, between 1 MiB and 3 GiB). Keeps V8's own process-wide code
+    /// limit, whose breach aborts the process, out of reach.
+    pub process_code_budget_bytes: u64,
+}
+
+impl Default for WasmEngineLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_pages: 16384,
+            max_module_bytes: 16 * 1024 * 1024,
+            max_functions: 100_000,
+            liftoff_only: true,
+            process_code_budget_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Applies process-wide V8 WebAssembly limits; required for
+/// [`WasmPolicy::EnabledMetered`].
+///
+/// V8 flags are process-wide and frozen when V8 initializes, which happens
+/// when the first environment of the process is created, so call this
+/// before that (for example at embedder startup). The limits apply to every
+/// context of the process, whatever its policy, and they do not create the
+/// V8 platform. Calling it again with the same limits succeeds; different
+/// limits fail once V8 runs. Out-of-range values are rejected.
+///
+/// Also disables V8's process-wide cache of compiled wasm modules, which
+/// would share code between contexts, and never enables V8's wasm trap
+/// handler (bounds are checked explicitly) or streaming compilation.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub fn configure_wasm_engine(limits: &WasmEngineLimits) -> Result<()> {
+    let config = crate::snapi::SnapiWasmEngineConfig {
+        size: std::mem::size_of::<crate::snapi::SnapiWasmEngineConfig>() as u32,
+        max_memory_pages: limits.max_memory_pages,
+        max_module_bytes: limits.max_module_bytes,
+        max_functions: limits.max_functions,
+        liftoff_only: u32::from(limits.liftoff_only),
+        process_code_budget_bytes: limits.process_code_budget_bytes,
+    };
+    match unsafe { crate::snapi::snapi_v8_configure_wasm_engine(&config) } {
+        0 => Ok(()),
+        1 => bail!("invalid WebAssembly engine limits: {limits:?}"),
+        _ => bail!("the V8 runtime already started with different WebAssembly engine limits"),
     }
 }
 
@@ -145,6 +287,27 @@ pub struct NapiRuntimeControl {
 }
 
 impl NapiRuntimeControl {
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+    pub(crate) fn new(
+        envs: Arc<Mutex<HashSet<usize>>>,
+        host_stopped: Arc<AtomicBool>,
+        pending_messages: Arc<PendingMessages>,
+    ) -> Self {
+        Self {
+            envs,
+            host_stopped,
+            pending_messages,
+        }
+    }
+
+    /// Sets the sticky stop flag without touching the isolates: imports and
+    /// isolates created later are refused. [`Self::terminate_all`] completes
+    /// the stop.
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+    pub(crate) fn mark_stopped(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+    }
+
     /// Permanently stop every currently-live V8 isolate owned by this context.
     ///
     /// Embedders call this both when the app exceeded its memory budget and
@@ -259,8 +422,8 @@ impl NapiCtxBuilder {
     }
 
     /// Whether guest JavaScript can use V8's `WebAssembly` (default:
-    /// [`WasmPolicy::Restricted`]). Read [`WasmPolicy::EnabledUnmetered`] before
-    /// enabling it: wasm memory and code are not charged to any limit.
+    /// [`WasmPolicy::Restricted`]). Prefer [`WasmPolicy::EnabledMetered`]; with
+    /// [`WasmPolicy::EnabledUnmetered`] wasm memory and code are not bounded.
     ///
     /// Applies to every environment a guest creates after this context is
     /// built, including those of WASIX worker threads.
@@ -691,7 +854,7 @@ fn napi_wasmer_extension_version_from_namespace(
 
 #[cfg(test)]
 mod tests {
-    use super::{NapiCtx, WasmPolicy};
+    use super::{NapiCtx, WasmLimits, WasmPolicy};
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     use std::{
@@ -753,6 +916,10 @@ mod tests {
         // Mirrors NapiWebAssemblyPolicy in restricted_context.h.
         assert_eq!(WasmPolicy::Restricted.bridge_code(), 0);
         assert_eq!(WasmPolicy::EnabledUnmetered.bridge_code(), 1);
+        assert_eq!(
+            WasmPolicy::EnabledMetered(WasmLimits::default()).bridge_code(),
+            2
+        );
 
         let mut store = Store::default();
         let module = compile_wat(
@@ -762,7 +929,11 @@ mod tests {
             (import "env" "memory" (memory 1 512))
         )"#,
         );
-        for policy in [WasmPolicy::Restricted, WasmPolicy::EnabledUnmetered] {
+        for policy in [
+            WasmPolicy::Restricted,
+            WasmPolicy::EnabledUnmetered,
+            WasmPolicy::EnabledMetered(WasmLimits::default()),
+        ] {
             let hooks = NapiCtx::builder()
                 .webassembly(policy)
                 .build()
