@@ -2,6 +2,7 @@
 #define NAPI_V8_EDGE_V8_PLATFORM_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -28,6 +29,34 @@ extern "C" void* snapi_v8_lane_swap_current(void* handle);
 extern "C" void* snapi_v8_lane_current();
 extern "C" bool snapi_v8_lane_is_running(void* handle);
 extern "C" bool snapi_v8_lane_overloaded(void* handle);
+// Attaches the embedder's memory accountant to a lane. Commits of page-backed
+// buffers (resizable ArrayBuffers, growable SharedArrayBuffers) reserved while
+// the lane is bound are charged through `charge`, which must deny without side
+// effects, and returned through `uncharge`. On success the lane and every
+// region it reserved share ownership of `context`; `release` runs once when
+// the last of them is gone. Returns false, leaving `context` with the caller,
+// if the lane already has an accountant.
+//
+// Once any lane has an accountant, a buffer-shaped reservation made with no
+// attributable lane bound (and outside runtime/isolate setup) is refused,
+// failing closed in JS as a RangeError. A process that also enabled the
+// standalone worker pool (it runs contexts without a lane) opts into
+// leniency instead: such reservations pass through unmetered. Both cases are
+// counted by snapi_v8_unattributed_page_reservations().
+extern "C" bool snapi_v8_lane_set_page_accountant(
+    void* handle, void* context, bool (*charge)(void*, uint64_t),
+    void (*uncharge)(void*, uint64_t), void (*release)(void*));
+
+// While alive on a thread, page reservations are treated as V8's own and
+// never attributed to the bound lane. Only for runtime and isolate setup,
+// where no guest code runs.
+class EdgeV8PageAttributionPause {
+ public:
+  EdgeV8PageAttributionPause();
+  ~EdgeV8PageAttributionPause();
+  EdgeV8PageAttributionPause(const EdgeV8PageAttributionPause&) = delete;
+  EdgeV8PageAttributionPause& operator=(const EdgeV8PageAttributionPause&) = delete;
+};
 
 class EdgeV8Platform final : public v8::Platform {
  public:
@@ -110,6 +139,8 @@ class EdgeV8Platform final : public v8::Platform {
                           bool begin_shutdown);
 
   std::unique_ptr<v8::Platform> fallback_;
+  // Meters page-backed buffers; see MeteringPageAllocator.
+  std::unique_ptr<v8::PageAllocator> page_allocator_;
   // Managed isolates dispatch every worker task to their instance lane. The
   // process-wide V8 pool exists only when a standalone environment is used.
   std::mutex standalone_workers_mutex_;

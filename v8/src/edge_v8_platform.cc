@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -17,6 +18,41 @@
 #include <v8.h>
 
 namespace {
+
+// Embedder-owned memory accountant for page-allocator commits. The context is
+// a counted embedder reference, released exactly once when the last lane or
+// tracked region holding this object drops it.
+class PageAccountant {
+ public:
+  PageAccountant(void* context, bool (*charge)(void*, uint64_t),
+                 void (*uncharge)(void*, uint64_t), void (*release)(void*))
+      : context_(context), charge_(charge), uncharge_(uncharge),
+        release_(release) {}
+  ~PageAccountant() {
+    if (release_ != nullptr) release_(context_);
+  }
+  // Leave the context reference with the caller.
+  void Detach() { release_ = nullptr; }
+  PageAccountant(const PageAccountant&) = delete;
+  PageAccountant& operator=(const PageAccountant&) = delete;
+
+  // Must deny without side effects: V8 turns a refused commit into a
+  // RangeError (or a failed grow) and may retry after a GC.
+  bool Charge(uint64_t bytes) { return bytes == 0 || charge_(context_, bytes); }
+  void Uncharge(uint64_t bytes) {
+    if (bytes != 0) uncharge_(context_, bytes);
+  }
+
+ private:
+  void* context_;
+  bool (*charge_)(void*, uint64_t);
+  void (*uncharge_)(void*, uint64_t);
+  void (*release_)(void*);
+};
+
+// Set once any lane carries an accountant: from then on this process meters
+// page-backed buffers and refuses reservations it cannot attribute.
+std::atomic<bool> g_page_accounting_managed{false};
 
 // A lane belongs to one N-API context. Only its dedicated embedder-owned
 // thread executes V8 background work. The bounded queue prevents a guest
@@ -128,6 +164,19 @@ class BackgroundLane {
     if (notify && on_overload_ != nullptr) on_overload_(scope_context_);
   }
 
+  // First accountant wins; every environment sharing a lane shares a budget.
+  bool SetPageAccountant(std::shared_ptr<PageAccountant> accountant) {
+    std::lock_guard<std::mutex> lock(accountant_mutex_);
+    if (page_accountant_ != nullptr) return false;
+    page_accountant_ = std::move(accountant);
+    return true;
+  }
+
+  std::shared_ptr<PageAccountant> page_accountant() {
+    std::lock_guard<std::mutex> lock(accountant_mutex_);
+    return page_accountant_;
+  }
+
  private:
   using Clock = std::chrono::steady_clock;
   struct Item {
@@ -145,11 +194,303 @@ class BackgroundLane {
   void* (*enter_scope_)(void*) = nullptr;
   bool (*leave_scope_)(void*, void*) = nullptr;
   void (*on_overload_)(void*) = nullptr;
+  // Separate from mutex_: page reservations must never wait on queue state.
+  std::mutex accountant_mutex_;
+  std::shared_ptr<PageAccountant> page_accountant_;
 };
 
 thread_local BackgroundLane* current_background_lane = nullptr;
+thread_local int page_attribution_pause_depth = 0;
 std::atomic<uint64_t> fallback_worker_posts{0};
 std::atomic<uint64_t> unattributed_worker_posts{0};
+std::atomic<uint64_t> page_charge_denials{0};
+std::atomic<uint64_t> unattributed_page_reservations{0};
+
+// Wraps the platform page allocator so commits of tenant-reachable buffers
+// are charged to the reserving context's accountant before the kernel call.
+//
+// V8 allocates resizable ArrayBuffers, growable SharedArrayBuffers and
+// WebAssembly memories by reserving an inaccessible region with page (4 KiB)
+// or wasm-page (64 KiB) alignment and committing a prefix of it with
+// SetPermissions; shrinking decommits a suffix. Those bytes bypass the
+// ArrayBuffer::Allocator. Every other caller of this allocator either
+// reserves with a much larger alignment (pointer and cppgc cages), reserves
+// executable ranges, or runs during runtime or isolate setup, where page
+// attribution is paused. Such regions pass through unmetered.
+//
+// Only committed bytes are charged: reservations are bounded by V8's maximum
+// buffer sizes, not by the memory limit. A tracked region keeps its
+// accountant alive, so the charge is returned on FreePages even after the
+// reserving lane is gone.
+class MeteringPageAllocator final : public v8::PageAllocator {
+ public:
+  explicit MeteringPageAllocator(v8::PageAllocator* inner) : inner_(inner) {}
+
+  size_t AllocatePageSize() override { return inner_->AllocatePageSize(); }
+  size_t CommitPageSize() override { return inner_->CommitPageSize(); }
+  void SetRandomMmapSeed(int64_t seed) override { inner_->SetRandomMmapSeed(seed); }
+  void* GetRandomMmapAddr() override { return inner_->GetRandomMmapAddr(); }
+
+  void* AllocatePages(void* hint, size_t length, size_t alignment,
+                      Permission access) override {
+    std::shared_ptr<PageAccountant> accountant;
+    if (IsBufferReservation(alignment, access) &&
+        page_attribution_pause_depth == 0) {
+      if (current_background_lane != nullptr) {
+        accountant = current_background_lane->page_accountant();
+      }
+      if (accountant == nullptr) {
+        unattributed_page_reservations.fetch_add(1, std::memory_order_relaxed);
+        // Fail closed in a metered process. A standalone pool means this
+        // process also runs unmetered environments without a lane.
+        if (g_page_accounting_managed.load(std::memory_order_acquire) &&
+            !StandalonePoolCreated()) {
+          return nullptr;
+        }
+      }
+    }
+    void* result = inner_->AllocatePages(hint, length, alignment, access);
+    if (result == nullptr) return nullptr;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(result);
+    if (accountant != nullptr) {
+      if (!Track(base, length, std::move(accountant))) {
+        inner_->FreePages(result, length);
+        return nullptr;
+      }
+    } else if (alignment >= kLargeAlignment ||
+               (length >= kLargeLength && !IsBufferReservation(alignment, access))) {
+      // Unattributed (standalone) buffers stay out of the table: they would
+      // only crowd out the cages and code range.
+      AddExcluded(base, length);
+    }
+    return result;
+  }
+
+  bool FreePages(void* address, size_t length) override {
+    std::shared_ptr<Region> region;
+    if (tracked_regions_.load(std::memory_order_acquire) != 0) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = regions_.find(reinterpret_cast<uintptr_t>(address));
+      if (it != regions_.end()) {
+        region = std::move(it->second);
+        regions_.erase(it);
+        tracked_regions_.fetch_sub(1, std::memory_order_release);
+      }
+    }
+    if (region == nullptr) {
+      // Before the kernel can hand the range to a tracked buffer.
+      TrimExcluded(reinterpret_cast<uintptr_t>(address));
+      return inner_->FreePages(address, length);
+    }
+    std::lock_guard<std::mutex> lock(region->mutex);
+    const bool ok = inner_->FreePages(address, length);
+    // A failed free is fatal in V8; the charge is returned either way.
+    region->accountant->Uncharge(region->committed);
+    region->committed = 0;
+    return ok;
+  }
+
+  bool ReleasePages(void* address, size_t length, size_t new_length) override {
+    std::shared_ptr<Region> region = Find(address);
+    if (region == nullptr || region->base != reinterpret_cast<uintptr_t>(address)) {
+      TrimExcluded(reinterpret_cast<uintptr_t>(address) + new_length);
+      return inner_->ReleasePages(address, length, new_length);
+    }
+    std::lock_guard<std::mutex> lock(region->mutex);
+    if (!inner_->ReleasePages(address, length, new_length)) return false;
+    {
+      std::lock_guard<std::mutex> map_lock(mutex_);
+      region->length.store(std::min(region->length.load(std::memory_order_relaxed),
+                                    new_length),
+                           std::memory_order_relaxed);
+    }
+    if (region->committed > new_length) {
+      region->accountant->Uncharge(region->committed - new_length);
+      region->committed = new_length;
+    }
+    return true;
+  }
+
+  bool SetPermissions(void* address, size_t length, Permission access) override {
+    std::shared_ptr<Region> region = MaybeFind(address);
+    if (region == nullptr) return inner_->SetPermissions(address, length, access);
+    return Update(*region, address, length, access, [&] {
+      return inner_->SetPermissions(address, length, access);
+    });
+  }
+
+  bool RecommitPages(void* address, size_t length, Permission access) override {
+    std::shared_ptr<Region> region = MaybeFind(address);
+    if (region == nullptr) return inner_->RecommitPages(address, length, access);
+    return Update(*region, address, length, access, [&] {
+      return inner_->RecommitPages(address, length, access);
+    });
+  }
+
+  bool DecommitPages(void* address, size_t size) override {
+    std::shared_ptr<Region> region = MaybeFind(address);
+    if (region == nullptr) return inner_->DecommitPages(address, size);
+    return Update(*region, address, size, kNoAccess,
+                  [&] { return inner_->DecommitPages(address, size); });
+  }
+
+  // Discarded pages stay committed (accessible), so the charge stays.
+  bool DiscardSystemPages(void* address, size_t size) override {
+    return inner_->DiscardSystemPages(address, size);
+  }
+  bool SealPages(void* address, size_t length) override {
+    return inner_->SealPages(address, length);
+  }
+  bool ReserveForSharedMemoryMapping(void* address, size_t size) override {
+    return inner_->ReserveForSharedMemoryMapping(address, size);
+  }
+  std::unique_ptr<SharedMemory> AllocateSharedPages(
+      size_t length, const void* original_address) override {
+    return inner_->AllocateSharedPages(length, original_address);
+  }
+  bool CanAllocateSharedPages() override { return inner_->CanAllocateSharedPages(); }
+
+  v8::PageAllocator* inner() { return inner_; }
+
+ private:
+  // Buffer reservations use the OS page size or the 64 KiB wasm page size.
+  static constexpr size_t kMaxBufferAlignment = size_t{64} * 1024;
+  // V8's own cages are aligned to (at least) their 4 GiB size.
+  static constexpr size_t kLargeAlignment = size_t{1} << 30;
+  static constexpr size_t kLargeLength = size_t{64} << 20;
+  static constexpr size_t kMaxExcluded = 16;
+
+  struct Region {
+    std::mutex mutex;  // serializes commits; GSABs grow from several threads
+    uintptr_t base = 0;
+    // Written under both locks (ReleasePages); read under either.
+    std::atomic<size_t> length{0};
+    size_t committed = 0;  // charged prefix, guarded by `mutex`
+    std::shared_ptr<PageAccountant> accountant;
+  };
+
+  bool Track(uintptr_t base, size_t length,
+             std::shared_ptr<PageAccountant> accountant) {
+    try {
+      auto region = std::make_shared<Region>();
+      region->base = base;
+      region->length = length;
+      region->accountant = std::move(accountant);
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!regions_.emplace(base, std::move(region)).second) return false;
+      tracked_regions_.fetch_add(1, std::memory_order_release);
+      return true;
+    } catch (const std::bad_alloc&) {
+      return false;
+    }
+  }
+
+  bool IsBufferReservation(size_t alignment, Permission access) const {
+    return access == kNoAccess &&
+           alignment <= std::max(kMaxBufferAlignment, inner_->AllocatePageSize());
+  }
+
+  static bool StandalonePoolCreated();
+
+  // Lock-free filter for the hot path: V8 heap and code pages live in a few
+  // large process-wide reservations and never take the allocator lock.
+  std::shared_ptr<Region> MaybeFind(void* address) {
+    if (tracked_regions_.load(std::memory_order_acquire) == 0) return nullptr;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+    for (size_t i = 0; i < kMaxExcluded; ++i) {
+      const uintptr_t begin = excluded_begin_[i].load(std::memory_order_acquire);
+      if (begin != 0 && addr >= begin &&
+          addr < excluded_end_[i].load(std::memory_order_acquire)) {
+        return nullptr;
+      }
+    }
+    return Find(address);
+  }
+
+  std::shared_ptr<Region> Find(void* address) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = regions_.upper_bound(addr);
+    if (it == regions_.begin()) return nullptr;
+    --it;
+    if (addr - it->first >= it->second->length.load(std::memory_order_relaxed)) {
+      return nullptr;
+    }
+    return it->second;
+  }
+
+  // V8 commits prefixes (grow passes the buffer start and the new total) and
+  // decommits suffixes (ResizeInPlace shrink). Anything else is charged
+  // conservatively: a commit charges up to its end, a decommit that does not
+  // reach the committed end keeps its charge until the region is freed.
+  template <typename Op>
+  bool Update(Region& region, void* address, size_t length, Permission access,
+              Op op) {
+    std::lock_guard<std::mutex> lock(region.mutex);
+    const size_t offset = reinterpret_cast<uintptr_t>(address) - region.base;
+    const size_t region_length = region.length.load(std::memory_order_relaxed);
+    if (offset >= region_length) return op();  // trimmed away meanwhile
+    const size_t end = offset + std::min(length, region_length - offset);
+    if (access == kNoAccess || access == kNoAccessWillJitLater) {
+      if (!op()) return false;
+      if (offset < region.committed && end >= region.committed) {
+        region.accountant->Uncharge(region.committed - offset);
+        region.committed = offset;
+      }
+      return true;
+    }
+    const size_t delta = end > region.committed ? end - region.committed : 0;
+    if (!region.accountant->Charge(delta)) {
+      page_charge_denials.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (!op()) {
+      region.accountant->Uncharge(delta);
+      return false;
+    }
+    region.committed += delta;
+    return true;
+  }
+
+  void AddExcluded(uintptr_t base, size_t length) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < kMaxExcluded; ++i) {
+      if (excluded_begin_[i].load(std::memory_order_relaxed) != 0) continue;
+      // Publish the end before the begin; readers check begin first.
+      excluded_end_[i].store(base + length, std::memory_order_release);
+      excluded_begin_[i].store(base, std::memory_order_release);
+      return;
+    }
+    // Full: such regions then take the slow path, which is still correct.
+  }
+
+  // An excluded range must never cover memory the kernel may reuse: every
+  // entry containing `released_from` ends there (or is dropped). Called
+  // before the range is unmapped.
+  void TrimExcluded(uintptr_t released_from) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < kMaxExcluded; ++i) {
+      const uintptr_t begin = excluded_begin_[i].load(std::memory_order_relaxed);
+      const uintptr_t end = excluded_end_[i].load(std::memory_order_relaxed);
+      if (begin == 0 || released_from < begin || released_from >= end) continue;
+      if (released_from == begin) {
+        excluded_begin_[i].store(0, std::memory_order_release);
+        excluded_end_[i].store(0, std::memory_order_release);
+      } else {
+        excluded_end_[i].store(released_from, std::memory_order_release);
+      }
+    }
+  }
+
+  v8::PageAllocator* inner_;
+  std::atomic<size_t> tracked_regions_{0};
+  std::atomic<uintptr_t> excluded_begin_[kMaxExcluded] = {};
+  std::atomic<uintptr_t> excluded_end_[kMaxExcluded] = {};
+  std::mutex mutex_;
+  std::map<uintptr_t, std::shared_ptr<Region>> regions_;
+};
+
+std::atomic<MeteringPageAllocator*> g_metering_page_allocator{nullptr};
 
 struct WorkerWarmupState {
   std::mutex mutex;
@@ -257,6 +598,64 @@ extern "C" bool snapi_v8_lane_is_running(void* handle) {
 
 extern "C" bool snapi_v8_lane_overloaded(void* handle) {
   return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsOverloaded();
+}
+
+extern "C" bool snapi_v8_lane_set_page_accountant(
+    void* handle, void* context, bool (*charge)(void*, uint64_t),
+    void (*uncharge)(void*, uint64_t), void (*release)(void*)) {
+  if (handle == nullptr || charge == nullptr || uncharge == nullptr) return false;
+  std::shared_ptr<PageAccountant> accountant;
+  try {
+    accountant = std::make_shared<PageAccountant>(context, charge, uncharge, release);
+  } catch (const std::bad_alloc&) {
+    return false;  // the caller still owns `context`
+  }
+  if (!static_cast<BackgroundLane*>(handle)->SetPageAccountant(accountant)) {
+    accountant->Detach();
+    return false;
+  }
+  g_page_accounting_managed.store(true, std::memory_order_release);
+  return true;
+}
+
+EdgeV8PageAttributionPause::EdgeV8PageAttributionPause() {
+  ++page_attribution_pause_depth;
+}
+
+EdgeV8PageAttributionPause::~EdgeV8PageAttributionPause() {
+  --page_attribution_pause_depth;
+}
+
+extern "C" uint64_t snapi_v8_page_charge_denials() {
+  return page_charge_denials.load(std::memory_order_acquire);
+}
+
+extern "C" uint64_t snapi_v8_unattributed_page_reservations() {
+  return unattributed_page_reservations.load(std::memory_order_acquire);
+}
+
+// Native-only probes (not guest imports) for classification tests and the
+// hot-path micro-benchmark. `metered == false` bypasses the wrapper.
+extern "C" void* snapi_v8_test_page_reserve(void* hint, size_t length,
+                                            size_t alignment) {
+  auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire);
+  if (allocator == nullptr) return nullptr;
+  return allocator->AllocatePages(hint, length, alignment,
+                                  v8::PageAllocator::kNoAccess);
+}
+
+extern "C" bool snapi_v8_test_page_set_permissions(void* address, size_t length,
+                                                   int access, bool metered) {
+  auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire);
+  if (allocator == nullptr) return false;
+  v8::PageAllocator* target = metered ? allocator : allocator->inner();
+  return target->SetPermissions(address, length,
+                                static_cast<v8::PageAllocator::Permission>(access));
+}
+
+extern "C" bool snapi_v8_test_page_free(void* address, size_t length) {
+  auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire);
+  return allocator != nullptr && allocator->FreePages(address, length);
 }
 
 extern "C" uint64_t snapi_v8_fallback_worker_posts() {
@@ -527,6 +926,12 @@ extern "C" bool snapi_v8_standalone_pool_created() {
   return g_standalone_pool_created.load(std::memory_order_acquire);
 }
 
+namespace {
+bool MeteringPageAllocator::StandalonePoolCreated() {
+  return g_standalone_pool_created.load(std::memory_order_acquire);
+}
+}  // namespace
+
 bool EdgeV8Platform::SetWorkerThreadCount(int count) {
   const int requested = count < 0 ? 0 : count;
   if (g_platform_created.load(std::memory_order_acquire)) {
@@ -556,7 +961,17 @@ std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create(bool standalone_workers) 
 }
 
 EdgeV8Platform::EdgeV8Platform(std::unique_ptr<v8::Platform> fallback)
-    : fallback_(std::move(fallback)) {}
+    : fallback_(std::move(fallback)) {
+  v8::PageAllocator* inner =
+      fallback_ != nullptr ? fallback_->GetPageAllocator() : nullptr;
+  if (inner != nullptr) {
+    auto allocator = std::make_unique<MeteringPageAllocator>(inner);
+    // V8 caches the platform page allocator for the process lifetime, and
+    // this platform is never destroyed while V8 is initialized.
+    g_metering_page_allocator.store(allocator.get(), std::memory_order_release);
+    page_allocator_ = std::move(allocator);
+  }
+}
 
 EdgeV8Platform::~EdgeV8Platform() = default;
 
@@ -819,7 +1234,7 @@ v8::TracingController* EdgeV8Platform::GetTracingController() {
 }
 
 v8::PageAllocator* EdgeV8Platform::GetPageAllocator() {
-  return fallback_ != nullptr ? fallback_->GetPageAllocator() : nullptr;
+  return page_allocator_.get();
 }
 
 v8::ThreadIsolatedAllocator* EdgeV8Platform::GetThreadIsolatedAllocator() {
