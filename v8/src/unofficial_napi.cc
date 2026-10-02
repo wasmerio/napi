@@ -716,6 +716,8 @@ napi_status ConfigureRuntime(const char* engine_flags,
     return napi_ok;
   }
 
+  // Process-wide V8 and cppgc reservations made here belong to no context.
+  EdgeV8PageAttributionPause page_attribution_pause;
   ApplyDefaultV8Flags();
   if (engine_flags_length > 0) {
     v8::V8::SetFlagsFromString(engine_flags,
@@ -1978,6 +1980,9 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
+  // Isolate and context setup runs no guest code; its reservations are
+  // V8's own even though the context's lane is already bound.
+  EdgeV8PageAttributionPause page_attribution_pause;
 
   // Linux gives newly created threads the PKRU state of their creator. A
   // worker thread that predates V8's process-wide JIT protection key may
