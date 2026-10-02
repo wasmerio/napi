@@ -4042,18 +4042,27 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   return napi_ok;
 }
 
-// Rust-exported grant callback (see budget.rs). Charges a grow-step against
-// the resource budget and returns the raised (or unchanged) heap limit.
+// Rust-exported grant callback (see budget.rs). Charges the heap growth
+// against the resource budget and returns the raised (or unchanged) heap
+// limit. `committed_old_generation` is what V8 will compare against the
+// returned limit right after the callback (zero if unknown).
 extern "C" size_t napi_host_near_heap_limit_grant(const void *data,
                                                   size_t current_limit,
-                                                  size_t initial_limit);
+                                                  size_t initial_limit,
+                                                  size_t committed_old_generation);
 
 namespace {
 // V8-shaped trampoline forwarding to the Rust grant callback. The budget
 // tracker rides in `data`.
-size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void *data,
+size_t HostNearHeapLimitTrampoline(napi_env env, void *data,
                                    size_t current_limit, size_t initial_limit) {
-  return napi_host_near_heap_limit_grant(data, current_limit, initial_limit);
+  size_t committed = 0;
+  if (unofficial_napi_get_heap_committed_old_generation(env, &committed) !=
+      napi_ok) {
+    committed = 0;
+  }
+  return napi_host_near_heap_limit_grant(data, current_limit, initial_limit,
+                                         committed);
 }
 } // namespace
 
@@ -4404,6 +4413,36 @@ snapi_bridge_unofficial_take_fatal_requested(SnapiEnvState *env_state) {
   auto state = LookupEnvState(env_state);
   return state != nullptr &&
          state->fatal_requested.exchange(false, std::memory_order_acq_rel);
+}
+
+// After JavaScript ran on this thread: collect if the heap holds memory
+// beyond its limit that no collection has examined (the engine admits the
+// first large young object without a limit check). The collection routes the
+// figure through the near-heap-limit callback, which charges or stops the
+// env. Returns nonzero when a collection ran.
+extern "C" int
+snapi_bridge_unofficial_settle_heap_overshoot(SnapiEnvState *env_state) {
+  auto state = LookupEnvState(env_state);
+  if (state == nullptr)
+    return 0;
+  napi_env env;
+  {
+    std::lock_guard<std::mutex> lock(state->control_mutex);
+    if (state->disposing || state->env == nullptr)
+      return 0;
+    ++state->active_control_calls;
+    env = state->env;
+  }
+  bool collected = false;
+  const napi_status status =
+      unofficial_napi_collect_garbage_if_over_heap_limit(env, &collected);
+  {
+    std::lock_guard<std::mutex> lock(state->control_mutex);
+    --state->active_control_calls;
+    if (state->active_control_calls == 0)
+      state->control_cv.notify_all();
+  }
+  return status == napi_ok && collected ? 1 : 0;
 }
 
 extern "C" int

@@ -32,6 +32,11 @@ pub struct NapiLimits {
     pub total_memory_bytes: Option<u64>,
     pub max_total_external_memory: Option<u64>,
     pub max_total_heap_bytes: Option<u64>,
+    /// V8 heap headroom exposed outside the budget to an isolate whose growth
+    /// was refused, so that V8 can complete the failed allocation while the
+    /// isolate is terminated instead of aborting the process. `None` uses
+    /// [`crate::budget::DEFAULT_HEAP_EMERGENCY_HEADROOM`].
+    pub heap_emergency_headroom_bytes: Option<u64>,
 }
 
 impl NapiLimits {
@@ -429,6 +434,15 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Override the V8 heap headroom exposed to an isolate whose growth was
+    /// refused (see [`NapiLimits::heap_emergency_headroom_bytes`]). Values
+    /// below [`crate::budget::DEFAULT_HEAP_EMERGENCY_HEADROOM`] reintroduce
+    /// process aborts for single allocations larger than the override.
+    pub fn heap_emergency_headroom(mut self, bytes: u64) -> Self {
+        self.limits.heap_emergency_headroom_bytes = Some(bytes);
+        self
+    }
+
     /// Delegate total-memory admission to the embedder.
     pub fn memory_accountant(mut self, accountant: Arc<dyn NapiMemoryAccountant>) -> Self {
         self.accountant = Some(accountant);
@@ -477,6 +491,9 @@ impl NapiCtxBuilder {
                 None => ResourceBudget::unlimited(),
             },
         };
+        if let Some(bytes) = self.limits.heap_emergency_headroom_bytes {
+            budget.set_heap_emergency_headroom(bytes);
+        }
         let envs = Arc::new(Mutex::new(HashSet::new()));
         let host_stopped = Arc::new(AtomicBool::new(false));
         Arc::new(NapiProviderBindings {

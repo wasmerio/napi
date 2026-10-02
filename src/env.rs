@@ -357,7 +357,7 @@ impl NapiEnv {
                 budget: Arc::clone(&self.budget),
                 env: env as usize,
                 host_stopped: Arc::clone(&self.host_stopped),
-                unwind_slack_available: std::sync::atomic::AtomicBool::new(true),
+                emergency_exposed: AtomicU64::new(0),
                 granted: AtomicU64::new(0),
                 bookkeeping_granted: AtomicU64::new(0),
             }));
@@ -580,6 +580,8 @@ impl NapiEnv {
                     Pool::HostBookkeeping,
                     boxed.bookkeeping_granted.load(Ordering::Acquire),
                 );
+                self.budget
+                    .release_heap_emergency(boxed.emergency_exposed.load(Ordering::Acquire));
             }
             self.budget.release_env(handle.ceiling);
         }
