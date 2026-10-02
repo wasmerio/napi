@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use wasmer_napi::{
-    NapiCtx,
+    NapiCtx, WasmPolicy,
     cli::{GuestMount, run_wasix_main_with_ctx},
 };
 
@@ -282,7 +282,7 @@ fn main() -> Result<()> {
         Some(path) => PathBuf::from(path),
         None => {
             bail!(
-                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--] [guest-args...]"
+                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--unmetered-webassembly] [--] [guest-args...]"
             );
         }
     };
@@ -298,6 +298,7 @@ fn main() -> Result<()> {
         .to_string();
     let mut guest_args = Vec::new();
     let mut forwarding_guest_args = false;
+    let mut webassembly = WasmPolicy::Restricted;
 
     while let Some(arg) = argv.next() {
         if forwarding_guest_args {
@@ -306,6 +307,9 @@ fn main() -> Result<()> {
         }
         match arg.as_str() {
             "--" => forwarding_guest_args = true,
+            // Exposes V8 WebAssembly to the guest without resource accounting
+            // (see `WasmPolicy::EnabledUnmetered`).
+            "--unmetered-webassembly" => webassembly = WasmPolicy::EnabledUnmetered,
             "--app-dir" => {
                 let host_dir = argv
                     .next()
@@ -383,7 +387,7 @@ fn main() -> Result<()> {
     maybe_remap_first_guest_arg_to_app_mount(&mut guest_args, &mut extra_mounts)?;
     maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
 
-    let ctx = NapiCtx::default();
+    let ctx = NapiCtx::builder().webassembly(webassembly).build();
     let exit_code = run_wasix_main_with_ctx(
         &ctx,
         &wasm_path,

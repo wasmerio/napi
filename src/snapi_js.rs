@@ -1831,6 +1831,9 @@ pub unsafe extern "C" fn snapi_bridge_init() -> i32 {
 pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
     _version: i32,
     _guest_heap_ctx: *const c_void,
+    // Guest JS runs in the host realm here, whose WebAssembly is the host's
+    // own; the provider policy only applies to the embedded V8 backend.
+    _webassembly_policy: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
     let runtime_configured = RUNTIME_ENGINE_FLAGS
@@ -1855,9 +1858,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env_with_options(
     _code: u32,
     _stack: u32,
     guest_heap_ctx: *const c_void,
+    webassembly_policy: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
-    unsafe { snapi_bridge_unofficial_create_env(version, guest_heap_ctx, out) }
+    unsafe { snapi_bridge_unofficial_create_env(version, guest_heap_ctx, webassembly_policy, out) }
 }
 
 #[unsafe(no_mangle)]

@@ -136,6 +136,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     };
 
     let guest_heap_ctx = guest_heap_alloc_ctx(&env);
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = if reservation.clamped {
         unsafe {
@@ -148,11 +149,19 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
                 reservation.code_range,
                 0,
                 guest_heap_ctx,
+                webassembly_policy,
                 &mut snapi_env_state,
             )
         }
     } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
+        unsafe {
+            snapi_bridge_unofficial_create_env(
+                8,
+                guest_heap_ctx,
+                webassembly_policy,
+                &mut snapi_env_state,
+            )
+        }
     };
     if status != 0 || snapi_env_state.is_null() {
         env.data().abort_isolate(&reservation);
@@ -411,6 +420,7 @@ fn create_env_with_options(
     };
 
     let guest_heap_ctx = guest_heap_alloc_ctx(&env);
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
@@ -422,6 +432,7 @@ fn create_env_with_options(
             reservation.code_range,
             options.stack_limit,
             guest_heap_ctx,
+            webassembly_policy,
             &mut snapi_env_state,
         )
     };

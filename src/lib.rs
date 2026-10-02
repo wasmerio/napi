@@ -28,7 +28,7 @@ pub use budget::{
 };
 pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeControl,
-    NapiRuntimeHooks, NapiSession,
+    NapiRuntimeHooks, NapiSession, WasmPolicy,
 };
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
