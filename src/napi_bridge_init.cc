@@ -166,6 +166,10 @@ struct SnapiEnvState {
   // compare this identity while holding g_mu; env itself is cleared under the
   // per-env mutex during teardown and cannot be read from that callback.
   napi_env native_env_identity = nullptr;
+  // Registry membership, flipped under g_mu together with the g_envs
+  // mutation. Lets a thread that already holds a reference to this state
+  // (see g_env_cache) answer LookupEnvState without taking g_mu.
+  std::atomic<bool> in_registry{false};
   std::atomic<bool> legacy_fatal_hook_live{false};
   unofficial_napi_env_owner owner = nullptr;
 
@@ -275,6 +279,57 @@ struct CallbackBinding {
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>> &g_envs =
     *new std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>>();
+
+// Per-thread front cache for g_envs. Every bridge entry resolves its env
+// pointer through the registry; with many environments running on different
+// threads the single g_mu behind that lookup becomes the contended hot spot
+// of the whole bridge. A thread normally drives one environment, so the last
+// few states it resolved are kept here, pinned by a shared_ptr obtained from
+// the registry. Pinning is what makes a hit trustworthy: while a slot holds
+// the state at address P, no other SnapiEnvState can be allocated at P, so a
+// key match identifies exactly that object, and its `in_registry` flag is
+// the same membership bit the map would answer with. Misses, stale hits and
+// every registry mutation still go through g_mu.
+struct EnvCacheSlot {
+  SnapiEnvState *key = nullptr;
+  std::shared_ptr<SnapiEnvState> state;
+};
+constexpr size_t kEnvCacheSlots = 4;
+struct EnvCache {
+  EnvCacheSlot slots[kEnvCacheSlots];
+  size_t next_victim = 0;
+
+  // Fills an empty slot if there is one (e.g. after Forget), otherwise
+  // evicts round-robin.
+  void Insert(SnapiEnvState *key, std::shared_ptr<SnapiEnvState> state) {
+    for (EnvCacheSlot &slot : slots) {
+      if (slot.key == nullptr) {
+        slot.key = key;
+        slot.state = std::move(state);
+        return;
+      }
+    }
+    EnvCacheSlot &slot = slots[next_victim];
+    next_victim = (next_victim + 1) % kEnvCacheSlots;
+    slot.key = key;
+    slot.state = std::move(state);
+  }
+  // Drops every slot pinning `state`. Called by the disposing thread so the
+  // state's memory is not kept alive by its own cache after teardown.
+  void Forget(const SnapiEnvState *state) {
+    for (EnvCacheSlot &slot : slots) {
+      if (slot.key == state) {
+        slot.key = nullptr;
+        slot.state.reset();
+      }
+    }
+  }
+};
+thread_local EnvCache g_env_cache;
+// Number of lookups that reached g_envs (cache misses and stale hits). Test
+// probe only; incremented off the fast path.
+std::atomic<uint64_t> g_registry_lookups{0};
+
 // Message resources cross worker environments. Rust validates each guest ID
 // against the owning NapiCtx before calling into this process-wide table.
 HandleTable &g_message_handles = *new HandleTable();
@@ -375,9 +430,37 @@ std::shared_ptr<SnapiEnvState> LookupEnvState(SnapiEnvState *env_state) {
   // The pointer originates from the guest (via the Rust env-id layer); gate it
   // on live-env membership before the first dereference so a stale or forged
   // env handle fails cleanly instead of touching freed memory.
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  auto it = g_envs.find(env_state);
-  return it == g_envs.end() ? std::shared_ptr<SnapiEnvState>{} : it->second;
+  //
+  // Fast path: this thread resolved the pointer before and still pins the
+  // object it found, so the key comparison cannot be fooled by address reuse
+  // and `in_registry` is the current membership answer. The only memory
+  // shared with other threads that a hit touches is the state's own
+  // shared_ptr control block (refcount), which only this env's thread
+  // normally uses.
+  std::shared_ptr<SnapiEnvState> stale;
+  for (EnvCacheSlot &slot : g_env_cache.slots) {
+    if (slot.key != env_state)
+      continue;
+    if (slot.state->in_registry.load(std::memory_order_acquire))
+      return slot.state;
+    // Keep the disposed object pinned until the registry has answered, so
+    // its address cannot be handed to a new environment in between and the
+    // stale handle deterministically resolves to "not registered".
+    stale = std::move(slot.state);
+    slot.key = nullptr;
+    break;
+  }
+  std::shared_ptr<SnapiEnvState> found;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    g_registry_lookups.fetch_add(1, std::memory_order_relaxed);
+    auto it = g_envs.find(env_state);
+    if (it != g_envs.end())
+      found = it->second;
+  }
+  if (found != nullptr)
+    g_env_cache.Insert(env_state, found);
+  return found;
 }
 
 struct EnvLease {
@@ -766,8 +849,12 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->bk_reclaimable_floor = 0;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    state->in_registry.store(false, std::memory_order_release);
     g_envs.erase(state);
   }
+  // The caller's lease still owns a reference; dropping this thread's cached
+  // pin lets the state die with that lease instead of lingering in the cache.
+  g_env_cache.Forget(state);
   return release_status;
 }
 
@@ -3950,6 +4037,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    state->in_registry.store(true, std::memory_order_release);
     g_envs.emplace(state.get(), state);
   }
 
@@ -4013,6 +4101,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
+    state->in_registry.store(true, std::memory_order_release);
     g_envs.emplace(state.get(), state);
   }
 
@@ -4376,6 +4465,12 @@ extern "C" uintptr_t snapi_bridge_test_native_env_identity(SnapiEnvState *env_st
 
 extern "C" void snapi_bridge_test_signal_legacy_fatal(uintptr_t identity) {
   LegacyFatalErrorCallback(reinterpret_cast<napi_env>(identity), nullptr, nullptr);
+}
+
+// Lets a test assert that repeated bridge calls on a warm thread resolve
+// their env without consulting the shared registry.
+extern "C" uint64_t snapi_bridge_test_registry_lookup_count() {
+  return g_registry_lookups.load(std::memory_order_relaxed);
 }
 
 extern "C" int
