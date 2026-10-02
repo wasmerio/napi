@@ -73,11 +73,14 @@ unsafe extern "C" {
         engine_flags: *const c_char,
         engine_flags_length: u32,
     ) -> i32;
+    /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
+        webassembly_policy: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
     pub fn snapi_bridge_unofficial_create_env_with_options(
         module_api_version: i32,
         total_memory: u64,
@@ -87,6 +90,7 @@ unsafe extern "C" {
         code_range_size_in_bytes: u32,
         stack_limit: u32,
         guest_heap_ctx: *const core::ffi::c_void,
+        webassembly_policy: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
