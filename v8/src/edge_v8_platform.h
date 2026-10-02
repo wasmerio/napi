@@ -53,6 +53,9 @@ enum : uint32_t {
   SNAPI_V8_WASM_CODE_LIMIT_BUDGET = 1,
   // charge_code refused a commit (the memory limit is exhausted).
   SNAPI_V8_WASM_CODE_LIMIT_MEMORY = 2,
+  // The commit took the process's metered wasm code past the hard process
+  // limit (twice the soft code budget).
+  SNAPI_V8_WASM_CODE_LIMIT_PROCESS = 3,
 };
 
 // Per-context WebAssembly limits and accounting, attached to a lane that
@@ -67,8 +70,9 @@ enum : uint32_t {
 //   into a failed memory.grow or a RangeError).
 // * Committed wasm code is charged after the fact through `charge_code`:
 //   V8 aborts the process if a code commit fails, so it is never refused.
-//   When `charge_code` refuses or the context's committed code exceeds
-//   `code_budget_bytes`, `on_code_limit` runs once (possibly on a V8
+//   When `charge_code` refuses, the context's committed code exceeds
+//   `code_budget_bytes`, or the commit takes the process's metered code past
+//   the hard process limit, `on_code_limit` runs once (possibly on a V8
 //   background thread, inside V8): it must stop the context without
 //   blocking on V8 or N-API locks. New compilations in the context are
 //   refused from then on (CompileError), as they are while the process-wide
@@ -104,6 +108,7 @@ extern "C" void snapi_v8_lane_wasm_usage(void* handle,
 struct snapi_v8_wasm_stats {
   uint64_t code_committed_bytes;   // all metered wasm code in the process
   uint64_t code_budget_bytes;      // process-wide soft budget (0: unmetered)
+  uint64_t code_hard_limit_bytes;  // process-wide hard limit, 2x the budget
   uint64_t memory_cap_denials;     // wasm memory reservations over a cap
   uint64_t codegen_denials;        // compilations refused by a code budget
   uint64_t code_limit_stops;       // contexts stopped by on_code_limit
@@ -119,8 +124,13 @@ extern "C" void snapi_v8_wasm_process_stats(snapi_v8_wasm_stats* out);
 // same configuration later succeeds; a different one fails.
 //
 // Sets --wasm-max-mem-pages, --wasm-max-module-size, --max-wasm-functions,
-// --no-wasm-native-module-cache and, if `liftoff_only`, --liftoff-only, and
+// --wasm-max-table-size, --no-wasm-native-module-cache and, if
+// `liftoff_only`, --liftoff-only, and
 // enables wasm code metering with the given process-wide soft code budget.
+// The soft budget refuses new compilations; lazy compilation of admitted
+// modules has no embedder hook, so a context whose commit takes the process
+// past twice the soft budget (at most 3 GiB, well below V8's fatal 4095 MiB
+// committed-code limit) is stopped instead.
 // Returns napi_ok, napi_invalid_arg for out-of-range values, or
 // napi_generic_failure once V8 runs with a different configuration.
 struct snapi_v8_wasm_engine_config {
@@ -129,7 +139,9 @@ struct snapi_v8_wasm_engine_config {
   uint64_t max_module_bytes;    // 16..=1 GiB
   uint32_t max_functions;       // 1..=1,000,000 per module
   uint32_t liftoff_only;        // 0 or 1
-  uint64_t process_code_budget_bytes;  // 1 MiB..=3 GiB
+  uint64_t process_code_budget_bytes;  // 1 MiB..=1536 MiB
+  uint32_t max_table_size;      // 1..=10,000,000 entries per table
+  uint32_t reserved;            // 0
 };
 extern "C" int snapi_v8_configure_wasm_engine(
     const snapi_v8_wasm_engine_config* config);

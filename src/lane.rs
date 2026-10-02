@@ -44,8 +44,9 @@ unsafe extern "C" {
     fn snapi_v8_wasm_process_stats(out: *mut WasmProcessStats);
 }
 
-/// `SNAPI_V8_WASM_CODE_LIMIT_BUDGET` in `edge_v8_platform.h`.
+/// `SNAPI_V8_WASM_CODE_LIMIT_*` in `edge_v8_platform.h`.
 const WASM_CODE_LIMIT_BUDGET: u32 = 1;
+const WASM_CODE_LIMIT_PROCESS: u32 = 3;
 
 /// Mirrors `snapi_v8_wasm_accounting` in `edge_v8_platform.h`.
 #[repr(C)]
@@ -81,6 +82,9 @@ pub struct WasmProcessStats {
     pub code_committed_bytes: u64,
     /// Process-wide soft code budget (0 if wasm code is not metered).
     pub code_budget_bytes: u64,
+    /// Process-wide hard code limit, twice the soft budget (0 if wasm code
+    /// is not metered).
+    pub code_hard_limit_bytes: u64,
     /// Wasm memory reservations refused by a per-context cap.
     pub memory_cap_denials: u64,
     /// Compilations refused by a context or process code budget.
@@ -320,8 +324,8 @@ unsafe extern "C" fn uncharge_wasm_code(context: *mut c_void, bytes: u64) {
     guarded((), || budget.uncharge(Pool::V8WasmCode, bytes));
 }
 
-/// Stops the context: its committed wasm code was refused by the budget or
-/// exceeded the code budget. Runs inside V8's allocator, possibly on the
+/// Stops the context: its committed wasm code was refused by the budget,
+/// exceeded the code budget, or took the process past its hard code limit. Runs inside V8's allocator, possibly on the
 /// lane thread while another thread holds bridge locks and waits for the
 /// lane's current task, so it only sets the sticky stop flag here and
 /// terminates the isolates from a helper thread.
@@ -338,13 +342,18 @@ unsafe extern "C" fn on_wasm_code_limit(
         };
         control.mark_stopped();
         let budget = Arc::clone(&accountant.budget);
-        let notify = move || {
-            if reason == WASM_CODE_LIMIT_BUDGET {
+        let notify = move || match reason {
+            WASM_CODE_LIMIT_BUDGET => {
                 budget.notify_limit_exceeded(NapiLimitExceeded::WasmCodeBudget {
                     committed,
                     budget: limit,
-                });
+                })
             }
+            WASM_CODE_LIMIT_PROCESS => budget
+                .notify_limit_exceeded(NapiLimitExceeded::WasmProcessCode { committed, limit }),
+            // A refused charge already went through the embedder's
+            // terminal `try_charge`.
+            _ => {}
         };
         let stop = {
             let notify = notify.clone();

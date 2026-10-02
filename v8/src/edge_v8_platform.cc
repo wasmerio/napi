@@ -39,6 +39,9 @@ std::atomic<uint64_t> wasm_code_decommitted_bytes{0};
 // Committed bytes in every tracked wasm code space, attributed or not.
 std::atomic<uint64_t> wasm_code_committed{0};
 std::atomic<uint64_t> wasm_process_code_budget{0};
+// Twice the soft budget: a context whose commit takes the process past it is
+// stopped, since lazy compilation of admitted modules bypasses the soft gate.
+std::atomic<uint64_t> wasm_process_code_hard_limit{UINT64_MAX};
 // Metered wasm memories in the process: committed bytes and live count.
 std::atomic<uint64_t> wasm_memory_committed{0};
 std::atomic<uint64_t> wasm_memories{0};
@@ -123,18 +126,23 @@ class PageAccountant {
     return has_wasm() && !lane_gone_.load(std::memory_order_acquire);
   }
 
-  // Charges code V8 already committed. Returns whether the bytes were
-  // charged; sets `*stop` to the reason when the context must now stop (once
-  // per context; the caller reports it outside its locks).
-  bool ChargeCode(uint64_t bytes, uint32_t* stop) {
+  // Charges code V8 already committed, which took the process's metered
+  // code to `process_committed`. Returns whether the bytes were charged;
+  // sets `*stop` to the reason when the context must now stop (once per
+  // context; the caller reports it outside its locks).
+  bool ChargeCode(uint64_t bytes, uint64_t process_committed, uint32_t* stop) {
     if (!wasm_->charge_code(context_, bytes)) {
       if (ClaimStop()) *stop = SNAPI_V8_WASM_CODE_LIMIT_MEMORY;
       return false;
     }
     const uint64_t committed =
         code_committed_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
-    if (committed > wasm_->code_budget_bytes && ClaimStop()) {
-      *stop = SNAPI_V8_WASM_CODE_LIMIT_BUDGET;
+    if (committed > wasm_->code_budget_bytes) {
+      if (ClaimStop()) *stop = SNAPI_V8_WASM_CODE_LIMIT_BUDGET;
+    } else if (process_committed >
+                   wasm_process_code_hard_limit.load(std::memory_order_acquire) &&
+               ClaimStop()) {
+      *stop = SNAPI_V8_WASM_CODE_LIMIT_PROCESS;
     }
     return true;
   }
@@ -151,11 +159,15 @@ class PageAccountant {
         isolate->TerminateExecution();
       }
     }
-    const uint64_t limit = reason == SNAPI_V8_WASM_CODE_LIMIT_BUDGET
-                               ? wasm_->code_budget_bytes
-                               : 0;
-    wasm_->on_code_limit(context_, reason,
-                         code_committed_.load(std::memory_order_acquire), limit);
+    uint64_t committed = code_committed_.load(std::memory_order_acquire);
+    uint64_t limit = 0;
+    if (reason == SNAPI_V8_WASM_CODE_LIMIT_BUDGET) {
+      limit = wasm_->code_budget_bytes;
+    } else if (reason == SNAPI_V8_WASM_CODE_LIMIT_PROCESS) {
+      committed = wasm_code_committed.load(std::memory_order_acquire);
+      limit = wasm_process_code_hard_limit.load(std::memory_order_acquire);
+    }
+    wasm_->on_code_limit(context_, reason, committed, limit);
   }
 
   // New compilations are admitted while the context is under its budget and
@@ -724,8 +736,9 @@ class MeteringPageAllocator final : public v8::PageAllocator {
         scratch.emplace(from, CodeSpan{to, nullptr});
         SpanMap::node_type node = scratch.extract(scratch.begin());
         const uint64_t bytes = to - from;
-        wasm_code_committed.fetch_add(bytes, std::memory_order_acq_rel);
-        if (owner != nullptr && owner->ChargeCode(bytes, &stop)) {
+        const uint64_t process_committed =
+            wasm_code_committed.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+        if (owner != nullptr && owner->ChargeCode(bytes, process_committed, &stop)) {
           node.mapped().owner = owner;
         }
         InsertSpan(*region, std::move(node));
@@ -1079,6 +1092,8 @@ extern "C" void snapi_v8_wasm_process_stats(snapi_v8_wasm_stats* out) {
   if (out == nullptr) return;
   out->code_committed_bytes = wasm_code_committed.load(std::memory_order_acquire);
   out->code_budget_bytes = wasm_process_code_budget.load(std::memory_order_acquire);
+  const uint64_t hard = wasm_process_code_hard_limit.load(std::memory_order_acquire);
+  out->code_hard_limit_bytes = hard == UINT64_MAX ? 0 : hard;
   out->memory_cap_denials = wasm_memory_cap_denials.load(std::memory_order_acquire);
   out->codegen_denials = wasm_codegen_denials.load(std::memory_order_acquire);
   out->code_limit_stops = wasm_code_limit_stops.load(std::memory_order_acquire);
@@ -1091,6 +1106,8 @@ extern "C" void snapi_v8_wasm_process_stats(snapi_v8_wasm_stats* out) {
 void EdgeV8EnableWasmCodeMetering(uint64_t process_code_budget_bytes) {
   wasm_process_code_budget.store(process_code_budget_bytes,
                                  std::memory_order_release);
+  wasm_process_code_hard_limit.store(process_code_budget_bytes * 2,
+                                     std::memory_order_release);
   wasm_code_metering.store(true, std::memory_order_release);
 }
 

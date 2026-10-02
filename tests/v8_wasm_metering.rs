@@ -315,9 +315,11 @@ fn code_is_charged_per_context_and_not_shared() {
     assert!(second.accountant.code() >= code / 2);
     assert_eq!(first.accountant.code(), code);
 
+    // Environments of one thread are entered and must be released LIFO.
+    b.release();
+    assert_eq!(first.accountant.code(), code);
     a.release();
     assert_eq!(first.accountant.code(), 0);
-    b.release();
     first.finish();
     second.finish();
 }
@@ -416,6 +418,23 @@ fn module_size_and_function_count_are_capped() {
         )),
         "ok"
     );
+    // Tables live on the V8 heap: capped at 1M entries.
+    for (expr, expected) in [
+        (
+            "new WebAssembly.Table({ initial: 1000001, element: 'anyfunc' })",
+            "RangeError",
+        ),
+        (
+            "new WebAssembly.Table({ initial: 1, element: 'anyfunc' }).grow(1000000)",
+            "RangeError",
+        ),
+        (
+            "new WebAssembly.Table({ initial: 1000000, element: 'anyfunc' })",
+            "ok",
+        ),
+    ] {
+        assert_eq!(env.eval(&outcome(expr)), expected, "{expr}");
+    }
     env.release();
     lane.finish();
 }
@@ -539,8 +558,8 @@ fn non_wasm_javascript_cost() {
         "non-wasm JavaScript committed metered wasm code"
     );
     assert_eq!(metered.accountant.code(), 0);
-    metered_env.release();
     plain_env.release();
+    metered_env.release();
     metered.finish();
     plain.finish();
 }

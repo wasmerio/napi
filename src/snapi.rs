@@ -74,6 +74,8 @@ pub struct SnapiWasmEngineConfig {
     pub max_functions: u32,
     pub liftoff_only: u32,
     pub process_code_budget_bytes: u64,
+    pub max_table_size: u32,
+    pub reserved: u32,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]

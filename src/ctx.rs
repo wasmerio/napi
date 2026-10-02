@@ -114,8 +114,11 @@ pub enum WasmPolicy {
     ///   [`NapiMemoryAccountant::limit_exceeded`]. New compilations are
     ///   refused with a `CompileError` while the context or the process
     ///   ([`WasmEngineLimits::process_code_budget_bytes`]) is at its code
-    ///   budget. Module size and function count are capped by the engine
-    ///   limits.
+    ///   budget; a context whose commit takes the process past twice that
+    ///   budget is stopped. A context can overshoot its code budget by the
+    ///   function being compiled when it is crossed: up to about 38 MiB of
+    ///   baseline code for a function at V8's size limit. Module size,
+    ///   function count and table size are capped by the engine limits.
     ///
     /// Not charged: compiler working memory (bounded by the module size cap),
     /// V8's wasm metadata, and code pointer table entries (bounded by the
@@ -195,9 +198,17 @@ pub struct WasmEngineLimits {
     pub liftoff_only: bool,
     /// Committed wasm code in the whole process past which new compilations
     /// in metered contexts are refused with a `CompileError` (default
-    /// 1 GiB, between 1 MiB and 3 GiB). Keeps V8's own process-wide code
-    /// limit, whose breach aborts the process, out of reach.
+    /// 1 GiB, between 1 MiB and 1.5 GiB). Lazy compilation of already
+    /// admitted modules cannot be refused; a metered context whose code
+    /// commit takes the process past twice this budget is stopped (see
+    /// [`NapiLimitExceeded::WasmProcessCode`](crate::NapiLimitExceeded)).
+    /// Both keep V8's own process-wide code limit (4095 MiB), whose breach
+    /// aborts the process, out of reach.
     pub process_code_budget_bytes: u64,
+    /// Maximum entries per wasm table (default 1,000,000, at most
+    /// 10,000,000). Tables live on the V8 heap, where a single allocation
+    /// larger than the heap's headroom is fatal for the process.
+    pub max_table_size: u32,
 }
 
 impl Default for WasmEngineLimits {
@@ -208,6 +219,7 @@ impl Default for WasmEngineLimits {
             max_functions: 100_000,
             liftoff_only: true,
             process_code_budget_bytes: 1024 * 1024 * 1024,
+            max_table_size: 1_000_000,
         }
     }
 }
@@ -234,6 +246,8 @@ pub fn configure_wasm_engine(limits: &WasmEngineLimits) -> Result<()> {
         max_functions: limits.max_functions,
         liftoff_only: u32::from(limits.liftoff_only),
         process_code_budget_bytes: limits.process_code_budget_bytes,
+        max_table_size: limits.max_table_size,
+        reserved: 0,
     };
     match unsafe { crate::snapi::snapi_v8_configure_wasm_engine(&config) } {
         0 => Ok(()),

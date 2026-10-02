@@ -661,6 +661,7 @@ bool SameWasmEngineConfig(const snapi_v8_wasm_engine_config& a,
          a.max_module_bytes == b.max_module_bytes &&
          a.max_functions == b.max_functions &&
          a.liftoff_only == b.liftoff_only &&
+         a.max_table_size == b.max_table_size &&
          a.process_code_budget_bytes == b.process_code_budget_bytes;
 }
 
@@ -671,10 +672,12 @@ void ApplyWasmEngineFlags(const snapi_v8_wasm_engine_config& config) {
   const int length = std::snprintf(
       flags, sizeof(flags),
       "--wasm-max-mem-pages=%u --wasm-max-module-size=%llu "
-      "--max-wasm-functions=%u --no-wasm-native-module-cache%s",
+      "--max-wasm-functions=%u --wasm-max-table-size=%u "
+      "--no-wasm-native-module-cache%s",
       config.max_memory_pages,
       static_cast<unsigned long long>(config.max_module_bytes),
-      config.max_functions, config.liftoff_only != 0 ? " --liftoff-only" : "");
+      config.max_functions, config.max_table_size,
+      config.liftoff_only != 0 ? " --liftoff-only" : "");
   if (length > 0 && static_cast<size_t>(length) < sizeof(flags)) {
     v8::V8::SetFlagsFromString(flags, length);
   }
@@ -774,10 +777,14 @@ napi_status ConfigureWasmEngine(const snapi_v8_wasm_engine_config* config) {
       config->max_memory_pages == 0 || config->max_memory_pages > 65536 ||
       config->max_module_bytes < 16 || config->max_module_bytes > 1024 * kMiB ||
       config->max_functions == 0 || config->max_functions > 1000000 ||
-      config->liftoff_only > 1 || config->process_code_budget_bytes < kMiB ||
-      // Well below V8's process-wide committed-code limit (4095 MiB), whose
-      // breach aborts the process.
-      config->process_code_budget_bytes > 3072 * kMiB) {
+      config->liftoff_only > 1 || config->max_table_size == 0 ||
+      // Tables live on the V8 heap; a single huge allocation there is fatal.
+      config->max_table_size > 10000000 || config->reserved != 0 ||
+      config->process_code_budget_bytes < kMiB ||
+      // The hard limit (2x) stays at most 3 GiB, leaving 1 GiB below V8's
+      // process-wide committed-code limit (4095 MiB, whose breach aborts the
+      // process) for in-flight compilations and unmetered contexts.
+      config->process_code_budget_bytes > 1536 * kMiB) {
     return napi_invalid_arg;
   }
   std::lock_guard<std::mutex> lock(g_runtime_mu);

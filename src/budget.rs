@@ -138,6 +138,18 @@ pub enum NapiLimitExceeded {
         /// The budget.
         budget: u64,
     },
+    /// A wasm code commit of this context took the process's metered wasm
+    /// code past the hard process limit (twice
+    /// [`crate::WasmEngineLimits::process_code_budget_bytes`]). Lazy
+    /// compilation of already admitted modules cannot be refused, so the
+    /// committing context is stopped to keep V8's own process-wide limit,
+    /// whose breach aborts the process, out of reach.
+    WasmProcessCode {
+        /// Process-wide committed wasm code at the time.
+        committed: u64,
+        /// The hard process limit.
+        limit: u64,
+    },
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
