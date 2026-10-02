@@ -237,11 +237,18 @@ fn with_cb_context<R>(
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
     if !snapi_env.is_null() {
-        // JavaScript may have left a large young object above the heap limit
-        // that no collection has examined; settle it now so the heap budget
-        // sees it before the guest continues (see `budget.rs`).
-        unsafe {
-            snapi_bridge_unofficial_settle_heap_overshoot(snapi_env);
+        // JavaScript may have left a large object above the heap limit that no
+        // collection has examined; settle it so the heap budget sees it before
+        // the guest continues (see `budget.rs`). The sweep is not free, so the
+        // tracker decides lock-free whether this entry is due.
+        let due = env
+            .data_mut()
+            .heap_tracker_for(snapi_env)
+            .and_then(|tracker| tracker.take_settle_turn());
+        if let Some(old_limit) = due {
+            unsafe {
+                snapi_bridge_unofficial_settle_heap_overshoot(snapi_env, old_limit);
+            }
         }
     }
     if !snapi_env.is_null()

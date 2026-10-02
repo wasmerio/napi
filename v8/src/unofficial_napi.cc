@@ -2046,7 +2046,7 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
 }
 
 napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
-    napi_env env, bool* collected) {
+    napi_env env, size_t old_generation_limit, bool* collected) {
   if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
     return napi_invalid_arg;
   }
@@ -2070,12 +2070,16 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
       napi_ok) {
     return napi_ok;
   }
-  v8::HeapStatistics heap;
-  isolate->GetHeapStatistics(&heap);
-  // `heap_size_limit` includes the young generation, so comparing the
-  // old-generation figure against it is conservative: it never collects while
-  // the old generation is within its own limit.
-  if (committed_old <= heap.heap_size_limit()) {
+  size_t limit = old_generation_limit;
+  if (limit == 0) {
+    // Unknown: fall back to the reported total limit (MaxReserved = old
+    // generation + young generation), which is looser than V8's own check by
+    // the young-generation allowance, so this under-triggers slightly.
+    v8::HeapStatistics heap;
+    isolate->GetHeapStatistics(&heap);
+    limit = heap.heap_size_limit();
+  }
+  if (committed_old <= limit) {
     return napi_ok;
   }
   // The callback invoked during the collection may create handles.

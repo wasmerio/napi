@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasmer::TypedFunction;
@@ -108,6 +108,12 @@ pub(crate) struct NapiEnv {
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
+    /// Single-entry cache for [`NapiEnv::heap_tracker_for`]: the last native
+    /// env asked about and its tracker pointer (`0` for an unlimited budget).
+    /// JS entries overwhelmingly come from one env in a row, and the hook runs
+    /// on every entry, so two hash lookups per entry are avoided. Invalidated
+    /// when an env is unregistered.
+    heap_settle_cache: (usize, usize),
     /// External memory the guest has declared via `napi_adjust_external_memory`,
     /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can
     /// only release what this env actually declared, never more, and so
@@ -200,6 +206,7 @@ impl NapiEnv {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             managed_lane: None,
             env_heap_charges: HashMap::new(),
+            heap_settle_cache: (0, 0),
             external_declared: 0,
             callback_depth: 0,
             memory: None,
@@ -353,14 +360,12 @@ impl NapiEnv {
         }
 
         let tracker = if reservation.clamped {
-            let boxed = Box::into_raw(Box::new(EnvHeapCharge {
-                budget: Arc::clone(&self.budget),
-                env: env as usize,
-                host_stopped: Arc::clone(&self.host_stopped),
-                emergency_exposed: AtomicU64::new(0),
-                granted: AtomicU64::new(0),
-                bookkeeping_granted: AtomicU64::new(0),
-            }));
+            let boxed = Box::into_raw(Box::new(EnvHeapCharge::new(
+                Arc::clone(&self.budget),
+                env as usize,
+                Arc::clone(&self.host_stopped),
+                u64::from(reservation.max_old),
+            )));
             // SAFETY: `env` is the isolate just created; `boxed` outlives the
             // bridge's hooks (freed only at this env's teardown, below).
             unsafe {
@@ -379,6 +384,30 @@ impl NapiEnv {
             },
         );
         Some((env_id, scope_id))
+    }
+
+    /// The heap budget tracker of a live budgeted env, or `None` for an env
+    /// under an unlimited budget (which has no heap limit to settle).
+    pub(crate) fn heap_tracker_for(&mut self, env: SnapiEnv) -> Option<&EnvHeapCharge> {
+        let key = env as usize;
+        let tracker = if self.heap_settle_cache.0 == key && key != 0 {
+            self.heap_settle_cache.1
+        } else {
+            let tracker = self
+                .napi_state_to_guest_env
+                .get(&key)
+                .and_then(|env_id| self.env_heap_charges.get(env_id))
+                .map_or(0, |handle| handle.tracker);
+            self.heap_settle_cache = (key, tracker);
+            tracker
+        };
+        if tracker == 0 {
+            return None;
+        }
+        // SAFETY: the box lives until `finish_unregister_napi_env` removes the
+        // handle (and clears this cache), which only happens while no JS runs
+        // on this env.
+        Some(unsafe { &*(tracker as *const EnvHeapCharge) })
     }
 
     /// Release a reservation whose env creation failed after [`reserve_isolate`].
@@ -592,6 +621,9 @@ impl NapiEnv {
             self.persistent_callback_contexts.remove(&env_id);
         }
         self.napi_state_to_guest_env.remove(&(env as usize));
+        if self.heap_settle_cache.0 == env as usize {
+            self.heap_settle_cache = (0, 0);
+        }
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]

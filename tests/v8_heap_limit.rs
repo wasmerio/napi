@@ -301,3 +301,141 @@ fn a_heap_bomb_does_not_disturb_a_benign_context() {
         "the benign context's budget saw the other tenant's emergency: {benign:?}"
     );
 }
+
+/// Runs `js` in a *second* env of `ctx` (a worker isolate: own heap limit and
+/// own emergency headroom, shared budget) while a first env stays idle, then
+/// probes both envs with `1+1`. Returns the worker's statuses and the main
+/// env's probe status.
+fn run_script_in_worker(ctx: &NapiCtx, js: &str) -> (Statuses, i32) {
+    assert!(!js.contains('\0'));
+    let wat = format!(
+        r#"(module
+      (import "napi" "unofficial_napi_create_env" (func $create (param i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 256) "1+1\00")
+      (data (i32.const 512) "{}\00")
+      (func $run_at (param $env i32) (param $source i32) (result i32)
+        (if (call $string (local.get $env) (local.get $source) (i32.const -1) (i32.const 20))
+          (then (return (i32.const -2))))
+        (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24)))
+      (func (export "run") (result i32)
+        ;; main env -> mem[4]; worker env -> mem[40]
+        (if (call $create (i32.const 0) (i32.const 4) (i32.const 12))
+          (then (return (i32.const -1))))
+        (if (call $create (i32.const 0) (i32.const 40) (i32.const 44))
+          (then (return (i32.const -3))))
+        (call $run_at (i32.load (i32.const 40)) (i32.const 512)))
+      (func (export "after") (result i32)
+        (call $run_at (i32.load (i32.const 40)) (i32.const 256)))
+      (func (export "after_main") (result i32)
+        (call $run_at (i32.load (i32.const 4)) (i32.const 256))))"#,
+        wat_string(js)
+    );
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let session = ctx.new_session(&module).unwrap();
+    let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    let call = |name: &str, store: &mut Store| {
+        instance
+            .exports
+            .get_typed_function::<(), i32>(store, name)
+            .unwrap()
+            .call(store)
+            .unwrap()
+    };
+    let script = call("run", &mut store);
+    let after = call("after", &mut store);
+    let after_main = call("after_main", &mut store);
+    let in_flight = ctx.budget().snapshot();
+    (
+        Statuses {
+            script,
+            after,
+            in_flight,
+        },
+        after_main,
+    )
+}
+
+/// Two isolates share one budget (a main env and a worker); the bomb runs in
+/// the worker. The worker's own near-heap-limit callback refuses, terminates
+/// the worker and exposes headroom; the process survives; the shared budget
+/// is released with the envs.
+#[test]
+fn a_heap_bomb_in_a_worker_isolate_terminates_only_that_tenant() {
+    let grants_before = heap_emergency_stats().grants;
+    // Room for two default isolates plus the guest heap.
+    let ctx = NapiCtx::builder().total_memory_bytes(256 * MIB).build();
+    let (worker, after_main) = run_script_in_worker(&ctx, "var a=new Array(30000000).fill(1.5);");
+    assert!(
+        worker.terminated(),
+        "the worker isolate should be terminated, got {worker:?}"
+    );
+    assert_eq!(worker.in_flight.live_isolates, 2, "{worker:?}");
+    assert!(worker.in_flight.v8_heap_emergency > 0, "{worker:?}");
+    assert!(heap_emergency_stats().grants > grants_before);
+    // The refusal is sticky for the whole context (the embedder kills the
+    // instance), so the main env either still answers or reports the stop;
+    // what it must not do is take the process with it.
+    assert!(
+        after_main == 0 || after_main == NAPI_PENDING_EXCEPTION,
+        "unexpected main env status {after_main}"
+    );
+    let released = ctx.budget().snapshot();
+    assert_eq!(released.v8_heap_emergency, 0, "{released:?}");
+    assert_eq!(released.live_isolates, 0, "{released:?}");
+}
+
+/// Node-wide worst case: several tenants hit emergency at the same time. Each
+/// is terminated with its own headroom; the process survives; a benign third
+/// tenant is undisturbed; every exposure is released.
+#[test]
+fn simultaneous_heap_bombs_each_terminate_and_a_benign_tenant_is_unaffected() {
+    let grants_before = heap_emergency_stats().grants;
+    let start = Arc::new(Barrier::new(3));
+    let bombs: Vec<_> = (0..2)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let ctx = NapiCtx::builder().total_memory_bytes(BUDGET).build();
+                start.wait();
+                let statuses = run_script(&ctx, "var a=new Array(30000000).fill(1.5);");
+                (statuses, ctx.budget().snapshot())
+            })
+        })
+        .collect();
+    let benign = {
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            let ctx = NapiCtx::builder().total_memory_bytes(BUDGET).build();
+            start.wait();
+            (0..20)
+                .map(|_| {
+                    run_script(
+                        &ctx,
+                        "var a=[];for(var i=0;i<1000;i++){a.push({i:i});}if(a.length!==1000)throw new Error('bad');",
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    for bomb in bombs {
+        let (statuses, released) = bomb.join().unwrap();
+        assert!(statuses.terminated(), "{statuses:?}");
+        assert!(statuses.in_flight.v8_heap_emergency > 0, "{statuses:?}");
+        assert_eq!(released.v8_heap_emergency, 0, "{released:?}");
+        assert_eq!(released.live_isolates, 0, "{released:?}");
+    }
+    assert!(heap_emergency_stats().grants >= grants_before + 2);
+    let benign = benign.join().unwrap();
+    assert!(
+        benign.iter().all(Statuses::completed),
+        "the benign tenant was disturbed: {benign:?}"
+    );
+}
