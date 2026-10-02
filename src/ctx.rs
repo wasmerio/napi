@@ -42,10 +42,69 @@ impl NapiLimits {
     }
 }
 
+/// Whether JavaScript in guest environments can use V8's `WebAssembly`.
+///
+/// Guest environments allocate V8 array buffers in the guest's linear memory,
+/// where they count against the context's memory budget. V8 does not allocate
+/// WebAssembly memories and compiled wasm code that way: they come from V8's
+/// page allocator, outside the guest heap and outside every budget this crate
+/// enforces. The default therefore removes `WebAssembly` from guest
+/// environments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WasmPolicy {
+    /// `WebAssembly` is absent from the root context and from every `vm`
+    /// context of a guest environment, and V8 refuses wasm code generation in
+    /// them. This is the default.
+    ///
+    /// The restriction applies to environments backed by a guest heap, which
+    /// is every environment a guest creates through this crate. (The
+    /// provider's native C API leaves environments without a guest heap
+    /// unrestricted, since their array buffers are not budgeted either.)
+    #[default]
+    Restricted,
+    /// Expose V8's `WebAssembly` in guest environments **without any resource
+    /// accounting**. Unsupported for untrusted code.
+    ///
+    /// With this policy, guest JavaScript can make V8:
+    ///
+    /// * reserve address space for wasm memories (by default 4 GiB for each
+    ///   32-bit memory without a declared maximum) and commit memory as they
+    ///   grow,
+    /// * compile and commit executable wasm code, including on V8
+    ///   background tasks (asynchronous compilation and tier-up),
+    /// * use compiler working memory that grows with the module size,
+    ///
+    /// and none of it is charged to [`NapiLimits::total_memory_bytes`], to a
+    /// [`NapiMemoryAccountant`], or to any other limit of the context. Only the
+    /// process-wide V8 flags bound it. Enabling V8's wasm compilers also adds
+    /// them to the attack surface reachable from guest code.
+    ///
+    /// `vm` contexts follow their own `codeGeneration.wasm` option, and
+    /// contexts not created by the provider (for example `ShadowRealm`
+    /// realms) still refuse wasm code generation.
+    ///
+    /// Intended for trusted workloads and for evaluation until wasm
+    /// allocations are accounted for.
+    EnabledUnmetered,
+}
+
+impl WasmPolicy {
+    /// Value passed to the native bridge; must match `NapiWebAssemblyPolicy`
+    /// in the provider's `restricted_context.h`.
+    pub(crate) const fn bridge_code(self) -> u32 {
+        match self {
+            Self::Restricted => 0,
+            Self::EnabledUnmetered => 1,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
+    webassembly: WasmPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +175,7 @@ impl NapiRuntimeControl {
 /// linking a module; no NapiCtx, V8 isolate, or background queue exists yet.
 struct NapiProviderBindings {
     limits: NapiLimits,
+    webassembly: WasmPolicy,
     active_sessions: Arc<AtomicUsize>,
     /// Guest-visible native env IDs span all worker sessions of this instance.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -198,6 +258,17 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Whether guest JavaScript can use V8's `WebAssembly` (default:
+    /// [`WasmPolicy::Restricted`]). Read [`WasmPolicy::EnabledUnmetered`] before
+    /// enabling it: wasm memory and code are not charged to any limit.
+    ///
+    /// Applies to every environment a guest creates after this context is
+    /// built, including those of WASIX worker threads.
+    pub fn webassembly(mut self, policy: WasmPolicy) -> Self {
+        self.webassembly = policy;
+        self
+    }
+
     /// Build lightweight import bindings for a managed embedder. The embedder
     /// owns lazy instance activation and must return its managed V8 task queue
     /// when a guest first creates an environment. Importing functions does not
@@ -233,6 +304,7 @@ impl NapiCtxBuilder {
         let host_stopped = Arc::new(AtomicBool::new(false));
         Arc::new(NapiProviderBindings {
             limits: self.limits,
+            webassembly: self.webassembly,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             next_native_env_id: Arc::new(AtomicU32::new(1)),
@@ -259,6 +331,11 @@ impl NapiCtx {
 
     pub fn limits(&self) -> &NapiLimits {
         &self.inner.limits
+    }
+
+    /// The WebAssembly policy for this context's guest environments.
+    pub fn webassembly_policy(&self) -> WasmPolicy {
+        self.inner.webassembly
     }
 
     pub fn active_sessions(&self) -> usize {
@@ -478,7 +555,7 @@ impl NapiSession {
     fn add_imports(&self, store: &mut StoreMut<'_>, import_object: &mut Imports) -> Result<()> {
         register_env_imports(store, import_object);
 
-        let napi_env = NapiEnv::new(
+        let mut napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
             Arc::clone(&self.inner.ctx.pending_messages),
             self.inner.ctx.limits.max_envs,
@@ -489,6 +566,7 @@ impl NapiSession {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             self.inner.ctx.managed_lane_activator.clone(),
         );
+        napi_env.webassembly = self.inner.ctx.webassembly;
         let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self
@@ -613,7 +691,7 @@ fn napi_wasmer_extension_version_from_namespace(
 
 #[cfg(test)]
 mod tests {
-    use super::NapiCtx;
+    use super::{NapiCtx, WasmPolicy};
     use crate::{NapiVersion, NapiWasmerExtensionVersion};
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     use std::{
@@ -663,6 +741,49 @@ mod tests {
                 .host_stopped
                 .load(std::sync::atomic::Ordering::Acquire)
         );
+    }
+
+    #[test]
+    fn webassembly_policy_defaults_to_restricted_and_reaches_store_envs() {
+        assert_eq!(WasmPolicy::default(), WasmPolicy::Restricted);
+        assert_eq!(
+            NapiCtx::default().webassembly_policy(),
+            WasmPolicy::Restricted
+        );
+        // Mirrors NapiWebAssemblyPolicy in restricted_context.h.
+        assert_eq!(WasmPolicy::Restricted.bridge_code(), 0);
+        assert_eq!(WasmPolicy::EnabledUnmetered.bridge_code(), 1);
+
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+            (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            (import "env" "memory" (memory 1 512))
+        )"#,
+        );
+        for policy in [WasmPolicy::Restricted, WasmPolicy::EnabledUnmetered] {
+            let hooks = NapiCtx::builder()
+                .webassembly(policy)
+                .build()
+                .runtime_hooks();
+            let (_imports, state) = hooks
+                .additional_imports(&module, &mut store.as_store_mut())
+                .unwrap();
+            let env_policy = state
+                .session
+                .as_ref()
+                .unwrap()
+                .inner
+                .func_env
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref(&store)
+                .webassembly;
+            assert_eq!(env_policy, policy);
+        }
     }
 
     #[test]

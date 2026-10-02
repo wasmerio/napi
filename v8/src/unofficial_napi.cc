@@ -1954,9 +1954,14 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(
+// Provider-private (never imported by guests): unofficial_napi_create_env
+// with an embedder-selected NapiWebAssemblyPolicy. The policy is a separate
+// argument rather than an env-create option because that descriptor is also
+// the guest's wire ABI.
+napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -1970,10 +1975,14 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // function owns it from here on and must release it exactly once.
   unofficial_napi_guest_heap guest_heap =
       options != nullptr ? options->guest_heap : nullptr;
-  if (env_out == nullptr || owner_out == nullptr) {
+  NapiWebAssemblyPolicy policy = NapiWebAssemblyPolicy::kRestrictGuestHeap;
+  if (env_out == nullptr || owner_out == nullptr ||
+      !NapiWebAssemblyPolicyFromRaw(webassembly_policy, &policy)) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
   }
+  const bool restrict_webassembly =
+      RestrictsUnmeteredWebAssembly(policy, guest_heap != nullptr);
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
@@ -2049,7 +2058,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   if (context.IsEmpty() ||
-      (guest_heap != nullptr && !RemoveUnmeteredWebAssembly(context))) {
+      (restrict_webassembly && !RemoveUnmeteredWebAssembly(context))) {
     delete scope;
     DisposeIsolateAndWait(platform, isolate);
     {
@@ -2059,7 +2068,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return napi_generic_failure;
   }
-  SetWasmCodeGenerationAllowed(context, guest_heap == nullptr);
+  SetWasmCodeGenerationAllowed(context, !restrict_webassembly);
   isolate->SetAllowWasmCodeGenerationCallback(AllowWasmCodeGeneration);
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
@@ -2074,11 +2083,23 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
-  scope->env->restrict_unmetered_webassembly = guest_heap != nullptr;
+  // Contexts created later through contextify inherit the restriction.
+  scope->env->restrict_unmetered_webassembly = restrict_webassembly;
 
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out) {
+  return snapi_private_create_env(
+      module_api_version, options,
+      static_cast<uint32_t>(NapiWebAssemblyPolicy::kRestrictGuestHeap),
+      env_out, owner_out);
 }
 
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,

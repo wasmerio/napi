@@ -27,6 +27,7 @@
 #include "edge_v8_platform.h"
 #include "internal/napi_external_transfer_observer.h"
 #include "internal/napi_v8_env.h"
+#include "internal/restricted_context.h"
 #include "node_api.h"
 #include "unofficial_napi.h"
 
@@ -36,6 +37,13 @@ extern "C" size_t unofficial_napi_message_retained_bytes(
 extern "C" napi_status unofficial_napi_contextify_compile_cjs_legacy(
     napi_env env, napi_value code, napi_value filename, bool is_sea_main,
     bool should_detect_module, napi_value *result_out);
+// Private V8 provider entry: unofficial_napi_create_env with an embedder
+// WebAssembly policy (see NapiWebAssemblyPolicy). Never imported by guests.
+extern "C" napi_status NAPI_CDECL snapi_private_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options *options,
+    uint32_t webassembly_policy, napi_env *env_out,
+    unofficial_napi_env_owner *owner_out);
 extern "C" napi_status NAPI_CDECL snapi_private_validate_script(
     napi_env env, napi_value source_text, napi_value filename,
     int32_t line_offset, int32_t column_offset,
@@ -3916,8 +3924,15 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState *env_state,
   return napi_ok;
 }
 
+// The Rust side encodes `WasmPolicy` with these values (ctx.rs).
+static_assert(static_cast<uint32_t>(
+                  NapiWebAssemblyPolicy::kRestrictGuestHeap) == 0);
+static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered) ==
+              1);
+
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                    const void *guest_heap_ctx,
+                                                   uint32_t webassembly_policy,
                                                    SnapiEnvState **env_out) {
   // V8's isolate initialization touches process-wide state. Serialize only
   // construction, never execution or GC of an existing environment.
@@ -3931,9 +3946,11 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
     options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
     options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
         const_cast<void *>(guest_heap_ctx));
-    s = unofficial_napi_create_env(module_api_version, &options, &env, &owner);
+    s = snapi_private_create_env(module_api_version, &options,
+                                 webassembly_policy, &env, &owner);
   } else {
-    s = unofficial_napi_create_env(module_api_version, nullptr, &env, &owner);
+    s = snapi_private_create_env(module_api_version, nullptr,
+                                 webassembly_policy, &env, &owner);
   }
   if (s != napi_ok)
     return s;
@@ -3974,7 +3991,8 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint64_t constrained_memory, uint32_t max_young_generation_size_in_bytes,
     uint32_t max_old_generation_size_in_bytes,
     uint32_t code_range_size_in_bytes, uint32_t /*stack_limit*/,
-    const void *guest_heap_ctx, SnapiEnvState **env_out) {
+    const void *guest_heap_ctx, uint32_t webassembly_policy,
+    SnapiEnvState **env_out) {
   std::lock_guard<std::recursive_mutex> init_lock(g_mu);
   unofficial_napi_env_create_options options{};
   const bool has_options = max_young_generation_size_in_bytes > 0 ||
@@ -3996,8 +4014,9 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
       const_cast<void *>(guest_heap_ctx));
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
-  napi_status s = unofficial_napi_create_env(
-      module_api_version, has_options ? &options : nullptr, &env, &owner);
+  napi_status s = snapi_private_create_env(
+      module_api_version, has_options ? &options : nullptr, webassembly_policy,
+      &env, &owner);
   if (s != napi_ok)
     return s;
 

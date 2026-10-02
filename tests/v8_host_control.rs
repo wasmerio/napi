@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wasmer_napi::NapiCtx;
+use wasmer_napi::{NapiCtx, WasmPolicy};
 
 mod common;
 use common::{build_wasix_test, run_guest};
@@ -199,6 +199,44 @@ fn asm_js_runs_as_plain_javascript() {
         stdout.contains("ASMJS_RUNS_AS_PLAIN_JS_OK"),
         "{stdout}\n{stderr}"
     );
+}
+
+#[test]
+fn explicitly_restricted_webassembly_policy_keeps_webassembly_unavailable() {
+    let wasm = build_wasix_test("test_js_wasm_disabled");
+    let ctx = NapiCtx::builder()
+        .webassembly(WasmPolicy::Restricted)
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    assert_eq!(ctx.webassembly_policy(), WasmPolicy::Restricted);
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
+}
+
+/// The embedder opt-in exposes V8 WebAssembly in the root and `vm` contexts;
+/// per-context code-generation settings still apply.
+#[test]
+fn unmetered_webassembly_policy_exposes_webassembly() {
+    let wasm = build_wasix_test("test_js_wasm_unmetered");
+    let ctx = NapiCtx::builder()
+        .webassembly(WasmPolicy::EnabledUnmetered)
+        .build();
+    assert_eq!(ctx.webassembly_policy(), WasmPolicy::EnabledUnmetered);
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("JS_WASM_UNMETERED_OK"),
+        "{stdout}\n{stderr}"
+    );
+
+    // The policy belongs to one context: the next default context is
+    // restricted again in the same process.
+    let wasm = build_wasix_test("test_js_wasm_disabled");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
 }
 
 #[test]
