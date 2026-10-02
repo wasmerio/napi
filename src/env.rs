@@ -261,6 +261,7 @@ impl NapiEnv {
             if self.host_stopped.load(Ordering::Acquire) {
                 anyhow::bail!("N-API instance stopped during activation");
             }
+            lane.attach_page_accountant(&self.budget);
             self.managed_lane = Some(lane);
         }
         Ok(self.managed_lane.as_ref().map(ManagedV8Lane::enter))

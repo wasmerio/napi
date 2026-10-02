@@ -4,6 +4,8 @@ use std::{cell::RefCell, ffi::c_void, ptr::NonNull, sync::Arc};
 
 use anyhow::{Result, bail};
 
+use crate::budget::{Pool, ResourceBudget};
+
 /// Called for each actual V8 background task. Dropping the returned guard
 /// ends that task's metered active interval.
 pub type BackgroundTaskScope = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
@@ -24,6 +26,13 @@ unsafe extern "C" {
     fn snapi_v8_lane_stop(handle: *mut c_void);
     fn snapi_v8_lane_delete(handle: *mut c_void);
     fn snapi_v8_lane_swap_current(handle: *mut c_void) -> *mut c_void;
+    fn snapi_v8_lane_set_page_accountant(
+        handle: *mut c_void,
+        context: *mut c_void,
+        charge: unsafe extern "C" fn(*mut c_void, u64) -> bool,
+        uncharge: unsafe extern "C" fn(*mut c_void, u64),
+        release: unsafe extern "C" fn(*mut c_void),
+    ) -> bool;
 }
 
 pub struct ManagedV8Lane {
@@ -88,6 +97,29 @@ impl ManagedV8Lane {
         unsafe { snapi_v8_lane_run(self.handle.as_ptr()) }
     }
 
+    /// Charge commits of page-backed V8 buffers (resizable `ArrayBuffer`s,
+    /// growable `SharedArrayBuffer`s) reserved while this lane is bound to
+    /// `budget`. The first budget attached to a lane is kept; every context
+    /// sharing a lane shares its application's budget.
+    pub(crate) fn attach_page_accountant(&self, budget: &Arc<ResourceBudget>) {
+        let context = Arc::into_raw(Arc::clone(budget))
+            .cast_mut()
+            .cast::<c_void>();
+        let attached = unsafe {
+            snapi_v8_lane_set_page_accountant(
+                self.handle.as_ptr(),
+                context,
+                charge_backing_pages,
+                uncharge_backing_pages,
+                release_page_accountant,
+            )
+        };
+        if !attached {
+            // SAFETY: the lane did not take ownership of the reference.
+            drop(unsafe { Arc::from_raw(context.cast::<ResourceBudget>()) });
+        }
+    }
+
     /// Bind this queue to the calling thread while V8 creates or enters an
     /// isolate. The guard restores the previous binding on drop.
     pub(crate) fn enter(self: &Arc<Self>) -> ManagedV8LaneScope {
@@ -120,6 +152,29 @@ impl Drop for ManagedV8Lane {
             snapi_v8_lane_delete(self.handle.as_ptr());
         }
     }
+}
+
+// The page-accountant context is an `Arc<ResourceBudget>` reference owned by
+// the native lane and its tracked regions; see `attach_page_accountant`.
+unsafe extern "C" fn charge_backing_pages(context: *mut c_void, bytes: u64) -> bool {
+    let budget = unsafe { &*context.cast::<ResourceBudget>() };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        budget.try_charge_soft(Pool::V8BackingPages, bytes).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+unsafe extern "C" fn uncharge_backing_pages(context: *mut c_void, bytes: u64) {
+    let budget = unsafe { &*context.cast::<ResourceBudget>() };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        budget.uncharge(Pool::V8BackingPages, bytes);
+    }));
+}
+
+unsafe extern "C" fn release_page_accountant(context: *mut c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(unsafe { Arc::from_raw(context.cast::<ResourceBudget>()) });
+    }));
 }
 
 unsafe extern "C" fn enter_task_scope(context: *mut c_void) -> *mut c_void {
@@ -236,6 +291,24 @@ mod tests {
     }
 
     unsafe extern "C" fn run_noop_task(_data: *mut c_void) {}
+
+    #[test]
+    fn page_accountant_charges_softly_and_releases_its_budget_reference() {
+        let budget = ResourceBudget::with_memory_limit(8 * 4096);
+        let lane = ManagedV8Lane::new(1, Arc::new(|| Box::new(())), Arc::new(|| {})).unwrap();
+        lane.attach_page_accountant(&budget);
+        // A second attach is refused and must not leak its reference.
+        lane.attach_page_accountant(&budget);
+        assert_eq!(Arc::strong_count(&budget), 2);
+        let context = Arc::as_ptr(&budget).cast_mut().cast();
+        assert!(unsafe { charge_backing_pages(context, 6 * 4096) });
+        assert!(!unsafe { charge_backing_pages(context, 4 * 4096) });
+        assert_eq!(budget.snapshot().v8_backing_pages, 6 * 4096);
+        unsafe { uncharge_backing_pages(context, 6 * 4096) };
+        assert_eq!(budget.snapshot().v8_backing_pages, 0);
+        drop(lane);
+        assert_eq!(Arc::strong_count(&budget), 1);
+    }
 
     #[test]
     fn zero_queue_capacity_is_rejected() {
