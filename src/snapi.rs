@@ -218,6 +218,13 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_attach_legacy_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_take_fatal_requested(env: SnapiEnv) -> i32;
+    /// After JavaScript ran on this thread: run a collection if the heap holds
+    /// memory beyond its limit that no collection has examined yet, so the
+    /// near-heap-limit callback sees it. Nonzero when a collection ran.
+    pub fn snapi_bridge_unofficial_settle_heap_overshoot(
+        env: SnapiEnv,
+        old_generation_limit: u64,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
