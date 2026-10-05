@@ -11,7 +11,23 @@ bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
-void NapiV8TrackProviderPromise(v8::Isolate* isolate,
+class NapiV8ProviderPromiseReservation {
+ public:
+  explicit NapiV8ProviderPromiseReservation(v8::Isolate* isolate);
+  ~NapiV8ProviderPromiseReservation();
+
+  NapiV8ProviderPromiseReservation(const NapiV8ProviderPromiseReservation&) = delete;
+  NapiV8ProviderPromiseReservation& operator=(const NapiV8ProviderPromiseReservation&) = delete;
+
+  bool acquired() const { return acquired_; }
+
+ private:
+  v8::Isolate* isolate_;
+  bool acquired_;
+  bool reserved_;
+};
+
+bool NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);
 

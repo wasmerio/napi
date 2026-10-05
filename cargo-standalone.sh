@@ -71,4 +71,5 @@ for entry in build.rs include lib src tests v8; do
   ln -s "$repo_root/$entry" "$standalone_work_dir/$entry"
 done
 
+export NAPI_SOURCE_ROOT="$repo_root"
 "${cargo_cmd[@]}" "$subcommand" --manifest-path "$standalone_work_dir/Cargo.toml" "$@"

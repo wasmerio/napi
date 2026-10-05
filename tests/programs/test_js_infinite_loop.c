@@ -13,7 +13,7 @@
 
 int main(void) {
   napi_env env = napi_wasm_init_env();
-  CHECK_OR_FAIL(env != nullptr, "napi_wasm_init_env returned NULL");
+  CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
 
   napi_value script;
   NAPI_CALL(env, napi_create_string_utf8(env, "while (true) {}",

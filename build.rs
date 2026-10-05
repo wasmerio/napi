@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -37,6 +37,12 @@ enum ExtraLink {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(napi_standalone_legacy_wait)");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    if standalone_legacy_wait() {
+        println!("cargo:rustc-cfg=napi_standalone_legacy_wait");
+    }
+
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "wasm32" {
         if env::var_os("CARGO_FEATURE_JS").is_none() {
@@ -85,6 +91,24 @@ fn main() {
 
     let v8_defines = read_env_value("V8_DEFINES", &["NAPI_V8_DEFINES", "NAPI_V8_V8_DEFINES"])
         .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
+    let sandbox_define = v8_defines
+        .split(&[';', ',', ' '][..])
+        .any(|define| matches!(define, "V8_ENABLE_SANDBOX" | "V8_ENABLE_SANDBOX=1"));
+    if sandbox_define {
+        panic!(
+            "V8_ENABLE_SANDBOX is unsupported: N-API backing stores can reside outside the V8 sandbox"
+        );
+    }
+    // The bridge exposes Wasmer linear memory and other embedder-owned
+    // allocations as V8 ArrayBuffer backing stores. V8's sandbox requires
+    // every such store to reside inside its sandbox address range. Until the
+    // bridge has a sandbox-resident backing-store implementation, accepting
+    // this archive would make ordinary guest code abort the host process.
+    if read_sandbox_build_flag(&v8.library_path) == Some(true) {
+        panic!(
+            "sandbox-enabled V8 archives are unsupported: N-API backing stores can reside outside the V8 sandbox"
+        );
+    }
 
     let mut build = cc::Build::new();
     build
@@ -222,6 +246,49 @@ fn main() {
         if target_os == "linux" && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
             println!("cargo:rustc-link-lib=dylib=atomic");
         }
+    }
+}
+
+fn standalone_legacy_wait() -> bool {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .expect("failed to read N-API Cargo.toml");
+    let mut in_napi_metadata = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_napi_metadata = line == "[package.metadata.napi]";
+        } else if in_napi_metadata {
+            let declaration = line.split('#').next().unwrap_or("").trim();
+            if let Some((key, value)) = declaration.split_once('=')
+                && key.trim() == "standalone_legacy_wait"
+            {
+                return value.trim() == "true";
+            }
+        }
+    }
+    false
+}
+
+fn read_sandbox_build_flag(library_path: &Path) -> Option<bool> {
+    let config_path = library_path.parent()?.parent()?.join("build-config.txt");
+    println!("cargo:rerun-if-changed={}", config_path.display());
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => panic!("failed to read {}: {err}", config_path.display()),
+    };
+    match config
+        .lines()
+        .find_map(|line| line.strip_prefix("v8_enable_sandbox="))
+    {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => panic!(
+            "{} lacks a valid v8_enable_sandbox flag",
+            config_path.display()
+        ),
     }
 }
 

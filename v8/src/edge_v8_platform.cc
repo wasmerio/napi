@@ -1,12 +1,15 @@
 #include "edge_v8_platform.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -14,6 +17,139 @@
 #include <v8.h>
 
 namespace {
+
+// A lane belongs to one N-API context. Only its dedicated embedder-owned
+// thread executes V8 background work. The bounded queue prevents a guest
+// from accumulating unbounded host-side Task objects while the lane is busy.
+class BackgroundLane {
+ public:
+  BackgroundLane(size_t max_queued_tasks,
+                 void* scope_context, void* (*enter_scope)(void*),
+                 bool (*leave_scope)(void*, void*),
+                 void (*on_overload)(void*))
+      : max_queued_tasks_(max_queued_tasks), scope_context_(scope_context), enter_scope_(enter_scope),
+        leave_scope_(leave_scope), on_overload_(on_overload) {}
+
+  bool Post(std::unique_ptr<v8::Task> task, double delay_seconds) {
+    if (!task) return true;
+    using Clock = std::chrono::steady_clock;
+    const double bounded_delay = std::isfinite(delay_seconds)
+        ? std::clamp(delay_seconds, 0.0, 86400.0) : 0.0;
+    const auto delay = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(bounded_delay));
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopped_) return false;
+      if (queue_.size() < max_queued_tasks_) {
+        Item item{Clock::now() + delay, std::move(task)};
+        auto it = queue_.begin();
+        while (it != queue_.end() && it->due <= item.due) ++it;
+        queue_.insert(it, std::move(item));
+        cv_.notify_one();
+        return true;
+      }
+      // Stop admission before signaling the embedder. It may need to acquire
+      // other V8 locks to terminate the isolates, so never call it under ours.
+      overloaded_ = true;
+      stopped_ = true;
+      cv_.notify_all();
+    }
+    if (on_overload_ != nullptr) on_overload_(scope_context_);
+    return false;
+  }
+
+  void Run() {
+    v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (running_) return;
+    running_ = true;
+    cv_.notify_all();
+    while (!stopped_) {
+      if (queue_.empty()) {
+        cv_.wait(lock, [&] { return stopped_ || !queue_.empty(); });
+        continue;
+      }
+      auto due = queue_.front().due;
+      if (std::chrono::steady_clock::now() < due) {
+        cv_.wait_until(lock, due);
+        continue;
+      }
+      auto task = std::move(queue_.front().task);
+      queue_.pop_front();
+      lock.unlock();
+      void* scope = enter_scope_ != nullptr ? enter_scope_(scope_context_) : nullptr;
+      if (enter_scope_ != nullptr && scope == nullptr) {
+        SignalOverload();
+        lock.lock();
+        break;
+      }
+      // The lane can be created before V8 allocates its Linux JIT pkey. New
+      // pkeys default to access-disabled on an already-running thread.
+      v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+      task->Run();
+      if (leave_scope_ != nullptr && !leave_scope_(scope_context_, scope)) {
+        SignalOverload();
+        lock.lock();
+        break;
+      }
+      lock.lock();
+    }
+    queue_.clear();
+    running_ = false;
+  }
+
+  void Stop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopped_ = true;
+    cv_.notify_all();
+  }
+
+  bool IsRunning() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return running_;
+  }
+
+  bool IsOverloaded() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return overloaded_;
+  }
+
+  void SignalOverload() {
+    bool notify = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!overloaded_) {
+        overloaded_ = true;
+        notify = true;
+      }
+      stopped_ = true;
+      cv_.notify_all();
+    }
+    if (notify && on_overload_ != nullptr) on_overload_(scope_context_);
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  struct Item {
+    Clock::time_point due;
+    std::unique_ptr<v8::Task> task;
+  };
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<Item> queue_;
+  bool running_ = false;
+  bool stopped_ = false;
+  bool overloaded_ = false;
+  size_t max_queued_tasks_ = 0;
+  void* scope_context_ = nullptr;
+  void* (*enter_scope_)(void*) = nullptr;
+  bool (*leave_scope_)(void*, void*) = nullptr;
+  void (*on_overload_)(void*) = nullptr;
+};
+
+thread_local BackgroundLane* current_background_lane = nullptr;
+std::atomic<uint64_t> fallback_worker_posts{0};
+std::atomic<uint64_t> unattributed_worker_posts{0};
 
 struct WorkerWarmupState {
   std::mutex mutex;
@@ -78,6 +214,78 @@ void CleanupForegroundTaskRecord(napi_env /*env*/, void* data);
 
 }  // namespace
 
+extern "C" void* snapi_v8_lane_new(size_t max_queued_tasks,
+                                     void* scope_context,
+                                     void* (*enter_scope)(void*),
+                                     bool (*leave_scope)(void*, void*),
+                                     void (*on_overload)(void*)) {
+  if (max_queued_tasks == 0) return nullptr;
+  return new (std::nothrow)
+      BackgroundLane(max_queued_tasks, scope_context, enter_scope, leave_scope, on_overload);
+}
+
+extern "C" void snapi_v8_lane_run(void* handle) {
+  if (handle == nullptr) return;
+  auto* lane = static_cast<BackgroundLane*>(handle);
+  auto* previous = current_background_lane;
+  current_background_lane = lane;
+  lane->Run();
+  current_background_lane = previous;
+}
+
+extern "C" void snapi_v8_lane_stop(void* handle) {
+  if (handle != nullptr) static_cast<BackgroundLane*>(handle)->Stop();
+}
+
+extern "C" void snapi_v8_lane_delete(void* handle) {
+  delete static_cast<BackgroundLane*>(handle);
+}
+
+extern "C" void* snapi_v8_lane_swap_current(void* handle) {
+  auto* previous = current_background_lane;
+  current_background_lane = static_cast<BackgroundLane*>(handle);
+  return previous;
+}
+
+extern "C" void* snapi_v8_lane_current() {
+  return current_background_lane;
+}
+
+extern "C" bool snapi_v8_lane_is_running(void* handle) {
+  return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsRunning();
+}
+
+extern "C" bool snapi_v8_lane_overloaded(void* handle) {
+  return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsOverloaded();
+}
+
+extern "C" uint64_t snapi_v8_fallback_worker_posts() {
+  return fallback_worker_posts.load(std::memory_order_acquire);
+}
+
+extern "C" uint64_t snapi_v8_unattributed_worker_posts() {
+  return unattributed_worker_posts.load(std::memory_order_acquire);
+}
+
+// Native-only regression hook. It is not reachable through guest imports.
+// Exercising the actual V8 Task queue catches accidental process-wide pool
+// routing that a Rust-only state-machine test cannot detect.
+extern "C" bool snapi_v8_lane_post_test_task(void* handle,
+                                               void (*callback)(void*), void* data) {
+  if (handle == nullptr || callback == nullptr) return false;
+  class CallbackTask final : public v8::Task {
+   public:
+    CallbackTask(void (*callback)(void*), void* data)
+        : callback_(callback), data_(data) {}
+    void Run() override { callback_(data_); }
+   private:
+    void (*callback_)(void*);
+    void* data_;
+  };
+  return static_cast<BackgroundLane*>(handle)->Post(
+      std::make_unique<CallbackTask>(callback, data), 0.0);
+}
+
 struct EdgeV8Platform::FinishedCallback {
   void (*callback)(void*) = nullptr;
   void* data = nullptr;
@@ -86,14 +294,17 @@ struct EdgeV8Platform::FinishedCallback {
 struct EdgeV8Platform::IsolateState {
   IsolateState(EdgeV8Platform* platform_in,
                v8::Isolate* isolate_in,
-               std::shared_ptr<ForegroundTaskRunner> runner_in)
+               std::shared_ptr<ForegroundTaskRunner> runner_in,
+               bool standalone_workers_in)
       : platform(platform_in),
         isolate(isolate_in),
-        runner(std::move(runner_in)) {}
+        runner(std::move(runner_in)),
+        standalone_workers(standalone_workers_in) {}
 
   EdgeV8Platform* platform = nullptr;
   v8::Isolate* isolate = nullptr;
   std::shared_ptr<ForegroundTaskRunner> runner;
+  bool standalone_workers = false;
   std::mutex mutex;
   size_t pending_foreground_tasks = 0;
   bool shutdown_started = false;
@@ -220,23 +431,27 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
     if (enqueue != nullptr && target != nullptr) {
       ForegroundTaskRecord* record = new (std::nothrow) ForegroundTaskRecord();
       if (record != nullptr) {
-        record->isolate_state.reset();
+        // The embedder may run and clean up the task before enqueue returns.
+        // Publish all record state and charge pending work first.
+        if (isolate_state != nullptr && isolate_state->platform != nullptr) {
+          isolate_state->platform->AddPendingForegroundTask(isolate_state);
+          record->isolate_state = isolate_state;
+        }
         record->task = std::move(task);
         if (enqueue(target,
                     RunForegroundTaskRecord,
                     record,
                     CleanupForegroundTaskRecord,
                     delay_ms) == napi_ok) {
-          if (isolate_state != nullptr &&
-              isolate_state->platform != nullptr) {
-            isolate_state->platform->AddPendingForegroundTask(isolate_state);
-            record->isolate_state = isolate_state;
-          }
           return;
         }
         task = std::move(record->task);
-        record->isolate_state.reset();
+        std::shared_ptr<IsolateState> pending_state =
+            std::move(record->isolate_state);
         delete record;
+        if (pending_state != nullptr && pending_state->platform != nullptr) {
+          pending_state->platform->CompletePendingForegroundTask(pending_state);
+        }
       }
     }
 
@@ -301,7 +516,16 @@ namespace {
 // when the platform is built.
 std::atomic<int> g_worker_thread_count{0};
 std::atomic<bool> g_platform_created{false};
+std::atomic<bool> g_standalone_pool_created{false};
 }  // namespace
+
+extern "C" bool snapi_v8_platform_created() {
+  return g_platform_created.load(std::memory_order_acquire);
+}
+
+extern "C" bool snapi_v8_standalone_pool_created() {
+  return g_standalone_pool_created.load(std::memory_order_acquire);
+}
 
 bool EdgeV8Platform::SetWorkerThreadCount(int count) {
   const int requested = count < 0 ? 0 : count;
@@ -315,19 +539,44 @@ bool EdgeV8Platform::SetWorkerThreadCount(int count) {
   return true;
 }
 
-std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create() {
+std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create(bool standalone_workers) {
   g_platform_created.store(true, std::memory_order_release);
-  std::unique_ptr<v8::Platform> fallback = v8::platform::NewDefaultPlatform(
-      g_worker_thread_count.load(std::memory_order_acquire));
+  // This delegate supplies foreground runners, clocks, and allocators. V8
+  // sees EdgeV8Platform (not this delegate), which implements every worker/job
+  // entry point. The delegate's documented --single-threaded requirement is
+  // for passing it directly to V8; here the outer platform supplies workers.
+  // Its own pool must stay absent in a managed Edge process: those tasks
+  // belong to the instance lane and its CPU/memory accounting.
+  std::unique_ptr<v8::Platform> fallback =
+      v8::platform::NewSingleThreadedDefaultPlatform();
   if (!fallback) return nullptr;
-  WarmUpFallbackWorkerThreads(fallback.get());
-  return std::unique_ptr<EdgeV8Platform>(new EdgeV8Platform(std::move(fallback)));
+  auto platform = std::unique_ptr<EdgeV8Platform>(new EdgeV8Platform(std::move(fallback)));
+  if (standalone_workers && !platform->EnableStandaloneWorkers()) return nullptr;
+  return platform;
 }
 
 EdgeV8Platform::EdgeV8Platform(std::unique_ptr<v8::Platform> fallback)
     : fallback_(std::move(fallback)) {}
 
 EdgeV8Platform::~EdgeV8Platform() = default;
+
+bool EdgeV8Platform::EnableStandaloneWorkers() {
+  std::lock_guard<std::mutex> lock(standalone_workers_mutex_);
+  if (standalone_workers_) return true;
+  auto workers = v8::platform::NewDefaultPlatform(
+      g_worker_thread_count.load(std::memory_order_acquire));
+  if (!workers) return false;
+  WarmUpFallbackWorkerThreads(workers.get());
+  standalone_workers_ = std::move(workers);
+  standalone_workers_ptr_.store(standalone_workers_.get(),
+                                std::memory_order_release);
+  g_standalone_pool_created.store(true, std::memory_order_release);
+  return true;
+}
+
+v8::Platform* EdgeV8Platform::StandaloneWorkers() {
+  return standalone_workers_ptr_.load(std::memory_order_acquire);
+}
 
 std::shared_ptr<EdgeV8Platform::IsolateState> EdgeV8Platform::GetState(v8::Isolate* isolate) {
   if (isolate == nullptr) return nullptr;
@@ -346,7 +595,14 @@ std::shared_ptr<EdgeV8Platform::IsolateState> EdgeV8Platform::EnsureState(v8::Is
     // exists for every isolate it tears down.
     (void)fallback_->GetForegroundTaskRunner(isolate);
   }
-  auto state = std::make_shared<IsolateState>(this, isolate, nullptr);
+  const bool standalone_workers = current_background_lane == nullptr &&
+                                  StandaloneWorkers() != nullptr;
+  if (standalone_workers) {
+    // libplatform's shutdown helper expects an isolate runner to exist.
+    (void)StandaloneWorkers()->GetForegroundTaskRunner(isolate);
+  }
+  auto state = std::make_shared<IsolateState>(this, isolate, nullptr,
+                                              standalone_workers);
   state->runner = std::make_shared<ForegroundTaskRunner>(state, isolate, fallback_.get());
   isolates_.emplace(isolate, state);
   return state;
@@ -458,10 +714,15 @@ void EdgeV8Platform::NotifyIsolateShutdown(v8::Isolate* isolate) {
   if (runner) {
     runner->NotifyIsolateShutdown();
   }
-  // The fallback platform owns all background V8 work for these isolates,
-  // even when foreground tasks stayed on the Edge-specific runner.
+  // The foreground delegate owns the fallback runner used before guest
+  // callbacks are bound. A standalone isolate also needs its worker pool's
+  // shutdown notification; managed background tasks belong to its lane.
   if (fallback_ != nullptr) {
     v8::platform::NotifyIsolateShutdown(fallback_.get(), isolate);
+  }
+  if (state != nullptr && state->standalone_workers) {
+    auto* workers = StandaloneWorkers();
+    v8::platform::NotifyIsolateShutdown(workers, isolate);
   }
   BeginShutdown(state);
   MaybeFinishIsolate(state, false);
@@ -525,7 +786,9 @@ void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
 }
 
 int EdgeV8Platform::NumberOfWorkerThreads() {
-  return fallback_ != nullptr ? fallback_->NumberOfWorkerThreads() : 0;
+  if (current_background_lane != nullptr) return 1;
+  auto* workers = StandaloneWorkers();
+  return workers != nullptr ? workers->NumberOfWorkerThreads() : 0;
 }
 
 std::shared_ptr<v8::TaskRunner> EdgeV8Platform::GetForegroundTaskRunner(
@@ -598,8 +861,17 @@ std::unique_ptr<v8::JobHandle> EdgeV8Platform::CreateJobImpl(
 void EdgeV8Platform::PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,
                                                std::unique_ptr<v8::Task> task,
                                                const v8::SourceLocation& location) {
-  if (fallback_ != nullptr) {
-    fallback_->PostTaskOnWorkerThread(priority, std::move(task), location);
+  if (current_background_lane != nullptr) {
+    current_background_lane->Post(std::move(task), 0.0);
+    return;
+  }
+  if (auto* workers = StandaloneWorkers()) {
+    fallback_worker_posts.fetch_add(1, std::memory_order_relaxed);
+    workers->PostTaskOnWorkerThread(priority, std::move(task), location);
+  } else {
+    // A managed worker task without a bound lane has no safe tenant to bill.
+    // Discard it rather than starting an unmetered global worker.
+    unattributed_worker_posts.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -608,7 +880,14 @@ void EdgeV8Platform::PostDelayedTaskOnWorkerThreadImpl(
     std::unique_ptr<v8::Task> task,
     double delay_in_seconds,
     const v8::SourceLocation& location) {
-  if (fallback_ != nullptr) {
-    fallback_->PostDelayedTaskOnWorkerThread(priority, std::move(task), delay_in_seconds, location);
+  if (current_background_lane != nullptr) {
+    current_background_lane->Post(std::move(task), delay_in_seconds);
+    return;
+  }
+  if (auto* workers = StandaloneWorkers()) {
+    fallback_worker_posts.fetch_add(1, std::memory_order_relaxed);
+    workers->PostDelayedTaskOnWorkerThread(priority, std::move(task), delay_in_seconds, location);
+  } else {
+    unattributed_worker_posts.fetch_add(1, std::memory_order_relaxed);
   }
 }
