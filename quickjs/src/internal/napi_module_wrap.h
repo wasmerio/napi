@@ -104,6 +104,7 @@ private:
   record *find_by_wrapper(JSValueConst wrapper) const;
   void remove(record *entry);
   void free_record(record *entry);
+  napi_status validate_linked_graph(record *root);
 
   JSValue get_host_defined_option_symbol() const;
   JSValue get_symbols_binding_property(const char *name) const;

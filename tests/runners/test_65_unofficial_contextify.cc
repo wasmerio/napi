@@ -20,7 +20,37 @@ napi_value Sym(napi_env env, const char* value) {
   return out;
 }
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+unofficial_napi_module CreateSourceModule(napi_env env, const char* url, const char* text) {
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  if (napi_create_object(env, &wrapper) != napi_ok ||
+      napi_get_undefined(env, &undefined) != napi_ok) {
+    return nullptr;
+  }
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(env, text));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(env, url);
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  if (unofficial_napi_module_wrap_create(env, &options, &created) != napi_ok) {
+    return nullptr;
+  }
+  return created.module;
+}
+#endif
+
 #if defined(NAPI_TEST_ENGINE_V8)
+extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynamically(
+    napi_env env, size_t argc, napi_value* argv, napi_value* result_out);
+
 constexpr char kPreparedStack[] =
     "Error: sentinel\n"
     "    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)\n"
@@ -105,6 +135,85 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
   EXPECT_EQ(answer, 42);
 
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, MakeContextBoundsNativeOwnPropertySnapshot) {
+  EnvScope s(runtime_.get());
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "(() => { const object = {}; for (let i = 0; i < 16385; ++i) "
+                    "object['k' + i] = i; return object; })()"),
+                &sandbox),
+            napi_ok);
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_make_context(
+                s.env, sandbox, Str(s.env, "many-properties"), undefined,
+                true, true, false, undefined, &result),
+            napi_generic_failure);
+  EXPECT_EQ(result, nullptr);
+}
+
+TEST_F(Test65UnofficialContextify, NativeEnvironmentsRetainWebAssemblyInAllContexts) {
+  EnvScope s(runtime_.get());
+  constexpr char kCompileEmptyModule[] =
+      "new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))";
+  napi_value source = Str(s.env, "typeof WebAssembly");
+  ASSERT_NE(source, nullptr);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, source, &result), napi_ok);
+  char type[16] = {};
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "object");
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, kCompileEmptyModule), &result), napi_ok);
+  napi_valuetype value_type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, result, &value_type), napi_ok);
+  EXPECT_EQ(value_type, napi_object);
+
+  napi_value sandbox = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value context = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_make_context(
+                s.env, sandbox, undefined, undefined, true, true, true,
+                undefined, &context), napi_ok);
+  const unofficial_napi_js_source context_source =
+      unofficial_napi_js_source_from_text(source);
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &context_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "object");
+  const unofficial_napi_js_source compile_source =
+      unofficial_napi_js_source_from_text(Str(s.env, kCompileEmptyModule));
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &compile_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_typeof(s.env, result, &value_type), napi_ok);
+  EXPECT_EQ(value_type, napi_object);
+
+  napi_value disabled_sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &disabled_sandbox), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_make_context(
+                s.env, disabled_sandbox, undefined, undefined, true, false,
+                true, undefined, &context), napi_ok);
+  const unofficial_napi_js_source denied_source =
+      unofficial_napi_js_source_from_text(Str(
+          s.env,
+          "try { new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])); "
+          "'allowed' } catch (error) { error.name }"));
+  ASSERT_EQ(unofficial_napi_contextify_run_script(
+                s.env, context, &denied_source, undefined, 0, 0, -1,
+                true, false, false, undefined, &result), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, type, sizeof(type), nullptr), napi_ok);
+  EXPECT_STREQ(type, "CompileError");
+}
+#endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test65UnofficialContextify, MakeContextPreservesThrownProxyException) {
@@ -422,6 +531,9 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   ASSERT_EQ(napi_typeof(s.env, error, &error_type), napi_ok);
   EXPECT_EQ(error_type, napi_undefined);
 
+  // Reject before allocating or copying the caller's oversized link list.
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, module, 4097, nullptr),
+            napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
   ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
   status = -1;
@@ -434,6 +546,350 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
 
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
+
+TEST_F(Test65UnofficialContextify, DestroyedDependencyInvalidatesIncomingLinks) {
+  EnvScope s(runtime_.get());
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+
+  auto create_module = [&](const char* url, const char* text) {
+    napi_value wrapper = nullptr;
+    EXPECT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_text(Str(s.env, text));
+    unofficial_napi_module_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+    options.kind = unofficial_napi_module_source_text;
+    options.wrapper = wrapper;
+    options.url = Str(s.env, url);
+    options.context_or_undefined = undefined;
+    options.payload.source_text.source = &source;
+    options.payload.source_text.host_defined_option_id = undefined;
+    unofficial_napi_module_create_result created{};
+    EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+    return created.module;
+  };
+
+  unofficial_napi_module dependency =
+      create_module("dep.mjs", "export const dep = 2;");
+  unofficial_napi_module parent =
+      create_module("parent.mjs", "import './dep.mjs'; export const value = 1;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, parent, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, parent),
+            napi_pending_exception);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  EXPECT_NE(exception, nullptr);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, parent), napi_ok);
+}
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test65UnofficialContextify, TransitiveDestroyedDependencyBlocksImplicitLinking) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency =
+      CreateSourceModule(s.env, "dep.mjs", "export const dep = 2;");
+  unofficial_napi_module middle =
+      CreateSourceModule(s.env, "middle.mjs", "import './dep.mjs'; export const middle = 3;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import './middle.mjs'; export const root = 4;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(middle, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, middle, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &middle), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+
+  auto assert_pending = [&](napi_status status) {
+    EXPECT_EQ(status, napi_pending_exception);
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+    EXPECT_NE(exception, nullptr);
+  };
+  assert_pending(unofficial_napi_module_wrap_instantiate(s.env, root));
+  napi_value result = nullptr;
+  assert_pending(unofficial_napi_module_wrap_evaluate(s.env, root, -1, false, &result));
+  assert_pending(unofficial_napi_module_wrap_evaluate_sync(
+      s.env, root, Str(s.env, "root.mjs"), Str(s.env, "parent.mjs"), &result));
+  assert_pending(unofficial_napi_module_wrap_create_required_module_facade(s.env, root, &result));
+
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, middle), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, LinkedGraphSurvivesDestroyedDependencyWrapper) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency =
+      CreateSourceModule(s.env, "dep.mjs", "export const dep = 2;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import { dep } from './dep.mjs'; export const root = dep + 2;");
+  unofficial_napi_module outer =
+      CreateSourceModule(s.env, "outer.mjs", "import { root } from './root.mjs'; export const outer = root + 1;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_NE(outer, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, outer, 1, &root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, outer), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(
+                s.env, outer, Str(s.env, "outer.mjs"), Str(s.env, "parent.mjs"), &result),
+            napi_ok);
+  EXPECT_NE(result, nullptr);
+  napi_value namespace_value = nullptr;
+  napi_value exported_value = nullptr;
+  int32_t exported = 0;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, outer, &namespace_value), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, namespace_value, "outer", &exported_value), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, exported_value, &exported), napi_ok);
+  EXPECT_EQ(exported, 5);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, outer), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, CyclicGraphLinksWithoutRecursion) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module a =
+      CreateSourceModule(s.env, "a.mjs", "import './b.mjs'; export const a = 1;");
+  unofficial_napi_module b =
+      CreateSourceModule(s.env, "b.mjs", "import './a.mjs'; export const b = 2;");
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, a, 1, &b), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, b, 1, &a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, a), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, b), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, InvalidatedParentCanRelinkReplacement) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module old_dependency =
+      CreateSourceModule(s.env, "old.mjs", "export const dep = 1;");
+  unofficial_napi_module root =
+      CreateSourceModule(s.env, "root.mjs", "import { dep } from './dep.mjs'; export const root = dep + 2;");
+  ASSERT_NE(old_dependency, nullptr);
+  ASSERT_NE(root, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, old_dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &old_dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, old_dependency), napi_ok);
+
+  unofficial_napi_module replacement =
+      CreateSourceModule(s.env, "new.mjs", "export const dep = 2;");
+  ASSERT_NE(replacement, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, replacement, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 1, &replacement), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, root), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(
+                s.env, root, Str(s.env, "root.mjs"), Str(s.env, "parent.mjs"), &result),
+            napi_ok);
+  napi_value namespace_value = nullptr;
+  napi_value exported_value = nullptr;
+  int32_t exported = 0;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, root, &namespace_value), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, namespace_value, "root", &exported_value), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, exported_value, &exported), napi_ok);
+  EXPECT_EQ(exported, 4);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, replacement), napi_ok);
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, PrivateDynamicImportShortCallsKeepResultsAlive) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.internalBinding = name => name === 'symbols' ? "
+                    "{vm_dynamic_import_default_internal: Symbol.for('default-import-id')} : {};"
+                    "globalThis.shortImportArgs = [];"
+                    "(...args) => { shortImportArgs.push(args); return {marker: 42}; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  napi_value argv[2] = {Str(s.env, "node:test"), Str(s.env, "parent.js")};
+  ASSERT_NE(argv[0], nullptr);
+  ASSERT_NE(argv[1], nullptr);
+  for (size_t argc : {1u, 2u}) {
+    napi_value result = nullptr;
+    ASSERT_EQ(snapi_private_module_wrap_import_module_dynamically(
+                  s.env, argc, argv, &result), napi_ok);
+    ASSERT_NE(result, nullptr);
+    for (size_t i = 0; i < 2048; ++i) {
+      napi_value churn = nullptr;
+      ASSERT_EQ(napi_create_object(s.env, &churn), napi_ok);
+    }
+    napi_value marker = nullptr;
+    int32_t value = 0;
+    ASSERT_EQ(napi_get_named_property(s.env, result, "marker", &marker), napi_ok);
+    ASSERT_EQ(napi_get_value_int32(s.env, marker, &value), napi_ok);
+    EXPECT_EQ(value, 42);
+  }
+
+  napi_value args = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "shortImportArgs"), &args), napi_ok);
+  napi_value first = nullptr;
+  napi_value second = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, args, 0, &first), napi_ok);
+  ASSERT_EQ(napi_get_element(s.env, args, 1, &second), napi_ok);
+  napi_value first_referrer = nullptr;
+  napi_value second_referrer = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, first, 4, &first_referrer), napi_ok);
+  ASSERT_EQ(napi_get_element(s.env, second, 4, &second_referrer), napi_ok);
+  napi_valuetype type = napi_object;
+  ASSERT_EQ(napi_typeof(s.env, first_referrer, &type), napi_ok);
+  EXPECT_EQ(type, napi_undefined);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, second_referrer, argv[1], &same), napi_ok);
+  EXPECT_TRUE(same);
+}
+
+TEST_F(Test65UnofficialContextify, PrivateDynamicImportRejectsMissingRequiredSymbol) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.internalBinding = () => ({});"
+                    "globalThis.shortImportCalls = 0;"
+                    "() => { ++shortImportCalls; return {}; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+  napi_value specifier = Str(s.env, "node:test");
+  napi_value result = reinterpret_cast<napi_value>(1);
+  EXPECT_EQ(snapi_private_module_wrap_import_module_dynamically(
+                s.env, 1, &specifier, &result), napi_generic_failure);
+  EXPECT_EQ(result, nullptr);
+  napi_value calls = nullptr;
+  int32_t count = -1;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "shortImportCalls"), &calls), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, calls, &count), napi_ok);
+  EXPECT_EQ(count, 0);
+}
+
+TEST_F(Test65UnofficialContextify, CompileFunctionBoundsNativeFilenameScratch) {
+  EnvScope s(runtime_.get());
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "return 1;"));
+  std::string large_filename(1024 * 1024 + 1, 'a');
+  napi_value filename = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, large_filename.data(),
+                                    large_filename.size(), &filename), napi_ok);
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_contextify_compile_function(
+                s.env, &source, filename, 0, 0, undefined, undefined,
+                undefined, undefined, &result), napi_invalid_arg);
+  EXPECT_EQ(result, nullptr);
+}
+
+TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
+  EnvScope s(runtime_.get());
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+
+  // Reuse one V8 source string: V8 can intern the specifier while each module
+  // record otherwise retains two uncharged native copies of it.
+  const std::string source_text = "import '" + std::string(256 * 1024, 'a') + "';";
+  napi_value source_value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, source_text.data(), source_text.size(),
+                                   &source_value), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(source_value);
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "same.mjs");
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+
+  std::vector<unofficial_napi_module> modules;
+  bool denied = false;
+  for (size_t i = 0; i < 32; ++i) {
+    unofficial_napi_module_create_result created{};
+    const napi_status status = unofficial_napi_module_wrap_create(s.env, &options, &created);
+    if (status != napi_ok) {
+      EXPECT_EQ(status, napi_generic_failure);
+      denied = true;
+      break;
+    }
+    modules.push_back(created.module);
+  }
+  ASSERT_TRUE(denied);
+  ASSERT_FALSE(modules.empty());
+  EXPECT_LT(modules.size(), 16u);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, modules.back()), napi_ok);
+  modules.pop_back();
+  unofficial_napi_module_create_result retry{};
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &retry), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, retry.module), napi_ok);
+  for (unofficial_napi_module module : modules)
+    ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, PendingDynamicImportsCannotGrowWithoutBound) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(
+                s.env,
+                Str(s.env,
+                    "globalThis.neverImport = new Promise(() => {});"
+                    "globalThis.dynamicImportCalls = 0;"
+                    "() => { ++dynamicImportCalls; return neverImport; }"),
+                &callback),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = callback;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  napi_value ignored = nullptr;
+  ASSERT_EQ(napi_run_script(
+      s.env,
+      Str(s.env, "for (let i = 0; i < 5000; ++i) import('never').catch(() => {});"
+                 "dynamicImportCalls"),
+      &ignored), napi_pending_exception);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_NE(exception, nullptr);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "dynamicImportCalls"), &ignored),
+            napi_ok);
+  uint32_t calls = 0;
+  ASSERT_EQ(napi_get_value_uint32(s.env, ignored, &calls), napi_ok);
+  EXPECT_EQ(calls, 4096u);
+}
+#endif
 
 TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
   EnvScope s(runtime_.get());

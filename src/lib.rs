@@ -7,6 +7,9 @@ mod guest;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod guest_heap;
 mod id_hash;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+mod lane;
+mod message;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;
@@ -32,6 +35,8 @@ use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub use lane::{BackgroundTaskScope, ManagedV8Lane, ManagedV8LaneActivator};
 
 /// Host capabilities required by the JavaScript-backed N-API implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
