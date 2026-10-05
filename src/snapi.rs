@@ -63,6 +63,27 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
+/// Mirrors `snapi_v8_wasm_engine_config` in the provider's
+/// `edge_v8_platform.h`.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[repr(C)]
+pub struct SnapiWasmEngineConfig {
+    pub size: u32,
+    pub max_memory_pages: u32,
+    pub max_module_bytes: u64,
+    pub max_functions: u32,
+    pub liftoff_only: u32,
+    pub process_code_budget_bytes: u64,
+    pub max_table_size: u32,
+    pub reserved: u32,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+unsafe extern "C" {
+    /// Returns 0 (ok), 1 (invalid) or 9 (V8 runs with other limits).
+    pub fn snapi_v8_configure_wasm_engine(config: *const SnapiWasmEngineConfig) -> i32;
+}
+
 // The bridge ABI is shared with the browser-hosted backend and optional
 // extension imports, so a native build does not reference every declaration.
 #[allow(dead_code)]

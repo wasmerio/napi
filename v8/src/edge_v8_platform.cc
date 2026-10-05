@@ -19,6 +19,34 @@
 
 namespace {
 
+constexpr size_t kWasmPageSize = size_t{64} * 1024;
+
+// What a tracked page-allocator region holds.
+enum class RegionKind : uint8_t {
+  // Resizable ArrayBuffer / growable SharedArrayBuffer backing store, or a
+  // wasm memory of a context without wasm accounting.
+  kBuffer,
+  // Wasm memory of a context with wasm accounting.
+  kWasmMemory,
+  // Wasm code space (compiled modules, import wrappers).
+  kWasmCode,
+};
+
+std::atomic<uint64_t> wasm_memory_cap_denials{0};
+std::atomic<uint64_t> wasm_codegen_denials{0};
+std::atomic<uint64_t> wasm_code_limit_stops{0};
+std::atomic<uint64_t> wasm_code_decommitted_bytes{0};
+// Committed bytes in every tracked wasm code space, attributed or not.
+std::atomic<uint64_t> wasm_code_committed{0};
+std::atomic<uint64_t> wasm_process_code_budget{0};
+// Twice the soft budget: a context whose commit takes the process past it is
+// stopped, since lazy compilation of admitted modules bypasses the soft gate.
+std::atomic<uint64_t> wasm_process_code_hard_limit{UINT64_MAX};
+// Metered wasm memories in the process: committed bytes and live count.
+std::atomic<uint64_t> wasm_memory_committed{0};
+std::atomic<uint64_t> wasm_memories{0};
+std::atomic<bool> wasm_code_metering{false};
+
 // Embedder-owned memory accountant for page-allocator commits. The context is
 // a counted embedder reference, released exactly once when the last lane or
 // tracked region holding this object drops it.
@@ -38,16 +66,148 @@ class PageAccountant {
 
   // Must deny without side effects: V8 turns a refused commit into a
   // RangeError (or a failed grow) and may retry after a GC.
-  bool Charge(uint64_t bytes) { return bytes == 0 || charge_(context_, bytes); }
-  void Uncharge(uint64_t bytes) {
-    if (bytes != 0) uncharge_(context_, bytes);
+  bool Charge(RegionKind kind, uint64_t bytes) {
+    if (bytes == 0) return true;
+    if (kind != RegionKind::kWasmMemory) return charge_(context_, bytes);
+    if (!wasm_->charge_memory(context_, bytes)) return false;
+    wasm_memory_committed.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+  }
+  void Uncharge(RegionKind kind, uint64_t bytes) {
+    if (bytes == 0) return;
+    if (kind == RegionKind::kWasmMemory) {
+      wasm_memory_committed.fetch_sub(bytes, std::memory_order_relaxed);
+      wasm_->uncharge_memory(context_, bytes);
+    } else {
+      uncharge_(context_, bytes);
+    }
+  }
+
+  // Published once, before the lane runs guest code; immutable afterwards.
+  bool AttachWasm(const snapi_v8_wasm_accounting& accounting) {
+    std::lock_guard<std::mutex> lock(wasm_mutex_);
+    if (wasm_ != nullptr) return false;
+    wasm_storage_ = accounting;
+    wasm_ = &wasm_storage_;
+    has_wasm_.store(true, std::memory_order_release);
+    return true;
+  }
+  bool has_wasm() const { return has_wasm_.load(std::memory_order_acquire); }
+
+  // Counts a new wasm memory reservation against the caps, or refuses it.
+  bool AdmitWasmMemory(size_t length) {
+    uint64_t count = wasm_memories_.load(std::memory_order_relaxed);
+    do {
+      if (count >= wasm_->max_memories) return false;
+    } while (!wasm_memories_.compare_exchange_weak(count, count + 1,
+                                                   std::memory_order_acq_rel));
+    uint64_t reserved = wasm_reserved_.load(std::memory_order_relaxed);
+    do {
+      if (length > wasm_->max_reserved_bytes ||
+          reserved > wasm_->max_reserved_bytes - length) {
+        wasm_memories_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+      }
+    } while (!wasm_reserved_.compare_exchange_weak(reserved, reserved + length,
+                                                   std::memory_order_acq_rel));
+    wasm_memories.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  void ReleaseWasmReservation(size_t length, bool freed) {
+    wasm_reserved_.fetch_sub(length, std::memory_order_acq_rel);
+    if (freed) {
+      wasm_memories_.fetch_sub(1, std::memory_order_acq_rel);
+      wasm_memories.fetch_sub(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Whether code committed while this context runs is charged to it.
+  bool MetersCode() const {
+    return has_wasm() && !lane_gone_.load(std::memory_order_acquire);
+  }
+
+  // Charges code V8 already committed, which took the process's metered
+  // code to `process_committed`. Returns whether the bytes were charged;
+  // sets `*stop` to the reason when the context must now stop (once per
+  // context; the caller reports it outside its locks).
+  bool ChargeCode(uint64_t bytes, uint64_t process_committed, uint32_t* stop) {
+    if (!wasm_->charge_code(context_, bytes)) {
+      if (ClaimStop()) *stop = SNAPI_V8_WASM_CODE_LIMIT_MEMORY;
+      return false;
+    }
+    const uint64_t committed =
+        code_committed_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+    if (committed > wasm_->code_budget_bytes) {
+      if (ClaimStop()) *stop = SNAPI_V8_WASM_CODE_LIMIT_BUDGET;
+    } else if (process_committed >
+                   wasm_process_code_hard_limit.load(std::memory_order_acquire) &&
+               ClaimStop()) {
+      *stop = SNAPI_V8_WASM_CODE_LIMIT_PROCESS;
+    }
+    return true;
+  }
+  void UnchargeCode(uint64_t bytes) {
+    code_committed_.fetch_sub(bytes, std::memory_order_acq_rel);
+    wasm_->uncharge_code(context_, bytes);
+  }
+  // `on_current_isolate`: the commit ran on this context's JS thread, whose
+  // isolate stops right away; the callback stops the others.
+  void ReportCodeLimit(uint32_t reason, bool on_current_isolate) {
+    wasm_code_limit_stops.fetch_add(1, std::memory_order_relaxed);
+    if (on_current_isolate) {
+      if (v8::Isolate* isolate = v8::Isolate::TryGetCurrent()) {
+        isolate->TerminateExecution();
+      }
+    }
+    uint64_t committed = code_committed_.load(std::memory_order_acquire);
+    uint64_t limit = 0;
+    if (reason == SNAPI_V8_WASM_CODE_LIMIT_BUDGET) {
+      limit = wasm_->code_budget_bytes;
+    } else if (reason == SNAPI_V8_WASM_CODE_LIMIT_PROCESS) {
+      committed = wasm_code_committed.load(std::memory_order_acquire);
+      limit = wasm_process_code_hard_limit.load(std::memory_order_acquire);
+    }
+    wasm_->on_code_limit(context_, reason, committed, limit);
+  }
+
+  // New compilations are admitted while the context is under its budget and
+  // has not been stopped for its code.
+  bool AdmitsCodegen() const {
+    return !code_stopped_.load(std::memory_order_acquire) &&
+           code_committed_.load(std::memory_order_acquire) <
+               wasm_->code_budget_bytes;
+  }
+
+  // The lane is gone: code committed from now on (a module outliving its
+  // context) is no longer charged here.
+  void MarkLaneGone() { lane_gone_.store(true, std::memory_order_release); }
+
+  snapi_v8_wasm_usage Usage() const {
+    return {wasm_memories_.load(std::memory_order_acquire),
+            wasm_reserved_.load(std::memory_order_acquire),
+            code_committed_.load(std::memory_order_acquire)};
   }
 
  private:
+  bool ClaimStop() {
+    return !code_stopped_.exchange(true, std::memory_order_acq_rel);
+  }
+
   void* context_;
   bool (*charge_)(void*, uint64_t);
   void (*uncharge_)(void*, uint64_t);
   void (*release_)(void*);
+  std::mutex wasm_mutex_;
+  snapi_v8_wasm_accounting wasm_storage_{};
+  // Set once under wasm_mutex_ and published by has_wasm_; read only after
+  // has_wasm() returned true.
+  const snapi_v8_wasm_accounting* wasm_ = nullptr;
+  std::atomic<bool> has_wasm_{false};
+  std::atomic<uint64_t> wasm_memories_{0};
+  std::atomic<uint64_t> wasm_reserved_{0};
+  std::atomic<uint64_t> code_committed_{0};
+  std::atomic<bool> code_stopped_{false};
+  std::atomic<bool> lane_gone_{false};
 };
 
 // Set once any lane carries an accountant: from then on this process meters
@@ -222,6 +382,14 @@ std::atomic<uint64_t> unattributed_page_reservations{0};
 // buffer sizes, not by the memory limit. A tracked region keeps its
 // accountant alive, so the charge is returned on FreePages even after the
 // reserving lane is gone.
+//
+// With wasm code metering enabled, wasm code spaces (page-aligned
+// reservations made for JIT code outside runtime/isolate setup) are tracked
+// too. V8 commits code with RecommitPages and returns it with DecommitPages,
+// in disjoint page ranges, and aborts the process if either fails, so code
+// commits are never refused: each committed range is charged after the fact
+// to the context running when it was committed (an import-wrapper space is
+// shared by every context) and returned to that same context.
 class MeteringPageAllocator final : public v8::PageAllocator {
  public:
   explicit MeteringPageAllocator(v8::PageAllocator* inner) : inner_(inner) {}
@@ -234,26 +402,57 @@ class MeteringPageAllocator final : public v8::PageAllocator {
   void* AllocatePages(void* hint, size_t length, size_t alignment,
                       Permission access) override {
     std::shared_ptr<PageAccountant> accountant;
-    if (IsBufferReservation(alignment, access) &&
-        page_attribution_pause_depth == 0) {
-      if (current_background_lane != nullptr) {
-        accountant = current_background_lane->page_accountant();
-      }
-      if (accountant == nullptr) {
-        unattributed_page_reservations.fetch_add(1, std::memory_order_relaxed);
-        // Fail closed in a metered process. A standalone pool means this
-        // process also runs unmetered environments without a lane.
-        if (g_page_accounting_managed.load(std::memory_order_acquire) &&
-            !StandalonePoolCreated()) {
-          return nullptr;
+    RegionKind kind = RegionKind::kBuffer;
+    bool track = false;
+    if (page_attribution_pause_depth == 0) {
+      if (IsBufferReservation(alignment, access)) {
+        if (current_background_lane != nullptr) {
+          accountant = current_background_lane->page_accountant();
+        }
+        if (accountant == nullptr) {
+          unattributed_page_reservations.fetch_add(1, std::memory_order_relaxed);
+          // Fail closed in a metered process. A standalone pool means this
+          // process also runs unmetered environments without a lane.
+          if (g_page_accounting_managed.load(std::memory_order_acquire) &&
+              !StandalonePoolCreated()) {
+            return nullptr;
+          }
+        } else {
+          track = true;
+          if (IsWasmMemoryReservation(alignment) && accountant->has_wasm()) {
+            kind = RegionKind::kWasmMemory;
+            if (!accountant->AdmitWasmMemory(length)) {
+              wasm_memory_cap_denials.fetch_add(1, std::memory_order_relaxed);
+              return nullptr;
+            }
+          }
+        }
+      } else if (IsCodeReservation(alignment, access) &&
+                 wasm_code_metering.load(std::memory_order_acquire)) {
+        // Never refused: a failed code reservation aborts the process.
+        kind = RegionKind::kWasmCode;
+        track = true;
+        if (current_background_lane != nullptr) {
+          accountant = current_background_lane->page_accountant();
         }
       }
     }
     void* result = inner_->AllocatePages(hint, length, alignment, access);
-    if (result == nullptr) return nullptr;
+    if (result == nullptr) {
+      if (kind == RegionKind::kWasmMemory) {
+        accountant->ReleaseWasmReservation(length, true);
+      }
+      return nullptr;
+    }
     const uintptr_t base = reinterpret_cast<uintptr_t>(result);
-    if (accountant != nullptr) {
-      if (!Track(base, length, std::move(accountant))) {
+    if (track) {
+      if (!Track(base, length, kind, accountant)) {
+        // Without bookkeeping a code space would commit unmetered; that is
+        // still better than refusing it, which aborts.
+        if (kind == RegionKind::kWasmCode) return result;
+        if (kind == RegionKind::kWasmMemory) {
+          accountant->ReleaseWasmReservation(length, true);
+        }
         inner_->FreePages(result, length);
         return nullptr;
       }
@@ -285,8 +484,16 @@ class MeteringPageAllocator final : public v8::PageAllocator {
     std::lock_guard<std::mutex> lock(region->mutex);
     const bool ok = inner_->FreePages(address, length);
     // A failed free is fatal in V8; the charge is returned either way.
-    region->accountant->Uncharge(region->committed);
+    if (region->kind == RegionKind::kWasmCode) {
+      UnchargeCode(*region, region->base, UINTPTR_MAX);
+      return ok;
+    }
+    region->accountant->Uncharge(region->kind, region->committed);
     region->committed = 0;
+    if (region->kind == RegionKind::kWasmMemory) {
+      region->accountant->ReleaseWasmReservation(
+          region->length.load(std::memory_order_relaxed), true);
+    }
     return ok;
   }
 
@@ -298,14 +505,22 @@ class MeteringPageAllocator final : public v8::PageAllocator {
     }
     std::lock_guard<std::mutex> lock(region->mutex);
     if (!inner_->ReleasePages(address, length, new_length)) return false;
+    size_t old_length;
     {
       std::lock_guard<std::mutex> map_lock(mutex_);
-      region->length.store(std::min(region->length.load(std::memory_order_relaxed),
-                                    new_length),
+      old_length = region->length.load(std::memory_order_relaxed);
+      region->length.store(std::min(old_length, new_length),
                            std::memory_order_relaxed);
     }
+    if (region->kind == RegionKind::kWasmCode) {
+      UnchargeCode(*region, region->base + new_length, UINTPTR_MAX);
+      return true;
+    }
+    if (region->kind == RegionKind::kWasmMemory && old_length > new_length) {
+      region->accountant->ReleaseWasmReservation(old_length - new_length, false);
+    }
     if (region->committed > new_length) {
-      region->accountant->Uncharge(region->committed - new_length);
+      region->accountant->Uncharge(region->kind, region->committed - new_length);
       region->committed = new_length;
     }
     return true;
@@ -313,7 +528,11 @@ class MeteringPageAllocator final : public v8::PageAllocator {
 
   bool SetPermissions(void* address, size_t length, Permission access) override {
     std::shared_ptr<Region> region = MaybeFind(address);
-    if (region == nullptr) return inner_->SetPermissions(address, length, access);
+    // Code spaces are made accessible as a whole when reserved (without
+    // memory protection keys) and committed with RecommitPages.
+    if (region == nullptr || region->kind == RegionKind::kWasmCode) {
+      return inner_->SetPermissions(address, length, access);
+    }
     return Update(*region, address, length, access, [&] {
       return inner_->SetPermissions(address, length, access);
     });
@@ -322,6 +541,14 @@ class MeteringPageAllocator final : public v8::PageAllocator {
   bool RecommitPages(void* address, size_t length, Permission access) override {
     std::shared_ptr<Region> region = MaybeFind(address);
     if (region == nullptr) return inner_->RecommitPages(address, length, access);
+    if (region->kind == RegionKind::kWasmCode) {
+      // Charged after the fact: refusing would abort the process.
+      if (!inner_->RecommitPages(address, length, access)) return false;
+      if (access != kNoAccess && access != kNoAccessWillJitLater) {
+        CommitCode(region, reinterpret_cast<uintptr_t>(address), length);
+      }
+      return true;
+    }
     return Update(*region, address, length, access, [&] {
       return inner_->RecommitPages(address, length, access);
     });
@@ -330,6 +557,15 @@ class MeteringPageAllocator final : public v8::PageAllocator {
   bool DecommitPages(void* address, size_t size) override {
     std::shared_ptr<Region> region = MaybeFind(address);
     if (region == nullptr) return inner_->DecommitPages(address, size);
+    if (region->kind == RegionKind::kWasmCode) {
+      std::lock_guard<std::mutex> lock(region->mutex);
+      const bool ok = inner_->DecommitPages(address, size);
+      // A failed decommit is fatal in V8; the charge is returned either way.
+      const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+      wasm_code_decommitted_bytes.fetch_add(
+          UnchargeCode(*region, begin, begin + size), std::memory_order_relaxed);
+      return ok;
+    }
     return Update(*region, address, size, kNoAccess,
                   [&] { return inner_->DecommitPages(address, size); });
   }
@@ -352,30 +588,69 @@ class MeteringPageAllocator final : public v8::PageAllocator {
 
   v8::PageAllocator* inner() { return inner_; }
 
+  // Returns every code charge `accountant` still holds (code spaces shared
+  // across contexts, such as import wrappers, outlive the context) and
+  // leaves those ranges uncharged.
+  void DetachCodeOwner(const PageAccountant* accountant) {
+    std::vector<std::shared_ptr<Region>> code_regions;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto& entry : regions_) {
+        if (entry.second->kind == RegionKind::kWasmCode) {
+          code_regions.push_back(entry.second);
+        }
+      }
+    }
+    for (auto& region : code_regions) {
+      std::lock_guard<std::mutex> lock(region->mutex);
+      ReleaseOwnerSpans(*region, accountant);
+    }
+  }
+
  private:
   // Buffer reservations use the OS page size or the 64 KiB wasm page size.
-  static constexpr size_t kMaxBufferAlignment = size_t{64} * 1024;
+  static constexpr size_t kMaxBufferAlignment = kWasmPageSize;
   // V8's own cages are aligned to (at least) their 4 GiB size.
   static constexpr size_t kLargeAlignment = size_t{1} << 30;
   static constexpr size_t kLargeLength = size_t{64} << 20;
   static constexpr size_t kMaxExcluded = 16;
+
+  // A committed range of a code space and the context it is charged to
+  // (none if the commit had no metered context or its charge was refused).
+  struct CodeSpan {
+    uintptr_t end;
+    std::shared_ptr<PageAccountant> owner;
+  };
+  using SpanMap = std::map<uintptr_t, CodeSpan>;
 
   struct Region {
     std::mutex mutex;  // serializes commits; GSABs grow from several threads
     uintptr_t base = 0;
     // Written under both locks (ReleasePages); read under either.
     std::atomic<size_t> length{0};
-    size_t committed = 0;  // charged prefix, guarded by `mutex`
+    RegionKind kind = RegionKind::kBuffer;
+    size_t committed = 0;  // charged prefix (buffers), guarded by `mutex`
+    // Buffers and wasm memories: the reserving context, charged for every
+    // commit. Code spaces: unset (each span has its own owner).
     std::shared_ptr<PageAccountant> accountant;
+    // Code spaces: the reserving context, charged for commits made while no
+    // metered context is bound. Weak: it must not outlive its context.
+    std::weak_ptr<PageAccountant> reserver;
+    SpanMap spans;  // code spaces only, by start
   };
 
-  bool Track(uintptr_t base, size_t length,
-             std::shared_ptr<PageAccountant> accountant) {
+  bool Track(uintptr_t base, size_t length, RegionKind kind,
+             const std::shared_ptr<PageAccountant>& accountant) {
     try {
       auto region = std::make_shared<Region>();
       region->base = base;
       region->length = length;
-      region->accountant = std::move(accountant);
+      region->kind = kind;
+      if (kind == RegionKind::kWasmCode) {
+        region->reserver = accountant;
+      } else {
+        region->accountant = accountant;
+      }
       std::lock_guard<std::mutex> lock(mutex_);
       if (!regions_.emplace(base, std::move(region)).second) return false;
       tracked_regions_.fetch_add(1, std::memory_order_release);
@@ -390,7 +665,169 @@ class MeteringPageAllocator final : public v8::PageAllocator {
            alignment <= std::max(kMaxBufferAlignment, inner_->AllocatePageSize());
   }
 
+  // Wasm memories are reserved with the wasm page size as alignment; other
+  // page-backed buffers with the OS allocation page size. Where the two
+  // coincide, every such buffer is treated as a wasm memory.
+  bool IsWasmMemoryReservation(size_t alignment) const {
+    return alignment == kWasmPageSize;
+  }
+
+  // WasmCodeManager reserves code spaces page-aligned for JIT. V8's own code
+  // range has a larger alignment or is reserved during isolate setup, where
+  // attribution is paused.
+  bool IsCodeReservation(size_t alignment, Permission access) const {
+    return access == kNoAccessWillJitLater &&
+           alignment <= inner_->AllocatePageSize();
+  }
+
   static bool StandalonePoolCreated();
+
+  // The context a code commit on this thread is charged to: the bound lane's
+  // if it meters wasm (`*bound` = true), else the context that reserved the
+  // space.
+  static std::shared_ptr<PageAccountant> CodeOwner(const Region& region,
+                                                   bool* bound) {
+    *bound = false;
+    if (current_background_lane != nullptr) {
+      std::shared_ptr<PageAccountant> accountant =
+          current_background_lane->page_accountant();
+      if (accountant != nullptr && accountant->MetersCode()) {
+        *bound = true;
+        return accountant;
+      }
+    }
+    std::shared_ptr<PageAccountant> reserver = region.reserver.lock();
+    if (reserver != nullptr && reserver->MetersCode()) return reserver;
+    return nullptr;
+  }
+
+  // Records [begin, begin + length) as committed; only bytes not committed
+  // yet are counted and charged.
+  void CommitCode(const std::shared_ptr<Region>& region, uintptr_t begin,
+                  size_t length) {
+    bool bound = false;
+    std::shared_ptr<PageAccountant> owner = CodeOwner(*region, &bound);
+    uint32_t stop = 0;
+    try {
+      std::lock_guard<std::mutex> lock(region->mutex);
+      const size_t region_length = region->length.load(std::memory_order_relaxed);
+      if (begin < region->base || begin - region->base >= region_length) return;
+      const uintptr_t end =
+          begin + std::min(length, region_length - (begin - region->base));
+      std::vector<std::pair<uintptr_t, uintptr_t>> fresh;
+      auto it = region->spans.upper_bound(begin);
+      uintptr_t cursor = begin;
+      if (it != region->spans.begin()) {
+        auto previous = std::prev(it);
+        if (previous->second.end > cursor) cursor = previous->second.end;
+      }
+      while (cursor < end) {
+        const uintptr_t next =
+            it == region->spans.end() ? end : std::min(it->first, end);
+        if (cursor < next) fresh.emplace_back(cursor, next);
+        if (it == region->spans.end() || it->first >= end) break;
+        cursor = std::max(cursor, it->second.end);
+        ++it;
+      }
+      for (const auto& [from, to] : fresh) {
+        // Allocate the bookkeeping before charging, so a charge is never
+        // left without a span to return it from.
+        SpanMap scratch;
+        scratch.emplace(from, CodeSpan{to, nullptr});
+        SpanMap::node_type node = scratch.extract(scratch.begin());
+        const uint64_t bytes = to - from;
+        const uint64_t process_committed =
+            wasm_code_committed.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+        if (owner != nullptr && owner->ChargeCode(bytes, process_committed, &stop)) {
+          node.mapped().owner = owner;
+        }
+        InsertSpan(*region, std::move(node));
+      }
+      // The owner's lane may have been deleted meanwhile; its teardown walk
+      // either saw these spans or ran before them, so return them here.
+      if (owner != nullptr && !owner->MetersCode()) {
+        ReleaseOwnerSpans(*region, owner.get());
+      }
+    } catch (const std::bad_alloc&) {
+      // Out of host memory for bookkeeping: the rest of this commit stays
+      // unmetered, which is still better than aborting inside V8.
+    }
+    if (stop != 0) owner->ReportCodeLimit(stop, bound);
+  }
+
+  // Returns the charges `owner` holds in `region` and leaves those spans
+  // committed but uncharged. Caller holds region.mutex.
+  static void ReleaseOwnerSpans(Region& region, const PageAccountant* owner) {
+    for (auto& span : region.spans) {
+      if (span.second.owner.get() != owner) continue;
+      span.second.owner->UnchargeCode(span.second.end - span.first);
+      span.second.owner.reset();
+    }
+  }
+
+  // Adds a span, merging it with adjacent spans of the same owner. Never
+  // allocates.
+  static void InsertSpan(Region& region, SpanMap::node_type node) {
+    const uintptr_t from = node.key();
+    uintptr_t to = node.mapped().end;
+    const std::shared_ptr<PageAccountant>& owner = node.mapped().owner;
+    auto next = region.spans.lower_bound(from);
+    if (next != region.spans.end() && next->first == to &&
+        next->second.owner == owner) {
+      to = next->second.end;
+      next = region.spans.erase(next);
+    }
+    if (next != region.spans.begin()) {
+      auto previous = std::prev(next);
+      if (previous->second.end == from && previous->second.owner == owner) {
+        previous->second.end = to;
+        return;
+      }
+    }
+    node.mapped().end = to;
+    region.spans.insert(next, std::move(node));
+  }
+
+  // Removes committed ranges inside [begin, end), returning each owner's
+  // charge. Returns the number of committed bytes removed. Caller holds
+  // region.mutex.
+  static uint64_t UnchargeCode(Region& region, uintptr_t begin, uintptr_t end) {
+    uint64_t removed = 0;
+    auto it = region.spans.upper_bound(begin);
+    if (it != region.spans.begin() && std::prev(it)->second.end > begin) --it;
+    while (it != region.spans.end() && it->first < end) {
+      const uintptr_t start = it->first;
+      const uintptr_t span_end = it->second.end;
+      const uintptr_t from = std::max(start, begin);
+      const uintptr_t to = std::min(span_end, end);
+      std::shared_ptr<PageAccountant> owner = it->second.owner;
+      if (start < from && to < span_end) {
+        // Splitting needs a node; without one the span keeps its charge.
+        try {
+          region.spans.emplace_hint(std::next(it), to, CodeSpan{span_end, owner});
+        } catch (const std::bad_alloc&) {
+          ++it;
+          continue;
+        }
+        it->second.end = from;
+      } else if (start < from) {
+        it->second.end = from;
+      } else if (to < span_end) {
+        // Re-key the remainder in place; extract/insert does not allocate.
+        auto node = region.spans.extract(it);
+        node.key() = to;
+        region.spans.insert(std::move(node));
+      } else {
+        region.spans.erase(it);
+      }
+      const uint64_t bytes = to - from;
+      removed += bytes;
+      wasm_code_committed.fetch_sub(bytes, std::memory_order_acq_rel);
+      if (owner != nullptr) owner->UnchargeCode(bytes);
+      it = region.spans.lower_bound(to);
+    }
+    return removed;
+  }
 
   // Lock-free filter for the hot path: V8 heap and code pages live in a few
   // large process-wide reservations and never take the allocator lock.
@@ -434,18 +871,18 @@ class MeteringPageAllocator final : public v8::PageAllocator {
     if (access == kNoAccess || access == kNoAccessWillJitLater) {
       if (!op()) return false;
       if (offset < region.committed && end >= region.committed) {
-        region.accountant->Uncharge(region.committed - offset);
+        region.accountant->Uncharge(region.kind, region.committed - offset);
         region.committed = offset;
       }
       return true;
     }
     const size_t delta = end > region.committed ? end - region.committed : 0;
-    if (!region.accountant->Charge(delta)) {
+    if (!region.accountant->Charge(region.kind, delta)) {
       page_charge_denials.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     if (!op()) {
-      region.accountant->Uncharge(delta);
+      region.accountant->Uncharge(region.kind, delta);
       return false;
     }
     region.committed += delta;
@@ -579,7 +1016,15 @@ extern "C" void snapi_v8_lane_stop(void* handle) {
 }
 
 extern "C" void snapi_v8_lane_delete(void* handle) {
-  delete static_cast<BackgroundLane*>(handle);
+  auto* lane = static_cast<BackgroundLane*>(handle);
+  if (lane == nullptr) return;
+  if (std::shared_ptr<PageAccountant> accountant = lane->page_accountant()) {
+    accountant->MarkLaneGone();
+    if (auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire)) {
+      allocator->DetachCodeOwner(accountant.get());
+    }
+  }
+  delete lane;
 }
 
 extern "C" void* snapi_v8_lane_swap_current(void* handle) {
@@ -618,6 +1063,81 @@ extern "C" bool snapi_v8_lane_set_page_accountant(
   return true;
 }
 
+extern "C" bool snapi_v8_lane_set_wasm_accounting(
+    void* handle, const snapi_v8_wasm_accounting* accounting) {
+  if (handle == nullptr || accounting == nullptr ||
+      accounting->size < sizeof(snapi_v8_wasm_accounting) ||
+      accounting->charge_memory == nullptr ||
+      accounting->uncharge_memory == nullptr ||
+      accounting->charge_code == nullptr || accounting->uncharge_code == nullptr ||
+      accounting->on_code_limit == nullptr) {
+    return false;
+  }
+  std::shared_ptr<PageAccountant> accountant =
+      static_cast<BackgroundLane*>(handle)->page_accountant();
+  return accountant != nullptr && accountant->AttachWasm(*accounting);
+}
+
+extern "C" void snapi_v8_lane_wasm_usage(void* handle,
+                                         snapi_v8_wasm_usage* out) {
+  if (out == nullptr) return;
+  *out = {};
+  if (handle == nullptr) return;
+  std::shared_ptr<PageAccountant> accountant =
+      static_cast<BackgroundLane*>(handle)->page_accountant();
+  if (accountant != nullptr && accountant->has_wasm()) *out = accountant->Usage();
+}
+
+extern "C" void snapi_v8_wasm_process_stats(snapi_v8_wasm_stats* out) {
+  if (out == nullptr) return;
+  out->code_committed_bytes = wasm_code_committed.load(std::memory_order_acquire);
+  out->code_budget_bytes = wasm_process_code_budget.load(std::memory_order_acquire);
+  const uint64_t hard = wasm_process_code_hard_limit.load(std::memory_order_acquire);
+  out->code_hard_limit_bytes = hard == UINT64_MAX ? 0 : hard;
+  out->memory_cap_denials = wasm_memory_cap_denials.load(std::memory_order_acquire);
+  out->codegen_denials = wasm_codegen_denials.load(std::memory_order_acquire);
+  out->code_limit_stops = wasm_code_limit_stops.load(std::memory_order_acquire);
+  out->code_decommitted_bytes =
+      wasm_code_decommitted_bytes.load(std::memory_order_acquire);
+  out->memory_committed_bytes = wasm_memory_committed.load(std::memory_order_acquire);
+  out->memories = wasm_memories.load(std::memory_order_acquire);
+}
+
+void EdgeV8EnableWasmCodeMetering(uint64_t process_code_budget_bytes) {
+  wasm_process_code_budget.store(process_code_budget_bytes,
+                                 std::memory_order_release);
+  wasm_process_code_hard_limit.store(process_code_budget_bytes * 2,
+                                     std::memory_order_release);
+  wasm_code_metering.store(true, std::memory_order_release);
+}
+
+bool EdgeV8WasmMeteringReady() {
+  if (!wasm_code_metering.load(std::memory_order_acquire) ||
+      current_background_lane == nullptr) {
+    return false;
+  }
+  std::shared_ptr<PageAccountant> accountant =
+      current_background_lane->page_accountant();
+  return accountant != nullptr && accountant->has_wasm();
+}
+
+bool EdgeV8AdmitWasmCodegen() {
+  if (current_background_lane == nullptr) return true;
+  std::shared_ptr<PageAccountant> accountant =
+      current_background_lane->page_accountant();
+  if (accountant == nullptr || !accountant->has_wasm()) return true;
+  // Compilations can overshoot by one module's code (bounded by the module
+  // size cap); denying before V8 reaches its own process-wide code limit
+  // keeps that limit, which aborts the process, out of reach.
+  if (!accountant->AdmitsCodegen() ||
+      wasm_code_committed.load(std::memory_order_acquire) >=
+          wasm_process_code_budget.load(std::memory_order_acquire)) {
+    wasm_codegen_denials.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
 EdgeV8PageAttributionPause::EdgeV8PageAttributionPause() {
   ++page_attribution_pause_depth;
 }
@@ -651,6 +1171,24 @@ extern "C" bool snapi_v8_test_page_set_permissions(void* address, size_t length,
   v8::PageAllocator* target = metered ? allocator : allocator->inner();
   return target->SetPermissions(address, length,
                                 static_cast<v8::PageAllocator::Permission>(access));
+}
+
+extern "C" void* snapi_v8_test_code_reserve(size_t length) {
+  auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire);
+  if (allocator == nullptr) return nullptr;
+  return allocator->AllocatePages(nullptr, length, allocator->AllocatePageSize(),
+                                  v8::PageAllocator::kNoAccessWillJitLater);
+}
+
+// `commit` recommits read-write (the probe never executes the pages), else
+// decommits.
+extern "C" bool snapi_v8_test_code_commit(void* address, size_t length,
+                                          bool commit) {
+  auto* allocator = g_metering_page_allocator.load(std::memory_order_acquire);
+  if (allocator == nullptr) return false;
+  return commit ? allocator->RecommitPages(address, length,
+                                           v8::PageAllocator::kReadWrite)
+                : allocator->DecommitPages(address, length);
 }
 
 extern "C" bool snapi_v8_test_page_free(void* address, size_t length) {

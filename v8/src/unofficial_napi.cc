@@ -43,6 +43,10 @@ struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
   std::string engine_flags;
   uint32_t refcount = 0;
+  // Host WebAssembly limits (snapi_v8_configure_wasm_engine), applied when
+  // the platform is created.
+  bool has_wasm_engine = false;
+  snapi_v8_wasm_engine_config wasm_engine{};
 };
 
 class TrackingArrayBufferAllocator;
@@ -651,6 +655,34 @@ void ApplyDefaultV8Flags() {
       static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
 }
 
+bool SameWasmEngineConfig(const snapi_v8_wasm_engine_config& a,
+                          const snapi_v8_wasm_engine_config& b) {
+  return a.max_memory_pages == b.max_memory_pages &&
+         a.max_module_bytes == b.max_module_bytes &&
+         a.max_functions == b.max_functions &&
+         a.liftoff_only == b.liftoff_only &&
+         a.max_table_size == b.max_table_size &&
+         a.process_code_budget_bytes == b.process_code_budget_bytes;
+}
+
+// Built from validated numbers only: V8 ignores unknown or malformed flags
+// silently, so embedders never pass flag strings here.
+void ApplyWasmEngineFlags(const snapi_v8_wasm_engine_config& config) {
+  char flags[256];
+  const int length = std::snprintf(
+      flags, sizeof(flags),
+      "--wasm-max-mem-pages=%u --wasm-max-module-size=%llu "
+      "--max-wasm-functions=%u --wasm-max-table-size=%u "
+      "--no-wasm-native-module-cache%s",
+      config.max_memory_pages,
+      static_cast<unsigned long long>(config.max_module_bytes),
+      config.max_functions, config.max_table_size,
+      config.liftoff_only != 0 ? " --liftoff-only" : "");
+  if (length > 0 && static_cast<size_t>(length) < sizeof(flags)) {
+    v8::V8::SetFlagsFromString(flags, length);
+  }
+}
+
 void FatalErrorCallback(const char* location, const char* message) {
   v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
   if (isolate == nullptr) return;
@@ -719,6 +751,10 @@ napi_status ConfigureRuntime(const char* engine_flags,
   // Process-wide V8 and cppgc reservations made here belong to no context.
   EdgeV8PageAttributionPause page_attribution_pause;
   ApplyDefaultV8Flags();
+  if (g_runtime.has_wasm_engine) {
+    ApplyWasmEngineFlags(g_runtime.wasm_engine);
+    EdgeV8EnableWasmCodeMetering(g_runtime.wasm_engine.process_code_budget_bytes);
+  }
   if (engine_flags_length > 0) {
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
@@ -732,6 +768,35 @@ napi_status ConfigureRuntime(const char* engine_flags,
   v8::V8::Initialize();
   g_runtime.engine_flags.assign(engine_flags_length > 0 ? engine_flags : "",
                                 engine_flags_length);
+  return napi_ok;
+}
+
+napi_status ConfigureWasmEngine(const snapi_v8_wasm_engine_config* config) {
+  constexpr uint64_t kMiB = uint64_t{1} << 20;
+  if (config == nullptr || config->size < sizeof(snapi_v8_wasm_engine_config) ||
+      config->max_memory_pages == 0 || config->max_memory_pages > 65536 ||
+      config->max_module_bytes < 16 || config->max_module_bytes > 1024 * kMiB ||
+      config->max_functions == 0 || config->max_functions > 1000000 ||
+      config->liftoff_only > 1 || config->max_table_size == 0 ||
+      // Tables live on the V8 heap; a single huge allocation there is fatal.
+      config->max_table_size > 10000000 || config->reserved != 0 ||
+      config->process_code_budget_bytes < kMiB ||
+      // The hard limit (2x) stays at most 3 GiB, leaving 1 GiB below V8's
+      // process-wide committed-code limit (4095 MiB, whose breach aborts the
+      // process) for in-flight compilations and unmetered contexts.
+      config->process_code_budget_bytes > 1536 * kMiB) {
+    return napi_invalid_arg;
+  }
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (g_runtime.platform != nullptr) {
+    return g_runtime.has_wasm_engine &&
+                   SameWasmEngineConfig(g_runtime.wasm_engine, *config)
+               ? napi_ok
+               : napi_generic_failure;
+  }
+  g_runtime.wasm_engine = *config;
+  g_runtime.wasm_engine.size = sizeof(snapi_v8_wasm_engine_config);
+  g_runtime.has_wasm_engine = true;
   return napi_ok;
 }
 
@@ -1761,6 +1826,10 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 
 extern "C" {
 
+int snapi_v8_configure_wasm_engine(const snapi_v8_wasm_engine_config* config) {
+  return ConfigureWasmEngine(config);
+}
+
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
     const unofficial_napi_runtime_options* options) {
   if (options != nullptr &&
@@ -1983,6 +2052,13 @@ napi_status NAPI_CDECL snapi_private_create_env(
   }
   const bool restrict_webassembly =
       RestrictsUnmeteredWebAssembly(policy, guest_heap != nullptr);
+  // Metered WebAssembly fails closed: without the lane's wasm accounting and
+  // the process-wide engine limits, nothing would bound or charge it.
+  if (policy == NapiWebAssemblyPolicy::kAllowMetered &&
+      !EdgeV8WasmMeteringReady()) {
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    return napi_generic_failure;
+  }
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {

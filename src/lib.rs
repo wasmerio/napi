@@ -23,19 +23,24 @@ pub const NAPI_EXTENSION_WASMER_MODULE_NAME: &str = "napi_extension_wasmer_v0";
 #[cfg(not(target_arch = "wasm32"))]
 pub use budget::{BudgetedMemory, BudgetedTunables, budgeted_tunables};
 pub use budget::{
-    EnvRejected, HeapReservation, NapiMemoryAccountant, OverBudget, Pool, RequestedHeap,
-    ResourceBudget, ResourceUsage,
+    EnvRejected, HeapReservation, NapiLimitExceeded, NapiMemoryAccountant, OverBudget, Pool,
+    RequestedHeap, ResourceBudget, ResourceUsage,
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub use ctx::configure_wasm_engine;
 pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeControl,
-    NapiRuntimeHooks, NapiSession, WasmPolicy,
+    NapiRuntimeHooks, NapiSession, WasmEngineLimits, WasmLimits, WasmPolicy,
 };
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) use env::{GuestBackingStoreMapping, HostBufferCopy};
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-pub use lane::{BackgroundTaskScope, ManagedV8Lane, ManagedV8LaneActivator};
+pub use lane::{
+    BackgroundTaskScope, ManagedV8Lane, ManagedV8LaneActivator, WasmLaneUsage, WasmProcessStats,
+    wasm_process_stats,
+};
 
 /// Host capabilities required by the JavaScript-backed N-API implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
