@@ -257,8 +257,7 @@ fn run_wasix_main_with_runner(
         if napi_version.is_some() || napi_extension_version.is_some() {
             runner
                 .capabilities_mut()
-                .threading
-                .enable_asynchronous_threading = false;
+                .enable_context_switching = false;
         }
         runtime
             .with_instantiation_hook(ctx.runtime_hooks())
