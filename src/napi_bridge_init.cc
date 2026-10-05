@@ -3929,6 +3929,8 @@ static_assert(static_cast<uint32_t>(
                   NapiWebAssemblyPolicy::kRestrictGuestHeap) == 0);
 static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered) ==
               1);
+static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowMetered) ==
+              2);
 
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                    const void *guest_heap_ctx,

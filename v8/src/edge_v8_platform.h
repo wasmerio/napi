@@ -47,6 +47,118 @@ extern "C" bool snapi_v8_lane_set_page_accountant(
     void* handle, void* context, bool (*charge)(void*, uint64_t),
     void (*uncharge)(void*, uint64_t), void (*release)(void*));
 
+// Reasons passed to snapi_v8_wasm_accounting::on_code_limit.
+enum : uint32_t {
+  // The context's committed wasm code exceeded code_budget_bytes.
+  SNAPI_V8_WASM_CODE_LIMIT_BUDGET = 1,
+  // charge_code refused a commit (the memory limit is exhausted).
+  SNAPI_V8_WASM_CODE_LIMIT_MEMORY = 2,
+  // The commit took the process's metered wasm code past the hard process
+  // limit (twice the soft code budget).
+  SNAPI_V8_WASM_CODE_LIMIT_PROCESS = 3,
+};
+
+// Per-context WebAssembly limits and accounting, attached to a lane that
+// already has a page accountant (same `context`). With it, the lane's context
+// is metered for WebAssembly:
+//
+// * Wasm memories (no-access reservations aligned to the 64 KiB wasm page)
+//   are counted and capped by number (`max_memories`) and reserved address
+//   space (`max_reserved_bytes`); a reservation over a cap is refused, which
+//   V8 reports as a RangeError. Their committed bytes are charged through
+//   `charge_memory`, which must deny without side effects (V8 turns a refusal
+//   into a failed memory.grow or a RangeError).
+// * Committed wasm code is charged after the fact through `charge_code`:
+//   V8 aborts the process if a code commit fails, so it is never refused.
+//   When `charge_code` refuses, the context's committed code exceeds
+//   `code_budget_bytes`, or the commit takes the process's metered code past
+//   the hard process limit, `on_code_limit` runs once (possibly on a V8
+//   background thread, inside V8): it must stop the context without
+//   blocking on V8 or N-API locks. New compilations in the context are
+//   refused from then on (CompileError), as they are while the process-wide
+//   code budget is exhausted.
+//
+// Without it a lane's wasm memories are charged like other page-backed
+// buffers and wasm code is not metered. Returns false if the lane has no page
+// accountant or already has wasm accounting.
+struct snapi_v8_wasm_accounting {
+  uint32_t size;  // sizeof(snapi_v8_wasm_accounting)
+  uint32_t max_memories;
+  uint64_t max_reserved_bytes;
+  uint64_t code_budget_bytes;
+  bool (*charge_memory)(void* context, uint64_t bytes);
+  void (*uncharge_memory)(void* context, uint64_t bytes);
+  bool (*charge_code)(void* context, uint64_t bytes);
+  void (*uncharge_code)(void* context, uint64_t bytes);
+  void (*on_code_limit)(void* context, uint32_t reason, uint64_t committed,
+                        uint64_t limit);
+};
+extern "C" bool snapi_v8_lane_set_wasm_accounting(
+    void* handle, const snapi_v8_wasm_accounting* accounting);
+
+struct snapi_v8_wasm_usage {
+  uint64_t memories;          // live wasm memories reserved by the context
+  uint64_t reserved_bytes;    // their reserved address space
+  uint64_t code_bytes;        // committed wasm code charged to the context
+};
+// Zeroes `out` for a lane without wasm accounting.
+extern "C" void snapi_v8_lane_wasm_usage(void* handle,
+                                         snapi_v8_wasm_usage* out);
+
+struct snapi_v8_wasm_stats {
+  uint64_t code_committed_bytes;   // all metered wasm code in the process
+  uint64_t code_budget_bytes;      // process-wide soft budget (0: unmetered)
+  uint64_t code_hard_limit_bytes;  // process-wide hard limit, 2x the budget
+  uint64_t memory_cap_denials;     // wasm memory reservations over a cap
+  uint64_t codegen_denials;        // compilations refused by a code budget
+  uint64_t code_limit_stops;       // contexts stopped by on_code_limit
+  uint64_t code_decommitted_bytes; // wasm code returned by V8 (cumulative)
+  uint64_t memory_committed_bytes; // committed bytes of metered wasm memories
+  uint64_t memories;               // live metered wasm memories
+};
+extern "C" void snapi_v8_wasm_process_stats(snapi_v8_wasm_stats* out);
+
+// Process-wide V8 WebAssembly limits for metered contexts. Must be set before
+// the runtime is configured (the first environment is created): the derived
+// V8 flags are process-wide and frozen when V8 initializes. Repeating the
+// same configuration later succeeds; a different one fails.
+//
+// Sets --wasm-max-mem-pages, --wasm-max-module-size, --max-wasm-functions,
+// --wasm-max-table-size, --no-wasm-native-module-cache and, if
+// `liftoff_only`, --liftoff-only, and
+// enables wasm code metering with the given process-wide soft code budget.
+// The soft budget refuses new compilations; lazy compilation of admitted
+// modules has no embedder hook, so a context whose commit takes the process
+// past twice the soft budget (at most 3 GiB, well below V8's fatal 4095 MiB
+// committed-code limit) is stopped instead.
+// Returns napi_ok, napi_invalid_arg for out-of-range values, or
+// napi_generic_failure once V8 runs with a different configuration.
+struct snapi_v8_wasm_engine_config {
+  uint32_t size;                // sizeof(snapi_v8_wasm_engine_config)
+  uint32_t max_memory_pages;    // 1..=65536 (64 KiB pages, per memory)
+  uint64_t max_module_bytes;    // 16..=1 GiB
+  uint32_t max_functions;       // 1..=1,000,000 per module
+  uint32_t liftoff_only;        // 0 or 1
+  uint64_t process_code_budget_bytes;  // 1 MiB..=1536 MiB
+  uint32_t max_table_size;      // 1..=10,000,000 entries per table
+  uint32_t reserved;            // 0
+};
+extern "C" int snapi_v8_configure_wasm_engine(
+    const snapi_v8_wasm_engine_config* config);
+
+// Process-wide wasm code metering, enabled once by the runtime configuration
+// before V8 initializes. `process_code_budget_bytes` is the soft budget past
+// which new compilations in metered contexts are refused.
+void EdgeV8EnableWasmCodeMetering(uint64_t process_code_budget_bytes);
+// Whether the calling thread's lane meters WebAssembly and the process
+// meters wasm code: required to create an environment with metered
+// WebAssembly.
+bool EdgeV8WasmMeteringReady();
+// Dynamic part of the wasm code-generation policy: false when the calling
+// thread's metered context or the process exhausted its code budget. Always
+// true for contexts without wasm accounting.
+bool EdgeV8AdmitWasmCodegen();
+
 // While alive on a thread, page reservations are treated as V8's own and
 // never attributed to the bound lane. Only for runtime and isolate setup,
 // where no guest code runs.

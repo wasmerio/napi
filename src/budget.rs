@@ -112,6 +112,54 @@ pub enum Pool {
     /// [`ResourceBudget::try_charge_soft`]): a refused commit surfaces in JS as
     /// a `RangeError` and does not stop the context.
     V8BackingPages,
+    /// Committed pages of V8 WebAssembly memories in contexts with metered
+    /// WebAssembly ([`crate::WasmPolicy::EnabledMetered`]). Charged softly: a
+    /// refused commit fails `memory.grow` (it returns `-1`) or makes
+    /// `new WebAssembly.Memory` throw a `RangeError`.
+    V8WasmMemory,
+    /// Committed V8 WebAssembly code in contexts with metered WebAssembly.
+    /// Charged softly after V8 committed it (from inside V8's code allocator,
+    /// so the embedder must not stop the application there): V8 cannot fail
+    /// a code commit, so a refusal stops the context instead and is reported
+    /// as [`NapiLimitExceeded::WasmCodeMemory`].
+    V8WasmCode,
+}
+
+/// A provider-enforced limit, outside the memory total, whose breach stopped
+/// the application's JavaScript. See
+/// [`NapiMemoryAccountant::limit_exceeded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NapiLimitExceeded {
+    /// Committed WebAssembly code exceeded the context's code budget
+    /// ([`crate::WasmLimits::code_budget_bytes`]).
+    WasmCodeBudget {
+        /// Committed code bytes when the budget was found exceeded.
+        committed: u64,
+        /// The budget.
+        budget: u64,
+    },
+    /// Committed wasm code did not fit the memory limit. The provider cannot
+    /// refuse a code commit, so it stopped the context; the embedder should
+    /// treat this like an exhausted memory limit.
+    WasmCodeMemory {
+        /// The context's committed (charged) wasm code at the time.
+        committed: u64,
+        /// The memory limit.
+        limit: u64,
+    },
+    /// A wasm code commit of this context took the process's metered wasm
+    /// code past the hard process limit (twice
+    /// [`crate::WasmEngineLimits::process_code_budget_bytes`]). Lazy
+    /// compilation of already admitted modules cannot be refused, so the
+    /// committing context is stopped to keep V8's own process-wide limit,
+    /// whose breach aborts the process, out of reach.
+    WasmProcessCode {
+        /// Process-wide committed wasm code at the time.
+        committed: u64,
+        /// The hard process limit.
+        limit: u64,
+    },
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -129,6 +177,24 @@ pub trait NapiMemoryAccountant: Send + Sync {
     /// [`try_charge`](Self::try_charge) is terminal should override it.
     fn try_charge_soft(&self, bytes: u64) -> bool {
         self.try_charge(bytes)
+    }
+    /// [`try_charge_soft`](Self::try_charge_soft) with the N-API pool being
+    /// charged ([`Pool::V8BackingPages`], [`Pool::V8WasmMemory`] or
+    /// [`Pool::V8WasmCode`]), for
+    /// embedders that label denials. Same contract; defaults to
+    /// `try_charge_soft`.
+    fn try_charge_soft_for(&self, pool: Pool, bytes: u64) -> bool {
+        let _ = pool;
+        self.try_charge_soft(bytes)
+    }
+    /// N-API stopped the application's JavaScript because it exceeded a
+    /// provider-enforced limit that is not part of the memory total. Called
+    /// at most once per limit and context, off V8's allocation path; the
+    /// embedder should treat it like an exhausted memory limit (for example
+    /// end the workload). The default does nothing beyond the stop N-API
+    /// already performed.
+    fn limit_exceeded(&self, limit: NapiLimitExceeded) {
+        let _ = limit;
     }
     fn uncharge(&self, bytes: u64);
 }
@@ -181,6 +247,10 @@ pub struct ResourceUsage {
     pub host_bookkeeping: u64,
     /// Committed bytes of page-allocated V8 buffers (resizable buffers).
     pub v8_backing_pages: u64,
+    /// Committed bytes of metered V8 WebAssembly memories.
+    pub v8_wasm_memory: u64,
+    /// Committed bytes of metered V8 WebAssembly code.
+    pub v8_wasm_code: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -238,6 +308,8 @@ pub struct ResourceBudget {
     serialized_message: AtomicU64,
     host_bookkeeping: AtomicU64,
     v8_backing_pages: AtomicU64,
+    v8_wasm_memory: AtomicU64,
+    v8_wasm_code: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -273,6 +345,11 @@ impl std::fmt::Debug for ResourceBudget {
                 "v8_backing_pages",
                 &self.v8_backing_pages.load(Ordering::Acquire),
             )
+            .field(
+                "v8_wasm_memory",
+                &self.v8_wasm_memory.load(Ordering::Acquire),
+            )
+            .field("v8_wasm_code", &self.v8_wasm_code.load(Ordering::Acquire))
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
     }
@@ -314,6 +391,8 @@ impl ResourceBudget {
             serialized_message: AtomicU64::new(0),
             host_bookkeeping: AtomicU64::new(0),
             v8_backing_pages: AtomicU64::new(0),
+            v8_wasm_memory: AtomicU64::new(0),
+            v8_wasm_code: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -331,6 +410,8 @@ impl ResourceBudget {
             serialized_message: AtomicU64::new(0),
             host_bookkeeping: AtomicU64::new(0),
             v8_backing_pages: AtomicU64::new(0),
+            v8_wasm_memory: AtomicU64::new(0),
+            v8_wasm_code: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -384,7 +465,7 @@ impl ResourceBudget {
 
         if let Some(accountant) = &self.accountant {
             let granted = if soft {
-                accountant.try_charge_soft(bytes)
+                accountant.try_charge_soft_for(pool, bytes)
             } else {
                 accountant.try_charge(bytes)
             };
@@ -453,6 +534,8 @@ impl ResourceBudget {
             Pool::SerializedMessage => &self.serialized_message,
             Pool::HostBookkeeping => &self.host_bookkeeping,
             Pool::V8BackingPages => &self.v8_backing_pages,
+            Pool::V8WasmMemory => &self.v8_wasm_memory,
+            Pool::V8WasmCode => &self.v8_wasm_code,
         }
     }
 
@@ -469,7 +552,17 @@ impl ResourceBudget {
             serialized_message: self.serialized_message.load(Ordering::Acquire),
             host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
             v8_backing_pages: self.v8_backing_pages.load(Ordering::Acquire),
+            v8_wasm_memory: self.v8_wasm_memory.load(Ordering::Acquire),
+            v8_wasm_code: self.v8_wasm_code.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
+        }
+    }
+
+    /// Reports a provider-enforced limit breach to the embedder accountant,
+    /// if any (see [`NapiMemoryAccountant::limit_exceeded`]).
+    pub(crate) fn notify_limit_exceeded(&self, limit: NapiLimitExceeded) {
+        if let Some(accountant) = &self.accountant {
+            accountant.limit_exceeded(limit);
         }
     }
 
