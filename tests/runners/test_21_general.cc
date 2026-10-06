@@ -32,7 +32,7 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
 extern "C" size_t unofficial_napi_message_retained_bytes(
     unofficial_napi_message message);
 // Provider-private env creation with an embedder WebAssembly policy
-// (NapiWebAssemblyPolicy: 0 = restrict guest-heap envs, 1 = allow unmetered).
+// (NapiWebAssemblyPolicy: 0 = restrict, 1 = unmetered, 2 = metered).
 extern "C" napi_status snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
@@ -163,6 +163,7 @@ namespace {
 
 constexpr uint32_t kWebAssemblyRestrictGuestHeap = 0;
 constexpr uint32_t kWebAssemblyAllowUnmetered = 1;
+constexpr uint32_t kWebAssemblyAllowMetered = 2;
 
 // (module (func (export "add") (param i32 i32) (result i32)
 //   local.get 0 local.get 1 i32.add))
@@ -205,6 +206,29 @@ bool CanCompileWasm() {
 }  // namespace
 
 TEST_F(Test21General, UnknownWebAssemblyPolicyIsRejectedAfterTakingGuestHeap) {
+  for (uint32_t policy : {kWebAssemblyAllowMetered + 1, UINT32_MAX}) {
+    SCOPED_TRACE(policy);
+    unofficial_napi_env_create_options options{};
+    InitializeTestEnvCreateOptions(&options);
+    int guest_heap_marker = 0;
+    options.guest_heap =
+        reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+
+    g_guest_heap_release_calls = 0;
+    g_last_released_guest_heap_ctx = nullptr;
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                       policy, &env, &owner),
+              napi_invalid_arg);
+    EXPECT_EQ(env, nullptr);
+    EXPECT_EQ(owner, nullptr);
+    EXPECT_EQ(g_guest_heap_release_calls, 1);
+    EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+  }
+}
+
+TEST_F(Test21General, MeteredWebAssemblyRequiresConfiguredAccounting) {
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
   int guest_heap_marker = 0;
@@ -216,9 +240,8 @@ TEST_F(Test21General, UnknownWebAssemblyPolicyIsRejectedAfterTakingGuestHeap) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
-                                     kWebAssemblyAllowUnmetered + 1, &env,
-                                     &owner),
-            napi_invalid_arg);
+                                     kWebAssemblyAllowMetered, &env, &owner),
+            napi_generic_failure);
   EXPECT_EQ(env, nullptr);
   EXPECT_EQ(owner, nullptr);
   EXPECT_EQ(g_guest_heap_release_calls, 1);
