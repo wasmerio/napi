@@ -510,8 +510,8 @@ void EdgeV8Platform::ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env en
   state->runner->ClearTarget(env);
 }
 
-void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
-  if (fallback_ == nullptr || isolate == nullptr) return;
+bool EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
+  if (fallback_ == nullptr || isolate == nullptr) return false;
   // ForegroundTaskRunner::PostTaskCommon forwards to the guest's bound
   // enqueue callback when one is set, but falls back to fallback_'s own
   // GetForegroundTaskRunner() when no guest target is bound (e.g. the guest
@@ -519,9 +519,10 @@ void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   // calls BindForegroundTaskTarget). Nothing else pumps that fallback
   // runner's queue, so tasks routed there -- including V8-internal work like
   // Heap::PostFinalizationRegistryCleanupTaskIfNeeded's cleanup task -- would
-  // otherwise be posted and never run. Drain it explicitly.
-  while (v8::platform::PumpMessageLoop(fallback_.get(), isolate)) {
-  }
+  // otherwise be posted and never run. Admit one task per checkpoint so
+  // self-rescheduling GC work cannot monopolize the guest's event-loop turn.
+  // The caller reports progress to keep the loop runnable for the next task.
+  return v8::platform::PumpMessageLoop(fallback_.get(), isolate);
 }
 
 int EdgeV8Platform::NumberOfWorkerThreads() {

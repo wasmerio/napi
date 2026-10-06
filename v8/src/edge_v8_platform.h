@@ -43,7 +43,9 @@ class EdgeV8Platform final : public v8::Platform {
   void ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env env);
   void AddPendingForegroundTask(const std::shared_ptr<IsolateState>& state);
   void CompletePendingForegroundTask(const std::shared_ptr<IsolateState>& state);
-  void PumpPendingForegroundTasks(v8::Isolate* isolate);
+  // Run at most one ready fallback task. Returns true when a task ran so
+  // the embedder can admit another loop turn before continuing provider work.
+  bool PumpPendingForegroundTasks(v8::Isolate* isolate);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
