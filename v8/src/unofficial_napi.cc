@@ -2373,20 +2373,21 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 // FinalizationRegistry callbacks never fire. Pump it here, at the same point
 // microtasks are already checkpointed, so this deferred work always gets a
 // chance to run regardless of whether the guest wired up its own hook.
-void PumpPlatformForegroundTasks(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return;
+bool PumpPlatformForegroundTasks(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
   EdgeV8Platform* platform = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     platform = g_runtime.platform.get();
   }
   if (platform != nullptr) {
-    platform->PumpPendingForegroundTasks(env->isolate);
+    return platform->PumpPendingForegroundTasks(env->isolate);
   }
+  return false;
 }
 
-void DrainMicrotasksForEnv(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return;
+bool DrainMicrotasksForEnv(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
   env->DrainFinalizerQueue();
   v8::Local<v8::Context> context = env->context();
   if (!context.IsEmpty()) {
@@ -2394,13 +2395,12 @@ void DrainMicrotasksForEnv(napi_env env) {
     if (queue != nullptr) {
       queue->PerformCheckpoint(env->isolate);
       env->DrainFinalizerQueue();
-      PumpPlatformForegroundTasks(env);
-      return;
+      return PumpPlatformForegroundTasks(env);
     }
   }
   env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
-  PumpPlatformForegroundTasks(env);
+  return PumpPlatformForegroundTasks(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
@@ -2414,11 +2414,17 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
   }
-  DrainMicrotasksForEnv(env);
+  const bool host_task_admitted = DrainMicrotasksForEnv(env);
   if (state_out != nullptr) {
     *state_out = NapiV8HasPendingProviderWork(env)
                      ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
                      : unofficial_napi_event_loop_checkpoint_state_none;
+    if (host_task_admitted) {
+      // A task may have posted its successor. Conservatively request another
+      // turn; an empty pump clears this signal without inspecting delayed work.
+      *state_out |= unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted |
+                    unofficial_napi_event_loop_checkpoint_state_pending_provider_work;
+    }
   }
   return napi_ok;
 }
