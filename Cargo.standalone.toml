@@ -1,10 +1,16 @@
 [package]
 name = "wasmer-napi"
-version = "0.704.0"
+version = "0.705.0"
 description = "NAPI library for Wasmer WebAssembly runtime"
 edition = "2024"
 license = "MIT"
 resolver = "2"
+
+[package.metadata.napi]
+# The pinned public Wasmer SDK predates LinearMemory::do_wait_interruptible.
+# build.rs uses this marker so the compatibility path cannot be changed by
+# --no-default-features or --all-features.
+standalone_legacy_wait = true
 
 [features]
 js = [
@@ -33,7 +39,9 @@ cli = [
 anyhow = "1"
 # Standalone builds use one immutable Wasmer source revision. The N-API
 # instantiation hook and shared-memory bridge are developed together on the SDK
-# branch, so mixing this source with crates.io lacks required APIs.
+# branch, so mixing this source with crates.io lacks required APIs. This public
+# revision also carries the APIs needed by the wasm32+js backend. Edge's WASIX
+# child-reap integration uses its separately reviewed Wasmer source.
 wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
@@ -46,6 +54,7 @@ virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
+parking_lot = "0.12"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }

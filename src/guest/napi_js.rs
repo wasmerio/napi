@@ -7,6 +7,8 @@
 use std::ffi::{CString, c_void};
 
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
+use wasmer_wasix::WasiError;
+use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasm_bindgen::JsValue;
@@ -24,6 +26,7 @@ use crate::{
         },
         typedarray_element_size,
     },
+    message::MessageCharge,
     snapi::*,
 };
 
@@ -40,16 +43,26 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return env_id as i32;
     }
 
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status =
-        unsafe { snapi_bridge_unofficial_create_env(8, std::ptr::null(), &mut snapi_env_state) };
+    let status = unsafe {
+        snapi_bridge_unofficial_create_env(
+            8,
+            std::ptr::null(),
+            webassembly_policy,
+            &mut snapi_env_state,
+        )
+    };
     if status != 0 || snapi_env_state.is_null() {
         return 0;
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, _scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 0;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
@@ -489,15 +502,10 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: i32,
 ) -> i32 {
-    let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
+    let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
         return 1;
     };
-    let Ok(flags) = CString::new(flags) else {
-        return 1;
-    };
-    unsafe {
-        snapi_bridge_unofficial_configure_runtime(flags.as_ptr(), flags.as_bytes().len() as u32)
-    }
+    unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }
 }
 
 fn guest_unofficial_napi_create_env(
@@ -530,6 +538,7 @@ fn guest_unofficial_napi_create_env(
         (0, 0, 0, 0, 0, 0)
     };
 
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
@@ -541,6 +550,7 @@ fn guest_unofficial_napi_create_env(
             code_range_size_in_bytes,
             stack_limit,
             std::ptr::null(),
+            webassembly_policy,
             &mut snapi_env_state,
         )
     };
@@ -549,7 +559,10 @@ fn guest_unofficial_napi_create_env(
     }
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 1;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
@@ -1073,10 +1086,20 @@ fn guest_unofficial_napi_message_create(
     let mut payload = 0u32;
     let status =
         unsafe { snapi_bridge_unofficial_message_create(env_handle, value as u32, &mut payload) };
-    if status == 0 && payload_out_ptr > 0 {
-        write_guest_u32(&mut env, payload_out_ptr as u32, payload);
+    if status != 0 {
+        return status;
     }
-    status
+    let charge = MessageCharge::reserve(env.data().budget.clone(), 0).expect("zero-byte charge");
+    if env.data().pending_messages.insert(payload, charge).is_err() {
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+        return 1;
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr as u32, payload) {
+        drop(env.data().pending_messages.take(payload));
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+        return 1;
+    }
+    0
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -1089,6 +1112,13 @@ async fn guest_unofficial_napi_message_take_async(
     if payload <= 0 {
         return 1;
     }
+    let charge = {
+        let locked = env.read().await;
+        locked.data().pending_messages.take(payload as u32)
+    };
+    let Some(charge) = charge else {
+        return 1;
+    };
     if result_out_ptr <= 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
         return 1;
@@ -1098,6 +1128,7 @@ async fn guest_unofficial_napi_message_take_async(
         env.data().resolve_napi_env(napi_env)
     };
     let (status, value) = with_callback_state_async(env.as_mut(), env_handle, async move {
+        let _charge = charge;
         if crate::snapi_js::wait_for_message(payload as u32)
             .await
             .is_err()
@@ -1129,6 +1160,9 @@ fn guest_unofficial_napi_message_take_sync(
     if payload <= 0 {
         return 1;
     }
+    let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
+        return 1;
+    };
     if result_out_ptr <= 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
         return 1;
@@ -1153,8 +1187,13 @@ fn message_take_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -
     Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take_sync)
 }
 
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: i32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
+fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: i32) {
+    if payload > 0 {
+        let Some(_charge) = env.data().pending_messages.take(payload as u32) else {
+            return;
+        };
+        unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
+    }
 }
 
 fn guest_unofficial_napi_enqueue_microtask(
@@ -5613,38 +5652,11 @@ fn guest_napi_fatal_error(
     loc_len: i32,
     msg_ptr: i32,
     msg_len: i32,
-) -> i32 {
-    // Read location and message from guest memory
-    let loc = if loc_ptr > 0 {
-        let len = if loc_len as u32 == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, loc_ptr)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        } else {
-            loc_len as usize
-        };
-        read_guest_bytes(&mut env, loc_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
-    } else {
-        None
-    };
-    let msg = if msg_ptr > 0 {
-        let len = if msg_len as u32 == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, msg_ptr)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        } else {
-            msg_len as usize
-        };
-        read_guest_bytes(&mut env, msg_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
-    } else {
-        None
-    };
-    eprintln!(
-        "FATAL ERROR: location={}, message={}",
-        loc.as_deref().unwrap_or("(null)"),
-        msg.as_deref().unwrap_or("(null)")
-    );
-    std::process::abort();
+) -> Result<(), WasiError> {
+    let loc = read_guest_fatal_text(&mut env, loc_ptr, loc_len);
+    let msg = read_guest_fatal_text(&mut env, msg_ptr, msg_len);
+    eprintln!("FATAL ERROR: location={}, message={}", loc, msg);
+    Err(WasiError::Exit(ExitCode::from(1)))
 }
 
 // --- Constructor ---
@@ -5683,6 +5695,15 @@ fn guest_napi_new_instance(
 // Register WASM imports for both the core "napi" module and the
 // Wasmer-specific "napi_extension_wasmer_v0" extension module.
 // ============================================================
+
+/// The browser backend has no frozen native EdgeJS compatibility imports.
+/// Signature discrimination belongs to the native legacy provider only.
+pub(crate) fn frozen_napi_type_matches(
+    _name: &str,
+    _actual: &wasmer::FunctionType,
+) -> Option<bool> {
+    None
+}
 
 pub(crate) fn is_known_napi_import(name: &str) -> bool {
     matches!(
@@ -6062,7 +6083,9 @@ fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
 pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     macro_rules! reg_env {
         ($name:expr, $func:expr) => {
-            io.define("env", $name, Function::new_typed(store, $func));
+            if io.get_export("env", $name).is_none() {
+                io.define("env", $name, Function::new_typed(store, $func));
+            }
         };
     }
 

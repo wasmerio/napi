@@ -28,6 +28,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "internal/restricted_context.h"
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
@@ -42,6 +43,10 @@ struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
   std::string engine_flags;
   uint32_t refcount = 0;
+  // Host WebAssembly limits (snapi_v8_configure_wasm_engine), applied when
+  // the platform is created.
+  bool has_wasm_engine = false;
+  snapi_v8_wasm_engine_config wasm_engine{};
 };
 
 class TrackingArrayBufferAllocator;
@@ -349,7 +354,8 @@ void ResetPrepareStackTraceState(PrepareStackTraceState* state) {
 }
 
 v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
-                                                        v8::Local<v8::Context> context) {
+                                                        v8::Local<v8::Context> context,
+                                                        bool is_contextify_context) {
   if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) {
     return v8::Local<v8::Function>();
   }
@@ -363,7 +369,7 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
   v8::Local<v8::Context> principal_context = env->context();
   const bool use_principal_callback =
       !principal_context.IsEmpty() &&
-      (context == principal_context || NapiV8IsContextifyContext(env, context));
+      (context == principal_context || is_contextify_context);
 
   if (use_principal_callback) {
     return state.principal_callback.Get(context->GetIsolate());
@@ -396,9 +402,13 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   }
 
   v8::Local<v8::Function> callback;
+  // Contextify membership takes g_context_mu. Resolve it before g_runtime_mu
+  // so promise-hook updates cannot take the two locks in the opposite order.
+  const bool is_contextify_context = NapiV8IsContextifyContext(env, context);
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
-    callback = LookupPrepareStackTraceCallback(env, context);
+    callback = LookupPrepareStackTraceCallback(env, context,
+                                               is_contextify_context);
   }
 
   if (callback.IsEmpty()) {
@@ -645,6 +655,34 @@ void ApplyDefaultV8Flags() {
       static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
 }
 
+bool SameWasmEngineConfig(const snapi_v8_wasm_engine_config& a,
+                          const snapi_v8_wasm_engine_config& b) {
+  return a.max_memory_pages == b.max_memory_pages &&
+         a.max_module_bytes == b.max_module_bytes &&
+         a.max_functions == b.max_functions &&
+         a.liftoff_only == b.liftoff_only &&
+         a.max_table_size == b.max_table_size &&
+         a.process_code_budget_bytes == b.process_code_budget_bytes;
+}
+
+// Built from validated numbers only: V8 ignores unknown or malformed flags
+// silently, so embedders never pass flag strings here.
+void ApplyWasmEngineFlags(const snapi_v8_wasm_engine_config& config) {
+  char flags[256];
+  const int length = std::snprintf(
+      flags, sizeof(flags),
+      "--wasm-max-mem-pages=%u --wasm-max-module-size=%llu "
+      "--max-wasm-functions=%u --wasm-max-table-size=%u "
+      "--no-wasm-native-module-cache%s",
+      config.max_memory_pages,
+      static_cast<unsigned long long>(config.max_module_bytes),
+      config.max_functions, config.max_table_size,
+      config.liftoff_only != 0 ? " --liftoff-only" : "");
+  if (length > 0 && static_cast<size_t>(length) < sizeof(flags)) {
+    v8::V8::SetFlagsFromString(flags, length);
+  }
+}
+
 void FatalErrorCallback(const char* location, const char* message) {
   v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
   if (isolate == nullptr) return;
@@ -697,22 +735,34 @@ napi_status ConfigureRuntime(const char* engine_flags,
   }
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform != nullptr) {
-    return g_runtime.engine_flags.size() == engine_flags_length &&
-                   (engine_flags_length == 0 ||
-                    std::memcmp(g_runtime.engine_flags.data(), engine_flags,
-                                engine_flags_length) == 0)
-               ? napi_ok
-               : napi_invalid_arg;
+    const bool flags_match =
+        g_runtime.engine_flags.size() == engine_flags_length &&
+        (engine_flags_length == 0 ||
+         std::memcmp(g_runtime.engine_flags.data(), engine_flags,
+                     engine_flags_length) == 0);
+    if (!flags_match) return napi_invalid_arg;
+    if (snapi_v8_lane_current() == nullptr &&
+        !g_runtime.platform->EnableStandaloneWorkers()) {
+      return napi_generic_failure;
+    }
+    return napi_ok;
   }
 
+  // Process-wide V8 and cppgc reservations made here belong to no context.
+  EdgeV8PageAttributionPause page_attribution_pause;
   ApplyDefaultV8Flags();
+  if (g_runtime.has_wasm_engine) {
+    ApplyWasmEngineFlags(g_runtime.wasm_engine);
+    EdgeV8EnableWasmCodeMetering(g_runtime.wasm_engine.process_code_budget_bytes);
+  }
   if (engine_flags_length > 0) {
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
   }
   v8::V8::InitializeICUDefaultLocation("");
   v8::V8::InitializeExternalStartupData("");
-  g_runtime.platform = EdgeV8Platform::Create();
+  g_runtime.platform = EdgeV8Platform::Create(
+      snapi_v8_lane_current() == nullptr);
   if (g_runtime.platform == nullptr) return napi_generic_failure;
   v8::V8::InitializePlatform(g_runtime.platform.get());
   v8::V8::Initialize();
@@ -721,10 +771,43 @@ napi_status ConfigureRuntime(const char* engine_flags,
   return napi_ok;
 }
 
+napi_status ConfigureWasmEngine(const snapi_v8_wasm_engine_config* config) {
+  constexpr uint64_t kMiB = uint64_t{1} << 20;
+  if (config == nullptr || config->size < sizeof(snapi_v8_wasm_engine_config) ||
+      config->max_memory_pages == 0 || config->max_memory_pages > 65536 ||
+      config->max_module_bytes < 16 || config->max_module_bytes > 1024 * kMiB ||
+      config->max_functions == 0 || config->max_functions > 1000000 ||
+      config->liftoff_only > 1 || config->max_table_size == 0 ||
+      // Tables live on the V8 heap; a single huge allocation there is fatal.
+      config->max_table_size > 10000000 || config->reserved != 0 ||
+      config->process_code_budget_bytes < kMiB ||
+      // The hard limit (2x) stays at most 3 GiB, leaving 1 GiB below V8's
+      // process-wide committed-code limit (4095 MiB, whose breach aborts the
+      // process) for in-flight compilations and unmetered contexts.
+      config->process_code_budget_bytes > 1536 * kMiB) {
+    return napi_invalid_arg;
+  }
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (g_runtime.platform != nullptr) {
+    return g_runtime.has_wasm_engine &&
+                   SameWasmEngineConfig(g_runtime.wasm_engine, *config)
+               ? napi_ok
+               : napi_generic_failure;
+  }
+  g_runtime.wasm_engine = *config;
+  g_runtime.wasm_engine.size = sizeof(snapi_v8_wasm_engine_config);
+  g_runtime.has_wasm_engine = true;
+  return napi_ok;
+}
+
 napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform == nullptr) return napi_invalid_arg;
+  if (snapi_v8_lane_current() == nullptr &&
+      !g_runtime.platform->EnableStandaloneWorkers()) {
+    return napi_generic_failure;
+  }
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;
@@ -1426,6 +1509,8 @@ namespace {
 using v8impl::detail::DeserializerContext;
 using v8impl::detail::SerializerContext;
 
+void ThrowCloneTransferError(v8::Isolate* isolate, const char* message);
+
 void SetProtoMethod(v8::Isolate* isolate,
                     v8::Local<v8::FunctionTemplate> tmpl,
                     const char* name,
@@ -1447,8 +1532,24 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate)
-      : isolate_(isolate) {}
+  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate,
+                                             size_t max_buffer_bytes = 0)
+      : isolate_(isolate), max_buffer_bytes_(max_buffer_bytes) {}
+
+  void* ReallocateBufferMemory(void* old_buffer, size_t size,
+                               size_t* actual_size) override {
+    if (max_buffer_bytes_ != 0 && size > max_buffer_bytes_) return nullptr;
+    void* buffer = std::realloc(old_buffer, size);
+    if (buffer != nullptr) {
+      *actual_size = size;
+      buffer_capacity_ = size;
+    }
+    return buffer;
+  }
+
+  void FreeBufferMemory(void* buffer) override { std::free(buffer); }
+
+  size_t buffer_capacity() const { return buffer_capacity_; }
 
   void ThrowDataCloneError(v8::Local<v8::String> message) override {
     isolate_->ThrowException(v8::Exception::Error(message));
@@ -1464,6 +1565,11 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
         return v8::Just(i);
       }
     }
+    // Bound side-table metadata as well as the serialized byte buffer.
+    if (max_buffer_bytes_ != 0 && shared_array_buffers_.size() >= 65536) {
+      ThrowCloneTransferError(isolate_, "Too many shared buffers in message");
+      return v8::Nothing<uint32_t>();
+    }
     shared_array_buffers_.push_back(std::move(backing_store));
     return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
   }
@@ -1471,6 +1577,10 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
   v8::Maybe<uint32_t> GetWasmModuleTransferId(
       v8::Isolate* /*isolate*/,
       v8::Local<v8::WasmModuleObject> module) override {
+    if (max_buffer_bytes_ != 0 && wasm_modules_.size() >= 64) {
+      ThrowCloneTransferError(isolate_, "Too many Wasm modules in message");
+      return v8::Nothing<uint32_t>();
+    }
     wasm_modules_.push_back(module->GetCompiledModule());
     return v8::Just(static_cast<uint32_t>(wasm_modules_.size() - 1));
   }
@@ -1489,6 +1599,8 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
 
  private:
   v8::Isolate* isolate_ = nullptr;
+  size_t max_buffer_bytes_ = 0;
+  size_t buffer_capacity_ = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
   std::vector<v8::CompiledWasmModule> wasm_modules_;
 };
@@ -1524,7 +1636,9 @@ class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::
 };
 
 struct SerializedClonePayload {
-  std::vector<uint8_t> bytes;
+  std::unique_ptr<uint8_t, decltype(&std::free)> bytes{nullptr, &std::free};
+  size_t bytes_size = 0;
+  size_t bytes_capacity = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> array_buffers;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
   std::vector<v8::CompiledWasmModule> wasm_modules;
@@ -1570,6 +1684,10 @@ napi_status CollectTransferArrayBuffers(
       ThrowCloneTransferError(isolate, "Transfer list contains duplicate ArrayBuffer");
       return napi_pending_exception;
     }
+    if (out->size() >= 65536) {
+      ThrowCloneTransferError(isolate, "Too many ArrayBuffers in transfer list");
+      return napi_pending_exception;
+    }
     serializer->TransferArrayBuffer(static_cast<uint32_t>(out->size()), array_buffer);
     out->push_back(array_buffer);
   }
@@ -1595,7 +1713,8 @@ napi_status DetachTransferredArrayBuffers(
 
 napi_status DeserializeTransferredClone(
     napi_env env,
-    const std::vector<uint8_t>& bytes,
+    const uint8_t* bytes,
+    size_t bytes_size,
     const std::vector<std::shared_ptr<v8::BackingStore>>& array_buffers,
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
@@ -1610,8 +1729,8 @@ napi_status DeserializeTransferredClone(
       isolate, shared_array_buffers, wasm_modules);
   v8::ValueDeserializer deserializer(
       isolate,
-      bytes.data(),
-      bytes.size(),
+      bytes,
+      bytes_size,
       &deserializer_delegate);
 
   for (uint32_t i = 0; i < array_buffers.size(); ++i) {
@@ -1649,7 +1768,8 @@ napi_status StructuredCloneImpl(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  // The guest reserves native transient memory before entering this call.
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, 4 * 1024 * 1024);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   std::vector<v8::Local<v8::ArrayBuffer>> array_buffers;
@@ -1674,11 +1794,11 @@ napi_status StructuredCloneImpl(
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
 
-  std::vector<uint8_t> bytes(buffer.get(), buffer.get() + released.second);
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      bytes,
+      buffer.get(),
+      released.second,
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
@@ -1705,6 +1825,10 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 }
 
 extern "C" {
+
+int snapi_v8_configure_wasm_engine(const snapi_v8_wasm_engine_config* config) {
+  return ConfigureWasmEngine(config);
+}
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
     const unofficial_napi_runtime_options* options) {
@@ -1891,6 +2015,80 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
+    napi_env env, size_t* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  // Heap::OldGenerationCapacity() is what V8 compares against the hard limit
+  // (Heap::CanExpandOldGeneration): the paged old-generation spaces plus the
+  // old large-object spaces. It is not exported, so sum the committed memory
+  // of every space except the young generation and the read-only space; the
+  // committed figure is an upper bound of the capacity, so a limit raised to
+  // cover it always satisfies V8. Reading space statistics neither allocates
+  // nor collects, so this is safe from inside a near-heap-limit callback.
+  v8::Isolate* isolate = env->isolate;
+  size_t total = 0;
+  const size_t spaces = isolate->NumberOfHeapSpaces();
+  for (size_t index = 0; index < spaces; ++index) {
+    v8::HeapSpaceStatistics stats;
+    if (!isolate->GetHeapSpaceStatistics(&stats, index)) continue;
+    const char* name = stats.space_name();
+    if (name == nullptr || std::strcmp(name, "read_only_space") == 0 ||
+        std::strcmp(name, "new_space") == 0 ||
+        std::strcmp(name, "new_large_object_space") == 0) {
+      continue;
+    }
+    total += stats.space_size();
+  }
+  *result = total;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+    napi_env env, size_t old_generation_limit, bool* collected) {
+  if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
+    return napi_invalid_arg;
+  }
+  *collected = false;
+  v8::Isolate* isolate = env->isolate;
+  // The old generation can hold committed memory beyond the hard limit that
+  // no limit check has examined: NewLargeObjectSpace::AllocateRaw admits its
+  // first large object unconditionally, and a large object allocated on the
+  // retry-of-a-failed-allocation path takes a page from the OS directly
+  // (OldLargeObjectSpace::AllocateRaw via ShouldExpandOldGenerationOnSlowAllocation),
+  // in both cases without consulting the limit. An idle environment would
+  // keep that memory unaccounted for. If the old generation already exceeds
+  // the limit, run a collection: Heap::CollectGarbage promotes and frees,
+  // then compares the (post-GC, live) old generation against the limit and
+  // invokes the near-heap-limit callback if it is still exceeded, which
+  // charges the growth or stops the environment. So this terminates only an
+  // environment that *retains* memory beyond its budget, never one whose
+  // overshoot was transient garbage.
+  size_t committed_old = 0;
+  if (unofficial_napi_get_heap_committed_old_generation(env, &committed_old) !=
+      napi_ok) {
+    return napi_ok;
+  }
+  size_t limit = old_generation_limit;
+  if (limit == 0) {
+    // Unknown: fall back to the reported total limit (MaxReserved = old
+    // generation + young generation), which is looser than V8's own check by
+    // the young-generation allowance, so this under-triggers slightly.
+    v8::HeapStatistics heap;
+    isolate->GetHeapStatistics(&heap);
+    limit = heap.heap_size_limit();
+  }
+  if (committed_old <= limit) {
+    return napi_ok;
+  }
+  // The callback invoked during the collection may create handles.
+  v8::HandleScope handle_scope(isolate);
+  isolate->LowMemoryNotification();
+  *collected = true;
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
                                                            napi_value* result) {
@@ -1899,9 +2097,14 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(
+// Provider-private (never imported by guests): unofficial_napi_create_env
+// with an embedder-selected NapiWebAssemblyPolicy. The policy is a separate
+// argument rather than an env-create option because that descriptor is also
+// the guest's wire ABI.
+napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -1915,9 +2118,20 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // function owns it from here on and must release it exactly once.
   unofficial_napi_guest_heap guest_heap =
       options != nullptr ? options->guest_heap : nullptr;
-  if (env_out == nullptr || owner_out == nullptr) {
+  NapiWebAssemblyPolicy policy = NapiWebAssemblyPolicy::kRestrictGuestHeap;
+  if (env_out == nullptr || owner_out == nullptr ||
+      !NapiWebAssemblyPolicyFromRaw(webassembly_policy, &policy)) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
+  }
+  const bool restrict_webassembly =
+      RestrictsUnmeteredWebAssembly(policy, guest_heap != nullptr);
+  // Metered WebAssembly fails closed: without the lane's wasm accounting and
+  // the process-wide engine limits, nothing would bound or charge it.
+  if (policy == NapiWebAssemblyPolicy::kAllowMetered &&
+      !EdgeV8WasmMeteringReady()) {
+    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    return napi_generic_failure;
   }
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
@@ -1925,6 +2139,16 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
+  // Isolate and context setup runs no guest code; its reservations are
+  // V8's own even though the context's lane is already bound.
+  EdgeV8PageAttributionPause page_attribution_pause;
+
+  // Linux gives newly created threads the PKRU state of their creator. A
+  // worker thread that predates V8's process-wide JIT protection key may
+  // still have access disabled for that key. V8's dispatch table is then
+  // unreadable even though its page mapping is readable. Restore V8's
+  // documented default (read-only) permissions on this execution thread.
+  v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
@@ -1983,6 +2207,19 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
+  if (context.IsEmpty() ||
+      (restrict_webassembly && !RemoveUnmeteredWebAssembly(context))) {
+    delete scope;
+    DisposeIsolateAndWait(platform, isolate);
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_tracking_allocators.erase(allocator.get());
+    }
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
+  SetWasmCodeGenerationAllowed(context, !restrict_webassembly);
+  isolate->SetAllowWasmCodeGenerationCallback(AllowWasmCodeGeneration);
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
@@ -1996,10 +2233,23 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
+  // Contexts created later through contextify inherit the restriction.
+  scope->env->restrict_unmetered_webassembly = restrict_webassembly;
 
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out) {
+  return snapi_private_create_env(
+      module_api_version, options,
+      static_cast<uint32_t>(NapiWebAssemblyPolicy::kRestrictGuestHeap),
+      env_out, owner_out);
 }
 
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
@@ -2060,6 +2310,8 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
   if (current_context.IsEmpty()) {
     current_context = env->context();
   }
+  const bool is_contextify_context =
+      !current_context.IsEmpty() && NapiV8IsContextifyContext(env, current_context);
 
   bool has_prepare_stack_trace_callback = false;
   {
@@ -2070,7 +2322,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
         current_context.IsEmpty() ||
         (!principal_context.IsEmpty() &&
          (current_context == principal_context ||
-          NapiV8IsContextifyContext(env, current_context)));
+          is_contextify_context));
 
     if (use_principal_callback) {
       state.principal_callback.Reset();
@@ -2121,20 +2373,21 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 // FinalizationRegistry callbacks never fire. Pump it here, at the same point
 // microtasks are already checkpointed, so this deferred work always gets a
 // chance to run regardless of whether the guest wired up its own hook.
-void PumpPlatformForegroundTasks(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return;
+bool PumpPlatformForegroundTasks(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
   EdgeV8Platform* platform = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     platform = g_runtime.platform.get();
   }
   if (platform != nullptr) {
-    platform->PumpPendingForegroundTasks(env->isolate);
+    return platform->PumpPendingForegroundTasks(env->isolate);
   }
+  return false;
 }
 
-void DrainMicrotasksForEnv(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return;
+bool DrainMicrotasksForEnv(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
   env->DrainFinalizerQueue();
   v8::Local<v8::Context> context = env->context();
   if (!context.IsEmpty()) {
@@ -2142,13 +2395,12 @@ void DrainMicrotasksForEnv(napi_env env) {
     if (queue != nullptr) {
       queue->PerformCheckpoint(env->isolate);
       env->DrainFinalizerQueue();
-      PumpPlatformForegroundTasks(env);
-      return;
+      return PumpPlatformForegroundTasks(env);
     }
   }
   env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
-  PumpPlatformForegroundTasks(env);
+  return PumpPlatformForegroundTasks(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
@@ -2162,11 +2414,17 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
   }
-  DrainMicrotasksForEnv(env);
+  const bool host_task_admitted = DrainMicrotasksForEnv(env);
   if (state_out != nullptr) {
     *state_out = NapiV8HasPendingProviderWork(env)
                      ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
                      : unofficial_napi_event_loop_checkpoint_state_none;
+    if (host_task_admitted) {
+      // A task may have posted its successor. Conservatively request another
+      // turn; an empty pump clears this signal without inspecting delayed work.
+      *state_out |= unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted |
+                    unofficial_napi_event_loop_checkpoint_state_pending_provider_work;
+    }
   }
   return napi_ok;
 }
@@ -2264,7 +2522,10 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  // Worker messages are retained outside the V8 heap until another worker
+  // consumes them. Bound the native serializer buffer before it allocates.
+  constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, kMaxMessageBytes);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   serializer.WriteHeader();
@@ -2280,21 +2541,31 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
     std::free(released.first);
     return napi_generic_failure;
   }
-  payload->bytes.assign(released.first, released.first + released.second);
-  std::free(released.first);
+  payload->bytes.reset(released.first);
+  payload->bytes_size = released.second;
+  payload->bytes_capacity = serializer_delegate.buffer_capacity();
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_message_take(
+size_t unofficial_napi_message_retained_bytes(unofficial_napi_message message) {
+  auto* payload = reinterpret_cast<SerializedClonePayload*>(message);
+  if (payload == nullptr) return 0;
+  return sizeof(*payload) + payload->bytes_capacity +
+         payload->array_buffers.capacity() * sizeof(payload->array_buffers[0]) +
+         payload->shared_array_buffers.capacity() *
+             sizeof(payload->shared_array_buffers[0]) +
+         payload->wasm_modules.capacity() * sizeof(payload->wasm_modules[0]);
+}
+
+napi_status ReadSerializedMessage(
     napi_env env,
     unofficial_napi_message message,
     napi_value* result_out) {
   if (message == nullptr) return napi_invalid_arg;
-  std::unique_ptr<SerializedClonePayload> payload(
-      reinterpret_cast<SerializedClonePayload*>(message));
+  auto* payload = reinterpret_cast<SerializedClonePayload*>(message);
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2308,7 +2579,8 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      payload->bytes,
+      payload->bytes.get(),
+      payload->bytes_size,
       payload->array_buffers,
       payload->shared_array_buffers,
       payload->wasm_modules,
@@ -2317,6 +2589,20 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(output));
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+extern "C" napi_status unofficial_napi_message_read_legacy(
+    napi_env env, unofficial_napi_message message, napi_value* result_out) {
+  return ReadSerializedMessage(env, message, result_out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_message_take(
+    napi_env env,
+    unofficial_napi_message message,
+    napi_value* result_out) {
+  std::unique_ptr<SerializedClonePayload> owner(
+      reinterpret_cast<SerializedClonePayload*>(message));
+  return ReadSerializedMessage(env, message, result_out);
 }
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {

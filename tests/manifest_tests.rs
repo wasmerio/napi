@@ -6,7 +6,11 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // The standalone wrapper builds through a temporary manifest directory.
+    // Fixture scripts and nested CLI builds must use the actual source tree.
+    option_env!("NAPI_SOURCE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 fn path_from_env_or(name: &str, default: PathBuf) -> PathBuf {

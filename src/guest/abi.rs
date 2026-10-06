@@ -2,7 +2,7 @@ use wasmer::FunctionEnvMut;
 
 use crate::NapiEnv;
 
-use super::util::read_guest_bytes;
+use super::util::{HostCopy, read_guest_bytes};
 
 #[repr(C)]
 struct Wasm32VersionedHeader {
@@ -138,7 +138,7 @@ fn read_versioned(
     guest_ptr: i32,
     prefix_size: usize,
     version: u32,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy<u8>> {
     if guest_ptr <= 0 {
         return None;
     }
@@ -164,6 +164,7 @@ pub(crate) fn read_output_header(
         .then_some(size)
 }
 
+#[derive(Default)]
 pub(crate) struct EnvCreate {
     pub total_memory: u64,
     pub constrained_memory: u64,
@@ -173,29 +174,78 @@ pub(crate) struct EnvCreate {
     pub stack_limit: u32,
 }
 
-pub(crate) fn read_runtime_options(
+/// The 0.0.1 atom passes four raw wasm32 fields, without a size/version
+/// header. Its stack address is validated as wire data but never installed as
+/// a native V8 thread stack limit.
+pub(crate) fn read_legacy_env_create(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
-) -> Option<Vec<u8>> {
+) -> Option<EnvCreate> {
+    let bytes = read_guest_bytes(env, guest_ptr, 16)?;
+    Some(EnvCreate {
+        max_young_generation_size_in_bytes: u32_at(&bytes, 0)?,
+        max_old_generation_size_in_bytes: u32_at(&bytes, 4)?,
+        code_range_size_in_bytes: u32_at(&bytes, 8)?,
+        stack_limit: u32_at(&bytes, 12)?,
+        ..EnvCreate::default()
+    })
+}
+
+/// Longest engine flag string that is read from the guest. Every inert
+/// default is shorter, so longer strings are rejected without a host copy.
+const MAX_ENGINE_FLAGS_LENGTH: u32 = 64;
+
+/// Whether guest runtime options only request inert engine flags. Guests are
+/// never permitted to set process-wide V8 flags, but EdgeJS unconditionally
+/// passes its fixed defaults before it creates an env; those are accepted
+/// without being forwarded. `None` means the options are malformed.
+pub(crate) fn runtime_options_are_inert(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<bool> {
     if guest_ptr == 0 {
-        return Some(Vec::new());
+        return Some(true);
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
-    let flags_ptr = u32_at(
+    let flags = i32::try_from(u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
-    )? as i32;
+    )?)
+    .ok()?;
     let flags_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
-    )? as usize;
-    if flags_length == 0 {
-        return Some(Vec::new());
+    )?;
+    engine_flags_are_inert(env, flags, flags_length)
+}
+
+/// Whether a guest engine flag string only holds EdgeJS's fixed defaults.
+/// `None` means the string cannot be read.
+pub(crate) fn engine_flags_are_inert(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    length: u32,
+) -> Option<bool> {
+    if length == 0 {
+        return Some(true);
     }
-    if flags_ptr <= 0 {
+    if length > MAX_ENGINE_FLAGS_LENGTH {
+        return Some(false);
+    }
+    if guest_ptr <= 0 {
         return None;
     }
-    read_guest_bytes(env, flags_ptr, flags_length)
+    let bytes = read_guest_bytes(env, guest_ptr, length as usize)?;
+    Some(is_default_engine_flags(&bytes))
+}
+
+fn is_default_engine_flags(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"" | b"--js-source-phase-imports"
+            | b"--harmony-import-attributes"
+            | b"--js-source-phase-imports --harmony-import-attributes"
+    )
 }
 
 pub(crate) fn read_env_create(
@@ -267,6 +317,8 @@ pub(crate) fn read_js_source(
     }
 }
 
+// Kept alongside the versioned ABI while bytecode imports fail closed.
+#[allow(dead_code)]
 pub(crate) struct BytecodeOpen {
     pub source_text: u32,
     pub filename: u32,
@@ -275,11 +327,12 @@ pub(crate) struct BytecodeOpen {
     pub host_defined_option_id: u32,
     pub line_offset: i32,
     pub column_offset: i32,
-    pub cache: Vec<u8>,
+    pub cache: HostCopy<u8>,
     pub has_cache: u8,
     pub cache_policy: u8,
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_bytecode_open(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: i32,
@@ -304,7 +357,7 @@ pub(crate) fn read_bytecode_open(
         }
         read_guest_bytes(env, cache_ptr, cache_length)?
     } else {
-        Vec::new()
+        HostCopy::default()
     };
     Some(BytecodeOpen {
         source_text: u32_at(
@@ -523,5 +576,27 @@ impl Wasm32EnvHooksV1 {
     }
     const fn oom_error_callback_offset() -> usize {
         std::mem::offset_of!(Self, oom_error_callback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_default_engine_flags;
+
+    #[test]
+    fn only_edgejs_default_engine_flags_are_inert() {
+        assert!(is_default_engine_flags(
+            b"--js-source-phase-imports --harmony-import-attributes"
+        ));
+        assert!(is_default_engine_flags(b"--js-source-phase-imports"));
+        assert!(is_default_engine_flags(b"--harmony-import-attributes"));
+        assert!(is_default_engine_flags(b""));
+        assert!(!is_default_engine_flags(b"--allow-natives-syntax"));
+        assert!(!is_default_engine_flags(
+            b"--js-source-phase-imports --allow-natives-syntax"
+        ));
+        assert!(!is_default_engine_flags(
+            b"--harmony-import-attributes --js-source-phase-imports"
+        ));
     }
 }

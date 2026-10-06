@@ -25,6 +25,22 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
   g_last_released_guest_heap_ctx = ctx;
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+
+// Provider-internal accounting hook, intentionally absent from guest imports.
+extern "C" size_t unofficial_napi_message_retained_bytes(
+    unofficial_napi_message message);
+// Provider-private env creation with an embedder WebAssembly policy
+// (NapiWebAssemblyPolicy: 0 = restrict, 1 = unmetered, 2 = metered).
+extern "C" napi_status snapi_private_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out);
+#endif
+
 class Test21General : public FixtureTestBase {};
 
 namespace {
@@ -141,6 +157,153 @@ TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeOutp
   EXPECT_EQ(g_guest_heap_release_calls, 2);
   EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+constexpr uint32_t kWebAssemblyRestrictGuestHeap = 0;
+constexpr uint32_t kWebAssemblyAllowUnmetered = 1;
+constexpr uint32_t kWebAssemblyAllowMetered = 2;
+
+// (module (func (export "add") (param i32 i32) (result i32)
+//   local.get 0 local.get 1 i32.add))
+constexpr uint8_t kAddModule[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01,
+    0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07,
+    0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0a, 0x09, 0x01,
+    0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b};
+
+std::string TypeofWebAssembly(napi_env env) {
+  napi_value source = nullptr;
+  napi_value result = nullptr;
+  if (napi_create_string_utf8(env, "typeof WebAssembly", NAPI_AUTO_LENGTH,
+                              &source) != napi_ok ||
+      napi_run_script(env, source, &result) != napi_ok) {
+    return "<script failed>";
+  }
+  char text[32] = {0};
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, result, text, sizeof(text), &length) !=
+      napi_ok) {
+    return "<not a string>";
+  }
+  return std::string(text, length);
+}
+
+// Compiles through the V8 API in the env's current context. Unlike the JS
+// API this does not need the WebAssembly global, so it checks the
+// code-generation policy itself.
+bool CanCompileWasm() {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope scope(isolate);
+  v8::TryCatch try_catch(isolate);
+  return !v8::WasmModuleObject::Compile(
+              isolate, v8::MemorySpan<const uint8_t>(kAddModule,
+                                                     sizeof(kAddModule)))
+              .IsEmpty();
+}
+
+}  // namespace
+
+TEST_F(Test21General, UnknownWebAssemblyPolicyIsRejectedAfterTakingGuestHeap) {
+  for (uint32_t policy : {kWebAssemblyAllowMetered + 1, UINT32_MAX}) {
+    SCOPED_TRACE(policy);
+    unofficial_napi_env_create_options options{};
+    InitializeTestEnvCreateOptions(&options);
+    int guest_heap_marker = 0;
+    options.guest_heap =
+        reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+
+    g_guest_heap_release_calls = 0;
+    g_last_released_guest_heap_ctx = nullptr;
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                       policy, &env, &owner),
+              napi_invalid_arg);
+    EXPECT_EQ(env, nullptr);
+    EXPECT_EQ(owner, nullptr);
+    EXPECT_EQ(g_guest_heap_release_calls, 1);
+    EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+  }
+}
+
+TEST_F(Test21General, MeteredWebAssemblyRequiresConfiguredAccounting) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  int guest_heap_marker = 0;
+  options.guest_heap =
+      reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                     kWebAssemblyAllowMetered, &env, &owner),
+            napi_generic_failure);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 1);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+}
+
+TEST_F(Test21General, GuestHeapEnvironmentsRestrictWebAssemblyUnlessAllowed) {
+  struct Case {
+    const char* name;
+    bool use_public_entry;
+    uint32_t policy;
+    bool webassembly_available;
+  };
+  const Case cases[] = {
+      {"public default", true, kWebAssemblyRestrictGuestHeap, false},
+      {"explicit restrict", false, kWebAssemblyRestrictGuestHeap, false},
+      {"allow unmetered", false, kWebAssemblyAllowUnmetered, true},
+  };
+  for (const Case& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    unofficial_napi_env_create_options options{};
+    InitializeTestEnvCreateOptions(&options);
+    int guest_heap_marker = 0;
+    options.guest_heap =
+        reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+    g_guest_heap_release_calls = 0;
+
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    const napi_status status =
+        test_case.use_public_entry
+            ? unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION,
+                                         &options, &env, &owner)
+            : snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                       test_case.policy, &env, &owner);
+    ASSERT_EQ(status, napi_ok);
+    ASSERT_NE(env, nullptr);
+
+    EXPECT_EQ(TypeofWebAssembly(env),
+              test_case.webassembly_available ? "object" : "undefined");
+    EXPECT_EQ(CanCompileWasm(), test_case.webassembly_available);
+
+    ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+    EXPECT_EQ(g_guest_heap_release_calls, 1);
+  }
+}
+
+TEST_F(Test21General, EnvironmentsWithoutGuestHeapKeepWebAssembly) {
+  for (uint32_t policy :
+       {kWebAssemblyRestrictGuestHeap, kWebAssemblyAllowUnmetered}) {
+    SCOPED_TRACE(policy);
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    ASSERT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, nullptr,
+                                       policy, &env, &owner),
+              napi_ok);
+    EXPECT_EQ(TypeofWebAssembly(env), "object");
+    EXPECT_TRUE(CanCompileWasm());
+    ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  }
+}
+#endif
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;
@@ -297,14 +460,19 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   unofficial_napi_message message = nullptr;
   ASSERT_EQ(unofficial_napi_message_create(s.env, source, &message), napi_ok);
   ASSERT_NE(message, nullptr);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_GT(unofficial_napi_message_retained_bytes(message), 0u);
+#endif
 
+  // A worker receives the payload in its own isolate, not the sender's.
+  EnvScope receiver(runtime_.get());
   napi_value result = nullptr;
-  ASSERT_EQ(unofficial_napi_message_take(s.env, message, &result), napi_ok);
+  ASSERT_EQ(unofficial_napi_message_take(receiver.env, message, &result), napi_ok);
   ASSERT_NE(result, nullptr);
   napi_value answer = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, result, "answer", &answer), napi_ok);
+  ASSERT_EQ(napi_get_named_property(receiver.env, result, "answer", &answer), napi_ok);
   uint32_t actual = 0;
-  ASSERT_EQ(napi_get_value_uint32(s.env, answer, &actual), napi_ok);
+  ASSERT_EQ(napi_get_value_uint32(receiver.env, answer, &actual), napi_ok);
   EXPECT_EQ(actual, 42u);
 
   unofficial_napi_message dropped = nullptr;
@@ -312,6 +480,30 @@ TEST_F(Test21General, MessageTakeConsumesOpaqueMessage) {
   ASSERT_NE(dropped, nullptr);
   unofficial_napi_message_drop(dropped);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test21General, MessageSerializerRejectsOversizedPayload) {
+  EnvScope s(runtime_.get());
+  std::string bytes(5 * 1024 * 1024, 'x');
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, bytes.data(), bytes.size(), &value), napi_ok);
+  unofficial_napi_message message = nullptr;
+  EXPECT_EQ(unofficial_napi_message_create(s.env, value, &message),
+            napi_pending_exception);
+  EXPECT_EQ(message, nullptr);
+}
+
+TEST_F(Test21General, StructuredCloneRejectsOversizedPayload) {
+  EnvScope s(runtime_.get());
+  std::string bytes(5 * 1024 * 1024, 'x');
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(s.env, bytes.data(), bytes.size(), &value), napi_ok);
+  napi_value cloned = nullptr;
+  EXPECT_EQ(unofficial_napi_structured_clone(s.env, value, nullptr, &cloned),
+            napi_pending_exception);
+  EXPECT_EQ(cloned, nullptr);
+}
+#endif
 
 TEST_F(Test21General, ProviderFiltersIndexedPropertyNamesInBulk) {
   EnvScope s(runtime_.get());

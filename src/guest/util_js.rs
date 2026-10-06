@@ -8,6 +8,9 @@ use crate::{
     GuestBackingStoreMapping, HostBufferCopy, NapiEnv, snapi::snapi_bridge_create_reference,
 };
 
+/// The JavaScript-hosted guest backend has no native host snapshot budget.
+pub(crate) type HostCopy<T> = Vec<T>;
+
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
@@ -61,9 +64,36 @@ pub fn read_guest_bytes(
     if (guest_ptr as u64).checked_add(len as u64)? > view.data_size() {
         return None;
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
+}
+
+/// Copy a bounded diagnostic string supplied to `napi_fatal_error`.
+/// Explicit lengths may include NUL bytes; `-1` requests NUL termination.
+pub(crate) fn read_guest_fatal_text(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+    len: i32,
+) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if guest_ptr <= 0 {
+        return "(null)".to_owned();
+    }
+    let bytes = if len == -1 {
+        read_guest_c_string(env, guest_ptr)
+    } else {
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| read_guest_bytes(env, guest_ptr, len.min(MAX_DIAGNOSTIC_BYTES)))
+    };
+    bytes
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+        })
+        .unwrap_or_else(|| "(invalid guest string)".to_owned())
 }
 
 pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
@@ -317,7 +347,8 @@ pub fn read_guest_u32_array(
     count: usize,
 ) -> Option<Vec<u32>> {
     let bytes = read_guest_bytes(env, guest_ptr, count.checked_mul(4)?)?;
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).ok()?;
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }

@@ -32,8 +32,11 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "internal/restricted_context.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
+
+bool NapiV8HasPendingProviderWork(napi_env env);
 
 namespace {
 
@@ -86,8 +89,18 @@ struct ModuleWrapBindingState {
   napi_ref initialize_import_meta_ref = nullptr;
   std::vector<ModuleWrapRecord*> modules;
   std::vector<PendingProviderPromise> pending_dynamic_imports;
+  size_t pending_dynamic_imports_in_flight = 0;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
+  size_t request_metadata_bytes = 0;
 };
+
+// These native copies sit outside V8's heap accounting. Keep their maximum
+// below the fixed per-isolate overhead reserved by the host budget.
+constexpr size_t kMaxLiveModuleWraps = 2048;
+constexpr size_t kMaxModuleRequests = 4096;
+constexpr size_t kMaxModuleRequestMetadata = 4 * 1024 * 1024;
+constexpr size_t kMaxPendingProviderPromises = 4096;
+constexpr int kMaxDynamicImportAttributeEntries = 2048;
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
 napi_value GetSourceTextModuleDefaultHdoSymbol(napi_env env);
@@ -602,12 +615,20 @@ napi_env GetModuleWrapEnvForIsolate(v8::Isolate* isolate) {
 
 ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
   if (env == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
   return &g_module_wrap_states[env];
+}
+
+ModuleWrapBindingState* FindModuleWrapState(napi_env env) {
+  if (env == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  auto it = g_module_wrap_states.find(env);
+  return it == g_module_wrap_states.end() ? nullptr : &it->second;
 }
 
 void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
   if (env == nullptr || record == nullptr) return;
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return;
   auto& modules = state->modules;
   modules.erase(std::remove(modules.begin(), modules.end(), record), modules.end());
@@ -616,6 +637,22 @@ void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
 void DestroyModuleRecord(ModuleWrapRecord* record) {
   if (record == nullptr || record->env == nullptr) return;
   napi_env env = record->env;
+  if (auto* state = FindModuleWrapState(env)) {
+    if (record->request_metadata_bytes != 0) {
+      state->request_metadata_bytes -= record->request_metadata_bytes;
+      record->request_metadata_bytes = 0;
+    }
+    // Other modules keep raw dependency pointers for V8's resolve callback.
+    // Invalidate every incoming link before freeing this record.
+    for (ModuleWrapRecord* dependent : state->modules) {
+      if (dependent == nullptr || dependent == record) continue;
+      for (ModuleWrapRecord*& linked : dependent->linked_requests) {
+        if (linked == record) linked = nullptr;
+      }
+    }
+    if (state->temporary_required_module_facade_original == record)
+      state->temporary_required_module_facade_original = nullptr;
+  }
   RemoveModuleRecord(env, record);
   ResetRef(env, &record->wrapper_ref);
   ResetRef(env, &record->synthetic_eval_steps_ref);
@@ -748,21 +785,29 @@ bool SnapshotOwnProperties(v8::Isolate* isolate,
     return false;
   }
 
-  out->reserve(names->Length());
-  for (uint32_t i = 0; i < names->Length(); ++i) {
-    v8::Local<v8::Value> key_value;
-    if (!names->Get(context, i).ToLocal(&key_value) || !key_value->IsName()) {
-      continue;
+  // The Rust import reserves for this vector and its persistent handles
+  // before V8 can invoke a sandbox getter or Proxy trap.
+  if (names->Length() > 16 * 1024) return false;
+  try {
+    out->reserve(names->Length());
+    for (uint32_t i = 0; i < names->Length(); ++i) {
+      v8::Local<v8::Value> key_value;
+      if (!names->Get(context, i).ToLocal(&key_value) || !key_value->IsName()) {
+        continue;
+      }
+      v8::Local<v8::Name> key = key_value.As<v8::Name>();
+      v8::Local<v8::Value> value;
+      if (!object->Get(context, key).ToLocal(&value)) {
+        return false;
+      }
+      SavedOwnProperty saved;
+      saved.key.Reset(isolate, key);
+      saved.value.Reset(isolate, value);
+      out->push_back(std::move(saved));
     }
-    v8::Local<v8::Name> key = key_value.As<v8::Name>();
-    v8::Local<v8::Value> value;
-    if (!object->Get(context, key).ToLocal(&value)) {
-      return false;
-    }
-    SavedOwnProperty saved;
-    saved.key.Reset(isolate, key);
-    saved.value.Reset(isolate, value);
-    out->push_back(std::move(saved));
+  } catch (const std::bad_alloc&) {
+    out->clear();
+    return false;
   }
   return true;
 }
@@ -783,12 +828,16 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
 
 void CleanupContextRecords(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  g_context_cleanup_hooks.erase(env);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-  for (auto& rec : it->second) {
+  std::vector<ContextRecord> records;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    g_context_cleanup_hooks.erase(env);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    records = std::move(it->second);
+    g_context_records.erase(it);
+  }
+  for (auto& rec : records) {
     if (rec.key_ref != nullptr && env->context_token_unassign_callback != nullptr) {
       env->context_token_unassign_callback(
           env, rec.key_ref, env->context_token_callback_data);
@@ -800,7 +849,6 @@ void CleanupContextRecords(void* arg) {
     rec.context.Reset();
     rec.own_microtask_queue.reset();
   }
-  g_context_records.erase(it);
 }
 
 void EnsureContextCleanupHook(napi_env env) {
@@ -813,13 +861,18 @@ void EnsureContextCleanupHook(napi_env env) {
 
 void CleanupModuleWrapState(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  g_module_wrap_cleanup_hooks.erase(env);
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
-
-  for (ModuleWrapRecord* record : it->second.modules) {
+  ModuleWrapBindingState state;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    g_module_wrap_cleanup_hooks.erase(env);
+    auto it = g_module_wrap_states.find(env);
+    if (it == g_module_wrap_states.end()) return;
+    state = std::move(it->second);
+    g_module_wrap_states.erase(it);
+  }
+  // Releasing refs and modules enters V8. Keep the registry lock out of that
+  // work so teardown of one isolate cannot stall another isolate's lookup.
+  for (ModuleWrapRecord* record : state.modules) {
     if (record == nullptr) continue;
     ResetRef(env, &record->wrapper_ref);
     ResetRef(env, &record->synthetic_eval_steps_ref);
@@ -830,18 +883,21 @@ void CleanupModuleWrapState(void* arg) {
     env->release(record);
   }
 
-  ResetRef(env, &it->second.import_module_dynamically_ref);
-  ResetRef(env, &it->second.initialize_import_meta_ref);
-  for (auto& promise : it->second.pending_dynamic_imports) promise.value.Reset();
-  it->second.pending_dynamic_imports.clear();
-  g_module_wrap_states.erase(it);
+  ResetRef(env, &state.import_module_dynamically_ref);
+  ResetRef(env, &state.initialize_import_meta_ref);
+  for (auto& promise : state.pending_dynamic_imports) promise.value.Reset();
 }
 
 void EnsureModuleWrapCleanupHook(napi_env env) {
-  auto [it, inserted] = g_module_wrap_cleanup_hooks.emplace(env);
+  bool inserted;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    inserted = g_module_wrap_cleanup_hooks.emplace(env).second;
+  }
   if (!inserted) return;
   if (napi_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
-    g_module_wrap_cleanup_hooks.erase(it);
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    g_module_wrap_cleanup_hooks.erase(env);
   }
 }
 
@@ -921,7 +977,7 @@ void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const st
 }
 
 ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> module) {
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr || module.IsEmpty()) return nullptr;
   for (ModuleWrapRecord* record : state->modules) {
     if (record == nullptr || record->module.IsEmpty()) continue;
@@ -933,7 +989,7 @@ ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> 
 ModuleWrapRecord* FindModuleRecordForHandle(napi_env env,
                                             unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return nullptr;
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return nullptr;
   ModuleWrapRecord* candidate = ModuleRecord(module);
   auto it = std::find(state->modules.begin(), state->modules.end(), candidate);
@@ -1015,10 +1071,53 @@ bool PopulateModuleRequests(napi_env env,
                             v8::Local<v8::Context> context,
                             v8::Local<v8::Module> module) {
   if (env == nullptr || record == nullptr || module.IsEmpty()) return false;
+  auto* state = GetModuleWrapState(env);
+  if (state == nullptr || state->request_metadata_bytes > kMaxModuleRequestMetadata)
+    return false;
   record->module_requests.clear();
   record->resolve_cache.clear();
 
   v8::Local<v8::FixedArray> raw_requests = module->GetModuleRequests();
+  if (raw_requests->Length() < 0 ||
+      static_cast<size_t>(raw_requests->Length()) > kMaxModuleRequests)
+    return false;
+  const size_t available = kMaxModuleRequestMetadata - state->request_metadata_bytes;
+  size_t estimated_bytes = 0;
+  auto consume = [&](size_t bytes) {
+    if (bytes > available - estimated_bytes) return false;
+    estimated_bytes += bytes;
+    return true;
+  };
+  auto consume_string = [&](v8::Local<v8::Value> value) {
+    if (value.IsEmpty() || !value->IsString()) return false;
+    int length = value.As<v8::String>()->Utf8Length(env->isolate);
+    return length >= 0 &&
+           static_cast<size_t>(length) <= (available - estimated_bytes) / 4 &&
+           consume(static_cast<size_t>(length) * 4);
+  };
+  // Count all metadata before allocating any retained std::string or map
+  // entry. The factor of four covers the request text, serialized lookup key,
+  // temporary conversion, and allocator capacity; fixed overhead covers nodes
+  // and vector slack. The per-env sum includes every still-live module.
+  for (int i = 0; i < raw_requests->Length(); ++i) {
+    v8::Local<v8::Value> value = raw_requests->Get(context, i).As<v8::Value>();
+    if (value.IsEmpty() || !value->IsModuleRequest() || !consume(256))
+      return false;
+    v8::Local<v8::ModuleRequest> request = value.As<v8::ModuleRequest>();
+    if (!consume_string(request->GetSpecifier())) return false;
+    v8::Local<v8::FixedArray> attributes = request->GetImportAttributes();
+    if (attributes->Length() < 0 || attributes->Length() % 3 != 0 ||
+        static_cast<size_t>(attributes->Length() / 3) > kMaxModuleRequests)
+      return false;
+    for (int j = 0; j < attributes->Length(); j += 3) {
+      if (!consume(128) ||
+          !consume_string(attributes->Get(context, j).As<v8::Value>()) ||
+          !consume_string(attributes->Get(context, j + 1).As<v8::Value>()))
+        return false;
+    }
+  }
+  record->request_metadata_bytes = estimated_bytes;
+  state->request_metadata_bytes += estimated_bytes;
   record->module_requests.reserve(raw_requests->Length());
   for (int i = 0; i < raw_requests->Length(); ++i) {
     v8::Local<v8::Value> request_value = raw_requests->Get(context, i).As<v8::Value>();
@@ -1169,6 +1268,15 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
     v8::Local<v8::FixedArray> import_attributes) {
   v8::Isolate* isolate = env->isolate;
   v8::Local<v8::Context> context = env->context();
+  // Four native vectors are materialized below and in
+  // CreateFrozenNullProtoObject. Bound this transient metadata before reserve.
+  if (import_attributes->Length() < 0 ||
+      import_attributes->Length() > kMaxDynamicImportAttributeEntries ||
+      import_attributes->Length() % 2 != 0) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        OneByteString(isolate, "too many dynamic import attributes")));
+    return {};
+  }
   std::vector<v8::Local<v8::Name>> names;
   std::vector<v8::Local<v8::Value>> values;
   names.reserve(import_attributes->Length() / 2);
@@ -1193,7 +1301,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return v8::MaybeLocal<v8::Promise>();
 
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr) return v8::MaybeLocal<v8::Promise>();
   napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
   if (callback == nullptr) return v8::MaybeLocal<v8::Promise>();
@@ -1201,6 +1309,8 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   v8::Isolate* isolate = context->GetIsolate();
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(context);
+  NapiV8ProviderPromiseReservation reservation(isolate);
+  if (!reservation.acquired()) return v8::MaybeLocal<v8::Promise>();
 
   v8::Local<v8::Value> id = v8::Undefined(isolate);
   bool have_host_defined_options = false;
@@ -1227,11 +1337,14 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
 
   napi_value phase_value = nullptr;
   napi_create_int32(env, phase == v8::ModuleImportPhase::kSource ? 1 : 2, &phase_value);
+  v8::Local<v8::Object> attributes =
+      CreateDynamicImportAttributesObject(env, import_attributes);
+  if (attributes.IsEmpty()) return v8::MaybeLocal<v8::Promise>();
   napi_value argv[5] = {
       napi_v8_wrap_value(env, id),
       napi_v8_wrap_value(env, specifier),
       phase_value,
-      napi_v8_wrap_value(env, CreateDynamicImportAttributesObject(env, import_attributes)),
+      napi_v8_wrap_value(env, attributes),
       napi_v8_wrap_value(env, resource_name),
   };
 
@@ -1257,7 +1370,9 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     return v8::MaybeLocal<v8::Promise>();
   }
   v8::Local<v8::Promise> promise = resolver->GetPromise();
-  NapiV8TrackProviderPromise(isolate, promise);
+  if (!NapiV8TrackProviderPromise(isolate, promise)) {
+    return v8::MaybeLocal<v8::Promise>();
+  }
   return handle_scope.Escape(promise);
 }
 
@@ -1276,12 +1391,12 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
                                     v8::Local<v8::Object> meta) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return;
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return;
   ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
   if (record == nullptr) return;
 
-  napi_value callback = GetRefValue(env, it->second.initialize_import_meta_ref);
+  napi_value callback = GetRefValue(env, state->initialize_import_meta_ref);
   napi_value wrapper = GetRefValue(env, record->wrapper_ref);
   napi_value id_value = GetRefValue(env, record->host_defined_option_ref);
   if (callback == nullptr || wrapper == nullptr || id_value == nullptr) return;
@@ -1300,7 +1415,7 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
                                                       v8::Local<v8::Module> /*referrer*/) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return v8::MaybeLocal<v8::Module>();
-  auto* state = GetModuleWrapState(env);
+  auto* state = FindModuleWrapState(env);
   if (state == nullptr || state->temporary_required_module_facade_original == nullptr ||
       state->temporary_required_module_facade_original->module.IsEmpty()) {
     return v8::MaybeLocal<v8::Module>();
@@ -1490,10 +1605,19 @@ bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<s
   if (value.IsEmpty() || !value->IsArray()) return false;
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Array> array = value.As<v8::Array>();
-  out->reserve(array->Length());
-  for (uint32_t i = 0; i < array->Length(); ++i) {
+  constexpr uint32_t kMaxParams = 1024;
+  constexpr size_t kMaxParamBytes = 1024 * 1024;
+  const uint32_t length = array->Length();
+  if (length > kMaxParams) return false;
+  out->reserve(length);
+  size_t total_bytes = 0;
+  for (uint32_t i = 0; i < length; ++i) {
     v8::Local<v8::Value> item;
     if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
+    const int bytes = item.As<v8::String>()->Utf8Length(env->isolate);
+    if (bytes < 0 || static_cast<size_t>(bytes) > kMaxParamBytes - total_bytes)
+      return false;
+    total_bytes += static_cast<size_t>(bytes);
     out->push_back(V8ValueToUtf8(env->isolate, item));
   }
   return true;
@@ -1645,17 +1769,21 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
 
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
-    if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(env, context);
+  v8::HandleScope scope(env->isolate);
+  std::vector<v8::Local<v8::Context>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    contexts.reserve(it->second.size());
+    for (auto& rec : it->second) {
+      v8::Local<v8::Context> context = rec.context.Get(env->isolate);
+      if (!context.IsEmpty()) contexts.push_back(context);
     }
   }
+  // Applying hooks touches g_runtime_mu and can enter V8. Never hold the
+  // process-wide context registry mutex across either operation.
+  for (auto context : contexts) NapiV8ApplyPromiseHooksToContext(env, context);
 }
 
 extern "C" {
@@ -1673,7 +1801,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   if (env == nullptr || sandbox_or_symbol == nullptr || name == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
-  (void)allow_code_gen_wasm;
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
@@ -1726,7 +1853,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
         napi_v8_set_last_exception(
             env, try_catch.Exception(), try_catch.Message());
       }
-      return napi_pending_exception;
+      return try_catch.HasCaught() ? napi_pending_exception : napi_generic_failure;
     }
     maybe_global_object = sandbox_value;
   }
@@ -1745,6 +1872,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
 
   context->SetSecurityToken(current->GetSecurityToken());
   context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
+  SetWasmCodeGenerationAllowed(
+      context, !env->restrict_unmetered_webassembly && allow_code_gen_wasm);
   NapiV8ApplyPromiseHooksToContext(env, context);
 
   v8::Local<v8::Object> key_object;
@@ -1756,6 +1885,11 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
             isolate, context, key_object, saved_properties)) {
       return napi_pending_exception;
     }
+  }
+
+  if (env->restrict_unmetered_webassembly &&
+      !RemoveUnmeteredWebAssembly(context)) {
+    return napi_pending_exception;
   }
 
   napi_value key_napi = napi_v8_wrap_value(env, handle_scope.Escape(key_object));
@@ -1986,6 +2120,113 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_release(
   return napi_ok;
 }
 
+extern "C" napi_status NAPI_CDECL snapi_private_validate_script(
+    napi_env env,
+    napi_value source_text,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value host_defined_option_id) {
+  if (env == nullptr || source_text == nullptr || filename == nullptr) {
+    return napi_invalid_arg;
+  }
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Value> source_value = napi_v8_unwrap_value(source_text);
+  v8::Local<v8::Value> filename_value = napi_v8_unwrap_value(filename);
+  if (source_value.IsEmpty() || filename_value.IsEmpty()) return napi_invalid_arg;
+  if (!source_value->IsString() || !filename_value->IsString()) {
+    return napi_string_expected;
+  }
+
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (host_defined_option_id != nullptr) {
+    v8::Local<v8::Value> host_id = napi_v8_unwrap_value(host_defined_option_id);
+    if (!host_id.IsEmpty() && host_id->IsSymbol()) {
+      host_id_symbol = host_id.As<v8::Symbol>();
+    }
+  }
+  v8::Context::Scope context_scope(env->context());
+  v8::TryCatch try_catch(isolate);
+  v8::ScriptOrigin origin(filename_value,
+                          line_offset,
+                          column_offset,
+                          true,
+                          -1,
+                          v8::Local<v8::Value>(),
+                          false,
+                          false,
+                          false,
+                          HostDefinedOptions(isolate, host_id_symbol));
+  v8::ScriptCompiler::Source source(source_value.As<v8::String>(), origin);
+  v8::Local<v8::UnboundScript> compiled;
+  if (!v8::ScriptCompiler::CompileUnboundScript(
+           isolate, &source, v8::ScriptCompiler::kNoCompileOptions,
+           v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason)
+           .ToLocal(&compiled)) {
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      return ThrowTryCatchException(env, try_catch);
+    }
+    return try_catch.HasTerminated() ? napi_pending_exception : napi_generic_failure;
+  }
+  return napi_ok;
+}
+
+extern "C" napi_status NAPI_CDECL snapi_private_module_wrap_import_module_dynamically(
+    napi_env env, size_t argc, napi_value* argv, napi_value* result_out) {
+  if (env == nullptr || argv == nullptr || result_out == nullptr || argc == 0 || argc > 5)
+    return napi_invalid_arg;
+  *result_out = nullptr;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr)
+    return napi_generic_failure;
+  napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
+  if (callback == nullptr)
+    return napi_invalid_arg;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok)
+    return napi_generic_failure;
+  if (argc >= 5)
+    return napi_call_function(env, global, callback, 5, argv, result_out);
+
+  v8::Isolate* isolate = env->isolate;
+  v8::EscapableHandleScope scope(isolate);
+  napi_value phase = nullptr;
+  if (napi_create_int32(env, 2, &phase) != napi_ok)
+    return napi_generic_failure;
+  napi_value default_symbol = GetVmDynamicImportDefaultInternalSymbol(env);
+  napi_valuetype symbol_type = napi_undefined;
+  if (default_symbol == nullptr ||
+      napi_typeof(env, default_symbol, &symbol_type) != napi_ok ||
+      symbol_type != napi_symbol)
+    return napi_generic_failure;
+  napi_value referrer = argc >= 2 ? argv[1] : nullptr;
+  if (referrer == nullptr && napi_get_undefined(env, &referrer) != napi_ok)
+    return napi_generic_failure;
+  std::vector<v8::Local<v8::Name>> empty_names;
+  std::vector<v8::Local<v8::Value>> empty_values;
+  v8::Local<v8::Object> attributes_object =
+      CreateFrozenNullProtoObject(env, empty_names, empty_values);
+  if (attributes_object.IsEmpty())
+    return napi_generic_failure;
+  napi_value attributes = napi_v8_wrap_value(env, attributes_object);
+  if (attributes == nullptr)
+    return napi_generic_failure;
+  napi_value call_argv[5] = {
+      default_symbol, argv[0], phase, attributes, referrer,
+  };
+  napi_value result = nullptr;
+  napi_status status = napi_call_function(env, global, callback, 5, call_argv, &result);
+  if (status != napi_ok)
+    return status;
+  v8::Local<v8::Value> raw_result = napi_v8_unwrap_value(result);
+  if (raw_result.IsEmpty())
+    return napi_generic_failure;
+  *result_out = napi_v8_wrap_value(env, scope.Escape(raw_result));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
     napi_env env,
     napi_value sandbox_or_null,
@@ -2177,8 +2418,17 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     return napi_invalid_arg;
   }
 
-  std::string source_text = bytecode_record != nullptr ? bytecode_record->source_utf8
-                                                       : ToUtf8String(env, source->text, "");
+  std::string source_text;
+  if (bytecode_record != nullptr) {
+    source_text = bytecode_record->source_utf8;
+  } else {
+    v8::Local<v8::String> source_string = ToV8String(env, source->text, "");
+    const int source_bytes = source_string->Utf8Length(isolate);
+    if (source_bytes < 0 || source_bytes > 4 * 1024 * 1024)
+      return napi_invalid_arg;
+    source_text = V8ValueToUtf8(isolate, source_string);
+  }
+  if (source_text.size() > 4 * 1024 * 1024) return napi_invalid_arg;
   if (StartsWithBomHashbang(source_text)) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(
         isolate, "Invalid or unexpected token");
@@ -2193,6 +2443,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   }
 
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
+  if (filename_str->Utf8Length(isolate) > 1024 * 1024)
+    return napi_invalid_arg;
 
   v8::Local<v8::Symbol> host_id_symbol;
   if (host_defined_option_id != nullptr) {
@@ -2207,8 +2459,10 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     v8::Local<v8::Value> value = napi_v8_unwrap_value(context_extensions_or_undefined);
     if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
     v8::Local<v8::Array> array = value.As<v8::Array>();
-    context_extensions.reserve(array->Length());
-    for (uint32_t i = 0; i < array->Length(); ++i) {
+    const uint32_t length = array->Length();
+    if (length > 1024) return napi_invalid_arg;
+    context_extensions.reserve(length);
+    for (uint32_t i = 0; i < length; ++i) {
       v8::Local<v8::Value> item;
       if (!array->Get(current, i).ToLocal(&item) || !item->IsObject()) return napi_invalid_arg;
       context_extensions.push_back(item.As<v8::Object>());
@@ -2333,6 +2587,81 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
+// Private bridge entry for the published wasm32 EdgeJS CJS loader. Keep its
+// result object and ESM retry decision stable without adding an import to the
+// versioned guest surface.
+extern "C" napi_status unofficial_napi_contextify_compile_cjs_legacy(
+    napi_env env, napi_value code, napi_value filename, bool is_sea_main,
+    bool should_detect_module, napi_value* result_out) {
+  if (env == nullptr || code == nullptr || filename == nullptr || result_out == nullptr)
+    return napi_invalid_arg;
+  (void)is_sea_main;
+  v8::Isolate* isolate = env->isolate;
+  v8::EscapableHandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  v8::Local<v8::String> code_str = ToV8String(env, code, "");
+  if (code_str->Utf8Length(isolate) > 4 * 1024 * 1024)
+    return napi_invalid_arg;
+  v8::Local<v8::String> filename_str = ToV8String(env, filename, "[eval]");
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (napi_value host_id = GetVmDynamicImportDefaultInternalSymbol(env)) {
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(host_id);
+    if (!raw.IsEmpty() && raw->IsSymbol()) host_id_symbol = raw.As<v8::Symbol>();
+  }
+
+  v8::Local<v8::Function> fn;
+  v8::Local<v8::Value> cjs_exception;
+  v8::Local<v8::Message> cjs_message;
+  bool cjs_ok = false;
+  {
+    v8::TryCatch try_catch(isolate);
+    cjs_ok = CompileCjsFunction(context, code_str, filename_str, true,
+                                host_id_symbol).ToLocal(&fn);
+    if (!cjs_ok && try_catch.HasCaught()) {
+      cjs_exception = try_catch.Exception();
+      cjs_message = try_catch.Message();
+    }
+  }
+  bool can_parse_as_esm = false;
+  if (!cjs_ok) {
+    if (!cjs_message.IsEmpty()) {
+      can_parse_as_esm = ShouldRetryAsEsm(isolate, context, env,
+                                         cjs_message->Get(), code_str, filename_str);
+    }
+    if (!can_parse_as_esm || !should_detect_module) {
+      if (!cjs_exception.IsEmpty()) {
+        unofficial_napi_internal::AttachSyntaxArrowMessage(
+            isolate, context, cjs_exception, cjs_message);
+        isolate->ThrowException(cjs_exception);
+      }
+      return cjs_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
+    }
+  }
+  v8::Local<v8::Object> out = v8::Object::New(isolate);
+  if (!SetNamed(context, out, "cachedDataRejected", v8::Boolean::New(isolate, false)) ||
+      !SetNamed(context, out, "canParseAsESM", v8::Boolean::New(isolate, can_parse_as_esm)))
+    return napi_generic_failure;
+  if (cjs_ok) {
+    if (!host_id_symbol.IsEmpty()) {
+      SetApiPrivate(context, fn.As<v8::Object>(),
+                    "node:host_defined_option_symbol", host_id_symbol.As<v8::Value>());
+    }
+    v8::ScriptOrigin origin = fn->GetScriptOrigin();
+    if (!SetNamed(context, out, "sourceMapURL", origin.SourceMapUrl()) ||
+        !SetNamed(context, out, "sourceURL", origin.ResourceName()) ||
+        !SetNamed(context, out, "function", fn))
+      return napi_generic_failure;
+  } else {
+    if (!SetNamed(context, out, "sourceMapURL", v8::Undefined(isolate)) ||
+        !SetNamed(context, out, "sourceURL", v8::Undefined(isolate)) ||
+        !SetNamed(context, out, "function", v8::Undefined(isolate)))
+      return napi_generic_failure;
+  }
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(out));
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
     napi_env env,
     napi_value code,
@@ -2393,6 +2722,8 @@ static napi_status CreateSourceTextModule(
   *module_out = nullptr;
 
   EnsureModuleWrapCleanupHook(env);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+    return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
@@ -2503,10 +2834,11 @@ static napi_status CreateSourceTextModule(
     return napi_generic_failure;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+    DestroyModuleRecord(record);
+    return napi_generic_failure;
   }
+  GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;
 }
@@ -2529,6 +2861,8 @@ static napi_status CreateSyntheticModule(
   if (napi_is_array(env, export_names, &is_array) != napi_ok || !is_array) return napi_invalid_arg;
 
   EnsureModuleWrapCleanupHook(env);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+    return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
@@ -2539,6 +2873,7 @@ static napi_status CreateSyntheticModule(
 
   uint32_t export_count = 0;
   napi_get_array_length(env, export_names, &export_count);
+  if (export_count > 1024) return napi_invalid_arg;
   std::vector<v8::Local<v8::String>> export_names_v8;
   export_names_v8.reserve(export_count);
   for (uint32_t i = 0; i < export_count; ++i) {
@@ -2562,10 +2897,11 @@ static napi_status CreateSyntheticModule(
   napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
   napi_create_reference(env, synthetic_eval_steps, 1, &record->synthetic_eval_steps_ref);
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
+  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+    DestroyModuleRecord(record);
+    return napi_generic_failure;
   }
+  GetModuleWrapState(env)->modules.push_back(record);
   *module_out = ModuleHandle(record);
   return napi_ok;
 }
@@ -2626,14 +2962,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
     unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    auto it = g_module_wrap_states.find(env);
-    if (it == g_module_wrap_states.end()) return napi_ok;
-    auto& modules = it->second.modules;
-    if (std::find(modules.begin(), modules.end(), record) == modules.end()) {
-      return napi_ok;
-    }
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr ||
+      std::find(state->modules.begin(), state->modules.end(), record) == state->modules.end()) {
+    return napi_ok;
   }
   DestroyModuleRecord(record);
   return napi_ok;
@@ -2690,29 +3022,36 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     const unofficial_napi_module* linked_modules) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (count > kMaxModuleRequests) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
   }
 
-  record->linked_requests.assign(count, nullptr);
-  for (size_t i = 0; i < count; ++i) {
-    ModuleWrapRecord* linked =
-        linked_modules != nullptr ? ModuleRecord(linked_modules[i]) : nullptr;
-    if (linked == nullptr) {
-      ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
-      return napi_pending_exception;
+  try {
+    std::vector<ModuleWrapRecord*> linked_requests(count, nullptr);
+    for (size_t i = 0; i < count; ++i) {
+      ModuleWrapRecord* linked =
+          linked_modules != nullptr ? ModuleRecord(linked_modules[i]) : nullptr;
+      if (linked == nullptr) {
+        ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
+        return napi_pending_exception;
+      }
+      linked_requests[i] = linked;
+      const std::string key = SerializeModuleRequestKey(
+          record->module_requests[i].specifier, record->module_requests[i].attributes);
+      auto it = record->resolve_cache.find(key);
+      if (it != record->resolve_cache.end() && it->second < i &&
+          linked_requests[it->second] != linked) {
+        ThrowCodeError(env,
+                       "ERR_MODULE_LINK_MISMATCH",
+                       "Module request '" + record->module_requests[i].specifier + "' must be linked to the same module");
+        return napi_pending_exception;
+      }
     }
-    record->linked_requests[i] = linked;
-    const std::string key =
-        SerializeModuleRequestKey(record->module_requests[i].specifier, record->module_requests[i].attributes);
-    auto it = record->resolve_cache.find(key);
-    if (it != record->resolve_cache.end() && it->second < i && record->linked_requests[it->second] != linked) {
-      ThrowCodeError(env,
-                     "ERR_MODULE_LINK_MISMATCH",
-                     "Module request '" + record->module_requests[i].specifier + "' must be linked to the same module");
-      return napi_pending_exception;
-    }
+    record->linked_requests.swap(linked_requests);
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
   return napi_ok;
 }
@@ -3006,12 +3345,34 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
   }
 
   EnsureModuleWrapCleanupHook(env);
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
   auto* state = GetModuleWrapState(env);
   ResetRef(env, &state->import_module_dynamically_ref);
   ResetRef(env, &state->initialize_import_meta_ref);
   state->import_module_dynamically_ref = import_ref;
   state->initialize_import_meta_ref = import_meta_ref;
+  env->isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
+  env->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(ImportModuleDynamicallyWithPhase);
+  env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);
+  return napi_ok;
+}
+
+extern "C" napi_status unofficial_napi_module_wrap_set_legacy_hook(
+    napi_env env, napi_value callback, int32_t kind) {
+  if (env == nullptr || (kind != 0 && kind != 1)) return napi_invalid_arg;
+  napi_ref new_ref = nullptr;
+  if (callback != nullptr) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, callback, &type) != napi_ok || type != napi_function)
+      return napi_invalid_arg;
+    napi_status status = napi_create_reference(env, callback, 1, &new_ref);
+    if (status != napi_ok) return status;
+  }
+  EnsureModuleWrapCleanupHook(env);
+  auto* state = GetModuleWrapState(env);
+  napi_ref* target = kind == 0 ? &state->import_module_dynamically_ref
+                                : &state->initialize_import_meta_ref;
+  ResetRef(env, target);
+  *target = new_ref;
   env->isolate->SetHostImportModuleDynamicallyCallback(ImportModuleDynamically);
   env->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(ImportModuleDynamicallyWithPhase);
   env->isolate->SetHostInitializeImportMetaObjectCallback(HostInitializeImportMetaObject);
@@ -3046,15 +3407,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     return napi_pending_exception;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = record;
-  }
+  GetModuleWrapState(env)->temporary_required_module_facade_original = record;
   const bool instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = nullptr;
-  }
+  GetModuleWrapState(env)->temporary_required_module_facade_original = nullptr;
   if (!instantiated) return napi_pending_exception;
 
   v8::Local<v8::Value> evaluated;
@@ -3065,25 +3420,68 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 
 }  // extern "C"
 
-void NapiV8TrackProviderPromise(v8::Isolate* isolate,
-                                v8::Local<v8::Promise> promise) {
-  if (isolate == nullptr || promise.IsEmpty()) return;
+NapiV8ProviderPromiseReservation::NapiV8ProviderPromiseReservation(
+    v8::Isolate* isolate)
+    : isolate_(isolate), acquired_(true), reserved_(false) {
+  if (isolate == nullptr) return;
   napi_env env = GetModuleWrapEnvForIsolate(isolate);
   if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto it = g_module_wrap_states.find(env);
-  if (it != g_module_wrap_states.end()) {
-    it->second.pending_dynamic_imports.emplace_back(isolate, promise);
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return;
+  if (state->pending_dynamic_imports.size() +
+          state->pending_dynamic_imports_in_flight >=
+      kMaxPendingProviderPromises) {
+    NapiV8HasPendingProviderWork(env);
+    if (state->pending_dynamic_imports.size() +
+            state->pending_dynamic_imports_in_flight >=
+        kMaxPendingProviderPromises) {
+      acquired_ = false;
+      isolate->ThrowException(v8::Exception::RangeError(
+          OneByteString(isolate, "too many pending dynamic imports")));
+      return;
+    }
   }
+  ++state->pending_dynamic_imports_in_flight;
+  reserved_ = true;
+}
+
+NapiV8ProviderPromiseReservation::~NapiV8ProviderPromiseReservation() {
+  if (!reserved_) return;
+  napi_env env = GetModuleWrapEnvForIsolate(isolate_);
+  if (env == nullptr) return;
+  auto* state = FindModuleWrapState(env);
+  if (state != nullptr && state->pending_dynamic_imports_in_flight != 0) {
+    --state->pending_dynamic_imports_in_flight;
+  }
+}
+
+bool NapiV8TrackProviderPromise(v8::Isolate* isolate,
+                                v8::Local<v8::Promise> promise) {
+  if (isolate == nullptr || promise.IsEmpty()) return true;
+  napi_env env = GetModuleWrapEnvForIsolate(isolate);
+  if (env == nullptr) return true;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return true;
+  if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
+    NapiV8HasPendingProviderWork(env);
+    if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
+      // Dropping tracking would let the instance report quiescence with guest
+      // module work still alive. End this isolate instead.
+      isolate->ThrowException(v8::Exception::RangeError(
+          OneByteString(isolate, "too many pending dynamic imports")));
+      return false;
+    }
+  }
+  state->pending_dynamic_imports.emplace_back(isolate, promise);
+  return true;
 }
 
 bool NapiV8HasPendingProviderWork(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return false;
-  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return false;
+  auto* state = FindModuleWrapState(env);
+  if (state == nullptr) return false;
 
-  auto& imports = it->second.pending_dynamic_imports;
+  auto& imports = state->pending_dynamic_imports;
   size_t write_index = 0;
   for (size_t index = 0; index < imports.size(); ++index) {
     auto& tracked = imports[index];
