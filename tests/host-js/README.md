@@ -11,17 +11,23 @@ The tests extract the context implementation from the JavaScript embedded in
 `src/snapi_js.rs`. They cover virtual global identity, lazy host accessor reads,
 context-owned writes, Error constructor/prototype ownership, native error
 compatibility, causes/subclasses, stack formatting and collection of released
-contexts and their shared WebAssembly buffers. The shared-object registry and
+contexts and their shared WebAssembly buffers. Retained callback wrappers must
+become inert on release and allow collection of their contexts and dispatch
+captures. The shared-object registry and
 module loader are outside this isolated test.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
-hook. Bun 1.3.14 does not honor it in the same way as V8, so those two tests skip
+hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip
 while the ownership and collection tests still run.
+
+Stack support is detected once per host realm. Modern V8 reuses its native lazy
+stack accessor; Node 20 exercises the fallback for lazy data properties.
 
 The Wasm Rust test `snapi_js::tests` creates 64 real N-API callback trampolines,
 releases their environment, checks that no unowned externref roots remain, and
-invokes a saved callback after release. It must return `undefined` through the
-liveness guard instead of entering the freed environment or throwing a
+verifies the Rust closure captures are freed immediately without GC. It invokes
+a saved callback after release, which must return `undefined` through its empty
+dispatch slot instead of entering the freed environment or throwing a
 dropped-closure error. With a matching `wasm-bindgen-test-runner`, `rust-src`
 and Acorn available to the runner, execute it with:
 

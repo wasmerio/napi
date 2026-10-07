@@ -26,6 +26,7 @@ try {
 
 const create = runtime.wasmer_napi_create_global_context;
 const evaluate = runtime.wasmer_napi_context_eval;
+const callback = runtime.wasmer_napi_make_callback;
 const stackFormattingSupported = (() => {
   const saved=Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),marker={};
   try {
@@ -70,6 +71,39 @@ test('a guest process assignment does not replace the worker process', () => {
   assert.equal(globalThis.process,original);
   assert.equal(b.scope.process,original);
   assert.deepEqual(a.scope.process,{guest:'a'});
+});
+
+test('closing an inactive context disables only its callbacks', () => {
+  const a=create(), b=create();
+  const fnA=callback(a,(receiver,args)=>({receiver,args}));
+  const fnB=callback(b,()=>{throw new Error('active callback');});
+  const receiver={guest:'a'};
+  assert.deepEqual(fnA.call(receiver,1,2),{receiver,args:[1,2]});
+  assert.throws(()=>fnB(),/active callback/);
+  runtime.wasmer_napi_activate_global_context(a);
+  runtime.wasmer_napi_release_global_context(b);
+  assert.equal(fnB(),undefined);
+  assert.equal(evaluate(undefined,'globalThis'),a.scope);
+  assert.deepEqual(fnA.call(receiver,3),{receiver,args:[3]});
+  runtime.wasmer_napi_release_global_context(a);
+  assert.equal(fnA(),undefined);
+});
+
+test('retained callback wrappers do not retain closed contexts or dispatch captures', async () => {
+  const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
+  const references=[], callbacks=[];
+  for(let i=0;i<12;i++) {
+    (() => {
+      const context=create();
+      const buffer=new ArrayBuffer(1024*1024);
+      callbacks.push(callback(context,()=>buffer));
+      runtime.wasmer_napi_release_global_context(context);
+      references.push(new WeakRef(context),new WeakRef(buffer));
+    })();
+  }
+  for(let i=0;i<8;i++) { await setImmediate(); gc(); }
+  assert.ok(callbacks.every(fn=>fn()===undefined));
+  assert.equal(references.filter(reference=>reference.deref()).length,0);
 });
 
 test('Error constructors, static hooks and prototype writes stay local', () => {
@@ -133,6 +167,25 @@ test('Error.captureStackTrace targets use the local formatter', {skip:!stackForm
   assert.ok(object.stack.frames.length>0);
   object.stack='overridden';
   assert.equal(object.stack,'overridden');
+});
+
+test('delayed stacks keep their owner and capture its frame limit', {skip:!stackFormattingSupported}, () => {
+  const a=create(), b=create();
+  const host=Object.getOwnPropertyDescriptor(Error,'stackTraceLimit');
+  a.scope.Error.stackTraceLimit=2;
+  b.scope.Error.stackTraceLimit=4;
+  a.scope.Error.prepareStackTrace=(error,frames)=>({owner:'a',error,frames});
+  b.scope.Error.prepareStackTrace=(error,frames)=>({owner:'b',error,frames});
+  const source='function first(){return second()} function second(){return third()} function third(){return new TypeError("delayed")} first()';
+  const errorA=evaluate(a.scope,source), errorB=evaluate(b.scope,source);
+  const stackB=errorB.stack, stackA=errorA.stack;
+  assert.equal(stackA.owner,'a');
+  assert.equal(stackB.owner,'b');
+  assert.equal(stackA.error,errorA);
+  assert.equal(stackB.error,errorB);
+  assert.equal(stackA.frames.length,2);
+  assert.equal(stackB.frames.length,4);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'stackTraceLimit'),host);
 });
 
 test('closed virtual contexts and their guest buffers are collectible', async () => {
