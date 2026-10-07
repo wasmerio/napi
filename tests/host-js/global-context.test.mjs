@@ -44,6 +44,29 @@ test('script this and globalThis refer to the virtual global', () => {
   assert.ok(values.every(value => value === context.scope));
 });
 
+test('VM script globals expose builtins without writing to the host global', () => {
+  const sandbox = { answer:42 };
+  const other = {};
+  const values = evaluate(sandbox,'[this, globalThis, global, this.RegExp, RegExp, answer]');
+  assert.ok(values.slice(0,3).every(value => value === values[0]));
+  assert.notEqual(values[0],globalThis);
+  assert.equal(values[3],RegExp);
+  assert.equal(values[4],RegExp);
+  assert.equal(values[5],42);
+  assert.equal(evaluate(sandbox,'this'),values[0], 'reuse the VM global across scripts');
+  // Edge stream cleanup uses vm.runInNewContext('this').RegExp this way.
+  assert.equal(evaluate(sandbox,'new this.RegExp("released", "g")[Symbol.replace]("released", "closed")'),'closed');
+  const hostProcess = globalThis.process;
+  const hostFormatter = Error.prepareStackTrace;
+  evaluate(sandbox,'this.process={vm:true}; Error.prepareStackTrace=()=>"vm stack"; this.answer++');
+  assert.equal(globalThis.process,hostProcess);
+  assert.equal(Error.prepareStackTrace,hostFormatter);
+  assert.equal(sandbox.answer,43);
+  assert.deepEqual(sandbox.process,{vm:true});
+  assert.notEqual(evaluate(other,'Error'),evaluate(sandbox,'Error'));
+  assert.notEqual(evaluate(other,'Error.prepareStackTrace'),evaluate(sandbox,'Error.prepareStackTrace'));
+});
+
 test('global accessors retain lazy reads and context-owned writes', () => {
   let reads = 0, writes = 0;
   const original = { host:true };
@@ -238,12 +261,35 @@ function releasedGuestBufferReferences() {
   return references;
 }
 
-test('closed virtual contexts and their guest buffers are collectible', async () => {
+function releasedVmReferences() {
+  const references=[];
+  for(let i=0;i<12;i++) {
+    const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
+    const sandbox={buffer:new Int32Array(memory.buffer)};
+    const scope=evaluate(sandbox,'Error.prepareStackTrace=()=>buffer; this');
+    references.push(new WeakRef(sandbox),new WeakRef(scope),new WeakRef(memory.buffer));
+  }
+  return references;
+}
+
+async function assertCollected(references) {
   const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
   assert.equal(typeof gc,'function','run with --expose-gc');
-  // Keep creator variables out of the suspended async frame, and finish the
-  // WeakRef creation jobs before collecting their targets.
-  const references=releasedGuestBufferReferences();
-  for(let i=0;i<8;i++) { await setTimeout(0); gc(); }
+  // Allow asynchronous engine work (including JIT compilation) to release
+  // temporary references across GC jobs; every target must still be collected.
+  for(let i=0;i<80;i++) {
+    await setTimeout(0); gc();
+    if(references.every(reference=>reference.deref()===undefined)) return;
+  }
   assert.equal(references.filter(reference=>reference.deref()).length,0);
+}
+
+test('cached VM globals and their guest buffers are collectible', async () => {
+  await assertCollected(releasedVmReferences());
+});
+
+test('closed virtual contexts and their guest buffers are collectible', async () => {
+  // Keep creator variables out of the suspended async frame, and finish the
+  // WeakRef creation job before collecting its targets.
+  await assertCollected(releasedGuestBufferReferences());
 });
