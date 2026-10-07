@@ -76,9 +76,11 @@ test('a guest process assignment does not replace the worker process', () => {
 test('closing an inactive context disables only its callbacks', () => {
   const a=create(), b=create();
   const fnA=callback(a,(receiver,args)=>({receiver,args}));
+  const fnA2=callback(a,()=>42);
   const fnB=callback(b,()=>{throw new Error('active callback');});
   const receiver={guest:'a'};
   assert.deepEqual(fnA.call(receiver,1,2),{receiver,args:[1,2]});
+  assert.equal(fnA2(),42);
   assert.throws(()=>fnB(),/active callback/);
   runtime.wasmer_napi_activate_global_context(a);
   runtime.wasmer_napi_release_global_context(b);
@@ -87,6 +89,7 @@ test('closing an inactive context disables only its callbacks', () => {
   assert.deepEqual(fnA.call(receiver,3),{receiver,args:[3]});
   runtime.wasmer_napi_release_global_context(a);
   assert.equal(fnA(),undefined);
+  assert.equal(fnA2(),undefined);
 });
 
 test('retained callback wrappers do not retain closed contexts or dispatch captures', async () => {

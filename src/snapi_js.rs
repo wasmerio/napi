@@ -454,16 +454,17 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
   return context.scope;
 }
 export function wasmer_napi_make_callback(context, dispatch) {
-  const cell = {dispatch};
-  context.callbacks.push(cell);
+  const callbacks = context.callbacks;
+  const index = callbacks.dispatches.push(dispatch) - 1;
   return function (...args) {
-    return cell.dispatch?.(this, args);
+    const dispatch = callbacks.dispatches?.[index];
+    return dispatch?.(this, args);
   };
 }
 export function wasmer_napi_create_global_context() {
   const context = {
     scopeTarget: Object.create(null),
-    callbacks: [],
+    callbacks: {dispatches: []},
   };
   context.scope = new Proxy(context.scopeTarget, {
     has(target, key) {
@@ -510,8 +511,7 @@ export function wasmer_napi_activate_global_context(context) {
 }
 export function wasmer_napi_release_global_context(context) {
   // Retained JS wrappers must stop calling Rust before its closures are dropped.
-  for (const cell of context.callbacks) cell.dispatch = undefined;
-  context.callbacks.length = 0;
+  context.callbacks.dispatches = undefined;
   if (wasmerNapiActiveGlobalContext === context) wasmerNapiActiveGlobalContext = undefined;
 }
 export function wasmer_napi_context_eval(sandbox, source) {
