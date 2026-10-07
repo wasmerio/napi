@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { setImmediate } from 'node:timers/promises';
+import { setImmediate, setTimeout } from 'node:timers/promises';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -224,21 +224,26 @@ test('delayed stacks keep their owner and capture its frame limit', {skip:!stack
   assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'stackTraceLimit'),host);
 });
 
+function releasedGuestBufferReferences() {
+  const references=[];
+  for(let i=0;i<12;i++) {
+    const context=create();
+    const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
+    context.scope.buffer=new Int32Array(memory.buffer);
+    evaluate(context.scope,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
+    runtime.wasmer_napi_activate_global_context(context);
+    runtime.wasmer_napi_release_global_context(context);
+    references.push(new WeakRef(memory.buffer));
+  }
+  return references;
+}
+
 test('closed virtual contexts and their guest buffers are collectible', async () => {
   const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
   assert.equal(typeof gc,'function','run with --expose-gc');
-  const references=[];
-  for(let i=0;i<12;i++) {
-    (() => {
-      const context=create();
-      const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
-      context.scope.buffer=new Int32Array(memory.buffer);
-      evaluate(context.scope,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
-      runtime.wasmer_napi_activate_global_context(context);
-      runtime.wasmer_napi_release_global_context(context);
-      references.push(new WeakRef(memory.buffer));
-    })();
-  }
-  for(let i=0;i<8;i++) { await setImmediate(); gc(); }
+  // Keep creator variables out of the suspended async frame, and finish the
+  // WeakRef creation jobs before collecting their targets.
+  const references=releasedGuestBufferReferences();
+  for(let i=0;i<8;i++) { await setTimeout(0); gc(); }
   assert.equal(references.filter(reference=>reference.deref()).length,0);
 });
