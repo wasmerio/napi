@@ -52,7 +52,10 @@ jobs:
           release="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}"
           curl --fail --location --retry 3 "${release}/${archive}.tar.gz" -o "${RUNNER_TEMP}/${archive}.tar.gz"
           curl --fail --location --retry 3 "${release}/${archive}.tar.gz.sha256sum" -o "${RUNNER_TEMP}/${archive}.tar.gz.sha256sum"
-          (cd "${RUNNER_TEMP}" && sha256sum --check "${archive}.tar.gz.sha256sum")
+          # Release checksums include the publisher's gh-release/ directory.
+          # Check the same digest against our actual downloaded archive path.
+          read -r checksum _ < "${RUNNER_TEMP}/${archive}.tar.gz.sha256sum"
+          printf '%s  %s\n' "$checksum" "${RUNNER_TEMP}/${archive}.tar.gz" | sha256sum --check
           tar -xzf "${RUNNER_TEMP}/${archive}.tar.gz" -C "${RUNNER_TEMP}"
           echo "${RUNNER_TEMP}/${archive}" >> "$GITHUB_PATH"
           npm install --prefix "${RUNNER_TEMP}/napi-host-js" --no-save acorn@8.18.0
