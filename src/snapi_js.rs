@@ -67,11 +67,6 @@ fn next_serialized_message(scope: u32) -> Option<u32> {
 #[wasm_bindgen(inline_js = r#"
 import { parse as wasmerNapiParse } from 'acorn';
 
-export function wasmer_napi_make_callback(dispatch) {
-  return function (...args) {
-    return dispatch(this, args);
-  };
-}
 export function wasmer_napi_has_jspi() {
   return typeof WebAssembly.Suspending === 'function' &&
          typeof WebAssembly.promising === 'function';
@@ -251,6 +246,152 @@ for (const key of [
     });
   }
 }
+// Cache by capture function: the embedding SDK may install a stack shim later.
+// A reusable native accessor avoids capturing a second stack on modern V8.
+const wasmerNapiStackSupportCache = new WeakMap();
+function wasmerNapiGetStackSupport() {
+  const rootError = globalThis.Error;
+  const captureStackTrace = rootError.captureStackTrace;
+  if (typeof captureStackTrace !== 'function') return undefined;
+  if (wasmerNapiStackSupportCache.has(captureStackTrace)) {
+    return wasmerNapiStackSupportCache.get(captureStackTrace);
+  }
+  const saved = Object.getOwnPropertyDescriptor(rootError,'prepareStackTrace');
+  const marker = {};
+  let support;
+  try {
+    Object.defineProperty(rootError,'prepareStackTrace',{
+      value:()=>marker,writable:true,configurable:true,
+    });
+    const holder = {};
+    captureStackTrace(holder);
+    const {get} = Object.getOwnPropertyDescriptor(holder,'stack');
+    if (holder.stack === marker) {
+      // Shim accessors can close over their target instead of using `this`.
+      rootError.prepareStackTrace = error => error;
+      const error = new rootError();
+      let nativeGet;
+      try { if (get && Reflect.apply(get,error,[]) === error) nativeGet = get; } catch {}
+      support = {get:nativeGet, captureStackTrace};
+    }
+  } finally {
+    if (saved) Object.defineProperty(rootError,'prepareStackTrace',saved);
+    else delete rootError.prepareStackTrace;
+  }
+  wasmerNapiStackSupportCache.set(captureStackTrace,support);
+  return support;
+}
+// Give each N-API virtual context its own mutable Error constructors.
+// Native instances/prototypes still come from the host; this is focused on
+// bootstrap ownership and is not a replacement for a separate JS realm.
+function wasmerNapiInstallErrorConstructors(context) {
+  const rootError = globalThis.Error;
+  const wasmerNapiStackSupport = wasmerNapiGetStackSupport();
+  let localError;
+  const stackKeys = ['prepareStackTrace', 'stackTraceLimit'];
+  const withStackSettings = (callback, error, keys = stackKeys) => {
+    const saved = keys.map(key => Object.getOwnPropertyDescriptor(rootError,key));
+    try {
+      for (const key of keys) {
+        let value = localError[key];
+        if (key === 'prepareStackTrace' && typeof value === 'function' && error) {
+          const format = value;
+          value = (_holder, frames) => Reflect.apply(format,localError,[error,frames]);
+        }
+        Object.defineProperty(rootError,key,{value,writable:true,configurable:true});
+      }
+      return callback();
+    } finally {
+      for (const [index,key] of keys.entries()) {
+        if (saved[index]) Object.defineProperty(rootError,key,saved[index]);
+        else delete rootError[key];
+      }
+    }
+  };
+  const installStack = (target, constructorOpt) => {
+    const nativeGet = wasmerNapiStackSupport.get;
+    const holder = nativeGet ? target : {name:target.name,message:target.message};
+    if (!nativeGet || constructorOpt) {
+      withStackSettings(() => wasmerNapiStackSupport.captureStackTrace(holder,constructorOpt));
+    }
+    Object.defineProperty(target,'stack',{
+      configurable:true,
+      get() {
+        if (!nativeGet) {
+          holder.name = target.name;
+          holder.message = target.message;
+        }
+        const value = withStackSettings(
+          () => nativeGet ? Reflect.apply(nativeGet,target,[]) : holder.stack,
+          nativeGet ? undefined : target,
+        );
+        Object.defineProperty(target,'stack',{value,writable:true,configurable:true});
+        return value;
+      },
+      set(value) {
+        Object.defineProperty(target,'stack',{value,writable:true,configurable:true});
+      },
+    });
+  };
+  for (const name of [
+    'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
+    'TypeError', 'URIError', 'AggregateError',
+  ]) {
+    const NativeError = globalThis[name];
+    if (typeof NativeError !== 'function') continue;
+    const LocalError = function (...args) {
+      const construct = () => Reflect.construct(NativeError, args, new.target ?? LocalError);
+      const value = wasmerNapiStackSupport?.get
+        ? withStackSettings(construct,undefined,['stackTraceLimit']) : construct();
+      if (wasmerNapiStackSupport) {
+        installStack(value,wasmerNapiStackSupport.get ? undefined : LocalError);
+      }
+      return value;
+    };
+    Object.defineProperty(LocalError, 'name', { value: name, configurable: true });
+    Object.defineProperty(LocalError, 'length', {
+      value: NativeError.length, configurable: true,
+    });
+    Object.setPrototypeOf(LocalError, localError ?? NativeError);
+    const descriptors = Object.getOwnPropertyDescriptors(NativeError);
+    for (const key of ['name', 'length', 'prototype', 'arguments', 'caller']) {
+      delete descriptors[key];
+    }
+    Object.defineProperties(LocalError, descriptors);
+    // Edge snapshots own prototype methods into its primordials. Inherited
+    // methods alone would omit ErrorPrototypeToString from that snapshot.
+    const prototypeDescriptors = Object.getOwnPropertyDescriptors(NativeError.prototype);
+    prototypeDescriptors.constructor = {
+      value:LocalError,writable:true,configurable:true,
+    };
+    Object.defineProperty(LocalError, 'prototype', {
+      value: Object.create(localError?.prototype ?? NativeError.prototype,prototypeDescriptors),
+    });
+    Object.defineProperty(LocalError, Symbol.hasInstance, {
+      value:function (value) {
+        if (this === LocalError) {
+          return value !== LocalError.prototype &&
+            (Reflect.apply(Function.prototype[Symbol.hasInstance],this,[value]) || value instanceof NativeError);
+        }
+        return Reflect.apply(Function.prototype[Symbol.hasInstance],this,[value]);
+      },configurable:true,
+    });
+    if (name === 'Error') {
+      localError = LocalError;
+      // Native N-API errors and local TypeErrors must still satisfy
+      // `instanceof Error`, just as they did with the host constructor.
+      if (wasmerNapiStackSupport) {
+        Object.defineProperty(LocalError,'captureStackTrace',{
+          value:function captureStackTrace(target,constructorOpt) {
+            installStack(target,constructorOpt ?? captureStackTrace);
+          },writable:true,configurable:true,
+        });
+      }
+    }
+    context.scopeTarget[name] = LocalError;
+  }
+}
+
 function wasmerNapiSnapshotGlobal() {
   return Object.getOwnPropertyDescriptors(globalThis);
 }
@@ -286,8 +427,22 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
           ? hostBinding.bound
           : descriptor.value;
       } else {
-        targetDescriptor.get = descriptor.get;
-        targetDescriptor.set = descriptor.set;
+        // Preserve lazy reads, but keep writes in a context-owned binding.
+        // Copying Node's global.process setter shares its host-owned cell and
+        // lets a guest replace the worker process with a guest-memory root.
+        let initialized = false;
+        let value;
+        targetDescriptor.get = () => {
+          if (!initialized) {
+            value = Reflect.get(globalThis, key, globalThis);
+            initialized = true;
+          }
+          return value;
+        };
+        targetDescriptor.set = next => {
+          value = next;
+          initialized = true;
+        };
       }
       Object.defineProperty(target, key, targetDescriptor);
     } catch {}
@@ -298,9 +453,18 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
   });
   return context.scope;
 }
+export function wasmer_napi_make_callback(context, dispatch) {
+  const callbacks = context.callbacks;
+  const index = callbacks.dispatches.push(dispatch) - 1;
+  return function (...args) {
+    const dispatch = callbacks.dispatches?.[index];
+    return dispatch?.(this, args);
+  };
+}
 export function wasmer_napi_create_global_context() {
   const context = {
     scopeTarget: Object.create(null),
+    callbacks: {dispatches: []},
   };
   context.scope = new Proxy(context.scopeTarget, {
     has(target, key) {
@@ -336,6 +500,7 @@ export function wasmer_napi_create_global_context() {
     },
   });
   wasmerNapiSyncGlobalScope(context, wasmerNapiSnapshotGlobal());
+  wasmerNapiInstallErrorConstructors(context);
   return context;
 }
 export function wasmer_napi_global_context_scope(context) {
@@ -345,8 +510,9 @@ export function wasmer_napi_activate_global_context(context) {
   wasmerNapiActiveGlobalContext = context;
 }
 export function wasmer_napi_release_global_context(context) {
-  if (wasmerNapiActiveGlobalContext !== context) return;
-  wasmerNapiActiveGlobalContext = undefined;
+  // Retained JS wrappers must stop calling Rust before its closures are dropped.
+  context.callbacks.dispatches = undefined;
+  if (wasmerNapiActiveGlobalContext === context) wasmerNapiActiveGlobalContext = undefined;
 }
 export function wasmer_napi_context_eval(sandbox, source) {
   if (wasmerNapiActiveGlobalContext !== undefined &&
@@ -356,7 +522,7 @@ export function wasmer_napi_context_eval(sandbox, source) {
   }
   if (sandbox == null) return (0, eval)(source);
   return Function('sandbox', 'source',
-    'with (sandbox) { return eval(source); }')(sandbox, source);
+    'with (sandbox) { return eval(source); }').call(sandbox, sandbox, source);
 }
 function wasmerNapiLowerDynamicImports(params, source, filename) {
   const names = Array.from(params, String);
@@ -934,7 +1100,7 @@ export function wasmer_napi_create_serdes_binding() {
 }
 "#)]
 extern "C" {
-    fn wasmer_napi_make_callback(dispatch: &Function) -> Function;
+    fn wasmer_napi_make_callback(context: &JsValue, dispatch: &Function) -> Function;
     fn wasmer_napi_enqueue_microtask(callback: &Function);
     fn wasmer_napi_event_loop_checkpoint(
         allow_host_tasks: bool,
@@ -1865,7 +2031,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
     if env.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let mut state = unsafe { Box::from_raw(env.cast::<HostJsEnv>()) };
+    let state = unsafe { Box::from_raw(env.cast::<HostJsEnv>()) };
     let env_addr = env as usize;
     ACTIVE_HOST_JS_ENV.with(|active| {
         if active.get() == env_addr {
@@ -1874,13 +2040,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
     });
     state.live_env_addr.set(0);
     wasmer_napi_release_global_context(&state.global_context);
-    // JavaScript can retain callbacks through globals, event listeners, and
-    // pending tasks after the N-API environment is released. Keep only the
-    // wasm-bindgen trampoline alive; its shared liveness token makes retained
-    // callbacks inert without retaining or dereferencing the freed environment.
-    for closure in state.closures.drain(..) {
-        closure.forget();
-    }
+    // JS dispatch slots are now empty, so dropping the environment can free all
+    // Rust closures immediately, even when JavaScript keeps their wrappers.
     drop(state);
     NAPI_OK
 }
@@ -3153,7 +3314,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
         }
         result
     }) as Box<dyn Fn(JsValue, Array) -> JsValue>);
-    let function = wasmer_napi_make_callback(closure.as_ref().unchecked_ref());
+    let function = wasmer_napi_make_callback(&s.global_context, closure.as_ref().unchecked_ref());
     if !name.is_null() {
         let _ = Reflect::set(
             &function,
@@ -6513,4 +6674,57 @@ pub unsafe extern "C" fn snapi_bridge_define_properties(
 pub unsafe extern "C" fn snapi_bridge_dispose() {
     let _ = ();
     ()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn released_callbacks_do_not_keep_externref_roots_and_remain_callable() {
+        let before = wasm_bindgen::externref_heap_live_count();
+        let mut state = Box::new(HostJsEnv::new());
+        let liveness = Rc::downgrade(&state.live_env_addr);
+        state
+            .live_env_addr
+            .set((&*state as *const HostJsEnv) as usize);
+        // No guest dispatch is needed: invoke the saved function only after
+        // release, when the liveness token must make it return undefined.
+        state.callback_regs.insert(
+            1,
+            CallbackReg {
+                guest_env: 0,
+                wasm_fn_ptr: 0,
+                data: 0,
+            },
+        );
+        let env = Box::into_raw(state).cast::<SnapiEnvState>();
+        let mut handle = 0;
+        for _ in 0..64 {
+            assert_eq!(
+                unsafe { snapi_bridge_create_function(env, ptr::null(), 0, 1, &mut handle) },
+                NAPI_OK
+            );
+        }
+        let retained: Function = unsafe { env_mut(env) }
+            .unwrap()
+            .get(handle)
+            .unwrap()
+            .clone()
+            .unchecked_into();
+        assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+        assert!(
+            liveness.upgrade().is_none(),
+            "Rust callback captures must be freed during release without waiting for GC"
+        );
+        assert_eq!(
+            wasm_bindgen::externref_heap_live_count(),
+            before + 1,
+            "only the saved JavaScript function should have a Rust externref root"
+        );
+        assert!(retained.call0(&JsValue::UNDEFINED).unwrap().is_undefined());
+        drop(retained);
+        assert_eq!(wasm_bindgen::externref_heap_live_count(), before);
+    }
 }
