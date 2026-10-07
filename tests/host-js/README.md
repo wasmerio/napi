@@ -20,8 +20,9 @@ Custom `Error.prepareStackTrace` tests detect whether the engine honors the
 hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip
 while the ownership and collection tests still run.
 
-Stack support is detected once per host realm. Modern V8 reuses its native lazy
-stack accessor; Node 20 exercises the fallback for lazy data properties.
+Stack support is cached by the host capture function, allowing an embedding
+SDK to install a stack shim later. Modern V8 reuses its native lazy stack
+accessor; Node 20 and target-bound shim accessors exercise the fallback.
 
 The Wasm Rust test `snapi_js::tests` creates 64 real N-API callback trampolines,
 releases their environment, checks that no unowned externref roots remain, and

@@ -246,14 +246,19 @@ for (const key of [
     });
   }
 }
-// Probe once per host realm. Older V8 versions expose a lazy data property;
-// newer ones expose an accessor we can reuse without capturing a second stack.
-const wasmerNapiStackSupport = (() => {
+// Cache by capture function: the embedding SDK may install a stack shim later.
+// A reusable native accessor avoids capturing a second stack on modern V8.
+const wasmerNapiStackSupportCache = new WeakMap();
+function wasmerNapiGetStackSupport() {
   const rootError = globalThis.Error;
   const captureStackTrace = rootError.captureStackTrace;
   if (typeof captureStackTrace !== 'function') return undefined;
+  if (wasmerNapiStackSupportCache.has(captureStackTrace)) {
+    return wasmerNapiStackSupportCache.get(captureStackTrace);
+  }
   const saved = Object.getOwnPropertyDescriptor(rootError,'prepareStackTrace');
   const marker = {};
+  let support;
   try {
     Object.defineProperty(rootError,'prepareStackTrace',{
       value:()=>marker,writable:true,configurable:true,
@@ -261,18 +266,27 @@ const wasmerNapiStackSupport = (() => {
     const holder = {};
     captureStackTrace(holder);
     const {get} = Object.getOwnPropertyDescriptor(holder,'stack');
-    // JavaScriptCore may expose captureStackTrace without V8-style formatting.
-    if (holder.stack === marker) return {get, captureStackTrace};
+    if (holder.stack === marker) {
+      // Shim accessors can close over their target instead of using `this`.
+      rootError.prepareStackTrace = error => error;
+      const error = new rootError();
+      let nativeGet;
+      try { if (get && Reflect.apply(get,error,[]) === error) nativeGet = get; } catch {}
+      support = {get:nativeGet, captureStackTrace};
+    }
   } finally {
     if (saved) Object.defineProperty(rootError,'prepareStackTrace',saved);
     else delete rootError.prepareStackTrace;
   }
-})();
+  wasmerNapiStackSupportCache.set(captureStackTrace,support);
+  return support;
+}
 // Give each N-API virtual context its own mutable Error constructors.
 // Native instances/prototypes still come from the host; this is focused on
 // bootstrap ownership and is not a replacement for a separate JS realm.
 function wasmerNapiInstallErrorConstructors(context) {
   const rootError = globalThis.Error;
+  const wasmerNapiStackSupport = wasmerNapiGetStackSupport();
   let localError;
   const stackKeys = ['prepareStackTrace', 'stackTraceLimit'];
   const withStackSettings = (callback, error, keys = stackKeys) => {
