@@ -461,15 +461,12 @@ export function wasmer_napi_make_callback(context, dispatch) {
     return dispatch?.(this, args);
   };
 }
-export function wasmer_napi_create_global_context() {
-  const context = {
-    scopeTarget: Object.create(null),
-    callbacks: {dispatches: []},
-  };
-  context.scope = new Proxy(context.scopeTarget, {
+const wasmerNapiGlobalScopes = new WeakMap();
+function wasmerNapiCreateGlobalScope(scopeTarget, fallback = globalThis) {
+  const scope = new Proxy(scopeTarget, {
     has(target, key) {
       if (key === 'global' || key === 'globalThis') return true;
-      return Reflect.has(target, key) || Reflect.has(globalThis, key);
+      return Reflect.has(target, key) || Reflect.has(fallback, key);
     },
     get(target, key, receiver) {
       if (key === 'global' || key === 'globalThis') return receiver;
@@ -480,7 +477,7 @@ export function wasmer_napi_create_global_context() {
           ? hostBinding.bound
           : value;
       }
-      const value = Reflect.get(globalThis, key, globalThis);
+      const value = Reflect.get(fallback, key, fallback);
       const hostBinding = wasmerNapiHostGlobalBindings.get(key);
       return hostBinding !== undefined && value === hostBinding.raw
         ? hostBinding.bound
@@ -499,6 +496,15 @@ export function wasmer_napi_create_global_context() {
       return true;
     },
   });
+  wasmerNapiGlobalScopes.set(scope,scope);
+  return scope;
+}
+export function wasmer_napi_create_global_context() {
+  const context = {
+    scopeTarget: Object.create(null),
+    callbacks: {dispatches: []},
+  };
+  context.scope = wasmerNapiCreateGlobalScope(context.scopeTarget);
   wasmerNapiSyncGlobalScope(context, wasmerNapiSnapshotGlobal());
   wasmerNapiInstallErrorConstructors(context);
   return context;
@@ -521,6 +527,15 @@ export function wasmer_napi_context_eval(sandbox, source) {
     sandbox = wasmerNapiActiveGlobalContext.scope;
   }
   if (sandbox == null) return (0, eval)(source);
+  // A VM's global facade exposes the same builtins as bare identifiers while
+  // preserving the caller's sandbox bindings. Keep its defaults context-local
+  // so writes to process and Error hooks cannot reach the worker global.
+  let scope = wasmerNapiGlobalScopes.get(sandbox);
+  if (!scope) {
+    scope = wasmerNapiCreateGlobalScope(sandbox,wasmer_napi_create_global_context().scope);
+    wasmerNapiGlobalScopes.set(sandbox,scope);
+  }
+  sandbox = scope;
   return Function('sandbox', 'source',
     'with (sandbox) { return eval(source); }').call(sandbox, sandbox, source);
 }
