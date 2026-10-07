@@ -253,13 +253,9 @@ fn run_wasix_main_with_runner(
         runtime.set_engine(engine.clone());
         configure_system_tty(&mut runtime, use_system_tty);
 
-        let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(&module);
-        if napi_version.is_some() || napi_extension_version.is_some() {
-            runner
-                .capabilities_mut()
-                .threading
-                .enable_asynchronous_threading = false;
-        }
+        // How an N-API guest runs (no context switching, entered synchronously
+        // here) is decided per process by the N-API runtime hooks registered
+        // below; see `NapiRuntimeHooks::configure_capabilities`.
         runtime
             .with_instantiation_hook(ctx.runtime_hooks())
             .with_instantiation_hook(WasmCapiRuntimeHooks::new())
