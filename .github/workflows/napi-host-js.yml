@@ -1,0 +1,61 @@
+name: napi-host-js
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  node-context:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --expose-gc --test tests/host-js/global-context.test.mjs
+
+  bun-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun test tests/host-js/global-context.test.mjs
+
+  wasm-callback-lifetime:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: wasm32-unknown-unknown
+      - name: Install matching wasm-bindgen runner and host parser
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; lock=tomllib.load(open("Cargo.standalone.lock", "rb")); print(next(p["version"] for p in lock["package"] if p["name"] == "wasm-bindgen"))')
+          archive="wasm-bindgen-${version}-x86_64-unknown-linux-musl"
+          release="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}"
+          curl --fail --location --retry 3 "${release}/${archive}.tar.gz" -o "${RUNNER_TEMP}/${archive}.tar.gz"
+          curl --fail --location --retry 3 "${release}/${archive}.tar.gz.sha256sum" -o "${RUNNER_TEMP}/${archive}.tar.gz.sha256sum"
+          (cd "${RUNNER_TEMP}" && sha256sum --check "${archive}.tar.gz.sha256sum")
+          tar -xzf "${RUNNER_TEMP}/${archive}.tar.gz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/${archive}" >> "$GITHUB_PATH"
+          npm install --prefix "${RUNNER_TEMP}/napi-host-js" --no-save acorn@8.18.0
+          echo "TMPDIR=${RUNNER_TEMP}/napi-host-js" >> "$GITHUB_ENV"
+      - name: Test Wasm callback ownership and liveness
+        run: ./cargo-standalone.sh +nightly test --locked --target wasm32-unknown-unknown --features js --lib -Z build-std=std,panic_abort snapi_js::tests
