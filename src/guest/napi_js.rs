@@ -16,7 +16,7 @@ use wasmer::AsyncFunctionEnvMut;
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv,
     guest::{
-        MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
+        MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{
             flush_host_buffer_copies_for_owner, install_persistent_callback_state,
             publish_pending_host_buffer_copies, refresh_host_buffer_copies, with_callback_state,
@@ -28,6 +28,10 @@ use crate::{
 };
 
 use super::{abi, util::*};
+use crate::snapi_js::{
+    host_js_get_named_property, host_js_has_named_property, host_js_put_primitive,
+    host_js_set_named_property, host_js_value,
+};
 
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
@@ -2221,24 +2225,13 @@ fn guest_napi_create_string_utf8(
     length: i32,
     rp: i32,
 ) -> i32 {
-    let wl = length as u32;
-    let sb = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string(&mut env, str_ptr)
-    } else {
-        read_guest_bytes(&mut env, str_ptr, wl as usize)
-    };
-    let Some(sb) = sb else {
+    let Some(value) =
+        read_guest_string_value(&mut env, str_ptr, length as u32, GuestStringEncoding::Utf8)
+    else {
         return 1;
     };
     let mut out: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_create_string_utf8(
-            snapi_env(&env, e),
-            sb.as_ptr() as *const i8,
-            sb.len() as u32,
-            &mut out,
-        )
-    };
+    let s = unsafe { host_js_put_primitive(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2252,24 +2245,16 @@ fn guest_napi_create_string_latin1(
     length: i32,
     rp: i32,
 ) -> i32 {
-    let wl = length as u32;
-    let sb = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string(&mut env, str_ptr)
-    } else {
-        read_guest_bytes(&mut env, str_ptr, wl as usize)
-    };
-    let Some(sb) = sb else {
+    let Some(value) = read_guest_string_value(
+        &mut env,
+        str_ptr,
+        length as u32,
+        GuestStringEncoding::Latin1,
+    ) else {
         return 1;
     };
     let mut out: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_create_string_latin1(
-            snapi_env(&env, e),
-            sb.as_ptr() as *const i8,
-            sb.len() as u32,
-            &mut out,
-        )
-    };
+    let s = unsafe { host_js_put_primitive(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -2469,37 +2454,11 @@ fn guest_napi_get_value_string_utf8(
     bs: i32,
     rp: i32,
 ) -> i32 {
-    let hbs = if bs <= 0 { 0usize } else { bs as usize };
-    if hbs as u64 > guest_data_size(&mut env) {
-        return 1;
-    }
-    let mut hb = vec![0i8; hbs];
-    let mut rl: usize = 0;
-    let s = unsafe {
-        snapi_bridge_get_value_string_utf8(
-            snapi_env(&env, e),
-            vh as u32,
-            if hbs > 0 {
-                hb.as_mut_ptr()
-            } else {
-                std::ptr::null_mut()
-            },
-            hbs,
-            &mut rl,
-        )
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
     };
-    if s != 0 {
-        return s;
-    }
-    if bp > 0 && hbs > 0 {
-        let n = hbs.min(rl + 1);
-        let b: Vec<u8> = hb[..n].iter().map(|&x| x as u8).collect();
-        write_guest_bytes(&mut env, bp as u32, &b);
-    }
-    if rp > 0 {
-        write_guest_u32(&mut env, rp as u32, rl as u32);
-    }
-    0
+    write_guest_string_value(&mut env, &value, bp, bs, rp, GuestStringEncoding::Utf8)
 }
 
 fn guest_napi_get_value_string_latin1(
@@ -2510,73 +2469,43 @@ fn guest_napi_get_value_string_latin1(
     bs: i32,
     rp: i32,
 ) -> i32 {
-    let hbs = if bs <= 0 { 0usize } else { bs as usize };
-    if hbs as u64 > guest_data_size(&mut env) {
-        return 1;
-    }
-    let mut hb = vec![0i8; hbs];
-    let mut rl: usize = 0;
-    let s = unsafe {
-        snapi_bridge_get_value_string_latin1(
-            snapi_env(&env, e),
-            vh as u32,
-            if hbs > 0 {
-                hb.as_mut_ptr()
-            } else {
-                std::ptr::null_mut()
-            },
-            hbs,
-            &mut rl,
-        )
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
     };
-    if s != 0 {
-        return s;
-    }
-    if bp > 0 && hbs > 0 {
-        let n = hbs.min(rl + 1);
-        let b: Vec<u8> = hb[..n].iter().map(|&x| x as u8).collect();
-        write_guest_bytes(&mut env, bp as u32, &b);
-    }
-    if rp > 0 {
-        write_guest_u32(&mut env, rp as u32, rl as u32);
-    }
-    0
+    write_guest_string_value(&mut env, &value, bp, bs, rp, GuestStringEncoding::Latin1)
 }
 
 fn guest_napi_get_value_int32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-    let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_get_value_int32(snapi_env(&env, e), vh as u32, &mut r) };
-    if s == 0 {
-        write_guest_i32(&mut env, rp as u32, r);
-    }
-    s
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    write_guest_number_value(&mut env, &value, rp, GuestNumberKind::I32)
 }
 
 fn guest_napi_get_value_uint32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-    let mut r: u32 = 0;
-    let s = unsafe { snapi_bridge_get_value_uint32(snapi_env(&env, e), vh as u32, &mut r) };
-    if s == 0 {
-        write_guest_u32(&mut env, rp as u32, r);
-    }
-    s
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    write_guest_number_value(&mut env, &value, rp, GuestNumberKind::U32)
 }
 
 fn guest_napi_get_value_double(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-    let mut r: f64 = 0.0;
-    let s = unsafe { snapi_bridge_get_value_double(snapi_env(&env, e), vh as u32, &mut r) };
-    if s == 0 {
-        write_guest_f64(&mut env, rp as u32, r);
-    }
-    s
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    write_guest_number_value(&mut env, &value, rp, GuestNumberKind::F64)
 }
 
 fn guest_napi_get_value_int64(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-    let mut r: i64 = 0;
-    let s = unsafe { snapi_bridge_get_value_int64(snapi_env(&env, e), vh as u32, &mut r) };
-    if s == 0 {
-        write_guest_i64(&mut env, rp as u32, r);
-    }
-    s
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    write_guest_number_value(&mut env, &value, rp, GuestNumberKind::I64)
 }
 
 fn guest_napi_get_value_bool(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
@@ -2810,13 +2739,13 @@ fn guest_napi_set_named_property(
     np: i32,
     v: i32,
 ) -> i32 {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(key) = read_guest_string_value(&mut env, np, u32::MAX, GuestStringEncoding::Utf8)
+    else {
         return 1;
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
-        snapi_bridge_set_named_property(snapi, o as u32, cn.as_ptr(), v as u32)
+        host_js_set_named_property(snapi, o as u32, &key, v as u32)
     })
 }
 
@@ -2827,14 +2756,14 @@ fn guest_napi_get_named_property(
     np: i32,
     rp: i32,
 ) -> i32 {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(key) = read_guest_string_value(&mut env, np, u32::MAX, GuestStringEncoding::Utf8)
+    else {
         return 1;
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
-        snapi_bridge_get_named_property(snapi, o as u32, cn.as_ptr(), &mut out)
+        host_js_get_named_property(snapi, o as u32, &key, &mut out)
     });
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
@@ -2849,14 +2778,14 @@ fn guest_napi_has_named_property(
     np: i32,
     rp: i32,
 ) -> i32 {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(key) = read_guest_string_value(&mut env, np, u32::MAX, GuestStringEncoding::Utf8)
+    else {
         return 1;
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
-        snapi_bridge_has_named_property(snapi, o as u32, cn.as_ptr(), &mut r)
+        host_js_has_named_property(snapi, o as u32, &key, &mut r)
     });
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
@@ -4692,52 +4621,13 @@ fn guest_napi_create_string_utf16(
     length: i32,
     rp: i32,
 ) -> i32 {
-    let wl = length as u32;
-    // UTF-16: each char is 2 bytes
-    let char_count: usize = if wl == 0xFFFFFFFFu32 {
-        // Auto-length: scan for null terminator (u16 == 0)
-        let mut scan_len: usize = 0;
-        loop {
-            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else {
-                break;
-            };
-            let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
-            if ch == 0 {
-                break;
-            }
-            scan_len += 1;
-            if scan_len > MAX_GUEST_CSTRING_SCAN {
-                break;
-            }
-        }
-        scan_len
-    } else {
-        wl as usize
-    };
-    let Some(byte_len) = char_count.checked_mul(2) else {
+    let Some(value) =
+        read_guest_string_value(&mut env, str_ptr, length as u32, GuestStringEncoding::Utf16)
+    else {
         return 1;
     };
-    if byte_len as u64 > guest_data_size(&mut env) {
-        return 1;
-    }
-    let Some(raw_bytes) = read_guest_bytes(&mut env, str_ptr, byte_len) else {
-        return 1;
-    };
-    // Convert bytes to u16 array
-    let u16_data: Vec<u16> = raw_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
     let mut out: u32 = 0;
-    // Always pass the actual char count to the 64-bit bridge (not the WASM32 NAPI_AUTO_LENGTH sentinel)
-    let s = unsafe {
-        snapi_bridge_create_string_utf16(
-            snapi_env(&env, e),
-            u16_data.as_ptr(),
-            char_count as u32,
-            &mut out,
-        )
-    };
+    let s = unsafe { host_js_put_primitive(snapi_env(&env, e), value, &mut out) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
@@ -4752,41 +4642,11 @@ fn guest_napi_get_value_string_utf16(
     bs: i32,
     rp: i32,
 ) -> i32 {
-    let hbs = if bs <= 0 { 0usize } else { bs as usize };
-    let Some(byte_len) = hbs.checked_mul(2) else {
-        return 1;
+    let value = match unsafe { host_js_value(snapi_env(&env, e), vh as u32) } {
+        Ok(value) => value,
+        Err(status) => return status,
     };
-    if byte_len as u64 > guest_data_size(&mut env) {
-        return 1;
-    }
-    let mut hb = vec![0u16; hbs];
-    let mut rl: usize = 0;
-    let s = unsafe {
-        snapi_bridge_get_value_string_utf16(
-            snapi_env(&env, e),
-            vh as u32,
-            if hbs > 0 {
-                hb.as_mut_ptr()
-            } else {
-                std::ptr::null_mut()
-            },
-            hbs,
-            &mut rl,
-        )
-    };
-    if s != 0 {
-        return s;
-    }
-    if bp > 0 && hbs > 0 {
-        let n = hbs.min(rl + 1);
-        // Write u16 values as LE bytes to guest memory
-        let bytes: Vec<u8> = hb[..n].iter().flat_map(|&v| v.to_le_bytes()).collect();
-        write_guest_bytes(&mut env, bp as u32, &bytes);
-    }
-    if rp > 0 {
-        write_guest_u32(&mut env, rp as u32, rl as u32);
-    }
-    0
+    write_guest_string_value(&mut env, &value, bp, bs, rp, GuestStringEncoding::Utf16)
 }
 
 // --- BigInt words ---
