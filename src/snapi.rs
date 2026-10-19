@@ -50,6 +50,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
+// The JS backend implements this ABI in `snapi_js`; its guest layer reaches
+// several functions through `host_js_*` entry points instead of these.
+#[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;

@@ -1205,6 +1205,42 @@ extern "C" {
     fn wasmer_napi_create_serdes_binding() -> Result<JsValue, JsValue>;
 }
 
+#[wasm_bindgen(inline_js = r#"
+// Object identity maps (handles, wraps). `ids` maps each object to the id
+// recorded for it. Returns -1 for a primitive, the recorded id, or 0 for an
+// object seen for the first time, after recording a non-zero `candidate`.
+export function wasmer_napi_object_handle(ids, value, candidate) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return -1;
+  const id = ids.get(value);
+  if (id !== undefined) return id;
+  // A zero candidate only looks the object up.
+  if (candidate !== 0) ids.set(value, candidate);
+  return 0;
+}
+export function wasmer_napi_is_object_like(value) {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+// napi_valuetype of a value that is not an external.
+export function wasmer_napi_typeof(value) {
+  if (value === undefined) return 0;
+  if (value === null) return 1;
+  switch (typeof value) {
+    case 'boolean': return 2;
+    case 'number': return 3;
+    case 'string': return 4;
+    case 'symbol': return 5;
+    case 'function': return 7;
+    case 'bigint': return 9;
+    default: return 6;
+  }
+}
+"#)]
+extern "C" {
+    fn wasmer_napi_object_handle(ids: &WeakMap, value: &JsValue, candidate: u32) -> f64;
+    fn wasmer_napi_is_object_like(value: &JsValue) -> bool;
+    fn wasmer_napi_typeof(value: &JsValue) -> i32;
+}
+
 pub(crate) fn has_jspi() -> bool {
     wasmer_napi_has_jspi()
 }
@@ -1419,26 +1455,22 @@ impl HostJsEnv {
         }
     }
 
-    fn insert(&mut self, value: JsValue) -> u32 {
-        let object = if value.is_object() || value.is_function() {
-            Some(value.clone().unchecked_into::<Object>())
-        } else {
-            None
-        };
-        let previous_id = object.as_ref().and_then(|object| {
-            self.object_ids
-                .get_checked(object)
-                .and_then(|id| id.as_f64())
-                .map(|id| id as u32)
-        });
-        if let Some(id) = previous_id
-            && self
-                .get(id)
-                .is_some_and(|existing| Object::is(existing, &value))
-        {
-            return id;
+    fn next_handle(&mut self) -> u32 {
+        // Handles are opaque guest tokens. Keep their identity independent of
+        // reusable storage slots: packing both into u32 either caps live slots
+        // (too many generation bits) or aliases stale handles under sustained
+        // reuse (too few). A monotonically unique token plus an indirection map
+        // gives us the full non-zero u32 namespace for both properties.
+        loop {
+            let candidate = self.next_value_handle.max(1);
+            self.next_value_handle = candidate.wrapping_add(1).max(1);
+            if !self.value_handles.contains_key(&candidate) {
+                break candidate;
+            }
         }
+    }
 
+    fn store(&mut self, id: u32, value: JsValue) {
         let index = if let Some(index) = self.value_free_slots.pop() {
             unsafe { *self.values[index as usize].get() = value };
             self.value_live[index as usize] = true;
@@ -1449,26 +1481,39 @@ impl HostJsEnv {
             self.value_live.push(true);
             index
         };
-        // Handles are opaque guest tokens. Keep their identity independent of
-        // reusable storage slots: packing both into u32 either caps live slots
-        // (too many generation bits) or aliases stale handles under sustained
-        // reuse (too few). A monotonically unique token plus an indirection map
-        // gives us the full non-zero u32 namespace for both properties.
-        let id = loop {
-            let candidate = self.next_value_handle.max(1);
-            self.next_value_handle = candidate.wrapping_add(1).max(1);
-            if !self.value_handles.contains_key(&candidate) {
-                break candidate;
-            }
-        };
         self.value_handles.insert(id, index);
         if let Some(frame) = self.value_frames.last_mut() {
             frame.handles.push(id);
         }
-        if let Some(object) = object.as_ref() {
-            self.object_ids.set(object, &JsValue::from_f64(id as f64));
-        }
-        if let Some(previous_id) = previous_id {
+    }
+
+    /// Stores a value the caller knows is a primitive (string, number,
+    /// boolean, bigint): primitives have no identity to look up.
+    fn insert_primitive(&mut self, value: JsValue) -> u32 {
+        let id = self.next_handle();
+        self.store(id, value);
+        id
+    }
+
+    fn insert(&mut self, value: JsValue) -> u32 {
+        let id = self.next_handle();
+        // An object keeps the handle it already has while that handle is live.
+        // One host call classifies the value, looks its handle up and records
+        // `id` for an object seen for the first time.
+        let previous = wasmer_napi_object_handle(&self.object_ids, &value, id);
+        if previous > 0.0 {
+            let previous_id = previous as u32;
+            if self
+                .get(previous_id)
+                .is_some_and(|existing| Object::is(existing, &value))
+            {
+                // `id` stays unused; hand it out next time.
+                self.next_value_handle = id;
+                return previous_id;
+            }
+            // A stale handle (its frame closed): the object moves to `id`.
+            self.object_ids
+                .set(value.unchecked_ref::<Object>(), &JsValue::from_f64(id as f64));
             if let Some(value) = self.externals.remove(&previous_id) {
                 self.externals.insert(id, value);
             }
@@ -1479,30 +1524,23 @@ impl HostJsEnv {
                 self.type_tags.insert(id, value);
             }
         }
+        self.store(id, value);
         id
     }
 
     fn wrap_id(&mut self, value_id: u32, create: bool) -> Option<u32> {
-        let value = self.get(value_id)?.clone();
-        if !value.is_object() && !value.is_function() {
+        let value = self.get(value_id)?;
+        let candidate = if create { self.next_wrap_id.max(1) } else { 0 };
+        // One host call: object test, lookup and, when creating, the record.
+        let id = wasmer_napi_object_handle(&self.wrap_ids, value, candidate);
+        if id > 0.0 {
+            return Some(id as u32);
+        }
+        if id < 0.0 || !create {
             return None;
         }
-        let object = value.unchecked_into::<Object>();
-        if let Some(id) = self
-            .wrap_ids
-            .get_checked(&object)
-            .and_then(|id| id.as_f64())
-            .map(|id| id as u32)
-        {
-            return Some(id);
-        }
-        if !create {
-            return None;
-        }
-        let id = self.next_wrap_id.max(1);
-        self.next_wrap_id = id.saturating_add(1);
-        self.wrap_ids.set(&object, &JsValue::from_f64(id as f64));
-        Some(id)
+        self.next_wrap_id = candidate.saturating_add(1);
+        Some(candidate)
     }
 
     fn register_guest_finalizer(
@@ -1966,6 +2004,90 @@ unsafe fn put_value(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
+/// `put_value` for a value known to be a primitive.
+unsafe fn put_primitive(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let id = state.insert_primitive(value);
+    unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
+}
+
+// Entry points for the JS backend's guest layer, which reads names and
+// strings straight from guest memory into JS values: they skip the C string
+// and host buffer round trips of the shared `snapi_bridge_*` ABI.
+
+pub(crate) unsafe fn host_js_value(env: SnapiEnv, id: u32) -> Result<JsValue, i32> {
+    let state = unsafe { env_mut(env) }?;
+    state.get(id).cloned().ok_or(NAPI_INVALID_ARG)
+}
+
+pub(crate) unsafe fn host_js_put_primitive(env: SnapiEnv, value: JsValue, out: *mut u32) -> i32 {
+    unsafe { put_primitive(env, out, value) }
+}
+
+pub(crate) unsafe fn host_js_set_named_property(
+    env: SnapiEnv,
+    obj: u32,
+    key: &JsValue,
+    value: u32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let (Some(obj), Some(value)) = (state.get(obj), state.get(value)) else {
+        return NAPI_INVALID_ARG;
+    };
+    match Reflect::set(obj, key, value) {
+        Ok(_) => NAPI_OK,
+        Err(e) => {
+            state.last_exception = Some(e);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
+}
+
+pub(crate) unsafe fn host_js_get_named_property(
+    env: SnapiEnv,
+    obj: u32,
+    key: &JsValue,
+    out: *mut u32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.get(obj) else {
+        return NAPI_INVALID_ARG;
+    };
+    if !wasmer_napi_is_object_like(value) {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    unsafe { reflect_op(env, out, |s| Reflect::get(s.get(obj).ok_or(JsValue::NULL)?, key)) }
+}
+
+pub(crate) unsafe fn host_js_has_named_property(
+    env: SnapiEnv,
+    obj_id: u32,
+    key: &JsValue,
+    result: *mut i32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(object) = state.get(obj_id) else {
+        return NAPI_INVALID_ARG;
+    };
+    match Reflect::has(object, key) {
+        Ok(value) => {
+            unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
+}
+
 fn js_string(value: &JsValue) -> Result<String, JsValue> {
     if let Some(value) = value.as_string() {
         return Ok(value);
@@ -1984,26 +2106,9 @@ fn is_array_index_key(value: &str) -> bool {
 
 fn napi_typeof(value: &JsValue) -> i32 {
     // napi_valuetype: undefined, null, boolean, number, string, symbol,
-    // object, function, external, bigint.
-    if value.is_undefined() {
-        0
-    } else if value.is_null() {
-        1
-    } else if value.as_bool().is_some() {
-        2
-    } else if value.as_f64().is_some() {
-        3
-    } else if value.as_string().is_some() {
-        4
-    } else if value.is_symbol() {
-        5
-    } else if value.is_function() {
-        7
-    } else if value.is_bigint() {
-        9
-    } else {
-        6
-    }
+    // object, function, external, bigint. One host call instead of a chain
+    // of wasm-bindgen tests (whose string test copied the whole string).
+    wasmer_napi_typeof(value)
 }
 
 #[unsafe(no_mangle)]
@@ -2083,17 +2188,17 @@ pub unsafe extern "C" fn snapi_bridge_free_buffer(data: *mut c_void) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_get_undefined(env: SnapiEnv, out: *mut u32) -> i32 {
-    unsafe { put_value(env, out, JsValue::UNDEFINED) }
+    unsafe { put_primitive(env, out, JsValue::UNDEFINED) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_get_null(env: SnapiEnv, out: *mut u32) -> i32 {
-    unsafe { put_value(env, out, JsValue::NULL) }
+    unsafe { put_primitive(env, out, JsValue::NULL) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_get_boolean(env: SnapiEnv, value: i32, out: *mut u32) -> i32 {
-    unsafe { put_value(env, out, JsValue::from_bool(value != 0)) }
+    unsafe { put_primitive(env, out, JsValue::from_bool(value != 0)) }
 }
 
 #[unsafe(no_mangle)]
@@ -2121,7 +2226,7 @@ unsafe fn create_string(
     } else {
         String::from_utf8_lossy(raw).into_owned()
     };
-    unsafe { put_value(env, out, JsValue::from_str(&value)) }
+    unsafe { put_primitive(env, out, JsValue::from_str(&value)) }
 }
 
 #[unsafe(no_mangle)]
@@ -2158,7 +2263,7 @@ pub unsafe extern "C" fn snapi_bridge_create_string_utf16(
     } else {
         unsafe { slice::from_raw_parts(ptr, len as usize) }
     };
-    unsafe { put_value(env, out, JsValue::from_str(&String::from_utf16_lossy(raw))) }
+    unsafe { put_primitive(env, out, JsValue::from_str(&String::from_utf16_lossy(raw))) }
 }
 
 unsafe fn read_string_bytes(
@@ -2252,7 +2357,7 @@ macro_rules! create_number {
     ($name:ident, $ty:ty) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(env: SnapiEnv, value: $ty, out: *mut u32) -> i32 {
-            unsafe { put_value(env, out, JsValue::from_f64(value as f64)) }
+            unsafe { put_primitive(env, out, JsValue::from_f64(value as f64)) }
         }
     };
 }
@@ -2266,7 +2371,7 @@ pub unsafe extern "C" fn snapi_bridge_create_double(
     value: f64,
     out: *mut u32,
 ) -> i32 {
-    unsafe { put_value(env, out, JsValue::from_f64(value)) }
+    unsafe { put_primitive(env, out, JsValue::from_f64(value)) }
 }
 
 macro_rules! read_number {
@@ -2439,19 +2544,7 @@ pub unsafe extern "C" fn snapi_bridge_set_named_property(
     let Ok(name) = (unsafe { cstr(name) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let (Some(obj), Some(value)) = (state.get(obj), state.get(value)) else {
-        return NAPI_INVALID_ARG;
-    };
-    match Reflect::set(obj, &JsValue::from_str(&name), value) {
-        Ok(_) => NAPI_OK,
-        Err(e) => {
-            state.last_exception = Some(e);
-            NAPI_PENDING_EXCEPTION
-        }
-    }
+    unsafe { host_js_set_named_property(env, obj, &JsValue::from_str(&name), value) }
 }
 
 #[unsafe(no_mangle)]
@@ -2464,20 +2557,7 @@ pub unsafe extern "C" fn snapi_bridge_get_named_property(
     let Ok(name) = (unsafe { cstr(name) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(value) = state.get(obj) else {
-        return NAPI_INVALID_ARG;
-    };
-    if !value.is_object() && !value.is_function() {
-        return NAPI_OBJECT_EXPECTED;
-    }
-    unsafe {
-        reflect_op(env, out, |s| {
-            Reflect::get(s.get(obj).ok_or(JsValue::NULL)?, &JsValue::from_str(&name))
-        })
-    }
+    unsafe { host_js_get_named_property(env, obj, &JsValue::from_str(&name), out) }
 }
 
 #[unsafe(no_mangle)]
@@ -5492,9 +5572,11 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_string(
     let Some(value) = state.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
-    match js_string(&value) {
+    // Convert in JS: a round trip through a Rust String would cost two
+    // transcodes and replace lone surrogates with U+FFFD.
+    match wasmer_napi_string(&value) {
         Ok(text) => {
-            let id = state.insert(JsValue::from_str(&text));
+            let id = state.insert_primitive(text);
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5601,21 +5683,7 @@ pub unsafe extern "C" fn snapi_bridge_has_named_property(
     let Ok(name) = (unsafe { cstr(name) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(object) = state.get(obj_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    match Reflect::has(object, &JsValue::from_str(&name)) {
-        Ok(value) => {
-            unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
-        }
-        Err(error) => {
-            state.last_exception = Some(error);
-            NAPI_PENDING_EXCEPTION
-        }
-    }
+    unsafe { host_js_has_named_property(env, obj_id, &JsValue::from_str(&name), result) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_has_element(
