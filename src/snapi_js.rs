@@ -8,7 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     ffi::{CStr, CString, c_void},
     ptr,
     rc::Rc,
@@ -47,6 +47,9 @@ const SERIALIZED_MESSAGE_SEQUENCE_MASK: u32 = (1 << SERIALIZED_MESSAGE_SEQUENCE_
 const SERIALIZED_MESSAGE_SCOPE_MAX: u32 = (1 << (32 - SERIALIZED_MESSAGE_SEQUENCE_BITS)) - 1;
 
 static NEXT_SERIALIZED_MESSAGE_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+
+// Every map here is keyed by ids this provider allocates or host addresses.
+type HashMap<K, V> = crate::id_hash::IdHashMap<K, V>;
 // Runtime flags configure the provider, not an individual N-API environment
 // or calling thread. Worker environments are created on guest pthreads, so a
 // thread-local configuration would incorrectly make the process-global setup
@@ -1372,7 +1375,7 @@ impl HostJsEnv {
             values: Vec::new(),
             value_live: Vec::new(),
             value_free_slots: Vec::new(),
-            value_handles: HashMap::new(),
+            value_handles: HashMap::default(),
             next_value_handle: 1,
             // The root frame owns values created outside an explicit handle
             // scope and receives values escaped from the outermost scope.
@@ -1391,27 +1394,27 @@ impl HostJsEnv {
             last_exception: None,
             active_callback_ctx: ptr::null_mut(),
             next_deferred: 1,
-            deferreds: HashMap::new(),
+            deferreds: HashMap::default(),
             next_reference: 1,
-            references: HashMap::new(),
+            references: HashMap::default(),
             next_callback: 1,
-            callback_regs: HashMap::new(),
+            callback_regs: HashMap::default(),
             next_cbinfo: 1,
-            callback_infos: HashMap::new(),
+            callback_infos: HashMap::default(),
             pending_callbacks: VecDeque::new(),
             closures: Vec::new(),
             instance_data: 0,
-            wraps: HashMap::new(),
+            wraps: HashMap::default(),
             guest_finalizers: Vec::new(),
             guest_buffer_finalizers: Vec::new(),
-            externals: HashMap::new(),
-            backing_tokens: HashMap::new(),
-            type_tags: HashMap::new(),
+            externals: HashMap::default(),
+            backing_tokens: HashMap::default(),
+            type_tags: HashMap::default(),
             next_module: 1,
             next_bytecode: 1,
-            bytecodes: HashMap::new(),
-            synthetic_modules: HashMap::new(),
-            source_text_modules: HashMap::new(),
+            bytecodes: HashMap::default(),
+            synthetic_modules: HashMap::default(),
+            source_text_modules: HashMap::default(),
             embedder_hooks_attached: false,
         }
     }
@@ -1657,7 +1660,7 @@ impl HostJsEnv {
 }
 
 thread_local! {
-    static BUFFER_ALLOCS: RefCell<HashMap<usize, Box<[u8]>>> = RefCell::new(HashMap::new());
+    static BUFFER_ALLOCS: RefCell<HashMap<usize, Box<[u8]>>> = RefCell::new(HashMap::default());
     // N-API calls normally arrive in long runs from one guest environment.
     // Realm activation is only a context switch; repeating its wasm-bindgen
     // call before every operation doubles the host boundary crossings on the

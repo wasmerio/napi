@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use wasmer::TypedFunction;
 use wasmer::{Function, Memory, Table};
 
+use crate::id_hash::IdHashMap;
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
@@ -131,9 +132,9 @@ pub(crate) struct NapiEnv {
     pub(crate) default_napi_env_id: Option<u32>,
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
-    pub(crate) napi_envs: HashMap<u32, usize>,
-    pub(crate) napi_state_to_guest_env: HashMap<usize, u32>,
-    pub(crate) napi_scopes: HashMap<u32, u32>,
+    pub(crate) napi_envs: IdHashMap<u32, usize>,
+    pub(crate) napi_state_to_guest_env: IdHashMap<usize, u32>,
+    pub(crate) napi_scopes: IdHashMap<u32, u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) guest_buffer_pool: Vec<(u32, usize)>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -189,9 +190,9 @@ impl NapiEnv {
             default_napi_env_id: None,
             next_napi_env_id: 0,
             next_napi_scope_id: 0,
-            napi_envs: HashMap::new(),
-            napi_state_to_guest_env: HashMap::new(),
-            napi_scopes: HashMap::new(),
+            napi_envs: IdHashMap::default(),
+            napi_state_to_guest_env: IdHashMap::default(),
+            napi_scopes: IdHashMap::default(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             guest_buffer_pool: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
