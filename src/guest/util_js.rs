@@ -23,11 +23,12 @@ const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 // One Uint8Array per guest memory, replaced whenever an access reaches past it.
 // A shared memory never detaches: after growth its old view stays valid for its
 // old length and `buffer` yields a longer one. A non-shared memory detaches on
-// growth, which leaves the old view empty. Either way the access refreshes.
+// growth, which leaves the old view empty; an empty view is always replaced, so
+// even a zero-length access never touches a detached buffer.
 const views = new WeakMap();
 function view(memory, end) {
   let bytes = views.get(memory);
-  if (bytes === undefined || end > bytes.length) {
+  if (bytes === undefined || end > bytes.length || bytes.length === 0) {
     bytes = new Uint8Array(memory.buffer);
     views.set(memory, bytes);
   }
@@ -123,7 +124,8 @@ export function wasmer_napi_guest_c_string_length(memory, ptr, max) {
 
 // Strings. `encoding` is 0 for UTF-8, 1 for Latin-1 and 2 for UTF-16, with
 // lengths in code units (bytes for the first two).
-const utf8Decoder = new TextDecoder();
+// Like V8 and wasm-bindgen, keep a leading U+FEFF instead of consuming it.
+const utf8Decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 const utf8Encoder = new TextEncoder();
 const CHUNK = 8192;
 function fromCodes(codes) {
@@ -172,30 +174,29 @@ export function wasmer_napi_guest_string(memory, ptr, length, encoding, max) {
 // size) the full length is reported. Otherwise at most size - 1 units are
 // copied (UTF-8 never splits a character), followed by a NUL, and the copied
 // length is reported. The length is also stored at a non-zero `resultPtr`.
-// Returns the length, -1 if `value` is not a string, or -2 if a write would
-// leave guest memory.
+// Only the units actually written must lie inside guest memory. Returns the
+// length, -1 if `value` is not a string, or -2 if a write would leave guest
+// memory.
 export function wasmer_napi_guest_write_string(memory, value, buf, size, resultPtr, encoding) {
   if (typeof value !== 'string') return -1;
   let length;
   if (buf === 0 || size === 0) {
     length = encoding === 0 ? utf8Length(value) : value.length;
   } else if (encoding === 0) {
-    let bytes = view(memory, buf + size);
-    if (buf + size > bytes.length) return -2;
-    const limit = Math.min(value.length, size - 1);
-    let i = 0;
-    for (; i < limit; i++) {
-      const c = value.charCodeAt(i);
-      if (c >= 0x80) break;
-      bytes[buf + i] = c;
-    }
-    length = i;
-    if (i < limit) {
-      const encoded = utf8Encoder.encode(value);
+    length = Math.min(value.length, size - 1);
+    let ascii = 0;
+    while (ascii < length && value.charCodeAt(ascii) < 0x80) ascii++;
+    let encoded = null;
+    if (ascii < length) {
+      encoded = utf8Encoder.encode(value);
       length = Math.min(encoded.length, size - 1);
       while (length > 0 && length < encoded.length && (encoded[length] & 0xc0) === 0x80) length--;
-      bytes.set(encoded.subarray(0, length), buf);
     }
+    const end = buf + length + 1;
+    const bytes = view(memory, end);
+    if (end > bytes.length) return -2;
+    if (encoded !== null) bytes.set(encoded.subarray(0, length), buf);
+    else for (let i = 0; i < length; i++) bytes[buf + i] = value.charCodeAt(i);
     bytes[buf + length] = 0;
   } else {
     const unit = encoding === 2 ? 2 : 1;
@@ -269,9 +270,6 @@ pub fn read_guest_string_value(
     length: u32,
     encoding: GuestStringEncoding,
 ) -> Option<JsValue> {
-    if guest_ptr < 0 {
-        return None;
-    }
     let memory = guest_memory(env)?;
     let length = if length == u32::MAX {
         -1.0
@@ -279,6 +277,7 @@ pub fn read_guest_string_value(
         f64::from(length)
     };
     let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
+    // A wasm32 pointer arrives as i32; addresses above 2 GiB are negative.
     wasmer_napi_guest_string(&memory, guest_ptr as u32, length, encoding as u32, max)
         .map(JsValue::from)
 }
@@ -296,11 +295,15 @@ pub fn write_guest_string_value(
     let Some(memory) = guest_memory(env) else {
         return 1;
     };
-    let buf = if buf > 0 { buf as u32 } else { 0 };
-    let size = if size > 0 { size as u32 } else { 0 };
-    let result_ptr = if result_ptr > 0 { result_ptr as u32 } else { 0 };
-    let written =
-        wasmer_napi_guest_write_string(&memory, value, buf, size, result_ptr, encoding as u32);
+    // wasm32 pointers and sizes arrive as i32; zero is NULL.
+    let written = wasmer_napi_guest_write_string(
+        &memory,
+        value,
+        buf as u32,
+        size as u32,
+        result_ptr as u32,
+        encoding as u32,
+    );
     if written == -1.0 {
         3 // napi_string_expected
     } else if written < 0.0 {
@@ -680,6 +683,18 @@ mod tests {
         js_sys::WebAssembly::Memory::new(&descriptor).unwrap().into()
     }
 
+    fn shared_memory(pages: u32, maximum: u32) -> JsValue {
+        let descriptor = js_sys::Object::new();
+        js_sys::Reflect::set(&descriptor, &"initial".into(), &pages.into()).unwrap();
+        js_sys::Reflect::set(&descriptor, &"maximum".into(), &maximum.into()).unwrap();
+        js_sys::Reflect::set(&descriptor, &"shared".into(), &true.into()).unwrap();
+        js_sys::WebAssembly::Memory::new(&descriptor).unwrap().into()
+    }
+
+    fn grow(memory: &JsValue) {
+        memory.unchecked_ref::<js_sys::WebAssembly::Memory>().grow(1);
+    }
+
     fn read(memory: &JsValue, ptr: u32, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
         assert!(wasmer_napi_guest_read(memory, ptr, &mut out));
@@ -720,14 +735,17 @@ mod tests {
         let memory = memory(1);
         assert!(wasmer_napi_guest_write_u32(&memory, 100, 7));
         assert!(!wasmer_napi_guest_write_u32(&memory, 65536, 7));
-        memory
-            .unchecked_ref::<js_sys::WebAssembly::Memory>()
-            .grow(1);
-        // The cached view of the old (now detached) buffer must be replaced.
+        grow(&memory);
+        // The cached view of the old (now detached) buffer must be replaced,
+        // also by accesses that touch no bytes.
+        assert!(wasmer_napi_guest_read(&memory, 0, &mut []));
+        assert!(wasmer_napi_guest_write(&memory, 0, &[]));
+        assert_eq!(string(&memory, 0, 0.0, GuestStringEncoding::Utf8).as_deref(), Some(""));
+        grow(&memory);
         assert!(wasmer_napi_guest_write_u32(&memory, 65536, 9));
         assert_eq!(read(&memory, 65536, 4), 9u32.to_le_bytes());
         assert_eq!(read(&memory, 100, 4), 7u32.to_le_bytes());
-        assert_eq!(wasmer_napi_guest_byte_length(&memory), 131072.0);
+        assert_eq!(wasmer_napi_guest_byte_length(&memory), 196608.0);
     }
 
     #[wasm_bindgen_test]
@@ -742,6 +760,19 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn c_string_scans_continue_into_grown_shared_memory() {
+        let memory = shared_memory(1, 2);
+        // Cache a view of the first page, then grow and terminate the string
+        // in the second page without going through the cache.
+        assert!(wasmer_napi_guest_write(&memory, 65534, b"ab"));
+        grow(&memory);
+        let buffer = memory.unchecked_ref::<js_sys::WebAssembly::Memory>().buffer();
+        js_sys::Uint8Array::new(&buffer).set(&js_sys::Uint8Array::from(&b"c\0"[..]), 65536);
+        assert_eq!(wasmer_napi_guest_c_string_length(&memory, 65534, 64), 3);
+        assert_eq!(string(&memory, 65534, -1.0, GuestStringEncoding::Utf8).as_deref(), Some("abc"));
+    }
+
+    #[wasm_bindgen_test]
     fn strings_decode_in_every_encoding() {
         let memory = memory(1);
         let text = "a\u{e9}\u{4e2d}\u{1f600}";
@@ -751,6 +782,9 @@ mod tests {
         assert_eq!(string(&memory, 64, -1.0, GuestStringEncoding::Utf8).as_deref(), Some("name"));
         assert!(wasmer_napi_guest_write(&memory, 80, &[b'x', 0xff, b'y']));
         assert_eq!(string(&memory, 80, 3.0, GuestStringEncoding::Utf8).as_deref(), Some("x\u{fffd}y"));
+        // A leading byte order mark is kept, as V8 keeps it.
+        assert!(wasmer_napi_guest_write(&memory, 88, b"\xef\xbb\xbfA"));
+        assert_eq!(string(&memory, 88, 4.0, GuestStringEncoding::Utf8).as_deref(), Some("\u{feff}A"));
         assert!(wasmer_napi_guest_write(&memory, 96, &[0x63, 0xe9, 0xff]));
         assert_eq!(string(&memory, 96, 3.0, GuestStringEncoding::Latin1).as_deref(), Some("c\u{e9}\u{ff}"));
         // UTF-16 keeps a lone surrogate, at aligned and unaligned addresses.
@@ -787,7 +821,11 @@ mod tests {
         assert_eq!(write(&"\u{e9}xyz".into(), 500, 3, 0, GuestStringEncoding::Latin1), 2.0);
         assert_eq!(read(&memory, 500, 3), [0xe9, b'x', 0]);
         assert_eq!(write(&JsValue::from_f64(1.0), 200, 8, 0, GuestStringEncoding::Utf8), -1.0);
+        // Only the units written must be inside guest memory, the result too.
+        assert_eq!(write(&"ab".into(), 65533, 64, 0, GuestStringEncoding::Utf8), 2.0);
+        assert_eq!(read(&memory, 65533, 3), *b"ab\0");
         assert_eq!(write(&text, 65534, 8, 0, GuestStringEncoding::Utf8), -2.0);
+        assert_eq!(write(&"ab".into(), 200, 8, 65534, GuestStringEncoding::Utf16), -2.0);
     }
 
     #[wasm_bindgen_test]

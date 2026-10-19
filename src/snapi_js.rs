@@ -1487,8 +1487,8 @@ impl HostJsEnv {
         }
     }
 
-    /// Stores a value the caller knows is a primitive (string, number,
-    /// boolean, bigint): primitives have no identity to look up.
+    /// Stores a value the caller knows is a string, number, boolean, null or
+    /// undefined: these have no identity to look up.
     fn insert_primitive(&mut self, value: JsValue) -> u32 {
         let id = self.next_handle();
         self.store(id, value);
@@ -1511,17 +1511,21 @@ impl HostJsEnv {
                 self.next_value_handle = id;
                 return previous_id;
             }
-            // A stale handle (its frame closed): the object moves to `id`.
+            // A stale handle (its frame closed): the object moves to `id`, and
+            // so does its per-handle data, unless that id now names another
+            // value (possible only after the id space wrapped around).
             self.object_ids
                 .set(value.unchecked_ref::<Object>(), &JsValue::from_f64(id as f64));
-            if let Some(value) = self.externals.remove(&previous_id) {
-                self.externals.insert(id, value);
-            }
-            if let Some(value) = self.backing_tokens.remove(&previous_id) {
-                self.backing_tokens.insert(id, value);
-            }
-            if let Some(value) = self.type_tags.remove(&previous_id) {
-                self.type_tags.insert(id, value);
+            if !self.value_handles.contains_key(&previous_id) {
+                if let Some(value) = self.externals.remove(&previous_id) {
+                    self.externals.insert(id, value);
+                }
+                if let Some(value) = self.backing_tokens.remove(&previous_id) {
+                    self.backing_tokens.insert(id, value);
+                }
+                if let Some(value) = self.type_tags.remove(&previous_id) {
+                    self.type_tags.insert(id, value);
+                }
             }
         }
         self.store(id, value);
@@ -6767,9 +6771,20 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    /// Runs `test` on a fresh environment and releases it afterwards, so its
+    /// global context does not outlive the test.
+    fn with_env(test: impl FnOnce(SnapiEnv, &mut HostJsEnv)) {
+        let env = Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
+        test(env, unsafe { env_mut(env) }.unwrap());
+        assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+    }
+
     #[wasm_bindgen_test]
     fn objects_keep_their_handle_while_it_is_live() {
-        let mut state = HostJsEnv::new();
+        with_env(|_, state| objects_keep_their_handle(state));
+    }
+
+    fn objects_keep_their_handle(state: &mut HostJsEnv) {
         let object: JsValue = Object::new().into();
         let id = state.insert(object.clone());
         assert_eq!(state.insert(object.clone()), id);
@@ -6791,7 +6806,10 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn wrap_ids_are_recorded_once_per_object() {
-        let mut state = HostJsEnv::new();
+        with_env(|_, state| wrap_ids_are_recorded_once(state));
+    }
+
+    fn wrap_ids_are_recorded_once(state: &mut HostJsEnv) {
         let object = state.insert(Object::new().into());
         let number = state.insert_primitive(JsValue::from_f64(1.0));
         assert_eq!(state.wrap_id(object, false), None);
@@ -6823,17 +6841,22 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn coerce_to_string_keeps_lone_surrogates() {
-        let env = Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
-        let state = unsafe { env_mut(env) }.unwrap();
-        let lone = state.insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
-        let number = state.insert_primitive(JsValue::from_f64(1.5));
-        let mut out = 0;
-        assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) }, NAPI_OK);
-        let text: js_sys::JsString = unsafe { env_mut(env) }.unwrap().get(out).unwrap().clone().unchecked_into();
-        assert_eq!((text.length(), text.char_code_at(0)), (1, 0xd800 as f64));
-        assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, number, &mut out) }, NAPI_OK);
-        assert_eq!(unsafe { env_mut(env) }.unwrap().get(out).and_then(JsValue::as_string).as_deref(), Some("1.5"));
-        assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+        with_env(|env, state| {
+            let lone = state.insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
+            let number = state.insert_primitive(JsValue::from_f64(1.5));
+            let mut out = 0;
+            assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) }, NAPI_OK);
+            let text: js_sys::JsString = unsafe { env_mut(env) }
+                .unwrap()
+                .get(out)
+                .unwrap()
+                .clone()
+                .unchecked_into();
+            assert_eq!((text.length(), text.char_code_at(0)), (1, 0xd800 as f64));
+            assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, number, &mut out) }, NAPI_OK);
+            let text = unsafe { env_mut(env) }.unwrap().get(out).and_then(JsValue::as_string);
+            assert_eq!(text.as_deref(), Some("1.5"));
+        });
     }
 
     #[wasm_bindgen_test]
