@@ -1,8 +1,16 @@
 // ============================================================
 // Guest memory helpers
 // ============================================================
+//
+// Every N-API import touches guest memory: it reads arguments (property names,
+// string bytes) and writes results (handles, statuses). Wasmer's JS backend
+// `MemoryView` performs each access as several wasm-bindgen calls (`buffer`,
+// `byteLength`, a new `Uint8Array`, `length`, `subarray`, the copy), and the
+// C string reader repeated that per byte. These helpers do one host call per
+// access over a view cached per guest memory.
 
-use wasmer::FunctionEnvMut;
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+use wasmer::{FunctionEnvMut, js::AsJs};
 
 use crate::{
     GuestBackingStoreMapping, HostBufferCopy, NapiEnv, snapi::snapi_bridge_create_reference,
@@ -11,21 +19,87 @@ use crate::{
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
-pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
+#[wasm_bindgen(inline_js = r#"
+// One Uint8Array per guest memory, replaced whenever an access reaches past it.
+// A shared memory never detaches: after growth its old view stays valid for its
+// old length and `buffer` yields a longer one. A non-shared memory detaches on
+// growth, which leaves the old view empty. Either way the access refreshes.
+const views = new WeakMap();
+function view(memory, end) {
+  let bytes = views.get(memory);
+  if (bytes === undefined || end > bytes.length) {
+    bytes = new Uint8Array(memory.buffer);
+    views.set(memory, bytes);
+  }
+  return bytes;
+}
+export function wasmer_napi_guest_byte_length(memory) {
+  return memory.buffer.byteLength;
+}
+export function wasmer_napi_guest_read(memory, ptr, out) {
+  const end = ptr + out.length;
+  const bytes = view(memory, end);
+  if (end > bytes.length) return false;
+  out.set(bytes.subarray(ptr, end));
+  return true;
+}
+export function wasmer_napi_guest_write(memory, ptr, data) {
+  const end = ptr + data.length;
+  const bytes = view(memory, end);
+  if (end > bytes.length) return false;
+  bytes.set(data, ptr);
+  return true;
+}
+export function wasmer_napi_guest_write_u32(memory, ptr, value) {
+  const bytes = view(memory, ptr + 4);
+  if (ptr + 4 > bytes.length) return false;
+  bytes[ptr] = value;
+  bytes[ptr + 1] = value >>> 8;
+  bytes[ptr + 2] = value >>> 16;
+  bytes[ptr + 3] = value >>> 24;
+  return true;
+}
+// Length of the NUL-terminated string at `ptr`, scanning at most `max` bytes;
+// -1 if no terminator lies within that bound and the memory.
+export function wasmer_napi_guest_c_string_length(memory, ptr, max) {
+  let bytes = view(memory, ptr + 1);
+  if (ptr >= bytes.length) return -1;
+  // The terminator may lie past a view that predates growth.
+  if (bytes.length - ptr < max) bytes = view(memory, Math.min(ptr + max, memory.buffer.byteLength));
+  const length = bytes.subarray(ptr, Math.min(bytes.length, ptr + max)).indexOf(0);
+  return length;
+}
+"#)]
+extern "C" {
+    fn wasmer_napi_guest_byte_length(memory: &JsValue) -> f64;
+    fn wasmer_napi_guest_read(memory: &JsValue, ptr: u32, out: &mut [u8]) -> bool;
+    fn wasmer_napi_guest_write(memory: &JsValue, ptr: u32, data: &[u8]) -> bool;
+    fn wasmer_napi_guest_write_u32(memory: &JsValue, ptr: u32, value: u32) -> bool;
+    fn wasmer_napi_guest_c_string_length(memory: &JsValue, ptr: u32, max: u32) -> i32;
+}
+
+/// The guest's `WebAssembly.Memory`, a cheap externref clone.
+fn guest_memory(env: &mut FunctionEnvMut<NapiEnv>) -> Option<JsValue> {
     let (state, store) = env.data_and_store_mut();
-    let Some(memory) = state.memory.clone() else {
+    Some(state.memory.as_ref()?.as_jsvalue(&store))
+}
+
+pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
+    let Some(memory) = guest_memory(env) else {
         return false;
     };
-    let view = memory.view(&store);
-    view.write(guest_ptr as u64, data).is_ok()
+    wasmer_napi_guest_write(&memory, guest_ptr, data)
 }
 
 pub fn write_guest_u32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u32) -> bool {
-    write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
+    let Some(memory) = guest_memory(env) else {
+        return false;
+    };
+    wasmer_napi_guest_write_u32(&memory, guest_ptr, val)
 }
 
 pub fn write_guest_i32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: i32) -> bool {
-    write_guest_bytes(env, guest_ptr, &val.to_le_bytes())
+    write_guest_u32(env, guest_ptr, val as u32)
 }
 
 pub fn write_guest_u64(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u64) -> bool {
@@ -52,26 +126,22 @@ pub fn read_guest_bytes(
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
+    let memory = guest_memory(env)?;
     // Reject an impossible guest range before allocating the host snapshot.
     // The bounds-checked read below is too late: `vec![0; len]` may otherwise
     // abort the host on a forged multi-gigabyte length.
-    if (guest_ptr as u64).checked_add(len as u64)? > view.data_size() {
+    if (guest_ptr as u64).checked_add(len as u64)? > wasmer_napi_guest_byte_length(&memory) as u64 {
         return None;
     }
     let mut out = vec![0u8; len];
-    view.read(guest_ptr as u64, &mut out).ok()?;
-    Some(out)
+    wasmer_napi_guest_read(&memory, guest_ptr as u32, &mut out).then_some(out)
 }
 
 pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
-    let Some(memory) = env.data().memory.clone() else {
+    let Some(memory) = guest_memory(env) else {
         return 0;
     };
-    let (_, store) = env.data_and_store_mut();
-    memory.view(&store).data_size()
+    wasmer_napi_guest_byte_length(&memory) as u64
 }
 
 pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
@@ -328,19 +398,9 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) ->
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
-    let mut out = Vec::new();
-    let mut offset = guest_ptr as u64;
-    for _ in 0..super::MAX_GUEST_CSTRING_SCAN {
-        let mut b = [0u8; 1];
-        view.read(offset, &mut b).ok()?;
-        if b[0] == 0 {
-            return Some(out);
-        }
-        out.push(b[0]);
-        offset += 1;
-    }
-    None
+    let memory = guest_memory(env)?;
+    let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
+    let len = usize::try_from(wasmer_napi_guest_c_string_length(&memory, guest_ptr as u32, max)).ok()?;
+    let mut out = vec![0u8; len];
+    wasmer_napi_guest_read(&memory, guest_ptr as u32, &mut out).then_some(out)
 }
