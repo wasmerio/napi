@@ -42,7 +42,8 @@ pub(crate) type IdHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDef
 mod tests {
     use super::IdHashMap;
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn sequential_and_tuple_keys_round_trip() {
         let mut map = IdHashMap::default();
         for id in 1..=10_000u32 {

@@ -6768,6 +6768,75 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test]
+    fn objects_keep_their_handle_while_it_is_live() {
+        let mut state = HostJsEnv::new();
+        let object: JsValue = Object::new().into();
+        let id = state.insert(object.clone());
+        assert_eq!(state.insert(object.clone()), id);
+        assert_ne!(state.insert_primitive("x".into()), state.insert_primitive("x".into()));
+
+        let frame = state.open_value_frame();
+        let scoped: JsValue = Object::new().into();
+        let stale = state.insert(scoped.clone());
+        state.externals.insert(stale, 7);
+        assert!(state.close_value_frame(frame));
+        assert!(state.get(stale).is_none());
+        // A closed frame's handle is stale: the object moves, with its data.
+        let fresh = state.insert(scoped.clone());
+        assert_ne!(fresh, stale);
+        assert!(Object::is(state.get(fresh).unwrap(), &scoped));
+        assert_eq!(state.externals.get(&fresh), Some(&7));
+        assert_eq!(state.insert(scoped), fresh);
+    }
+
+    #[wasm_bindgen_test]
+    fn wrap_ids_are_recorded_once_per_object() {
+        let mut state = HostJsEnv::new();
+        let object = state.insert(Object::new().into());
+        let number = state.insert_primitive(JsValue::from_f64(1.0));
+        assert_eq!(state.wrap_id(object, false), None);
+        let id = state.wrap_id(object, true).unwrap();
+        assert_eq!(state.wrap_id(object, false), Some(id));
+        assert_eq!(state.wrap_id(object, true), Some(id));
+        assert_eq!(state.wrap_id(number, true), None);
+        let other = state.insert(Object::new().into());
+        assert_eq!(state.wrap_id(other, true), Some(id + 1));
+    }
+
+    #[wasm_bindgen_test]
+    fn typeof_matches_napi_valuetype() {
+        let cases: [(JsValue, i32); 9] = [
+            (JsValue::UNDEFINED, 0),
+            (JsValue::NULL, 1),
+            (JsValue::TRUE, 2),
+            (JsValue::from_f64(1.5), 3),
+            ("s".into(), 4),
+            (js_sys::Symbol::for_("napi").into(), 5),
+            (Object::new().into(), 6),
+            (Function::new_no_args("").into(), 7),
+            (js_sys::BigInt::from(1).into(), 9),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(napi_typeof(&value), expected, "{value:?}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn coerce_to_string_keeps_lone_surrogates() {
+        let env = Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
+        let state = unsafe { env_mut(env) }.unwrap();
+        let lone = state.insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
+        let number = state.insert_primitive(JsValue::from_f64(1.5));
+        let mut out = 0;
+        assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) }, NAPI_OK);
+        let text: js_sys::JsString = unsafe { env_mut(env) }.unwrap().get(out).unwrap().clone().unchecked_into();
+        assert_eq!((text.length(), text.char_code_at(0)), (1, 0xd800 as f64));
+        assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, number, &mut out) }, NAPI_OK);
+        assert_eq!(unsafe { env_mut(env) }.unwrap().get(out).and_then(JsValue::as_string).as_deref(), Some("1.5"));
+        assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+    }
+
+    #[wasm_bindgen_test]
     fn released_callbacks_do_not_keep_externref_roots_and_remain_callable() {
         let before = wasm_bindgen::externref_heap_live_count();
         let mut state = Box::new(HostJsEnv::new());

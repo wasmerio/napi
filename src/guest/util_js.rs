@@ -667,3 +667,144 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) ->
     let mut out = vec![0u8; len];
     wasmer_napi_guest_read(&memory, guest_ptr as u32, &mut out).then_some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn memory(pages: u32) -> JsValue {
+        let descriptor = js_sys::Object::new();
+        js_sys::Reflect::set(&descriptor, &"initial".into(), &pages.into()).unwrap();
+        js_sys::WebAssembly::Memory::new(&descriptor).unwrap().into()
+    }
+
+    fn read(memory: &JsValue, ptr: u32, len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        assert!(wasmer_napi_guest_read(memory, ptr, &mut out));
+        out
+    }
+
+    fn string(memory: &JsValue, ptr: u32, length: f64, encoding: GuestStringEncoding) -> Option<String> {
+        wasmer_napi_guest_string(memory, ptr, length, encoding as u32, 64 * 1024).map(String::from)
+    }
+
+    fn code_units(value: &js_sys::JsString) -> Vec<u16> {
+        (0..value.length()).map(|i| value.char_code_at(i) as u16).collect()
+    }
+
+    #[wasm_bindgen_test]
+    fn bytes_and_scalars_round_trip_within_bounds() {
+        let memory = memory(1);
+        assert!(wasmer_napi_guest_write(&memory, 10, &[1, 2, 3]));
+        assert_eq!(read(&memory, 10, 3), [1, 2, 3]);
+        assert!(wasmer_napi_guest_write_u32(&memory, 21, 0xdead_beef));
+        assert_eq!(read(&memory, 21, 4), 0xdead_beef_u32.to_le_bytes());
+        assert!(wasmer_napi_guest_write_u8(&memory, 30, 0xab));
+        assert_eq!(read(&memory, 30, 1), [0xab]);
+        assert!(wasmer_napi_guest_write_u64(&memory, 33, 0x0403_0201, 0x0807_0605));
+        assert_eq!(read(&memory, 33, 8), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(wasmer_napi_guest_write_f64(&memory, 41, -2.5));
+        assert_eq!(read(&memory, 41, 8), (-2.5f64).to_le_bytes());
+        let end = 65536;
+        assert!(!wasmer_napi_guest_write(&memory, end - 2, &[0; 3]));
+        assert!(!wasmer_napi_guest_write_u32(&memory, end - 3, 1));
+        assert!(!wasmer_napi_guest_write_f64(&memory, end - 7, 1.0));
+        let mut out = [0; 2];
+        assert!(!wasmer_napi_guest_read(&memory, end - 1, &mut out));
+    }
+
+    #[wasm_bindgen_test]
+    fn views_follow_memory_growth() {
+        let memory = memory(1);
+        assert!(wasmer_napi_guest_write_u32(&memory, 100, 7));
+        assert!(!wasmer_napi_guest_write_u32(&memory, 65536, 7));
+        memory
+            .unchecked_ref::<js_sys::WebAssembly::Memory>()
+            .grow(1);
+        // The cached view of the old (now detached) buffer must be replaced.
+        assert!(wasmer_napi_guest_write_u32(&memory, 65536, 9));
+        assert_eq!(read(&memory, 65536, 4), 9u32.to_le_bytes());
+        assert_eq!(read(&memory, 100, 4), 7u32.to_le_bytes());
+        assert_eq!(wasmer_napi_guest_byte_length(&memory), 131072.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn c_strings_need_a_terminator_within_bounds() {
+        let memory = memory(1);
+        assert!(wasmer_napi_guest_write(&memory, 8, b"abc\0"));
+        assert_eq!(wasmer_napi_guest_c_string_length(&memory, 8, 64), 3);
+        assert_eq!(wasmer_napi_guest_c_string_length(&memory, 8, 2), -1);
+        assert!(wasmer_napi_guest_write(&memory, 65534, b"xy"));
+        assert_eq!(wasmer_napi_guest_c_string_length(&memory, 65534, 64), -1);
+        assert_eq!(wasmer_napi_guest_c_string_length(&memory, 70000, 64), -1);
+    }
+
+    #[wasm_bindgen_test]
+    fn strings_decode_in_every_encoding() {
+        let memory = memory(1);
+        let text = "a\u{e9}\u{4e2d}\u{1f600}";
+        assert!(wasmer_napi_guest_write(&memory, 16, text.as_bytes()));
+        assert_eq!(string(&memory, 16, text.len() as f64, GuestStringEncoding::Utf8).as_deref(), Some(text));
+        assert!(wasmer_napi_guest_write(&memory, 64, b"name\0"));
+        assert_eq!(string(&memory, 64, -1.0, GuestStringEncoding::Utf8).as_deref(), Some("name"));
+        assert!(wasmer_napi_guest_write(&memory, 80, &[b'x', 0xff, b'y']));
+        assert_eq!(string(&memory, 80, 3.0, GuestStringEncoding::Utf8).as_deref(), Some("x\u{fffd}y"));
+        assert!(wasmer_napi_guest_write(&memory, 96, &[0x63, 0xe9, 0xff]));
+        assert_eq!(string(&memory, 96, 3.0, GuestStringEncoding::Latin1).as_deref(), Some("c\u{e9}\u{ff}"));
+        // UTF-16 keeps a lone surrogate, at aligned and unaligned addresses.
+        let units = [0x78u16, 0xd800, 0x79, 0];
+        let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        for ptr in [128, 161] {
+            assert!(wasmer_napi_guest_write(&memory, ptr, &bytes));
+            let value = wasmer_napi_guest_string(&memory, ptr, -1.0, GuestStringEncoding::Utf16 as u32, 64).unwrap();
+            assert_eq!(code_units(&value), [0x78, 0xd800, 0x79]);
+        }
+        assert!(string(&memory, 65530, 10.0, GuestStringEncoding::Utf8).is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn strings_write_like_napi_get_value_string() {
+        let memory = memory(1);
+        let write = |value: &JsValue, buf, size, result, encoding: GuestStringEncoding| {
+            wasmer_napi_guest_write_string(&memory, value, buf, size, result, encoding as u32)
+        };
+        let text: JsValue = "a\u{e9}\u{1f600}".into();
+        // Length queries report the full length in the encoding's units.
+        assert_eq!(write(&text, 0, 0, 0, GuestStringEncoding::Utf8), 7.0);
+        assert_eq!(write(&text, 0, 0, 0, GuestStringEncoding::Utf16), 4.0);
+        // UTF-8 truncation never splits a character; the copy is terminated.
+        assert_eq!(write(&text, 200, 3, 300, GuestStringEncoding::Utf8), 1.0);
+        assert_eq!(read(&memory, 200, 2), [b'a', 0]);
+        assert_eq!(read(&memory, 300, 4), 1u32.to_le_bytes());
+        assert_eq!(write(&text, 200, 16, 0, GuestStringEncoding::Utf8), 7.0);
+        assert_eq!(read(&memory, 200, 8), *b"a\xc3\xa9\xf0\x9f\x98\x80\0");
+        // UTF-16 copies code units, lone surrogates included.
+        let lone: JsValue = js_sys::JsString::from_char_code2(0x78, 0xdc00).into();
+        assert_eq!(write(&lone, 401, 8, 0, GuestStringEncoding::Utf16), 2.0);
+        assert_eq!(read(&memory, 401, 6), [0x78, 0, 0x00, 0xdc, 0, 0]);
+        assert_eq!(write(&"\u{e9}xyz".into(), 500, 3, 0, GuestStringEncoding::Latin1), 2.0);
+        assert_eq!(read(&memory, 500, 3), [0xe9, b'x', 0]);
+        assert_eq!(write(&JsValue::from_f64(1.0), 200, 8, 0, GuestStringEncoding::Utf8), -1.0);
+        assert_eq!(write(&text, 65534, 8, 0, GuestStringEncoding::Utf8), -2.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn numbers_saturate_like_rust_casts() {
+        let memory = memory(1);
+        let store = |value: f64, kind: GuestNumberKind| {
+            assert!(wasmer_napi_guest_write_number(&memory, &JsValue::from_f64(value), 8, kind as u32));
+            read(&memory, 8, 8)
+        };
+        for value in [3e10, -3e10, f64::NAN, -1.9, 7.9] {
+            assert_eq!(store(value, GuestNumberKind::I32)[..4], (value as i32).to_le_bytes());
+            assert_eq!(store(value, GuestNumberKind::U32)[..4], (value as u32).to_le_bytes());
+        }
+        for value in [1e30, -1e30, f64::NAN, 9007199254740993.0, -42.5] {
+            assert_eq!(store(value, GuestNumberKind::I64), (value as i64).to_le_bytes());
+        }
+        assert_eq!(store(-0.25, GuestNumberKind::F64), (-0.25f64).to_le_bytes());
+        assert!(!wasmer_napi_guest_write_number(&memory, &"1".into(), 8, GuestNumberKind::I32 as u32));
+    }
+}
