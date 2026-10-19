@@ -36,6 +36,7 @@ const NAPI_INVALID_ARG: i32 = 1;
 const NAPI_OBJECT_EXPECTED: i32 = 2;
 const NAPI_STRING_EXPECTED: i32 = 3;
 const NAPI_FUNCTION_EXPECTED: i32 = 5;
+const NAPI_NUMBER_EXPECTED: i32 = 6;
 const NAPI_ARRAY_EXPECTED: i32 = 8;
 const NAPI_GENERIC_FAILURE: i32 = 9;
 const NAPI_PENDING_EXCEPTION: i32 = 10;
@@ -2378,24 +2379,45 @@ pub unsafe extern "C" fn snapi_bridge_create_double(
     unsafe { put_primitive(env, out, JsValue::from_f64(value)) }
 }
 
+// Node's conversions: `v8::Value::Uint32Value`/`Int32Value` wrap modulo 2^32,
+// `IntegerValue` saturates, and Node maps non-finite values to zero for all.
+fn number_to_uint32(value: f64) -> u32 {
+    if value.is_finite() {
+        value.trunc().rem_euclid(4_294_967_296.0) as u32
+    } else {
+        0
+    }
+}
+
+fn number_to_int32(value: f64) -> i32 {
+    number_to_uint32(value) as i32
+}
+
+fn number_to_int64(value: f64) -> i64 {
+    if value.is_finite() { value as i64 } else { 0 }
+}
+
 macro_rules! read_number {
-    ($name:ident, $ty:ty) => {
+    ($name:ident, $ty:ty, $convert:expr) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(env: SnapiEnv, id: u32, out: *mut $ty) -> i32 {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(value) = state.get(id).and_then(JsValue::as_f64) else {
+            let Some(value) = state.get(id) else {
                 return NAPI_INVALID_ARG;
             };
-            unsafe { write(out, value as $ty) }.map_or_else(|e| e, |_| NAPI_OK)
+            let Some(value) = value.as_f64() else {
+                return NAPI_NUMBER_EXPECTED;
+            };
+            unsafe { write(out, $convert(value)) }.map_or_else(|e| e, |_| NAPI_OK)
         }
     };
 }
-read_number!(snapi_bridge_get_value_int32, i32);
-read_number!(snapi_bridge_get_value_uint32, u32);
-read_number!(snapi_bridge_get_value_int64, i64);
-read_number!(snapi_bridge_get_value_double, f64);
+read_number!(snapi_bridge_get_value_int32, i32, number_to_int32);
+read_number!(snapi_bridge_get_value_uint32, u32, number_to_uint32);
+read_number!(snapi_bridge_get_value_int64, i64, number_to_int64);
+read_number!(snapi_bridge_get_value_double, f64, |value: f64| value);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_get_value_bool(env: SnapiEnv, id: u32, out: *mut i32) -> i32 {
@@ -6819,6 +6841,24 @@ mod tests {
         assert_eq!(state.wrap_id(number, true), None);
         let other = state.insert(Object::new().into());
         assert_eq!(state.wrap_id(other, true), Some(id + 1));
+    }
+
+    #[wasm_bindgen_test]
+    fn number_getters_convert_like_node() {
+        with_env(|env, state| {
+            let big = state.insert_primitive(JsValue::from_f64(4294967301.0));
+            let negative = state.insert_primitive(JsValue::from_f64(-1.0));
+            let infinite = state.insert_primitive(JsValue::from_f64(f64::INFINITY));
+            let text = state.insert_primitive("1".into());
+            let (mut int32, mut uint32, mut int64) = (0i32, 0u32, 1i64);
+            unsafe {
+                assert_eq!(snapi_bridge_get_value_int32(env, big, &mut int32), NAPI_OK);
+                assert_eq!(snapi_bridge_get_value_uint32(env, negative, &mut uint32), NAPI_OK);
+                assert_eq!(snapi_bridge_get_value_int64(env, infinite, &mut int64), NAPI_OK);
+                assert_eq!(snapi_bridge_get_value_int32(env, text, &mut int32), NAPI_NUMBER_EXPECTED);
+            }
+            assert_eq!((int32, uint32, int64), (5, u32::MAX, 0));
+        });
     }
 
     #[wasm_bindgen_test]

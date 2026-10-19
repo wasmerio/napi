@@ -86,17 +86,26 @@ export function wasmer_napi_guest_write_f64(memory, ptr, value) {
   return write8(memory, ptr);
 }
 // napi_get_value_{int32,uint32,int64,double}: stores `value` at `ptr` with
-// Rust's saturating float-to-int casts (NaN becomes 0). `kind` is 0 for i32,
-// 1 for u32, 2 for i64 and 3 for f64. Returns false for a non-number or a
-// store outside guest memory.
+// Node's conversions: int32 and uint32 wrap like ToInt32/ToUint32, int64
+// saturates, and non-finite values become 0. `kind` is 0 for i32, 1 for u32,
+// 2 for i64 and 3 for f64. Returns an N-API status: 0, 6
+// (napi_number_expected) for a non-number, or 1 for a store outside guest
+// memory.
 export function wasmer_napi_guest_write_number(memory, value, ptr, kind) {
-  if (typeof value !== 'number') return false;
-  if (kind === 3) return wasmer_napi_guest_write_f64(memory, ptr, value);
-  const x = value !== value ? 0 : Math.trunc(value);
-  if (kind === 0) return wasmer_napi_guest_write_u32(memory, ptr, x <= -2147483648 ? -2147483648 : x >= 2147483647 ? 2147483647 : x);
-  if (kind === 1) return wasmer_napi_guest_write_u32(memory, ptr, x <= 0 ? 0 : x >= 4294967295 ? 4294967295 : x);
-  scratch.setBigInt64(0, x <= -9223372036854775808 ? -9223372036854775808n : x >= 9223372036854775807 ? 9223372036854775807n : BigInt(x), true);
-  return write8(memory, ptr);
+  if (typeof value !== 'number') return 6;
+  let stored;
+  if (kind === 3) {
+    stored = wasmer_napi_guest_write_f64(memory, ptr, value);
+  } else if (kind === 0) {
+    stored = wasmer_napi_guest_write_u32(memory, ptr, value | 0);
+  } else if (kind === 1) {
+    stored = wasmer_napi_guest_write_u32(memory, ptr, value >>> 0);
+  } else {
+    const x = Number.isFinite(value) ? Math.trunc(value) : 0;
+    scratch.setBigInt64(0, x <= -9223372036854775808 ? -9223372036854775808n : x >= 9223372036854775807 ? 9223372036854775807n : BigInt(x), true);
+    stored = write8(memory, ptr);
+  }
+  return stored ? 0 : 1;
 }
 // Length in units (1 or 2 bytes) of the NUL-terminated string at `ptr`,
 // scanning at most `max` units; -1 if no terminator lies within that bound and
@@ -233,7 +242,7 @@ extern "C" {
     fn wasmer_napi_guest_write_u32(memory: &JsValue, ptr: u32, value: u32) -> bool;
     fn wasmer_napi_guest_write_u64(memory: &JsValue, ptr: u32, low: u32, high: u32) -> bool;
     fn wasmer_napi_guest_write_f64(memory: &JsValue, ptr: u32, value: f64) -> bool;
-    fn wasmer_napi_guest_write_number(memory: &JsValue, value: &JsValue, ptr: u32, kind: u32) -> bool;
+    fn wasmer_napi_guest_write_number(memory: &JsValue, value: &JsValue, ptr: u32, kind: u32) -> i32;
     fn wasmer_napi_guest_c_string_length(memory: &JsValue, ptr: u32, max: u32) -> i32;
     fn wasmer_napi_guest_string(
         memory: &JsValue,
@@ -372,8 +381,8 @@ pub enum GuestNumberKind {
 }
 
 /// Implements `napi_get_value_{int32,uint32,int64,double}` for a value already
-/// resolved from its handle, storing the result in guest memory directly.
-/// Conversions saturate like Rust's `as`. Returns an N-API status.
+/// resolved from its handle, storing the result in guest memory directly with
+/// Node's conversions. Returns an N-API status.
 pub fn write_guest_number_value(
     env: &mut FunctionEnvMut<NapiEnv>,
     value: &JsValue,
@@ -383,12 +392,7 @@ pub fn write_guest_number_value(
     let Some(memory) = guest_memory(env) else {
         return 1;
     };
-    // Like the host bridge, a non-number is napi_invalid_arg.
-    if wasmer_napi_guest_write_number(&memory, value, guest_ptr as u32, kind as u32) {
-        0
-    } else {
-        1
-    }
+    wasmer_napi_guest_write_number(&memory, value, guest_ptr as u32, kind as u32)
 }
 
 pub fn read_guest_bytes(
@@ -829,20 +833,42 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn numbers_saturate_like_rust_casts() {
+    fn numbers_convert_like_node() {
         let memory = memory(1);
         let store = |value: f64, kind: GuestNumberKind| {
-            assert!(wasmer_napi_guest_write_number(&memory, &JsValue::from_f64(value), 8, kind as u32));
+            let status = wasmer_napi_guest_write_number(&memory, &JsValue::from_f64(value), 8, kind as u32);
+            assert_eq!(status, 0);
             read(&memory, 8, 8)
         };
-        for value in [3e10, -3e10, f64::NAN, -1.9, 7.9] {
-            assert_eq!(store(value, GuestNumberKind::I32)[..4], (value as i32).to_le_bytes());
-            assert_eq!(store(value, GuestNumberKind::U32)[..4], (value as u32).to_le_bytes());
+        let i32_of = |value| i32::from_le_bytes(store(value, GuestNumberKind::I32)[..4].try_into().unwrap());
+        let u32_of = |value| u32::from_le_bytes(store(value, GuestNumberKind::U32)[..4].try_into().unwrap());
+        let i64_of = |value| i64::from_le_bytes(store(value, GuestNumberKind::I64).try_into().unwrap());
+        // int32 and uint32 wrap like ToInt32 and ToUint32.
+        for (value, int32, uint32) in [
+            (4294967301.0, 5, 5),
+            (-1.0, -1, u32::MAX),
+            (2147483648.0, i32::MIN, 2147483648),
+            (-1.9, -1, u32::MAX),
+            (7.9, 7, 7),
+            (f64::NAN, 0, 0),
+            (f64::INFINITY, 0, 0),
+            (f64::NEG_INFINITY, 0, 0),
+        ] {
+            assert_eq!((i32_of(value), u32_of(value)), (int32, uint32), "{value}");
         }
-        for value in [1e30, -1e30, f64::NAN, 9007199254740993.0, -42.5] {
-            assert_eq!(store(value, GuestNumberKind::I64), (value as i64).to_le_bytes());
+        // int64 saturates; non-finite values become zero.
+        for (value, int64) in [
+            (1e30, i64::MAX),
+            (-1e30, i64::MIN),
+            (f64::INFINITY, 0),
+            (f64::NAN, 0),
+            (-42.5, -42),
+            (9007199254740993.0, 9007199254740992),
+        ] {
+            assert_eq!(i64_of(value), int64, "{value}");
         }
         assert_eq!(store(-0.25, GuestNumberKind::F64), (-0.25f64).to_le_bytes());
-        assert!(!wasmer_napi_guest_write_number(&memory, &"1".into(), 8, GuestNumberKind::I32 as u32));
+        assert_eq!(wasmer_napi_guest_write_number(&memory, &"1".into(), 8, GuestNumberKind::I32 as u32), 6);
+        assert_eq!(wasmer_napi_guest_write_number(&memory, &JsValue::from_f64(1.0), 65534, GuestNumberKind::I32 as u32), 1);
     }
 }
