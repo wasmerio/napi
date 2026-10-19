@@ -3,8 +3,8 @@
 //!
 //! Such keys are never chosen by the guest, so SipHash's flooding resistance
 //! only costs time, and several of these maps are consulted on every N-API
-//! call. A multiplicative hash spreads sequential ids over both the bucket index
-//! (low bits) and hashbrown's control byte (top bits).
+//! call. A multiplicative hash spreads sequential ids and aligned addresses
+//! over both hashbrown's bucket index and its control byte.
 
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -13,7 +13,10 @@ pub(crate) struct IdHasher(u64);
 
 impl Hasher for IdHasher {
     fn finish(&self) -> u64 {
-        self.0
+        // The multiply mixes the high bits best, but hashbrown takes bucket
+        // indices from the low bits (and, on 32-bit targets, its control byte
+        // from bits 25-31). Rotate the well-mixed bits down, like rustc-hash.
+        self.0.rotate_left(26)
     }
 
     fn write(&mut self, bytes: &[u8]) {

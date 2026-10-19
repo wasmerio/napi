@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use wasmer::TypedFunction;
 use wasmer::{Function, Memory, Table};
 
-use crate::id_hash::IdHashMap;
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
+use crate::id_hash::IdHashMap;
 use crate::snapi::{
     SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,

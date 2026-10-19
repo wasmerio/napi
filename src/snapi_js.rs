@@ -26,6 +26,8 @@ use js_sys::{
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 
+// Every map here is keyed by ids this provider allocates or by host addresses.
+use crate::id_hash::IdHashMap;
 use crate::snapi::{
     SnapiEnv, SnapiEnvState, SnapiUnofficialHeapCodeStatistics, SnapiUnofficialHeapSpaceStatistics,
     SnapiUnofficialHeapStatistics,
@@ -49,8 +51,6 @@ const SERIALIZED_MESSAGE_SCOPE_MAX: u32 = (1 << (32 - SERIALIZED_MESSAGE_SEQUENC
 
 static NEXT_SERIALIZED_MESSAGE_SEQUENCE: AtomicU32 = AtomicU32::new(1);
 
-// Every map here is keyed by ids this provider allocates or host addresses.
-type HashMap<K, V> = crate::id_hash::IdHashMap<K, V>;
 // Runtime flags configure the provider, not an individual N-API environment
 // or calling thread. Worker environments are created on guest pthreads, so a
 // thread-local configuration would incorrectly make the process-global setup
@@ -1340,7 +1340,7 @@ struct HostJsEnv {
     values: Vec<UnsafeCell<JsValue>>,
     value_live: Vec<bool>,
     value_free_slots: Vec<u32>,
-    value_handles: HashMap<u32, u32>,
+    value_handles: IdHashMap<u32, u32>,
     next_value_handle: u32,
     value_frames: Vec<ValueFrame>,
     next_value_frame: u32,
@@ -1354,27 +1354,27 @@ struct HostJsEnv {
     last_exception: Option<JsValue>,
     active_callback_ctx: *mut c_void,
     next_deferred: u32,
-    deferreds: HashMap<u32, Deferred>,
+    deferreds: IdHashMap<u32, Deferred>,
     next_reference: u32,
-    references: HashMap<u32, Reference>,
+    references: IdHashMap<u32, Reference>,
     next_callback: u32,
-    callback_regs: HashMap<u32, CallbackReg>,
+    callback_regs: IdHashMap<u32, CallbackReg>,
     next_cbinfo: u32,
-    callback_infos: HashMap<u32, CallbackInfo>,
+    callback_infos: IdHashMap<u32, CallbackInfo>,
     pending_callbacks: VecDeque<PendingCallback>,
     closures: Vec<Closure<dyn Fn(JsValue, Array) -> JsValue>>,
     instance_data: u64,
-    wraps: HashMap<u32, u64>,
+    wraps: IdHashMap<u32, u64>,
     guest_finalizers: Vec<GuestFinalizer>,
     guest_buffer_finalizers: Vec<GuestBufferFinalizer>,
-    externals: HashMap<u32, u64>,
-    backing_tokens: HashMap<u32, u64>,
-    type_tags: HashMap<u32, (u64, u64)>,
+    externals: IdHashMap<u32, u64>,
+    backing_tokens: IdHashMap<u32, u64>,
+    type_tags: IdHashMap<u32, (u64, u64)>,
     next_module: u32,
     next_bytecode: u32,
-    bytecodes: HashMap<u32, HostJsBytecode>,
-    synthetic_modules: HashMap<u32, SyntheticModule>,
-    source_text_modules: HashMap<u32, SourceTextModule>,
+    bytecodes: IdHashMap<u32, HostJsBytecode>,
+    synthetic_modules: IdHashMap<u32, SyntheticModule>,
+    source_text_modules: IdHashMap<u32, SourceTextModule>,
     embedder_hooks_attached: bool,
 }
 
@@ -1412,7 +1412,7 @@ impl HostJsEnv {
             values: Vec::new(),
             value_live: Vec::new(),
             value_free_slots: Vec::new(),
-            value_handles: HashMap::default(),
+            value_handles: IdHashMap::default(),
             next_value_handle: 1,
             // The root frame owns values created outside an explicit handle
             // scope and receives values escaped from the outermost scope.
@@ -1431,27 +1431,27 @@ impl HostJsEnv {
             last_exception: None,
             active_callback_ctx: ptr::null_mut(),
             next_deferred: 1,
-            deferreds: HashMap::default(),
+            deferreds: IdHashMap::default(),
             next_reference: 1,
-            references: HashMap::default(),
+            references: IdHashMap::default(),
             next_callback: 1,
-            callback_regs: HashMap::default(),
+            callback_regs: IdHashMap::default(),
             next_cbinfo: 1,
-            callback_infos: HashMap::default(),
+            callback_infos: IdHashMap::default(),
             pending_callbacks: VecDeque::new(),
             closures: Vec::new(),
             instance_data: 0,
-            wraps: HashMap::default(),
+            wraps: IdHashMap::default(),
             guest_finalizers: Vec::new(),
             guest_buffer_finalizers: Vec::new(),
-            externals: HashMap::default(),
-            backing_tokens: HashMap::default(),
-            type_tags: HashMap::default(),
+            externals: IdHashMap::default(),
+            backing_tokens: IdHashMap::default(),
+            type_tags: IdHashMap::default(),
             next_module: 1,
             next_bytecode: 1,
-            bytecodes: HashMap::default(),
-            synthetic_modules: HashMap::default(),
-            source_text_modules: HashMap::default(),
+            bytecodes: IdHashMap::default(),
+            synthetic_modules: IdHashMap::default(),
+            source_text_modules: IdHashMap::default(),
             embedder_hooks_attached: false,
         }
     }
@@ -1515,8 +1515,10 @@ impl HostJsEnv {
             // A stale handle (its frame closed): the object moves to `id`, and
             // so does its per-handle data, unless that id now names another
             // value (possible only after the id space wrapped around).
-            self.object_ids
-                .set(value.unchecked_ref::<Object>(), &JsValue::from_f64(id as f64));
+            self.object_ids.set(
+                value.unchecked_ref::<Object>(),
+                &JsValue::from_f64(id as f64),
+            );
             if !self.value_handles.contains_key(&previous_id) {
                 if let Some(value) = self.externals.remove(&previous_id) {
                     self.externals.insert(id, value);
@@ -1703,7 +1705,7 @@ impl HostJsEnv {
 }
 
 thread_local! {
-    static BUFFER_ALLOCS: RefCell<HashMap<usize, Box<[u8]>>> = RefCell::new(HashMap::default());
+    static BUFFER_ALLOCS: RefCell<IdHashMap<usize, Box<[u8]>>> = RefCell::new(IdHashMap::default());
     // N-API calls normally arrive in long runs from one guest environment.
     // Realm activation is only a context switch; repeating its wasm-bindgen
     // call before every operation doubles the host boundary crossings on the
@@ -2067,7 +2069,11 @@ pub(crate) unsafe fn host_js_get_named_property(
     if !wasmer_napi_is_object_like(value) {
         return NAPI_OBJECT_EXPECTED;
     }
-    unsafe { reflect_op(env, out, |s| Reflect::get(s.get(obj).ok_or(JsValue::NULL)?, key)) }
+    unsafe {
+        reflect_op(env, out, |s| {
+            Reflect::get(s.get(obj).ok_or(JsValue::NULL)?, key)
+        })
+    }
 }
 
 pub(crate) unsafe fn host_js_has_named_property(
@@ -6810,7 +6816,10 @@ mod tests {
         let object: JsValue = Object::new().into();
         let id = state.insert(object.clone());
         assert_eq!(state.insert(object.clone()), id);
-        assert_ne!(state.insert_primitive("x".into()), state.insert_primitive("x".into()));
+        assert_ne!(
+            state.insert_primitive("x".into()),
+            state.insert_primitive("x".into())
+        );
 
         let frame = state.open_value_frame();
         let scoped: JsValue = Object::new().into();
@@ -6853,9 +6862,18 @@ mod tests {
             let (mut int32, mut uint32, mut int64) = (0i32, 0u32, 1i64);
             unsafe {
                 assert_eq!(snapi_bridge_get_value_int32(env, big, &mut int32), NAPI_OK);
-                assert_eq!(snapi_bridge_get_value_uint32(env, negative, &mut uint32), NAPI_OK);
-                assert_eq!(snapi_bridge_get_value_int64(env, infinite, &mut int64), NAPI_OK);
-                assert_eq!(snapi_bridge_get_value_int32(env, text, &mut int32), NAPI_NUMBER_EXPECTED);
+                assert_eq!(
+                    snapi_bridge_get_value_uint32(env, negative, &mut uint32),
+                    NAPI_OK
+                );
+                assert_eq!(
+                    snapi_bridge_get_value_int64(env, infinite, &mut int64),
+                    NAPI_OK
+                );
+                assert_eq!(
+                    snapi_bridge_get_value_int32(env, text, &mut int32),
+                    NAPI_NUMBER_EXPECTED
+                );
             }
             assert_eq!((int32, uint32, int64), (5, u32::MAX, 0));
         });
@@ -6885,7 +6903,10 @@ mod tests {
             let lone = state.insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
             let number = state.insert_primitive(JsValue::from_f64(1.5));
             let mut out = 0;
-            assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) }, NAPI_OK);
+            assert_eq!(
+                unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) },
+                NAPI_OK
+            );
             let text: js_sys::JsString = unsafe { env_mut(env) }
                 .unwrap()
                 .get(out)
@@ -6893,8 +6914,14 @@ mod tests {
                 .clone()
                 .unchecked_into();
             assert_eq!((text.length(), text.char_code_at(0)), (1, 0xd800 as f64));
-            assert_eq!(unsafe { snapi_bridge_coerce_to_string(env, number, &mut out) }, NAPI_OK);
-            let text = unsafe { env_mut(env) }.unwrap().get(out).and_then(JsValue::as_string);
+            assert_eq!(
+                unsafe { snapi_bridge_coerce_to_string(env, number, &mut out) },
+                NAPI_OK
+            );
+            let text = unsafe { env_mut(env) }
+                .unwrap()
+                .get(out)
+                .and_then(JsValue::as_string);
             assert_eq!(text.as_deref(), Some("1.5"));
         });
     }

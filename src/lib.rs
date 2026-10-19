@@ -4,9 +4,9 @@ pub mod cli;
 mod ctx;
 mod env;
 mod guest;
-mod id_hash;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod guest_heap;
+mod id_hash;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;

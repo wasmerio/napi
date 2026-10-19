@@ -2245,9 +2245,12 @@ fn guest_napi_create_string_latin1(
     length: i32,
     rp: i32,
 ) -> i32 {
-    let Some(value) =
-        read_guest_string_value(&mut env, str_ptr, length as u32, GuestStringEncoding::Latin1)
-    else {
+    let Some(value) = read_guest_string_value(
+        &mut env,
+        str_ptr,
+        length as u32,
+        GuestStringEncoding::Latin1,
+    ) else {
         return 1;
     };
     let mut out: u32 = 0;

@@ -50,9 +50,8 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
-// The JS backend implements this ABI in `snapi_js`; its guest layer reaches
-// several functions through `host_js_*` entry points instead of these.
-#[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+// Items allowed to be dead for the JS backend are reached by its guest layer
+// through `snapi_js::host_js_*` entry points or direct guest memory access.
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
@@ -432,12 +431,14 @@ unsafe extern "C" {
     pub fn snapi_bridge_get_null(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_get_boolean(env: SnapiEnv, value: i32, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_get_global(env: SnapiEnv, out_id: *mut u32) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_create_string_utf8(
         env: SnapiEnv,
         str_ptr: *const c_char,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_create_string_latin1(
         env: SnapiEnv,
         str_ptr: *const c_char,
@@ -456,6 +457,7 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     // Value reading
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_string_utf8(
         env: SnapiEnv,
         id: u32,
@@ -463,6 +465,7 @@ unsafe extern "C" {
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_string_latin1(
         env: SnapiEnv,
         id: u32,
@@ -470,9 +473,13 @@ unsafe extern "C" {
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_int32(env: SnapiEnv, id: u32, result: *mut i32) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_uint32(env: SnapiEnv, id: u32, result: *mut u32) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_double(env: SnapiEnv, id: u32, result: *mut f64) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_int64(env: SnapiEnv, id: u32, result: *mut i64) -> i32;
     pub fn snapi_bridge_get_value_bool(env: SnapiEnv, id: u32, result: *mut i32) -> i32;
     // Type checking
@@ -521,18 +528,21 @@ unsafe extern "C" {
         key_id: u32,
         result: *mut i32,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_set_named_property(
         env: SnapiEnv,
         obj_id: u32,
         name: *const c_char,
         val_id: u32,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_named_property(
         env: SnapiEnv,
         obj_id: u32,
         name: *const c_char,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_has_named_property(
         env: SnapiEnv,
         obj_id: u32,
@@ -806,12 +816,14 @@ unsafe extern "C" {
     // Script execution
     pub fn snapi_bridge_run_script(env: SnapiEnv, script_id: u32, out_value_id: *mut u32) -> i32;
     // UTF-16 strings
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_create_string_utf16(
         env: SnapiEnv,
         str_ptr: *const u16,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub fn snapi_bridge_get_value_string_utf16(
         env: SnapiEnv,
         id: u32,
