@@ -60,7 +60,7 @@ public:
   static JSTypedArrayEnum to_quickjs_array_type(napi_typedarray_type type);
   static bool from_quickjs_array_type(int type, napi_typedarray_type *out);
 
-  static void free_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr);
+  static void *realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size);
 
   static int key_filter_to_gpn(napi_key_filter key_filter);
   static napi_status get_property_names(napi_env env,

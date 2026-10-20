@@ -435,6 +435,61 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
 
+TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
+  EnvScope s(runtime_.get());
+
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env,
+      "globalThis.unhandledModulePromises = new Set();"
+      "globalThis.moduleError = new Error('module failure');"
+      "(event, promise) => {"
+      "  if (event === 0) unhandledModulePromises.add(promise);"
+      "  if (event === 1) unhandledModulePromises.delete(promise);"
+      "}"), &callback), napi_ok);
+  ASSERT_EQ(unofficial_napi_set_promise_reject_callback(s.env, callback), napi_ok);
+
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "throw globalThis.moduleError;"));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "throwing.mjs");
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, created.module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, created.module), napi_ok);
+
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(
+                s.env, created.module, options.url, undefined, &result),
+            napi_pending_exception);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  napi_value expected = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "globalThis.moduleError"), &expected), napi_ok);
+  bool same_error = false;
+  ASSERT_EQ(napi_strict_equals(s.env, exception, expected, &same_error), napi_ok);
+  EXPECT_TRUE(same_error);
+
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "unhandledModulePromises.size"), &result), napi_ok);
+  uint32_t unhandled_count = 0;
+  ASSERT_EQ(napi_get_value_uint32(s.env, result, &unhandled_count), napi_ok);
+  EXPECT_EQ(unhandled_count, 0u);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, created.module), napi_ok);
+}
+
 TEST_F(Test65UnofficialContextify, ModuleHooksUseOneVersionedConfiguration) {
   EnvScope s(runtime_.get());
 

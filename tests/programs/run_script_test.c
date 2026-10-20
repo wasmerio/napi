@@ -126,6 +126,114 @@ static int RunStringScript(napi_env env,
       env, result, result_out, result_capacity, &result_length);
 }
 
+static int CreateSourceModule(napi_env env, const char* url, const char* text,
+                              unofficial_napi_module* module_out) {
+  napi_value wrapper, url_value, source_value, undefined;
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  NAPI_CALL(env, napi_create_string_utf8(env, url, NAPI_AUTO_LENGTH, &url_value));
+  NAPI_CALL(env, napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &source_value));
+  NAPI_CALL(env, napi_get_undefined(env, &undefined));
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(source_value);
+  unofficial_napi_module_create_options options = {0};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = url_value;
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &options, &result));
+  *module_out = result.module;
+  return 0;
+}
+
+static int CheckModuleEvaluation(napi_env env) {
+  int32_t count = 0;
+  NAPI_CALL(env, RunInt32Script(env, "globalThis.__napi_module_runs = 0", &count));
+  unofficial_napi_module leaf, root;
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///leaf.mjs",
+      "#!/usr/bin/env node\n"
+      "globalThis.__napi_module_runs++; export const answer = 42;", &leaf) == 0,
+      "failed to compile hashbang module");
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///root.mjs",
+      "import {answer} from './leaf.mjs'; export const result = answer + 1;", &root) == 0,
+      "failed to compile root module");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, leaf, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, root, 1, &leaf));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, root));
+  int32_t dependency_status = -1;
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(env, leaf, &dependency_status, NULL, NULL));
+  CHECK_OR_FAIL(dependency_status == 2, "Instantiate did not instantiate the dependency graph");
+  napi_value promise, namespace;
+  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate(env, root, -1, false, &promise));
+  int32_t status = -1;
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(env, root, &status, NULL, NULL));
+  CHECK_OR_FAIL(status == 4, "Evaluate left synchronous graph pending");
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(env, leaf, &status, NULL, NULL));
+  CHECK_OR_FAIL(status == 4, "Evaluate left synchronous dependency pending");
+  int32_t promise_state = -1;
+  NAPI_CALL(env, unofficial_napi_get_promise_details(env, promise, &promise_state, NULL, NULL));
+  CHECK_OR_FAIL(promise_state == 1, "synchronous evaluation promise was not immediately fulfilled");
+  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(env, leaf, NULL, NULL, &namespace));
+  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(env, root, NULL, NULL, &namespace));
+  napi_value answer;
+  NAPI_CALL(env, napi_get_named_property(env, namespace, "result", &answer));
+  NAPI_CALL(env, napi_get_value_int32(env, answer, &count));
+  CHECK_OR_FAIL(count == 43, "dependency namespace was not ready before root evaluation");
+  NAPI_CALL(env, RunInt32Script(env, "globalThis.__napi_module_runs", &count));
+  CHECK_OR_FAIL(count == 1, "evaluated module executed more than once");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, root));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, leaf));
+
+  // A static cycle is legal and must evaluate each body exactly once.
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///cycle-a.mjs",
+      "import './cycle-b.mjs'; globalThis.__napi_module_runs++;", &root) == 0,
+      "failed to compile cycle root");
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///cycle-b.mjs",
+      "import './cycle-a.mjs'; globalThis.__napi_module_runs++;", &leaf) == 0,
+      "failed to compile cycle dependency");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, root, 1, &leaf));
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, leaf, 1, &root));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, root));
+  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate(env, root, -1, false, &promise));
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(env, root, &status, NULL, NULL));
+  CHECK_OR_FAIL(status == 4, "static module cycle did not finish synchronously");
+  NAPI_CALL(env, RunInt32Script(env, "globalThis.__napi_module_runs", &count));
+  CHECK_OR_FAIL(count == 3, "static module cycle did not execute exactly once");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, root));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, leaf));
+
+  // Cache failures on both the failing dependency and its dependent.
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///throwing.mjs",
+      "globalThis.__napi_module_runs++; throw new Error('module failure');", &leaf) == 0,
+      "failed to compile throwing module");
+  CHECK_OR_FAIL(CreateSourceModule(env, "file:///throwing-parent.mjs",
+      "import './throwing.mjs';", &root) == 0,
+      "failed to compile throwing module parent");
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, leaf, 0, NULL));
+  NAPI_CALL(env, unofficial_napi_module_wrap_link(env, root, 1, &leaf));
+  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, root));
+  CHECK_OR_FAIL(unofficial_napi_module_wrap_evaluate_sync(env, root, NULL, NULL, &namespace)
+                    == napi_pending_exception, "throwing graph did not throw");
+  napi_value first_error, second_error;
+  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &first_error));
+  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(env, leaf, &status, NULL, NULL));
+  CHECK_OR_FAIL(status == 5, "failed dependency did not cache its error");
+  CHECK_OR_FAIL(unofficial_napi_module_wrap_evaluate_sync(env, leaf, NULL, NULL, &namespace)
+                    == napi_pending_exception, "failed dependency did not rethrow");
+  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &second_error));
+  bool same_error = false;
+  NAPI_CALL(env, napi_strict_equals(env, first_error, second_error, &same_error));
+  CHECK_OR_FAIL(same_error, "cached evaluation failure lost error identity");
+  NAPI_CALL(env, RunInt32Script(env, "globalThis.__napi_module_runs", &count));
+  CHECK_OR_FAIL(count == 4, "failed dependency was evaluated a second time");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, root));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, leaf));
+  return 0;
+}
+
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -472,6 +580,14 @@ int main(void) {
                      env, synthetic_module, &facade_namespace));
   CHECK_OR_FAIL(facade_namespace != NULL && facade_evaluation_count == 1,
                 "required-module facade did not run its guest evaluation callback");
+  napi_value facade_marker;
+  bool is_es_module = false;
+  NAPI_CALL(env, napi_get_named_property(env, facade_namespace, "__esModule", &facade_marker));
+  NAPI_CALL(env, napi_get_value_bool(env, facade_marker, &is_es_module));
+  CHECK_OR_FAIL(is_es_module, "required-module facade did not expose __esModule");
+  NAPI_CALL(env, unofficial_napi_module_wrap_create_required_module_facade(
+                     env, synthetic_module, &facade_namespace));
+  CHECK_OR_FAIL(facade_evaluation_count == 1, "required-module facade reevaluated its source");
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, synthetic_module));
 
   // A memory lease, rather than a scope-bound napi_value or its data pointer,
@@ -723,5 +839,6 @@ int main(void) {
                 "failed to acquire teardown lease");
   NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope, NULL));
 
+  CHECK_OR_FAIL(CheckModuleEvaluation(env) == 0, "module evaluation regressions failed");
   return PrintSuccess("RUN_SCRIPT_TEST");
 }

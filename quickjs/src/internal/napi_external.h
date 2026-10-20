@@ -21,7 +21,7 @@ public:
   static const char *wrap_property();
   static const char *finalizer_property();
 
-  static void free_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr);
+  static void *realloc_external_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size);
 
 private:
   static void finalizer(JSRuntime *rt, JSValue value);

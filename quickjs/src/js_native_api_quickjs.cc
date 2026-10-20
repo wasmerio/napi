@@ -382,8 +382,8 @@ extern "C"
     }
 
     auto ab = JS_NewArrayBuffer(env->context(), reinterpret_cast<uint8_t *>(buf),
-                                byte_length,
-                                &napi_util__::free_array_buffer_data, nullptr,
+                                byte_length, 0,
+                                &napi_util__::realloc_array_buffer_data, nullptr,
                                 false);
     if (JS_IsException(ab))
     {
@@ -429,8 +429,8 @@ extern "C"
         return napi_generic_failure;
 
       out = JS_NewArrayBuffer(env->context(), reinterpret_cast<uint8_t *>(external_data),
-                              byte_length,
-                              &napi_external__::free_external_array_buffer_data,
+                              byte_length, 0,
+                              &napi_external__::realloc_external_array_buffer_data,
                               hint,
                               false);
 
@@ -588,19 +588,7 @@ extern "C"
     if (!JS_IsArrayBuffer(local))
       return napi_arraybuffer_expected;
 
-    JSFreeArrayBufferDataFunc *free_func = nullptr;
-    void *opaque = nullptr;
-    napi_external_backing_store_hint__ *hint = nullptr;
-    if (JS_GetArrayBufferFreeInfo(env->context(), local, &free_func, &opaque) &&
-        free_func == &napi_external__::free_external_array_buffer_data)
-    {
-      hint = static_cast<napi_external_backing_store_hint__ *>(opaque);
-    }
-    if (hint != nullptr)
-      hint->begin_detach();
     JS_DetachArrayBuffer(env->context(), local);
-    if (hint != nullptr)
-      hint->end_detach();
     return napi_ok;
   }
 
@@ -1352,7 +1340,7 @@ extern "C"
     if (buf == nullptr)
       return napi_generic_failure;
 
-    JSValue sab = JS_NewArrayBuffer(env->context(), buf, byte_length, nullptr, nullptr, true);
+    JSValue sab = JS_NewArrayBuffer(env->context(), buf, byte_length, 0, nullptr, nullptr, true);
     if (JS_IsException(sab))
     {
       napi_shared_array_buffer__::free_data(buf);
@@ -2876,6 +2864,22 @@ extern "C"
     if (slot == nullptr)
       return napi_invalid_arg;
     if (slot->is_empty())
+    {
+      *result = nullptr;
+      return napi_ok;
+    }
+    // QuickJS frees reference cycles in two passes, so a finalizer can still
+    // see other members of its cycle as zombies (hence JS_IsLiveObject). A weak
+    // slot pointing at one has not been cleared yet -- reset_weak_ref only runs
+    // in that object's own free_object -- so dup_inner() here would resurrect
+    // memory the collector is about to release, and the scope that owns the
+    // resulting napi_value would later free it again. Report it as gone.
+    // Objects only: JS_IsLiveObject reports every non-object (strings, symbols,
+    // bigints) as "not live", which would make every reference to one read back
+    // as empty.
+    JSValueConst inner = slot->get_inner();
+    if (JS_IsObject(inner) && slot->context() != nullptr &&
+        !JS_IsLiveObject(JS_GetRuntime(slot->context()), inner))
     {
       *result = nullptr;
       return napi_ok;

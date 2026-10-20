@@ -525,7 +525,13 @@ extern "C"
         napi_env env,
         napi_value promise)
     {
-        return (!napi_util__::check_env(env) || promise == nullptr) ? napi_invalid_arg : napi_ok;
+        if (!napi_util__::check_value(env, promise))
+            return napi_invalid_arg;
+        JSValueConst raw = napi_quickjs_value_inner(env, promise);
+        if (!JS_IsPromise(raw))
+            return napi_invalid_arg;
+        JS_PromiseMarkAsHandled(napi_quickjs_value_context(env, promise), raw);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_proxy_details(napi_env env,
