@@ -84,6 +84,7 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
 /// `Err(WasiError::Exit)`. wasmer re-raises it, and the same happens at each
 /// outer import layer until the runner handles it, terminating just this guest
 /// instance. Callers propagate with `?`.
+#[allow(clippy::result_large_err)]
 fn with_cb_context<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: i32,
@@ -276,6 +277,7 @@ fn guest_unofficial_napi_create_env(
     0
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_release_env(
     mut env: FunctionEnvMut<NapiEnv>,
     scope_ptr: i32,
@@ -328,6 +330,7 @@ fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env:
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -615,6 +618,7 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_request_interrupt(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1185,6 +1189,7 @@ fn guest_unofficial_napi_contextify_make_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1451,6 +1456,7 @@ fn guest_unofficial_napi_module_wrap_instantiate(
     unsafe { snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle as u32) }
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_evaluate(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1476,6 +1482,7 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     Ok(status)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_evaluate_sync(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1701,6 +1708,7 @@ fn guest_unofficial_napi_module_wrap_set_hooks(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -2277,6 +2285,7 @@ guest_coerce!(guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 
 // --- Object operations ---
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_set_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2290,6 +2299,7 @@ fn guest_napi_set_property(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2308,6 +2318,7 @@ fn guest_napi_get_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_has_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2326,6 +2337,7 @@ fn guest_napi_has_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_has_own_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2344,6 +2356,7 @@ fn guest_napi_has_own_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_delete_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2362,6 +2375,7 @@ fn guest_napi_delete_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_set_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2379,6 +2393,7 @@ fn guest_napi_set_named_property(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2401,6 +2416,7 @@ fn guest_napi_get_named_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_has_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2423,6 +2439,7 @@ fn guest_napi_has_named_property(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_set_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2436,6 +2453,7 @@ fn guest_napi_set_element(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2454,6 +2472,7 @@ fn guest_napi_get_element(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_has_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2472,6 +2491,7 @@ fn guest_napi_has_element(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_delete_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2499,6 +2519,7 @@ fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: i32, ah: i32
     s
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_property_names(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2517,6 +2538,7 @@ fn guest_napi_get_property_names(
     Ok(s)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_all_property_names(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3198,9 +3220,7 @@ fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i3
     s
 }
 fn guest_napi_close_handle_scope(env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
-    let s = unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) };
-    if s == 0 {}
-    s
+    unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) }
 }
 
 fn guest_napi_open_escapable_handle_scope(
@@ -3282,6 +3302,7 @@ fn guest_napi_check_object_type_tag(
 
 // --- Function calling ---
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_call_function(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3884,6 +3905,7 @@ fn guest_napi_define_properties(
 
 // --- Script execution ---
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3916,10 +3938,7 @@ fn guest_napi_create_string_utf16(
     let char_count: usize = if wl == 0xFFFFFFFFu32 {
         // Auto-length: scan for null terminator (u16 == 0)
         let mut scan_len: usize = 0;
-        loop {
-            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else {
-                break;
-            };
+        while let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) {
             let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
             if ch == 0 {
                 break;
@@ -4302,6 +4321,7 @@ fn guest_napi_get_buffer_info(
     0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4681,6 +4701,7 @@ fn guest_napi_fatal_error(
 
 // --- Constructor ---
 
+#[allow(clippy::result_large_err)]
 fn guest_napi_new_instance(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
