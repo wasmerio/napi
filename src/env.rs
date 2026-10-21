@@ -503,14 +503,12 @@ impl NapiEnv {
         Some(env)
     }
 
-    pub(crate) fn resolve_napi_env(&self, guest_env: i32) -> SnapiEnv {
-        let env_id = if guest_env > 0 {
-            guest_env as u32
-        } else {
+    pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> SnapiEnv {
+        if guest_env == 0 {
             return std::ptr::null_mut();
-        };
+        }
         self.napi_envs
-            .get(&env_id)
+            .get(&guest_env)
             .map(|env| *env as SnapiEnv)
             .unwrap_or(std::ptr::null_mut())
     }

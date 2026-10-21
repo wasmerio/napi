@@ -63,7 +63,7 @@ fn call_guest_callback(
     store: &mut StoreMut<'_>,
     func_env: &FunctionEnv<NapiEnv>,
     table: &Table,
-    guest_env: i32,
+    guest_env: u32,
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
@@ -87,7 +87,10 @@ fn call_guest_callback(
     };
     match func.call(
         store,
-        &[Value::I32(guest_env), Value::I32(callback_arg as i32)],
+        &[
+            Value::I32(guest_env as i32),
+            Value::I32(callback_arg as i32),
+        ],
     ) {
         Ok(ret_vals) => match ret_vals.first() {
             Some(Value::I32(v)) => *v as u32,
@@ -111,7 +114,7 @@ fn call_guest_callback2(
     store: &mut StoreMut<'_>,
     func_env: &FunctionEnv<NapiEnv>,
     table: &Table,
-    guest_env: i32,
+    guest_env: u32,
     wasm_fn_ptr: u32,
     arg0: u32,
     arg1: u32,
@@ -137,7 +140,7 @@ fn call_guest_callback2(
     match func.call(
         store,
         &[
-            Value::I32(guest_env),
+            Value::I32(guest_env as i32),
             Value::I32(arg0 as i32),
             Value::I32(arg1 as i32),
         ],
@@ -235,7 +238,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
             store,
             &func_env,
             &table,
-            guest_env as i32,
+            guest_env,
             wasm_fn_ptr,
             callback_arg,
         );
@@ -285,15 +288,8 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
             eprintln!("[finalizer trampoline] reentrancy depth limit exceeded");
             return 0;
         }
-        let result = call_guest_callback2(
-            store,
-            &func_env,
-            &table,
-            guest_env as i32,
-            wasm_fn_ptr,
-            data,
-            hint,
-        );
+        let result =
+            call_guest_callback2(store, &func_env, &table, guest_env, wasm_fn_ptr, data, hint);
         func_env.as_mut(store).leave_callback();
         result
     })
