@@ -776,6 +776,11 @@ fn guest_unofficial_napi_get_error_metadata(
     mode: i32,
     metadata_ptr: u32,
 ) -> i32 {
+    // The whole 28-byte metadata struct must lie below 4 GiB, so the field
+    // offsets below cannot wrap.
+    if metadata_ptr != 0 && u64::from(metadata_ptr) + 28 > 1u64 << 32 {
+        return 1;
+    }
     let env_handle = snapi_env(&env, napi_env);
     let error_id = error;
     let mut source_line_id = 0u32;
@@ -804,16 +809,12 @@ fn guest_unofficial_napi_get_error_metadata(
     }
     if metadata_ptr != 0 {
         write_guest_u32(&mut env, metadata_ptr, source_line_id);
-        write_guest_u32(
-            &mut env,
-            metadata_ptr.saturating_add(4),
-            script_resource_name_id,
-        );
-        write_guest_u32(&mut env, metadata_ptr.saturating_add(8), stderr_line_id);
-        write_guest_u32(&mut env, metadata_ptr.saturating_add(12), thrown_at_id);
-        write_guest_i32(&mut env, metadata_ptr.saturating_add(16), line_number);
-        write_guest_i32(&mut env, metadata_ptr.saturating_add(20), start_column);
-        write_guest_i32(&mut env, metadata_ptr.saturating_add(24), end_column);
+        write_guest_u32(&mut env, metadata_ptr + 4, script_resource_name_id);
+        write_guest_u32(&mut env, metadata_ptr + 8, stderr_line_id);
+        write_guest_u32(&mut env, metadata_ptr + 12, thrown_at_id);
+        write_guest_i32(&mut env, metadata_ptr + 16, line_number);
+        write_guest_i32(&mut env, metadata_ptr + 20, start_column);
+        write_guest_i32(&mut env, metadata_ptr + 24, end_column);
     }
     0
 }
@@ -1235,7 +1236,9 @@ fn guest_unofficial_napi_bytecode_open(
     let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
         return 1;
     };
-    if result_ptr == 0 {
+    // The whole 6-byte result must lie below 4 GiB (checked before
+    // anything is created), so the field offsets below cannot wrap.
+    if result_ptr == 0 || u64::from(result_ptr) + 6 > 1u64 << 32 {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
@@ -1266,8 +1269,8 @@ fn guest_unofficial_napi_bytecode_open(
         )
     };
     write_guest_u32(&mut env, result_ptr, bytecode_id);
-    write_guest_u8(&mut env, result_ptr.saturating_add(4), cache_rejected);
-    write_guest_u8(&mut env, result_ptr.saturating_add(5), can_parse_as_module);
+    write_guest_u8(&mut env, result_ptr + 4, cache_rejected);
+    write_guest_u8(&mut env, result_ptr + 5, can_parse_as_module);
     status
 }
 
@@ -1305,7 +1308,9 @@ fn guest_unofficial_napi_module_wrap_create(
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
         return 1;
     };
-    if result_ptr == 0 {
+    // The whole 9-byte result must lie below 4 GiB (checked before
+    // anything is created), so the field offsets below cannot wrap.
+    if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
@@ -1333,12 +1338,8 @@ fn guest_unofficial_napi_module_wrap_create(
     };
     if status == 0 {
         write_guest_u32(&mut env, result_ptr, handle_id);
-        write_guest_u32(&mut env, result_ptr.saturating_add(4), requests_id);
-        write_guest_bytes(
-            &mut env,
-            result_ptr.saturating_add(8),
-            &[has_top_level_await],
-        );
+        write_guest_u32(&mut env, result_ptr + 4, requests_id);
+        write_guest_bytes(&mut env, result_ptr + 8, &[has_top_level_await]);
     }
     status
 }
@@ -3313,12 +3314,12 @@ fn guest_napi_get_cb_info(
     // Write argv (array of handle IDs) - only write up to min(wanted, actual)
     if argv_ptr != 0 {
         let to_write = std::cmp::min(wanted, actual_argc);
+        // The argv entries written must lie below 4 GiB.
+        if u64::from(argv_ptr) + u64::from(to_write) * 4 > 1u64 << 32 {
+            return 1;
+        }
         for i in 0..to_write {
-            write_guest_u32(
-                &mut env,
-                argv_ptr.saturating_add(i * 4),
-                argv_ids[i as usize],
-            );
+            write_guest_u32(&mut env, argv_ptr + i * 4, argv_ids[i as usize]);
         }
     }
 

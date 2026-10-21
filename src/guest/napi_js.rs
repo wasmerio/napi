@@ -1222,6 +1222,11 @@ fn guest_unofficial_napi_get_error_metadata(
     mode: i32,
     metadata_ptr: u32,
 ) -> i32 {
+    // The whole 28-byte metadata struct must lie below 4 GiB, so the field
+    // offsets below cannot wrap.
+    if metadata_ptr != 0 && u64::from(metadata_ptr) + 28 > 1u64 << 32 {
+        return 1;
+    }
     let env_handle = snapi_env(&env, napi_env);
     let error_id = error;
     let mut source_line_id = 0u32;
@@ -1677,7 +1682,9 @@ fn guest_unofficial_napi_bytecode_open(
     let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
         return 1;
     };
-    if result_ptr == 0 {
+    // The whole 6-byte result must lie below 4 GiB (checked before
+    // anything is created), so the field offsets below cannot wrap.
+    if result_ptr == 0 || u64::from(result_ptr) + 6 > 1u64 << 32 {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
@@ -1747,7 +1754,9 @@ fn guest_unofficial_napi_module_wrap_create(
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
         return 1;
     };
-    if result_ptr == 0 {
+    // The whole 9-byte result must lie below 4 GiB (checked before
+    // anything is created), so the field offsets below cannot wrap.
+    if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
@@ -3973,6 +3982,10 @@ fn guest_napi_get_cb_info(
     // Write argv (array of handle IDs) - only write up to min(wanted, actual)
     if argv_ptr != 0 {
         let to_write = std::cmp::min(wanted, actual_argc);
+        // The argv entries written must lie below 4 GiB.
+        if u64::from(argv_ptr) + u64::from(to_write) * 4 > 1u64 << 32 {
+            return 1;
+        }
         for i in 0..to_write {
             write_guest_u32(&mut env, argv_ptr + i * 4, argv_ids[i as usize]);
         }
@@ -4614,6 +4627,7 @@ fn guest_napi_create_buffer(
             return 1;
         };
         let Some(memory) = env.data().memory.clone() else {
+            recycle_guest_allocation(&mut env, guest_ptr);
             return 1;
         };
         let memory_buffer = memory.as_js().js_buffer();
@@ -4626,6 +4640,7 @@ fn guest_napi_create_buffer(
             &mut out,
         );
         if status != 0 {
+            recycle_guest_allocation(&mut env, guest_ptr);
             return status;
         }
         let backing_store_token = host_backing_store_token(&env, e, out);
