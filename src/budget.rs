@@ -155,6 +155,12 @@ pub enum Pool {
     /// slots, finalizer records, deferreds, scope frames, callback
     /// registrations), granted in chunks by [`napi_host_bookkeeping_charge`].
     HostBookkeeping,
+    /// Committed pages of buffers V8 reserves through its page allocator
+    /// rather than the `ArrayBuffer::Allocator`: resizable `ArrayBuffer`s and
+    /// growable `SharedArrayBuffer`s. Charged softly (see
+    /// [`ResourceBudget::try_charge_soft`]): a refused commit surfaces in JS as
+    /// a `RangeError` and does not stop the context.
+    V8BackingPages,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -165,6 +171,14 @@ pub trait NapiMemoryAccountant: Send + Sync {
     fn memory_limit(&self) -> u64;
     fn memory_charged(&self) -> u64;
     fn try_charge(&self, bytes: u64) -> bool;
+    /// Charge bytes whose refusal the provider handles gracefully (V8 turns
+    /// it into a JS `RangeError`). Must deny without side effects such as
+    /// stopping the application; it may be called from V8 background
+    /// threads and must not call back into V8. Embedders whose
+    /// [`try_charge`](Self::try_charge) is terminal should override it.
+    fn try_charge_soft(&self, bytes: u64) -> bool {
+        self.try_charge(bytes)
+    }
     fn uncharge(&self, bytes: u64);
 }
 
@@ -219,6 +233,8 @@ pub struct ResourceUsage {
     /// [`DEFAULT_HEAP_EMERGENCY_HEADROOM`]). Non-zero means at least one
     /// isolate of this budget is stopping after exhausting its heap.
     pub v8_heap_emergency: u64,
+    /// Committed bytes of page-allocated V8 buffers (resizable buffers).
+    pub v8_backing_pages: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -281,6 +297,7 @@ pub struct ResourceBudget {
     /// Emergency headroom currently exposed, summed over stopping isolates.
     /// Not part of `mem_charged`: it is by definition over the budget.
     v8_heap_emergency: AtomicU64,
+    v8_backing_pages: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -315,6 +332,10 @@ impl std::fmt::Debug for ResourceBudget {
             .field(
                 "v8_heap_emergency",
                 &self.v8_heap_emergency.load(Ordering::Acquire),
+            )
+            .field(
+                "v8_backing_pages",
+                &self.v8_backing_pages.load(Ordering::Acquire),
             )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
@@ -358,6 +379,7 @@ impl ResourceBudget {
             host_bookkeeping: AtomicU64::new(0),
             heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
             v8_heap_emergency: AtomicU64::new(0),
+            v8_backing_pages: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -376,6 +398,7 @@ impl ResourceBudget {
             host_bookkeeping: AtomicU64::new(0),
             heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
             v8_heap_emergency: AtomicU64::new(0),
+            v8_backing_pages: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -411,12 +434,29 @@ impl ResourceBudget {
     ///
     /// [`uncharge`]: ResourceBudget::uncharge
     pub fn try_charge(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
+        self.charge(pool, bytes, false)
+    }
+
+    /// Like [`try_charge`](Self::try_charge), but a refusal is reported only
+    /// to the caller: an embedder accountant is asked through
+    /// [`NapiMemoryAccountant::try_charge_soft`], so the application is not
+    /// stopped. For allocations whose failure V8 handles gracefully.
+    pub fn try_charge_soft(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
+        self.charge(pool, bytes, true)
+    }
+
+    fn charge(&self, pool: Pool, bytes: u64, soft: bool) -> Result<(), OverBudget> {
         if bytes == 0 {
             return Ok(());
         }
 
         if let Some(accountant) = &self.accountant {
-            if !accountant.try_charge(bytes) {
+            let granted = if soft {
+                accountant.try_charge_soft(bytes)
+            } else {
+                accountant.try_charge(bytes)
+            };
+            if !granted {
                 return Err(OverBudget {
                     pool,
                     requested: bytes,
@@ -480,6 +520,7 @@ impl ResourceBudget {
             Pool::HostTransient => &self.host_transient,
             Pool::SerializedMessage => &self.serialized_message,
             Pool::HostBookkeeping => &self.host_bookkeeping,
+            Pool::V8BackingPages => &self.v8_backing_pages,
         }
     }
 
@@ -496,6 +537,7 @@ impl ResourceBudget {
             serialized_message: self.serialized_message.load(Ordering::Acquire),
             host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
             v8_heap_emergency: self.v8_heap_emergency.load(Ordering::Acquire),
+            v8_backing_pages: self.v8_backing_pages.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -1966,6 +2008,54 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8HeapReserved, 60);
         assert_eq!(accountant.memory_charged(), 40);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+
+    /// Counts terminal charges; soft charges must never take that path.
+    struct SoftAccountant {
+        inner: Arc<TestAccountant>,
+        terminal_calls: AtomicU64,
+    }
+
+    impl NapiMemoryAccountant for SoftAccountant {
+        fn memory_limit(&self) -> u64 {
+            self.inner.memory_limit()
+        }
+
+        fn memory_charged(&self) -> u64 {
+            self.inner.memory_charged()
+        }
+
+        fn try_charge(&self, bytes: u64) -> bool {
+            self.terminal_calls.fetch_add(1, Ordering::AcqRel);
+            self.inner.try_charge(bytes)
+        }
+
+        fn try_charge_soft(&self, bytes: u64) -> bool {
+            self.inner.try_charge(bytes)
+        }
+
+        fn uncharge(&self, bytes: u64) {
+            self.inner.uncharge(bytes);
+        }
+    }
+
+    #[test]
+    fn soft_charges_use_the_accountants_soft_path() {
+        let accountant = Arc::new(SoftAccountant {
+            inner: TestAccountant::new(100),
+            terminal_calls: AtomicU64::new(0),
+        });
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        budget.try_charge_soft(Pool::V8BackingPages, 80).unwrap();
+        let refused = budget
+            .try_charge_soft(Pool::V8BackingPages, 40)
+            .unwrap_err();
+        assert_eq!(refused.pool, Pool::V8BackingPages);
+        assert_eq!(accountant.terminal_calls.load(Ordering::Acquire), 0);
+        assert_eq!(budget.snapshot().v8_backing_pages, 80);
+        budget.uncharge(Pool::V8BackingPages, 80);
+        assert_eq!(budget.snapshot().v8_backing_pages, 0);
+        assert_eq!(budget.memory_charged(), 0);
     }
 
     #[cfg(all(napi_standalone_legacy_wait, not(target_arch = "wasm32")))]
