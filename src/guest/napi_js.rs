@@ -47,9 +47,16 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return env_id as i32;
     }
 
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status =
-        unsafe { snapi_bridge_unofficial_create_env(8, std::ptr::null(), &mut snapi_env_state) };
+    let status = unsafe {
+        snapi_bridge_unofficial_create_env(
+            8,
+            std::ptr::null(),
+            webassembly_policy,
+            &mut snapi_env_state,
+        )
+    };
     if status != 0 || snapi_env_state.is_null() {
         return 0;
     }
@@ -527,6 +534,7 @@ fn guest_unofficial_napi_create_env(
         (0, 0, 0, 0, 0, 0)
     };
 
+    let webassembly_policy = env.data().webassembly.bridge_code();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
@@ -538,6 +546,7 @@ fn guest_unofficial_napi_create_env(
             code_range_size_in_bytes,
             stack_limit,
             std::ptr::null(),
+            webassembly_policy,
             &mut snapi_env_state,
         )
     };
