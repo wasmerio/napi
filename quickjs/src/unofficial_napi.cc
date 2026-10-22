@@ -1,4 +1,5 @@
 #include "unofficial_napi.h"
+#include "napi_heap_limit.h"
 
 #include "internal/napi_callsite.h"
 #include "internal/napi_serdes.h"
@@ -471,6 +472,31 @@ extern "C"
         (void)callback_or_null;
         (void)data;
         (void)restored_heap_limit;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL snapi_private_get_heap_committed_old_generation(
+        napi_env env,
+        size_t *result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr)
+            return napi_invalid_arg;
+        // QuickJS has no generational heap; the figure is only consumed by
+        // near-heap-limit callbacks, which this engine never invokes.
+        *result = 0;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL snapi_private_collect_garbage_if_over_heap_limit(
+        napi_env env,
+        size_t old_generation_limit,
+        bool *collected)
+    {
+        if (!napi_util__::check_env(env) || collected == nullptr)
+            return napi_invalid_arg;
+        (void)old_generation_limit;
+        // QuickJS enforces its memory limit at every allocation.
+        *collected = false;
         return napi_ok;
     }
 
