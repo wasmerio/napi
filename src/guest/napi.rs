@@ -598,8 +598,8 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
 }
 
 fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
+    // Any env of this application, including one owned by another store.
+    env.data().terminate_app_env(napi_env)
 }
 
 fn guest_unofficial_napi_cancel_terminate_execution(
