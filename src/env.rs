@@ -449,6 +449,16 @@ impl NapiEnv {
         }
     }
 
+    pub(crate) fn in_callback(&self) -> bool {
+        self.callback_depth != 0
+    }
+
+    pub(crate) fn scope_env(&self, scope_id: u32) -> Option<(u32, SnapiEnv)> {
+        let env_id = *self.napi_scopes.get(&scope_id)?;
+        let env = *self.napi_envs.get(&env_id)?;
+        Some((env_id, env as SnapiEnv))
+    }
+
     pub(crate) fn begin_unregister_napi_scope(&mut self, scope_id: u32) -> Option<(u32, SnapiEnv)> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {

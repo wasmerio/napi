@@ -1,0 +1,93 @@
+name: napi-native-runtime
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-native-runtime:
+    name: Rust native runtime regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: clang
+      CXX: clang++
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      NAPI_WASMER_FORCE_STANDALONE: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang pkg-config libssl-dev
+
+      - name: Cache Rust dependencies and native V8 archive
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-napi-runtime-rust-1.97.1-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', '.github/workflows/napi-native-runtime.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-napi-runtime-rust-1.97.1-
+
+      - name: Check Rust formatting
+        run: ./cargo-standalone.sh +1.97.1 fmt --all --check
+
+      - name: Lint the native provider
+        run: ./cargo-standalone.sh +1.97.1 clippy --quiet --locked --lib
+
+      - name: Test native Rust runtime and accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_targets=()
+          # Each split PR adds its own suites. Exercise those already present
+          # without requiring a later PR's test target to exist yet.
+          for suite in \
+            core_callbacks external_transfer guest_boundary_accounting \
+            guest_error_callbacks message_memory review_memory \
+            v8_heap_limit v8_page_accounting v8_wasm_metering \
+            v8_wasm_process_budget v8_wasm_tiering; do
+            if [[ -f "tests/${suite}.rs" ]]; then
+              test_targets+=(--test "$suite")
+            fi
+          done
+          # Unit tests exercise lane admission, stop races and teardown.
+          # The integration suites use WAT or native FFI, so the immutable
+          # public SDK in Cargo.standalone.lock needs no private credentials
+          # or WASIX C compiler. CLI guest integration still needs the
+          # wrapper-preserving SDK used by Edge and is a separate check.
+          # Serialize test functions to bound heap-bomb RSS on hosted runners;
+          # the concurrency regressions create their own competing workers.
+          ./cargo-standalone.sh +1.97.1 test --quiet --locked \
+            --lib "${test_targets[@]}" -- --test-threads=1 \
+            2>&1 | tee "${RUNNER_TEMP}/napi-runtime-tests.log"
+
+      - name: Upload runtime failure output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-native-runtime-failure
+          path: ${{ runner.temp }}/napi-runtime-tests.log
+          if-no-files-found: ignore

@@ -1926,6 +1926,11 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     return status != napi_ok ? status : napi_generic_failure;
   }
 
+  // Existing workers can predate the JIT protection key allocated by the
+  // first isolate. Restore read access before initializing a second isolate's
+  // builtin dispatch table; restoring permissions at bridge entry is too late.
+  v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);

@@ -29,6 +29,59 @@ const NAPI_PENDING_EXCEPTION: i32 = 10;
 /// ceiling is clamped.
 const BUDGET_BELOW_ISOLATE_FLOOR: u64 = 20 * 1024 * 1024;
 
+#[test]
+fn two_guest_isolates_run_sequentially() {
+    let wasm = build_wasix_test("hello_napi_test");
+    for _ in 0..2 {
+        let (exit_code, stdout, stderr) =
+            run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+        assert_eq!(exit_code, 0, "{stderr}");
+        assert!(
+            stdout.contains("HELLO_NAPI_TEST_OK=1"),
+            "{stdout}\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn guest_fatal_error_exits_only_its_workload() {
+    let fatal_wasm = build_wasix_test("test_guest_fatal_error");
+    let hello_wasm = build_wasix_test("hello_napi_test");
+
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &fatal_wasm).expect("fatal guest run failed");
+    assert_ne!(
+        exit_code, 0,
+        "fatal guest unexpectedly survived: {stdout}\n{stderr}"
+    );
+
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &hello_wasm).expect("next guest run failed");
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(
+        stdout.contains("HELLO_NAPI_TEST_OK=1"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn two_guest_isolates_can_coexist_while_one_sleeps() {
+    let sleeping_wasm = build_wasix_test("test_env_sleep");
+    let hello_wasm = build_wasix_test("hello_napi_test");
+    let sleeping = thread::spawn(move || run_guest(&NapiCtx::default(), &sleeping_wasm));
+    thread::sleep(Duration::from_secs(1));
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &hello_wasm).expect("second guest failed");
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(
+        stdout.contains("HELLO_NAPI_TEST_OK=1"),
+        "{stdout}\n{stderr}"
+    );
+    let (exit_code, stdout, stderr) = sleeping.join().unwrap().unwrap();
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(stdout.contains("ENV_READY"), "{stdout}\n{stderr}");
+}
+
 /// The kill path Edge relies on: a JS loop that never returns on its own has
 /// to stop when the host says so. Nothing in the guest cooperates here — the
 /// isolate is executing JS when the request arrives.
@@ -94,6 +147,48 @@ fn terminate_all_stops_running_js() {
     eprintln!(
         "JS loop stopped {}ms after the request",
         elapsed.as_millis()
+    );
+}
+
+/// A busy isolate cannot hold the bridge's process-wide registry lock while
+/// another workload creates its isolate and requests GC.
+#[test]
+fn another_guest_can_collect_gc_while_js_is_spinning() {
+    let spinning_wasm = build_wasix_test("test_js_infinite_loop");
+    let gc_wasm = build_wasix_test("test_gc_once");
+    let busy_ctx = NapiCtx::default();
+    let control = busy_ctx.runtime_control();
+    let (busy_tx, busy_rx) = mpsc::channel();
+    let busy = thread::spawn(move || {
+        let result = run_guest(&busy_ctx, &spinning_wasm);
+        let _ = busy_tx.send(());
+        result
+    });
+
+    // The guest prints its marker before entering the loop. The captured
+    // stdout is only returned at completion, so allow startup time here.
+    thread::sleep(Duration::from_secs(2));
+
+    let (gc_tx, gc_rx) = mpsc::channel();
+    let gc_guest = thread::spawn(move || {
+        let result = run_guest(&NapiCtx::default(), &gc_wasm);
+        let _ = gc_tx.send(());
+        result
+    });
+    let gc_finished = gc_rx.recv_timeout(Duration::from_secs(15));
+    control.terminate_all();
+    busy_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("spinning guest survived termination");
+
+    gc_finished.expect("second guest stalled behind busy isolate");
+    let (exit_code, stdout, stderr) = gc_guest.join().unwrap().unwrap();
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert!(stdout.contains("GC_DONE"), "{stdout}\n{stderr}");
+    let (_, busy_stdout, busy_stderr) = busy.join().unwrap().unwrap();
+    assert!(
+        busy_stdout.contains("JS_LOOP_ENTERED"),
+        "busy guest never entered JS: {busy_stdout}\n{busy_stderr}"
     );
 }
 

@@ -6,6 +6,13 @@ use wasmer::{AsStoreMut, FunctionEnvMut};
 
 use crate::NapiEnv;
 
+pub fn guest_range_is_valid(env: &mut FunctionEnvMut<NapiEnv>, ptr: u32, len: usize) -> bool {
+    let Some(end) = u64::from(ptr).checked_add(len as u64) else {
+        return false;
+    };
+    end <= guest_data_size(env)
+}
+
 pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
     let (state, store) = env.data_and_store_mut();
     let Some(memory) = state.memory.clone() else {
@@ -58,6 +65,32 @@ pub fn read_guest_bytes(
     let mut out = vec![0u8; len];
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
+}
+
+/// Copy a bounded diagnostic string supplied to `napi_fatal_error`.
+/// `NAPI_AUTO_LENGTH` is a NUL-terminated string; explicit lengths may
+/// include NUL bytes and are deliberately kept intact in the diagnostic.
+pub(crate) fn read_guest_fatal_text(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    len: u32,
+) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if guest_ptr == 0 {
+        return "(null)".to_owned();
+    }
+    let bytes = if len == u32::MAX {
+        read_guest_c_string(env, guest_ptr)
+    } else {
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| read_guest_bytes(env, guest_ptr, len.min(MAX_DIAGNOSTIC_BYTES)))
+    };
+    bytes
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+        })
+        .unwrap_or_else(|| "(invalid guest string)".to_owned())
 }
 
 /// Live size of the guest's linear memory in bytes, or 0 if it has none. Used

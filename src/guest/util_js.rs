@@ -408,6 +408,31 @@ pub fn read_guest_bytes(
     wasmer_napi_guest_read(&memory, guest_ptr, &mut out).then_some(out)
 }
 
+/// Copy a bounded diagnostic string supplied to `napi_fatal_error`.
+/// Explicit lengths may include NUL bytes; `-1` requests NUL termination.
+pub(crate) fn read_guest_fatal_text(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    len: u32,
+) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if guest_ptr == 0 {
+        return "(null)".to_owned();
+    }
+    let bytes = if len == u32::MAX {
+        read_guest_c_string(env, guest_ptr)
+    } else {
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| read_guest_bytes(env, guest_ptr, len.min(MAX_DIAGNOSTIC_BYTES)))
+    };
+    bytes
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+        })
+        .unwrap_or_else(|| "(invalid guest string)".to_owned())
+}
+
 pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
     // Exact-size large transfers avoid doubling peak memory for package
     // archives and Wasm binaries while retaining cheap pooled size classes for
