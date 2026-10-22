@@ -293,9 +293,9 @@ fn guest_unofficial_napi_release_env(
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
     // A guest exit raised by a finalizer still means the env was torn down.
-    let released = status.as_ref().map_or(0, |status| *status);
+    let release_status = status.as_ref().map_or(0, |status| *status);
     env.data_mut()
-        .finish_unregister_napi_env(guest_env, snapi_env_state, released);
+        .finish_unregister_napi_env(guest_env, snapi_env_state, release_status);
     status
 }
 
