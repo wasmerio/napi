@@ -4760,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "wasmer-napi"
-version = "0.704.0"
+version = "0.705.0"
 dependencies = [
  "anyhow",
  "cc",
