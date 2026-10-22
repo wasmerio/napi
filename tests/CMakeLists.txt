@@ -325,3 +325,20 @@ add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
 )
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_checkpoint_test src/v8_foreground_checkpoint_test.cc)
+  target_include_directories(napi_v8_foreground_checkpoint_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_checkpoint_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_checkpoint_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_checkpoint_fairness
+    COMMAND napi_v8_foreground_checkpoint_test)
+endif()
