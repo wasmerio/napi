@@ -16,6 +16,10 @@ class NapiV8ContextScope {
     env_->context_scope = this;
   }
   ~NapiV8ContextScope() {
+    // A token scope can close outside any caller HandleScope (a top-level
+    // leave, or environment release). Keep the Local made below out of the
+    // caller's scope, which may be the environment's never-closed root.
+    v8::HandleScope handles(env_->isolate);
     // A native callback may return or trap with guest-entered scopes open.
     // Reclaim only those explicit scopes, never a live outer callback frame.
     while (env_->context_scope != this) {

@@ -5,6 +5,10 @@
 
 #include <vector>
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+#endif
+
 class Test65UnofficialContextify : public FixtureTestBase {};
 
 namespace {
@@ -1440,6 +1444,29 @@ TEST_F(Test65UnofficialContextify, ContextScopeTokensBelongToOneEnvironment) {
   EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
   EXPECT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+}
+
+// Scopes left outside any handle scope must not grow the environment's root
+// handle scope, which stays open for the environment's lifetime.
+TEST_F(Test65UnofficialContextify, ContextScopeLeaveDoesNotRetainHandles) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  ASSERT_NE(isolate, nullptr);
+
+  const int before = v8::HandleScope::NumberOfHandles(isolate);
+  for (int i = 0; i < 10000; ++i) {
+    unofficial_napi_context_scope outer = 0;
+    unofficial_napi_context_scope inner = 0;
+    ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &inner), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+  }
+  EXPECT_LT(v8::HandleScope::NumberOfHandles(isolate) - before, 16);
 }
 
 TEST_F(Test65UnofficialContextify, ContextScopeDepthIsBounded) {
