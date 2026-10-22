@@ -4,6 +4,10 @@
 
 #include <string>
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+#endif
+
 // unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js.
 // V8 implements both; QuickJS reports them as unsupported.
 class Test66UnofficialTrustedScript : public FixtureTestBase {};
@@ -132,6 +136,18 @@ uint64_t UsedHeapAfterGc(napi_env env) {
   return stats.used_heap_size;
 }
 
+unsigned g_embedder_hook_calls = 0;
+
+// An embedder hook that leaves every source unchanged.
+v8::ModifyCodeGenerationFromStringsResult EmbedderHook(v8::Local<v8::Context>,
+                                                      v8::Local<v8::Value>,
+                                                      bool) {
+  ++g_embedder_hook_calls;
+  v8::ModifyCodeGenerationFromStringsResult result;
+  result.codegen_allowed = true;
+  return result;
+}
+
 void InstallGlobal(napi_env env, const char* name, napi_callback callback, void* data) {
   napi_value global = nullptr;
   napi_value function = nullptr;
@@ -242,6 +258,24 @@ TEST_F(Test66UnofficialTrustedScript, BrandCannotBeForgedWithPrivateSymbol) {
     ASSERT_EQ(napi_set_named_property(s.env, global, "real", real), napi_ok);
     EXPECT_TRUE(IsTrue(s.env, "eval(real) === 1")) << name;
   }
+}
+
+// The isolate-wide hook is installed once. A hook the embedder installs
+// afterwards is not overwritten by later trusted-script creation.
+TEST_F(Test66UnofficialTrustedScript, KeepsEmbedderHookInstalledLater) {
+  EnvScope s(runtime_.get());
+  InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
+  EXPECT_TRUE(IsTrue(s.env, "eval(makeTrusted('2')) === 2"));
+
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  ASSERT_NE(isolate, nullptr);
+  g_embedder_hook_calls = 0;
+  isolate->SetModifyCodeGenerationFromStringsCallback(EmbedderHook);
+  // Created after the embedder's hook: eval now follows that hook, which
+  // leaves the object unchanged.
+  EXPECT_TRUE(IsTrue(s.env, "(() => { const source = makeTrusted('3'); "
+                            "return eval(source) === source; })()"));
+  EXPECT_GT(g_embedder_hook_calls, 0u);
 }
 
 TEST_F(Test66UnofficialTrustedScript, CreateValidatesArguments) {

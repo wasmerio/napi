@@ -235,10 +235,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
 // be copied, inherited or recreated (unofficial_napi_create_private_symbol
 // cannot name it), and does not bypass a context's codegen restriction.
 // Source must be a primitive string. Unsupported engines return generic_failure.
-// The hook is isolate-wide: every call installs this provider's
-// ModifyCodeGenerationFromStrings callback on the environment's isolate,
-// replacing any callback the embedder installed. V8 cannot report the
-// previous callback, so it is not chained. For other values the hook keeps
+// The hook is isolate-wide: the first call on an isolate installs this
+// provider's ModifyCodeGenerationFromStrings callback, replacing any callback
+// the embedder installed. V8 cannot report the previous callback, so it is not
+// chained. A callback the embedder installs afterwards is kept, and trusted
+// scripts then follow that callback instead. For other values the hook keeps
 // V8's behavior: eval returns non-string objects unchanged, and strings follow
 // each context's code generation setting.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(

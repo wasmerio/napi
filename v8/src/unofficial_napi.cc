@@ -53,10 +53,11 @@ v8::Local<v8::Private> TrustedScriptKey(v8::Isolate* isolate) {
   return it->second.Get(isolate);
 }
 
-v8::Local<v8::Private> EnsureTrustedScriptKey(v8::Isolate* isolate) {
+v8::Local<v8::Private> EnsureTrustedScriptKey(v8::Isolate* isolate, bool* created) {
   std::lock_guard<std::mutex> lock(g_trusted_script_mu);
   auto& key = g_trusted_script_keys[isolate];
-  if (key.IsEmpty()) {
+  *created = key.IsEmpty();
+  if (*created) {
     key.Reset(isolate, v8::Private::New(isolate,
         v8::String::NewFromUtf8Literal(isolate, "TrustedScript source")));
   }
@@ -2416,9 +2417,16 @@ napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
   } else {
     shape = env->trusted_script_template.Get(isolate);
   }
+  bool first_on_isolate = false;
+  auto key = EnsureTrustedScriptKey(isolate, &first_on_isolate);
+  // Install the hook once per isolate, with its brand. A hook the embedder
+  // installs afterwards replaces it, and is not overwritten here again.
+  if (first_on_isolate) {
+    isolate->SetModifyCodeGenerationFromStringsCallback(TrustedCodeGeneration);
+  }
   v8::Local<v8::Object> object;
   if (!shape->NewInstance(context).ToLocal(&object) ||
-      !object->SetPrivate(context, EnsureTrustedScriptKey(isolate), raw_source).FromMaybe(false))
+      !object->SetPrivate(context, key, raw_source).FromMaybe(false))
     return napi_generic_failure;
   // A native default stringifier makes Function(trustedSource) work before
   // an embedder replaces the prototype with its own TrustedScript WebIDL one.
@@ -2429,7 +2437,6 @@ napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
           v8::String::NewFromUtf8Literal(isolate, "toString"), stringify,
           v8::DontEnum).FromMaybe(false) ||
       !object->SetPrototype(context, prototype).FromMaybe(false)) return napi_generic_failure;
-  isolate->SetModifyCodeGenerationFromStringsCallback(TrustedCodeGeneration);
   *result = napi_v8_wrap_value(env, handles.Escape(object));
   return *result ? napi_ok : napi_generic_failure;
 }
