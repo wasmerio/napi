@@ -1671,10 +1671,13 @@ napi_status NAPI_CDECL unofficial_napi_contextify_enter(
     return napi_generic_failure;
   v8::HandleScope handles(env->isolate);
   v8::Local<v8::Context> context = env->context_ref.Get(env->isolate);
-  v8::MicrotaskQueue* queue = nullptr;
+  // Selection does not change which microtask queue checkpoints drain, so the
+  // context's own queue, if any, is not used here.
+  v8::MicrotaskQueue* unused_own_queue = nullptr;
   if (!IsNullish(env, sandbox_or_null)) {
     std::lock_guard<std::mutex> lock(g_context_mu);
-    if (!ResolveContextFromKey(env, sandbox_or_null, &context, &queue)) return napi_invalid_arg;
+    if (!ResolveContextFromKey(env, sandbox_or_null, &context, &unused_own_queue))
+      return napi_invalid_arg;
   }
   // Never recycle a token, including across environments. A stale or foreign
   // Wasm token cannot alias a subsequently allocated native scope pointer.

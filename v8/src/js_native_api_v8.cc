@@ -518,7 +518,9 @@ napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env)
 void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
   if (cb == nullptr) return;
   v8::HandleScope handle_scope(isolate);
-  NapiV8ContextScope context_scope(this, context());
+  // Deferred finalizers run whenever the queue drains, so do not inherit
+  // whichever context happens to be selected then.
+  NapiV8ContextScope context_scope(this, root_context());
   cb(this, data, hint);
 }
 
@@ -602,6 +604,10 @@ napi_env__::~napi_env__() {
 
 v8::Local<v8::Context> napi_env__::context() const {
   if (context_scope != nullptr) return context_scope->context();
+  return root_context();
+}
+
+v8::Local<v8::Context> napi_env__::root_context() const {
   return context_ref.Get(isolate);
 }
 

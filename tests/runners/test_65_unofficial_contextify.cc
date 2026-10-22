@@ -1112,6 +1112,50 @@ void EnterWithoutLeaving(napi_env env, void* data) {
   record->status = unofficial_napi_contextify_enter(env, record->sandbox, &record->scope);
 }
 
+struct RootCallbackRecord {
+  unsigned calls = 0;
+  napi_value expected_global = nullptr;
+  bool saw_expected_global = false;
+};
+
+napi_value CountCall(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) == napi_ok) {
+    ++static_cast<RootCallbackRecord*>(data)->calls;
+  }
+  return nullptr;
+}
+
+// Compares the global selected while a provider callback runs. The callback's
+// own handles do not outlive it, so compare here rather than keep them.
+void RecordGlobal(napi_env env, void* data) {
+  auto* record = static_cast<RootCallbackRecord*>(data);
+  ++record->calls;
+  record->saw_expected_global = StrictEquals(env, CurrentGlobal(env), record->expected_global);
+}
+
+void RecordGlobalFinalizer(napi_env env, void* data, void* /*hint*/) {
+  RecordGlobal(env, data);
+}
+
+napi_value MakeOwnQueueRealm(napi_env env, ContextScopeFixture* fixture) {
+  napi_value sandbox = nullptr;
+  napi_value ignored = nullptr;
+  if (napi_create_object(env, &sandbox) != napi_ok ||
+      unofficial_napi_contextify_make_context(env,
+                                              sandbox,
+                                              Str(env, "own-queue"),
+                                              Str(env, "test://own-queue"),
+                                              true,
+                                              true,
+                                              true,
+                                              fixture->host_defined_option,
+                                              &ignored) != napi_ok) {
+    return nullptr;
+  }
+  return sandbox;
+}
+
 struct TeardownCounters {
   unsigned cleanup_calls = 0;
   unsigned finalizer_calls = 0;
@@ -1487,6 +1531,86 @@ TEST_F(Test65UnofficialContextify, ContextScopeInterruptReclaimsUnbalancedScopes
   EXPECT_NE(record.scope, 0u);
   EXPECT_EQ(unofficial_napi_contextify_leave(s.env, record.scope), napi_invalid_arg);
   EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+// Event-loop checkpoints and unofficial_napi_enqueue_microtask use the root
+// context's queue even while a context with its own queue is selected.
+TEST_F(Test65UnofficialContextify, ContextScopeCheckpointsUseRootMicrotaskQueue) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value own = MakeOwnQueueRealm(s.env, &fixture);
+  ASSERT_NE(own, nullptr);
+  RootCallbackRecord record;
+  napi_value count = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "count", NAPI_AUTO_LENGTH, CountCall, &record, &count),
+            napi_ok);
+
+  // Root work queued before the selection still drains at a checkpoint.
+  unofficial_napi_context_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, count), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, own, &scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
+  EXPECT_EQ(record.calls, 1u);
+
+  // Work queued while the context is selected goes to the root queue too.
+  ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, count), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
+  EXPECT_EQ(record.calls, 2u);
+}
+
+// Deferred finalizers and interrupt callbacks act for the environment, so they
+// run in its root context whatever context is selected when they run.
+TEST_F(Test65UnofficialContextify, ContextScopeProviderCallbacksRunInRoot) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  ASSERT_NE(parent_global, nullptr);
+
+  RootCallbackRecord finalized;
+  finalized.expected_global = root;
+  napi_handle_scope handles = nullptr;
+  napi_value transient = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+  ASSERT_EQ(napi_create_object(s.env, &transient), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, transient, &finalized, RecordGlobalFinalizer, nullptr,
+                               nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+
+  unofficial_napi_context_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &scope), napi_ok);
+  for (int attempt = 0; attempt < 3 && finalized.calls == 0; ++attempt) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+              napi_ok);
+  }
+  ASSERT_EQ(finalized.calls, 1u);
+  EXPECT_TRUE(finalized.saw_expected_global);
+
+  RootCallbackRecord interrupted;
+  interrupted.expected_global = root;
+  napi_value ignored = nullptr;
+  ASSERT_EQ(unofficial_napi_request_interrupt(s.env, RecordGlobal, &interrupted), napi_ok);
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env, "let total = 0; "
+                                       "for (let i = 0; i < 1000000; ++i) total += i; total"),
+                            &ignored),
+            napi_ok);
+  ASSERT_EQ(interrupted.calls, 1u);
+  EXPECT_TRUE(interrupted.saw_expected_global);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scope), napi_ok);
 }
 
 // Scopes left outside any handle scope must not grow the environment's root

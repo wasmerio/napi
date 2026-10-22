@@ -59,7 +59,12 @@ struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
 
+  // The context ordinary N-API operations use: the innermost selected
+  // context scope, else the root context.
   v8::Local<v8::Context> context() const;
+  // The environment's own context, regardless of selection. Provider
+  // internals that act for the environment as a whole use it.
+  v8::Local<v8::Context> root_context() const;
   void CallFinalizer(node_api_basic_finalize cb, void* data, void* hint);
   void InvokeFinalizerFromGC(napi_ref_tracker__* finalizer);
   void EnqueueFinalizer(napi_ref_tracker__* finalizer);
