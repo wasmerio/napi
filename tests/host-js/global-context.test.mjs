@@ -115,6 +115,29 @@ test('closing an inactive context disables only its callbacks', () => {
   assert.equal(fnA2(),undefined);
 });
 
+test('callbacks receive new.target, so napi_get_new_target can tell construction from a call', () => {
+  const context=create(), seen=[];
+  const fn=callback(context,(receiver,args,target)=>{seen.push(target);if(target)receiver.answer=args[0];return undefined;});
+  assert.equal(fn.call({},7),undefined);
+  assert.equal(seen[0],undefined);
+  assert.equal(new fn(42).answer,42);
+  assert.equal(seen[1],fn);
+  class Child extends fn {}
+  const child=new Child(51);
+  assert.equal(child.answer,51);
+  assert.equal(seen[2],Child);
+  assert.ok(child instanceof Child);
+  function Alternate() {}
+  const reflected=Reflect.construct(fn,[63],Alternate);
+  assert.equal(reflected.answer,63);
+  assert.equal(seen[3],Alternate);
+  assert.ok(reflected instanceof Alternate);
+  const outer=callback(context,(_receiver,_args,target)=>{assert.equal(target,outer);new fn(99);});
+  new outer();
+  assert.equal(seen.at(-1),fn);
+  runtime.wasmer_napi_release_global_context(context);
+});
+
 test('retained callback wrappers do not retain closed contexts or dispatch captures', async () => {
   const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
   const references=[], callbacks=[];

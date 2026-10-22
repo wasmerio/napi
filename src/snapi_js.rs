@@ -462,7 +462,8 @@ export function wasmer_napi_make_callback(context, dispatch) {
   const index = callbacks.dispatches.push(dispatch) - 1;
   return function (...args) {
     const dispatch = callbacks.dispatches?.[index];
-    return dispatch?.(this, args);
+    // new.target lets napi_get_new_target tell construction from a call.
+    return dispatch?.(this, args, new.target);
   };
 }
 const wasmerNapiGlobalScopes = new WeakMap();
@@ -1279,9 +1280,13 @@ struct CallbackReg {
     data: u64,
 }
 
+/// A guest callback trampoline: receives `this`, the arguments and `new.target`.
+type CallbackClosure = Closure<dyn Fn(JsValue, Array, JsValue) -> JsValue>;
+
 struct CallbackInfo {
     args: Vec<u32>,
     this_value: u32,
+    new_target: u32,
     data: u64,
 }
 
@@ -1362,7 +1367,7 @@ struct HostJsEnv {
     next_cbinfo: u32,
     callback_infos: IdHashMap<u32, CallbackInfo>,
     pending_callbacks: VecDeque<PendingCallback>,
-    closures: Vec<Closure<dyn Fn(JsValue, Array) -> JsValue>>,
+    closures: Vec<CallbackClosure>,
     instance_data: u64,
     wraps: IdHashMap<u32, u64>,
     guest_finalizers: Vec<GuestFinalizer>,
@@ -3350,100 +3355,108 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
     };
     let live_env_addr = s.live_env_addr.clone();
     let callback_name = function_name.clone();
-    let closure = Closure::wrap(Box::new(move |this: JsValue, args: Array| -> JsValue {
-        let env_addr = live_env_addr.get();
-        if env_addr == 0 {
-            wasmer_napi_console_error(&format!(
-                "[wasmer-napi-callback] released env callback={callback_name}"
-            ));
-            return JsValue::UNDEFINED;
-        }
-        let env = env_addr as SnapiEnv;
-        // Do not keep a mutable environment borrow across the guest callback:
-        // invoking JavaScript from that callback may recursively enter this
-        // same trampoline.
-        let (value_frame, cb, callback_ctx) = {
-            let Ok(state) = (unsafe { env_mut(env) }) else {
+    let closure = Closure::wrap(Box::new(
+        move |this: JsValue, args: Array, new_target: JsValue| -> JsValue {
+            let env_addr = live_env_addr.get();
+            if env_addr == 0 {
                 wasmer_napi_console_error(&format!(
-                    "[wasmer-napi-callback] invalid env callback={callback_name}"
+                    "[wasmer-napi-callback] released env callback={callback_name}"
                 ));
                 return JsValue::UNDEFINED;
-            };
-            let value_frame = state.open_value_frame();
-            let mut ids = Vec::with_capacity(args.length() as usize);
-            for v in args.iter() {
-                ids.push(state.insert(v));
             }
-            let this_value = state.insert(this);
-            let cb = state.next_cbinfo;
-            state.next_cbinfo = cb.saturating_add(1);
-            state.callback_infos.insert(
-                cb,
-                CallbackInfo {
-                    args: ids,
-                    this_value,
-                    data: registration.data,
-                },
-            );
-            (value_frame, cb, state.active_callback_ctx)
-        };
-        if callback_ctx.is_null() {
-            wasmer_napi_console_error(&format!(
-                "[wasmer-napi-callback] missing context callback={callback_name}"
-            ));
-        }
-        let result = unsafe {
-            snapi_host_invoke_wasm_callback(
-                callback_ctx,
-                registration.guest_env,
-                registration.wasm_fn_ptr,
-                cb,
-            )
-        };
-        if result == CALLBACK_DEFERRED {
-            let resolve_slot = Rc::new(RefCell::new(None));
-            let reject_slot = Rc::new(RefCell::new(None));
-            let rs = resolve_slot.clone();
-            let rj = reject_slot.clone();
-            let promise = Promise::new(&mut |resolve, reject| {
-                *rs.borrow_mut() = Some(resolve);
-                *rj.borrow_mut() = Some(reject);
-            });
+            let env = env_addr as SnapiEnv;
+            // Do not keep a mutable environment borrow across the guest callback:
+            // invoking JavaScript from that callback may recursively enter this
+            // same trampoline.
+            let (value_frame, cb, callback_ctx) = {
+                let Ok(state) = (unsafe { env_mut(env) }) else {
+                    wasmer_napi_console_error(&format!(
+                        "[wasmer-napi-callback] invalid env callback={callback_name}"
+                    ));
+                    return JsValue::UNDEFINED;
+                };
+                let value_frame = state.open_value_frame();
+                let mut ids = Vec::with_capacity(args.length() as usize);
+                for v in args.iter() {
+                    ids.push(state.insert(v));
+                }
+                let this_value = state.insert(this);
+                let new_target = if new_target.is_undefined() {
+                    0
+                } else {
+                    state.insert(new_target)
+                };
+                let cb = state.next_cbinfo;
+                state.next_cbinfo = cb.saturating_add(1);
+                state.callback_infos.insert(
+                    cb,
+                    CallbackInfo {
+                        args: ids,
+                        this_value,
+                        new_target,
+                        data: registration.data,
+                    },
+                );
+                (value_frame, cb, state.active_callback_ctx)
+            };
+            if callback_ctx.is_null() {
+                wasmer_napi_console_error(&format!(
+                    "[wasmer-napi-callback] missing context callback={callback_name}"
+                ));
+            }
+            let result = unsafe {
+                snapi_host_invoke_wasm_callback(
+                    callback_ctx,
+                    registration.guest_env,
+                    registration.wasm_fn_ptr,
+                    cb,
+                )
+            };
+            if result == CALLBACK_DEFERRED {
+                let resolve_slot = Rc::new(RefCell::new(None));
+                let reject_slot = Rc::new(RefCell::new(None));
+                let rs = resolve_slot.clone();
+                let rj = reject_slot.clone();
+                let promise = Promise::new(&mut |resolve, reject| {
+                    *rs.borrow_mut() = Some(resolve);
+                    *rj.borrow_mut() = Some(reject);
+                });
+                let Ok(state) = (unsafe { env_mut(env) }) else {
+                    return JsValue::UNDEFINED;
+                };
+                state.pending_callbacks.push_back(PendingCallback {
+                    registration,
+                    cbinfo: cb,
+                    value_frame,
+                    resolve: resolve_slot.borrow_mut().take().unwrap(),
+                    reject: reject_slot.borrow_mut().take().unwrap(),
+                });
+                return promise.into();
+            }
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return JsValue::UNDEFINED;
             };
-            state.pending_callbacks.push_back(PendingCallback {
-                registration,
-                cbinfo: cb,
-                value_frame,
-                resolve: resolve_slot.borrow_mut().take().unwrap(),
-                reject: reject_slot.borrow_mut().take().unwrap(),
-            });
-            return promise.into();
-        }
-        let Ok(state) = (unsafe { env_mut(env) }) else {
-            return JsValue::UNDEFINED;
-        };
-        let error = state.last_exception.take();
-        let result_value = state.get(result).cloned();
-        if result_value.is_none() && result != 0 {
-            wasmer_napi_console_error(&format!(
-                "[wasmer-napi-callback] invalid result callback={callback_name} handle={result} guest_env={} wasm_fn={} value_slots={} free_slots={} scope_depth={}",
-                registration.guest_env,
-                registration.wasm_fn_ptr,
-                state.values.len(),
-                state.value_free_slots.len(),
-                state.value_frames.len(),
-            ));
-        }
-        let result = result_value.unwrap_or(JsValue::UNDEFINED);
-        state.callback_infos.remove(&cb);
-        state.close_value_frame(value_frame);
-        if let Some(error) = error {
-            wasm_bindgen::throw_val(error);
-        }
-        result
-    }) as Box<dyn Fn(JsValue, Array) -> JsValue>);
+            let error = state.last_exception.take();
+            let result_value = state.get(result).cloned();
+            if result_value.is_none() && result != 0 {
+                wasmer_napi_console_error(&format!(
+                    "[wasmer-napi-callback] invalid result callback={callback_name} handle={result} guest_env={} wasm_fn={} value_slots={} free_slots={} scope_depth={}",
+                    registration.guest_env,
+                    registration.wasm_fn_ptr,
+                    state.values.len(),
+                    state.value_free_slots.len(),
+                    state.value_frames.len(),
+                ));
+            }
+            let result = result_value.unwrap_or(JsValue::UNDEFINED);
+            state.callback_infos.remove(&cb);
+            state.close_value_frame(value_frame);
+            if let Some(error) = error {
+                wasm_bindgen::throw_val(error);
+            }
+            result
+        },
+    ) as Box<dyn Fn(JsValue, Array, JsValue) -> JsValue>);
     let function = wasmer_napi_make_callback(&s.global_context, closure.as_ref().unchecked_ref());
     if !name.is_null() {
         let _ = Reflect::set(
@@ -6479,8 +6492,15 @@ pub unsafe extern "C" fn snapi_bridge_get_new_target(
     cbinfo_id: u32,
     out_id: *mut u32,
 ) -> i32 {
-    let _ = (env, cbinfo_id, out_id);
-    NAPI_GENERIC_FAILURE
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(info) = state.callback_infos.get(&cbinfo_id) else {
+        return NAPI_INVALID_ARG;
+    };
+    // A non-constructor callback succeeds with a null napi_value. The handle
+    // stays valid for the whole callback, including reentrant and deferred ones.
+    unsafe { write(out_id, info.new_target) }.map_or_else(|error| error, |_| NAPI_OK)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6805,6 +6825,40 @@ mod tests {
         let env = Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
         test(env, unsafe { env_mut(env) }.unwrap());
         assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+    }
+
+    #[wasm_bindgen_test]
+    fn get_new_target_reports_the_constructor_or_null() {
+        with_env(|env, state| {
+            let target = state.insert(Object::new().into());
+            for (id, new_target) in [(7, target), (8, 0)] {
+                state.callback_infos.insert(
+                    id,
+                    CallbackInfo {
+                        args: Vec::new(),
+                        this_value: 0,
+                        new_target,
+                        data: 0,
+                    },
+                );
+            }
+            let mut out = u32::MAX;
+            assert_eq!(
+                unsafe { snapi_bridge_get_new_target(env, 7, &mut out) },
+                NAPI_OK
+            );
+            assert_eq!(out, target);
+            // A plain call succeeds with a null napi_value.
+            assert_eq!(
+                unsafe { snapi_bridge_get_new_target(env, 8, &mut out) },
+                NAPI_OK
+            );
+            assert_eq!(out, 0);
+            assert_eq!(
+                unsafe { snapi_bridge_get_new_target(env, 9, &mut out) },
+                NAPI_INVALID_ARG
+            );
+        });
     }
 
     #[wasm_bindgen_test]
