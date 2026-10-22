@@ -135,11 +135,11 @@ fn i32_at(bytes: &[u8], offset: usize) -> Option<i32> {
 
 fn read_versioned(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     prefix_size: usize,
     version: u32,
 ) -> Option<Vec<u8>> {
-    if guest_ptr <= 0 {
+    if guest_ptr == 0 {
         return None;
     }
     let bytes = read_guest_bytes(env, guest_ptr, prefix_size)?;
@@ -153,7 +153,7 @@ fn read_versioned(
 
 pub(crate) fn read_output_header(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     minimum_size: usize,
     version: u32,
 ) -> Option<u32> {
@@ -175,7 +175,7 @@ pub(crate) struct EnvCreate {
 
 pub(crate) fn read_runtime_options(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<Vec<u8>> {
     if guest_ptr == 0 {
         return Some(Vec::new());
@@ -184,7 +184,7 @@ pub(crate) fn read_runtime_options(
     let flags_ptr = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
-    )? as i32;
+    )?;
     let flags_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
@@ -192,7 +192,7 @@ pub(crate) fn read_runtime_options(
     if flags_length == 0 {
         return Some(Vec::new());
     }
-    if flags_ptr <= 0 {
+    if flags_ptr == 0 {
         return None;
     }
     read_guest_bytes(env, flags_ptr, flags_length)
@@ -200,7 +200,7 @@ pub(crate) fn read_runtime_options(
 
 pub(crate) fn read_env_create(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<EnvCreate> {
     let bytes = read_versioned(env, guest_ptr, ENV_CREATE_PREFIX_SIZE, 1)?;
     // A raw guest pointer is not an unofficial_napi_guest_heap provider
@@ -253,7 +253,7 @@ pub(crate) fn read_env_create(
 
 pub(crate) fn read_js_source(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<(u32, u32)> {
     let bytes = read_guest_bytes(env, guest_ptr, JS_SOURCE_SIZE)?;
     match (
@@ -282,13 +282,13 @@ pub(crate) struct BytecodeOpen {
 
 pub(crate) fn read_bytecode_open(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<BytecodeOpen> {
     let bytes = read_versioned(env, guest_ptr, BYTECODE_OPEN_SIZE, 1)?;
     let cache_ptr = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, cache_bytes),
-    )? as i32;
+    )?;
     let cache_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, cache_byte_length),
@@ -299,7 +299,7 @@ pub(crate) fn read_bytecode_open(
         cache_policy
     ))?;
     let cache = if has_cache != 0 && cache_length != 0 {
-        if cache_ptr <= 0 {
+        if cache_ptr == 0 {
             return None;
         }
         read_guest_bytes(env, cache_ptr, cache_length)?
@@ -357,7 +357,7 @@ pub(crate) struct ModuleCreate {
 
 pub(crate) fn read_module_create(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<ModuleCreate> {
     let bytes = read_versioned(env, guest_ptr, MODULE_CREATE_PREFIX_SIZE, 1)?;
     let kind = i32_at(
@@ -377,7 +377,7 @@ pub(crate) fn read_module_create(
         1 => {
             let source_offset =
                 payload_offset + std::mem::offset_of!(Wasm32ModuleCreateJsPayload, source);
-            let (text, bytecode) = read_js_source(env, u32_at(&bytes, source_offset)? as i32)?;
+            let (text, bytecode) = read_js_source(env, u32_at(&bytes, source_offset)?)?;
             (
                 text,
                 bytecode,
@@ -447,7 +447,7 @@ pub(crate) fn read_module_create(
 
 pub(crate) fn read_module_hooks(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<(u32, u32)> {
     let bytes = read_versioned(env, guest_ptr, MODULE_HOOKS_SIZE, 1)?;
     Some((
@@ -470,7 +470,7 @@ pub(crate) struct EnvHooks {
 
 pub(crate) fn read_env_hooks(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
 ) -> Option<EnvHooks> {
     let bytes = read_versioned(env, guest_ptr, ENV_HOOKS_SIZE, 1)?;
     let hook_fields = [

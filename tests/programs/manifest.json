@@ -169,6 +169,16 @@
       "name": "test_handle_scope_lifetime",
       "description": "Scope-bound value lifetimes: stale-after-close rejection, ref survival, LIFO mismatch error, slot reclamation under churn",
       "expected_stdout": "TEST_HANDLE_SCOPE_LIFETIME_OK=1\n"
+    },
+    {
+      "name": "test_high_value_ids",
+      "description": "Value ids >= 2^31 (over 2^19 live values) stay valid across core and unofficial imports",
+      "expected_stdout": "TEST_HIGH_VALUE_IDS_OK=1\n"
+    },
+    {
+      "name": "test_high_guest_pointers",
+      "description": "Guest pointers >= 2 GiB are read from and written to, not rejected or skipped",
+      "expected_stdout": "TEST_HIGH_GUEST_POINTERS_OK=1\n"
     }
   ]
 }

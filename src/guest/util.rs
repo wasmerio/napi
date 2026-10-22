@@ -41,12 +41,9 @@ pub fn write_guest_u8(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u8
 
 pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     len: usize,
 ) -> Option<Vec<u8>> {
-    if guest_ptr < 0 {
-        return None;
-    }
     let (state, store) = env.data_and_store_mut();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
@@ -115,7 +112,7 @@ pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) 
 
 pub fn read_guest_u32_array(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     count: usize,
 ) -> Option<Vec<u32>> {
     // Guard the byte-length multiply against overflow; the read below is then
@@ -129,10 +126,7 @@ pub fn read_guest_u32_array(
     Some(result)
 }
 
-pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) -> Option<Vec<u8>> {
-    if guest_ptr < 0 {
-        return None;
-    }
+pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<Vec<u8>> {
     let (state, store) = env.data_and_store_mut();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
