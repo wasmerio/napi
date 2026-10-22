@@ -14,7 +14,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -122,9 +121,10 @@ struct ScopeFrame {
 
 struct SnapiEnvState {
   // Isolates, their persistent scopes and all env-local handle tables stay on
-  // the creating VM thread. Different environments may execute concurrently.
-  const std::thread::id thread = std::this_thread::get_id();
-  // Protected by g_mu; blocks foreign control calls during owner teardown.
+  // the creating VM thread (see OwnedByThisThread). Different environments may
+  // execute concurrently.
+  // Written under g_mu by the owner when teardown starts; the owner may read
+  // it without the lock.
   bool closing = false;
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
@@ -188,6 +188,34 @@ struct CallbackBinding {
 // Never destroyed: static destructors race concurrent env teardown at process
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_set<SnapiEnvState*>& g_envs = *new std::unordered_set<SnapiEnvState*>();
+
+// Envs created on this thread and not yet released. Only this thread inserts
+// or erases its entries, so membership proves both that an env is alive and
+// that the caller owns it, without taking g_mu on every N-API call. A plain
+// pointer (freed when the thread's last env goes) keeps it usable from other
+// thread-exit destructors that may still release envs.
+thread_local std::unordered_set<SnapiEnvState*>* t_owned_envs = nullptr;
+
+bool OwnedByThisThread(const SnapiEnvState* state) {
+  return state != nullptr && t_owned_envs != nullptr &&
+         t_owned_envs->count(const_cast<SnapiEnvState*>(state)) != 0;
+}
+
+void AdoptOnThisThread(SnapiEnvState* state) {
+  if (t_owned_envs == nullptr) {
+    t_owned_envs = new std::unordered_set<SnapiEnvState*>();
+  }
+  t_owned_envs->insert(state);
+}
+
+void ForgetOnThisThread(SnapiEnvState* state) {
+  if (t_owned_envs == nullptr) return;
+  t_owned_envs->erase(state);
+  if (t_owned_envs->empty()) {
+    delete t_owned_envs;
+    t_owned_envs = nullptr;
+  }
+}
 // Message resources cross environment boundaries, so their guest-visible IDs
 // cannot belong to either the source or destination environment. The table is
 // process-wide and each entry is removed atomically by take or drop.
@@ -208,11 +236,9 @@ SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
   if (env_state == nullptr) return nullptr;
   // The pointer originates from the guest (via the Rust env-id layer); gate it
   // on live-env membership before the first dereference so a stale or forged
-  // env handle fails cleanly instead of touching freed memory.
-  std::lock_guard<std::mutex> lock(g_mu);
-  if (g_envs.find(env_state) == g_envs.end()) return nullptr;
-  if (env_state->thread != std::this_thread::get_id() ||
-      env_state->env == nullptr) return nullptr;
+  // env handle fails cleanly instead of touching freed memory. Only envs this
+  // thread owns are usable here; other threads get null.
+  if (!OwnedByThisThread(env_state) || env_state->env == nullptr) return nullptr;
   return env_state;
 }
 
@@ -434,10 +460,10 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
 
 napi_status DisposeBridgeState(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
+  if (!OwnedByThisThread(state)) return napi_invalid_arg;
   {
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_envs.count(state) || state->thread != std::this_thread::get_id() ||
-        state->closing) return napi_invalid_arg;
+    if (state->closing) return napi_invalid_arg;
     state->closing = true;
   }
   // Owner callbacks/finalizers may use their env while it unwinds. Foreign
@@ -484,12 +510,14 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
     state->owner = nullptr;
     state->env = nullptr;
     { std::lock_guard<std::mutex> lock(g_mu); g_envs.erase(state); }
+    ForgetOnThisThread(state);
     delete state;
     return s;
   }
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->env = nullptr;
   { std::lock_guard<std::mutex> lock(g_mu); g_envs.erase(state); }
+  ForgetOnThisThread(state);
   delete state;
   return napi_ok;
 }
@@ -2961,6 +2989,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   state->env = env;
   state->owner = owner;
   { std::lock_guard<std::mutex> lock(g_mu); g_envs.insert(state); }
+  AdoptOnThisThread(state);
 
   if (env_out != nullptr) *env_out = state;
   return napi_ok;
@@ -3023,6 +3052,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   state->env = env;
   state->owner = owner;
   { std::lock_guard<std::mutex> lock(g_mu); g_envs.insert(state); }
+  AdoptOnThisThread(state);
 
   if (env_out != nullptr) *env_out = state;
   return napi_ok;
@@ -3313,7 +3343,7 @@ extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_stat
   // Only the owner thread releases an env, so an owner caller needs no lock to
   // keep it alive. A foreign caller keeps registry membership pinned: the
   // engine only enqueues the callback, which runs later on the owner thread.
-  if (bridge_state->thread == std::this_thread::get_id()) lock.unlock();
+  if (OwnedByThisThread(bridge_state)) lock.unlock();
   napi_env env = bridge_state->env;
   auto* request =
       new (std::nothrow) WasmInterruptRequest{bridge_state, guest_env, wasm_fn_ptr, data};
@@ -4278,13 +4308,10 @@ extern "C" void snapi_bridge_dispose() {
   // An embedder may clean up its owner thread; it must never destroy another
   // thread's entered isolate or persistent V8 scopes. Normal worker shutdown
   // explicitly releases each env on its owner before joining that thread.
+  if (t_owned_envs == nullptr) return;
   std::vector<SnapiEnvState*> env_states;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    for (auto* state : g_envs) {
-      if (state->thread == std::this_thread::get_id() && !state->closing)
-        env_states.push_back(state);
-    }
+  for (auto* state : *t_owned_envs) {
+    if (!state->closing) env_states.push_back(state);
   }
   for (auto* state : env_states) (void)DisposeBridgeState(state);
   // Opaque messages are owned by queues, not by a source env. They may remain

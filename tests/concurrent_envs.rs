@@ -274,6 +274,62 @@ unsafe extern "C" {
     fn snapi_bridge_unofficial_terminate_execution(env: *mut c_void) -> i32;
     fn snapi_bridge_unofficial_cancel_terminate_execution(env: *mut c_void) -> i32;
     fn snapi_bridge_dispose();
+    fn snapi_bridge_create_int32(env: *mut c_void, value: i32, out_id: *mut u32) -> i32;
+    fn snapi_bridge_get_value_int32(env: *mut c_void, id: u32, out: *mut i32) -> i32;
+}
+
+/// Not a correctness test: bridge calls per second with 1, 2 and 4 envs, one
+/// per thread, all calling at once. Run with
+/// `cargo test --test concurrent_envs -- --ignored --nocapture bridge_call_throughput`
+/// (an optimized build of this crate gives meaningful numbers).
+#[test]
+#[ignore]
+fn bridge_call_throughput() {
+    const CALLS: u32 = 2_000_000;
+    unsafe {
+        assert_eq!(
+            snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0),
+            0
+        );
+    }
+    for threads in [1usize, 2, 4] {
+        let start = Arc::new(Barrier::new(threads + 1));
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                thread::spawn(move || unsafe {
+                    let mut env: *mut c_void = std::ptr::null_mut();
+                    assert_eq!(
+                        snapi_bridge_unofficial_create_env(8, std::ptr::null(), &mut env),
+                        0
+                    );
+                    let mut id = 0u32;
+                    assert_eq!(snapi_bridge_create_int32(env, 42, &mut id), 0);
+                    start.wait();
+                    let began = Instant::now();
+                    let mut value = 0i32;
+                    for _ in 0..CALLS {
+                        assert_eq!(snapi_bridge_get_value_int32(env, id, &mut value), 0);
+                    }
+                    let elapsed = began.elapsed();
+                    assert_eq!(value, 42);
+                    assert_eq!(snapi_bridge_unofficial_release_env(env), 0);
+                    elapsed
+                })
+            })
+            .collect();
+        start.wait();
+        let slowest = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("benchmark thread panicked"))
+            .max()
+            .unwrap();
+        println!(
+            "THROUGHPUT threads={threads} ns_per_call={:.1} total_calls_per_sec={:.0}",
+            slowest.as_nanos() as f64 / f64::from(CALLS),
+            f64::from(CALLS) * threads as f64 / slowest.as_secs_f64()
+        );
+    }
 }
 
 /// An isolate and its persistent scopes belong to the thread that created
