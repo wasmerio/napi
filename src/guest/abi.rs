@@ -164,6 +164,7 @@ pub(crate) fn read_output_header(
         .then_some(size)
 }
 
+#[derive(Default)]
 pub(crate) struct EnvCreate {
     pub total_memory: u64,
     pub constrained_memory: u64,
@@ -173,29 +174,60 @@ pub(crate) struct EnvCreate {
     pub stack_limit: u32,
 }
 
-pub(crate) fn read_runtime_options(
+/// Longest engine flag string that is read from the guest. Every inert
+/// default is shorter, so longer strings are rejected without a host copy.
+const MAX_ENGINE_FLAGS_LENGTH: u32 = 64;
+
+/// Whether guest runtime options only request inert engine flags. Guests are
+/// never permitted to set process-wide V8 flags, but EdgeJS unconditionally
+/// passes its fixed defaults before it creates an env; those are accepted
+/// without being forwarded. `None` means the options are malformed.
+pub(crate) fn runtime_options_are_inert(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
-) -> Option<Vec<u8>> {
+) -> Option<bool> {
     if guest_ptr == 0 {
-        return Some(Vec::new());
+        return Some(true);
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
-    let flags_ptr = u32_at(
+    let flags = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
     )?;
     let flags_length = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
-    )? as usize;
-    if flags_length == 0 {
-        return Some(Vec::new());
+    )?;
+    engine_flags_are_inert(env, flags, flags_length)
+}
+
+/// Whether a guest engine flag string only holds EdgeJS's fixed defaults.
+/// `None` means the string cannot be read.
+pub(crate) fn engine_flags_are_inert(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    length: u32,
+) -> Option<bool> {
+    if length == 0 {
+        return Some(true);
     }
-    if flags_ptr == 0 {
+    if length > MAX_ENGINE_FLAGS_LENGTH {
+        return Some(false);
+    }
+    if guest_ptr == 0 {
         return None;
     }
-    read_guest_bytes(env, flags_ptr, flags_length)
+    let bytes = read_guest_bytes(env, guest_ptr, length as usize)?;
+    Some(is_default_engine_flags(&bytes))
+}
+
+fn is_default_engine_flags(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"" | b"--js-source-phase-imports"
+            | b"--harmony-import-attributes"
+            | b"--js-source-phase-imports --harmony-import-attributes"
+    )
 }
 
 pub(crate) fn read_env_create(

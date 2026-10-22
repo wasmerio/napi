@@ -50,8 +50,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
     pub cpu_profiler_metadata_size: u64,
 }
 
-// Items allowed to be dead for the JS backend are reached by its guest layer
-// through `snapi_js::host_js_*` entry points or direct guest memory access.
+// The bridge ABI is shared with the browser-hosted backend and optional
+// extension imports, so a native build does not reference every declaration.
+#[allow(dead_code)]
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
@@ -76,6 +77,8 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_env_alive(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
@@ -117,17 +120,10 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    /// Register a host-owned near-heap-limit callback that charges V8 heap
-    /// growth against the resource budget. `data` is an
-    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
-    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
+    /// Install `data` (an `*const crate::budget::EnvHeapCharge`) as this env's
+    /// budget tracker: V8 heap growth and the bridge's per-handle host
+    /// bookkeeping are charged against the resource budget through it.
+    pub fn snapi_bridge_unofficial_set_host_budget(env: SnapiEnv, data: *const c_void) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -259,6 +255,12 @@ unsafe extern "C" {
         env: SnapiEnv,
         value_id: u32,
         payload_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_message_create_metered(
+        env: SnapiEnv,
+        value_id: u32,
+        payload_out: *mut u32,
+        retained_bytes_out: *mut u64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,

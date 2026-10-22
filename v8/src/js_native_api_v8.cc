@@ -61,6 +61,8 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
     v8::Local<v8::FixedArray> /*import_attributes*/) {
   v8::Isolate* isolate = context->GetIsolate();
   v8::EscapableHandleScope handle_scope(isolate);
+  NapiV8ProviderPromiseReservation reservation(isolate);
+  if (!reservation.acquired()) return v8::MaybeLocal<v8::Promise>();
   v8::TryCatch try_catch(isolate);
 
   v8::Local<v8::Promise::Resolver> resolver;
@@ -86,7 +88,10 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
-    NapiV8TrackProviderPromise(isolate, promise);
+    if (!NapiV8TrackProviderPromise(isolate, promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(promise);
   }
 
@@ -101,18 +106,27 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
       v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
       resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     }
-    NapiV8TrackProviderPromise(isolate, promise);
+    if (!NapiV8TrackProviderPromise(isolate, promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(promise);
   }
 
   if (result->IsPromise()) {
     v8::Local<v8::Promise> result_promise = result.As<v8::Promise>();
-    NapiV8TrackProviderPromise(isolate, result_promise);
+    if (!NapiV8TrackProviderPromise(isolate, result_promise)) {
+      try_catch.ReThrow();
+      return v8::MaybeLocal<v8::Promise>();
+    }
     return handle_scope.Escape(result_promise);
   }
 
   resolver->Resolve(context, result).FromMaybe(false);
-  NapiV8TrackProviderPromise(isolate, promise);
+  if (!NapiV8TrackProviderPromise(isolate, promise)) {
+    try_catch.ReThrow();
+    return v8::MaybeLocal<v8::Promise>();
+  }
   return handle_scope.Escape(promise);
 }
 
@@ -2630,40 +2644,39 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
-  napi_ref ref = nullptr;
+  // The object's private slot must own its tracker independently of the
+  // optional user reference. Deleting a user reference must never free the
+  // tracker that napi_unwrap/napi_remove_wrap later read from that slot.
+  napi_ref wrapped_ref = finalize_cb != nullptr
+                             ? static_cast<napi_ref>(napi_ref_with_finalizer__::New(
+                                   env, object, 0, napi_ref_ownership__::kRuntime,
+                                   finalize_cb, native_object, finalize_hint))
+                             : static_cast<napi_ref>(napi_ref_with_data__::New(
+                                   env, object, 0, napi_ref_ownership__::kRuntime,
+                                   native_object));
+  if (wrapped_ref == nullptr) return napi_generic_failure;
+  napi_ref user_ref = nullptr;
   if (result != nullptr) {
-    ref = napi_ref_with_finalizer__::New(env,
-                                         object,
-                                         0,
-                                         napi_ref_ownership__::kUserland,
-                                         finalize_cb,
-                                         native_object,
-                                         finalize_hint);
-  } else if (finalize_cb != nullptr) {
-    ref = napi_ref_with_finalizer__::New(env,
-                                         object,
-                                         0,
-                                         napi_ref_ownership__::kRuntime,
-                                         finalize_cb,
-                                         native_object,
-                                         finalize_hint);
-  } else {
-    ref = napi_ref_with_data__::New(
-        env, object, 0, napi_ref_ownership__::kRuntime, native_object);
+    user_ref = napi_ref__::New(env, object, 0,
+                               napi_ref_ownership__::kUserland);
+    if (user_ref == nullptr) {
+      wrapped_ref->Destroy();
+      return napi_generic_failure;
+    }
   }
-  if (ref == nullptr) return napi_generic_failure;
 
   if (!object
            ->SetPrivate(env->context(),
                         wrapKey,
-                        v8::External::New(env->isolate, ref))
+                        v8::External::New(env->isolate, wrapped_ref))
            .FromMaybe(false)) {
-    ref->Destroy();
+    if (user_ref != nullptr) user_ref->Destroy();
+    wrapped_ref->Destroy();
     return napi_generic_failure;
   }
 
   if (result != nullptr) {
-    *result = ref;
+    *result = user_ref;
   }
   return napi_ok;
 }

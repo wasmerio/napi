@@ -22,6 +22,15 @@ use crate::{
 use super::{abi, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+    if env.data().memory.is_none() {
+        return 0;
+    }
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
+        return 0;
+    };
+    if !ensure_guest_heap(&mut env) {
+        return 0;
+    }
     let _ = unsafe { snapi_bridge_init() };
     // Legacy N-API modules without an embedder-owned runtime configuration use
     // the provider default. If Edge configured flags first, this conflicting
@@ -60,9 +69,45 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     }
 
-    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
+    let Some((env_id, _scope_id)) = env.data_mut().commit_isolate(snapi_env_state, &reservation)
+    else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        env.data().abort_isolate(&reservation);
+        return 0;
+    };
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
+}
+
+// A Wasm start section can call N-API before configure_instance runs. An
+// imported env.memory is already available then, so install its guest heap on
+// first use. If no usable memory exists, fail before spawning V8: a null heap
+// would make this guest look like an unrestricted native embedder.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+fn ensure_guest_heap(env: &mut FunctionEnvMut<NapiEnv>) -> bool {
+    if env.data().host_stopped() {
+        return false;
+    }
+    if env.data().guest_heap.is_some() {
+        return true;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return false;
+    };
+    let budget = std::sync::Arc::clone(&env.data().budget);
+    let Some((heap, registration)) =
+        crate::guest_heap::GuestHeap::get_or_create(&mut env.as_store_mut(), &memory, budget)
+    else {
+        return false;
+    };
+    env.data_mut().guest_heap = Some(heap);
+    env.data_mut().guest_heap_registration = Some(registration);
+    true
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn ensure_guest_heap(_env: &mut FunctionEnvMut<NapiEnv>) -> bool {
+    true
 }
 
 /// Boxed guest-heap context for env creation, or null when no heap exists.
@@ -197,15 +242,18 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: u32,
 ) -> i32 {
-    let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
-        return 1;
-    };
     // V8 flags are process-wide. A guest must not change flags for other
     // tenants or make the first caller decide the host's security policy.
-    if !flags.is_empty() {
+    let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
+        return 1;
+    };
+    if env.data().host_stopped() {
         return 1;
     }
-    unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }
+    // Configuration has no per-guest mutable options. Defer native V8
+    // platform creation until env creation has activated the embedder's
+    // metered lane and admitted this instance.
+    0
 }
 
 fn guest_unofficial_napi_create_env(
@@ -215,33 +263,49 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: u32,
     scope_out_ptr: u32,
 ) -> i32 {
-    let (
-        total_memory,
-        constrained_memory,
-        max_young_generation_size_in_bytes,
-        max_old_generation_size_in_bytes,
-        code_range_size_in_bytes,
-        stack_limit,
-    ) = if options_ptr != 0 {
+    let options = if options_ptr == 0 {
+        abi::EnvCreate::default()
+    } else {
         let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
             return 1;
         };
-        (
-            options.total_memory,
-            options.constrained_memory,
-            options.max_young_generation_size_in_bytes,
-            options.max_old_generation_size_in_bytes,
-            options.code_range_size_in_bytes,
-            options.stack_limit,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0)
+        options
     };
+    create_env_with_options(env, module_api_version, options, env_out_ptr, scope_out_ptr)
+}
 
+fn create_env_with_options(
+    mut env: FunctionEnvMut<NapiEnv>,
+    module_api_version: i32,
+    options: abi::EnvCreate,
+    env_out_ptr: u32,
+    scope_out_ptr: u32,
+) -> i32 {
+    // Reject malformed output pointers before creating a V8 isolate. A bad
+    // result address would otherwise leave the guest with an unreachable env.
+    if env_out_ptr == 0
+        || scope_out_ptr == 0
+        || read_guest_bytes(&mut env, env_out_ptr, 4).is_none()
+        || read_guest_bytes(&mut env, scope_out_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    if env.data().memory.is_none() {
+        return 1;
+    }
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
+        return 1;
+    };
+    if !ensure_guest_heap(&mut env) {
+        return 1;
+    }
+    if unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) } != 0 {
+        return 1;
+    }
     let requested = RequestedHeap {
-        max_young: max_young_generation_size_in_bytes,
-        max_old: max_old_generation_size_in_bytes,
-        code_range: code_range_size_in_bytes,
+        max_young: options.max_young_generation_size_in_bytes,
+        max_old: options.max_old_generation_size_in_bytes,
+        code_range: options.code_range_size_in_bytes,
     };
     let reservation = match env.data().reserve_isolate(requested) {
         Ok(reservation) => reservation,
@@ -253,12 +317,12 @@ fn guest_unofficial_napi_create_env(
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
             module_api_version,
-            total_memory,
-            constrained_memory,
+            options.total_memory,
+            options.constrained_memory,
             reservation.max_young,
             reservation.max_old,
             reservation.code_range,
-            stack_limit,
+            options.stack_limit,
             guest_heap_ctx,
             &mut snapi_env_state,
         )
@@ -267,13 +331,14 @@ fn guest_unofficial_napi_create_env(
         env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    if env_out_ptr != 0 {
-        write_guest_u32(&mut env, env_out_ptr, env_id);
-    }
-    if scope_out_ptr != 0 {
-        write_guest_u32(&mut env, scope_out_ptr, scope_id);
-    }
+    let Some((env_id, scope_id)) = env.data_mut().commit_isolate(snapi_env_state, &reservation)
+    else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        env.data().abort_isolate(&reservation);
+        return 1;
+    };
+    write_guest_u32(&mut env, env_out_ptr, env_id);
+    write_guest_u32(&mut env, scope_out_ptr, scope_id);
     0
 }
 
@@ -282,7 +347,8 @@ fn guest_unofficial_napi_release_env(
     scope_ptr: u32,
     loop_ptr: u32,
 ) -> Result<i32, WasiError> {
-    // Disposing an isolate while its JavaScript callback is entered aborts V8.
+    // Disposing an entered V8 isolate from its own JS/Wasm callback aborts
+    // the shared host. Leave all registries intact when this is attempted.
     if env.data().in_callback() {
         return Ok(1);
     }
@@ -294,9 +360,11 @@ fn guest_unofficial_napi_release_env(
     let status = with_cb_context(&mut env, guest_env, || unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
-    if status.as_ref().is_ok_and(|code| *code == 0)
-        && let Some((guest_env, snapi_env_state)) =
-            env.data_mut().begin_unregister_napi_scope(scope_id)
+    if status.as_ref().is_ok_and(|code| {
+        *code == 0
+            || unsafe { crate::snapi::snapi_bridge_unofficial_env_alive(snapi_env_state) == 0 }
+    }) && let Some((guest_env, snapi_env_state)) =
+        env.data_mut().begin_unregister_napi_scope(scope_id)
     {
         env.data_mut()
             .finish_unregister_napi_env(guest_env, snapi_env_state);
@@ -609,27 +677,20 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     napi_env: u32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    if env.data().host_stopped() {
-        unsafe {
-            snapi_bridge_unofficial_terminate_execution(env_handle);
-        }
-        return 1;
-    }
-    unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
+    env.data().cancel_guest_termination(env_handle)
 }
 
 fn guest_unofficial_napi_request_interrupt(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: u32,
-    callback: u32,
-    data: u32,
-) -> Result<i32, WasiError> {
-    let env_handle = snapi_env(&env, napi_env);
-    let callback_id = callback;
-    let data_val = data;
-    with_cb_context(&mut env, napi_env, || unsafe {
-        snapi_bridge_unofficial_request_interrupt(env_handle, napi_env, callback_id, data_val)
-    })
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _callback: u32,
+    _data: u32,
+) -> i32 {
+    // V8 queues an opaque native request pointer until JS reaches an
+    // interrupt point. A guest can enqueue indefinitely without entering JS;
+    // teardown does not reclaim that pointer. Host stop uses its own control
+    // path, so guest requests must wait for a tracked, bounded implementation.
+    1
 }
 
 fn guest_unofficial_napi_structured_clone(
@@ -5138,7 +5199,9 @@ fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
 pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     macro_rules! reg_env {
         ($name:expr, $func:expr) => {
-            io.define("env", $name, Function::new_typed(store, $func));
+            if io.get_export("env", $name).is_none() {
+                io.define("env", $name, Function::new_typed(store, $func));
+            }
         };
     }
 

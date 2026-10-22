@@ -5,11 +5,10 @@
 //! host-native V8. To keep an embedder-imposed memory budget honest across
 //! *both*, every pool charges against one shared [`ResourceBudget`] per app.
 //!
-//! This module implements **Phase 1** of that design: the accountant itself
-//! plus exact, deterministic charging of **guest wasm linear memory**. Later
-//! phases charge the V8 heap, external memory, and host transients against the
-//! same budget, and add CPU metering; the [`Pool`] enum and the budget API are
-//! the insertion points for them.
+//! The accountant reserves guest wasm linear memory, V8 heap ceilings,
+//! declared external memory, and a bounded background lane against one shared
+//! limit. These reservations enforce a limit; callers must not mistake them
+//! for observed resident memory. The Edge task manager meters CPU separately.
 //!
 //! ## Native sys install path
 //!
@@ -17,10 +16,10 @@
 //! does not let an embedder inject a custom [`LinearMemory`] into a
 //! [`wasmer::Memory`] directly (the backend `VMMemory` enum is private), so the
 //! charge is installed one level down, via custom [`Tunables`]: a
-//! [`BudgetedTunables`] wraps [`BaseTunables`] and returns every host memory
+//! [`BudgetedTunables`] wraps [`BaseTunables`] and returns every native memory
 //! wrapped in a [`BudgetedMemory`]. Installing those tunables on the engine
-//! (see `cli.rs`) makes `Memory::new` — and therefore the guest's imported
-//! memory — budget-aware with no change to the memory-creation call site.
+//! (see `cli.rs`) makes imported and module-defined memories budget-aware
+//! with no change to the memory-creation call site.
 //!
 //! This tunables path exists only for Wasmer's native `sys` backend. A
 //! `wasm32` host-JavaScript build uses the host's WebAssembly memory and does
@@ -28,6 +27,8 @@
 //! [`ResourceBudget`] for provider-owned resources such as environments,
 //! value handles, and declared external memory.
 
+#[cfg(not(target_arch = "wasm32"))]
+use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::sync::{
     Arc,
@@ -36,6 +37,8 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(all(not(target_arch = "wasm32"), not(napi_standalone_legacy_wait)))]
+use wasmer::sys::vm::StoreId;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::vm::{
     ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
@@ -63,13 +66,6 @@ pub const DEFAULT_UNWIND_SLACK: u64 = 16 * MIB;
 /// and V8's own malloc'd metadata without sampling.
 pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 
-/// Estimated host-side bytes held per N-API value handle crossed to the guest:
-/// the `napi_ref` struct, the handle-map node, and a V8 global-handle slot. The
-/// referenced JS value itself lives in the (separately charged) V8 heap. Used
-/// only to derive a per-env cap on live handles — see
-/// [`ResourceBudget::value_handle_limit`].
-pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
-
 #[cfg(not(target_arch = "wasm32"))]
 fn pages_to_bytes(pages: Pages) -> u64 {
     u64::from(pages.0) * WASM_PAGE_SIZE as u64
@@ -83,8 +79,6 @@ fn round_up_to_page(bytes: u64) -> u64 {
 }
 
 /// A distinct byte pool metered against the budget.
-///
-/// Later phases add external-memory and host-transient pools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pool {
     /// Guest wasm linear memory (wasmer `WasmMmap`).
@@ -100,6 +94,18 @@ pub enum Pool {
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].
     V8External,
+    /// Fixed reservation for one dedicated V8 background lane, including its
+    /// native thread stack and bounded pending task queue.
+    V8BackgroundLane,
+    /// Short-lived host snapshots of guest bytes and argument arrays. These
+    /// are charged before allocation and released with their owning buffer.
+    HostTransient,
+    /// Serialized worker messages retained between a sender and a receiver.
+    SerializedMessage,
+    /// Host-side bookkeeping the bridge keeps per guest handle (refs, value
+    /// slots, finalizer records, deferreds, scope frames, callback
+    /// registrations), granted in chunks by [`napi_host_bookkeeping_charge`].
+    HostBookkeeping,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
@@ -153,6 +159,12 @@ pub struct ResourceUsage {
     pub v8_heap_reserved: u64,
     /// Currently-charged V8 external memory (ArrayBuffer/Buffer) bytes.
     pub v8_external: u64,
+    pub v8_background_lane: u64,
+    /// Live bytes in host snapshots of guest data.
+    pub host_transient: u64,
+    pub serialized_message: u64,
+    /// Bytes granted to the bridge for per-handle host bookkeeping.
+    pub host_bookkeeping: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -191,10 +203,10 @@ pub enum EnvRejected {
 
 /// One shared accountant per app, `Arc`-shared into every pool that allocates.
 ///
-/// Charging is **reserve-based**: bytes are charged before (or exactly at) the
-/// moment they become live, so `actual usage <= mem_charged <= mem_total`
-/// always holds and enforcement never races a garbage collector. All state is
-/// atomic, so worker threads (each its own store + isolate) share one budget.
+/// Charging is **reserve-based** for the pools listed above. The charged total
+/// is an admission limit for those pools, not an RSS measurement: some host
+/// copies and V8 native allocations are outside these reservations.
+/// All state is atomic so worker threads share one application budget.
 pub struct ResourceBudget {
     /// Total byte budget. `UNLIMITED` disables enforcement (tracking only).
     mem_total: u64,
@@ -205,6 +217,10 @@ pub struct ResourceBudget {
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
     v8_external: AtomicU64,
+    v8_background_lane: AtomicU64,
+    host_transient: AtomicU64,
+    serialized_message: AtomicU64,
+    host_bookkeeping: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -220,6 +236,22 @@ impl std::fmt::Debug for ResourceBudget {
                 &self.v8_heap_reserved.load(Ordering::Acquire),
             )
             .field("v8_external", &self.v8_external.load(Ordering::Acquire))
+            .field(
+                "v8_background_lane",
+                &self.v8_background_lane.load(Ordering::Acquire),
+            )
+            .field(
+                "host_transient",
+                &self.host_transient.load(Ordering::Acquire),
+            )
+            .field(
+                "serialized_message",
+                &self.serialized_message.load(Ordering::Acquire),
+            )
+            .field(
+                "host_bookkeeping",
+                &self.host_bookkeeping.load(Ordering::Acquire),
+            )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
     }
@@ -256,6 +288,10 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            v8_background_lane: AtomicU64::new(0),
+            host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -268,6 +304,10 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            v8_background_lane: AtomicU64::new(0),
+            host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -368,6 +408,10 @@ impl ResourceBudget {
             Pool::WasmLinear => &self.wasm_linear,
             Pool::V8HeapReserved => &self.v8_heap_reserved,
             Pool::V8External => &self.v8_external,
+            Pool::V8BackgroundLane => &self.v8_background_lane,
+            Pool::HostTransient => &self.host_transient,
+            Pool::SerializedMessage => &self.serialized_message,
+            Pool::HostBookkeeping => &self.host_bookkeeping,
         }
     }
 
@@ -379,6 +423,10 @@ impl ResourceBudget {
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
             v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
             v8_external: self.v8_external.load(Ordering::Acquire),
+            v8_background_lane: self.v8_background_lane.load(Ordering::Acquire),
+            host_transient: self.host_transient.load(Ordering::Acquire),
+            serialized_message: self.serialized_message.load(Ordering::Acquire),
+            host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -386,18 +434,6 @@ impl ResourceBudget {
     /// Number of live V8 isolates counted against `max_envs`.
     pub fn live_isolates(&self) -> usize {
         self.live_isolates.load(Ordering::Acquire)
-    }
-
-    /// Cap on the number of live per-value host handles an env may hold, derived
-    /// from the memory budget so this bookkeeping (which the byte pools don't
-    /// see) cannot grow the host RSS without bound. `None` under an unlimited
-    /// budget.
-    pub fn value_handle_limit(&self) -> Option<u64> {
-        if self.is_unlimited() {
-            None
-        } else {
-            Some((self.memory_limit() / EST_HOST_BYTES_PER_VALUE).max(1))
-        }
     }
 
     /// Reserve budget for a new V8 env: acquire an isolate slot against
@@ -515,10 +551,10 @@ impl ResourceBudget {
     }
 }
 
-/// Per-V8-env heap-growth tracker shared with the host-owned near-heap-limit
-/// callback.
+/// Per-V8-env budget tracker shared with the host-owned near-heap-limit
+/// callback and the bridge's bookkeeping hooks.
 ///
-/// Boxed at env creation and handed to the callback as an opaque pointer; the
+/// Boxed at env creation and handed to the bridge as an opaque pointer; the
 /// owning [`crate::env::NapiEnv`] reclaims it at env teardown to release the
 /// bytes granted beyond the initial ceiling.
 pub(crate) struct EnvHeapCharge {
@@ -528,6 +564,72 @@ pub(crate) struct EnvHeapCharge {
     pub(crate) unwind_slack_available: AtomicBool,
     /// Bytes granted beyond the initial ceiling by grow-step grants.
     pub(crate) granted: AtomicU64,
+    /// Bytes granted to [`Pool::HostBookkeeping`] and not yet returned.
+    pub(crate) bookkeeping_granted: AtomicU64,
+}
+
+impl EnvHeapCharge {
+    /// The budget refused: stop this env the way a host kill does. The sticky
+    /// flag keeps later imports out and termination unwinds any running JS.
+    fn deny(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        if self.env != 0 {
+            // SAFETY: the tracker is only reachable while its env is live.
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                    self.env as crate::snapi::SnapiEnv,
+                );
+            }
+        }
+    }
+}
+
+/// Host-owned bookkeeping grant for a budgeted V8 isolate: the bridge asks for
+/// `bytes` more of per-handle host bookkeeping. Returns nonzero when granted;
+/// a denial stops the env exactly like an exhausted heap-growth grant.
+///
+/// # Safety
+/// As for [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_bookkeeping_charge(data: *const c_void, bytes: u64) -> i32 {
+    if data.is_null() {
+        return 1;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    match tracker.budget.try_charge(Pool::HostBookkeeping, bytes) {
+        Ok(()) => {
+            tracker
+                .bookkeeping_granted
+                .fetch_add(bytes, Ordering::AcqRel);
+            1
+        }
+        Err(_) => {
+            tracker.deny();
+            0
+        }
+    }
+}
+
+/// Returns bookkeeping the bridge no longer needs, clamped to what it was
+/// granted. The bridge serializes calls per env, so a plain load/store cannot
+/// race.
+///
+/// # Safety
+/// As for [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_bookkeeping_uncharge(data: *const c_void, bytes: u64) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let granted = tracker.bookkeeping_granted.load(Ordering::Acquire);
+    let release = bytes.min(granted);
+    tracker
+        .bookkeeping_granted
+        .store(granted - release, Ordering::Release);
+    tracker.budget.uncharge(Pool::HostBookkeeping, release);
 }
 
 /// Host-owned near-heap-limit callback for a budgeted V8 isolate.
@@ -562,14 +664,7 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
             current_limit.saturating_add(step as usize)
         }
         Err(_) => {
-            tracker.host_stopped.store(true, Ordering::Release);
-            if tracker.env != 0 {
-                unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                        tracker.env as crate::snapi::SnapiEnv,
-                    );
-                }
-            }
+            tracker.deny();
             if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
                 current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
             } else {
@@ -590,6 +685,9 @@ struct MemoryCharge {
     budget: Arc<ResourceBudget>,
     /// Bytes currently charged for this allocation.
     bytes: AtomicU64,
+    /// Shared clones must serialize the full size/reserve/mutate/reconcile
+    /// sequence, not only the backend's growth operation.
+    operation: Mutex<()>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -599,7 +697,14 @@ impl MemoryCharge {
         Ok(Arc::new(Self {
             budget,
             bytes: AtomicU64::new(bytes),
+            operation: Mutex::new(()),
         }))
+    }
+
+    fn release(&self, bytes: u64) {
+        let previous = self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "linear-memory charge underflow");
+        self.budget.uncharge(Pool::WasmLinear, bytes);
     }
 }
 
@@ -614,10 +719,12 @@ impl Drop for MemoryCharge {
 /// A [`LinearMemory`] that charges its bytes against a [`ResourceBudget`].
 ///
 /// Delegates every operation to an inner backend `VMMemory`, except that growth
-/// is charged first: `grow` (and `grow_at_least`) reserve the delta against the
+/// is charged first: `grow` (and `grow_at_least`) reserve the new high-water
 /// budget and fail with [`MemoryError::CouldNotGrow`] — which the guest sees as
 /// `memory.grow` returning `-1`, i.e. an ordinary allocation failure — when the
-/// budget is exhausted. The initial (minimum) size is charged at construction.
+/// budget is exhausted. The initial (minimum) size is charged before backend
+/// construction by [`BudgetedTunables`]. A reset retains the backing mapping,
+/// so its high-water charge remains until the final handle drops.
 #[derive(Debug)]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct BudgetedMemory {
@@ -639,8 +746,16 @@ impl BudgetedMemory {
         Ok(Self { inner, charge })
     }
 
-    fn budget(&self) -> &Arc<ResourceBudget> {
-        &self.charge.budget
+    fn from_precharged(inner: VMMemory, charge: Arc<MemoryCharge>) -> Result<Self, MemoryError> {
+        let actual = pages_to_bytes(inner.size());
+        let reserved = charge.bytes.load(Ordering::Acquire);
+        if actual > reserved {
+            return Err(MemoryError::Generic(format!(
+                "linear memory initialized with {actual} bytes after reserving {reserved} bytes"
+            )));
+        }
+        charge.release(reserved - actual);
+        Ok(Self { inner, charge })
     }
 }
 
@@ -664,73 +779,80 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
-        let delta_bytes = pages_to_bytes(delta);
-        // Reserve first: a denied charge must look exactly like hitting the
-        // memory's maximum, so the guest's `memory.grow` returns -1.
-        self.budget()
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .map_err(|_| MemoryError::CouldNotGrow {
-                current: self.inner.size(),
-                attempted_delta: delta,
-            })?;
-
-        match self.inner.grow(delta) {
-            Ok(previous) => {
-                self.charge.bytes.fetch_add(delta_bytes, Ordering::AcqRel);
-                Ok(previous)
+        let charge = Arc::clone(&self.charge);
+        wasmer::sys::vm::on_host_stack(|| {
+            let _operation = charge.operation.lock();
+            let before = pages_to_bytes(self.inner.size());
+            let high_water = charge.bytes.load(Ordering::Acquire);
+            let target = before.saturating_add(pages_to_bytes(delta));
+            let reserve = target.saturating_sub(high_water);
+            charge
+                .budget
+                .try_charge(Pool::WasmLinear, reserve)
+                .map_err(|_| MemoryError::CouldNotGrow {
+                    current: self.inner.size(),
+                    attempted_delta: delta,
+                })?;
+            match self.inner.grow(delta) {
+                Ok(previous) => {
+                    let after = pages_to_bytes(self.inner.size());
+                    let actual = after.saturating_sub(high_water);
+                    debug_assert!(actual <= reserve);
+                    charge.bytes.fetch_add(actual, Ordering::AcqRel);
+                    charge.budget.uncharge(Pool::WasmLinear, reserve - actual);
+                    Ok(previous)
+                }
+                Err(err) => {
+                    charge.budget.uncharge(Pool::WasmLinear, reserve);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                // The real grow failed (e.g. hit its own maximum); give the
-                // reservation back so it does not leak against the budget.
-                self.budget().uncharge(Pool::WasmLinear, delta_bytes);
-                Err(err)
-            }
-        }
+        })
     }
 
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
-        let before = pages_to_bytes(self.inner.size());
-        if min_size <= before {
-            // Already big enough; the inner call is a no-op that cannot grow.
-            return self.inner.grow_at_least(min_size);
-        }
-
-        // Reserve an upper bound (page-rounded target minus current) up front,
-        // then reconcile to the size actually reached.
-        let reserve = round_up_to_page(min_size).saturating_sub(before);
-        self.budget()
-            .try_charge(Pool::WasmLinear, reserve)
-            .map_err(|_| MemoryError::CouldNotGrow {
-                current: self.inner.size(),
-                attempted_delta: Pages::from_bytes_rounded_up(min_size.saturating_sub(before))
-                    .unwrap_or(Pages(u32::MAX)),
-            })?;
-
-        match self.inner.grow_at_least(min_size) {
-            Ok(()) => {
-                let actual = pages_to_bytes(self.inner.size()).saturating_sub(before);
-                if reserve > actual {
-                    self.budget().uncharge(Pool::WasmLinear, reserve - actual);
+        let charge = Arc::clone(&self.charge);
+        wasmer::sys::vm::on_host_stack(|| {
+            let _operation = charge.operation.lock();
+            let before = pages_to_bytes(self.inner.size());
+            if min_size <= before {
+                return self.inner.grow_at_least(min_size);
+            }
+            let high_water = charge.bytes.load(Ordering::Acquire);
+            let reserve = round_up_to_page(min_size).saturating_sub(high_water);
+            charge
+                .budget
+                .try_charge(Pool::WasmLinear, reserve)
+                .map_err(|_| MemoryError::CouldNotGrow {
+                    current: self.inner.size(),
+                    attempted_delta: Pages::from_bytes_rounded_up(min_size.saturating_sub(before))
+                        .unwrap_or(Pages(u32::MAX)),
+                })?;
+            match self.inner.grow_at_least(min_size) {
+                Ok(()) => {
+                    let after = pages_to_bytes(self.inner.size());
+                    let actual = after.saturating_sub(high_water);
+                    debug_assert!(actual <= reserve);
+                    charge.bytes.fetch_add(actual, Ordering::AcqRel);
+                    charge.budget.uncharge(Pool::WasmLinear, reserve - actual);
+                    Ok(())
                 }
-                self.charge.bytes.fetch_add(actual, Ordering::AcqRel);
-                Ok(())
+                Err(err) => {
+                    charge.budget.uncharge(Pool::WasmLinear, reserve);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                self.budget().uncharge(Pool::WasmLinear, reserve);
-                Err(err)
-            }
-        }
+        })
     }
 
     fn reset(&mut self) -> Result<(), MemoryError> {
-        self.inner.reset()?;
-        // reset only ever shrinks; release the freed bytes.
-        let after = pages_to_bytes(self.inner.size());
-        let previous = self.charge.bytes.swap(after, Ordering::AcqRel);
-        if previous > after {
-            self.budget().uncharge(Pool::WasmLinear, previous - after);
-        }
-        Ok(())
+        let charge = Arc::clone(&self.charge);
+        wasmer::sys::vm::on_host_stack(|| {
+            let _operation = charge.operation.lock();
+            // Wasmer resets the logical size but retains accessible backing.
+            // The high-water charge stays until the final handle drops.
+            self.inner.reset()
+        })
     }
 
     fn vmmemory(&self) -> std::ptr::NonNull<VMMemoryDefinition> {
@@ -742,27 +864,55 @@ impl LinearMemory for BudgetedMemory {
         // shares the same charge: the bytes are counted once and released when
         // the last handle drops.
         // `VMMemory::try_clone` (inherent) already yields a `VMMemory`.
-        let inner = self.inner.try_clone()?;
-        Ok(Box::new(BudgetedMemory {
-            inner,
-            charge: Arc::clone(&self.charge),
-        }))
+        wasmer::sys::vm::on_host_stack(|| {
+            let _operation = self.charge.operation.lock();
+            let inner = self.inner.try_clone()?;
+            Ok(Box::new(BudgetedMemory {
+                inner,
+                charge: Arc::clone(&self.charge),
+            })
+                as Box<dyn LinearMemory + Send + Sync + 'static>)
+        })
     }
 
     fn copy(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
-        // A copy is a genuinely new allocation, so it needs its own charge.
-        let forked = self.inner.copy()?;
-        let bytes = pages_to_bytes(forked.size());
-        let charge = MemoryCharge::new(Arc::clone(self.budget()), bytes)
-            .map_err(over_budget_to_memory_error)?;
-        Ok(Box::new(BudgetedMemory {
-            inner: VMMemory::from(forked),
-            charge,
-        }))
+        wasmer::sys::vm::on_host_stack(|| {
+            let _operation = self.charge.operation.lock();
+            // Copy retains the source mapping's accessible backing even after
+            // reset has lowered its logical size. Reserve that high-water
+            // allocation before the backend allocates the copy.
+            let bytes = self.charge.bytes.load(Ordering::Acquire);
+            let charge = MemoryCharge::new(Arc::clone(&self.charge.budget), bytes)
+                .map_err(over_budget_to_memory_error)?;
+            let forked = self.inner.copy()?;
+            if pages_to_bytes(forked.size()) > bytes {
+                return Err(MemoryError::Generic(
+                    "copied linear memory exceeded its quota reservation".into(),
+                ));
+            }
+            Ok(Box::new(BudgetedMemory {
+                inner: VMMemory::from(forked),
+                charge,
+            })
+                as Box<dyn LinearMemory + Send + Sync + 'static>)
+        })
     }
 
     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
-        self.inner.as_shared()
+        // The pinned public Wasmer used by the standalone CLI still detaches
+        // shared memories through this raw VMSharedMemory API. Its WASIX
+        // pthreads need that detach path for libuv's async workers. A raw
+        // handle drops our charge wrapper, so only permit it when accounting
+        // is explicitly unlimited. Managed Edge uses a newer Wasmer API that
+        // preserves the wrapper and never takes this compatibility path.
+        #[cfg(napi_standalone_legacy_wait)]
+        if self.charge.budget.accountant.is_none() && self.charge.budget.mem_total == UNLIMITED {
+            return self.inner.as_shared();
+        }
+
+        Err(MemoryError::UnsupportedOperation {
+            message: "budgeted memory requires wrapper-preserving shared detachment".into(),
+        })
     }
 
     unsafe fn do_wait(
@@ -773,11 +923,27 @@ impl LinearMemory for BudgetedMemory {
     ) -> Result<u32, WaiterError> {
         // SAFETY: forwarded verbatim to the inner memory, whose contract we
         // inherit; `dst` validity/alignment is the caller's responsibility.
-        unsafe { self.inner.do_wait(dst, expected, timeout) }
+        wasmer::sys::vm::on_host_stack(|| unsafe { self.inner.do_wait(dst, expected, timeout) })
+    }
+
+    #[cfg(not(napi_standalone_legacy_wait))]
+    unsafe fn do_wait_interruptible(
+        &mut self,
+        dst: u32,
+        expected: ExpectedValue,
+        timeout: Option<Duration>,
+        store_id: StoreId,
+    ) -> Result<u32, WaiterError> {
+        // Preserve the store identity so force-stop can wake an infinite
+        // atomic.wait registered by the underlying shared memory.
+        wasmer::sys::vm::on_host_stack(|| unsafe {
+            self.inner
+                .do_wait_interruptible(dst, expected, timeout, store_id)
+        })
     }
 
     fn do_notify(&mut self, dst: u32, count: u32) -> u32 {
-        self.inner.do_notify(dst, count)
+        wasmer::sys::vm::on_host_stack(|| self.inner.do_notify(dst, count))
     }
 
     fn thread_conditions(&self) -> Option<&ThreadConditions> {
@@ -785,15 +951,13 @@ impl LinearMemory for BudgetedMemory {
     }
 }
 
-/// [`Tunables`] that wrap every host memory in a [`BudgetedMemory`] and clamp a
+/// [`Tunables`] that wrap every native memory in a [`BudgetedMemory`] and clamp a
 /// requested memory's maximum to what the budget could ever grant.
 ///
-/// All other logic delegates to the wrapped base tunables — mirroring the
-/// `tunables_limit_memory` example. Module-*defined* memories (created via
-/// `create_vm_memory` into a fixed VM slot) are left to the base tunables in
-/// Phase 1; the edgejs guest *imports* its memory, so it flows through
-/// `create_host_memory` and is charged. The max-pages clamp still bounds the
-/// defined case cheaply.
+/// All other logic delegates to the wrapped base tunables. Both imported and
+/// module-defined memories reserve their initial pages before the backend maps
+/// them. The wrapped backend must initialize with at most the requested
+/// minimum; a larger actual size is rejected and the memory is dropped.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct BudgetedTunables<T: Tunables> {
     base: T,
@@ -859,8 +1023,11 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
     ) -> Result<VMMemory, MemoryError> {
         let adjusted = self.adjust_memory(ty);
         self.validate_memory(&adjusted)?;
+        let reserved = pages_to_bytes(adjusted.minimum);
+        let charge = MemoryCharge::new(Arc::clone(&self.budget), reserved)
+            .map_err(over_budget_to_memory_error)?;
         let inner = self.base.create_host_memory(&adjusted, style)?;
-        let budgeted = BudgetedMemory::new(inner, Arc::clone(&self.budget))?;
+        let budgeted = BudgetedMemory::from_precharged(inner, charge)?;
         Ok(VMMemory::from(
             Box::new(budgeted) as Box<dyn LinearMemory + Send + Sync + 'static>
         ))
@@ -874,12 +1041,19 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
     ) -> Result<VMMemory, MemoryError> {
         let adjusted = self.adjust_memory(ty);
         self.validate_memory(&adjusted)?;
+        let reserved = pages_to_bytes(adjusted.minimum);
+        let charge = MemoryCharge::new(Arc::clone(&self.budget), reserved)
+            .map_err(over_budget_to_memory_error)?;
         // SAFETY: contract forwarded to base; `vm_definition_location` validity
         // is the caller's responsibility.
-        unsafe {
+        let inner = unsafe {
             self.base
                 .create_vm_memory(&adjusted, style, vm_definition_location)
-        }
+        }?;
+        let budgeted = BudgetedMemory::from_precharged(inner, charge)?;
+        Ok(VMMemory::from(
+            Box::new(budgeted) as Box<dyn LinearMemory + Send + Sync + 'static>
+        ))
     }
 
     fn create_host_table(&self, ty: &TableType, style: &TableStyle) -> Result<VMTable, String> {
@@ -906,10 +1080,80 @@ pub fn budgeted_tunables(budget: Arc<ResourceBudget>) -> BudgetedTunables<BaseTu
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(napi_standalone_legacy_wait)]
+    use wasmer::MemoryLocation;
     use wasmer::sys::{Cranelift, EngineBuilder};
-    use wasmer::{Memory, MemoryType, Pages, Store, WASM_PAGE_SIZE};
+    use wasmer::{Imports, Instance, Memory, MemoryType, Module, Pages, Store, WASM_PAGE_SIZE};
 
     const PAGE: u64 = WASM_PAGE_SIZE as u64;
+
+    #[cfg(not(napi_standalone_legacy_wait))]
+    #[derive(Debug)]
+    struct InterruptWaitProbe {
+        inner: VMMemory,
+        seen: Arc<AtomicBool>,
+        expected_store: StoreId,
+    }
+
+    #[cfg(not(napi_standalone_legacy_wait))]
+    impl LinearMemory for InterruptWaitProbe {
+        fn ty(&self) -> MemoryType {
+            self.inner.ty()
+        }
+
+        fn size(&self) -> Pages {
+            self.inner.size()
+        }
+
+        fn style(&self) -> MemoryStyle {
+            self.inner.style()
+        }
+
+        fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
+            self.inner.grow(delta)
+        }
+
+        fn vmmemory(&self) -> std::ptr::NonNull<VMMemoryDefinition> {
+            self.inner.vmmemory()
+        }
+
+        fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync>, MemoryError> {
+            Ok(Box::new(Self {
+                inner: self.inner.try_clone()?,
+                seen: Arc::clone(&self.seen),
+                expected_store: self.expected_store,
+            }))
+        }
+
+        fn copy(&self) -> Result<Box<dyn LinearMemory + Send + Sync>, MemoryError> {
+            Ok(Box::new(Self {
+                inner: VMMemory::from(self.inner.copy()?),
+                seen: Arc::clone(&self.seen),
+                expected_store: self.expected_store,
+            }))
+        }
+
+        unsafe fn do_wait(
+            &mut self,
+            _dst: u32,
+            _expected: ExpectedValue,
+            _timeout: Option<Duration>,
+        ) -> Result<u32, WaiterError> {
+            panic!("interruptible wait must not be downgraded to a plain wait")
+        }
+
+        unsafe fn do_wait_interruptible(
+            &mut self,
+            _dst: u32,
+            _expected: ExpectedValue,
+            _timeout: Option<Duration>,
+            store_id: StoreId,
+        ) -> Result<u32, WaiterError> {
+            assert_eq!(store_id, self.expected_store);
+            self.seen.store(true, Ordering::Release);
+            Ok(7)
+        }
+    }
 
     /// A store whose engine charges guest wasm linear memory against `budget`.
     fn budgeted_store(budget: Arc<ResourceBudget>) -> Store {
@@ -1034,6 +1278,123 @@ mod tests {
     }
 
     #[test]
+    fn module_defined_memories_use_the_same_quota() {
+        let budget = ResourceBudget::with_memory_limit(2 * PAGE);
+        let mut store = budgeted_store(Arc::clone(&budget));
+        let wasm = wat::parse_str(r#"(module (memory (export "memory") 1 2))"#).unwrap();
+        let module = Module::new(&store, wasm).unwrap();
+        let first = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        let second = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, 2 * PAGE);
+        let memory = first.exports.get_memory("memory").unwrap();
+        assert!(memory.grow(&mut store, Pages(1)).is_err());
+        assert!(Instance::new(&mut store, &module, &Imports::new()).is_err());
+        assert_eq!(budget.snapshot().wasm_linear, 2 * PAGE);
+        drop((first, second, store));
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+    }
+
+    // Public standalone Wasmer detaches copies through a raw shared-memory
+    // handle. Finite-budget copies fail closed there; this quota-preserving
+    // copy test applies to the newer wrapper-preserving managed Wasmer API.
+    #[cfg(not(napi_standalone_legacy_wait))]
+    #[test]
+    fn reset_keeps_backing_charged_and_copy_reserves_it() {
+        let budget = ResourceBudget::with_memory_limit(2 * PAGE);
+        let mut store = budgeted_store(Arc::clone(&budget));
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+        memory.reset(&mut store).unwrap();
+        assert_eq!(memory.size(&store), Pages(0));
+        assert_eq!(budget.snapshot().wasm_linear, PAGE);
+
+        let copied = memory.copy(&store).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, 2 * PAGE);
+        assert!(memory.copy(&store).is_err());
+        assert_eq!(budget.snapshot().wasm_linear, 2 * PAGE);
+        drop(copied);
+        assert_eq!(budget.snapshot().wasm_linear, PAGE);
+
+        memory.grow(&mut store, Pages(1)).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, PAGE);
+        memory.grow_at_least(&mut store, 2 * PAGE).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, 2 * PAGE);
+        drop(store);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+    }
+
+    #[test]
+    fn direct_raw_shared_detachment_is_rejected() {
+        let budget = ResourceBudget::with_memory_limit(PAGE);
+        let ty = MemoryType::new(1, Some(1), true);
+        let base = BaseTunables::new();
+        let style = base.memory_style(&ty);
+        let inner = base.create_host_memory(&ty, &style).unwrap();
+        let wrapped = BudgetedMemory::new(inner, Arc::clone(&budget)).unwrap();
+        assert!(LinearMemory::as_shared(&wrapped).is_err());
+        assert_eq!(budget.snapshot().wasm_linear, PAGE);
+        drop(wrapped);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+
+        #[cfg(napi_standalone_legacy_wait)]
+        {
+            let mut store = budgeted_store(Arc::clone(&budget));
+            let memory = Memory::new(&mut store, ty).unwrap();
+            assert!(
+                memory.as_shared(&store).is_none(),
+                "legacy Wasmer must reject raw detachment under a finite quota"
+            );
+        }
+    }
+
+    #[cfg(napi_standalone_legacy_wait)]
+    #[test]
+    fn standalone_unlimited_budget_keeps_wasix_shared_memory_detachable() {
+        let budget = ResourceBudget::unlimited();
+        let mut store = budgeted_store(Arc::clone(&budget));
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+        let shared = memory
+            .as_shared(&store)
+            .expect("legacy Wasmer must be able to detach WASIX pthread memory");
+        assert_eq!(
+            shared
+                .wait(MemoryLocation::new_32(0), Some(Duration::ZERO))
+                .unwrap(),
+            2,
+        );
+        let mut worker_store = Store::new(store.engine().clone());
+        let attached = shared.attach(&mut worker_store);
+        assert_eq!(attached.size(&worker_store), Pages(1));
+    }
+
+    #[cfg(not(napi_standalone_legacy_wait))]
+    #[test]
+    fn interruptible_wait_preserves_the_store_identity() {
+        let budget = ResourceBudget::with_memory_limit(PAGE);
+        let ty = MemoryType::new(1, Some(1), true);
+        let base = BaseTunables::new();
+        let style = base.memory_style(&ty);
+        let inner = base.create_host_memory(&ty, &style).unwrap();
+        let seen = Arc::new(AtomicBool::new(false));
+        let store_id = StoreId::default();
+        let probe = InterruptWaitProbe {
+            inner,
+            seen: Arc::clone(&seen),
+            expected_store: store_id,
+        };
+        let mut memory = BudgetedMemory::new(
+            VMMemory::from(Box::new(probe) as Box<dyn LinearMemory + Send + Sync>),
+            budget,
+        )
+        .unwrap();
+        let result = unsafe {
+            LinearMemory::do_wait_interruptible(&mut memory, 0, ExpectedValue::None, None, store_id)
+        }
+        .unwrap();
+        assert_eq!(result, 7);
+        assert!(seen.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn env_reservation_charges_ceiling_and_releases() {
         let budget = ResourceBudget::with_memory_limit(100 * MIB);
         let res = budget
@@ -1154,6 +1515,7 @@ mod tests {
             host_stopped: Arc::clone(&host_stopped),
             unwind_slack_available: AtomicBool::new(true),
             granted: AtomicU64::new(0),
+            bookkeeping_granted: AtomicU64::new(0),
         }));
         let data = ptr as *const c_void;
         let base = 100 * 1024 * 1024usize;
@@ -1212,17 +1574,44 @@ mod tests {
     }
 
     #[test]
-    fn value_handle_limit_scales_with_budget() {
-        // Limit = budget / EST_HOST_BYTES_PER_VALUE.
-        let budget = ResourceBudget::with_memory_limit(1000 * EST_HOST_BYTES_PER_VALUE);
-        assert_eq!(budget.value_handle_limit(), Some(1000));
-        // Unlimited budget imposes no cap.
-        assert_eq!(ResourceBudget::unlimited().value_handle_limit(), None);
-        // A tiny budget still allows at least one handle.
-        assert_eq!(
-            ResourceBudget::with_memory_limit(1).value_handle_limit(),
-            Some(1)
+    fn bookkeeping_grants_until_budget_exhausted_then_stops_the_env() {
+        let budget = ResourceBudget::with_memory_limit(3 * MIB);
+        let host_stopped = Arc::new(AtomicBool::new(false));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
+            budget: Arc::clone(&budget),
+            env: 0,
+            host_stopped: Arc::clone(&host_stopped),
+            unwind_slack_available: AtomicBool::new(true),
+            granted: AtomicU64::new(0),
+            bookkeeping_granted: AtomicU64::new(0),
+        }));
+        let data = ptr as *const c_void;
+
+        assert_eq!(napi_host_bookkeeping_charge(data, 2 * MIB), 1);
+        assert_eq!(budget.snapshot().host_bookkeeping, 2 * MIB);
+        assert!(!host_stopped.load(Ordering::Acquire));
+
+        // Over budget: denied, nothing charged, and the env is stopped.
+        assert_eq!(napi_host_bookkeeping_charge(data, 2 * MIB), 0);
+        assert_eq!(budget.snapshot().host_bookkeeping, 2 * MIB);
+        assert!(host_stopped.load(Ordering::Acquire));
+
+        // Returns are clamped to what was granted, so the pool cannot underflow.
+        napi_host_bookkeeping_uncharge(data, MIB);
+        napi_host_bookkeeping_uncharge(data, 10 * MIB);
+        assert_eq!(budget.snapshot().host_bookkeeping, 0);
+
+        // Teardown releases whatever the bridge still held.
+        assert_eq!(napi_host_bookkeeping_charge(data, MIB), 1);
+        let tracker = unsafe { Box::from_raw(ptr) };
+        budget.uncharge(
+            Pool::HostBookkeeping,
+            tracker.bookkeeping_granted.load(Ordering::Acquire),
         );
+        assert_eq!(budget.snapshot().host_bookkeeping, 0);
+
+        // A null tracker (unbudgeted env) always grants.
+        assert_eq!(napi_host_bookkeeping_charge(std::ptr::null(), MIB), 1);
     }
 
     #[test]
@@ -1317,5 +1706,23 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8HeapReserved, 60);
         assert_eq!(accountant.memory_charged(), 40);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+
+    #[cfg(all(napi_standalone_legacy_wait, not(target_arch = "wasm32")))]
+    #[test]
+    fn external_accountant_cannot_use_legacy_raw_detachment() {
+        let accountant = TestAccountant::new(UNLIMITED);
+        let external: Arc<dyn NapiMemoryAccountant> = accountant.clone();
+        let budget = ResourceBudget::with_accountant(external);
+        let ty = MemoryType::new(1, Some(1), true);
+        let base = BaseTunables::new();
+        let inner = base
+            .create_host_memory(&ty, &base.memory_style(&ty))
+            .unwrap();
+        let wrapped = BudgetedMemory::new(inner, budget).unwrap();
+
+        assert!(LinearMemory::as_shared(&wrapped).is_err());
+        drop(wrapped);
+        assert_eq!(accountant.memory_charged(), 0);
     }
 }

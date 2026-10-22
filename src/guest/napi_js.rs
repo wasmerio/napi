@@ -55,7 +55,10 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, _scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 0;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
@@ -487,12 +490,9 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: u32,
 ) -> i32 {
-    let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
+    let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
         return 1;
     };
-    if !flags.is_empty() {
-        return 1;
-    }
     unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) }
 }
 
@@ -545,7 +545,10 @@ fn guest_unofficial_napi_create_env(
     }
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
-    let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
+    let Some((env_id, scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
+        unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
+        return 1;
+    };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
@@ -5695,7 +5698,9 @@ fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
 pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     macro_rules! reg_env {
         ($name:expr, $func:expr) => {
-            io.define("env", $name, Function::new_typed(store, $func));
+            if io.get_export("env", $name).is_none() {
+                io.define("env", $name, Function::new_typed(store, $func));
+            }
         };
     }
 

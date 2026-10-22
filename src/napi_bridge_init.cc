@@ -8,12 +8,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,6 +29,13 @@
 #include "internal/napi_v8_env.h"
 #include "node_api.h"
 #include "unofficial_napi.h"
+
+// Private V8 provider accounting hook. It is never imported by WASIX guests.
+extern "C" size_t unofficial_napi_message_retained_bytes(
+    unofficial_napi_message message);
+// Rust-exported budget hooks (see budget.rs) for the installed tracker.
+extern "C" int napi_host_bookkeeping_charge(const void *data, uint64_t bytes);
+extern "C" void napi_host_bookkeeping_uncharge(const void *data, uint64_t bytes);
 
 namespace {
 
@@ -54,7 +62,7 @@ struct HandleTable {
   uint32_t next_id = 1;
 
   uint32_t Store(void *handle) {
-    if (handle == nullptr)
+    if (handle == nullptr || next_id == 0)
       return 0;
     const uint32_t id = next_id++;
     handles[id] = handle;
@@ -129,6 +137,9 @@ struct SnapiEnvState {
   // enter the same environment on the same OS thread.
   std::recursive_mutex mutex;
   size_t active_bridge_calls = 0;
+  // Owned by the Rust NapiCtx while this env is live. EnvLease reinstalls its
+  // provenance on each bridge entry, including reentrant guest callbacks.
+  void* background_lane = nullptr;
   std::mutex control_mutex;
   std::condition_variable control_cv;
   size_t active_control_calls = 0;
@@ -152,6 +163,7 @@ struct SnapiEnvState {
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
   uint32_t next_ref_id = 1;
+  std::unordered_set<void *> guest_finalizer_records;
 
   // Handle table for napi_deferred (promise deferreds).
   std::unordered_map<uint32_t, napi_deferred> deferreds;
@@ -181,10 +193,43 @@ struct SnapiEnvState {
   uint32_t next_cb_reg_id = 1;
   std::vector<std::unique_ptr<CallbackBinding>> callback_bindings;
 
-  // Cap on live per-value host handles / callback registrations, bounding the
-  // host-side bookkeeping RSS that the byte budget pools do not otherwise see.
-  // 0 means unlimited. Set from the resource budget at env creation.
-  size_t value_limit = 0;
+  // Host memory this bridge keeps per guest handle (refs, value slots,
+  // finalizer records, deferreds, scope frames, callback registrations) is
+  // invisible to V8 and to the embedder's byte pools. It is estimated and
+  // charged to the embedder's budget through `host_budget` (null for an
+  // unbudgeted env) in kBookkeepingChunk steps, so a guest retaining many
+  // host handles hits the same out-of-memory path as one retaining many JS
+  // objects. `bk_reclaimable` is the part only a GC frees (refs and finalizer
+  // records die with their JS value); once it doubles since the last
+  // collection the bridge asks V8 to collect, because a small JS heap alone
+  // would never trigger the GC that releases it.
+  const void *host_budget = nullptr;
+  size_t bk_live = 0;
+  size_t bk_granted = 0;
+  size_t bk_reclaimable = 0;
+  size_t bk_reclaimable_floor = 0;
+  std::chrono::steady_clock::time_point bk_last_gc{};
+  bool bk_collecting = false;
+};
+
+// Estimated host bytes per bookkeeping entry: the bridge's record and
+// container node plus the engine-side object it owns.
+constexpr size_t kRefBytes = 192;
+constexpr size_t kValueSlotBytes = 32;
+constexpr size_t kFinalizerRecordBytes = 96;
+constexpr size_t kDeferredBytes = 64;
+constexpr size_t kScopeFrameBytes = 128;
+constexpr size_t kCallbackBytes = 96;
+constexpr size_t kBookkeepingChunk = 64 * 1024;
+constexpr size_t kBookkeepingGcMin = 1024 * 1024;
+constexpr auto kBookkeepingGcInterval = std::chrono::milliseconds(250);
+
+struct GuestFinalizerRecord {
+  SnapiEnvState *state;
+  uint32_t guest_env;
+  uint32_t wasm_fn_ptr;
+  uint32_t data;
+  uint32_t hint;
 };
 
 struct CallbackBinding {
@@ -196,19 +241,77 @@ struct CallbackBinding {
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>> &g_envs =
     *new std::unordered_map<SnapiEnvState *, std::shared_ptr<SnapiEnvState>>();
-// Message resources cross environment boundaries, so their guest-visible IDs
-// cannot belong to either the source or destination environment. The table is
-// process-wide and each entry is removed atomically by take or drop.
+// Message resources cross worker environments. Rust validates each guest ID
+// against the owning NapiCtx before calling into this process-wide table.
 HandleTable &g_message_handles = *new HandleTable();
+
+// Asks V8 to collect once the GC-reclaimable bookkeeping has doubled since
+// the last collection (at least kBookkeepingGcMin, at most once per
+// kBookkeepingGcInterval). Runs on the env's JS thread with V8 entered, like
+// every bridge call; weak callbacks only enqueue finalizers, so this cannot
+// re-enter the guest.
+void MaybeCollectBookkeeping(SnapiEnvState &state) {
+  const size_t threshold =
+      std::max(kBookkeepingGcMin, 2 * state.bk_reclaimable_floor);
+  if (state.bk_reclaimable < threshold || state.bk_collecting ||
+      state.env == nullptr)
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - state.bk_last_gc < kBookkeepingGcInterval)
+    return;
+  state.bk_collecting = true;
+  state.bk_last_gc = now;
+  state.bk_reclaimable_floor = state.bk_reclaimable;
+  (void)unofficial_napi_collect_garbage(state.env);
+  state.bk_collecting = false;
+}
+
+// Charges `bytes` of host bookkeeping, asking the embedder for another chunk
+// when the live estimate outgrows what it granted. Returns false when the
+// budget refused; the embedder has then already requested termination and the
+// caller fails the operation.
+bool ChargeBookkeeping(SnapiEnvState &state, size_t bytes, bool reclaimable) {
+  if (state.bk_live + bytes > state.bk_granted) {
+    const size_t needed = state.bk_live + bytes - state.bk_granted;
+    const size_t chunk =
+        (needed + kBookkeepingChunk - 1) / kBookkeepingChunk * kBookkeepingChunk;
+    if (state.host_budget != nullptr &&
+        !napi_host_bookkeeping_charge(state.host_budget, chunk))
+      return false;
+    state.bk_granted += chunk;
+  }
+  state.bk_live += bytes;
+  if (reclaimable) {
+    state.bk_reclaimable += bytes;
+    MaybeCollectBookkeeping(state);
+  }
+  return true;
+}
+
+// Returns whole unused chunks to the embedder, keeping one in hand so a
+// workload oscillating around a chunk boundary does not charge on every call.
+void UnchargeBookkeeping(SnapiEnvState &state, size_t bytes,
+                         bool reclaimable) {
+  state.bk_live -= bytes;
+  if (reclaimable) {
+    state.bk_reclaimable -= bytes;
+    state.bk_reclaimable_floor =
+        std::min(state.bk_reclaimable_floor, state.bk_reclaimable);
+  }
+  const size_t unused = state.bk_granted - state.bk_live;
+  if (unused < 2 * kBookkeepingChunk)
+    return;
+  const size_t release =
+      (unused - kBookkeepingChunk) / kBookkeepingChunk * kBookkeepingChunk;
+  state.bk_granted -= release;
+  if (state.host_budget != nullptr)
+    napi_host_bookkeeping_uncharge(state.host_budget, release);
+}
 
 CallbackBinding *RegisterCallbackBinding(SnapiEnvState *state,
                                          uint32_t reg_id) {
   if (state == nullptr || reg_id == 0)
     return nullptr;
-  if (state->value_limit != 0 &&
-      state->callback_bindings.size() >= state->value_limit) {
-    return nullptr;
-  }
   state->callback_bindings.push_back(
       std::make_unique<CallbackBinding>(CallbackBinding{state, reg_id}));
   return state->callback_bindings.back().get();
@@ -233,16 +336,22 @@ struct EnvLease {
                  : std::unique_lock<std::recursive_mutex>()) {
     if (state != nullptr) {
       ++state->active_bridge_calls;
-      // The calling worker may predate V8's allocation of its Linux JIT
-      // protection key. Restore V8's default read-only permissions before
-      // accessing isolate-owned memory on this thread.
+      // WASIX workers may predate V8's Linux protection key allocation.
+      // Re-enable only V8's default read-only access on this thread before
+      // touching any isolate-owned memory.
       v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+      previous_lane = snapi_v8_lane_swap_current(state->background_lane);
+      lane_bound = true;
     }
   }
 
   ~EnvLease() {
     if (state != nullptr) --state->active_bridge_calls;
+    if (lane_bound) snapi_v8_lane_swap_current(previous_lane);
   }
+
+  EnvLease(const EnvLease&) = delete;
+  EnvLease& operator=(const EnvLease&) = delete;
 
   SnapiEnvState *get() const {
     return state != nullptr && state->env != nullptr ? state.get() : nullptr;
@@ -250,6 +359,8 @@ struct EnvLease {
 
   std::shared_ptr<SnapiEnvState> state;
   std::unique_lock<std::recursive_mutex> lock;
+  void* previous_lane = nullptr;
+  bool lane_bound = false;
 };
 
 uint32_t RegisterCallbackInvocation(SnapiEnvState *state,
@@ -279,18 +390,17 @@ uint32_t StoreValueInFrame(SnapiEnvState &state, napi_value val,
     return 0;
   if (state.env == nullptr)
     return 0;
-  // Refuse once the per-env handle cap is reached: returning 0 surfaces as an
-  // N-API failure the guest can handle, instead of leaking host RSS unbounded.
-  if (state.value_limit != 0 && state.live_value_count >= state.value_limit) {
+  // Returning 0 surfaces as an N-API failure the guest can handle.
+  if (state.value_free_slots.empty() &&
+      state.value_slots.size() >= kValueIdMaxSlots)
     return 0;
-  }
+  if (!ChargeBookkeeping(state, kValueSlotBytes, /*reclaimable=*/false))
+    return 0;
   uint32_t index;
   if (!state.value_free_slots.empty()) {
     index = state.value_free_slots.back();
     state.value_free_slots.pop_back();
   } else {
-    if (state.value_slots.size() >= kValueIdMaxSlots)
-      return 0;
     index = static_cast<uint32_t>(state.value_slots.size());
     state.value_slots.emplace_back();
   }
@@ -336,6 +446,7 @@ void FreeValueSlot(SnapiEnvState &state, uint32_t index) {
       static_cast<uint16_t>((slot.generation + 1) & kValueIdGenMask);
   state.value_free_slots.push_back(index);
   --state.live_value_count;
+  UnchargeBookkeeping(state, kValueSlotBytes, /*reclaimable=*/false);
 }
 
 // Frees every slot the innermost frame owns and pops it. Closes the frame's
@@ -349,6 +460,10 @@ void PopCurrentFrame(SnapiEnvState &state, bool close_napi_scope) {
   for (uint32_t index : frame.owned_slots) {
     FreeValueSlot(state, index);
   }
+  // Only guest-opened frames are charged; implicit callback frames are
+  // bounded by the callback depth.
+  if (frame.id != 0)
+    UnchargeBookkeeping(state, kScopeFrameBytes, /*reclaimable=*/false);
   if (close_napi_scope && state.env != nullptr) {
     if (frame.esc_scope != nullptr) {
       (void)napi_close_escapable_handle_scope(state.env, frame.esc_scope);
@@ -414,9 +529,18 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   return 0;
 }
 
+// Charges one more napi_ref before the engine creates it. Pair with StoreRef,
+// or release it with UnchargeBookkeeping(kRefBytes) if creation fails.
+bool ReserveRef(SnapiEnvState &state) {
+  return state.next_ref_id != 0 &&
+         ChargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
+}
+
 uint32_t StoreRef(SnapiEnvState &state, napi_ref ref) {
-  if (ref == nullptr)
+  if (ref == nullptr) {
+    UnchargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
     return 0;
+  }
   uint32_t id = state.next_ref_id++;
   state.refs[id] = ref;
   return id;
@@ -429,11 +553,17 @@ napi_ref LoadRef(SnapiEnvState &state, uint32_t id) {
   return it != state.refs.end() ? it->second : nullptr;
 }
 
-void RemoveRef(SnapiEnvState &state, uint32_t id) { state.refs.erase(id); }
+void RemoveRef(SnapiEnvState &state, uint32_t id) {
+  if (state.refs.erase(id) != 0)
+    UnchargeBookkeeping(state, kRefBytes, /*reclaimable=*/true);
+}
 
+// The caller has charged kDeferredBytes (see snapi_bridge_create_promise).
 uint32_t StoreDeferred(SnapiEnvState &state, napi_deferred d) {
-  if (d == nullptr)
+  if (d == nullptr) {
+    UnchargeBookkeeping(state, kDeferredBytes, /*reclaimable=*/false);
     return 0;
+  }
   uint32_t id = state.next_deferred_id++;
   state.deferreds[id] = d;
   return id;
@@ -447,7 +577,8 @@ napi_deferred LoadDeferred(SnapiEnvState &state, uint32_t id) {
 }
 
 void RemoveDeferred(SnapiEnvState &state, uint32_t id) {
-  state.deferreds.erase(id);
+  if (state.deferreds.erase(id) != 0)
+    UnchargeBookkeeping(state, kDeferredBytes, /*reclaimable=*/false);
 }
 
 // Finds the open frame with the given guest-visible id (innermost first).
@@ -496,8 +627,9 @@ EnvLease RequireEnvState(SnapiEnvState *env_state) {
 napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   if (state == nullptr)
     return napi_ok;
-  // Releasing an environment from its own callback would dispose an entered
-  // isolate. Keep all ownership and registry state intact on this refusal.
+  // The release import itself owns one lease. A second one means this call
+  // reentered from an active N-API operation and disposing the entered V8
+  // isolate would leave its outer stack with freed native state.
   if (state->active_bridge_calls != 1 || !state->callback_invocations.empty())
     return napi_generic_failure;
   // Stop admitting control calls. Keep the state in the registry through V8
@@ -509,6 +641,12 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
     state->control_cv.wait(control_lock,
                            [&] { return state->active_control_calls == 0; });
   }
+  // Env destruction runs native finalizers. Never let those callbacks reenter
+  // guest Wasm or JS: Rust has already removed this env from the host kill
+  // registry, and provider teardown clears its heap-limit hook before the
+  // finalizer drain. A finalizer that executes JS here would be unmetered and
+  // impossible for the workload manager to interrupt safely.
+  state->active_callback_ctx.store(nullptr, std::memory_order_release);
   for (const auto &entry : state->buffer_lease_handles.handles) {
     (void)unofficial_napi_release_buffer_lease(
         state->env, static_cast<unofficial_napi_buffer_lease>(entry.second),
@@ -528,6 +666,12 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   state->next_ref_id = 1;
   state->deferreds.clear();
   state->next_deferred_id = 1;
+  for (const auto &entry : state->module_wrap_handles.handles) {
+    if (entry.second != nullptr) {
+      (void)unofficial_napi_module_wrap_destroy(
+          state->env, reinterpret_cast<unofficial_napi_module>(entry.second));
+    }
+  }
   state->module_wrap_handles.Reset();
   // Bytecode handles own engine resources outside any napi scope (V8
   // Globals / QuickJS JSValue refcounts), so they must be released
@@ -549,9 +693,19 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState *state) {
   if (state->owner != nullptr) {
     release_status = unofficial_napi_release_env(state->owner, nullptr);
   }
+  // remove_wrap/delete_reference can cancel provider finalizers without
+  // calling our trampoline. Reclaim their bridge records after the provider
+  // has finished draining every callback for this environment.
+  for (void *record : state->guest_finalizer_records)
+    delete static_cast<GuestFinalizerRecord *>(record);
+  state->guest_finalizer_records.clear();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
   state->owner = nullptr;
   state->env = nullptr;
+  // The embedder releases everything it granted when it drops the tracker.
+  state->host_budget = nullptr;
+  state->bk_live = state->bk_granted = state->bk_reclaimable = 0;
+  state->bk_reclaimable_floor = 0;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.erase(state);
@@ -1766,11 +1920,16 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState *env_state,
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  if (bridge_state->next_deferred_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kDeferredBytes, /*reclaimable=*/false))
+    return napi_generic_failure;
   napi_deferred deferred;
   napi_value promise;
   napi_status s = napi_create_promise(env, &deferred, &promise);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kDeferredBytes, /*reclaimable=*/false);
     return s;
+  }
   *deferred_out = StoreDeferred(*bridge_state, deferred);
   *out_id = StoreValue(*bridge_state, promise);
   return napi_ok;
@@ -1867,14 +2026,6 @@ namespace {
 // backing-store deleter for the guest finalizer — those run synchronously in
 // GC, with no way back into the guest — they attach via napi_add_finalizer
 // instead.) Allocated on registration, freed exactly once when it fires.
-struct GuestFinalizerRecord {
-  SnapiEnvState *state;
-  uint32_t guest_env;
-  uint32_t wasm_fn_ptr;
-  uint32_t data;
-  uint32_t hint;
-};
-
 void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
                               void *hint) {
   auto *record = static_cast<GuestFinalizerRecord *>(hint);
@@ -1882,6 +2033,13 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
     return;
   auto bridge_state_lease = LookupEnvState(record->state);
   auto *bridge_state = bridge_state_lease.get();
+  std::unique_lock<std::recursive_mutex> state_lock;
+  if (bridge_state != nullptr) {
+    state_lock = std::unique_lock<std::recursive_mutex>(bridge_state->mutex);
+    if (bridge_state->guest_finalizer_records.erase(record) != 0)
+      UnchargeBookkeeping(*bridge_state, kFinalizerRecordBytes,
+                          /*reclaimable=*/true);
+  }
   void *callback_ctx =
       bridge_state != nullptr
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
@@ -1916,18 +2074,35 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
   delete record;
 }
 
+void DropGuestFinalizerRecord(GuestFinalizerRecord *record) {
+  if (record == nullptr) return;
+  auto *state = record->state;
+  if (state != nullptr) {
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+    if (state->guest_finalizer_records.erase(record) != 0)
+      UnchargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true);
+  }
+  delete record;
+}
+
 GuestFinalizerRecord *MakeGuestFinalizerRecord(SnapiEnvState *state,
                                                uint32_t guest_env,
                                                uint32_t wasm_fn_ptr,
                                                uint32_t data, uint32_t hint) {
+  if (state == nullptr ||
+      !ChargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true))
+    return nullptr;
   auto *record = new (std::nothrow) GuestFinalizerRecord();
-  if (record != nullptr) {
-    record->state = state;
-    record->guest_env = guest_env;
-    record->wasm_fn_ptr = wasm_fn_ptr;
-    record->data = data;
-    record->hint = hint;
+  if (record == nullptr) {
+    UnchargeBookkeeping(*state, kFinalizerRecordBytes, /*reclaimable=*/true);
+    return nullptr;
   }
+  record->state = state;
+  record->guest_env = guest_env;
+  record->wasm_fn_ptr = wasm_fn_ptr;
+  record->data = data;
+  record->hint = hint;
+  state->guest_finalizer_records.insert(record);
   return record;
 }
 } // namespace
@@ -1958,7 +2133,7 @@ extern "C" int snapi_bridge_create_external_arraybuffer_guest_finalized(
   s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
                          nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (backing_store_token_out) {
@@ -1993,7 +2168,7 @@ extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
   s = napi_add_finalizer(env, result, nullptr, GuestFinalizerTrampoline, record,
                          nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
     return s;
   }
   if (backing_store_token_out) {
@@ -2436,10 +2611,14 @@ extern "C" int snapi_bridge_create_reference(SnapiEnvState *env_state,
   napi_value val = LoadValue(*bridge_state, value_id);
   if (!val)
     return napi_invalid_arg;
+  if (!ReserveRef(*bridge_state))
+    return napi_generic_failure;
   napi_ref ref;
   napi_status s = napi_create_reference(env, val, initial_refcount, &ref);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
+  }
   *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
 }
@@ -2517,10 +2696,17 @@ extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
+  if (bridge_state->next_scope_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                         /*reclaimable=*/false))
+    return napi_generic_failure;
   napi_handle_scope scope = nullptr;
   napi_status s = napi_open_handle_scope(env, &scope);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                        /*reclaimable=*/false);
     return s;
+  }
   ScopeFrame frame;
   frame.scope = scope;
   frame.id = bridge_state->next_scope_id++;
@@ -2559,10 +2745,17 @@ snapi_bridge_open_escapable_handle_scope(SnapiEnvState *env_state,
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   (void)CurrentFrame(*bridge_state); // materialize the root frame first
+  if (bridge_state->next_scope_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                         /*reclaimable=*/false))
+    return napi_generic_failure;
   napi_escapable_handle_scope scope = nullptr;
   napi_status s = napi_open_escapable_handle_scope(env, &scope);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    UnchargeBookkeeping(*bridge_state, kScopeFrameBytes,
+                        /*reclaimable=*/false);
     return s;
+  }
   ScopeFrame frame;
   frame.esc_scope = scope;
   frame.id = bridge_state->next_scope_id++;
@@ -3031,11 +3224,16 @@ extern "C" int snapi_bridge_wrap(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
+    return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void *)(uintptr_t)native_data, nullptr,
                             nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
+  }
   if (ref_out)
     *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -3057,16 +3255,20 @@ snapi_bridge_wrap_finalized(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
+    return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr)
-    return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s =
-      napi_wrap(env, obj, (void *)(uintptr_t)native_data,
-                GuestFinalizerTrampoline, record, ref_out ? &ref : nullptr);
+      record == nullptr
+          ? napi_generic_failure
+          : napi_wrap(env, obj, (void *)(uintptr_t)native_data,
+                      GuestFinalizerTrampoline, record, ref_out ? &ref : nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
   }
   if (ref_out)
@@ -3123,13 +3325,18 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState *env_state,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
+    return napi_generic_failure;
   // No actual WASM callback for finalizer; just register with nullptr callback
   napi_ref ref = nullptr;
   napi_status s =
       napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val, nullptr,
                          nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok)
+  if (s != napi_ok) {
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
+  }
   if (ref_out)
     *ref_out = StoreRef(*bridge_state, ref);
   return napi_ok;
@@ -3150,16 +3357,21 @@ snapi_bridge_add_finalizer_cb(SnapiEnvState *env_state, uint32_t obj_id,
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveRef(*bridge_state))
+    return napi_generic_failure;
   auto *record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr)
-    return napi_generic_failure;
   napi_ref ref = nullptr;
-  napi_status s = napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val,
-                                     GuestFinalizerTrampoline, record,
-                                     ref_out ? &ref : nullptr);
+  napi_status s =
+      record == nullptr
+          ? napi_generic_failure
+          : napi_add_finalizer(env, obj, (void *)(uintptr_t)data_val,
+                               GuestFinalizerTrampoline, record,
+                               ref_out ? &ref : nullptr);
   if (s != napi_ok) {
-    delete record;
+    DropGuestFinalizerRecord(record);
+    if (ref_out != nullptr)
+      UnchargeBookkeeping(*bridge_state, kRefBytes, /*reclaimable=*/true);
     return s;
   }
   if (ref_out)
@@ -3201,6 +3413,9 @@ extern "C" int snapi_bridge_new_instance(SnapiEnvState *env_state,
 // napi_define_properties
 // ============================================================
 
+static_assert(sizeof(napi_property_descriptor) <= 128,
+              "update the guest native-descriptor reservation");
+
 // Forward declaration (defined below in callback system section)
 static napi_value generic_wasm_callback(napi_env env, napi_callback_info info);
 
@@ -3218,39 +3433,49 @@ extern "C" int snapi_bridge_define_properties(
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  std::vector<napi_property_descriptor> descs(prop_count);
-  for (uint32_t i = 0; i < prop_count; i++) {
-    memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = utf8names != nullptr ? utf8names[i] : nullptr;
-    descs[i].name = (name_ids != nullptr && name_ids[i] != 0)
-                        ? LoadValue(*bridge_state, name_ids[i])
-                        : nullptr;
-    descs[i].attributes = (napi_property_attributes)attributes[i];
+  if (prop_count > 4096 ||
+      (prop_count != 0 &&
+       (prop_types == nullptr || value_ids == nullptr ||
+        method_reg_ids == nullptr || getter_reg_ids == nullptr ||
+        setter_reg_ids == nullptr || attributes == nullptr)))
+    return napi_invalid_arg;
+  try {
+    std::vector<napi_property_descriptor> descs(prop_count);
+    for (uint32_t i = 0; i < prop_count; i++) {
+      memset(&descs[i], 0, sizeof(napi_property_descriptor));
+      descs[i].utf8name = utf8names != nullptr ? utf8names[i] : nullptr;
+      descs[i].name = (name_ids != nullptr && name_ids[i] != 0)
+                          ? LoadValue(*bridge_state, name_ids[i])
+                          : nullptr;
+      descs[i].attributes = (napi_property_attributes)attributes[i];
 
-    switch (prop_types[i]) {
-    case 0:
-      descs[i].value = LoadValue(*bridge_state, value_ids[i]);
-      break;
-    case 1:
-      descs[i].method = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
-      break;
-    case 2:
-      descs[i].getter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
-      break;
-    case 3:
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
-      break;
-    case 4:
-      descs[i].getter = generic_wasm_callback;
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
-      break;
+      switch (prop_types[i]) {
+      case 0:
+        descs[i].value = LoadValue(*bridge_state, value_ids[i]);
+        break;
+      case 1:
+        descs[i].method = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
+        break;
+      case 2:
+        descs[i].getter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
+        break;
+      case 3:
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
+        break;
+      case 4:
+        descs[i].getter = generic_wasm_callback;
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
+        break;
+      }
     }
+    return napi_define_properties(env, obj, prop_count, descs.data());
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
-  return napi_define_properties(env, obj, prop_count, descs.data());
 }
 
 // ============================================================
@@ -3279,57 +3504,67 @@ extern "C" int snapi_bridge_define_class(
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  if (prop_count > 4096 ||
+      (prop_count != 0 &&
+       (prop_types == nullptr || prop_value_ids == nullptr ||
+        prop_method_reg_ids == nullptr || prop_getter_reg_ids == nullptr ||
+        prop_setter_reg_ids == nullptr || prop_attributes == nullptr)))
+    return napi_invalid_arg;
 
   // Build property descriptors
-  std::vector<napi_property_descriptor> descs(prop_count);
-  for (uint32_t i = 0; i < prop_count; i++) {
-    memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = prop_names != nullptr ? prop_names[i] : nullptr;
-    descs[i].name = (prop_name_ids != nullptr && prop_name_ids[i] != 0)
-                        ? LoadValue(*bridge_state, prop_name_ids[i])
-                        : nullptr;
-    descs[i].attributes = (napi_property_attributes)prop_attributes[i];
+  try {
+    std::vector<napi_property_descriptor> descs(prop_count);
+    for (uint32_t i = 0; i < prop_count; i++) {
+      memset(&descs[i], 0, sizeof(napi_property_descriptor));
+      descs[i].utf8name = prop_names != nullptr ? prop_names[i] : nullptr;
+      descs[i].name = (prop_name_ids != nullptr && prop_name_ids[i] != 0)
+                          ? LoadValue(*bridge_state, prop_name_ids[i])
+                          : nullptr;
+      descs[i].attributes = (napi_property_attributes)prop_attributes[i];
 
-    switch (prop_types[i]) {
-    case 0: // value
-      descs[i].value = LoadValue(*bridge_state, prop_value_ids[i]);
-      break;
-    case 1: // method
-      descs[i].method = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
-      break;
-    case 2: // getter only
-      descs[i].getter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
-      break;
-    case 3: // setter only
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
-      break;
-    case 4: // getter + setter
-      descs[i].getter = generic_wasm_callback;
-      descs[i].setter = generic_wasm_callback;
-      descs[i].data =
-          RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
-      // Note: N-API uses the same data pointer for both getter and setter.
-      // The setter_reg_id is stored in the getter_reg_id for now.
-      break;
+      switch (prop_types[i]) {
+      case 0: // value
+        descs[i].value = LoadValue(*bridge_state, prop_value_ids[i]);
+        break;
+      case 1: // method
+        descs[i].method = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
+        break;
+      case 2: // getter only
+        descs[i].getter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
+        break;
+      case 3: // setter only
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
+        break;
+      case 4: // getter + setter
+        descs[i].getter = generic_wasm_callback;
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data =
+            RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
+        // Note: N-API uses the same data pointer for both getter and setter.
+        // The setter_reg_id is stored in the getter_reg_id for now.
+        break;
+      }
     }
-  }
 
-  napi_value result;
-  napi_status s = napi_define_class(
-      env, utf8name,
-      name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
-      generic_wasm_callback, RegisterCallbackBinding(bridge_state, ctor_reg_id),
-      prop_count, descs.data(), &result);
-  if (s != napi_ok)
-    return s;
-  *out_id = StoreValue(*bridge_state, result);
-  return napi_ok;
+    napi_value result;
+    napi_status s = napi_define_class(
+        env, utf8name,
+        name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
+        generic_wasm_callback, RegisterCallbackBinding(bridge_state, ctor_reg_id),
+        prop_count, descs.data(), &result);
+    if (s != napi_ok)
+      return s;
+    *out_id = StoreValue(*bridge_state, result);
+    return napi_ok;
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
+  }
 }
 
 // ============================================================
@@ -3565,15 +3800,15 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState *env_state) {
-  if (env_state == nullptr)
+  auto lease = RequireEnvState(env_state);
+  auto *state = lease.get();
+  if (state == nullptr)
     return 0;
-  // Cap callback registrations alongside value handles: 0 signals failure so
-  // the registration chain aborts instead of growing cb_registry unbounded.
-  if (env_state->value_limit != 0 &&
-      env_state->cb_registry.size() >= env_state->value_limit) {
+  // Registrations live until env teardown. 0 signals failure so the
+  // registration chain aborts instead of growing cb_registry unbounded.
+  if (!ChargeBookkeeping(*state, kCallbackBytes, /*reclaimable=*/false))
     return 0;
-  }
-  return env_state->next_cb_reg_id++;
+  return state->next_cb_reg_id++;
 }
 
 // Register callback data for a registration ID
@@ -3653,6 +3888,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   }
   state->env = env;
   state->owner = owner;
+  state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.emplace(state.get(), state);
@@ -3714,6 +3950,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   }
   state->env = env;
   state->owner = owner;
+  state->background_lane = snapi_v8_lane_current();
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
     g_envs.emplace(state.get(), state);
@@ -3739,13 +3976,17 @@ size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void *data,
 }
 } // namespace
 
-extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-    SnapiEnvState *env_state, const void *data) {
+// Installs the embedder's budget tracker: V8 heap growth is charged through
+// the near-heap-limit callback and the bridge's own host bookkeeping through
+// napi_host_bookkeeping_charge. `data` must outlive the env.
+extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState *env_state,
+                                                       const void *data) {
   auto lease = RequireEnvState(env_state);
   auto *state = lease.get();
   if (state == nullptr) {
     return napi_invalid_arg;
   }
+  state->host_budget = data;
   return unofficial_napi_configure_near_heap_limit_callback(
       state->env, HostNearHeapLimitTrampoline, const_cast<void *>(data), 0);
 }
@@ -3771,20 +4012,16 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState *env_state,
   return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
 }
 
-extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState *env_state,
-                                                       uint64_t limit) {
-  auto lease = RequireEnvState(env_state);
-  auto *state = lease.get();
-  if (state == nullptr) {
-    return napi_invalid_arg;
-  }
-  state->value_limit = static_cast<size_t>(limit);
-  return napi_ok;
-}
-
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState *env_state) {
   auto lease = RequireEnvState(env_state);
   return DisposeBridgeStateLocked(lease.get());
+}
+
+// A release may report an error from a guest finalizer after the isolate was
+// nevertheless disposed. Query registry membership without dereferencing a
+// stale guest handle so Rust can retain quota only for a live native env.
+extern "C" int snapi_bridge_unofficial_env_alive(SnapiEnvState *env_state) {
+  return LookupEnvState(env_state) != nullptr ? 1 : 0;
 }
 
 extern "C" int
@@ -4412,9 +4649,9 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
-                                                      uint32_t value_id,
-                                                      uint32_t *message_out) {
+extern "C" int snapi_bridge_unofficial_message_create_metered(
+    SnapiEnvState *env_state, uint32_t value_id, uint32_t *message_out,
+    uint64_t *retained_bytes_out) {
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr || message_out == nullptr)
@@ -4427,17 +4664,40 @@ extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
       unofficial_napi_message_create(bridge_state->env, value, &message);
   if (status != napi_ok)
     return status;
+  // The guest reserved 32 MiB before entering V8. Reject any unexpected
+  // retained representation that would exceed that reservation.
+  constexpr size_t kMaxRetainedBytes = 32 * 1024 * 1024;
+  const size_t payload_bytes = unofficial_napi_message_retained_bytes(message);
+  if (payload_bytes > kMaxRetainedBytes - 4096) {
+    unofficial_napi_message_drop(message);
+    return napi_generic_failure;
+  }
+  const size_t retained_bytes = payload_bytes + 4096;
   uint32_t message_id;
   {
     std::lock_guard<std::recursive_mutex> registry_lock(g_mu);
-    message_id = g_message_handles.Store(reinterpret_cast<void *>(message));
+    try {
+      message_id = g_message_handles.Store(reinterpret_cast<void *>(message));
+    } catch (const std::bad_alloc &) {
+      unofficial_napi_message_drop(message);
+      return napi_generic_failure;
+    }
   }
   if (message_id == 0) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
   }
   *message_out = message_id;
+  if (retained_bytes_out != nullptr)
+    *retained_bytes_out = retained_bytes;
   return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_message_create(SnapiEnvState *env_state,
+                                                      uint32_t value_id,
+                                                      uint32_t *message_out) {
+  return snapi_bridge_unofficial_message_create_metered(env_state, value_id,
+                                                       message_out, nullptr);
 }
 
 extern "C" int snapi_bridge_unofficial_message_take(SnapiEnvState *env_state,
@@ -4847,12 +5107,30 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
     }
     return napi_generic_failure;
   }
-  if (handle_out != nullptr) {
-    *handle_out = StoreModuleWrapHandle(*bridge_state, result.module);
+  uint32_t handle_id = 0;
+  uint32_t requests_id = 0;
+  try {
+    if (handle_out != nullptr)
+      handle_id = StoreModuleWrapHandle(*bridge_state, result.module);
+    if (requests_out != nullptr)
+      requests_id = StoreValue(*bridge_state, result.module_requests);
+  } catch (const std::bad_alloc &) {
+    if (handle_id != 0)
+      RemoveModuleWrapHandle(*bridge_state, handle_id);
+    (void)unofficial_napi_module_wrap_destroy(env, result.module);
+    return napi_generic_failure;
   }
-  if (requests_out != nullptr) {
-    *requests_out = StoreValue(*bridge_state, result.module_requests);
+  if ((handle_out != nullptr && handle_id == 0) ||
+      (requests_out != nullptr && requests_id == 0)) {
+    if (handle_id != 0)
+      RemoveModuleWrapHandle(*bridge_state, handle_id);
+    (void)unofficial_napi_module_wrap_destroy(env, result.module);
+    return napi_generic_failure;
   }
+  if (handle_out != nullptr)
+    *handle_out = handle_id;
+  if (requests_out != nullptr)
+    *requests_out = requests_id;
   if (has_top_level_await_out != nullptr) {
     *has_top_level_await_out = result.has_top_level_await ? 1 : 0;
   }
@@ -4881,6 +5159,10 @@ extern "C" int
 snapi_bridge_unofficial_module_wrap_link(SnapiEnvState *env_state,
                                          uint32_t handle_id, uint32_t count,
                                          const uint32_t *linked_handle_ids) {
+  // Bound this before allocating the bridge vector even for callers that
+  // bypass the Rust import layer.
+  if (count > 4096 || (count != 0 && linked_handle_ids == nullptr))
+    return napi_invalid_arg;
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
   if (bridge_state == nullptr)
@@ -4890,18 +5172,20 @@ snapi_bridge_unofficial_module_wrap_link(SnapiEnvState *env_state,
       LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr)
     return napi_invalid_arg;
-  std::vector<unofficial_napi_module> linked_modules(count, nullptr);
-  for (uint32_t i = 0; i < count; ++i) {
-    unofficial_napi_module linked =
-        linked_handle_ids != nullptr
-            ? LoadModuleWrapHandle(*bridge_state, linked_handle_ids[i])
-            : nullptr;
-    if (linked == nullptr)
-      return napi_invalid_arg;
-    linked_modules[i] = linked;
+  try {
+    std::vector<unofficial_napi_module> linked_modules(count, nullptr);
+    for (uint32_t i = 0; i < count; ++i) {
+      unofficial_napi_module linked =
+          LoadModuleWrapHandle(*bridge_state, linked_handle_ids[i]);
+      if (linked == nullptr)
+        return napi_invalid_arg;
+      linked_modules[i] = linked;
+    }
+    return unofficial_napi_module_wrap_link(
+        env, module, count, count == 0 ? nullptr : linked_modules.data());
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
   }
-  return unofficial_napi_module_wrap_link(
-      env, module, count, count == 0 ? nullptr : linked_modules.data());
 }
 
 extern "C" int

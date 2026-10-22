@@ -2,6 +2,18 @@
 #include "upstream_js_test.h"
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
+#if defined(NAPI_TEST_ENGINE_V8)
+extern "C" void napi_v8_test_fail_next_external_buffer_after_transfer();
+extern "C" napi_status NAPI_CDECL napi_create_external_buffer(
+    napi_env env, size_t length, void* data, node_api_basic_finalize finalize_cb,
+    void* finalize_hint, napi_value* result);
+
+namespace {
+void CountExternalBufferFinalizer(node_api_basic_env, void*, void* hint) {
+  ++*static_cast<int*>(hint);
+}
+}  // namespace
+#endif
 
 class Test31DataView : public FixtureTestBase {};
 
@@ -34,3 +46,19 @@ TEST_F(Test31DataView, CreateArrayBufferWithNullDataOutParam) {
   ASSERT_NE(data, nullptr);
   ASSERT_EQ(byte_length, 12u);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test31DataView, ExternalBufferFailureStillTransfersFinalizerOwnership) {
+  EnvScope s(runtime_.get());
+  uint8_t bytes[8] = {};
+  int finalizer_calls = 0;
+  napi_value buffer = nullptr;
+  napi_v8_test_fail_next_external_buffer_after_transfer();
+  EXPECT_EQ(napi_create_external_buffer(s.env, sizeof(bytes), bytes,
+                                        CountExternalBufferFinalizer,
+                                        &finalizer_calls, &buffer),
+            napi_generic_failure);
+  EXPECT_EQ(buffer, nullptr);
+  EXPECT_EQ(finalizer_calls, 1);
+}
+#endif

@@ -110,6 +110,9 @@ struct napi_env__ {
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
   void* enqueue_foreground_task_target = nullptr;
   bool embedder_hooks_attached = false;
+  // Guest-heap-backed environments must not expose V8 allocations that bypass
+  // the workload's linear-memory accountant. Native embedders keep V8 Wasm.
+  bool restrict_unmetered_webassembly = false;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   napi::periodic_gate__ lifetime_stats_gate_{2000};
