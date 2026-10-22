@@ -8,6 +8,8 @@ struct napi_callback_payload__ {
   napi_env env;
   napi_callback cb;
   void* data;
+  // Creation context, selected while the callback runs. A strong handle: the
+  // context stays alive as long as this function's payload does.
   v8::Global<v8::Context> context;
 };
 

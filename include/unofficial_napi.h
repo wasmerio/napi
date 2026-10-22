@@ -597,7 +597,13 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(n
 // function, finalizer or interrupt callback) returns or its environment
 // closes. Unsupported providers return napi_generic_failure.
 // Call on the environment's owning VM thread. Entry fails with
-// napi_generic_failure during teardown or at a nesting depth of 1024.
+// napi_generic_failure during teardown or at a nesting depth of 1024; the
+// depth counts active native callback, finalizer and interrupt frames as well
+// as entered scopes. Each native function keeps its creation context alive for
+// as long as the function itself lives. Tokens are per environment, but V8's
+// entered-context stack is per isolate: environments sharing one isolate must
+// not interleave their scopes (the V8 provider creates one isolate per
+// environment).
 // Selection applies to N-API operations only. Event-loop checkpoints and
 // unofficial_napi_enqueue_microtask use the root context's microtask queue,
 // and deferred finalizers, interrupt callbacks and promise reject/hook

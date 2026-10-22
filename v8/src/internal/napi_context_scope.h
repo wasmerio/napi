@@ -12,6 +12,12 @@
 // A token scope can outlive the HandleScope it was opened in (a Wasm guest
 // enters and leaves in separate host imports), so it keeps a Global and never
 // retains a Local from a temporary HandleScope.
+//
+// The chain is per environment, while V8's entered-context stack is per
+// isolate. Strict LIFO here keeps V8's Enter/Exit balanced only if no other
+// environment on the same isolate interleaves its own scopes; the provider
+// creates one isolate per environment. depth() counts every scope on the
+// chain, so native callback frames count toward the entry limit.
 class NapiV8ContextScope {
  public:
   NapiV8ContextScope(napi_env env, v8::Local<v8::Context> context, uint64_t token = 0)
