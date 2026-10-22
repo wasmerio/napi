@@ -187,6 +187,10 @@ unsafe extern "C" {
         accepted_hooks_out: *mut u64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_retain_env(env: SnapiEnv);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_unretain_env(env: SnapiEnv);
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
         env: SnapiEnv,
