@@ -1664,15 +1664,21 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
 
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
-    if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(env, context);
+  // Collect the contexts first. Applying hooks takes g_runtime_mu, and the
+  // prepare-stack-trace path takes g_runtime_mu before g_context_mu, so
+  // g_context_mu must not be held here while envs run concurrently.
+  std::vector<v8::Local<v8::Context>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    for (auto& rec : it->second) {
+      v8::Local<v8::Context> context = rec.context.Get(env->isolate);
+      if (!context.IsEmpty()) contexts.push_back(context);
     }
+  }
+  for (const auto& context : contexts) {
+    NapiV8ApplyPromiseHooksToContext(env, context);
   }
 }
 
