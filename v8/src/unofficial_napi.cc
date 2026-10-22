@@ -26,6 +26,7 @@
 
 #include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
+#include "internal/napi_context_scope.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
@@ -2234,7 +2235,9 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         v8::HandleScope handle_scope(isolate);
         v8::Local<v8::Context> context = request->env->context();
         if (context.IsEmpty()) return;
-        v8::Context::Scope context_scope(context);
+        // Like a native function callback: scopes the callback enters and
+        // leaves open are closed when it returns.
+        NapiV8ContextScope context_scope(request->env, context);
         request->callback(request->env, request->data);
       },
       request);

@@ -592,8 +592,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(n
 // invalid after close. Context scopes are separate from handle scopes. Leaving
 // preserves a pending exception. Native callbacks select their creation realm
 // for the duration of dispatch, restoring the previous selection on return.
-// An unbalanced guest-entered scope is reclaimed when its callback returns or
-// its environment closes. Unsupported providers return napi_generic_failure.
+// An unbalanced guest-entered scope is reclaimed when its callback (native
+// function, finalizer or interrupt callback) returns or its environment
+// closes. Unsupported providers return napi_generic_failure.
 // Call on the environment's owning VM thread. Entry fails with
 // napi_generic_failure during teardown or at a nesting depth of 1024.
 typedef uint64_t unofficial_napi_context_scope;

@@ -1098,6 +1098,20 @@ napi_value ContextGlobal(napi_env env, napi_value sandbox, ContextScopeFixture* 
   return global;
 }
 
+struct InterruptRecord {
+  napi_value sandbox = nullptr;
+  unsigned calls = 0;
+  napi_status status = napi_generic_failure;
+  unofficial_napi_context_scope scope = 0;
+};
+
+// Enters a contextified realm and returns without leaving.
+void EnterWithoutLeaving(napi_env env, void* data) {
+  auto* record = static_cast<InterruptRecord*>(data);
+  ++record->calls;
+  record->status = unofficial_napi_contextify_enter(env, record->sandbox, &record->scope);
+}
+
 struct TeardownCounters {
   unsigned cleanup_calls = 0;
   unsigned finalizer_calls = 0;
@@ -1444,6 +1458,35 @@ TEST_F(Test65UnofficialContextify, ContextScopeTokensBelongToOneEnvironment) {
   EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
   EXPECT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+}
+
+// An interrupt callback, like a native function callback, has scopes it left
+// open closed when it returns, instead of unbalancing V8's entered contexts.
+TEST_F(Test65UnofficialContextify, ContextScopeInterruptReclaimsUnbalancedScopes) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  InterruptRecord record;
+  record.sandbox = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(record.sandbox, nullptr);
+
+  ASSERT_EQ(unofficial_napi_request_interrupt(s.env, EnterWithoutLeaving, &record), napi_ok);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env, "let total = 0; "
+                                       "for (let i = 0; i < 1000000; ++i) total += i; "
+                                       "globalThis === this"),
+                            &result),
+            napi_ok);
+  bool same_global = false;
+  ASSERT_EQ(napi_get_value_bool(s.env, result, &same_global), napi_ok);
+  EXPECT_TRUE(same_global);
+  ASSERT_EQ(record.calls, 1u);
+  ASSERT_EQ(record.status, napi_ok);
+  EXPECT_NE(record.scope, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, record.scope), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
 }
 
 // Scopes left outside any handle scope must not grow the environment's root
