@@ -4,7 +4,33 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".github/workflows/napi-native-concurrency.yml"
+      - "Cargo.standalone.lock"
+      - "Cargo.standalone.toml"
+      - "build.rs"
+      - "cargo-standalone.sh"
+      - "include/**"
+      - "lib/**"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/concurrent_*.rs"
+      - "tests/wat_guest/**"
+      - "v8/**"
   pull_request:
+    paths:
+      - ".github/workflows/napi-native-concurrency.yml"
+      - "Cargo.standalone.lock"
+      - "Cargo.standalone.toml"
+      - "build.rs"
+      - "cargo-standalone.sh"
+      - "include/**"
+      - "lib/**"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/concurrent_*.rs"
+      - "tests/wat_guest/**"
+      - "v8/**"
   workflow_dispatch:
 
 permissions:
@@ -43,9 +69,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-napi-concurrency-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-napi-concurrency-rust-1.96-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-napi-concurrency-
+            ${{ runner.os }}-napi-concurrency-rust-1.96-
 
       # WAT guests, each in its own Wasmer store and thread, against the real
       # C++ bridge and V8. No WASIX C toolchain is needed.

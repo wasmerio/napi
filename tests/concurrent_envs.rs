@@ -21,13 +21,14 @@ mod wat_guest;
 use wat_guest::{Guest, NAPI_INVALID_ARG, NAPI_PENDING_EXCEPTION, compile};
 
 /// Marks cell 1, then parks the script until another environment wakes it,
-/// for up to 10 s. A bridge that serializes environments keeps the other
-/// environment out until the wait times out. Some of these entry points do not
-/// install a guest callback context, so readiness is reported through the
-/// shared memory rather than through `signal()`.
+/// for up to 20 s, longer than the test's own 10 s deadlines. A bridge that
+/// serializes environments keeps the other environment out until the wait
+/// times out. Some of these entry points do not install a guest callback
+/// context, so readiness is reported through the shared memory rather than
+/// through `signal()`.
 const WAIT_SCRIPT: &str = "const cell = new Int32Array(shared); \
      Atomics.store(cell, 1, 1); \
-     globalThis.woke = Atomics.wait(cell, 0, 0, 10000);";
+     globalThis.woke = Atomics.wait(cell, 0, 0, 20000);";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bridge entry points that run JavaScript and that used to hold the bridge's

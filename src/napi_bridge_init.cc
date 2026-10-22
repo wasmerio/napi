@@ -119,6 +119,8 @@ struct ScopeFrame {
   uint32_t id = 0;
 };
 
+struct WasmInterruptRequest;
+
 struct SnapiEnvState {
   // Isolates, their persistent scopes and all env-local handle tables stay on
   // the creating VM thread (see OwnedByThisThread). Different environments may
@@ -137,6 +139,9 @@ struct SnapiEnvState {
   // snapi_bridge_unofficial_retain_env. A retained pointer may be handed to
   // other threads: it can outlive the env but is never reused for another.
   std::atomic<uint32_t> holders{1};
+  // Under g_mu. Interrupt requests the engine has queued but not run yet; the
+  // engine drops them without a callback when the isolate is disposed.
+  std::unordered_set<WasmInterruptRequest*> pending_interrupts;
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
 
@@ -227,6 +232,13 @@ void ForgetOnThisThread(SnapiEnvState* state) {
     t_owned_envs = nullptr;
   }
 }
+
+struct WasmInterruptRequest {
+  SnapiEnvState* state;
+  uint32_t guest_env;
+  uint32_t wasm_fn_ptr;
+  uint32_t callback_arg;
+};
 
 void DropEnvStateHolder(SnapiEnvState* state) {
   if (state->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) delete state;
@@ -558,11 +570,15 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   // (with no registry entry they return undefined), so free them only now.
   state->callback_bindings.clear();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
+  std::unordered_set<WasmInterruptRequest*> unserviced;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     state->env = nullptr;
     g_envs.erase(state);
+    unserviced.swap(state->pending_interrupts);
   }
+  // The isolate is gone, so these callbacks can no longer run.
+  for (auto* request : unserviced) delete request;
   ForgetOnThisThread(state);
   DropEnvStateHolder(state);
   return s;
@@ -2814,16 +2830,13 @@ extern "C" uint32_t snapi_host_invoke_wasm_callback(void* callback_ctx,
                                                     uint32_t wasm_fn_ptr,
                                                     uint32_t callback_arg);
 
-struct WasmInterruptRequest {
-  SnapiEnvState* state;
-  uint32_t guest_env;
-  uint32_t wasm_fn_ptr;
-  uint32_t callback_arg;
-};
-
 void WasmInterruptCallback(napi_env env, void* raw) {
   auto* request = static_cast<WasmInterruptRequest*>(raw);
   if (request == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    request->state->pending_interrupts.erase(request);
+  }
   auto* bridge_state = LookupEnvState(request->state);
   // An env being released no longer runs guest interrupt callbacks: its scopes
   // and handle tables are being torn down. `closing` is only written by the
@@ -3408,17 +3421,22 @@ extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_stat
   std::unique_lock<std::mutex> lock(g_mu);
   auto* bridge_state = env_state;
   if (!g_envs.count(bridge_state) || bridge_state->closing) return napi_invalid_arg;
+  auto* request =
+      new (std::nothrow) WasmInterruptRequest{bridge_state, guest_env, wasm_fn_ptr, data};
+  if (request == nullptr) return napi_generic_failure;
+  bridge_state->pending_interrupts.insert(request);
   // Only the owner thread releases an env, so an owner caller needs no lock to
   // keep it alive. A foreign caller keeps registry membership pinned: the
   // engine only enqueues the callback, which runs later on the owner thread.
   if (OwnedByThisThread(bridge_state)) lock.unlock();
   napi_env env = bridge_state->env;
-  auto* request =
-      new (std::nothrow) WasmInterruptRequest{bridge_state, guest_env, wasm_fn_ptr, data};
-  if (request == nullptr) return napi_generic_failure;
   napi_status s =
       unofficial_napi_request_interrupt(env, WasmInterruptCallback, request);
-  if (s != napi_ok) delete request;
+  if (s != napi_ok) {
+    if (!lock.owns_lock()) lock.lock();
+    bridge_state->pending_interrupts.erase(request);
+    delete request;
+  }
   return s;
 }
 

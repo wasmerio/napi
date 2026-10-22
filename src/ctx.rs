@@ -65,8 +65,13 @@ pub struct NapiInstantiationState {
 /// An N-API environment belongs to the OS thread that created it. Guests on
 /// different threads run concurrently, but other threads can only terminate
 /// an environment or request an interrupt; any other call from them, including
-/// release, is refused. Drop a store on the thread that ran it: an
-/// environment whose store is dropped elsewhere is not released.
+/// release, is refused.
+///
+/// A store that created environments must therefore stay on one OS thread for
+/// its whole life, and be dropped there. That rules out resuming it on another
+/// thread, for example a WASIX thread woken from deep sleep on a different
+/// worker. An environment whose store is dropped on another thread is not
+/// released: its isolate leaks and stays charged to the budget.
 // The import phase creates a per-instantiation session holding the function
 // env backing the imported host functions, and hands it to the caller as
 // opaque state. The hooks themselves are stateless, so concurrent
