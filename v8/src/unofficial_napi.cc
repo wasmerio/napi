@@ -2463,7 +2463,9 @@ napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
+  // The environment-wide reject callback runs in the root, as it does from
+  // PromiseRejectCallback.
+  v8::Local<v8::Context> context = env->root_context();
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Promise> local_promise = raw.As<v8::Promise>();
   if (local_promise->State() != v8::Promise::PromiseState::kRejected) {
