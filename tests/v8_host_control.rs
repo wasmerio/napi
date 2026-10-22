@@ -187,6 +187,20 @@ fn guest_cannot_allocate_unmetered_v8_webassembly_memory() {
     assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
 }
 
+/// asm.js would otherwise be translated to WebAssembly and compiled into
+/// V8's wasm code space, bypassing the WebAssembly restriction above.
+#[test]
+fn asm_js_runs_as_plain_javascript() {
+    let wasm = build_wasix_test("test_js_asmjs_plain");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("ASMJS_RUNS_AS_PLAIN_JS_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
 #[test]
 fn guest_cannot_start_unmanaged_v8_workers_or_profiler() {
     let wasm = build_wasix_test("test_guest_unmanaged_controls");
