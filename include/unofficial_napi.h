@@ -229,6 +229,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
     unofficial_napi_interrupt_callback callback,
     void* data);
 
+// Provider intrinsic trusted source. V8 evaluates it through its native code
+// generation hook: direct eval retains lexical scope and never calls author
+// toString/@@toPrimitive. Its private brand survives prototype changes, cannot
+// be copied or inherited, and does not bypass a context's codegen restriction.
+// Source must be a primitive string. Unsupported engines return generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
+    napi_env env, napi_value source, napi_value* result);
+// Owning VM thread only. Reports actual JS frames (including other security
+// origins) or an active microtask checkpoint; does not execute JS or replace an
+// existing pending exception. Unsupported engines return generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
+    napi_env env, bool* result);
+
 // Unofficial helper. Enqueues a JS function into V8 microtask queue.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);
 

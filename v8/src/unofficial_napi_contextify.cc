@@ -1643,6 +1643,22 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return false;
 }
 
+bool NapiV8IsAnyContextifyMicrotaskQueueRunning(v8::Isolate* isolate) {
+  if (isolate == nullptr) return false;
+  // A native microtask callback can run from a contextify context's own
+  // queue while env->context() is a different context. Query the actual
+  // queues, rather than inferring execution state from the current context.
+  std::lock_guard<std::mutex> lock(g_context_mu);
+  for (auto& entry : g_context_records) {
+    if (entry.first->isolate != isolate) continue;
+    for (auto& record : entry.second) {
+      if (record.own_microtask_queue && record.own_microtask_queue->IsRunningMicrotasks())
+        return true;
+    }
+  }
+  return false;
+}
+
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
 

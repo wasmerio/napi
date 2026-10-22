@@ -179,6 +179,11 @@
       "name": "test_high_guest_pointers",
       "description": "Guest pointers >= 2 GiB are read from and written to, not rejected or skipped",
       "expected_stdout": "TEST_HIGH_GUEST_POINTERS_OK=1\n"
+    },
+    {
+      "name": "test_trusted_script",
+      "description": "unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js through the guest imports",
+      "expected_stdout": "TEST_TRUSTED_SCRIPT_OK=1\n"
     }
   ]
 }

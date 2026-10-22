@@ -3318,6 +3318,31 @@ extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_stat
   return s;
 }
 
+extern "C" int snapi_bridge_unofficial_create_trusted_script(
+    SnapiEnvState* state, uint32_t source_id, uint32_t* result_out) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr || result_out == nullptr) return napi_invalid_arg;
+  *result_out = 0;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value source = LoadValue(*bridge, source_id), result = nullptr;
+  if (source == nullptr) return napi_invalid_arg;
+  auto status = unofficial_napi_create_trusted_script(bridge->env, source, &result);
+  if (status != napi_ok) return status;
+  *result_out = StoreValue(*bridge, result);
+  return *result_out ? napi_ok : napi_generic_failure;
+}
+
+extern "C" int snapi_bridge_unofficial_is_executing_js(SnapiEnvState* state, int* result_out) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr || result_out == nullptr) return napi_invalid_arg;
+  *result_out = 0;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  bool result = false;
+  auto status = unofficial_napi_is_executing_js(bridge->env, &result);
+  if (status == napi_ok) *result_out = result;
+  return status;
+}
+
 extern "C" int snapi_bridge_unofficial_enqueue_microtask(SnapiEnvState* env_state,
                                                          uint32_t callback_id) {
   auto* bridge_state = RequireEnvState(env_state);
