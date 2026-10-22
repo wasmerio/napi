@@ -1,0 +1,53 @@
+name: napi-native-concurrency
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-native-concurrency:
+    name: Rust native concurrency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: clang
+      CXX: clang++
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      NAPI_WASMER_FORCE_STANDALONE: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang pkg-config libssl-dev
+
+      - name: Cache Rust dependencies and the V8 archive
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-napi-concurrency-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-napi-concurrency-
+
+      # WAT guests, each in its own Wasmer store and thread, against the real
+      # C++ bridge and V8. No WASIX C toolchain is needed.
+      - name: Test concurrent environments
+        run: ./cargo-standalone.sh test --locked --test concurrent_envs

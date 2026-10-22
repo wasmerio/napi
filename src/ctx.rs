@@ -61,6 +61,12 @@ pub struct NapiInstantiationState {
 }
 
 /// Runtime hooks that provide N-API imports for WASIX guests.
+///
+/// An N-API environment belongs to the OS thread that created it. Guests on
+/// different threads run concurrently, but other threads can only terminate
+/// an environment or request an interrupt; any other call from them, including
+/// release, is refused. Drop a store on the thread that ran it: an
+/// environment whose store is dropped elsewhere is not released.
 // The import phase creates a per-instantiation session holding the function
 // env backing the imported host functions, and hands it to the caller as
 // opaque state. The hooks themselves are stateless, so concurrent
