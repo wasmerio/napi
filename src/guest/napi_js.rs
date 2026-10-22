@@ -1135,6 +1135,29 @@ fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u3
     unsafe { snapi_bridge_unofficial_message_drop(payload) };
 }
 
+fn guest_unofficial_napi_create_trusted_script(
+    mut env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _source: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u32(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    9 // No native direct-eval brand on ordinary host JS objects.
+}
+
+fn guest_unofficial_napi_is_executing_js(
+    mut env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    9 // Never infer VM stack emptiness from JS adapter bookkeeping.
+}
+
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -5643,6 +5666,8 @@ pub fn register_napi_imports(
         "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
         "unofficial_napi_message_take" => message_take_import(store, fe),
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
+        "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
+        "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),

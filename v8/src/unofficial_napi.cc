@@ -38,6 +38,78 @@ struct unofficial_napi_profile__ {
 
 namespace {
 
+// The trusted-script brand is a private symbol from v8::Private::New, created
+// once per isolate. Unlike v8::Private::ForApi (which backs
+// unofficial_napi_create_private_symbol), nothing else can obtain it by name.
+// Only looked up and inserted under this lock; no JavaScript runs while held.
+std::mutex& g_trusted_script_mu = *new std::mutex();
+std::unordered_map<v8::Isolate*, v8::Global<v8::Private>>& g_trusted_script_keys =
+    *new std::unordered_map<v8::Isolate*, v8::Global<v8::Private>>();
+
+v8::Local<v8::Private> TrustedScriptKey(v8::Isolate* isolate) {
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto it = g_trusted_script_keys.find(isolate);
+  if (it == g_trusted_script_keys.end()) return {};
+  return it->second.Get(isolate);
+}
+
+v8::Local<v8::Private> EnsureTrustedScriptKey(v8::Isolate* isolate, bool* created) {
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto& key = g_trusted_script_keys[isolate];
+  *created = key.IsEmpty();
+  if (*created) {
+    key.Reset(isolate, v8::Private::New(isolate,
+        v8::String::NewFromUtf8Literal(isolate, "TrustedScript source")));
+  }
+  return key.Get(isolate);
+}
+
+void ForgetTrustedScriptKey(v8::Isolate* isolate) {
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto it = g_trusted_script_keys.find(isolate);
+  if (it == g_trusted_script_keys.end()) return;
+  it->second.Reset();
+  g_trusted_script_keys.erase(it);
+}
+
+v8::MaybeLocal<v8::String> TrustedScriptSource(v8::Local<v8::Context> context,
+                                             v8::Local<v8::Value> value) {
+  auto* isolate = context->GetIsolate();
+  if (!value->IsObject() || value->IsProxy()) return {};
+  auto object = value.As<v8::Object>();
+  auto key = TrustedScriptKey(isolate);
+  v8::Local<v8::Value> source;
+  if (key.IsEmpty() || !object->IsCodeLike(isolate) ||
+      !object->GetPrivate(context, key).ToLocal(&source) || !source->IsString()) return {};
+  return source.As<v8::String>();
+}
+
+v8::ModifyCodeGenerationFromStringsResult TrustedCodeGeneration(
+    v8::Local<v8::Context> context, v8::Local<v8::Value> source, bool) {
+  v8::ModifyCodeGenerationFromStringsResult result;
+  v8::Local<v8::String> trusted;
+  if (TrustedScriptSource(context, source).ToLocal(&trusted)) {
+    result.codegen_allowed = context->IsCodeGenerationFromStringsAllowed();
+    if (result.codegen_allowed) result.modified_source = trusted;
+  } else {
+    // eval(non-string) must return its argument unchanged, including when
+    // string codegen is disabled. Never stringify an unbranded object here.
+    result.codegen_allowed = !source->IsString() ||
+                             context->IsCodeGenerationFromStringsAllowed();
+  }
+  return result;
+}
+
+void TrustedScriptToString(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::String> source;
+  if (TrustedScriptSource(info.GetIsolate()->GetCurrentContext(), info.This()).ToLocal(&source)) {
+    info.GetReturnValue().Set(source);
+  } else {
+    info.GetIsolate()->ThrowException(v8::Exception::TypeError(
+        v8::String::NewFromUtf8Literal(info.GetIsolate(), "Illegal TrustedScript invocation")));
+  }
+}
+
 struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
   std::string engine_flags;
@@ -1810,6 +1882,7 @@ static napi_status DestroyEnvInstance(napi_env env) {
       g_env_by_isolate.erase(env_it);
     }
     g_hash_seeds.erase(env->isolate);
+    ForgetTrustedScriptKey(env->isolate);
     auto cb_it = g_promise_reject_callbacks.find(env->isolate);
     if (cb_it != g_promise_reject_callbacks.end()) {
       cb_it->second.Reset();
@@ -2321,6 +2394,66 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
   delete reinterpret_cast<SerializedClonePayload*>(message);
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
+    napi_env env, napi_value source, napi_value* result) {
+  if (env == nullptr || env->isolate == nullptr || source == nullptr || result == nullptr)
+    return napi_invalid_arg;
+  *result = nullptr;
+  auto raw_source = napi_v8_unwrap_value(source);
+  if (raw_source.IsEmpty() || !raw_source->IsString()) return napi_string_expected;
+  auto* isolate = env->isolate;
+  v8::EscapableHandleScope handles(isolate);
+  auto context = env->context();
+  v8::Context::Scope context_scope(context);
+  // One code-like template per environment. A fresh template per call would
+  // leave each instantiation in the context's template cache.
+  v8::Local<v8::ObjectTemplate> shape;
+  if (env->trusted_script_template.IsEmpty()) {
+    shape = v8::FunctionTemplate::New(isolate)->InstanceTemplate();
+    shape->SetCodeLike();
+    env->trusted_script_template.Reset(isolate, shape);
+  } else {
+    shape = env->trusted_script_template.Get(isolate);
+  }
+  bool first_on_isolate = false;
+  auto key = EnsureTrustedScriptKey(isolate, &first_on_isolate);
+  // Install the hook once per isolate, with its brand. A hook the embedder
+  // installs afterwards replaces it, and is not overwritten here again.
+  if (first_on_isolate) {
+    isolate->SetModifyCodeGenerationFromStringsCallback(TrustedCodeGeneration);
+  }
+  v8::Local<v8::Object> object;
+  if (!shape->NewInstance(context).ToLocal(&object) ||
+      !object->SetPrivate(context, key, raw_source).FromMaybe(false))
+    return napi_generic_failure;
+  // A native default stringifier makes Function(trustedSource) work before
+  // an embedder replaces the prototype with its own TrustedScript WebIDL one.
+  auto prototype = v8::Object::New(isolate);
+  v8::Local<v8::Function> stringify;
+  if (!v8::Function::New(context, TrustedScriptToString).ToLocal(&stringify) ||
+      !prototype->DefineOwnProperty(context,
+          v8::String::NewFromUtf8Literal(isolate, "toString"), stringify,
+          v8::DontEnum).FromMaybe(false) ||
+      !object->SetPrototype(context, prototype).FromMaybe(false)) return napi_generic_failure;
+  *result = napi_v8_wrap_value(env, handles.Escape(object));
+  return *result ? napi_ok : napi_generic_failure;
+}
+
+napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) return napi_invalid_arg;
+  *result = false;
+  auto* isolate = env->isolate;
+  v8::HandleScope handles(isolate);
+  auto stack = v8::StackTrace::CurrentStackTrace(isolate, 1,
+      v8::StackTrace::kExposeFramesAcrossSecurityOrigins);
+  auto* queue = env->context()->GetMicrotaskQueue();
+  *result = stack->GetFrameCount() != 0 ||
+            (queue != nullptr && queue->IsRunningMicrotasks()) ||
+            v8::MicrotasksScope::IsRunningMicrotasks(isolate) ||
+            env->contextify_microtask_checkpoints != 0;
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {

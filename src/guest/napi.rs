@@ -693,6 +693,42 @@ fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u3
     unsafe { snapi_bridge_unofficial_message_drop(payload) };
 }
 
+fn guest_unofficial_napi_create_trusted_script(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u32(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let mut result = 0;
+    let handle = snapi_env(&env, napi_env);
+    let status =
+        unsafe { snapi_bridge_unofficial_create_trusted_script(handle, source, &mut result) };
+    if status == 0 && !write_guest_u32(&mut env, result_ptr, result) {
+        return 1;
+    }
+    status
+}
+
+fn guest_unofficial_napi_is_executing_js(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let mut result = 0;
+    let handle = snapi_env(&env, napi_env);
+    let status = unsafe { snapi_bridge_unofficial_is_executing_js(handle, &mut result) };
+    if status == 0 && !write_guest_u8(&mut env, result_ptr, (result != 0) as u8) {
+        return 1;
+    }
+    status
+}
+
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -4893,6 +4929,8 @@ pub fn register_napi_imports(
         "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
         "unofficial_napi_message_take" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take),
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
+        "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
+        "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),

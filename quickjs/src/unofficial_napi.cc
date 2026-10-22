@@ -420,6 +420,21 @@ extern "C"
         return napi_ok;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
+        napi_env env, napi_value, napi_value* result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr) return napi_invalid_arg;
+        *result = nullptr;
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr) return napi_invalid_arg;
+        *result = false;
+        return napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback)
     {
         if (!napi_util__::check_env(env) || !napi_util__::is_callable(env, callback))

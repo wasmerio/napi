@@ -92,6 +92,11 @@ struct napi_env__ {
   v8::Global<v8::Private> wrap_private_key;
   v8::Global<v8::Private> buffer_private_key;
   v8::Global<v8::Private> type_tag_private_key;
+  // Built once: V8 caches every template instantiation per native context.
+  v8::Global<v8::ObjectTemplate> trusted_script_template;
+  // Nesting depth of contextify own-queue microtask checkpoints this
+  // environment is running. Owning VM thread only.
+  unsigned contextify_microtask_checkpoints = 0;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;

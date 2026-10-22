@@ -2097,7 +2097,12 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
 
     maybe_result = script->Run(target_context);
     if (!maybe_result.IsEmpty() && target_queue != nullptr) {
+      // A root callback can run from this queue while env->context() is
+      // another context. unofficial_napi_is_executing_js reads this depth,
+      // without locks, instead of scanning every context's queue.
+      ++env->contextify_microtask_checkpoints;
       target_queue->PerformCheckpoint(isolate);
+      --env->contextify_microtask_checkpoints;
     }
   }
 

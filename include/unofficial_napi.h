@@ -219,6 +219,31 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // current JS stack to unwind normally.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
+// Provider intrinsic trusted source. V8 evaluates it through its native code
+// generation hook: direct eval retains lexical scope and never calls author
+// toString/@@toPrimitive. Its private brand survives prototype changes, cannot
+// be copied, inherited or recreated (unofficial_napi_create_private_symbol
+// cannot name it), and does not bypass a context's codegen restriction.
+// Source must be a primitive string. Unsupported engines return generic_failure.
+// The hook is isolate-wide: the first call on an isolate installs this
+// provider's ModifyCodeGenerationFromStrings callback, replacing any callback
+// the embedder installed. V8 cannot report the previous callback, so it is not
+// chained. A callback the embedder installs afterwards is kept, and trusted
+// scripts then follow that callback instead. For other values the hook keeps
+// V8's behavior: eval returns non-string objects unchanged, and strings follow
+// each context's code generation setting.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
+    napi_env env, napi_value source, napi_value* result);
+// Owning VM thread only. Reports true only while the VM has a JavaScript frame
+// on its stack (in any context, including other security origins) or is
+// running a microtask checkpoint. A native function called from C through
+// napi_call_function, directly or through a builtin, with no JavaScript frame
+// below it reports false. Does not execute JS, take provider locks, or replace
+// an existing pending exception, so it may be called from any provider
+// callback. Unsupported engines return generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
+    napi_env env, bool* result);
+
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
 // Unofficial helper. Requests execution of a callback on the target env's
