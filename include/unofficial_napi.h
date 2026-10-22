@@ -229,7 +229,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
     unofficial_napi_interrupt_callback callback,
     void* data);
 
-// Unofficial helper. Enqueues a JS function into V8 microtask queue.
+// Unofficial helper. Enqueues a JS function into V8 microtask queue (the root
+// context's queue, regardless of unofficial_napi_contextify_enter).
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);
 
 // Unofficial helper. Sets the per-env PromiseReject callback used by
@@ -586,6 +587,35 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(n
 
 // Unofficial helpers for implementing internalBinding('contextify') on embedders.
 // These are engine-specific APIs and are not part of the public Node-API.
+// Enter a context for ordinary N-API operations, including allocations and
+// native function creation. A null/undefined sandbox selects the host root.
+// Tokens belong to one environment, must close in strict LIFO order, and are
+// invalid after close. Context scopes are separate from handle scopes. Leaving
+// preserves a pending exception. Native callbacks select their creation realm
+// for the duration of dispatch, restoring the previous selection on return.
+// An unbalanced guest-entered scope is reclaimed when its callback (native
+// function, finalizer or interrupt callback) returns or its environment
+// closes. Unsupported providers return napi_generic_failure.
+// Call on the environment's owning VM thread. Entry fails with
+// napi_generic_failure during teardown or at a nesting depth of 1024; the
+// depth counts active native callback, finalizer and interrupt frames as well
+// as entered scopes. Each native function keeps its creation context alive
+// until the environment is torn down (callback payloads are released only
+// then). Tokens are per environment, but V8's
+// entered-context stack is per isolate: environments sharing one isolate must
+// not interleave their scopes (the V8 provider creates one isolate per
+// environment).
+// Selection applies to N-API operations only. Event-loop checkpoints and
+// unofficial_napi_enqueue_microtask use the root context's microtask queue,
+// and deferred finalizers, interrupt callbacks and promise reject/hook
+// dispatch run in the root context, whatever is selected. A context made with
+// its own microtask queue drains it only after evaluation in that context.
+typedef uint64_t unofficial_napi_context_scope;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_enter(
+    napi_env env, napi_value sandbox_or_null, unofficial_napi_context_scope* scope_out);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_leave(
+    napi_env env, unofficial_napi_context_scope scope);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context(
     napi_env env,
     napi_value sandbox_or_symbol,

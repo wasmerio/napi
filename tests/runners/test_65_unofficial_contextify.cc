@@ -1,6 +1,13 @@
 #include "test_env.h"
 
+#include "node_api.h"
 #include "unofficial_napi.h"
+
+#include <vector>
+
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+#endif
 
 class Test65UnofficialContextify : public FixtureTestBase {};
 
@@ -905,5 +912,846 @@ TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
 
   ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(s.env, nullptr),
             napi_ok);
+}
+#endif
+
+// unofficial_napi_contextify_enter / unofficial_napi_contextify_leave select
+// the realm used by ordinary N-API operations. V8 implements them; QuickJS
+// reports them as unsupported.
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+struct ContextScopeFixture {
+  napi_value host_defined_option = nullptr;
+  napi_value child = nullptr;
+  unofficial_napi_context_scope leaked = 0;
+};
+
+napi_status RunInContext(napi_env env,
+                         napi_value sandbox,
+                         napi_value host_defined_option,
+                         const char* code,
+                         napi_value* result) {
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(Str(env, code));
+  return unofficial_napi_contextify_run_script(env,
+                                               sandbox,
+                                               &source,
+                                               Str(env, "context-scope.js"),
+                                               0,
+                                               0,
+                                               -1,
+                                               true,
+                                               false,
+                                               false,
+                                               host_defined_option,
+                                               result);
+}
+
+// Runs a boolean expression in a context. A thrown exception counts as false
+// and is cleared, so one failed expectation does not cascade.
+bool ScriptIsTrue(napi_env env,
+                  napi_value sandbox,
+                  napi_value host_defined_option,
+                  const char* code) {
+  napi_value result = nullptr;
+  bool value = false;
+  if (RunInContext(env, sandbox, host_defined_option, code, &result) != napi_ok ||
+      napi_get_value_bool(env, result, &value) != napi_ok) {
+    bool pending = false;
+    napi_value exception = nullptr;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_get_and_clear_last_exception(env, &exception);
+    }
+    return false;
+  }
+  return value;
+}
+
+bool StrictEquals(napi_env env, napi_value left, napi_value right) {
+  bool same = false;
+  return napi_strict_equals(env, left, right, &same) == napi_ok && same;
+}
+
+napi_value CurrentGlobal(napi_env env) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok) return nullptr;
+  return global;
+}
+
+napi_value NativeGlobal(napi_env env, napi_callback_info /*info*/) {
+  return CurrentGlobal(env);
+}
+
+napi_value NativeObject(napi_env env, napi_callback_info /*info*/) {
+  napi_value value = nullptr;
+  napi_create_object(env, &value);
+  return value;
+}
+
+napi_value NativeArray(napi_env env, napi_callback_info /*info*/) {
+  napi_value value = nullptr;
+  napi_create_array(env, &value);
+  return value;
+}
+
+napi_value NativeFunction(napi_env env, napi_callback_info /*info*/) {
+  napi_value value = nullptr;
+  napi_create_function(env, "nested", NAPI_AUTO_LENGTH, NativeObject, nullptr, &value);
+  return value;
+}
+
+ContextScopeFixture* FixtureFrom(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok) return nullptr;
+  return static_cast<ContextScopeFixture*>(data);
+}
+
+// Re-enters the child context from a callback created in the parent context.
+napi_value NativeReenter(napi_env env, napi_callback_info info) {
+  ContextScopeFixture* fixture = FixtureFrom(env, info);
+  napi_value child_passed = nullptr;
+  napi_value object = nullptr;
+  if (fixture == nullptr ||
+      RunInContext(env,
+                   fixture->child,
+                   fixture->host_defined_option,
+                   "realmName === 'child' && "
+                   "Object.getPrototypeOf(nativeObject()) === Object.prototype",
+                   &child_passed) != napi_ok ||
+      napi_create_object(env, &object) != napi_ok ||
+      napi_set_named_property(env, object, "childPassed", child_passed) != napi_ok) {
+    return nullptr;
+  }
+  return object;
+}
+
+// Enters the child context and returns without leaving.
+napi_value LeakScope(napi_env env, napi_callback_info info) {
+  ContextScopeFixture* fixture = FixtureFrom(env, info);
+  if (fixture == nullptr ||
+      unofficial_napi_contextify_enter(env, fixture->child, &fixture->leaked) != napi_ok) {
+    return nullptr;
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+// Enters the child context, then throws without leaving.
+napi_value ThrowInScope(napi_env env, napi_callback_info info) {
+  ContextScopeFixture* fixture = FixtureFrom(env, info);
+  napi_value value = nullptr;
+  if (fixture == nullptr ||
+      unofficial_napi_contextify_enter(env, fixture->child, &fixture->leaked) != napi_ok ||
+      napi_create_int32(env, 73, &value) != napi_ok) {
+    return nullptr;
+  }
+  napi_throw(env, value);
+  return nullptr;
+}
+
+bool Install(napi_env env,
+             napi_value target,
+             const char* name,
+             napi_callback callback,
+             ContextScopeFixture* fixture) {
+  napi_value function = nullptr;
+  return napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, fixture, &function) ==
+             napi_ok &&
+         napi_set_named_property(env, target, name, function) == napi_ok;
+}
+
+// Creates a context whose native functions are created while it is entered.
+napi_value MakeRealm(napi_env env, const char* name, ContextScopeFixture* fixture) {
+  napi_value sandbox = nullptr;
+  napi_value ignored = nullptr;
+  unofficial_napi_context_scope scope = 0;
+  if (napi_create_object(env, &sandbox) != napi_ok ||
+      napi_set_named_property(env, sandbox, "realmName", Str(env, name)) != napi_ok ||
+      unofficial_napi_contextify_make_context(env,
+                                              sandbox,
+                                              Str(env, name),
+                                              Str(env, "test://context-scope"),
+                                              true,
+                                              true,
+                                              false,
+                                              fixture->host_defined_option,
+                                              &ignored) != napi_ok ||
+      unofficial_napi_contextify_enter(env, sandbox, &scope) != napi_ok) {
+    return nullptr;
+  }
+  bool installed = Install(env, sandbox, "nativeGlobal", NativeGlobal, fixture) &&
+                   Install(env, sandbox, "nativeObject", NativeObject, fixture) &&
+                   Install(env, sandbox, "nativeArray", NativeArray, fixture) &&
+                   Install(env, sandbox, "nativeFunction", NativeFunction, fixture) &&
+                   Install(env, sandbox, "nativeReenter", NativeReenter, fixture);
+  if (unofficial_napi_contextify_leave(env, scope) != napi_ok || !installed) return nullptr;
+  return sandbox;
+}
+
+napi_value ContextGlobal(napi_env env, napi_value sandbox, ContextScopeFixture* fixture) {
+  napi_value global = nullptr;
+  if (RunInContext(env, sandbox, fixture->host_defined_option, "globalThis", &global) !=
+      napi_ok) {
+    return nullptr;
+  }
+  return global;
+}
+
+struct InterruptRecord {
+  napi_value sandbox = nullptr;
+  unsigned calls = 0;
+  napi_status status = napi_generic_failure;
+  unofficial_napi_context_scope scope = 0;
+};
+
+// Enters a contextified realm and returns without leaving.
+void EnterWithoutLeaving(napi_env env, void* data) {
+  auto* record = static_cast<InterruptRecord*>(data);
+  ++record->calls;
+  record->status = unofficial_napi_contextify_enter(env, record->sandbox, &record->scope);
+}
+
+struct RootCallbackRecord {
+  unsigned calls = 0;
+  napi_value expected_global = nullptr;
+  bool saw_expected_global = false;
+};
+
+napi_value CountCall(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) == napi_ok) {
+    ++static_cast<RootCallbackRecord*>(data)->calls;
+  }
+  return nullptr;
+}
+
+// Compares the global selected while a provider callback runs. The callback's
+// own handles do not outlive it, so compare here rather than keep them.
+void RecordGlobal(napi_env env, void* data) {
+  auto* record = static_cast<RootCallbackRecord*>(data);
+  ++record->calls;
+  record->saw_expected_global = StrictEquals(env, CurrentGlobal(env), record->expected_global);
+}
+
+void RecordGlobalFinalizer(napi_env env, void* data, void* /*hint*/) {
+  RecordGlobal(env, data);
+}
+
+napi_value MakeOwnQueueRealm(napi_env env, ContextScopeFixture* fixture) {
+  napi_value sandbox = nullptr;
+  napi_value ignored = nullptr;
+  if (napi_create_object(env, &sandbox) != napi_ok ||
+      unofficial_napi_contextify_make_context(env,
+                                              sandbox,
+                                              Str(env, "own-queue"),
+                                              Str(env, "test://own-queue"),
+                                              true,
+                                              true,
+                                              true,
+                                              fixture->host_defined_option,
+                                              &ignored) != napi_ok) {
+    return nullptr;
+  }
+  return sandbox;
+}
+
+struct TeardownCounters {
+  unsigned cleanup_calls = 0;
+  unsigned finalizer_calls = 0;
+  unsigned instance_calls = 0;
+  unsigned gc_calls = 0;
+  unsigned rejected_entries = 0;
+  unofficial_napi_context_scope gc_scope = 0;
+};
+
+TeardownCounters* g_teardown = nullptr;
+
+void ExpectEntryRejected(napi_env env) {
+  unofficial_napi_context_scope token = 123;
+  if (unofficial_napi_contextify_enter(env, nullptr, &token) == napi_generic_failure &&
+      token == 0) {
+    ++g_teardown->rejected_entries;
+  }
+}
+
+void CleanupHook(void* data) {
+  ++g_teardown->cleanup_calls;
+  ExpectEntryRejected(static_cast<napi_env>(data));
+}
+
+void TeardownFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
+  ++g_teardown->finalizer_calls;
+  ExpectEntryRejected(env);
+}
+
+void InstanceDataFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
+  ++g_teardown->instance_calls;
+  ExpectEntryRejected(env);
+}
+
+// Ordinary finalization may enter a context. Returning without leaving must
+// unwind the scope before the next VM operation.
+void GcFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
+  ++g_teardown->gc_calls;
+  if (unofficial_napi_contextify_enter(env, nullptr, &g_teardown->gc_scope) != napi_ok) {
+    g_teardown->gc_scope = 0;
+  }
+}
+
+}  // namespace
+
+TEST_F(Test65UnofficialContextify, ContextScopeSelectsRealmForOrdinaryOperations) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  fixture.child = MakeRealm(s.env, "child", &fixture);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(fixture.child, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  napi_value child_global = ContextGlobal(s.env, fixture.child, &fixture);
+  ASSERT_NE(parent_global, nullptr);
+  ASSERT_NE(child_global, nullptr);
+  EXPECT_FALSE(StrictEquals(s.env, parent_global, child_global));
+  EXPECT_FALSE(StrictEquals(s.env, parent_global, root));
+
+  unofficial_napi_context_scope outer = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  EXPECT_NE(outer, 0u);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
+  napi_value script_global = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "globalThis"), &script_global), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, script_global, parent_global));
+
+  napi_value object = nullptr;
+  napi_value array = nullptr;
+  napi_value error = nullptr;
+  napi_value promise = nullptr;
+  napi_value constructor = nullptr;
+  napi_deferred deferred = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_create_array(s.env, &array), napi_ok);
+  ASSERT_EQ(napi_create_error(s.env, nullptr, Str(s.env, "native error"), &error), napi_ok);
+  ASSERT_EQ(napi_create_promise(s.env, &deferred, &promise), napi_ok);
+  ASSERT_EQ(napi_resolve_deferred(s.env, deferred, object), napi_ok);
+  ASSERT_EQ(napi_define_class(s.env,
+                              "NativeClass",
+                              NAPI_AUTO_LENGTH,
+                              NativeObject,
+                              nullptr,
+                              0,
+                              nullptr,
+                              &constructor),
+            napi_ok);
+  napi_property_descriptor owner = {};
+  owner.utf8name = "owner";
+  owner.getter = NativeGlobal;
+  ASSERT_EQ(napi_define_properties(s.env, object, 1, &owner), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "nativeAllocatedObject", object),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "nativeAllocatedArray", array),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "nativeAllocatedError", error),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "nativeAllocatedPromise", promise),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "NativeClass", constructor), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+
+  EXPECT_TRUE(ScriptIsTrue(
+      s.env, parent, fixture.host_defined_option,
+      "Object.getPrototypeOf(nativeAllocatedObject) === Object.prototype && "
+      "Object.getPrototypeOf(nativeAllocatedArray) === Array.prototype && "
+      "Object.getPrototypeOf(nativeAllocatedError) === Error.prototype && "
+      "Object.getPrototypeOf(nativeAllocatedPromise) === Promise.prototype && "
+      "Object.getPrototypeOf(NativeClass) === Function.prototype && "
+      "Object.getPrototypeOf(NativeClass.prototype) === Object.prototype && "
+      "nativeAllocatedObject.owner === globalThis"));
+
+  // Values retained past their handle scope keep their creation realm.
+  napi_handle_scope handles = nullptr;
+  napi_ref reference = nullptr;
+  napi_value retained = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  ASSERT_EQ(napi_create_object(s.env, &retained), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, retained, 1, &reference), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  ASSERT_EQ(napi_get_reference_value(s.env, reference, &retained), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, parent_global, "retainedNativeObject", retained),
+            napi_ok);
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, fixture.host_defined_option,
+                           "Object.getPrototypeOf(retainedNativeObject) === Object.prototype"));
+  ASSERT_EQ(napi_delete_reference(s.env, reference), napi_ok);
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeNativeCallbacksUseCreationRealm) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  fixture.child = MakeRealm(s.env, "child", &fixture);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(fixture.child, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  napi_value child_global = ContextGlobal(s.env, fixture.child, &fixture);
+  ASSERT_NE(parent_global, nullptr);
+  ASSERT_NE(child_global, nullptr);
+
+  const napi_value host = fixture.host_defined_option;
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, host, "realmName === 'parent'"));
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, host, "nativeGlobal() === globalThis"));
+  EXPECT_TRUE(ScriptIsTrue(
+      s.env, parent, host, "Object.getPrototypeOf(nativeObject()) === Object.prototype"));
+  EXPECT_TRUE(ScriptIsTrue(
+      s.env, parent, host, "Object.getPrototypeOf(nativeArray()) === Array.prototype"));
+  EXPECT_TRUE(ScriptIsTrue(
+      s.env, parent, host, "Object.getPrototypeOf(nativeFunction()) === Function.prototype"));
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, host,
+                           "(() => { const result = nativeReenter(); return result.childPassed && "
+                           "Object.getPrototypeOf(result) === Object.prototype; })()"));
+
+  // A callback keeps its creation realm when another realm calls it.
+  napi_value parent_native_global = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, parent_global, "nativeGlobal", &parent_native_global),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, child_global, "parentNativeGlobal",
+                                    parent_native_global),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, child_global, "parentGlobal", parent_global), napi_ok);
+  EXPECT_TRUE(ScriptIsTrue(s.env, fixture.child, host, "parentNativeGlobal() === parentGlobal"));
+
+  // Microtask jobs dispatch native callbacks in their creation realm too.
+  napi_value ignored = nullptr;
+  ASSERT_EQ(RunInContext(s.env, fixture.child, host,
+                         "globalThis.jobPassed = false; Promise.resolve().then(() => { "
+                         "globalThis.jobPassed = nativeGlobal() === globalThis; });",
+                         &ignored),
+            napi_ok);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+              napi_ok);
+  }
+  EXPECT_TRUE(ScriptIsTrue(s.env, fixture.child, host, "jobPassed"));
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeTokensAreStrictlyLifo) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  napi_value child = MakeRealm(s.env, "child", &fixture);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(child, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  napi_value child_global = ContextGlobal(s.env, child, &fixture);
+
+  unofficial_napi_context_scope outer = 0;
+  unofficial_napi_context_scope inner = 0;
+  unofficial_napi_context_scope newer = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, child, &inner), napi_ok);
+  EXPECT_NE(outer, inner);
+
+  // Leaving out of order fails and leaves the selection unchanged.
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), child_global));
+
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
+
+  // Tokens are never reused, so a closed token cannot alias a newer scope.
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, child, &newer), napi_ok);
+  EXPECT_NE(newer, inner);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, newer), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, 0), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeSelectsRootAndValidatesArguments) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+
+  // A null or undefined sandbox selects the environment's root context.
+  unofficial_napi_context_scope outer = 0;
+  unofficial_napi_context_scope inner = 0;
+  napi_value undefined = nullptr;
+  napi_value null_value = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  ASSERT_EQ(napi_get_null(s.env, &null_value), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &inner), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, undefined, &inner), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, null_value, &inner), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+
+  // An object that was never contextified does not name a context.
+  napi_value plain = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &plain), napi_ok);
+  unofficial_napi_context_scope token = 123;
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, plain, &token), napi_invalid_arg);
+  EXPECT_EQ(token, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, parent, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_contextify_enter(nullptr, parent, &token), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_contextify_leave(nullptr, 1), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeLeavePreservesPendingException) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  napi_value child = MakeRealm(s.env, "child", &fixture);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(child, nullptr);
+
+  unofficial_napi_context_scope outer = 0;
+  napi_value ignored = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  EXPECT_EQ(RunInContext(s.env, child, fixture.host_defined_option, "throw 91", &ignored),
+            napi_pending_exception);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  napi_value exception = nullptr;
+  int32_t thrown = 0;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, exception, &thrown), napi_ok);
+  EXPECT_EQ(thrown, 91);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeCallbackReclaimsUnbalancedScopes) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  fixture.child = MakeRealm(s.env, "child", &fixture);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(fixture.child, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  ASSERT_NE(parent_global, nullptr);
+
+  unofficial_napi_context_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &scope), napi_ok);
+  ASSERT_TRUE(Install(s.env, parent_global, "leakScope", LeakScope, &fixture));
+  ASSERT_TRUE(Install(s.env, parent_global, "throwInScope", ThrowInScope, &fixture));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scope), napi_ok);
+
+  // A scope a callback leaves open is closed when the callback returns.
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, fixture.host_defined_option,
+                           "leakScope(); nativeGlobal() === globalThis"));
+  EXPECT_NE(fixture.leaked, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, fixture.leaked), napi_invalid_arg);
+
+  // The same holds when the callback throws.
+  fixture.leaked = 0;
+  EXPECT_TRUE(ScriptIsTrue(s.env, parent, fixture.host_defined_option,
+                           "(() => { try { throwInScope(); } catch (error) { "
+                           "return error === 73 && nativeGlobal() === globalThis; } "
+                           "return false; })()"));
+  EXPECT_NE(fixture.leaked, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, fixture.leaked), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeTokensBelongToOneEnvironment) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+
+  unofficial_napi_context_scope outer = 0;
+  unofficial_napi_context_scope inner = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+  {
+    EnvScope foreign(runtime_.get());
+    ASSERT_EQ(unofficial_napi_contextify_enter(foreign.env, nullptr, &inner), napi_ok);
+    EXPECT_NE(inner, outer);
+    EXPECT_EQ(unofficial_napi_contextify_leave(foreign.env, outer), napi_invalid_arg);
+    ASSERT_EQ(unofficial_napi_contextify_leave(foreign.env, inner), napi_ok);
+  }
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+}
+
+// An interrupt callback, like a native function callback, has scopes it left
+// open closed when it returns, instead of unbalancing V8's entered contexts.
+TEST_F(Test65UnofficialContextify, ContextScopeInterruptReclaimsUnbalancedScopes) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  InterruptRecord record;
+  record.sandbox = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(record.sandbox, nullptr);
+
+  ASSERT_EQ(unofficial_napi_request_interrupt(s.env, EnterWithoutLeaving, &record), napi_ok);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env, "let total = 0; "
+                                       "for (let i = 0; i < 1000000; ++i) total += i; "
+                                       "globalThis === this"),
+                            &result),
+            napi_ok);
+  bool same_global = false;
+  ASSERT_EQ(napi_get_value_bool(s.env, result, &same_global), napi_ok);
+  EXPECT_TRUE(same_global);
+  ASSERT_EQ(record.calls, 1u);
+  ASSERT_EQ(record.status, napi_ok);
+  EXPECT_NE(record.scope, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, record.scope), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+// Event-loop checkpoints and unofficial_napi_enqueue_microtask use the root
+// context's queue even while a context with its own queue is selected.
+TEST_F(Test65UnofficialContextify, ContextScopeCheckpointsUseRootMicrotaskQueue) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value own = MakeOwnQueueRealm(s.env, &fixture);
+  ASSERT_NE(own, nullptr);
+  RootCallbackRecord record;
+  napi_value count = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "count", NAPI_AUTO_LENGTH, CountCall, &record, &count),
+            napi_ok);
+
+  // Root work queued before the selection still drains at a checkpoint.
+  unofficial_napi_context_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, count), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, own, &scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
+  EXPECT_EQ(record.calls, 1u);
+
+  // Work queued while the context is selected goes to the root queue too.
+  ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, count), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
+  EXPECT_EQ(record.calls, 2u);
+}
+
+// Deferred finalizers and interrupt callbacks act for the environment, so they
+// run in its root context whatever context is selected when they run.
+TEST_F(Test65UnofficialContextify, ContextScopeProviderCallbacksRunInRoot) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value root = CurrentGlobal(s.env);
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+  napi_value parent_global = ContextGlobal(s.env, parent, &fixture);
+  ASSERT_NE(parent_global, nullptr);
+
+  RootCallbackRecord finalized;
+  finalized.expected_global = root;
+  napi_handle_scope handles = nullptr;
+  napi_value transient = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+  ASSERT_EQ(napi_create_object(s.env, &transient), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, transient, &finalized, RecordGlobalFinalizer, nullptr,
+                               nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+
+  unofficial_napi_context_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &scope), napi_ok);
+  for (int attempt = 0; attempt < 3 && finalized.calls == 0; ++attempt) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+              napi_ok);
+  }
+  ASSERT_EQ(finalized.calls, 1u);
+  EXPECT_TRUE(finalized.saw_expected_global);
+
+  RootCallbackRecord interrupted;
+  interrupted.expected_global = root;
+  napi_value ignored = nullptr;
+  ASSERT_EQ(unofficial_napi_request_interrupt(s.env, RecordGlobal, &interrupted), napi_ok);
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env, "let total = 0; "
+                                       "for (let i = 0; i < 1000000; ++i) total += i; total"),
+                            &ignored),
+            napi_ok);
+  ASSERT_EQ(interrupted.calls, 1u);
+  EXPECT_TRUE(interrupted.saw_expected_global);
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), parent_global));
+  ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scope), napi_ok);
+}
+
+// Scopes left outside any handle scope must not grow the environment's root
+// handle scope, which stays open for the environment's lifetime.
+TEST_F(Test65UnofficialContextify, ContextScopeLeaveDoesNotRetainHandles) {
+  EnvScope s(runtime_.get());
+  ContextScopeFixture fixture;
+  fixture.host_defined_option = Sym(s.env, "context-scope");
+  napi_value parent = MakeRealm(s.env, "parent", &fixture);
+  ASSERT_NE(parent, nullptr);
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  ASSERT_NE(isolate, nullptr);
+
+  const int before = v8::HandleScope::NumberOfHandles(isolate);
+  for (int i = 0; i < 10000; ++i) {
+    unofficial_napi_context_scope outer = 0;
+    unofficial_napi_context_scope inner = 0;
+    ASSERT_EQ(unofficial_napi_contextify_enter(s.env, parent, &outer), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &inner), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_leave(s.env, inner), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_leave(s.env, outer), napi_ok);
+  }
+  EXPECT_LT(v8::HandleScope::NumberOfHandles(isolate) - before, 16);
+}
+
+TEST_F(Test65UnofficialContextify, ContextScopeDepthIsBounded) {
+  EnvScope s(runtime_.get());
+  napi_value root = CurrentGlobal(s.env);
+  constexpr unsigned kMaxDepth = 1024;
+  std::vector<unofficial_napi_context_scope> scopes(kMaxDepth);
+  for (unsigned i = 0; i < kMaxDepth; ++i) {
+    ASSERT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &scopes[i]), napi_ok) << i;
+  }
+  unofficial_napi_context_scope overflow = 123;
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &overflow), napi_generic_failure);
+  EXPECT_EQ(overflow, 0u);
+  for (unsigned i = kMaxDepth; i > 0; --i) {
+    ASSERT_EQ(unofficial_napi_contextify_leave(s.env, scopes[i - 1]), napi_ok) << i;
+  }
+  EXPECT_TRUE(StrictEquals(s.env, CurrentGlobal(s.env), root));
+}
+
+// Releasing an environment closes scopes left open, and cleanup hooks and
+// teardown finalizers cannot enter a context. A finalizer that runs during
+// ordinary garbage collection may, and its unbalanced scope is reclaimed.
+TEST_F(Test65UnofficialContextify, ContextScopeTeardownReclaimsAndRejectsEntry) {
+  TeardownCounters counters;
+  g_teardown = &counters;
+  for (unsigned run = 0; run < 2; ++run) {
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    unofficial_napi_env_create_options options{};
+    InitializeTestEnvCreateOptions(&options);
+    ASSERT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+              napi_ok);
+
+    napi_handle_scope handles = nullptr;
+    napi_value transient = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env, &handles), napi_ok);
+    ASSERT_EQ(napi_create_object(env, &transient), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(env, transient, nullptr, GcFinalizer, nullptr, nullptr),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env, handles), napi_ok);
+    for (unsigned attempt = 0; attempt < 3 && counters.gc_calls != run + 1; ++attempt) {
+      ASSERT_EQ(unofficial_napi_collect_garbage(env), napi_ok);
+      ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                    env, unofficial_napi_event_loop_checkpoint_host_tasks, false, nullptr),
+                napi_ok);
+    }
+    ASSERT_EQ(counters.gc_calls, run + 1);
+    EXPECT_NE(counters.gc_scope, 0u);
+    EXPECT_EQ(unofficial_napi_contextify_leave(env, counters.gc_scope), napi_invalid_arg);
+
+    ASSERT_EQ(napi_add_env_cleanup_hook(env, CleanupHook, env), napi_ok);
+    ASSERT_EQ(napi_set_instance_data(env, nullptr, InstanceDataFinalizer, nullptr), napi_ok);
+    napi_value object = nullptr;
+    napi_ref reference = nullptr;
+    uint32_t count = 0;
+    ASSERT_EQ(napi_create_object(env, &object), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(env, object, nullptr, TeardownFinalizer, nullptr, &reference),
+              napi_ok);
+    ASSERT_EQ(napi_reference_ref(env, reference, &count), napi_ok);
+
+    // Leave the root and, innermost, a contextified realm entered. Release
+    // must close both before it exits the root context, or V8 aborts.
+    napi_value sandbox = nullptr;
+    napi_value ignored = nullptr;
+    napi_value host_defined_option = nullptr;
+    ASSERT_EQ(napi_create_object(env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_create_symbol(env, nullptr, &host_defined_option), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_make_context(env,
+                                                      sandbox,
+                                                      Str(env, "teardown"),
+                                                      Str(env, "test://teardown"),
+                                                      true,
+                                                      true,
+                                                      false,
+                                                      host_defined_option,
+                                                      &ignored),
+              napi_ok);
+    unofficial_napi_context_scope outer = 0;
+    unofficial_napi_context_scope inner = 0;
+    ASSERT_EQ(unofficial_napi_contextify_enter(env, nullptr, &outer), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_enter(env, sandbox, &inner), napi_ok);
+    ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  }
+  g_teardown = nullptr;
+  EXPECT_EQ(counters.cleanup_calls, 2u);
+  EXPECT_EQ(counters.finalizer_calls, 2u);
+  EXPECT_EQ(counters.instance_calls, 2u);
+  EXPECT_EQ(counters.rejected_entries, 6u);
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test65UnofficialContextify, ContextScopeIsUnsupported) {
+  EnvScope s(runtime_.get());
+
+  napi_value sandbox = nullptr;
+  napi_value ignored = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "ctx"),
+                                                    Str(s.env, "test://origin"),
+                                                    true,
+                                                    true,
+                                                    false,
+                                                    Sym(s.env, "hdo"),
+                                                    &ignored),
+            napi_ok);
+
+  unofficial_napi_context_scope token = 123;
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, &token), napi_generic_failure);
+  EXPECT_EQ(token, 0u);
+  token = 123;
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, sandbox, &token), napi_generic_failure);
+  EXPECT_EQ(token, 0u);
+  EXPECT_EQ(unofficial_napi_contextify_leave(s.env, 1), napi_generic_failure);
+  EXPECT_EQ(unofficial_napi_contextify_enter(s.env, nullptr, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_contextify_enter(nullptr, nullptr, &token), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_contextify_leave(nullptr, 1), napi_invalid_arg);
 }
 #endif

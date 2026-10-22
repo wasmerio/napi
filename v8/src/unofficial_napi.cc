@@ -26,6 +26,7 @@
 
 #include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
+#include "internal/napi_context_scope.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
@@ -360,7 +361,7 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
   }
 
   PrepareStackTraceState& state = state_it->second;
-  v8::Local<v8::Context> principal_context = env->context();
+  v8::Local<v8::Context> principal_context = env->root_context();
   const bool use_principal_callback =
       !principal_context.IsEmpty() &&
       (context == principal_context || NapiV8IsContextifyContext(env, context));
@@ -778,7 +779,7 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
       std::getenv("EDGE_DEBUG_EXCEPTIONS")[0] != '0';
 
   v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Context> context = env->root_context();
   v8::Context::Scope context_scope(context);
   v8::TryCatch tc(isolate);
   if (debug_promise_reject) {
@@ -2065,7 +2066,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     PrepareStackTraceState& state = g_prepare_stack_trace_callbacks[env];
-    v8::Local<v8::Context> principal_context = env->context();
+    v8::Local<v8::Context> principal_context = env->root_context();
     const bool use_principal_callback =
         current_context.IsEmpty() ||
         (!principal_context.IsEmpty() &&
@@ -2136,7 +2137,9 @@ void PumpPlatformForegroundTasks(napi_env env) {
 void DrainMicrotasksForEnv(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   env->DrainFinalizerQueue();
-  v8::Local<v8::Context> context = env->context();
+  // Always the root context's queue: a selected context with its own queue
+  // drains after evaluation in it (contextify_run_script), not here.
+  v8::Local<v8::Context> context = env->root_context();
   if (!context.IsEmpty()) {
     v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
     if (queue != nullptr) {
@@ -2232,9 +2235,13 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
           return;
         }
         v8::HandleScope handle_scope(isolate);
-        v8::Local<v8::Context> context = request->env->context();
+        // An interrupt can arrive while any context is selected; run the
+        // callback in the root context, like other provider callbacks.
+        v8::Local<v8::Context> context = request->env->root_context();
         if (context.IsEmpty()) return;
-        v8::Context::Scope context_scope(context);
+        // Like a native function callback: scopes the callback enters and
+        // leaves open are closed when it returns.
+        NapiV8ContextScope context_scope(request->env, context);
         request->callback(request->env, request->data);
       },
       request);
@@ -2327,7 +2334,8 @@ napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_valu
   if (env == nullptr || env->isolate == nullptr || callback == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(callback);
   if (!raw->IsFunction()) return napi_function_expected;
-  env->context()->GetMicrotaskQueue()->EnqueueMicrotask(env->isolate, raw.As<v8::Function>());
+  // The root queue, which event-loop checkpoints drain, whatever is selected.
+  env->root_context()->GetMicrotaskQueue()->EnqueueMicrotask(env->isolate, raw.As<v8::Function>());
   return napi_ok;
 }
 
@@ -2389,7 +2397,7 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
   }
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
-  NapiV8ApplyPromiseHooksToContext(env, env->context());
+  NapiV8ApplyPromiseHooksToContext(env, env->root_context());
   NapiV8ApplyPromiseHooksToContextifyContexts(env);
 #else
   env->isolate->SetPromiseHook(has_hooks ? PromiseHookCallback : nullptr);
@@ -2455,7 +2463,9 @@ napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
 
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
+  // The environment-wide reject callback runs in the root, as it does from
+  // PromiseRejectCallback.
+  v8::Local<v8::Context> context = env->root_context();
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Promise> local_promise = raw.As<v8::Promise>();
   if (local_promise->State() != v8::Promise::PromiseState::kRejected) {

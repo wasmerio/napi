@@ -1147,6 +1147,37 @@ fn guest_unofficial_napi_contextify_make_context(
     status
 }
 
+fn guest_unofficial_napi_contextify_enter(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    context: u32,
+    result_ptr: u32,
+) -> i32 {
+    // Validate before changing provider state; an invalid output pointer must
+    // not leave an unreachable VM scope open.
+    if result_ptr == 0 || !write_guest_u64(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let mut token = 0u64;
+    let handle = snapi_env(&env, napi_env);
+    let status = unsafe { snapi_bridge_unofficial_contextify_enter(handle, context, &mut token) };
+    if status == 0 && !write_guest_u64(&mut env, result_ptr, token) {
+        unsafe {
+            snapi_bridge_unofficial_contextify_leave(handle, token);
+        }
+        return 1;
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_leave(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    token: u64,
+) -> i32 {
+    unsafe { snapi_bridge_unofficial_contextify_leave(snapi_env(&env, napi_env), token) }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_contextify_run_script(
@@ -4912,6 +4943,8 @@ pub fn register_napi_imports(
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
         "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
+        "unofficial_napi_contextify_enter" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_enter),
+        "unofficial_napi_contextify_leave" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_leave),
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),
