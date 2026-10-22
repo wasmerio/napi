@@ -1592,11 +1592,16 @@ fn guest_unofficial_napi_contextify_make_context(
 // Explicitly unsupported until this provider has real context entry. Do not
 // claim that its Proxy/eval sandbox selects a native VM realm.
 fn guest_unofficial_napi_contextify_enter(
-    _env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     _napi_env: u32,
     _context: u32,
-    _result_ptr: u32,
+    result_ptr: u32,
 ) -> i32 {
+    // Same output contract as the native import and QuickJS: a valid result
+    // pointer holds token 0 after the call.
+    if result_ptr == 0 || !write_guest_u64(&mut env, result_ptr, 0) {
+        return 1;
+    }
     9
 }
 
