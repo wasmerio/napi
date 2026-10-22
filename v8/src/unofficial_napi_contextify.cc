@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -30,6 +31,7 @@
 #endif
 
 #include "internal/napi_v8_env.h"
+#include "internal/napi_context_scope.h"
 #include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "node_api.h"
@@ -1659,6 +1661,41 @@ void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
 }
 
 extern "C" {
+
+napi_status NAPI_CDECL unofficial_napi_contextify_enter(
+    napi_env env, napi_value sandbox_or_null, unofficial_napi_context_scope* scope_out) {
+  if (env == nullptr || env->isolate == nullptr || scope_out == nullptr) return napi_invalid_arg;
+  *scope_out = 0;
+  if (env->context_scopes_closing) return napi_generic_failure;
+  if (env->context_scope != nullptr && env->context_scope->depth() >= 1024)
+    return napi_generic_failure;
+  v8::HandleScope handles(env->isolate);
+  v8::Local<v8::Context> context = env->context_ref.Get(env->isolate);
+  v8::MicrotaskQueue* queue = nullptr;
+  if (!IsNullish(env, sandbox_or_null)) {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    if (!ResolveContextFromKey(env, sandbox_or_null, &context, &queue)) return napi_invalid_arg;
+  }
+  // Never recycle a token, including across environments. A stale or foreign
+  // Wasm token cannot alias a subsequently allocated native scope pointer.
+  static std::atomic<uint64_t> next_token{1};
+  uint64_t token = next_token.load(std::memory_order_relaxed);
+  while (token != UINT64_MAX && !next_token.compare_exchange_weak(
+      token, token + 1, std::memory_order_relaxed)) {}
+  if (token == UINT64_MAX) return napi_generic_failure;
+  auto* scope = new (std::nothrow) NapiV8ContextScope(env, context, token);
+  if (scope == nullptr) return napi_generic_failure;
+  *scope_out = token;
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL unofficial_napi_contextify_leave(
+    napi_env env, unofficial_napi_context_scope token) {
+  if (env == nullptr || env->isolate == nullptr || token == 0 || env->context_scope == nullptr
+      || env->context_scope->token() != token) return napi_invalid_arg;
+  delete env->context_scope;
+  return napi_v8_clear_last_error(env);
+}
 
 napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
     napi_env env,

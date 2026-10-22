@@ -1589,6 +1589,25 @@ fn guest_unofficial_napi_contextify_make_context(
     status
 }
 
+// Explicitly unsupported until this provider has real context entry. Do not
+// claim that its Proxy/eval sandbox selects a native VM realm.
+fn guest_unofficial_napi_contextify_enter(
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _context: u32,
+    _result_ptr: u32,
+) -> i32 {
+    9
+}
+
+fn guest_unofficial_napi_contextify_leave(
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _token: u64,
+) -> i32 {
+    9
+}
+
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -5662,6 +5681,8 @@ pub fn register_napi_imports(
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
         "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
+        "unofficial_napi_contextify_enter" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_enter),
+        "unofficial_napi_contextify_leave" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_leave),
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),

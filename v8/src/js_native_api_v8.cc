@@ -1,5 +1,6 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_callback_payload.h"
+#include "internal/napi_context_scope.h"
 #include "internal/napi_env_records.h"
 #include "internal/napi_escapable_handle_scope_wrapper.h"
 #include "internal/napi_external_wrapper.h"
@@ -450,6 +451,7 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   napi_env env = payload->env;
+  NapiV8ContextScope context_scope(env, payload->context.Get(env->isolate));
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
@@ -516,7 +518,7 @@ napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env)
 void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
   if (cb == nullptr) return;
   v8::HandleScope handle_scope(isolate);
-  v8::Context::Scope context_scope(context());
+  NapiV8ContextScope context_scope(this, context());
   cb(this, data, hint);
 }
 
@@ -577,6 +579,11 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 }
 
 napi_env__::~napi_env__() {
+  context_scopes_closing = true;
+  while (context_scope != nullptr) {
+    assert(context_scope->token() != 0);
+    delete context_scope;
+  }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   RunEnvCleanupHooks(this);
   napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
@@ -594,6 +601,7 @@ napi_env__::~napi_env__() {
 }
 
 v8::Local<v8::Context> napi_env__::context() const {
+  if (context_scope != nullptr) return context_scope->context();
   return context_ref.Get(isolate);
 }
 
@@ -1697,6 +1705,7 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   }
   auto* payload = env->allocate<napi_callback_payload__>(env, cb, data);
   if (payload == nullptr) return napi_generic_failure;
+  payload->context.Reset(env->isolate, env->context());
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
   v8::Local<v8::Context> context = env->context();
@@ -1742,6 +1751,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   v8::Local<v8::Context> context = env->context();
   auto* payload = env->allocate<napi_callback_payload__>(env, constructor, data);
   if (payload == nullptr) return napi_generic_failure;
+  payload->context.Reset(env->isolate, env->context());
 
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
   v8::Local<v8::String> name;

@@ -586,6 +586,22 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(n
 
 // Unofficial helpers for implementing internalBinding('contextify') on embedders.
 // These are engine-specific APIs and are not part of the public Node-API.
+// Enter a context for ordinary N-API operations, including allocations and
+// native function creation. A null/undefined sandbox selects the host root.
+// Tokens belong to one environment, must close in strict LIFO order, and are
+// invalid after close. Context scopes are separate from handle scopes. Leaving
+// preserves a pending exception. Native callbacks select their creation realm
+// for the duration of dispatch, restoring the previous selection on return.
+// An unbalanced guest-entered scope is reclaimed when its callback returns or
+// its environment closes. Unsupported providers return napi_generic_failure.
+// Call on the environment's owning VM thread. Entry fails with
+// napi_generic_failure during teardown or at a nesting depth of 1024.
+typedef uint64_t unofficial_napi_context_scope;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_enter(
+    napi_env env, napi_value sandbox_or_null, unofficial_napi_context_scope* scope_out);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_leave(
+    napi_env env, unofficial_napi_context_scope scope);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context(
     napi_env env,
     napi_value sandbox_or_symbol,

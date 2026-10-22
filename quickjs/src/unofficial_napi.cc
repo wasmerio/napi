@@ -1082,6 +1082,20 @@ extern "C"
         return napi_ok;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_contextify_enter(
+        napi_env env, napi_value, unofficial_napi_context_scope* scope_out)
+    {
+        if (env == nullptr || scope_out == nullptr) return napi_invalid_arg;
+        *scope_out = 0;
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_contextify_leave(
+        napi_env env, unofficial_napi_context_scope)
+    {
+        return env == nullptr ? napi_invalid_arg : napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
         napi_env env,
         napi_value sandbox_or_symbol,

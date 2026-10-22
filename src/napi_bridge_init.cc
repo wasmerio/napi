@@ -3749,6 +3749,23 @@ extern "C" int snapi_bridge_unofficial_contextify_make_context(
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_contextify_enter(
+    SnapiEnvState* state, uint32_t context_id, uint64_t* token_out) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr || token_out == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value context = context_id ? LoadValue(*bridge, context_id) : nullptr;
+  if (context_id && context == nullptr) return napi_invalid_arg;
+  return unofficial_napi_contextify_enter(bridge->env, context, token_out);
+}
+
+extern "C" int snapi_bridge_unofficial_contextify_leave(SnapiEnvState* state, uint64_t token) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  return unofficial_napi_contextify_leave(bridge->env, token);
+}
+
 extern "C" int snapi_bridge_unofficial_contextify_run_script(
     SnapiEnvState* env_state,
     uint32_t sandbox_or_null_id,

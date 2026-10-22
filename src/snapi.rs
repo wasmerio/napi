@@ -292,6 +292,12 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_enter(
+        env: SnapiEnv,
+        context_id: u32,
+        token_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_leave(env: SnapiEnv, token: u64) -> i32;
     pub fn snapi_bridge_unofficial_contextify_run_script(
         env: SnapiEnv,
         sandbox_or_null_id: u32,

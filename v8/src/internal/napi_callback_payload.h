@@ -2,11 +2,13 @@
 #define NAPI_V8_CALLBACK_PAYLOAD_H_
 
 #include "js_native_api.h"
+#include <v8.h>
 
 struct napi_callback_payload__ {
   napi_env env;
   napi_callback cb;
   void* data;
+  v8::Global<v8::Context> context;
 };
 
 struct napi_accessor_payload__ {

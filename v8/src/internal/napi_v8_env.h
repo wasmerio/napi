@@ -29,6 +29,7 @@ struct napi_escapable_handle_scope__;
 struct napi_external_backing_store_hint__;
 struct napi_external_wrapper__;
 struct napi_handle_scope__;
+class NapiV8ContextScope;
 struct napi_ref__;
 struct napi_ref_with_data__;
 struct napi_ref_with_finalizer__;
@@ -83,6 +84,8 @@ struct napi_env__ {
 
   v8::Isolate* isolate = nullptr;
   v8::Global<v8::Context> context_ref;
+  NapiV8ContextScope* context_scope = nullptr;
+  bool context_scopes_closing = false;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
   v8::Global<v8::Value> last_exception;
