@@ -448,25 +448,26 @@ impl NapiEnv {
         (env_id, scope_id)
     }
 
-    /// Runs `f` on an env of this application, which may belong to another
-    /// store and thread, while the registry lock keeps it from being released.
-    /// `f` may only make thread-safe control requests (terminate, interrupt):
-    /// it must not run JavaScript or use the env in any other way.
+    /// Terminates the JavaScript running in an env of this application, which
+    /// may belong to another store and thread. Returns `napi_invalid_arg` (1)
+    /// for an id this application does not know.
+    ///
+    /// Terminate is the only cross-store control: it runs no guest code. An
+    /// interrupt runs a guest function chosen by the caller, so it stays within
+    /// the caller's own store. The registry lock keeps the target from being
+    /// released while the request is handed to the bridge.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) fn with_control_env<R>(
-        &self,
-        guest_env: u32,
-        f: impl FnOnce(SnapiEnv) -> R,
-    ) -> Option<R> {
-        if guest_env == 0 {
-            return None;
-        }
+    pub(crate) fn terminate_app_env(&self, guest_env: u32) -> i32 {
         let registry = self
             .env_registry
             .lock()
             .expect("poisoned N-API env registry");
-        let raw = *registry.envs.get(&guest_env)?;
-        Some(f(raw as SnapiEnv))
+        let Some(&raw) = registry.envs.get(&guest_env) else {
+            return 1;
+        };
+        // SAFETY: registered envs are retained, and the bridge accepts
+        // terminate from any thread.
+        unsafe { crate::snapi::snapi_bridge_unofficial_terminate_execution(raw as SnapiEnv) }
     }
 
     fn discard_buffer_leases_for_env(&mut self, env_id: u32) {

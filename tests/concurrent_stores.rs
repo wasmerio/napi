@@ -64,10 +64,11 @@ fn env_ids_are_unique_per_application() {
 }
 
 /// A worker store's environment, running JavaScript on its own thread, can be
-/// interrupted and terminated from the main store, which cannot otherwise use,
-/// cancel or release it.
+/// terminated from the main store. The main store cannot interrupt it (an
+/// interrupt runs a guest function chosen by the caller), use, cancel or
+/// release it. The worker can still interrupt its own env.
 #[test]
-fn another_store_can_interrupt_and_terminate_but_not_use_an_env() {
+fn another_store_can_terminate_but_not_interrupt_or_use_an_env() {
     let (engine, module) = compile();
     let ctx = NapiCtx::default();
     let (signal_tx, _signal_rx) = mpsc::channel();
@@ -92,10 +93,12 @@ fn another_store_can_interrupt_and_terminate_but_not_use_an_env() {
             let token = from_main.recv_timeout(TIMEOUT).unwrap();
             assert_eq!(worker.take(token), 0);
             assert_eq!(worker.install(), 0);
+            // Runs at the next JavaScript entry, in this store.
+            assert_eq!(worker.interrupt(id), 0);
             // Cell 0 tells the main store where this script is.
             let waited = worker.number(
                 "const cell = new Int32Array(shared); Atomics.store(cell, 0, 1); \
-                 Atomics.wait(cell, 1, 0, 10000) === 'ok' ? 42 : 0",
+                 Atomics.wait(cell, 1, 0, 20000) === 'ok' ? 42 : 0",
             );
             to_main.send(waited).unwrap();
             to_main.send(worker.interrupted()).unwrap();
@@ -116,6 +119,11 @@ fn another_store_can_interrupt_and_terminate_but_not_use_an_env() {
     assert_eq!(main.undefined_in(worker_id), NAPI_INVALID_ARG);
     assert_eq!(main.cancel(worker_id), NAPI_INVALID_ARG);
     assert_eq!(main.release_scope(worker_scope), NAPI_INVALID_ARG);
+    assert_eq!(
+        main.interrupt(worker_id),
+        NAPI_INVALID_ARG,
+        "another store ran a guest function of its choice in this env"
+    );
 
     to_worker.send(shared_token).unwrap();
     let wait_until = |main: &mut Guest, value: i32| {
@@ -136,9 +144,6 @@ fn another_store_can_interrupt_and_terminate_but_not_use_an_env() {
     let other_token = main.token();
     assert_ne!(other_token, shared_token);
     main.drop_message(other_token);
-    // The worker's interrupt callback must run on the worker, in the worker's
-    // store, while its script is still waiting.
-    assert_eq!(main.interrupt(worker_id), 0);
     let deadline = Instant::now() + TIMEOUT;
     while main.number("Atomics.notify(new Int32Array(shared), 1)") != 1 {
         assert!(Instant::now() < deadline, "could not wake the worker");
@@ -148,7 +153,7 @@ fn another_store_can_interrupt_and_terminate_but_not_use_an_env() {
     assert_eq!(
         from_worker.recv_timeout(TIMEOUT).unwrap(),
         INTERRUPT_DATA,
-        "the interrupt did not run in the worker's own store"
+        "the worker's own interrupt did not run in its store"
     );
 
     wait_until(&mut main, 2);

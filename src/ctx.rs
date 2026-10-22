@@ -69,6 +69,13 @@ pub struct NapiInstantiationState {
 /// thread, for example a WASIX thread woken from deep sleep on a different
 /// worker. An environment whose store is dropped on another thread is not
 /// released: its isolate leaks and stays charged to the budget.
+///
+/// Environment ids are allocated per [`NapiCtx`], so all stores created from
+/// one context (one application, e.g. a guest and its WASIX threads) share
+/// them. Any of those stores may terminate any of the application's
+/// environments; every other call, including interrupts, which run a guest
+/// function chosen by the caller, resolves only within the caller's own store.
+/// Instantiate untrusted, unrelated guests from separate contexts.
 // The import phase creates a per-instantiation session holding the function
 // env backing the imported host functions, and hands it to the caller as
 // opaque state. The hooks themselves are stateless, so concurrent
