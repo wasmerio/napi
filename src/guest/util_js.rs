@@ -280,7 +280,7 @@ pub enum GuestStringEncoding {
 /// memory or has no terminator within `MAX_GUEST_CSTRING_SCAN` units.
 pub fn read_guest_string_value(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     length: u32,
     encoding: GuestStringEncoding,
 ) -> Option<JsValue> {
@@ -291,9 +291,7 @@ pub fn read_guest_string_value(
         f64::from(length)
     };
     let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
-    // A wasm32 pointer arrives as i32; addresses above 2 GiB are negative.
-    wasmer_napi_guest_string(&memory, guest_ptr as u32, length, encoding as u32, max)
-        .map(JsValue::from)
+    wasmer_napi_guest_string(&memory, guest_ptr, length, encoding as u32, max).map(JsValue::from)
 }
 
 /// Implements `napi_get_value_string_*` for a value already resolved from its
@@ -301,23 +299,17 @@ pub fn read_guest_string_value(
 pub fn write_guest_string_value(
     env: &mut FunctionEnvMut<NapiEnv>,
     value: &JsValue,
-    buf: i32,
-    size: i32,
-    result_ptr: i32,
+    buf: u32,
+    size: u32,
+    result_ptr: u32,
     encoding: GuestStringEncoding,
 ) -> i32 {
     let Some(memory) = guest_memory(env) else {
         return 1;
     };
-    // wasm32 pointers and sizes arrive as i32; zero is NULL.
-    let written = wasmer_napi_guest_write_string(
-        &memory,
-        value,
-        buf as u32,
-        size as u32,
-        result_ptr as u32,
-        encoding as u32,
-    );
+    // Zero `buf` or `size` asks for the length only; zero `result_ptr` is NULL.
+    let written =
+        wasmer_napi_guest_write_string(&memory, value, buf, size, result_ptr, encoding as u32);
     if written == -1.0 {
         3 // napi_string_expected
     } else if written < 0.0 {
@@ -391,23 +383,20 @@ pub enum GuestNumberKind {
 pub fn write_guest_number_value(
     env: &mut FunctionEnvMut<NapiEnv>,
     value: &JsValue,
-    guest_ptr: i32,
+    guest_ptr: u32,
     kind: GuestNumberKind,
 ) -> i32 {
     let Some(memory) = guest_memory(env) else {
         return 1;
     };
-    wasmer_napi_guest_write_number(&memory, value, guest_ptr as u32, kind as u32)
+    wasmer_napi_guest_write_number(&memory, value, guest_ptr, kind as u32)
 }
 
 pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     len: usize,
 ) -> Option<Vec<u8>> {
-    if guest_ptr < 0 {
-        return None;
-    }
     let memory = guest_memory(env)?;
     // Reject an impossible guest range before allocating the host snapshot.
     // The bounds-checked read below is too late: `vec![0; len]` may otherwise
@@ -416,7 +405,7 @@ pub fn read_guest_bytes(
         return None;
     }
     let mut out = vec![0u8; len];
-    wasmer_napi_guest_read(&memory, guest_ptr as u32, &mut out).then_some(out)
+    wasmer_napi_guest_read(&memory, guest_ptr, &mut out).then_some(out)
 }
 
 pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
@@ -441,11 +430,13 @@ pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize)
         env.data_mut().guest_buffer_pool.swap_remove(index)
     } else {
         let malloc_fn = env.data().malloc_fn.clone()?;
-        let allocation_len = i32::try_from(required_capacity).ok()?;
-        let guest_ptr: i32 = {
+        // `malloc` takes a wasm32 `size_t` and returns a wasm32 pointer; both
+        // are unsigned even though the typed function carries them as `i32`.
+        let allocation_len = u32::try_from(required_capacity).ok()?;
+        let guest_ptr: u32 = {
             let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, allocation_len) {
-                Ok(ptr) => ptr,
+            match malloc_fn.call(&mut store_ref, allocation_len as i32) {
+                Ok(ptr) => ptr as u32,
                 Err(error) => {
                     eprintln!(
                         "[wasmer-napi] guest buffer allocation trapped: requested={required_capacity} allocated={} error={error}",
@@ -455,7 +446,7 @@ pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize)
                 }
             }
         };
-        if guest_ptr <= 0 {
+        if guest_ptr == 0 {
             eprintln!(
                 "[wasmer-napi] guest buffer allocation failed: requested={required_capacity} allocated={} result={guest_ptr}",
                 env.data().guest_buffer_allocated_bytes,
@@ -467,7 +458,7 @@ pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize)
             .guest_buffer_allocated_bytes
             .saturating_add(required_capacity);
         env.data_mut().guest_buffer_allocated_bytes = allocated;
-        (guest_ptr as u32, required_capacity)
+        (guest_ptr, required_capacity)
     };
     env.data_mut()
         .guest_buffer_capacities
@@ -480,6 +471,32 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> O
     if !data.is_empty() && !write_guest_bytes(env, guest_ptr, data) {
         recycle_guest_allocation(env, guest_ptr);
         return None;
+    }
+    Some(guest_ptr)
+}
+
+/// Allocate `byte_len` zeroed bytes of guest memory. The guest allocation comes
+/// first, so a guest-supplied length is bounded by what the guest heap can
+/// actually provide, and zeroing goes through a fixed-size scratch buffer
+/// rather than a host copy sized by that length.
+pub fn allocate_zeroed_guest_bytes(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    byte_len: usize,
+) -> Option<u32> {
+    const ZERO_CHUNK: usize = 64 * 1024;
+    let guest_ptr = allocate_guest_buffer(env, byte_len)?;
+    let zeros = vec![0u8; byte_len.min(ZERO_CHUNK)];
+    let mut written = 0usize;
+    while written < byte_len {
+        let chunk = (byte_len - written).min(ZERO_CHUNK);
+        // In bounds of the allocation just made inside the 32-bit guest
+        // address space, so neither conversion nor addition can overflow.
+        let at = guest_ptr + written as u32;
+        if !write_guest_bytes(env, at, &zeros[..chunk]) {
+            recycle_guest_allocation(env, guest_ptr);
+            return None;
+        }
+        written += chunk;
     }
     Some(guest_ptr)
 }
@@ -611,7 +628,7 @@ pub fn resolve_or_copy_host_data_to_guest(
     }
     let host_slice = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) };
     let guest_ptr = allocate_guest_bytes(env, host_slice)?;
-    let snapi_env = env.data().resolve_napi_env(guest_env as i32);
+    let snapi_env = env.data().resolve_napi_env(guest_env);
     if snapi_env.is_null() {
         forget_guest_allocation(env, guest_ptr);
         return None;
@@ -658,7 +675,7 @@ pub fn resolve_or_copy_host_data_to_guest(
 
 pub fn read_guest_u32_array(
     env: &mut FunctionEnvMut<NapiEnv>,
-    guest_ptr: i32,
+    guest_ptr: u32,
     count: usize,
 ) -> Option<Vec<u32>> {
     let bytes = read_guest_bytes(env, guest_ptr, count.checked_mul(4)?)?;
@@ -669,20 +686,12 @@ pub fn read_guest_u32_array(
     Some(result)
 }
 
-pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) -> Option<Vec<u8>> {
-    if guest_ptr < 0 {
-        return None;
-    }
+pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<Vec<u8>> {
     let memory = guest_memory(env)?;
     let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
-    let len = usize::try_from(wasmer_napi_guest_c_string_length(
-        &memory,
-        guest_ptr as u32,
-        max,
-    ))
-    .ok()?;
+    let len = usize::try_from(wasmer_napi_guest_c_string_length(&memory, guest_ptr, max)).ok()?;
     let mut out = vec![0u8; len];
-    wasmer_napi_guest_read(&memory, guest_ptr as u32, &mut out).then_some(out)
+    wasmer_napi_guest_read(&memory, guest_ptr, &mut out).then_some(out)
 }
 
 #[cfg(test)]

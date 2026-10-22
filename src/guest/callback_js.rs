@@ -110,7 +110,7 @@ fn install_callback_state(
 fn call_guest_callback(
     env: &mut FunctionEnvMut<NapiEnv>,
     table: &Table,
-    guest_env: i32,
+    guest_env: u32,
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
@@ -140,7 +140,10 @@ fn call_guest_callback(
     };
     let result = func.call(
         env,
-        &[Value::I32(guest_env), Value::I32(callback_arg as i32)],
+        &[
+            Value::I32(guest_env as i32),
+            Value::I32(callback_arg as i32),
+        ],
     );
     match result {
         Ok(ret_vals) => match ret_vals.first() {
@@ -158,7 +161,7 @@ fn call_guest_callback(
 fn call_guest_finalizer(
     env: &mut FunctionEnvMut<NapiEnv>,
     table: &Table,
-    guest_env: i32,
+    guest_env: u32,
     wasm_fn_ptr: u32,
     data: u32,
     hint: u32,
@@ -177,7 +180,7 @@ fn call_guest_finalizer(
     match func.call(
         env,
         &[
-            Value::I32(guest_env),
+            Value::I32(guest_env as i32),
             Value::I32(data as i32),
             Value::I32(hint as i32),
         ],
@@ -197,7 +200,7 @@ fn call_guest_finalizer(
 fn call_guest_callback_and_flush(
     env: &mut FunctionEnvMut<NapiEnv>,
     table: &Table,
-    guest_env: i32,
+    guest_env: u32,
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
@@ -241,7 +244,7 @@ pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi
 
     let mut held = Vec::new();
     for mut mapping in drained {
-        let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env as i32);
+        let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env);
         if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
             if let Some(memory) = env.data().memory.clone() {
                 let memory_buffer = memory.as_js().js_buffer();
@@ -325,7 +328,7 @@ pub fn publish_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, sna
         if !needs_flush || byte_len == 0 {
             continue;
         }
-        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env as i32);
+        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env);
         if mapping_snapi.is_null() {
             continue;
         }
@@ -368,7 +371,7 @@ pub fn refresh_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: 
         if needs_flush || byte_len == 0 {
             continue;
         }
-        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env as i32);
+        let mapping_snapi = env.data().resolve_napi_env(mapping_guest_env);
         if mapping_snapi.is_null() {
             continue;
         }
@@ -393,7 +396,7 @@ pub fn flush_host_buffer_copies_for_owner(env: &mut FunctionEnvMut<NapiEnv>, own
 
     let mut held = Vec::new();
     for mut mapping in drained {
-        let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env as i32);
+        let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env);
         if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
             if let Some(memory) = env.data().memory.clone() {
                 let memory_buffer = memory.as_js().js_buffer();
@@ -526,7 +529,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
                 eprintln!("[callback trampoline] guest function table is not installed");
                 return 0;
             };
-            call_guest_callback_and_flush(env, &table, guest_env as i32, wasm_fn_ptr, callback_arg)
+            call_guest_callback_and_flush(env, &table, guest_env, wasm_fn_ptr, callback_arg)
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         CallbackEnv::Async(env) => {
@@ -538,7 +541,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
                 call_guest_callback_and_flush(
                     &mut sync_env,
                     &table,
-                    guest_env as i32,
+                    guest_env,
                     wasm_fn_ptr,
                     callback_arg,
                 )
@@ -551,7 +554,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
                     return call_guest_callback_and_flush(
                         &mut sync_env,
                         &table,
-                        guest_env as i32,
+                        guest_env,
                         wasm_fn_ptr,
                         callback_arg,
                     );
@@ -582,11 +585,11 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         let Some(table) = env.data().table.clone() else {
             return 0;
         };
-        let snapi_env = env.data().resolve_napi_env(guest_env as i32);
+        let snapi_env = env.data().resolve_napi_env(guest_env);
         refresh_host_buffer_copies(env, snapi_env);
         let owner_id = env.data_mut().next_host_buffer_owner();
         env.data_mut().host_buffer_copy_frames.push(owner_id);
-        let result = call_guest_finalizer(env, &table, guest_env as i32, wasm_fn_ptr, data, hint);
+        let result = call_guest_finalizer(env, &table, guest_env, wasm_fn_ptr, data, hint);
         flush_host_buffer_copies(env, owner_id);
         if env.data().host_buffer_copy_frames.is_empty() {
             flush_pending_host_buffer_copies(env, snapi_env);
