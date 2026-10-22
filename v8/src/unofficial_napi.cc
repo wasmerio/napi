@@ -38,9 +38,37 @@ struct unofficial_napi_profile__ {
 
 namespace {
 
+// The trusted-script brand is a private symbol from v8::Private::New, created
+// once per isolate. Unlike v8::Private::ForApi (which backs
+// unofficial_napi_create_private_symbol), nothing else can obtain it by name.
+// Only looked up and inserted under this lock; no JavaScript runs while held.
+std::mutex& g_trusted_script_mu = *new std::mutex();
+std::unordered_map<v8::Isolate*, v8::Global<v8::Private>>& g_trusted_script_keys =
+    *new std::unordered_map<v8::Isolate*, v8::Global<v8::Private>>();
+
 v8::Local<v8::Private> TrustedScriptKey(v8::Isolate* isolate) {
-  return v8::Private::ForApi(isolate,
-      v8::String::NewFromUtf8Literal(isolate, "wasmer.napi.intrinsic.TrustedScript.source.v1"));
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto it = g_trusted_script_keys.find(isolate);
+  if (it == g_trusted_script_keys.end()) return {};
+  return it->second.Get(isolate);
+}
+
+v8::Local<v8::Private> EnsureTrustedScriptKey(v8::Isolate* isolate) {
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto& key = g_trusted_script_keys[isolate];
+  if (key.IsEmpty()) {
+    key.Reset(isolate, v8::Private::New(isolate,
+        v8::String::NewFromUtf8Literal(isolate, "TrustedScript source")));
+  }
+  return key.Get(isolate);
+}
+
+void ForgetTrustedScriptKey(v8::Isolate* isolate) {
+  std::lock_guard<std::mutex> lock(g_trusted_script_mu);
+  auto it = g_trusted_script_keys.find(isolate);
+  if (it == g_trusted_script_keys.end()) return;
+  it->second.Reset();
+  g_trusted_script_keys.erase(it);
 }
 
 v8::MaybeLocal<v8::String> TrustedScriptSource(v8::Local<v8::Context> context,
@@ -48,9 +76,10 @@ v8::MaybeLocal<v8::String> TrustedScriptSource(v8::Local<v8::Context> context,
   auto* isolate = context->GetIsolate();
   if (!value->IsObject() || value->IsProxy()) return {};
   auto object = value.As<v8::Object>();
+  auto key = TrustedScriptKey(isolate);
   v8::Local<v8::Value> source;
-  if (!object->GetPrivate(context, TrustedScriptKey(isolate)).ToLocal(&source) ||
-      !source->IsString()) return {};
+  if (key.IsEmpty() || !object->IsCodeLike(isolate) ||
+      !object->GetPrivate(context, key).ToLocal(&source) || !source->IsString()) return {};
   return source.As<v8::String>();
 }
 
@@ -1852,6 +1881,7 @@ static napi_status DestroyEnvInstance(napi_env env) {
       g_env_by_isolate.erase(env_it);
     }
     g_hash_seeds.erase(env->isolate);
+    ForgetTrustedScriptKey(env->isolate);
     auto cb_it = g_promise_reject_callbacks.find(env->isolate);
     if (cb_it != g_promise_reject_callbacks.end()) {
       cb_it->second.Reset();
@@ -2388,7 +2418,7 @@ napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
   }
   v8::Local<v8::Object> object;
   if (!shape->NewInstance(context).ToLocal(&object) ||
-      !object->SetPrivate(context, TrustedScriptKey(isolate), raw_source).FromMaybe(false))
+      !object->SetPrivate(context, EnsureTrustedScriptKey(isolate), raw_source).FromMaybe(false))
     return napi_generic_failure;
   // A native default stringifier makes Function(trustedSource) work before
   // an embedder replaces the prototype with its own TrustedScript WebIDL one.

@@ -232,7 +232,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
 // Provider intrinsic trusted source. V8 evaluates it through its native code
 // generation hook: direct eval retains lexical scope and never calls author
 // toString/@@toPrimitive. Its private brand survives prototype changes, cannot
-// be copied or inherited, and does not bypass a context's codegen restriction.
+// be copied, inherited or recreated (unofficial_napi_create_private_symbol
+// cannot name it), and does not bypass a context's codegen restriction.
 // Source must be a primitive string. Unsupported engines return generic_failure.
 // The hook is isolate-wide: every call installs this provider's
 // ModifyCodeGenerationFromStrings callback on the environment's isolate,

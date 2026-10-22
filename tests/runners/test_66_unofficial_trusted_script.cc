@@ -217,6 +217,33 @@ TEST_F(Test66UnofficialTrustedScript, BrandCannotBeCopiedOrInherited) {
   EXPECT_TRUE(IsTrue(s.env, "eval('6 * 7') === 42"));
 }
 
+// The brand cannot be forged through the private-symbol API: a private symbol
+// with the brand's old registry name names a different property.
+TEST_F(Test66UnofficialTrustedScript, BrandCannotBeForgedWithPrivateSymbol) {
+  EnvScope s(runtime_.get());
+  InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
+  napi_value real = nullptr;
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "1"), &real), napi_ok);
+
+  const char* names[] = {"wasmer.napi.intrinsic.TrustedScript.source.v1", "TrustedScript source"};
+  for (const char* name : names) {
+    napi_value symbol = nullptr;
+    napi_value forged = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_private_symbol(s.env, name, NAPI_AUTO_LENGTH, &symbol),
+              napi_ok);
+    ASSERT_EQ(napi_create_object(s.env, &forged), napi_ok);
+    ASSERT_EQ(napi_set_property(s.env, forged, symbol, Str(s.env, "6 * 7")), napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "forged", forged), napi_ok);
+    EXPECT_TRUE(IsTrue(s.env, "eval(forged) === forged")) << name;
+    // A real trusted script given the forged property is still its own source.
+    ASSERT_EQ(napi_set_property(s.env, real, symbol, Str(s.env, "6 * 7")), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "real", real), napi_ok);
+    EXPECT_TRUE(IsTrue(s.env, "eval(real) === 1")) << name;
+  }
+}
+
 TEST_F(Test66UnofficialTrustedScript, CreateValidatesArguments) {
   EnvScope s(runtime_.get());
 
