@@ -2452,7 +2452,7 @@ napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* resul
   *result = stack->GetFrameCount() != 0 ||
             (queue != nullptr && queue->IsRunningMicrotasks()) ||
             v8::MicrotasksScope::IsRunningMicrotasks(isolate) ||
-            NapiV8IsAnyContextifyMicrotaskQueueRunning(isolate);
+            env->contextify_microtask_checkpoints != 0;
   return napi_ok;
 }
 

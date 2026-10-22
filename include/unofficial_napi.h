@@ -248,8 +248,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
 // on its stack (in any context, including other security origins) or is
 // running a microtask checkpoint. A native function called from C through
 // napi_call_function, directly or through a builtin, with no JavaScript frame
-// below it reports false. Does not execute JS or replace an existing pending
-// exception. Unsupported engines return generic_failure.
+// below it reports false. Does not execute JS, take provider locks, or replace
+// an existing pending exception, so it may be called from any provider
+// callback. Unsupported engines return generic_failure.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
     napi_env env, bool* result);
 

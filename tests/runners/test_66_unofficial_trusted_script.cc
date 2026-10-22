@@ -138,6 +138,20 @@ uint64_t UsedHeapAfterGc(napi_env env) {
 
 unsigned g_embedder_hook_calls = 0;
 
+struct TokenCallbackRecord {
+  unsigned calls = 0;
+  napi_status status = napi_generic_failure;
+  bool active = true;
+};
+
+// Context token callbacks run while the provider holds its context-record
+// lock; querying VM state from one must not wait on that lock.
+void QueryFromTokenCallback(napi_env env, void* /*token*/, void* data) {
+  auto* record = static_cast<TokenCallbackRecord*>(data);
+  ++record->calls;
+  record->status = unofficial_napi_is_executing_js(env, &record->active);
+}
+
 // An embedder hook that leaves every source unchanged.
 v8::ModifyCodeGenerationFromStringsResult EmbedderHook(v8::Local<v8::Context>,
                                                       v8::Local<v8::Value>,
@@ -423,6 +437,37 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
   ASSERT_EQ(napi_strict_equals(s.env, exception, global, &same), napi_ok);
   EXPECT_TRUE(same);
+}
+
+TEST_F(Test66UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
+  EnvScope s(runtime_.get());
+  TokenCallbackRecord record;
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.data = &record;
+  hooks.context_token_assign_callback = QueryFromTokenCallback;
+  uint64_t accepted = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+
+  napi_value sandbox = nullptr;
+  napi_value host = nullptr;
+  napi_value context = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "trusted-script"), &host), napi_ok);
+  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "token"),
+                                                    Str(s.env, "test://token"),
+                                                    true,
+                                                    true,
+                                                    true,
+                                                    host,
+                                                    &context),
+            napi_ok);
+  EXPECT_EQ(record.calls, 1u);
+  EXPECT_EQ(record.status, napi_ok);
+  EXPECT_FALSE(record.active);
 }
 
 // A native callback from the root context still sees JavaScript frames and
