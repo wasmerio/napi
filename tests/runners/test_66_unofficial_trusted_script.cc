@@ -119,6 +119,19 @@ std::string TakeExceptionMessage(napi_env env) {
   return ::testing::AssertionSuccess();
 }
 
+uint64_t UsedHeapAfterGc(napi_env env) {
+  for (int i = 0; i < 3; ++i) {
+    if (unofficial_napi_collect_garbage(env) != napi_ok) return 0;
+  }
+  unofficial_napi_heap_statistics stats;
+  unofficial_napi_heap_statistics_init(&stats);
+  if (unofficial_napi_get_heap_statistics(env, &stats) != napi_ok ||
+      (stats.valid_fields & unofficial_napi_heap_stat_used_heap_size) == 0) {
+    return 0;
+  }
+  return stats.used_heap_size;
+}
+
 void InstallGlobal(napi_env env, const char* name, napi_callback callback, void* data) {
   napi_value global = nullptr;
   napi_value function = nullptr;
@@ -227,6 +240,29 @@ TEST_F(Test66UnofficialTrustedScript, CreateValidatesArguments) {
   ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "1"), &trusted), napi_ok);
   ASSERT_EQ(napi_typeof(s.env, trusted, &type), napi_ok);
   EXPECT_EQ(type, napi_object);
+}
+
+// Creating trusted scripts retains nothing once they are unreachable. A new
+// template per call left every instantiation in the context's template cache
+// (about 750 KB after 20k calls).
+TEST_F(Test66UnofficialTrustedScript, CreationDoesNotRetainMemory) {
+  EnvScope s(runtime_.get());
+  napi_value source = Str(s.env, "1");
+  napi_value warm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, source, &warm), napi_ok);
+
+  const uint64_t before = UsedHeapAfterGc(s.env);
+  ASSERT_NE(before, 0u);
+  for (int i = 0; i < 20000; ++i) {
+    napi_handle_scope scope = nullptr;
+    napi_value trusted = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, source, &trusted), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  const uint64_t after = UsedHeapAfterGc(s.env);
+  ASSERT_NE(after, 0u);
+  EXPECT_LT(after, before + 128 * 1024);
 }
 
 // A trusted script does not bypass a context that disallows code generation

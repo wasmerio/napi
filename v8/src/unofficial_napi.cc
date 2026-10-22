@@ -2376,8 +2376,16 @@ napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
   v8::EscapableHandleScope handles(isolate);
   auto context = env->context();
   v8::Context::Scope context_scope(context);
-  auto shape = v8::FunctionTemplate::New(isolate)->InstanceTemplate();
-  shape->SetCodeLike();
+  // One code-like template per environment. A fresh template per call would
+  // leave each instantiation in the context's template cache.
+  v8::Local<v8::ObjectTemplate> shape;
+  if (env->trusted_script_template.IsEmpty()) {
+    shape = v8::FunctionTemplate::New(isolate)->InstanceTemplate();
+    shape->SetCodeLike();
+    env->trusted_script_template.Reset(isolate, shape);
+  } else {
+    shape = env->trusted_script_template.Get(isolate);
+  }
   v8::Local<v8::Object> object;
   if (!shape->NewInstance(context).ToLocal(&object) ||
       !object->SetPrivate(context, TrustedScriptKey(isolate), raw_source).FromMaybe(false))
