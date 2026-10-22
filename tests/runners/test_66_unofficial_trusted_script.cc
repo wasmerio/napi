@@ -322,6 +322,18 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   EXPECT_TRUE(IsTrue(s.env, "executing() === true"));
   EXPECT_TRUE(IsTrue(s.env, "Object.defineProperty({}, 'x', { get: executing }).x === true"));
 
+  // Only JavaScript frames count: a native function called from C, with no
+  // JavaScript frame below it, reports false.
+  napi_value global = nullptr;
+  napi_value executing = nullptr;
+  napi_value reported = nullptr;
+  bool reported_active = true;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, global, "executing", &executing), napi_ok);
+  ASSERT_EQ(napi_call_function(s.env, global, executing, 0, nullptr, &reported), napi_ok);
+  ASSERT_EQ(napi_get_value_bool(s.env, reported, &reported_active), napi_ok);
+  EXPECT_FALSE(reported_active);
+
   napi_value microtask = nullptr;
   ASSERT_EQ(napi_create_function(
                 s.env, "microtask", NAPI_AUTO_LENGTH, RecordMicrotask, &record, &microtask),
@@ -337,11 +349,9 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
 
   // The query neither runs JavaScript nor consumes a pending exception.
   napi_value ignored = nullptr;
-  napi_value global = nullptr;
   napi_value exception = nullptr;
   bool pending = false;
   bool same = false;
-  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
   ASSERT_EQ(napi_run_script(s.env, Str(s.env, "throw globalThis"), &ignored),
             napi_pending_exception);
   active = true;

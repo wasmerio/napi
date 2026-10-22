@@ -234,11 +234,20 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
 // toString/@@toPrimitive. Its private brand survives prototype changes, cannot
 // be copied or inherited, and does not bypass a context's codegen restriction.
 // Source must be a primitive string. Unsupported engines return generic_failure.
+// The hook is isolate-wide: every call installs this provider's
+// ModifyCodeGenerationFromStrings callback on the environment's isolate,
+// replacing any callback the embedder installed. V8 cannot report the
+// previous callback, so it is not chained. For other values the hook keeps
+// V8's behavior: eval returns non-string objects unchanged, and strings follow
+// each context's code generation setting.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
     napi_env env, napi_value source, napi_value* result);
-// Owning VM thread only. Reports actual JS frames (including other security
-// origins) or an active microtask checkpoint; does not execute JS or replace an
-// existing pending exception. Unsupported engines return generic_failure.
+// Owning VM thread only. Reports true only while the VM has a JavaScript frame
+// on its stack (in any context, including other security origins) or is
+// running a microtask checkpoint. A native function called from C through
+// napi_call_function, directly or through a builtin, with no JavaScript frame
+// below it reports false. Does not execute JS or replace an existing pending
+// exception. Unsupported engines return generic_failure.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
     napi_env env, bool* result);
 
