@@ -599,8 +599,12 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
 }
 
 fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
+    // Any env of this application, including one owned by another store.
+    env.data()
+        .with_control_env(napi_env, |target| unsafe {
+            snapi_bridge_unofficial_terminate_execution(target)
+        })
+        .unwrap_or(1)
 }
 
 fn guest_unofficial_napi_cancel_terminate_execution(
@@ -617,19 +621,20 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
 }
 
-#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_request_interrupt(
-    mut env: FunctionEnvMut<NapiEnv>,
+    env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     callback: u32,
     data: u32,
-) -> Result<i32, WasiError> {
-    let env_handle = snapi_env(&env, napi_env);
-    let callback_id = callback;
-    let data_val = data;
-    with_cb_context(&mut env, napi_env, || unsafe {
-        snapi_bridge_unofficial_request_interrupt(env_handle, napi_env, callback_id, data_val)
-    })
+) -> i32 {
+    // The target may belong to another store. The request is only queued: the
+    // callback runs later on the target's owner thread, in that store's active
+    // callback context, never in this caller's.
+    env.data()
+        .with_control_env(napi_env, |target| unsafe {
+            snapi_bridge_unofficial_request_interrupt(target, napi_env, callback, data)
+        })
+        .unwrap_or(1)
 }
 
 fn guest_unofficial_napi_structured_clone(
