@@ -29,6 +29,10 @@ const NAPI_PENDING_EXCEPTION: i32 = 10;
 /// ceiling is clamped.
 const BUDGET_BELOW_ISOLATE_FLOOR: u64 = 20 * 1024 * 1024;
 
+/// Admits a guest and a default isolate with only a few MiB to spare, which a
+/// guest holding tens of thousands of references exhausts.
+const BUDGET_STARVING_BOOKKEEPING: u64 = 144 * 1024 * 1024;
+
 #[test]
 fn two_guest_isolates_run_sequentially() {
     let wasm = build_wasix_test("hello_napi_test");
@@ -41,6 +45,83 @@ fn two_guest_isolates_run_sequentially() {
             "{stdout}\n{stderr}"
         );
     }
+}
+
+#[test]
+fn standalone_unlimited_context_does_not_apply_managed_value_cap() {
+    let wasm = build_wasix_test("test_unlimited_value_handles");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("UNLIMITED_VALUE_HANDLES_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn finite_budget_charges_value_handles_instead_of_capping_them() {
+    let wasm = build_wasix_test("test_unlimited_value_handles");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("UNLIMITED_VALUE_HANDLES_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+/// Waits for WASIX's asynchronous final-store cleanup, which is what releases
+/// an isolate's reservations, then returns the budget snapshot.
+fn usage_after_quiescence(ctx: &NapiCtx) -> wasmer_napi::ResourceUsage {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ctx.budget().snapshot().live_isolates != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ctx.budget().snapshot()
+}
+
+/// A workload holding a host handle per short-lived object used to fail past
+/// a fixed handle count, because the tiny JS objects never made V8 collect the
+/// handles' owners. The bookkeeping charge now asks for that collection.
+#[test]
+fn many_short_lived_refs_are_collected_under_a_finite_budget() {
+    let wasm = build_wasix_test("test_ref_churn");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REF_CHURN_OK"), "{stdout}\n{stderr}");
+    let usage = usage_after_quiescence(&ctx);
+    assert_eq!(
+        usage.host_bookkeeping, 0,
+        "bookkeeping outlived the guest: {usage:?}"
+    );
+}
+
+/// Bookkeeping the budget cannot cover is an out-of-memory condition: the env
+/// is stopped like one whose heap growth was refused, not left half-working.
+#[test]
+fn bookkeeping_exhaustion_stops_the_env() {
+    let wasm = build_wasix_test("test_ref_hold");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(BUDGET_STARVING_BOOKKEEPING)
+        .build();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REF_HOLD_REFUSED"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("JS_AFTER_REFUSAL status={NAPI_PENDING_EXCEPTION}")),
+        "the refusal did not terminate the isolate: {stdout}\n{stderr}"
+    );
+    let usage = usage_after_quiescence(&ctx);
+    assert_eq!(
+        usage.host_bookkeeping, 0,
+        "bookkeeping outlived the guest: {usage:?}"
+    );
 }
 
 #[test]
@@ -60,6 +141,91 @@ fn guest_fatal_error_exits_only_its_workload() {
     assert_eq!(exit_code, 0, "{stderr}");
     assert!(
         stdout.contains("HELLO_NAPI_TEST_OK=1"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn guest_cannot_set_process_wide_v8_flags_with_embedded_nul() {
+    let wasm = build_wasix_test("test_guest_runtime_flags");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("FLAGS_REJECTED"), "{stdout}\n{stderr}");
+}
+
+#[test]
+fn guest_property_descriptor_count_is_bounded_before_read() {
+    let wasm = build_wasix_test("test_property_descriptor_cap");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("PROPERTY_CAP_REJECTED"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn explicit_length_names_preserve_embedded_nul_without_native_overread() {
+    let wasm = build_wasix_test("test_embedded_nul_names");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("EMBEDDED_NUL_NAMES_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn guest_cannot_allocate_unmetered_v8_webassembly_memory() {
+    let wasm = build_wasix_test("test_js_wasm_disabled");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
+}
+
+#[test]
+fn guest_cannot_start_unmanaged_v8_workers_or_profiler() {
+    let wasm = build_wasix_test("test_guest_unmanaged_controls");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("UNMANAGED_CONTROLS_REJECTED"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn guest_messages_remain_charged_until_instance_shutdown() {
+    let wasm = build_wasix_test("test_guest_message_budget");
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(GENEROUS_BUDGET)
+        .build();
+    let budget = ctx.budget();
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("MESSAGE_BUDGET_OK"), "{stdout}\n{stderr}");
+    assert!(
+        budget.snapshot().serialized_message > 0,
+        "queued message escaped memory accounting"
+    );
+    ctx.runtime_control().terminate_all();
+    assert_eq!(budget.snapshot().serialized_message, 0);
+    drop(ctx);
+}
+
+#[test]
+fn named_properties_and_throw_errors_use_charged_guest_strings() {
+    let wasm = build_wasix_test("test_charged_cstring_bridge");
+    let (exit_code, stdout, stderr) =
+        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("CHARGED_CSTRING_BRIDGE_OK"),
         "{stdout}\n{stderr}"
     );
 }
@@ -211,7 +377,7 @@ fn isolate_reservations_are_released_when_the_guest_exits() {
         "guest did not report success\n--- stdout ---\n{stdout}"
     );
 
-    let usage = ctx.budget().snapshot();
+    let usage = usage_after_quiescence(&ctx);
     assert_eq!(
         usage.live_isolates, 0,
         "an isolate outlived the guest: {usage:?}"

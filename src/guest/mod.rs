@@ -25,6 +25,10 @@ pub const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;
 /// 2-Mbit integer), which keeps the transient uncounted host memory negligible.
 pub const MAX_NAPI_CALLBACK_ARGS: usize = 64 * 1024;
 pub const MAX_NAPI_BIGINT_WORDS: usize = 32 * 1024;
+/// One N-API definition call rarely needs even hundreds of properties. Bound
+/// its nine host descriptor arrays and copied names independently of memory
+/// limit configuration (which may be unlimited in local tools).
+pub const MAX_NAPI_PROPERTY_DESCRIPTORS: usize = 4096;
 
 /// Byte width for the public `napi_typedarray_type` enum. Keep the mapping in
 /// one place for both guest backends; values outside the public enum are not

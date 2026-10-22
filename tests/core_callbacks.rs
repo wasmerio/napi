@@ -1,22 +1,8 @@
 use wasmer::{AsStoreMut, Function, Instance, Module, RuntimeError, Store};
 use wasmer_napi::NapiCtx;
 use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
-fn configure_runtime() {
-    unsafe extern "C" {
-        fn snapi_bridge_unofficial_configure_runtime(
-            flags: *const std::ffi::c_char,
-            length: u32,
-        ) -> i32;
-    }
-    assert_eq!(
-        unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) },
-        0
-    );
-}
-
 #[test]
 fn core_callback_exit_probe() {
-    configure_runtime();
     let cases = [
         (
             "create_buffer",
@@ -207,11 +193,7 @@ fn core_callback_exit_probe() {
         );
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         session
-            .configure_instance(
-                &mut store.as_store_mut(),
-                &instance,
-                Some(instance.exports.get_memory("memory").unwrap()),
-            )
+            .configure_instance(&mut store.as_store_mut(), &instance, None)
             .unwrap();
         let result = instance
             .exports
@@ -227,8 +209,87 @@ fn core_callback_exit_probe() {
 }
 
 #[test]
+fn module_error_construction_preserves_guest_exit() {
+    let wat = r#"(module
+      (import "napi_extension_wasmer_v0" "unofficial_napi_create_env" (func $create (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+      (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_create_object" (func $object (param i32 i32) (result i32)))
+      (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+      (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create" (func $module
+        (param i32 i32 i32) (result i32)))
+      (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_get_namespace" (func $current_namespace (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+      (elem (i32.const 0) $callback)
+      (data (i32.const 100) "exitNow\00")
+      (data (i32.const 140) "Object.defineProperty(Error.prototype, 'code', {set(v){exitNow()}}); 0\00")
+      (data (i32.const 240) "test:module-error")
+      (data (i32.const 280) "export const x = 1;")
+      (func $callback (param i32 i32) (result i32)
+        (call $exit (i32.const 57)) (i32.const 0))
+      (func (export "run") (result i32)
+        (local $env i32)
+        (drop (call $create (i32.const 8) (i32.const 0) (i32.const 4) (i32.const 8)))
+        (local.set $env (i32.load (i32.const 4)))
+        (drop (call $function (local.get $env) (i32.const 100) (i32.const -1) (i32.const 0) (i32.const 0) (i32.const 12)))
+        (drop (call $global (local.get $env) (i32.const 16)))
+        (drop (call $set (local.get $env) (i32.load (i32.const 16)) (i32.const 100) (i32.load (i32.const 12))))
+        (drop (call $string (local.get $env) (i32.const 140) (i32.const -1) (i32.const 20)))
+        (drop (call $script (local.get $env) (i32.load (i32.const 20)) (i32.const 24)))
+        (drop (call $object (local.get $env) (i32.const 32)))
+        (drop (call $string (local.get $env) (i32.const 240) (i32.const 17) (i32.const 36)))
+        (drop (call $string (local.get $env) (i32.const 280) (i32.const 19) (i32.const 40)))
+        ;; Versioned source-text module descriptor and JS source union.
+        (i32.store (i32.const 512) (i32.const 40))
+        (i32.store (i32.const 516) (i32.const 1))
+        (i32.store (i32.const 520) (i32.const 1))
+        (i32.store (i32.const 524) (i32.load (i32.const 32)))
+        (i32.store (i32.const 528) (i32.load (i32.const 36)))
+        (i32.store (i32.const 532) (i32.const 0))
+        (i32.store (i32.const 536) (i32.const 560))
+        (i32.store (i32.const 540) (i32.const 0))
+        (i32.store (i32.const 544) (i32.const 0))
+        (i32.store (i32.const 548) (i32.const 0))
+        (i32.store (i32.const 560) (i32.const 0))
+        (i32.store (i32.const 564) (i32.load (i32.const 40)))
+        (i32.store (i32.const 568) (i32.const 0))
+        (drop (call $module (local.get $env) (i32.const 512) (i32.const 44)))
+        (call $current_namespace (local.get $env) (i32.load (i32.const 44)) (i32.const 52))))"#;
+    let ctx = NapiCtx::default();
+    let mut store = Store::default();
+    let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
+    let session = ctx.new_session(&module).unwrap();
+    let mut imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+    imports.define(
+        "wasi_snapshot_preview1",
+        "proc_exit",
+        Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
+            Err(RuntimeError::user(Box::new(WasiError::Exit(
+                ExitCode::from(code),
+            ))))
+        }),
+    );
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    session
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
+        .unwrap();
+    let result = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "run")
+        .unwrap()
+        .call(&mut store);
+    assert!(
+        matches!(result, Err(ref error) if matches!(error.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if *code == ExitCode::from(57))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn reentrant_release_refuses_to_dispose_the_entered_isolate() {
-    configure_runtime();
     let wat = r#"(module
       (import "napi_extension_wasmer_v0" "unofficial_napi_create_env" (func $create (param i32 i32 i32 i32) (result i32)))
       (import "napi_extension_wasmer_v0" "unofficial_napi_release_env" (func $release (param i32 i32) (result i32)))
@@ -265,11 +326,7 @@ fn reentrant_release_refuses_to_dispose_the_entered_isolate() {
     let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     session
-        .configure_instance(
-            &mut store.as_store_mut(),
-            &instance,
-            Some(instance.exports.get_memory("memory").unwrap()),
-        )
+        .configure_instance(&mut store.as_store_mut(), &instance, None)
         .unwrap();
     let status = instance
         .exports

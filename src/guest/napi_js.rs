@@ -26,6 +26,7 @@ use crate::{
         },
         typedarray_element_size,
     },
+    message::MessageCharge,
     snapi::*,
 };
 
@@ -1058,10 +1059,20 @@ fn guest_unofficial_napi_message_create(
     let env_handle = snapi_env(&env, napi_env);
     let mut payload = 0u32;
     let status = unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut payload) };
-    if status == 0 && payload_out_ptr != 0 {
-        write_guest_u32(&mut env, payload_out_ptr, payload);
+    if status != 0 {
+        return status;
     }
-    status
+    let charge = MessageCharge::reserve(env.data().budget.clone(), 0).expect("zero-byte charge");
+    if env.data().pending_messages.insert(payload, charge).is_err() {
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+        return 1;
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr, payload) {
+        drop(env.data().pending_messages.take(payload));
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+        return 1;
+    }
+    0
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -1074,6 +1085,13 @@ async fn guest_unofficial_napi_message_take_async(
     if payload == 0 {
         return 1;
     }
+    let charge = {
+        let locked = env.read().await;
+        locked.data().pending_messages.take(payload)
+    };
+    let Some(charge) = charge else {
+        return 1;
+    };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
@@ -1083,6 +1101,7 @@ async fn guest_unofficial_napi_message_take_async(
         env.data().resolve_napi_env(napi_env)
     };
     let (status, value) = with_callback_state_async(env.as_mut(), env_handle, async move {
+        let _charge = charge;
         if crate::snapi_js::wait_for_message(payload).await.is_err() {
             unsafe { snapi_bridge_unofficial_message_drop(payload) };
             return (9, 0);
@@ -1111,6 +1130,9 @@ fn guest_unofficial_napi_message_take_sync(
     if payload == 0 {
         return 1;
     }
+    let Some(_charge) = env.data().pending_messages.take(payload) else {
+        return 1;
+    };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
@@ -1134,8 +1156,13 @@ fn message_take_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -
     Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take_sync)
 }
 
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload) };
+fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: u32) {
+    if payload != 0 {
+        let Some(_charge) = env.data().pending_messages.take(payload) else {
+            return;
+        };
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+    }
 }
 
 fn guest_unofficial_napi_enqueue_microtask(

@@ -805,8 +805,17 @@ int main(void) {
                                (void*)(uintptr_t)0x22,
                                NULL));
   NAPI_CALL(env, unofficial_napi_release_env(finalizer_env_scope, NULL));
+#if defined(__wasm__)
+  // The WASIX bridge clears its guest callback context before releasing the
+  // provider env. Guest finalizers cannot run after the host kill registry
+  // stops tracking that env.
+  CHECK_OR_FAIL(wrap_finalizer_count == 0 && add_finalizer_count == 0,
+                "guest finalizer ran during uninterruptible env teardown");
+#else
+  // Direct native users still receive their normal N-API finalizers.
   CHECK_OR_FAIL(wrap_finalizer_count == 1 && add_finalizer_count == 1,
-                "guest finalizers were not dispatched exactly once");
+                "native finalizers were not dispatched exactly once");
+#endif
 
   // Environment teardown owns the failure/cancellation path for outstanding
   // leases. It must discard the snapshot and host reference without requiring

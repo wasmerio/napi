@@ -16,6 +16,9 @@ use crate::{
     GuestBackingStoreMapping, HostBufferCopy, NapiEnv, snapi::snapi_bridge_create_reference,
 };
 
+/// The JavaScript-hosted guest backend has no native host snapshot budget.
+pub(crate) type HostCopy<T> = Vec<T>;
+
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
@@ -404,7 +407,9 @@ pub fn read_guest_bytes(
     if (guest_ptr as u64).checked_add(len as u64)? > wasmer_napi_guest_byte_length(&memory) as u64 {
         return None;
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     wasmer_napi_guest_read(&memory, guest_ptr, &mut out).then_some(out)
 }
 
@@ -431,6 +436,13 @@ pub(crate) fn read_guest_fatal_text(
             String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
         })
         .unwrap_or_else(|| "(invalid guest string)".to_owned())
+}
+
+pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
+    let Some(memory) = guest_memory(env) else {
+        return 0;
+    };
+    wasmer_napi_guest_byte_length(&memory) as u64
 }
 
 pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize) -> Option<u32> {
@@ -704,7 +716,8 @@ pub fn read_guest_u32_array(
     count: usize,
 ) -> Option<Vec<u32>> {
     let bytes = read_guest_bytes(env, guest_ptr, count.checked_mul(4)?)?;
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).ok()?;
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
