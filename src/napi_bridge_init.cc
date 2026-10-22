@@ -2769,11 +2769,11 @@ void WasmInterruptCallback(napi_env env, void* raw) {
 // Passes the real callback frame explicitly to the Rust trampoline via a
 // short-lived callback-info token.
 static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
-  void* raw_data;
-  size_t argc = 64;
-  napi_value argv[64];
-  napi_value this_arg;
-  napi_get_cb_info(env, info, &argc, argv, &this_arg, &raw_data);
+  void* raw_data = nullptr;
+  // Only the actual argument count and registration data select the guest
+  // callback. Guest napi_get_cb_info retrieves arguments/receiver on demand.
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &raw_data);
 
   auto* binding = static_cast<CallbackBinding*>(raw_data);
   if (binding == nullptr) {
