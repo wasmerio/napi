@@ -181,6 +181,73 @@ fn host_terminate_reaches_an_env_inside_a_contextified_script() {
     guest.join().expect("guest thread panicked");
 }
 
+/// Release runs the env's finalizers, and a guest finalizer can run
+/// JavaScript. A host stop issued meanwhile must still reach it.
+#[test]
+fn host_terminate_reaches_javascript_a_finalizer_runs_during_release() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let control = ctx.runtime_control();
+    let (signal_tx, signal_rx) = mpsc::channel();
+    let (released_tx, released_rx) = mpsc::channel();
+    let guest = thread::spawn(move || {
+        let mut guest = Guest::new(&ctx, &engine, &module, signal_tx);
+        guest.create();
+        assert_eq!(guest.arm_spinning_finalizer(), 0);
+        let _ = released_tx.send(guest.release());
+    });
+
+    signal_rx
+        .recv_timeout(TIMEOUT)
+        .expect("the finalizer never ran");
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    thread::spawn(move || {
+        control.terminate_all();
+        let _ = stopped_tx.send(());
+    });
+    stopped_rx
+        .recv_timeout(TIMEOUT)
+        .expect("terminate_all() blocked while the env was being released");
+    assert_eq!(
+        released_rx
+            .recv_timeout(TIMEOUT)
+            .expect("the finalizer's JavaScript kept running after terminate_all()"),
+        0
+    );
+    guest.join().expect("guest thread panicked");
+}
+
+/// A store dropped on a thread other than the one that created its env cannot
+/// release the env there. The isolate must then stay charged to the budget,
+/// not leak unaccounted.
+///
+/// `wasmer::Store` is not `Send`; embedders that move stores anyway do so
+/// unsafely, and this test does the same to reach that path.
+#[test]
+fn an_env_whose_store_is_dropped_on_another_thread_stays_charged() {
+    struct MovedGuest(#[allow(dead_code)] Guest);
+    // SAFETY: the guest is only dropped on the other thread, never used there.
+    unsafe impl Send for MovedGuest {}
+
+    let (engine, module) = compile();
+    let ctx = NapiCtx::builder()
+        .total_memory_bytes(512 * 1024 * 1024)
+        .build();
+    let (signal_tx, _signal_rx) = mpsc::channel();
+    let mut guest = Guest::new(&ctx, &engine, &module, signal_tx);
+    guest.create();
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    let moved = MovedGuest(guest);
+    thread::spawn(move || drop(moved))
+        .join()
+        .expect("dropping the store panicked");
+    assert_eq!(
+        ctx.budget().snapshot().live_isolates,
+        1,
+        "an isolate that was never released was returned to the budget"
+    );
+}
+
 /// Envs created, used and released on several threads at once: module records
 /// live in provider state shared by all environments, and isolates are
 /// created and disposed while others start up. A failure here is a crash or

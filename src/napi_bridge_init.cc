@@ -126,6 +126,17 @@ struct SnapiEnvState {
   // Written under g_mu by the owner when teardown starts; the owner may read
   // it without the lock.
   bool closing = false;
+  // Under g_mu. Teardown runs guest finalizers, which can run JavaScript.
+  // teardown_guest_calls counts guest code running from teardown; while it is
+  // non-zero the napi_env and isolate are alive, so a foreign terminate can
+  // still stop it. A terminate during teardown also sets stop_requested, after
+  // which no more guest code starts.
+  uint32_t teardown_guest_calls = 0;
+  bool stop_requested = false;
+  // One reference held by the bridge until release, plus one per
+  // snapi_bridge_unofficial_retain_env. A retained pointer may be handed to
+  // other threads: it can outlive the env but is never reused for another.
+  std::atomic<uint32_t> holders{1};
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
 
@@ -216,6 +227,40 @@ void ForgetOnThisThread(SnapiEnvState* state) {
     t_owned_envs = nullptr;
   }
 }
+
+void DropEnvStateHolder(SnapiEnvState* state) {
+  if (state->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) delete state;
+}
+
+// Brackets guest code invoked by the bridge on the owner thread. While the env
+// is being released, it keeps the env stoppable (see teardown_guest_calls) and
+// refuses to start guest code once a stop was requested.
+class GuestCallScope {
+ public:
+  explicit GuestCallScope(SnapiEnvState* state) : state_(state) {
+    if (state_ == nullptr || !state_->closing) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (state_->stop_requested) {
+      allowed_ = false;
+      return;
+    }
+    ++state_->teardown_guest_calls;
+    counted_ = true;
+  }
+  ~GuestCallScope() {
+    if (!counted_) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    --state_->teardown_guest_calls;
+  }
+  GuestCallScope(const GuestCallScope&) = delete;
+  GuestCallScope& operator=(const GuestCallScope&) = delete;
+  bool allowed() const { return allowed_; }
+
+ private:
+  SnapiEnvState* state_;
+  bool allowed_ = true;
+  bool counted_ = false;
+};
 // Message resources cross environment boundaries, so their guest-visible IDs
 // cannot belong to either the source or destination environment. The table is
 // process-wide and each entry is removed atomically by take or drop.
@@ -467,8 +512,9 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
     state->closing = true;
   }
   // Owner callbacks/finalizers may use their env while it unwinds. Foreign
-  // termination/interrupt requests are now excluded. No registry lock spans
-  // reference deletion, finalizers, V8 shutdown or background-task draining.
+  // interrupts are now refused; a foreign terminate only reaches guest code
+  // that teardown runs (GuestCallScope). No registry lock spans reference
+  // deletion, finalizers, V8 shutdown or background-task draining.
   for (const auto& entry : state->buffer_lease_handles.handles) {
     (void)unofficial_napi_release_buffer_lease(
         state->env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
@@ -503,23 +549,23 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   state->next_callback_invocation_id = 1;
   state->cb_registry.clear();
   state->next_cb_reg_id = 1;
-  state->callback_bindings.clear();
+  napi_status s = napi_ok;
   if (state->owner != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->owner, nullptr);
-    state->active_callback_ctx.store(nullptr, std::memory_order_release);
+    s = unofficial_napi_release_env(state->owner, nullptr);
     state->owner = nullptr;
-    state->env = nullptr;
-    { std::lock_guard<std::mutex> lock(g_mu); g_envs.erase(state); }
-    ForgetOnThisThread(state);
-    delete state;
-    return s;
   }
+  // JS functions can still call their bindings while finalizers run above
+  // (with no registry entry they return undefined), so free them only now.
+  state->callback_bindings.clear();
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
-  state->env = nullptr;
-  { std::lock_guard<std::mutex> lock(g_mu); g_envs.erase(state); }
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    state->env = nullptr;
+    g_envs.erase(state);
+  }
   ForgetOnThisThread(state);
-  delete state;
-  return napi_ok;
+  DropEnvStateHolder(state);
+  return s;
 }
 
 }  // namespace
@@ -1526,8 +1572,9 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void* /*data*/,
   auto* record = static_cast<GuestFinalizerRecord*>(hint);
   if (record == nullptr) return;
   auto* bridge_state = LookupEnvState(record->state);
+  GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
-      bridge_state != nullptr
+      bridge_state != nullptr && guest_call.allowed()
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
           : nullptr;
   if (callback_ctx != nullptr) {
@@ -2836,8 +2883,11 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
     napi_get_undefined(env, &undef);
     return undef;
   }
+  GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
-      bridge_state->active_callback_ctx.load(std::memory_order_acquire);
+      guest_call.allowed()
+          ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
+          : nullptr;
   if (callback_ctx == nullptr) {
     napi_value undef;
     napi_get_undefined(env, &undef);
@@ -3316,11 +3366,29 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
 }
 
+// Keeps `env_state` allocated (not alive) until the matching unretain, so a
+// holder that hands the pointer to other threads never sees it reused for a
+// different env. Call while the env is alive, e.g. right after creation.
+extern "C" void snapi_bridge_unofficial_retain_env(SnapiEnvState* env_state) {
+  if (env_state != nullptr) env_state->holders.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void snapi_bridge_unofficial_unretain_env(SnapiEnvState* env_state) {
+  if (env_state != nullptr) DropEnvStateHolder(env_state);
+}
+
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {
   // V8 explicitly permits termination from another thread. Keep registry
   // membership pinned only for this non-reentrant engine control operation.
   std::lock_guard<std::mutex> lock(g_mu);
-  if (!g_envs.count(env_state) || env_state->closing) return napi_invalid_arg;
+  if (!g_envs.count(env_state)) return napi_invalid_arg;
+  if (env_state->closing) {
+    // Releasing: stop any guest code teardown is running now (finalizers can
+    // run JavaScript) and let no more start. Outside that guest code the
+    // isolate may already be going away, and no JavaScript can run anyway.
+    env_state->stop_requested = true;
+    if (env_state->teardown_guest_calls == 0) return napi_ok;
+  }
   return unofficial_napi_terminate_execution(env_state->env);
 }
 

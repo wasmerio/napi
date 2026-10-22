@@ -61,6 +61,8 @@ const WAT: &str = r#"(module
   (import "napi" "napi_create_function"
     (func $create_function (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_create_object" (func $create_object (param i32 i32) (result i32)))
+  (import "napi" "napi_add_finalizer"
+    (func $add_finalizer (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create"
     (func $module_create (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_link"
@@ -76,9 +78,10 @@ const WAT: &str = r#"(module
   ;; Out-slots: 8 env id, 12 scope id, 16..28 js source, 28 string,
   ;; 32 script result, 36 message token, 40 taken value, 44 int32,
   ;; 48 global, 52 function, 56 filename, 60 checkpoint state,
-  ;; 128..168 module create options, 168..177 module create result.
+  ;; 64..76 finalizer scratch, 128..168 module create options,
+  ;; 168..177 module create result.
   (memory (export "memory") 2)
-  (table (export "__indirect_function_table") 3 funcref)
+  (table (export "__indirect_function_table") 4 funcref)
   (global $env (mut i32) (i32.const 0))
   (global $scope (mut i32) (i32.const 0))
   (global $interrupted (mut i32) (i32.const 0))
@@ -86,6 +89,7 @@ const WAT: &str = r#"(module
   (data (i32.const 108) "signal\00")
   (data (i32.const 116) "test.js\00")
   (data (i32.const 180) "test.mjs\00")
+  (data (i32.const 200) "const end = Date.now() + 30000; while (Date.now() < end) {}\00")
 
   (func $string (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -195,7 +199,20 @@ const WAT: &str = r#"(module
   (func $on_signal (param $env i32) (param $info i32) (result i32)
     (call $host_signal)
     (i32.const 0))
-  (elem (i32.const 1) $on_interrupt $on_signal)
+  ;; Finalizer: tell the host, then run JavaScript that spins for 30 s.
+  (func $on_finalize (param $env i32) (param $data i32) (param $hint i32)
+    (call $host_signal)
+    (if (call $create_string (local.get $env) (i32.const 200) (i32.const -1) (i32.const 68))
+      (then (return)))
+    (drop (call $run_script (local.get $env) (i32.load (i32.const 68)) (i32.const 72))))
+  (elem (i32.const 1) $on_interrupt $on_signal $on_finalize)
+
+  ;; Attaches the spinning finalizer to an object that lives until the env is
+  ;; released, so the finalizer runs during release.
+  (func (export "arm_spinning_finalizer") (result i32)
+    (if (call $create_object (global.get $env) (i32.const 64)) (then unreachable))
+    (call $add_finalizer (global.get $env) (i32.load (i32.const 64)) (i32.const 0)
+      (i32.const 3) (i32.const 0) (i32.const 0)))
 )"#;
 
 /// Compiles the guest once; every [`Guest`] instantiates it in its own store.
@@ -315,6 +332,12 @@ impl Guest {
     /// step (1 create, 2 link, 3 instantiate, 4 evaluate, 5 destroy).
     pub fn eval_module(&mut self, source: &str) -> i32 {
         self.call_with_source("eval_module", source)
+    }
+
+    /// Attaches a finalizer that signals the host, then runs JavaScript that
+    /// spins for 30 s. It runs when this guest's env is released.
+    pub fn arm_spinning_finalizer(&mut self) -> i32 {
+        self.call0("arm_spinning_finalizer")
     }
 
     /// Drains microtasks; returns the checkpoint status.
