@@ -219,16 +219,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // current JS stack to unwind normally.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
-typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
-
-// Unofficial helper. Requests execution of a callback on the target env's
-// engine thread at the next interrupt point. The callback runs entered into
-// that env's isolate/context.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
-    napi_env env,
-    unofficial_napi_interrupt_callback callback,
-    void* data);
-
 // Provider intrinsic trusted source. V8 evaluates it through its native code
 // generation hook: direct eval retains lexical scope and never calls author
 // toString/@@toPrimitive. Its private brand survives prototype changes, cannot
@@ -253,6 +243,16 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
 // callback. Unsupported engines return generic_failure.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
     napi_env env, bool* result);
+
+typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
+
+// Unofficial helper. Requests execution of a callback on the target env's
+// engine thread at the next interrupt point. The callback runs entered into
+// that env's isolate/context.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
+    napi_env env,
+    unofficial_napi_interrupt_callback callback,
+    void* data);
 
 // Unofficial helper. Enqueues a JS function into V8 microtask queue.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);
