@@ -1,7 +1,6 @@
 # Realm-bound `napi_env`
 
-Status: Phase 0 implemented on branch `refactor/agent-realm-phase0` (see
-§11). Phases 1–4 are not started.
+Status: Phase 0 implemented (see §11). Phases 1–4 are not started.
 
 **Proposal:** split each provider into an **agent**, which is the engine
 instance and its thread, and **realm envs**. A realm env is a `napi_env` whose
