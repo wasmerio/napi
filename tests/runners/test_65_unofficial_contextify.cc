@@ -2,6 +2,10 @@
 
 #include "unofficial_napi.h"
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include "napi_resource_limits.h"
+#endif
+
 class Test65UnofficialContextify : public FixtureTestBase {};
 
 namespace {
@@ -139,6 +143,7 @@ TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
 #if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test65UnofficialContextify, MakeContextBoundsNativeOwnPropertySnapshot) {
   EnvScope s(runtime_.get());
+  ASSERT_EQ(snapi_private_set_resource_limits(s.env, 1), napi_ok);
   napi_value sandbox = nullptr;
   ASSERT_EQ(napi_run_script(
                 s.env,
@@ -531,7 +536,9 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   ASSERT_EQ(napi_typeof(s.env, error, &error_type), napi_ok);
   EXPECT_EQ(error_type, napi_undefined);
 
-  // Reject before allocating or copying the caller's oversized link list.
+  // A nonempty link list requires an array, regardless of its length.
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, module, 1, nullptr),
+            napi_invalid_arg);
   EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, module, 4097, nullptr),
             napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
@@ -792,6 +799,7 @@ TEST_F(Test65UnofficialContextify, PrivateDynamicImportRejectsMissingRequiredSym
 
 TEST_F(Test65UnofficialContextify, CompileFunctionBoundsNativeFilenameScratch) {
   EnvScope s(runtime_.get());
+  ASSERT_EQ(snapi_private_set_resource_limits(s.env, 1), napi_ok);
   const unofficial_napi_js_source source =
       unofficial_napi_js_source_from_text(Str(s.env, "return 1;"));
   std::string large_filename(1024 * 1024 + 1, 'a');
@@ -809,6 +817,7 @@ TEST_F(Test65UnofficialContextify, CompileFunctionBoundsNativeFilenameScratch) {
 
 TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
   EnvScope s(runtime_.get());
+  ASSERT_EQ(snapi_private_set_resource_limits(s.env, 1), napi_ok);
   napi_value wrapper = nullptr;
   napi_value undefined = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
@@ -859,6 +868,7 @@ TEST_F(Test65UnofficialContextify, ModuleRequestMetadataHasPerEnvLimit) {
 
 TEST_F(Test65UnofficialContextify, PendingDynamicImportsCannotGrowWithoutBound) {
   EnvScope s(runtime_.get());
+  ASSERT_EQ(snapi_private_set_resource_limits(s.env, 1), napi_ok);
   napi_value callback = nullptr;
   ASSERT_EQ(napi_run_script(
                 s.env,

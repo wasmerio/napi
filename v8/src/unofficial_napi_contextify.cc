@@ -3037,7 +3037,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     unofficial_napi_module module,
     size_t count,
     const unofficial_napi_module* linked_modules) {
-  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  if (env == nullptr || module == nullptr ||
+      (count != 0 && linked_modules == nullptr)) {
+    return napi_invalid_arg;
+  }
   ModuleWrapRecord* record = ModuleRecord(module);
   if (env->resource_limits_enabled && count > kMaxModuleRequests) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
