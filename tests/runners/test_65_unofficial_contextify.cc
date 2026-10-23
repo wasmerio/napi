@@ -907,3 +907,216 @@ TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
             napi_ok);
 }
 #endif
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+napi_value RunIn(napi_env env, napi_value sandbox, const char* code) {
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(env, code));
+  napi_value result = nullptr;
+  if (unofficial_napi_contextify_run_script(env, sandbox, &source, Str(env, "ctx.js"), 0, 0, -1,
+                                            true, false, false, Sym(env, "hdo"),
+                                            &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+bool IsCollected(napi_env env, napi_ref ref) {
+  napi_value value = nullptr;
+  return napi_get_reference_value(env, ref, &value) == napi_ok && value == nullptr;
+}
+
+}  // namespace
+
+// A context made for a sandbox is collected with it: the provider must not
+// keep every context alive until the environment is released.
+TEST_F(Test65UnofficialContextify, ContextIsCollectedWithItsSandbox) {
+  EnvScope s(runtime_.get());
+
+  // Object sandboxes, with and without their own microtask queue, and
+  // vanilla contexts (a symbol), whose key is the context's global.
+  constexpr int kContexts = 9;
+  napi_ref keys[kContexts] = {};
+  for (int i = 0; i < kContexts; ++i) {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    if (i % 3 == 2) {
+      sandbox = Sym(s.env, "vanilla");
+    } else {
+      ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    }
+    napi_value key = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, "ctx"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      i % 3 == 0, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    ASSERT_NE(RunIn(s.env, key, "globalThis.payload = new Array(4096).fill(1); 1"), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, key, 0, &keys[i]), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  // A sandbox still referenced keeps its context.
+  napi_ref kept = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    napi_value key = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, "kept"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      true, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    ASSERT_NE(RunIn(s.env, sandbox, "globalThis.marker = 42; 1"), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 1, &kept), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  for (napi_ref key : keys) {
+    EXPECT_TRUE(IsCollected(s.env, key));
+    ASSERT_EQ(napi_delete_reference(s.env, key), napi_ok);
+  }
+
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_get_reference_value(s.env, kept, &sandbox), napi_ok);
+  ASSERT_NE(sandbox, nullptr);
+  napi_value marker = RunIn(s.env, sandbox, "marker");
+  ASSERT_NE(marker, nullptr);
+  int32_t value = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, marker, &value), napi_ok);
+  EXPECT_EQ(value, 42);
+  ASSERT_EQ(napi_delete_reference(s.env, kept), napi_ok);
+}
+
+// A context stays usable, with its own microtask queue, while anything made
+// in it is reachable, even after its sandbox handle is dropped and the
+// provider releases collected contexts.
+TEST_F(Test65UnofficialContextify, ContextOutlivesSandboxHandleWhileReachable) {
+  EnvScope s(runtime_.get());
+
+  napi_ref functions = nullptr;
+  napi_ref weak_sandbox = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    napi_value key = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, "ctx"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      true, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    napi_value made = RunIn(s.env, sandbox,
+                            "globalThis.state = 0;"
+                            "[() => { Promise.resolve().then(() => { state++; }); return 7; }]");
+    ASSERT_NE(made, nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, made, 1, &functions), napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  // Collect, then make more contexts, which lets the provider release
+  // records of collected contexts.
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  for (int i = 0; i < 4; ++i) {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value other = nullptr;
+    napi_value key = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &other), napi_ok);
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, other, Str(s.env, "other"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      true, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    // The function's context keeps its global, the sandbox, alive.
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, weak_sandbox, &sandbox), napi_ok);
+    ASSERT_NE(sandbox, nullptr);
+
+    napi_value array = nullptr, function = nullptr, undefined = nullptr, result = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, functions, &array), napi_ok);
+    ASSERT_EQ(napi_get_element(s.env, array, 0, &function), napi_ok);
+    ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+    // Queues a microtask on the context's own queue.
+    ASSERT_EQ(napi_call_function(s.env, undefined, function, 0, nullptr, &result), napi_ok);
+    int32_t value = 0;
+    ASSERT_EQ(napi_get_value_int32(s.env, result, &value), napi_ok);
+    EXPECT_EQ(value, 7);
+
+    // Running a script in the context drains its queue afterwards.
+    ASSERT_NE(RunIn(s.env, sandbox, "0"), nullptr);
+    napi_value state = RunIn(s.env, sandbox, "state");
+    ASSERT_NE(state, nullptr);
+    ASSERT_EQ(napi_get_value_int32(s.env, state, &value), napi_ok);
+    EXPECT_EQ(value, 1);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  // Once nothing made in the context is reachable, it is collected.
+  ASSERT_EQ(napi_delete_reference(s.env, functions), napi_ok);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// The provider releases the records of collected contexts (their references
+// and microtask queues) when it makes the next context.
+TEST_F(Test65UnofficialContextify, CollectedContextRecordsAreReleased) {
+  struct TokenCounts {
+    int assigned = 0;
+    int unassigned = 0;
+  } counts;
+  constexpr int kContexts = 6;
+  {
+    EnvScope s(runtime_.get());
+    unofficial_napi_env_hooks hooks{};
+    hooks.size = sizeof(hooks);
+    hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+    hooks.data = &counts;
+    hooks.context_token_assign_callback = [](napi_env, void*, void* data) {
+      ++static_cast<TokenCounts*>(data)->assigned;
+    };
+    hooks.context_token_unassign_callback = [](napi_env, void*, void* data) {
+      ++static_cast<TokenCounts*>(data)->unassigned;
+    };
+    uint64_t accepted = 0;
+    ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+
+    auto make = [&](const char* name) {
+      napi_handle_scope scope = nullptr;
+      ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+      napi_value sandbox = nullptr;
+      napi_value key = nullptr;
+      ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+      ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, name),
+                                                        Str(s.env, "test://origin"), true, true,
+                                                        true, Sym(s.env, "hdo"), &key),
+                napi_ok);
+      ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+    };
+    for (int i = 0; i < kContexts; ++i) make("ctx");
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    EXPECT_EQ(counts.assigned, kContexts);
+    EXPECT_EQ(counts.unassigned, 0);
+
+    make("next");
+    EXPECT_EQ(counts.assigned, kContexts + 1);
+    EXPECT_EQ(counts.unassigned, kContexts);
+  }
+  // Releasing the environment releases the rest.
+  EXPECT_EQ(counts.unassigned, kContexts + 1);
+}
+#endif
