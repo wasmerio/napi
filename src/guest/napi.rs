@@ -815,7 +815,11 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    env.data().cancel_guest_termination(env_handle)
+    let status = env.data().cancel_guest_termination(env_handle);
+    // The refusal may be a provider stop; report it now that the registry
+    // lock is released.
+    env.data().budget.deliver_limits_exceeded();
+    status
 }
 
 fn guest_unofficial_napi_request_interrupt(
