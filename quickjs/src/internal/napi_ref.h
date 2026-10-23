@@ -38,7 +38,6 @@ private:
 
   // Owning environment and referenced QuickJS value.
   napi_env env_ = nullptr;
-  JSContext *context_ = nullptr;
   JSValue value_ = JS_UNDEFINED;
   JSNativeWeakRefLink weak_link_{};
 

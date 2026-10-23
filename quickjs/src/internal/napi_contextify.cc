@@ -216,7 +216,6 @@ namespace quickjs::detail
             if (rc < 0)
             {
                 JS_FreePropertyEnum(source_ctx, props, prop_count);
-                napi_env_context_scope__ target_scope{env, target_ctx};
                 return napi_util__::return_pending_if_caught(env, "Failed to define context property");
             }
         }
@@ -235,7 +234,6 @@ namespace quickjs::detail
                                    record->global,
                                    JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
         {
-            napi_env_context_scope__ child_scope{record->env, record->ctx};
             return napi_util__::return_pending_if_caught(record->env, "Failed to enumerate context baseline");
         }
 
@@ -267,7 +265,6 @@ namespace quickjs::detail
                                    record->global,
                                    JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
         {
-            napi_env_context_scope__ child_scope{record->env, record->ctx};
             return napi_util__::return_pending_if_caught(record->env, "Failed to enumerate context globals");
         }
 
@@ -281,7 +278,6 @@ namespace quickjs::detail
             if (sandbox_has < 0)
             {
                 JS_FreePropertyEnum(record->ctx, props, prop_count);
-                napi_env_context_scope__ parent_scope{record->env, record->parent_ctx};
                 return napi_util__::return_pending_if_caught(record->env, "Failed to inspect sandbox property");
             }
 
@@ -293,7 +289,6 @@ namespace quickjs::detail
             if (has < 0)
             {
                 JS_FreePropertyEnum(record->ctx, props, prop_count);
-                napi_env_context_scope__ child_scope{record->env, record->ctx};
                 return napi_util__::return_pending_if_caught(record->env, "Failed to read context global");
             }
             if (has == 0)
@@ -310,7 +305,6 @@ namespace quickjs::detail
             if (rc < 0)
             {
                 JS_FreePropertyEnum(record->ctx, props, prop_count);
-                napi_env_context_scope__ parent_scope{record->env, record->parent_ctx};
                 return napi_util__::return_pending_if_caught(record->env, "Failed to write sandbox property");
             }
         }
@@ -799,7 +793,6 @@ namespace quickjs::detail
                 env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return sync_status;
             }
-            napi_env_context_scope__ child_scope{env_, record->ctx};
             JSEvalOptions options{
                 .version = JS_EVAL_OPTIONS_VERSION,
                 .eval_flags = JS_EVAL_TYPE_GLOBAL,
@@ -822,7 +815,7 @@ namespace quickjs::detail
                 return sync_status;
             }
             env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
-            *result_out = env_->wrap_value_in_current_scope(record->ctx, result, true);
+            *result_out = env_->wrap_value_in_current_scope(result, true);
             return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
@@ -910,7 +903,6 @@ namespace quickjs::detail
         }
 
         JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
-        napi_env_context_scope__ compile_scope{env_, compile_ctx};
 
         JSValue fn = JS_UNDEFINED;
         bool have_fn = false;
@@ -949,7 +941,7 @@ namespace quickjs::detail
         if (!source_url.empty())
             napi_util__::set_string_property(compile_ctx, out, "sourceURL", source_url);
         JS_SetPropertyStr(compile_ctx, out, "sourceMapURL", JS_UNDEFINED);
-        *result_out = env_->wrap_value_in_current_scope(compile_ctx, out, true);
+        *result_out = env_->wrap_value_in_current_scope(out, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
