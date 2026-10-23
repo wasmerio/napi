@@ -293,7 +293,8 @@ pub fn read_guest_string_value(
     } else {
         f64::from(length)
     };
-    let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
+    let max =
+        u32::try_from(env.data().resource_limit(super::MAX_GUEST_CSTRING_SCAN)).unwrap_or(u32::MAX);
     wasmer_napi_guest_string(&memory, guest_ptr, length, encoding as u32, max).map(JsValue::from)
 }
 
@@ -727,7 +728,8 @@ pub fn read_guest_u32_array(
 
 pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<Vec<u8>> {
     let memory = guest_memory(env)?;
-    let max = u32::try_from(super::MAX_GUEST_CSTRING_SCAN).unwrap_or(u32::MAX);
+    let max =
+        u32::try_from(env.data().resource_limit(super::MAX_GUEST_CSTRING_SCAN)).unwrap_or(u32::MAX);
     let len = usize::try_from(wasmer_napi_guest_c_string_length(&memory, guest_ptr, max)).ok()?;
     let mut out = vec![0u8; len];
     wasmer_napi_guest_read(&memory, guest_ptr, &mut out).then_some(out)
@@ -1005,4 +1007,15 @@ mod tests {
             1
         );
     }
+}
+
+pub fn guest_range_is_valid(env: &mut FunctionEnvMut<NapiEnv>, ptr: u32, len: usize) -> bool {
+    let Some(end) = u64::from(ptr).checked_add(len as u64) else {
+        return false;
+    };
+    let (state, store) = env.data_and_store_mut();
+    let Some(memory) = state.memory.as_ref() else {
+        return false;
+    };
+    end <= (1u64 << 32) && end <= memory.view(&store).data_size()
 }

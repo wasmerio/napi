@@ -52,15 +52,16 @@ impl NapiLimits {
 /// Guest environments allocate V8 array buffers in the guest's linear memory,
 /// where they count against the context's memory budget. V8 does not allocate
 /// WebAssembly memories and compiled wasm code that way: they come from V8's
-/// page allocator, outside the guest heap. The default therefore removes
-/// `WebAssembly` from guest environments; [`WasmPolicy::EnabledMetered`]
-/// exposes it with those allocations bounded and charged.
+/// page allocator, outside the guest heap. Budgeted and managed contexts default
+/// to removing `WebAssembly`; [`WasmPolicy::EnabledMetered`] exposes it with those
+/// allocations bounded and charged. Unbudgeted standalone contexts default to
+/// [`WasmPolicy::EnabledUnmetered`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WasmPolicy {
     /// `WebAssembly` is absent from the root context and from every `vm`
     /// context of a guest environment, and V8 refuses wasm code generation in
-    /// them. This is the default.
+    /// them. Budgeted and managed contexts use this policy by default.
     ///
     /// The restriction applies to environments backed by a guest heap, which
     /// is every environment a guest creates through this crate. (The
@@ -265,7 +266,7 @@ pub fn configure_wasm_engine(limits: &WasmEngineLimits) -> Result<()> {
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
-    webassembly: WasmPolicy,
+    webassembly: Option<WasmPolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -449,14 +450,15 @@ impl NapiCtxBuilder {
         self
     }
 
-    /// Whether guest JavaScript can use V8's `WebAssembly` (default:
-    /// [`WasmPolicy::Restricted`]). Prefer [`WasmPolicy::EnabledMetered`]; with
-    /// [`WasmPolicy::EnabledUnmetered`] wasm memory and code are not bounded.
+    /// Whether guest JavaScript can use V8's `WebAssembly`. Standalone contexts
+    /// without a memory budget default to [`WasmPolicy::EnabledUnmetered`].
+    /// Managed contexts and contexts with an explicit memory budget default to
+    /// [`WasmPolicy::Restricted`]; they can opt into metered WebAssembly.
     ///
     /// Applies to every environment a guest creates after this context is
     /// built, including those of WASIX worker threads.
     pub fn webassembly(mut self, policy: WasmPolicy) -> Self {
-        self.webassembly = policy;
+        self.webassembly = Some(policy);
         self
     }
 
@@ -494,11 +496,22 @@ impl NapiCtxBuilder {
         if let Some(bytes) = self.limits.heap_emergency_headroom_bytes {
             budget.set_heap_emergency_headroom(bytes);
         }
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let managed = managed_lane_activator.is_some();
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        let managed = false;
+        let webassembly = self.webassembly.unwrap_or_else(|| {
+            if managed || !budget.is_unlimited() {
+                WasmPolicy::Restricted
+            } else {
+                WasmPolicy::EnabledUnmetered
+            }
+        });
         let envs = Arc::new(Mutex::new(HashSet::new()));
         let host_stopped = Arc::new(AtomicBool::new(false));
         Arc::new(NapiProviderBindings {
             limits: self.limits,
-            webassembly: self.webassembly,
+            webassembly,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             next_native_env_id: Arc::new(AtomicU32::new(1)),
@@ -938,12 +951,24 @@ mod tests {
     }
 
     #[test]
-    fn webassembly_policy_defaults_to_restricted_and_reaches_store_envs() {
+    fn webassembly_defaults_follow_explicit_resource_limits_and_reach_store_envs() {
         assert_eq!(WasmPolicy::default(), WasmPolicy::Restricted);
         assert_eq!(
             NapiCtx::default().webassembly_policy(),
+            WasmPolicy::EnabledUnmetered
+        );
+        assert!(NapiCtx::default().budget().is_unlimited());
+        assert_eq!(
+            NapiCtx::builder()
+                .total_memory_bytes(128 * 1024 * 1024)
+                .build()
+                .webassembly_policy(),
             WasmPolicy::Restricted
         );
+        let managed = NapiCtx::builder().build_managed_imports(Arc::new(|| {
+            unreachable!("building import hooks must not activate a lane")
+        }));
+        assert_eq!(managed.inner.webassembly, WasmPolicy::Restricted);
         // Mirrors NapiWebAssemblyPolicy in restricted_context.h.
         assert_eq!(WasmPolicy::Restricted.bridge_code(), 0);
         assert_eq!(WasmPolicy::EnabledUnmetered.bridge_code(), 1);

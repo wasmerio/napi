@@ -18,9 +18,10 @@ use crate::{
 };
 
 /// Temporary worst-case reservation covering serializer capacity, its object
-/// table, and message metadata. The native serializer rejects a buffer above
-/// 4 MiB and caps transfer side tables. On success the reservation shrinks to
-/// the measured native bytes retained until the receiver consumes the handle.
+/// table, and message metadata for resource-limited contexts. Their native
+/// serializer rejects buffers above 4 MiB and caps transfer side tables. The
+/// reservation becomes the measured retained size on success; unrestricted
+/// standalone messages may grow beyond it.
 pub(crate) const SERIALIZATION_RESERVATION: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct MessageCharge {
@@ -76,9 +77,20 @@ impl MessageCharge {
             .is_some_and(|bound| Arc::ptr_eq(bound, memory))
     }
 
-    pub(crate) fn shrink(&mut self, retained_bytes: u64) -> bool {
+    pub(crate) fn resize(&mut self, retained_bytes: u64) -> bool {
         if retained_bytes > self.bytes {
-            return false;
+            // Standalone serialization has no fixed reservation ceiling. Keep
+            // ownership/accounting exact after learning its actual size.
+            if !self.budget.is_unlimited()
+                || self
+                    .budget
+                    .try_charge(Pool::SerializedMessage, retained_bytes - self.bytes)
+                    .is_err()
+            {
+                return false;
+            }
+            self.bytes = retained_bytes;
+            return true;
         }
         self.budget
             .uncharge(Pool::SerializedMessage, self.bytes - retained_bytes);
@@ -236,12 +248,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unlimited_message_ownership_can_exceed_the_initial_reservation() {
+        let budget = ResourceBudget::unlimited();
+        let mut charge = MessageCharge::reserve(Arc::clone(&budget), 32 * 1024 * 1024).unwrap();
+        assert!(charge.resize(64 * 1024 * 1024));
+        assert_eq!(budget.snapshot().serialized_message, 64 * 1024 * 1024);
+        drop(charge);
+        assert_eq!(budget.snapshot().serialized_message, 0);
+
+        let budget = ResourceBudget::with_memory_limit(128 * 1024 * 1024);
+        let mut charge = MessageCharge::reserve(Arc::clone(&budget), 32 * 1024 * 1024).unwrap();
+        assert!(!charge.resize(64 * 1024 * 1024));
+        assert_eq!(budget.snapshot().serialized_message, 32 * 1024 * 1024);
+    }
+
+    #[test]
     fn pending_messages_are_context_owned_and_charged() {
         let budget = ResourceBudget::with_memory_limit(100);
         let first = PendingMessages::new();
         let second = PendingMessages::new();
         let mut charge = MessageCharge::reserve(Arc::clone(&budget), 80).unwrap();
-        assert!(charge.shrink(20));
+        assert!(charge.resize(20));
         assert_eq!(budget.snapshot().serialized_message, 20);
         first.insert(1, charge).unwrap();
         assert!(second.take(1).is_none());

@@ -478,7 +478,7 @@ fn module_code_cache_imports_fail_before_native_allocation() {
       (func (export "output") (result i32) (i32.load (i32.const 40))))"#;
 
     for mode in 0..2 {
-        let ctx = NapiCtx::default();
+        let ctx = NapiCtx::builder().total_memory_bytes(160 * MIB).build();
         let budget = ctx.budget();
         let mut store = Store::default();
         let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();

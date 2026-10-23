@@ -288,7 +288,7 @@ pub fn read_guest_c_string(
         let memory = state.memory.clone()?;
         let view = memory.view(&store);
         let mut len = None;
-        for i in 0..super::MAX_GUEST_CSTRING_SCAN {
+        for i in 0..state.resource_limit(super::MAX_GUEST_CSTRING_SCAN) {
             let mut b = [0u8; 1];
             view.read(guest_ptr as u64 + i as u64, &mut b).ok()?;
             if b[0] == 0 {

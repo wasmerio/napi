@@ -767,11 +767,12 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   return *out != nullptr;
 }
 
-bool SnapshotOwnProperties(v8::Isolate* isolate,
+bool SnapshotOwnProperties(napi_env env,
                            v8::Local<v8::Context> context,
                            v8::Local<v8::Object> object,
                            std::vector<SavedOwnProperty>* out) {
-  if (out == nullptr) return false;
+  if (env == nullptr || out == nullptr) return false;
+  v8::Isolate* isolate = env->isolate;
   out->clear();
 
   v8::Local<v8::Array> names;
@@ -787,7 +788,7 @@ bool SnapshotOwnProperties(v8::Isolate* isolate,
 
   // The Rust import reserves for this vector and its persistent handles
   // before V8 can invoke a sandbox getter or Proxy trap.
-  if (names->Length() > 16 * 1024) return false;
+  if (env->resource_limits_enabled && names->Length() > 16 * 1024) return false;
   try {
     out->reserve(names->Length());
     for (uint32_t i = 0; i < names->Length(); ++i) {
@@ -1072,16 +1073,21 @@ bool PopulateModuleRequests(napi_env env,
                             v8::Local<v8::Module> module) {
   if (env == nullptr || record == nullptr || module.IsEmpty()) return false;
   auto* state = GetModuleWrapState(env);
-  if (state == nullptr || state->request_metadata_bytes > kMaxModuleRequestMetadata)
+  if (state == nullptr ||
+      (env->resource_limits_enabled &&
+       state->request_metadata_bytes > kMaxModuleRequestMetadata))
     return false;
   record->module_requests.clear();
   record->resolve_cache.clear();
 
   v8::Local<v8::FixedArray> raw_requests = module->GetModuleRequests();
   if (raw_requests->Length() < 0 ||
-      static_cast<size_t>(raw_requests->Length()) > kMaxModuleRequests)
+      (env->resource_limits_enabled &&
+       static_cast<size_t>(raw_requests->Length()) > kMaxModuleRequests))
     return false;
-  const size_t available = kMaxModuleRequestMetadata - state->request_metadata_bytes;
+  const size_t available =
+      (env->resource_limits_enabled ? kMaxModuleRequestMetadata : SIZE_MAX) -
+      state->request_metadata_bytes;
   size_t estimated_bytes = 0;
   auto consume = [&](size_t bytes) {
     if (bytes > available - estimated_bytes) return false;
@@ -1107,7 +1113,8 @@ bool PopulateModuleRequests(napi_env env,
     if (!consume_string(request->GetSpecifier())) return false;
     v8::Local<v8::FixedArray> attributes = request->GetImportAttributes();
     if (attributes->Length() < 0 || attributes->Length() % 3 != 0 ||
-        static_cast<size_t>(attributes->Length() / 3) > kMaxModuleRequests)
+        (env->resource_limits_enabled &&
+         static_cast<size_t>(attributes->Length() / 3) > kMaxModuleRequests))
       return false;
     for (int j = 0; j < attributes->Length(); j += 3) {
       if (!consume(128) ||
@@ -1271,7 +1278,8 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
   // Four native vectors are materialized below and in
   // CreateFrozenNullProtoObject. Bound this transient metadata before reserve.
   if (import_attributes->Length() < 0 ||
-      import_attributes->Length() > kMaxDynamicImportAttributeEntries ||
+      (env->resource_limits_enabled &&
+       import_attributes->Length() > kMaxDynamicImportAttributeEntries) ||
       import_attributes->Length() % 2 != 0) {
     isolate->ThrowException(v8::Exception::RangeError(
         OneByteString(isolate, "too many dynamic import attributes")));
@@ -1608,14 +1616,16 @@ bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<s
   constexpr uint32_t kMaxParams = 1024;
   constexpr size_t kMaxParamBytes = 1024 * 1024;
   const uint32_t length = array->Length();
-  if (length > kMaxParams) return false;
+  if (env->resource_limits_enabled && length > kMaxParams) return false;
   out->reserve(length);
   size_t total_bytes = 0;
   for (uint32_t i = 0; i < length; ++i) {
     v8::Local<v8::Value> item;
     if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
     const int bytes = item.As<v8::String>()->Utf8Length(env->isolate);
-    if (bytes < 0 || static_cast<size_t>(bytes) > kMaxParamBytes - total_bytes)
+    if (bytes < 0 ||
+        static_cast<size_t>(bytes) >
+            (env->resource_limits_enabled ? kMaxParamBytes : SIZE_MAX) - total_bytes)
       return false;
     total_bytes += static_cast<size_t>(bytes);
     out->push_back(V8ValueToUtf8(env->isolate, item));
@@ -1848,7 +1858,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
     // creation must retain V8's normal, uncaught lifecycle.
     v8::TryCatch try_catch(isolate);
     if (!SnapshotOwnProperties(
-            isolate, current, sandbox_object, &saved_properties)) {
+            env, current, sandbox_object, &saved_properties)) {
       if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
         napi_v8_set_last_exception(
             env, try_catch.Exception(), try_catch.Message());
@@ -2424,11 +2434,13 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   } else {
     v8::Local<v8::String> source_string = ToV8String(env, source->text, "");
     const int source_bytes = source_string->Utf8Length(isolate);
-    if (source_bytes < 0 || source_bytes > 4 * 1024 * 1024)
+    if (source_bytes < 0 ||
+        (env->resource_limits_enabled && source_bytes > 4 * 1024 * 1024))
       return napi_invalid_arg;
     source_text = V8ValueToUtf8(isolate, source_string);
   }
-  if (source_text.size() > 4 * 1024 * 1024) return napi_invalid_arg;
+  if (env->resource_limits_enabled && source_text.size() > 4 * 1024 * 1024)
+    return napi_invalid_arg;
   if (StartsWithBomHashbang(source_text)) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(
         isolate, "Invalid or unexpected token");
@@ -2443,7 +2455,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
   }
 
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "");
-  if (filename_str->Utf8Length(isolate) > 1024 * 1024)
+  if (env->resource_limits_enabled &&
+      filename_str->Utf8Length(isolate) > 1024 * 1024)
     return napi_invalid_arg;
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -2460,7 +2473,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
     v8::Local<v8::Array> array = value.As<v8::Array>();
     const uint32_t length = array->Length();
-    if (length > 1024) return napi_invalid_arg;
+    if (env->resource_limits_enabled && length > 1024) return napi_invalid_arg;
     context_extensions.reserve(length);
     for (uint32_t i = 0; i < length; ++i) {
       v8::Local<v8::Value> item;
@@ -2722,7 +2735,8 @@ static napi_status CreateSourceTextModule(
   *module_out = nullptr;
 
   EnsureModuleWrapCleanupHook(env);
-  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+  if (env->resource_limits_enabled &&
+      GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
     return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
@@ -2834,7 +2848,8 @@ static napi_status CreateSourceTextModule(
     return napi_generic_failure;
   }
 
-  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+  if (env->resource_limits_enabled &&
+      GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
     DestroyModuleRecord(record);
     return napi_generic_failure;
   }
@@ -2861,7 +2876,8 @@ static napi_status CreateSyntheticModule(
   if (napi_is_array(env, export_names, &is_array) != napi_ok || !is_array) return napi_invalid_arg;
 
   EnsureModuleWrapCleanupHook(env);
-  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
+  if (env->resource_limits_enabled &&
+      GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps)
     return napi_generic_failure;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
@@ -2873,7 +2889,7 @@ static napi_status CreateSyntheticModule(
 
   uint32_t export_count = 0;
   napi_get_array_length(env, export_names, &export_count);
-  if (export_count > 1024) return napi_invalid_arg;
+  if (env->resource_limits_enabled && export_count > 1024) return napi_invalid_arg;
   std::vector<v8::Local<v8::String>> export_names_v8;
   export_names_v8.reserve(export_count);
   for (uint32_t i = 0; i < export_count; ++i) {
@@ -2897,7 +2913,8 @@ static napi_status CreateSyntheticModule(
   napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
   napi_create_reference(env, synthetic_eval_steps, 1, &record->synthetic_eval_steps_ref);
 
-  if (GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
+  if (env->resource_limits_enabled &&
+      GetModuleWrapState(env)->modules.size() >= kMaxLiveModuleWraps) {
     DestroyModuleRecord(record);
     return napi_generic_failure;
   }
@@ -3022,7 +3039,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     const unofficial_napi_module* linked_modules) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
-  if (count > kMaxModuleRequests) return napi_invalid_arg;
+  if (env->resource_limits_enabled && count > kMaxModuleRequests) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
@@ -3428,9 +3445,10 @@ NapiV8ProviderPromiseReservation::NapiV8ProviderPromiseReservation(
   if (env == nullptr) return;
   auto* state = FindModuleWrapState(env);
   if (state == nullptr) return;
-  if (state->pending_dynamic_imports.size() +
-          state->pending_dynamic_imports_in_flight >=
-      kMaxPendingProviderPromises) {
+  if (env->resource_limits_enabled &&
+      state->pending_dynamic_imports.size() +
+              state->pending_dynamic_imports_in_flight >=
+          kMaxPendingProviderPromises) {
     NapiV8HasPendingProviderWork(env);
     if (state->pending_dynamic_imports.size() +
             state->pending_dynamic_imports_in_flight >=
@@ -3462,7 +3480,8 @@ bool NapiV8TrackProviderPromise(v8::Isolate* isolate,
   if (env == nullptr) return true;
   auto* state = FindModuleWrapState(env);
   if (state == nullptr) return true;
-  if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
+  if (env->resource_limits_enabled &&
+      state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
     NapiV8HasPendingProviderWork(env);
     if (state->pending_dynamic_imports.size() >= kMaxPendingProviderPromises) {
       // Dropping tracking would let the instance report quiescence with guest

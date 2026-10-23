@@ -282,7 +282,7 @@ fn main() -> Result<()> {
         Some(path) => PathBuf::from(path),
         None => {
             bail!(
-                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--unmetered-webassembly] [--] [guest-args...]"
+                "usage: napi_wasmer <wasm-file> [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [--env <key>=<value>] [--cwd <guest-dir>] [--program-name <name>] [--restricted-webassembly|--unmetered-webassembly] [--] [guest-args...]"
             );
         }
     };
@@ -298,7 +298,7 @@ fn main() -> Result<()> {
         .to_string();
     let mut guest_args = Vec::new();
     let mut forwarding_guest_args = false;
-    let mut webassembly = WasmPolicy::Restricted;
+    let mut webassembly = WasmPolicy::EnabledUnmetered;
 
     while let Some(arg) = argv.next() {
         if forwarding_guest_args {
@@ -310,6 +310,7 @@ fn main() -> Result<()> {
             // Exposes V8 WebAssembly to the guest without resource accounting
             // (see `WasmPolicy::EnabledUnmetered`).
             "--unmetered-webassembly" => webassembly = WasmPolicy::EnabledUnmetered,
+            "--restricted-webassembly" => webassembly = WasmPolicy::Restricted,
             "--app-dir" => {
                 let host_dir = argv
                     .next()

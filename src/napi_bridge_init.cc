@@ -30,6 +30,7 @@
 #include "internal/restricted_context.h"
 #include "node_api.h"
 #include "unofficial_napi.h"
+#include "napi_resource_limits.h"
 
 // Private V8 provider accounting hook. It is never imported by WASIX guests.
 extern "C" size_t unofficial_napi_message_retained_bytes(
@@ -246,6 +247,7 @@ struct SnapiEnvState {
   // collection the bridge asks V8 to collect, because a small JS heap alone
   // would never trigger the GC that releases it.
   const void *host_budget = nullptr;
+  bool resource_limits_enabled = false;
   size_t bk_live = 0;
   size_t bk_granted = 0;
   size_t bk_reclaimable = 0;
@@ -3499,7 +3501,7 @@ extern "C" int snapi_bridge_define_properties(
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj)
     return napi_invalid_arg;
-  if (prop_count > 4096 ||
+  if ((bridge_state->resource_limits_enabled && prop_count > 4096) ||
       (prop_count != 0 &&
        (prop_types == nullptr || value_ids == nullptr ||
         method_reg_ids == nullptr || getter_reg_ids == nullptr ||
@@ -3570,7 +3572,7 @@ extern "C" int snapi_bridge_define_class(
   if (bridge_state == nullptr)
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  if (prop_count > 4096 ||
+  if ((bridge_state->resource_limits_enabled && prop_count > 4096) ||
       (prop_count != 0 &&
        (prop_types == nullptr || prop_value_ids == nullptr ||
         prop_method_reg_ids == nullptr || prop_getter_reg_ids == nullptr ||
@@ -4069,6 +4071,16 @@ size_t HostNearHeapLimitTrampoline(napi_env env, void *data,
 // Installs the embedder's budget tracker: V8 heap growth is charged through
 // the near-heap-limit callback and the bridge's own host bookkeeping through
 // napi_host_bookkeeping_charge. `data` must outlive the env.
+extern "C" int snapi_bridge_unofficial_set_resource_limits(
+    SnapiEnvState *env_state, int enabled) {
+  auto lease = RequireEnvState(env_state);
+  auto* state = lease.get();
+  if (state == nullptr) return napi_invalid_arg;
+  napi_status status = snapi_private_set_resource_limits(state->env, enabled);
+  if (status == napi_ok) state->resource_limits_enabled = enabled != 0;
+  return status;
+}
+
 extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState *env_state,
                                                        const void *data) {
   auto lease = RequireEnvState(env_state);
@@ -4837,11 +4849,13 @@ extern "C" int snapi_bridge_unofficial_message_create_metered(
       unofficial_napi_message_create(bridge_state->env, value, &message);
   if (status != napi_ok)
     return status;
-  // The guest reserved 32 MiB before entering V8. Reject any unexpected
-  // retained representation that would exceed that reservation.
+  // Resource-limited guests reserve 32 MiB before entering V8. Reject any
+  // retained representation that would exceed that reservation. Standalone
+  // callers update ownership accounting to the actual retained size.
   constexpr size_t kMaxRetainedBytes = 32 * 1024 * 1024;
   const size_t payload_bytes = unofficial_napi_message_retained_bytes(message);
-  if (payload_bytes > kMaxRetainedBytes - 4096) {
+  if (payload_bytes > SIZE_MAX - 4096 ||
+      (bridge_state->resource_limits_enabled && payload_bytes > kMaxRetainedBytes - 4096)) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
   }
@@ -5613,11 +5627,12 @@ snapi_bridge_unofficial_module_wrap_link(SnapiEnvState *env_state,
                                          const uint32_t *linked_handle_ids) {
   // Bound this before allocating the bridge vector even for callers that
   // bypass the Rust import layer.
-  if (count > 4096 || (count != 0 && linked_handle_ids == nullptr))
+  if (count != 0 && linked_handle_ids == nullptr)
     return napi_invalid_arg;
   auto bridge_state_lease = RequireEnvState(env_state);
   auto *bridge_state = bridge_state_lease.get();
-  if (bridge_state == nullptr)
+  if (bridge_state == nullptr ||
+      (bridge_state->resource_limits_enabled && count > 4096))
     return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module =

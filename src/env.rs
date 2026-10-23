@@ -338,6 +338,15 @@ impl NapiEnv {
         env: SnapiEnv,
         reservation: &HeapReservation,
     ) -> Option<(u32, u32)> {
+        if unsafe {
+            crate::snapi::snapi_bridge_unofficial_set_resource_limits(
+                env,
+                i32::from(self.enforces_resource_limits()),
+            )
+        } != 0
+        {
+            return None;
+        }
         let (env_id, scope_id) = self.register_napi_env(env)?;
         {
             let mut registry = self
@@ -475,6 +484,26 @@ impl NapiEnv {
             return 1;
         }
         unsafe { crate::snapi::snapi_bridge_unofficial_cancel_terminate_execution(env) }
+    }
+
+    /// Resource quotas are opt-in through a memory budget or managed execution.
+    pub(crate) fn enforces_resource_limits(&self) -> bool {
+        if !self.budget.is_unlimited() {
+            return true;
+        }
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if self.managed_lane_activator.is_some() {
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn resource_limit(&self, bounded_limit: usize) -> usize {
+        if self.enforces_resource_limits() {
+            bounded_limit
+        } else {
+            usize::MAX
+        }
     }
 
     /// Claim one level of guest↔host callback reentrancy. Returns `false` (the

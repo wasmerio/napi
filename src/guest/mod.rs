@@ -17,17 +17,12 @@ pub mod util;
 
 pub const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;
 
-/// Hard ceilings on host scratch buffers sized by a guest-supplied *count*
-/// (rather than by data that lives in guest memory). These are rejected before
-/// allocating — mirroring the WASIX `MAX_SOCKET_PAYLOAD` write cap — so a bogus
-/// count can never allocate gigabytes host-side. Each is ~256 KiB worth, far
-/// beyond any legitimate use (no function has 65k args; no real BigInt is a
-/// 2-Mbit integer), which keeps the transient uncounted host memory negligible.
+/// Per-call ceilings for explicitly budgeted or managed contexts. Standalone
+/// contexts use guest-memory/ABI bounds instead of these resource quotas.
 pub const MAX_NAPI_CALLBACK_ARGS: usize = 64 * 1024;
 pub const MAX_NAPI_BIGINT_WORDS: usize = 32 * 1024;
 /// One N-API definition call rarely needs even hundreds of properties. Bound
-/// its nine host descriptor arrays and copied names independently of memory
-/// limit configuration (which may be unlimited in local tools).
+/// its host descriptor arrays and copied names when resource limits are enabled.
 pub const MAX_NAPI_PROPERTY_DESCRIPTORS: usize = 4096;
 
 /// Byte width for the public `napi_typedarray_type` enum. Keep the mapping in

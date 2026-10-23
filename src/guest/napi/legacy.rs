@@ -1219,7 +1219,7 @@ fn legacy_serialize_value(
         }
         return Ok(status);
     }
-    if !charge.shrink(retained_bytes) {
+    if !charge.resize(retained_bytes) {
         unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }

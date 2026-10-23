@@ -920,7 +920,7 @@ fn guest_unofficial_napi_message_create(
         }
         return Ok(status);
     }
-    if !charge.shrink(retained_bytes) {
+    if !charge.resize(retained_bytes) {
         unsafe { snapi_bridge_unofficial_message_drop(message) };
         return Ok(1);
     }
@@ -1200,19 +1200,31 @@ fn guest_unofficial_napi_get_heap_space_statistics(
         return 1;
     }
     let capacity = capacity as usize;
-    if capacity > MAX_HEAP_SPACE_CAPACITY {
+    if capacity > env.data().resource_limit(MAX_HEAP_SPACE_CAPACITY) {
+        return 1;
+    }
+    let Some(bytes) =
+        capacity.checked_mul(std::mem::size_of::<SnapiUnofficialHeapSpaceStatistics>())
+    else {
+        return 1;
+    };
+    if !guest_range_is_valid(&mut env, count_ptr, 4)
+        || (capacity != 0 && !guest_range_is_valid(&mut env, stats_ptr, bytes))
+    {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
-    let mut stats: Vec<SnapiUnofficialHeapSpaceStatistics> = (0..capacity)
-        .map(|_| SnapiUnofficialHeapSpaceStatistics {
-            space_name: [0; 64],
-            space_size: 0,
-            space_used_size: 0,
-            space_available_size: 0,
-            physical_space_size: 0,
-        })
-        .collect();
+    let mut stats = Vec::new();
+    if stats.try_reserve_exact(capacity).is_err() {
+        return 1;
+    }
+    stats.resize_with(capacity, || SnapiUnofficialHeapSpaceStatistics {
+        space_name: [0; 64],
+        space_size: 0,
+        space_used_size: 0,
+        space_available_size: 0,
+        physical_space_size: 0,
+    });
     let mut count = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_get_heap_space_statistics(
@@ -1269,15 +1281,36 @@ fn guest_unofficial_napi_configure_near_heap_limit_callback(
 }
 
 fn guest_unofficial_napi_profile_start(
-    _env: FunctionEnvMut<NapiEnv>,
-    _napi_env: u32,
-    _kind: i32,
-    _result_ptr: u32,
-    _profile_ptr: u32,
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    kind: i32,
+    result_ptr: u32,
+    profile_ptr: u32,
 ) -> i32 {
-    // V8's CPU and heap profilers retain native samples outside the per-app
-    // budget. Do not let a guest start an unbounded profiling session.
-    1
+    if env.data().enforces_resource_limits()
+        || read_guest_bytes(&mut env, result_ptr, 4).is_none()
+        || profile_ptr == 0
+        || read_guest_bytes(&mut env, profile_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    let mut result = 0i32;
+    let mut profile = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_profile_start(
+            snapi_env(&env, napi_env),
+            kind,
+            &mut result,
+            &mut profile,
+        )
+    };
+    if status == 0
+        && (!write_guest_i32(&mut env, result_ptr, result)
+            || !write_guest_u32(&mut env, profile_ptr, profile))
+    {
+        return 1;
+    }
+    status
 }
 
 fn guest_unofficial_napi_profile_stop(
@@ -1299,24 +1332,61 @@ fn guest_unofficial_napi_profile_stop(
 }
 
 fn guest_unofficial_napi_take_heap_snapshot(
-    _env: FunctionEnvMut<NapiEnv>,
-    _napi_env: u32,
-    _options_ptr: u32,
-    _json_ptr: u32,
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    options_ptr: u32,
+    json_ptr: u32,
 ) -> i32 {
-    // V8 builds both the snapshot and its retained external ArrayBuffer in
-    // native memory that is invisible to the instance memory accountant.
-    1
+    if env.data().enforces_resource_limits()
+        || json_ptr == 0
+        || read_guest_bytes(&mut env, json_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    let (internals, numeric) = if options_ptr != 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, 2) else {
+            return 1;
+        };
+        (i32::from(bytes[0] != 0), i32::from(bytes[1] != 0))
+    } else {
+        (0, 0)
+    };
+    let mut json = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_take_heap_snapshot(
+            snapi_env(&env, napi_env),
+            internals,
+            numeric,
+            &mut json,
+        )
+    };
+    if status == 0 && !write_guest_u32(&mut env, json_ptr, json) {
+        return 1;
+    }
+    status
 }
 
 fn guest_unofficial_napi_create_serdes_binding(
-    _env: FunctionEnvMut<NapiEnv>,
-    _napi_env: u32,
-    _result_ptr: u32,
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    result_ptr: u32,
 ) -> i32 {
-    // Serializer and Deserializer retain native buffers without a budget
-    // owner. Refuse the guest binding until both paths are accounted.
-    1
+    // Retained native serializer buffers are unrestricted only when the host
+    // has not opted into resource accounting or managed execution.
+    if env.data().enforces_resource_limits()
+        || result_ptr == 0
+        || read_guest_bytes(&mut env, result_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    let mut result = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_create_serdes_binding(snapi_env(&env, napi_env), &mut result)
+    };
+    if status == 0 && !write_guest_u32(&mut env, result_ptr, result) {
+        return 1;
+    }
+    status
 }
 
 fn guest_napi_add_env_cleanup_hook(
@@ -1859,14 +1929,29 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
 }
 
 fn guest_unofficial_napi_module_wrap_create_cached_data(
-    _env: FunctionEnvMut<NapiEnv>,
-    _napi_env: u32,
-    _handle: u32,
-    _result_ptr: u32,
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    handle: u32,
+    result_ptr: u32,
 ) -> i32 {
-    // CreateCodeCache allocates native CachedData before a size can be read.
-    // Keep this import closed until the native allocation has an enforced cap.
-    1
+    if env.data().enforces_resource_limits()
+        || result_ptr == 0
+        || read_guest_bytes(&mut env, result_ptr, 4).is_none()
+    {
+        return 1;
+    }
+    let mut result = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_module_wrap_create_cached_data(
+            snapi_env(&env, napi_env),
+            handle,
+            &mut result,
+        )
+    };
+    if status == 0 && !write_guest_u32(&mut env, result_ptr, result) {
+        return 1;
+    }
+    status
 }
 
 fn guest_unofficial_napi_module_wrap_set_hooks(
@@ -3765,7 +3850,7 @@ fn guest_napi_get_cb_info(
         heap.maybe_refill(&mut store_ref);
     }
     // Read the caller's requested argc (size of their argv array)
-    let wanted: u32 = if argc_ptr != 0 {
+    let wanted: u32 = if argc_ptr != 0 && argv_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, argc_ptr, 4) else {
             return 1;
         };
@@ -3775,11 +3860,18 @@ fn guest_napi_get_cb_info(
     };
 
     // Reject an absurd requested argc before allocating the argv scratch array.
-    if wanted as usize > MAX_NAPI_CALLBACK_ARGS {
+    if wanted as usize > env.data().resource_limit(MAX_NAPI_CALLBACK_ARGS) {
         return 1;
     }
 
     // Query the bridge for callback context
+    let Some(argv_bytes) = (wanted as usize).checked_mul(4) else {
+        return 1;
+    };
+    if argv_ptr > 0 && !guest_range_is_valid(&mut env, argv_ptr, argv_bytes) {
+        return 1;
+    }
+
     let mut actual_argc: u32 = wanted;
     let Some(mut argv_ids) = HostCopy::<u32>::zeroed(env.data().budget.clone(), wanted as usize)
     else {
@@ -3893,7 +3985,7 @@ fn guest_napi_define_class(
         HostCopy::default()
     };
 
-    if prop_count as usize > MAX_NAPI_PROPERTY_DESCRIPTORS {
+    if prop_count as usize > env.data().resource_limit(MAX_NAPI_PROPERTY_DESCRIPTORS) {
         return Ok(1);
     }
     // The bridge builds one native napi_property_descriptor per property.
@@ -4110,7 +4202,7 @@ fn guest_napi_define_properties(
     prop_count: u32,
     props_ptr: u32,
 ) -> Result<i32, WasiError> {
-    if prop_count as usize > MAX_NAPI_PROPERTY_DESCRIPTORS {
+    if prop_count as usize > env.data().resource_limit(MAX_NAPI_PROPERTY_DESCRIPTORS) {
         return Ok(1);
     }
     let Some(_native_descriptors) =
@@ -4324,7 +4416,7 @@ fn guest_napi_create_string_utf16(
                 break;
             }
             scan_len += 1;
-            if scan_len > MAX_GUEST_CSTRING_SCAN {
+            if scan_len > env.data().resource_limit(MAX_GUEST_CSTRING_SCAN) {
                 break;
             }
         }
@@ -4427,7 +4519,7 @@ fn guest_napi_create_bigint_words(
     words_ptr: u32,
     rp: u32,
 ) -> i32 {
-    if word_count as usize > MAX_NAPI_BIGINT_WORDS {
+    if word_count as usize > env.data().resource_limit(MAX_NAPI_BIGINT_WORDS) {
         return 1;
     }
     let wc = word_count as u32;
@@ -4490,10 +4582,13 @@ fn guest_napi_get_value_bigint_words(
     }
 
     // Reject an absurd word count before allocating the words scratch buffer.
-    if word_count > MAX_NAPI_BIGINT_WORDS {
+    if word_count > env.data().resource_limit(MAX_NAPI_BIGINT_WORDS) {
         return 1;
     }
-    if !guest_range_is_valid(&mut env, words_ptr, word_count * 8) {
+    let Some(word_bytes) = word_count.checked_mul(8) else {
+        return 1;
+    };
+    if !guest_range_is_valid(&mut env, words_ptr, word_bytes) {
         return 1;
     }
 

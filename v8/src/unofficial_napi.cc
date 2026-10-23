@@ -1,4 +1,5 @@
 #include "unofficial_napi.h"
+#include "napi_resource_limits.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36,6 +37,12 @@ struct unofficial_napi_profile__ {
   unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
   uint32_t provider_id = 0;
 };
+
+napi_status NAPI_CDECL snapi_private_set_resource_limits(napi_env env, int enabled) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->resource_limits_enabled = enabled != 0;
+  return napi_ok;
+}
 
 namespace {
 
@@ -1684,7 +1691,7 @@ napi_status CollectTransferArrayBuffers(
       ThrowCloneTransferError(isolate, "Transfer list contains duplicate ArrayBuffer");
       return napi_pending_exception;
     }
-    if (out->size() >= 65536) {
+    if (env->resource_limits_enabled && out->size() >= 65536) {
       ThrowCloneTransferError(isolate, "Too many ArrayBuffers in transfer list");
       return napi_pending_exception;
     }
@@ -1769,7 +1776,7 @@ napi_status StructuredCloneImpl(
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
   // The guest reserves native transient memory before entering this call.
-  StructuredCloneSerializerDelegate serializer_delegate(isolate, 4 * 1024 * 1024);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, env->resource_limits_enabled ? 4 * 1024 * 1024 : 0);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   std::vector<v8::Local<v8::ArrayBuffer>> array_buffers;
@@ -2525,7 +2532,7 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   // Worker messages are retained outside the V8 heap until another worker
   // consumes them. Bound the native serializer buffer before it allocates.
   constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
-  StructuredCloneSerializerDelegate serializer_delegate(isolate, kMaxMessageBytes);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, env->resource_limits_enabled ? kMaxMessageBytes : 0);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   serializer.WriteHeader();

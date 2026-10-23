@@ -1067,8 +1067,7 @@ fn guest_unofficial_napi_message_create(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut payload = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut payload) };
+    let status = unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut payload) };
     if status != 0 {
         return status;
     }
@@ -1112,10 +1111,7 @@ async fn guest_unofficial_napi_message_take_async(
     };
     let (status, value) = with_callback_state_async(env.as_mut(), env_handle, async move {
         let _charge = charge;
-        if crate::snapi_js::wait_for_message(payload)
-            .await
-            .is_err()
-        {
+        if crate::snapi_js::wait_for_message(payload).await.is_err() {
             unsafe { snapi_bridge_unofficial_message_drop(payload) };
             return (9, 0);
         }
@@ -1392,19 +1388,31 @@ fn guest_unofficial_napi_get_heap_space_statistics(
         return 1;
     }
     let capacity = capacity as usize;
-    if capacity > MAX_HEAP_SPACE_CAPACITY {
+    if capacity > env.data().resource_limit(MAX_HEAP_SPACE_CAPACITY) {
+        return 1;
+    }
+    let Some(bytes) =
+        capacity.checked_mul(std::mem::size_of::<SnapiUnofficialHeapSpaceStatistics>())
+    else {
+        return 1;
+    };
+    if !guest_range_is_valid(&mut env, count_ptr, 4)
+        || (capacity != 0 && !guest_range_is_valid(&mut env, stats_ptr, bytes))
+    {
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
-    let mut stats: Vec<SnapiUnofficialHeapSpaceStatistics> = (0..capacity)
-        .map(|_| SnapiUnofficialHeapSpaceStatistics {
-            space_name: [0; 64],
-            space_size: 0,
-            space_used_size: 0,
-            space_available_size: 0,
-            physical_space_size: 0,
-        })
-        .collect();
+    let mut stats = Vec::new();
+    if stats.try_reserve_exact(capacity).is_err() {
+        return 1;
+    }
+    stats.resize_with(capacity, || SnapiUnofficialHeapSpaceStatistics {
+        space_name: [0; 64],
+        space_size: 0,
+        space_used_size: 0,
+        space_available_size: 0,
+        physical_space_size: 0,
+    });
     let mut count = 0u32;
     let status = unsafe {
         snapi_bridge_unofficial_get_heap_space_statistics(
@@ -3980,7 +3988,7 @@ fn guest_napi_get_cb_info(
     data_ptr: u32,
 ) -> i32 {
     // Read the caller's requested argc (size of their argv array)
-    let wanted: u32 = if argc_ptr != 0 {
+    let wanted: u32 = if argc_ptr != 0 && argv_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, argc_ptr, 4) else {
             return 1;
         };
@@ -3988,11 +3996,18 @@ fn guest_napi_get_cb_info(
     } else {
         0
     };
-    if wanted as usize > MAX_NAPI_CALLBACK_ARGS {
+    if wanted as usize > env.data().resource_limit(MAX_NAPI_CALLBACK_ARGS) {
         return 1;
     }
 
     // Query the bridge for callback context
+    let Some(argv_bytes) = (wanted as usize).checked_mul(4) else {
+        return 1;
+    };
+    if argv_ptr > 0 && !guest_range_is_valid(&mut env, argv_ptr, argv_bytes) {
+        return 1;
+    }
+
     let mut actual_argc: u32 = wanted;
     let mut argv_ids = vec![0u32; wanted as usize];
     let mut this_id: u32 = 0;
@@ -4534,7 +4549,7 @@ fn guest_napi_create_bigint_words(
     words_ptr: u32,
     rp: u32,
 ) -> i32 {
-    if word_count as usize > MAX_NAPI_BIGINT_WORDS {
+    if word_count as usize > env.data().resource_limit(MAX_NAPI_BIGINT_WORDS) {
         return 1;
     }
     let wc = word_count;
@@ -4572,7 +4587,7 @@ fn guest_napi_get_value_bigint_words(
         return 1;
     };
     let mut word_count = u32::from_le_bytes(wc_bytes.try_into().unwrap()) as usize;
-    if word_count > MAX_NAPI_BIGINT_WORDS {
+    if word_count > env.data().resource_limit(MAX_NAPI_BIGINT_WORDS) {
         return 1;
     }
 
@@ -4595,6 +4610,13 @@ fn guest_napi_get_value_bigint_words(
         return s;
     }
 
+    let Some(word_bytes) = word_count.checked_mul(8) else {
+        return 1;
+    };
+    if !guest_range_is_valid(&mut env, words_ptr, word_bytes) {
+        return 1;
+    }
+    let capacity = word_count;
     let mut sign: i32 = 0;
     let mut words = vec![0u64; word_count];
     let s = unsafe {
@@ -4610,7 +4632,7 @@ fn guest_napi_get_value_bigint_words(
         write_guest_i32(&mut env, sign_ptr, sign);
         write_guest_u32(&mut env, wc_ptr, word_count as u32);
         // Write u64 words as LE bytes to guest
-        let bytes: Vec<u8> = words[..word_count]
+        let bytes: Vec<u8> = words[..word_count.min(capacity)]
             .iter()
             .flat_map(|&v| v.to_le_bytes())
             .collect();

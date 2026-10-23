@@ -82,6 +82,7 @@ struct napi_env__ {
 #endif
 
   v8::Isolate* isolate = nullptr;
+  bool resource_limits_enabled = false;
   v8::Global<v8::Context> context_ref;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
