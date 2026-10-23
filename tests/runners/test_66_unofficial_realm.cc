@@ -15,7 +15,7 @@ napi_value Str(napi_env env, const char* value) {
   return out;
 }
 
-napi_value Run(napi_env env, const char* source) {
+napi_value Eval(napi_env env, const char* source) {
   napi_value result = nullptr;
   if (napi_run_script(env, Str(env, source), &result) != napi_ok) return nullptr;
   return result;
@@ -133,11 +133,11 @@ TEST_F(Test66UnofficialRealm, RealmHasItsOwnGlobal) {
 
   EXPECT_TRUE(StrictEquals(s.env, Global(realm), realm_global));
   EXPECT_FALSE(StrictEquals(s.env, Global(realm), Global(s.env)));
-  EXPECT_TRUE(StrictEquals(s.env, Run(realm, "globalThis"), realm_global));
+  EXPECT_TRUE(StrictEquals(s.env, Eval(realm, "globalThis"), realm_global));
 
-  ASSERT_NE(Run(realm, "globalThis.answer = 42"), nullptr);
-  EXPECT_EQ(Utf8(s.env, Run(s.env, "typeof answer")), "undefined");
-  EXPECT_EQ(Int32(realm, Run(realm, "answer")), 42);
+  ASSERT_NE(Eval(realm, "globalThis.answer = 42"), nullptr);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof answer")), "undefined");
+  EXPECT_EQ(Int32(realm, Eval(realm, "answer")), 42);
 }
 
 TEST_F(Test66UnofficialRealm, RealmCreatesObjectsWithItsIntrinsics) {
@@ -145,11 +145,11 @@ TEST_F(Test66UnofficialRealm, RealmCreatesObjectsWithItsIntrinsics) {
   napi_env realm = CreateRealm(s.env);
   ASSERT_NE(realm, nullptr);
 
-  napi_value realm_object_prototype = Run(realm, "Object.prototype");
-  napi_value realm_array_prototype = Run(realm, "Array.prototype");
-  napi_value realm_error_prototype = Run(realm, "Error.prototype");
+  napi_value realm_object_prototype = Eval(realm, "Object.prototype");
+  napi_value realm_array_prototype = Eval(realm, "Array.prototype");
+  napi_value realm_error_prototype = Eval(realm, "Error.prototype");
   ASSERT_NE(realm_object_prototype, nullptr);
-  EXPECT_FALSE(StrictEquals(s.env, realm_object_prototype, Run(s.env, "Object.prototype")));
+  EXPECT_FALSE(StrictEquals(s.env, realm_object_prototype, Eval(s.env, "Object.prototype")));
 
   napi_value object = nullptr;
   napi_value array = nullptr;
@@ -163,7 +163,7 @@ TEST_F(Test66UnofficialRealm, RealmCreatesObjectsWithItsIntrinsics) {
 
   // The parent keeps creating in its own realm.
   ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
-  EXPECT_TRUE(StrictEquals(s.env, Prototype(s.env, object), Run(s.env, "Object.prototype")));
+  EXPECT_TRUE(StrictEquals(s.env, Prototype(s.env, object), Eval(s.env, "Object.prototype")));
 }
 
 TEST_F(Test66UnofficialRealm, ValuesAreSharedAcrossRealms) {
@@ -176,14 +176,14 @@ TEST_F(Test66UnofficialRealm, ValuesAreSharedAcrossRealms) {
   napi_value shared = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &shared), napi_ok);
   ASSERT_EQ(napi_set_named_property(realm, Global(realm), "shared", shared), napi_ok);
-  ASSERT_NE(Run(realm, "shared.x = 7"), nullptr);
+  ASSERT_NE(Eval(realm, "shared.x = 7"), nullptr);
 
   napi_value x = nullptr;
   ASSERT_EQ(napi_get_named_property(s.env, shared, "x", &x), napi_ok);
   EXPECT_EQ(Int32(s.env, x), 7);
 
   // A value made through the realm env is usable through the parent.
-  napi_value from_realm = Run(realm, "({ y: 9 })");
+  napi_value from_realm = Eval(realm, "({ y: 9 })");
   napi_value y = nullptr;
   ASSERT_EQ(napi_get_named_property(s.env, from_realm, "y", &y), napi_ok);
   EXPECT_EQ(Int32(s.env, y), 9);
@@ -202,11 +202,11 @@ TEST_F(Test66UnofficialRealm, NativeFunctionsRunInTheirRealm) {
             napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "probe", fn), napi_ok);
 
-  napi_value result = Run(s.env, "probe()");
+  napi_value result = Eval(s.env, "probe()");
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(record.calls, 1);
   EXPECT_EQ(record.env, realm);
-  EXPECT_TRUE(StrictEquals(s.env, Prototype(s.env, result), Run(realm, "Object.prototype")));
+  EXPECT_TRUE(StrictEquals(s.env, Prototype(s.env, result), Eval(realm, "Object.prototype")));
 }
 
 TEST_F(Test66UnofficialRealm, GetRealmFindsRealmsByGlobalAndFunction) {
@@ -222,7 +222,7 @@ TEST_F(Test66UnofficialRealm, GetRealmFindsRealmsByGlobalAndFunction) {
   ASSERT_EQ(unofficial_napi_get_realm(realm, Global(s.env), &found), napi_ok);
   EXPECT_EQ(found, s.env);
 
-  napi_value fn = Run(realm, "(function f() {})");
+  napi_value fn = Eval(realm, "(function f() {})");
   ASSERT_NE(fn, nullptr);
   found = nullptr;
   ASSERT_EQ(unofficial_napi_get_realm(s.env, fn, &found), napi_ok);
@@ -277,7 +277,7 @@ TEST_F(Test66UnofficialRealm, SandboxRealmReadsAndWritesTheSandbox) {
   napi_value output = nullptr;
   ASSERT_EQ(napi_get_named_property(s.env, sandbox, "output", &output), napi_ok);
   EXPECT_EQ(Int32(s.env, output), 10);
-  EXPECT_EQ(Utf8(s.env, Run(s.env, "typeof output")), "undefined");
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof output")), "undefined");
 }
 
 TEST_F(Test66UnofficialRealm, MakeContextCreatesARealmEnv) {
@@ -323,27 +323,27 @@ TEST_F(Test66UnofficialRealm, PromiseRejectCallbackFallsBackToTheParent) {
   napi_env nested = CreateRealm(realm);
   ASSERT_NE(nested, nullptr);
 
-  napi_value parent_callback = Run(s.env,
+  napi_value parent_callback = Eval(s.env,
       "globalThis.parentRejections = 0;"
       "(event) => { if (event === 0) parentRejections++; }");
   ASSERT_NE(parent_callback, nullptr);
   ASSERT_EQ(unofficial_napi_set_promise_reject_callback(s.env, parent_callback), napi_ok);
 
-  ASSERT_NE(Run(realm, "Promise.reject(1); 0"), nullptr);
-  ASSERT_NE(Run(nested, "Promise.reject(2); 0"), nullptr);
-  EXPECT_EQ(Int32(s.env, Run(s.env, "parentRejections")), 2);
+  ASSERT_NE(Eval(realm, "Promise.reject(1); 0"), nullptr);
+  ASSERT_NE(Eval(nested, "Promise.reject(2); 0"), nullptr);
+  EXPECT_EQ(Int32(s.env, Eval(s.env, "parentRejections")), 2);
 
-  napi_value realm_callback = Run(realm,
+  napi_value realm_callback = Eval(realm,
       "globalThis.realmRejections = 0;"
       "(event) => { if (event === 0) realmRejections++; }");
   ASSERT_NE(realm_callback, nullptr);
   ASSERT_EQ(unofficial_napi_set_promise_reject_callback(realm, realm_callback), napi_ok);
 
-  ASSERT_NE(Run(realm, "Promise.reject(3); 0"), nullptr);
-  ASSERT_NE(Run(nested, "Promise.reject(4); 0"), nullptr);
-  ASSERT_NE(Run(s.env, "Promise.reject(5); 0"), nullptr);
-  EXPECT_EQ(Int32(realm, Run(realm, "realmRejections")), 2);
-  EXPECT_EQ(Int32(s.env, Run(s.env, "parentRejections")), 3);
+  ASSERT_NE(Eval(realm, "Promise.reject(3); 0"), nullptr);
+  ASSERT_NE(Eval(nested, "Promise.reject(4); 0"), nullptr);
+  ASSERT_NE(Eval(s.env, "Promise.reject(5); 0"), nullptr);
+  EXPECT_EQ(Int32(realm, Eval(realm, "realmRejections")), 2);
+  EXPECT_EQ(Int32(s.env, Eval(s.env, "parentRejections")), 3);
 }
 
 TEST_F(Test66UnofficialRealm, ModulesEvaluateInTheirRealm) {
