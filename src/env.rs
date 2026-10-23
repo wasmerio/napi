@@ -514,6 +514,28 @@ impl NapiEnv {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+impl NapiEnv {
+    /// Gives a realm env a guest env id. It has no owner scope: it is released
+    /// with its principal env.
+    pub(crate) fn register_js_realm_env(&mut self, env: SnapiEnv) -> u32 {
+        let env_id = next_js_napi_env_id();
+        self.napi_envs.insert(env_id, env as usize);
+        self.napi_state_to_guest_env.insert(env as usize, env_id);
+        env_id
+    }
+
+    /// Forgets a realm env's guest id and drops its buffer leases. The
+    /// provider releases the env itself with its principal env.
+    pub(crate) fn unregister_js_realm_env(&mut self, env: SnapiEnv) {
+        let Some(env_id) = self.napi_state_to_guest_env.remove(&(env as usize)) else {
+            return;
+        };
+        self.napi_envs.remove(&env_id);
+        self.discard_buffer_leases_for_env(env_id);
+    }
+}
+
 impl Drop for NapiEnv {
     fn drop(&mut self) {
         let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();

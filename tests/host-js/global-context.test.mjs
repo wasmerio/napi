@@ -329,3 +329,58 @@ test('closed virtual contexts and their guest buffers are collectible', async ()
   // WeakRef creation job before collecting its targets.
   await assertCollected(releasedGuestBufferReferences());
 });
+
+test('a sandbox realm evaluates exactly as scripts run with its sandbox', () => {
+  const sandbox={input:5};
+  const realm=runtime.wasmer_napi_create_sandbox_context(sandbox);
+  // Writes go through the global: an undeclared assignment would still reach
+  // the host global (a known limit of the with/Proxy emulation).
+  assert.equal(evaluate(realm,null,'globalThis.output = input * 2; input'),5);
+  assert.equal(sandbox.output,10);
+  // Running with the sandbox from another env reaches the same realm.
+  assert.equal(evaluate(host,sandbox,'output'),10);
+  assert.equal(evaluate(host,sandbox,'globalThis'),realm.scope);
+  assert.equal(evaluate(realm,undefined,'globalThis'),realm.scope);
+  assert.equal(evaluate(host,null,'typeof output'),'undefined');
+  runtime.wasmer_napi_release_global_context(realm);
+});
+
+test('realm lookups follow the owning env and stop at release', () => {
+  const envOf=runtime.wasmer_napi_context_env_of, scopeOf=runtime.wasmer_napi_realm_scope_of;
+  const setEnv=runtime.wasmer_napi_set_context_env;
+  const a=create(), sandbox={};
+  const realm=runtime.wasmer_napi_create_sandbox_context(sandbox);
+  setEnv(a,7); setEnv(realm,9);
+  const fn=callback(a,()=>1);
+  assert.equal(envOf(a.scope),7);
+  assert.equal(envOf(fn),7);
+  assert.equal(envOf(sandbox),9);
+  assert.equal(envOf(realm.scope),9);
+  assert.equal(envOf({}),0);
+  assert.equal(scopeOf(sandbox),realm.scope);
+  assert.equal(scopeOf(a.scope),a.scope);
+  const plain={};
+  assert.equal(scopeOf(plain),plain);
+  runtime.wasmer_napi_release_global_context(a);
+  assert.equal(envOf(a.scope),0);
+  assert.equal(envOf(fn),0);
+  assert.equal(envOf(sandbox),9);
+  runtime.wasmer_napi_release_global_context(realm);
+  assert.equal(envOf(sandbox),0);
+});
+
+test('released sandbox realms and their sandboxes are collectible', async () => {
+  const references=(() => {
+    const out=[];
+    for(let i=0;i<8;i++) {
+      const sandbox={buffer:new ArrayBuffer(1024*1024)};
+      const realm=runtime.wasmer_napi_create_sandbox_context(sandbox);
+      const fn=callback(realm,()=>sandbox);
+      fn();
+      runtime.wasmer_napi_release_global_context(realm);
+      out.push(new WeakRef(sandbox),new WeakRef(realm),new WeakRef(realm.scope));
+    }
+    return out;
+  })();
+  await assertCollected(references);
+});
