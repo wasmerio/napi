@@ -115,6 +115,9 @@ namespace quickjs::detail
         context_record *create_context_record(JSValueConst sandbox,
                                               JSValueConst host_defined_option_id);
         void destroy_context_record(context_record *record);
+        void prune_collected_records();
+        bool ensure_link_atoms();
+        void unlink_context(context_record *record);
 
         // Owning environment and QuickJS context.
         napi_env env_;
@@ -124,6 +127,9 @@ namespace quickjs::detail
         bool source_maps_enabled_ = false;
         JSValue source_map_error_source_callback_;
         std::vector<std::unique_ptr<context_record>> contexts_;
+        // Private symbols linking a sandbox and its context (see context_record).
+        JSAtom context_link_atom_ = JS_ATOM_NULL;
+        JSAtom sandbox_link_atom_ = JS_ATOM_NULL;
 
         // Subsystem lifecycle.
         bool torn_down_ = false;
