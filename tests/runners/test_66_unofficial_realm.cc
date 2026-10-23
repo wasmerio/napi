@@ -100,6 +100,22 @@ void RecordCleanup(void* arg) {
   probe->order->push_back(probe->id);
 }
 
+// Runs a throwing script through the realm env passed as data.
+napi_value CallIntoRealm(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok) return nullptr;
+  auto realm = static_cast<napi_env>(data);
+  napi_value result = nullptr;
+  napi_run_script(realm, Str(realm, "throw new Error('inside realm')"), &result);
+  return nullptr;
+}
+
+std::string ErrorMessage(napi_env env, napi_value error) {
+  napi_value message = nullptr;
+  if (napi_get_named_property(env, error, "message", &message) != napi_ok) return std::string();
+  return Utf8(env, message);
+}
+
 }  // namespace
 
 TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
@@ -351,6 +367,34 @@ TEST_F(Test66UnofficialRealm, PromiseRejectCallbackFallsBackToTheParent) {
   EXPECT_EQ(Int32(s.env, Eval(s.env, "parentRejections")), 3);
 }
 
+// The pending exception belongs to the engine instance: an exception raised
+// through a realm env is pending for every env of it, and reaches the native
+// callback that made the call.
+TEST_F(Test66UnofficialRealm, PendingExceptionsAreSharedAcrossRealms) {
+  EnvScope s(runtime_.get());
+  napi_env realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+
+  napi_value result = nullptr;
+  EXPECT_EQ(napi_run_script(realm, Str(realm, "throw new Error('from realm')"), &result),
+            napi_pending_exception);
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+  EXPECT_EQ(ErrorMessage(s.env, error), "from realm");
+  ASSERT_EQ(napi_is_exception_pending(realm, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "callRealm", NAPI_AUTO_LENGTH, CallIntoRealm, realm, &fn),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "callRealm", fn), napi_ok);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "try { callRealm(); 'no throw' } catch (e) { e.message }")),
+            "inside realm");
+}
+
 TEST_F(Test66UnofficialRealm, ModulesEvaluateInTheirRealm) {
   EnvScope s(runtime_.get());
   napi_value realm_global = nullptr;
@@ -386,6 +430,54 @@ TEST_F(Test66UnofficialRealm, ModulesEvaluateInTheirRealm) {
   EXPECT_TRUE(StrictEquals(realm, g, realm_global));
   EXPECT_FALSE(StrictEquals(realm, g, Global(s.env)));
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(realm, created.module), napi_ok);
+}
+
+// Module handles belong to the engine instance: a module made through a realm
+// env can be linked, evaluated, inspected and destroyed through its parent.
+TEST_F(Test66UnofficialRealm, ModuleHandlesWorkThroughAnyEnvOfTheAgent) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  napi_env realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(realm, nullptr);
+
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env, "export const g = globalThis;"));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "shared.mjs");
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  ASSERT_EQ(unofficial_napi_module_wrap_create(realm, &options, &created), napi_ok);
+
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, created.module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, created.module), napi_ok);
+  napi_value evaluated = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, created.module, -1, false, &evaluated),
+            napi_ok);
+  napi_value ns = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, created.module, &ns), napi_ok);
+  napi_value g = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "g", &g), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, g, realm_global));
+  int32_t status = -1;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, created.module, &status, nullptr, nullptr),
+            napi_ok);
+  EXPECT_EQ(status, 4);  // evaluated
+  bool settled = false;
+  ASSERT_EQ(unofficial_napi_module_wrap_check_unsettled_top_level_await(
+                s.env, created.module, false, &settled),
+            napi_ok);
+  EXPECT_TRUE(settled);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, created.module), napi_ok);
 }
 
 TEST_F(Test66UnofficialRealm, RealmEnvsHaveTheirOwnInstanceData) {
