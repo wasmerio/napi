@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     NapiRuntimeControl, WasmLimits,
-    budget::{NapiLimitExceeded, Pool, ResourceBudget},
+    budget::{LimitReport, NapiLimitExceeded, Pool, ResourceBudget},
 };
 
 /// Called for each actual V8 background task. Dropping the returned guard
@@ -316,7 +316,7 @@ unsafe extern "C" fn uncharge_wasm_memory(context: *mut c_void, bytes: u64) {
 // Asked softly: this runs inside V8's code allocator with its locks held, so
 // the embedder must not stop the application here. A refusal stops the
 // context through `on_wasm_code_limit`, which reports it to the embedder
-// (`NapiLimitExceeded::WasmCodeMemory`) from a helper thread.
+// (`NapiLimitExceeded::WasmCodeMemory`) off V8's locks.
 unsafe extern "C" fn charge_wasm_code(context: *mut c_void, bytes: u64) -> bool {
     let budget = &lane_accountant(context).budget;
     guarded(false, || {
@@ -350,18 +350,22 @@ unsafe extern "C" fn on_wasm_code_limit(
             return;
         };
         let budget = Arc::clone(&accountant.budget);
+        // The memory limit is the embedder's to answer, so it is looked up
+        // at delivery, not under V8's locks.
         let exceeded = match reason {
-            WASM_CODE_LIMIT_BUDGET => Some(NapiLimitExceeded::WasmCodeBudget {
-                committed,
-                budget: limit,
-            }),
-            WASM_CODE_LIMIT_PROCESS => {
-                Some(NapiLimitExceeded::WasmProcessCode { committed, limit })
+            WASM_CODE_LIMIT_BUDGET => {
+                Some(LimitReport::Exceeded(NapiLimitExceeded::WasmCodeBudget {
+                    committed,
+                    budget: limit,
+                }))
             }
-            WASM_CODE_LIMIT_MEMORY => Some(NapiLimitExceeded::WasmCodeMemory {
-                committed,
-                limit: budget.memory_limit(),
-            }),
+            WASM_CODE_LIMIT_PROCESS => {
+                Some(LimitReport::Exceeded(NapiLimitExceeded::WasmProcessCode {
+                    committed,
+                    limit,
+                }))
+            }
+            WASM_CODE_LIMIT_MEMORY => Some(LimitReport::WasmCodeMemory { committed }),
             _ => None,
         };
         // Queued before the stop is visible, so an import refused for the
