@@ -93,6 +93,13 @@ enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 // Immutable embedder callbacks attached as one complete environment state
 // transition. `size` and `version` make additions ABI-compatible. `data` is
 // owned by the embedder and must remain valid until the environment is released.
+//
+// Context tokens identify contextify contexts. The assign callback runs when
+// unofficial_napi_contextify_make_context records a context; the unassign
+// callback runs when that record is released: during a later make_context once
+// the context and its sandbox have been collected, or when the environment is
+// released. Both run under a provider lock and must not call back into the
+// contextify API. A released token's value may be reused for a later context.
 typedef struct {
   uint32_t size;
   uint32_t version;
