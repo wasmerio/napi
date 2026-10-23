@@ -592,12 +592,13 @@ std::string SerializeModuleRequestKey(const std::string& specifier,
   return key;
 }
 
+// The isolate's principal env, if it has module_wrap state.
 napi_env GetModuleWrapEnvForIsolate(v8::Isolate* isolate) {
+  napi_agent__* agent = napi_agent__::From(isolate);
+  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
+  if (env == nullptr) return nullptr;
   std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  for (auto& entry : g_module_wrap_states) {
-    if (entry.first != nullptr && entry.first->isolate == isolate) return entry.first;
-  }
-  return nullptr;
+  return g_module_wrap_states.count(env) != 0 ? env : nullptr;
 }
 
 ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
@@ -789,9 +790,10 @@ void CleanupContextRecords(void* arg) {
   auto it = g_context_records.find(env);
   if (it == g_context_records.end()) return;
   for (auto& rec : it->second) {
-    if (rec.key_ref != nullptr && env->context_token_unassign_callback != nullptr) {
-      env->context_token_unassign_callback(
-          env, rec.key_ref, env->context_token_callback_data);
+    if (rec.key_ref != nullptr && env->agent != nullptr &&
+        env->agent->context_token_unassign_callback != nullptr) {
+      env->agent->context_token_unassign_callback(
+          env, rec.key_ref, env->agent->context_token_callback_data);
     }
     if (rec.key_ref != nullptr) {
       napi_delete_reference(env, rec.key_ref);
@@ -1323,8 +1325,9 @@ bool StoreRecord(napi_env env,
   }
   record.context.Reset(env->isolate, context);
   record.own_microtask_queue = std::move(own_microtask_queue);
-  if (env->context_token_assign_callback != nullptr) {
-    env->context_token_assign_callback(env, record.key_ref, env->context_token_callback_data);
+  if (env->agent != nullptr && env->agent->context_token_assign_callback != nullptr) {
+    env->agent->context_token_assign_callback(
+        env, record.key_ref, env->agent->context_token_callback_data);
   }
   g_context_records[env].push_back(std::move(record));
   return true;

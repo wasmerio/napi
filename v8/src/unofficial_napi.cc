@@ -46,11 +46,14 @@ struct SharedRuntime {
 
 class TrackingArrayBufferAllocator;
 
+// The owner handle (unofficial_napi_env_owner): the isolate, its agent and
+// the scopes that keep the principal context entered.
 struct UnofficialEnvScope {
   v8::Isolate* isolate = nullptr;
   std::shared_ptr<TrackingArrayBufferAllocator> allocator;
   std::optional<v8::Isolate::Scope> isolate_scope;
   std::optional<v8::HandleScope> handle_scope;
+  std::unique_ptr<napi_agent__> agent;
   std::optional<v8::Global<v8::Context>> context;
   std::optional<v8::Context::Scope> context_scope;
   napi_env env = nullptr;
@@ -64,6 +67,7 @@ struct UnofficialEnvScope {
   }
 
   ~UnofficialEnvScope() {
+    agent.reset();
     if (context.has_value()) {
       context->Reset();
     }
@@ -91,49 +95,14 @@ std::mutex g_runtime_mu;
 // for the teardown thread (Isolate::Delete touches the platform's page
 // allocator and tracing controller). The OS reclaims everything at _exit.
 SharedRuntime& g_runtime = *new SharedRuntime();
-std::unordered_map<v8::Isolate*, napi_env>& g_env_by_isolate =
-    *new std::unordered_map<v8::Isolate*, napi_env>();
-std::unordered_map<v8::Isolate*, uint64_t>& g_hash_seeds =
-    *new std::unordered_map<v8::Isolate*, uint64_t>();
-std::unordered_map<v8::Isolate*, v8::Global<v8::Function>>& g_promise_reject_callbacks =
-    *new std::unordered_map<v8::Isolate*, v8::Global<v8::Function>>();
-std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>>& g_promise_hooks =
-    *new std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>>();
 std::unordered_map<napi_env, PrepareStackTraceState>& g_prepare_stack_trace_callbacks =
     *new std::unordered_map<napi_env, PrepareStackTraceState>();
-std::unordered_map<v8::ArrayBuffer::Allocator*, std::shared_ptr<TrackingArrayBufferAllocator>>&
-    g_tracking_allocators = *new std::unordered_map<v8::ArrayBuffer::Allocator*,
-                                                    std::shared_ptr<TrackingArrayBufferAllocator>>();
-
-struct FatalErrorCallbacks {
-  unofficial_napi_fatal_error_callback fatal = nullptr;
-  unofficial_napi_oom_error_callback oom = nullptr;
-};
-
-std::unordered_map<v8::Isolate*, FatalErrorCallbacks>& g_fatal_error_callbacks =
-    *new std::unordered_map<v8::Isolate*, FatalErrorCallbacks>();
-
-struct NearHeapLimitCallbackState {
-  unofficial_napi_near_heap_limit_callback callback = nullptr;
-  void* data = nullptr;
-};
-
-std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState>& g_near_heap_limit_callbacks =
-    *new std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState>();
 
 struct InterruptRequest {
   napi_env env = nullptr;
   unofficial_napi_interrupt_callback callback = nullptr;
   void* data = nullptr;
 };
-
-struct ProfilerState {
-  v8::CpuProfiler* cpu_profiler = nullptr;
-  std::vector<unofficial_napi_profile> active_profiles;
-};
-
-std::unordered_map<napi_env, ProfilerState>& g_profiler_states =
-    *new std::unordered_map<napi_env, ProfilerState>();
 
 class StringOutputStream final : public v8::OutputStream {
  public:
@@ -182,15 +151,15 @@ napi_status CreateExternalUtf8Bytes(napi_env env,
       env, napi_uint8_array, owner->size(), arraybuffer, 0, result);
 }
 
-void DisposeProfilerState(napi_env env, ProfilerState* state) {
-  if (env == nullptr || env->isolate == nullptr || state == nullptr) return;
+void DisposeProfilers(napi_agent__* agent) {
+  if (agent == nullptr || agent->isolate == nullptr) return;
   bool heap_profile_started = false;
-  for (unofficial_napi_profile profile_session : state->active_profiles) {
+  for (unofficial_napi_profile profile_session : agent->active_profiles) {
     if (profile_session == nullptr) continue;
     if (profile_session->kind == unofficial_napi_profile_cpu &&
-        state->cpu_profiler != nullptr) {
+        agent->cpu_profiler != nullptr) {
       if (v8::CpuProfile* profile =
-              state->cpu_profiler->Stop(profile_session->provider_id)) {
+              agent->cpu_profiler->Stop(profile_session->provider_id)) {
         profile->Delete();
       }
     } else if (profile_session->kind == unofficial_napi_profile_heap) {
@@ -198,18 +167,14 @@ void DisposeProfilerState(napi_env env, ProfilerState* state) {
     }
     delete profile_session;
   }
-  state->active_profiles.clear();
+  agent->active_profiles.clear();
   if (heap_profile_started) {
-    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+    agent->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
   }
-  if (state->cpu_profiler != nullptr) {
-    state->cpu_profiler->Dispose();
-    state->cpu_profiler = nullptr;
+  if (agent->cpu_profiler != nullptr) {
+    agent->cpu_profiler->Dispose();
+    agent->cpu_profiler = nullptr;
   }
-}
-
-ProfilerState& EnsureProfilerState(napi_env env) {
-  return g_profiler_states[env];
 }
 
 uint64_t GenerateHashSeed() {
@@ -382,15 +347,8 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
 v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> context,
                                                         v8::Local<v8::Value> exception,
                                                         v8::Local<v8::Array> trace) {
-  napi_env env = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto env_it = g_env_by_isolate.find(context->GetIsolate());
-    if (env_it != g_env_by_isolate.end()) {
-      env = env_it->second;
-    }
-  }
-
+  napi_agent__* agent = napi_agent__::From(context->GetIsolate());
+  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
   if (env == nullptr) {
     return exception->ToString(context);
   }
@@ -423,26 +381,17 @@ bool IsEnvThreadEntered(napi_env env) {
   return env != nullptr && env->isolate != nullptr && v8::Isolate::GetCurrent() == env->isolate;
 }
 
-size_t NearHeapLimitCallback(void* raw_env,
+size_t NearHeapLimitCallback(void* raw_agent,
                              size_t current_heap_limit,
                              size_t initial_heap_limit) {
-  napi_env env = static_cast<napi_env>(raw_env);
-  v8::Isolate* isolate = env != nullptr ? env->isolate : nullptr;
-  if (isolate == nullptr) {
+  auto* agent = static_cast<napi_agent__*>(raw_agent);
+  if (agent == nullptr || agent->near_heap_limit_callback == nullptr) {
     return current_heap_limit;
   }
-  NearHeapLimitCallbackState state;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto callback_it = g_near_heap_limit_callbacks.find(isolate);
-    if (callback_it != g_near_heap_limit_callbacks.end()) {
-      state = callback_it->second;
-    }
-  }
-  if (state.callback == nullptr) {
-    return current_heap_limit;
-  }
-  return state.callback(env, state.data, current_heap_limit, initial_heap_limit);
+  return agent->near_heap_limit_callback(agent->principal_env,
+                                         agent->near_heap_limit_data,
+                                         current_heap_limit,
+                                         initial_heap_limit);
 }
 
 // Rust-exported guest-heap hooks (see guest_heap.rs). When a guest-heap
@@ -646,47 +595,16 @@ void ApplyDefaultV8Flags() {
 }
 
 void FatalErrorCallback(const char* location, const char* message) {
-  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
-  if (isolate == nullptr) return;
-
-  unofficial_napi_fatal_error_callback callback = nullptr;
-  napi_env env = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto callback_it = g_fatal_error_callbacks.find(isolate);
-    if (callback_it != g_fatal_error_callbacks.end()) {
-      callback = callback_it->second.fatal;
-    }
-    auto env_it = g_env_by_isolate.find(isolate);
-    if (env_it != g_env_by_isolate.end()) {
-      env = env_it->second;
-    }
-  }
-  if (callback != nullptr) {
-    callback(env, location, message);
-  }
+  napi_agent__* agent = napi_agent__::From(v8::Isolate::TryGetCurrent());
+  if (agent == nullptr || agent->fatal_error_callback == nullptr) return;
+  agent->fatal_error_callback(agent->principal_env, location, message);
 }
 
 void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
-  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
-  if (isolate == nullptr) return;
-
-  unofficial_napi_oom_error_callback callback = nullptr;
-  napi_env env = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto callback_it = g_fatal_error_callbacks.find(isolate);
-    if (callback_it != g_fatal_error_callbacks.end()) {
-      callback = callback_it->second.oom;
-    }
-    auto env_it = g_env_by_isolate.find(isolate);
-    if (env_it != g_env_by_isolate.end()) {
-      env = env_it->second;
-    }
-  }
-  if (callback != nullptr) {
-    callback(env, location, details.is_heap_oom, details.detail);
-  }
+  napi_agent__* agent = napi_agent__::From(v8::Isolate::TryGetCurrent());
+  if (agent == nullptr || agent->oom_error_callback == nullptr) return;
+  agent->oom_error_callback(
+      agent->principal_env, location, details.is_heap_oom, details.detail);
 }
 
 napi_status ConfigureRuntime(const char* engine_flags,
@@ -743,18 +661,10 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
   if (promise.IsEmpty()) return;
 
   v8::Isolate* isolate = promise->GetIsolate();
-  napi_env env = nullptr;
-  v8::Local<v8::Function> callback;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    const auto env_it = g_env_by_isolate.find(isolate);
-    if (env_it == g_env_by_isolate.end() || env_it->second == nullptr) return;
-    env = env_it->second;
-    const auto cb_it = g_promise_reject_callbacks.find(isolate);
-    if (cb_it == g_promise_reject_callbacks.end() || cb_it->second.IsEmpty()) return;
-    callback = cb_it->second.Get(isolate);
-  }
-  if (env == nullptr || callback.IsEmpty()) return;
+  napi_agent__* agent = napi_agent__::From(isolate);
+  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
+  if (env == nullptr || env->promise_reject_callback.IsEmpty()) return;
+  v8::Local<v8::Function> callback = env->promise_reject_callback.Get(isolate);
 
   v8::PromiseRejectEvent event = message.GetEvent();
   v8::Local<v8::Value> value;
@@ -826,6 +736,7 @@ bool GetPromiseHookFunction(napi_env env,
   return true;
 }
 
+#ifndef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
   for (const auto& hook : hooks) {
     if (!hook.IsEmpty()) return true;
@@ -833,7 +744,6 @@ bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
   return false;
 }
 
-#ifndef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 size_t PromiseHookIndex(v8::PromiseHookType type) {
   switch (type) {
     case v8::PromiseHookType::kInit:
@@ -853,22 +763,12 @@ void PromiseHookCallback(v8::PromiseHookType type,
                          v8::Local<v8::Promise> promise,
                          v8::Local<v8::Value> parent) {
   v8::Isolate* isolate = promise->GetIsolate();
-  napi_env env = nullptr;
-  v8::Local<v8::Function> callback;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    const auto env_it = g_env_by_isolate.find(isolate);
-    if (env_it == g_env_by_isolate.end() || env_it->second == nullptr) return;
-    env = env_it->second;
-
-    const auto hooks_it = g_promise_hooks.find(isolate);
-    if (hooks_it == g_promise_hooks.end()) return;
-
-    const size_t index = PromiseHookIndex(type);
-    if (index >= hooks_it->second.size() || hooks_it->second[index].IsEmpty()) return;
-    callback = hooks_it->second[index].Get(isolate);
-  }
-  if (env == nullptr || callback.IsEmpty()) return;
+  napi_agent__* agent = napi_agent__::From(isolate);
+  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
+  if (env == nullptr) return;
+  const size_t index = PromiseHookIndex(type);
+  if (index >= env->promise_hooks.size() || env->promise_hooks[index].IsEmpty()) return;
+  v8::Local<v8::Function> callback = env->promise_hooks[index].Get(isolate);
 
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
@@ -898,13 +798,9 @@ std::array<v8::Local<v8::Function>, 4> LookupPromiseHooksForContext(napi_env env
   std::array<v8::Local<v8::Function>, 4> hooks;
   if (env == nullptr || isolate == nullptr) return hooks;
 
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  auto hooks_it = g_promise_hooks.find(isolate);
-  if (hooks_it == g_promise_hooks.end()) return hooks;
-
   for (size_t i = 0; i < hooks.size(); ++i) {
-    if (!hooks_it->second[i].IsEmpty()) {
-      hooks[i] = hooks_it->second[i].Get(isolate);
+    if (!env->promise_hooks[i].IsEmpty()) {
+      hooks[i] = env->promise_hooks[i].Get(isolate);
     }
   }
   return hooks;
@@ -1691,6 +1587,23 @@ napi_status StructuredCloneImpl(
 
 }  // namespace
 
+void napi_agent__::Shutdown() {
+  DisposeProfilers(this);
+  if (near_heap_limit_installed) {
+    near_heap_limit_installed = false;
+    isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, 0);
+  }
+  near_heap_limit_callback = nullptr;
+  near_heap_limit_data = nullptr;
+  fatal_error_callback = nullptr;
+  oom_error_callback = nullptr;
+  isolate->CancelTerminateExecution();
+  isolate->SetPromiseHook(nullptr);
+  isolate->SetPromiseRejectCallback(nullptr);
+  isolate->SetFatalErrorHandler(nullptr);
+  isolate->SetOOMErrorHandler(nullptr);
+}
+
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context) {
   if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) return;
 
@@ -1745,11 +1658,11 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks,
     uint64_t* accepted_hooks_out) {
-  if (env == nullptr || env->isolate == nullptr || hooks == nullptr ||
-      accepted_hooks_out == nullptr ||
+  if (env == nullptr || env->isolate == nullptr || env->agent == nullptr ||
+      hooks == nullptr || accepted_hooks_out == nullptr ||
       hooks->size < sizeof(unofficial_napi_env_hooks) ||
       hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
-      env->embedder_hooks_attached) {
+      env->agent->embedder_hooks_attached) {
     return napi_invalid_arg;
   }
   {
@@ -1762,17 +1675,17 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
             hooks->data)) {
       return napi_generic_failure;
     }
-    auto& fatal = g_fatal_error_callbacks[env->isolate];
-    fatal.fatal = hooks->fatal_error_callback;
-    fatal.oom = hooks->oom_error_callback;
   }
 
-  env->context_token_assign_callback = hooks->context_token_assign_callback;
-  env->context_token_unassign_callback = hooks->context_token_unassign_callback;
-  env->context_token_callback_data = hooks->data;
-  env->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
-  env->enqueue_foreground_task_target = hooks->data;
-  env->embedder_hooks_attached = true;
+  napi_agent__* agent = env->agent;
+  agent->fatal_error_callback = hooks->fatal_error_callback;
+  agent->oom_error_callback = hooks->oom_error_callback;
+  agent->context_token_assign_callback = hooks->context_token_assign_callback;
+  agent->context_token_unassign_callback = hooks->context_token_unassign_callback;
+  agent->context_token_callback_data = hooks->data;
+  agent->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
+  agent->enqueue_foreground_task_target = hooks->data;
+  agent->embedder_hooks_attached = true;
 
   env->isolate->SetFatalErrorHandler(
       hooks->fatal_error_callback != nullptr ? FatalErrorCallback : nullptr);
@@ -1785,42 +1698,18 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
 napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
     v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result) {
   if (result == nullptr || context.IsEmpty()) return napi_invalid_arg;
-  context->GetIsolate()->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   auto* env = new (std::nothrow) napi_env__(context, module_api_version);
   if (env == nullptr) return napi_generic_failure;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_env_by_isolate[env->isolate] = env;
-  }
   *result = env;
   return napi_ok;
 }
 
 static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  ProfilerState profiler_state;
-  bool has_profiler_state = false;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr) {
       g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
-    }
-    auto env_it = g_env_by_isolate.find(env->isolate);
-    if (env_it != g_env_by_isolate.end() && env_it->second == env) {
-      g_env_by_isolate.erase(env_it);
-    }
-    g_hash_seeds.erase(env->isolate);
-    auto cb_it = g_promise_reject_callbacks.find(env->isolate);
-    if (cb_it != g_promise_reject_callbacks.end()) {
-      cb_it->second.Reset();
-      g_promise_reject_callbacks.erase(cb_it);
-    }
-    auto hooks_it = g_promise_hooks.find(env->isolate);
-    if (hooks_it != g_promise_hooks.end()) {
-      for (auto& hook : hooks_it->second) {
-        hook.Reset();
-      }
-      g_promise_hooks.erase(hooks_it);
     }
     auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
     if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
@@ -1828,24 +1717,14 @@ static napi_status DestroyEnvInstance(napi_env env) {
       g_prepare_stack_trace_callbacks.erase(prepare_it);
     }
     unofficial_napi_internal::ResetErrorFormattingState(env);
-    g_fatal_error_callbacks.erase(env->isolate);
-    g_near_heap_limit_callbacks.erase(env->isolate);
-    auto profiler_it = g_profiler_states.find(env);
-    if (profiler_it != g_profiler_states.end()) {
-      profiler_state = std::move(profiler_it->second);
-      g_profiler_states.erase(profiler_it);
-      has_profiler_state = true;
-    }
   }
-  if (env->isolate != nullptr) {
-    if (has_profiler_state) {
-      DisposeProfilerState(env, &profiler_state);
-    }
-    env->isolate->CancelTerminateExecution();
-    env->isolate->SetPromiseHook(nullptr);
-    env->isolate->SetPromiseRejectCallback(nullptr);
-    env->isolate->SetFatalErrorHandler(nullptr);
-    env->isolate->SetOOMErrorHandler(nullptr);
+  env->promise_reject_callback.Reset();
+  for (auto& hook : env->promise_hooks) {
+    hook.Reset();
+  }
+  // The principal env takes the agent's hooks down with it.
+  if (env->agent != nullptr && env->agent->principal_env == env) {
+    env->agent->Shutdown();
   }
   delete env;
   return napi_ok;
@@ -1856,35 +1735,27 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
     unofficial_napi_near_heap_limit_callback callback_or_null,
     void* data,
     size_t restored_heap_limit) {
-  if (env == nullptr || env->isolate == nullptr ||
+  if (env == nullptr || env->isolate == nullptr || env->agent == nullptr ||
       (callback_or_null != nullptr && restored_heap_limit != 0) ||
       (callback_or_null == nullptr && data != nullptr)) {
     return napi_invalid_arg;
   }
 
+  napi_agent__* agent = env->agent;
   if (callback_or_null != nullptr) {
-    bool install_provider_callback = false;
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      auto [it, inserted] =
-          g_near_heap_limit_callbacks.try_emplace(env->isolate);
-      it->second.callback = callback_or_null;
-      it->second.data = data;
-      install_provider_callback = inserted;
-    }
-    if (install_provider_callback) {
-      env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
+    agent->near_heap_limit_callback = callback_or_null;
+    agent->near_heap_limit_data = data;
+    if (!agent->near_heap_limit_installed) {
+      agent->near_heap_limit_installed = true;
+      env->isolate->AddNearHeapLimitCallback(NearHeapLimitCallback, agent);
     }
     return napi_ok;
   }
 
-  bool remove_provider_callback = false;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    remove_provider_callback =
-        g_near_heap_limit_callbacks.erase(env->isolate) != 0;
-  }
-  if (remove_provider_callback) {
+  agent->near_heap_limit_callback = nullptr;
+  agent->near_heap_limit_data = nullptr;
+  if (agent->near_heap_limit_installed) {
+    agent->near_heap_limit_installed = false;
     env->isolate->RemoveNearHeapLimitCallback(
         NearHeapLimitCallback, restored_heap_limit);
   }
@@ -1965,22 +1836,15 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     ReleaseRuntime();
     return napi_generic_failure;
   }
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_hash_seeds[isolate] = GenerateHashSeed();
-    g_tracking_allocators[allocator.get()] = allocator;
-  }
-
   auto* scope = new (std::nothrow) UnofficialEnvScope(isolate, allocator);
   if (scope == nullptr) {
     DisposeIsolateAndWait(platform, isolate);
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      g_tracking_allocators.erase(allocator.get());
-    }
     ReleaseRuntime();
     return napi_generic_failure;
   }
+  scope->agent = std::make_unique<napi_agent__>(isolate);
+  scope->agent->allocator = allocator;
+  scope->agent->hash_seed = GenerateHashSeed();
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   scope->context.emplace(isolate, context);
@@ -1989,10 +1853,6 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   if (status != napi_ok || scope->env == nullptr) {
     delete scope;
     DisposeIsolateAndWait(platform, isolate);
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      g_tracking_allocators.erase(allocator.get());
-    }
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
@@ -2014,6 +1874,7 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
   }
 
   v8::Isolate* isolate = scope->isolate;
+  // Keeps the allocator alive until the isolate is disposed.
   std::shared_ptr<TrackingArrayBufferAllocator> allocator = scope->allocator;
   delete scope;
 
@@ -2025,12 +1886,7 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
     }
     DisposeIsolateAndWait(platform, isolate, shutdown_pump_handle);
   }
-  if (allocator != nullptr) {
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      g_tracking_allocators.erase(allocator.get());
-    }
-  }
+  allocator.reset();
   ReleaseRuntime();
   return status;
 }
@@ -2336,13 +2192,7 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env,
   if (env == nullptr || env->isolate == nullptr || callback == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(callback);
   if (!raw->IsFunction()) return napi_function_expected;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_env_by_isolate[env->isolate] = env;
-    auto& slot = g_promise_reject_callbacks[env->isolate];
-    slot.Reset();
-    slot.Reset(env->isolate, raw.As<v8::Function>());
-  }
+  env->promise_reject_callback.Reset(env->isolate, raw.As<v8::Function>());
   env->isolate->SetPromiseRejectCallback(PromiseRejectCallback);
   return napi_ok;
 }
@@ -2362,31 +2212,15 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
     return napi_function_expected;
   }
 
-  std::array<v8::Global<v8::Function>, 4> persistent_hooks;
   for (size_t i = 0; i < hooks.size(); ++i) {
+    env->promise_hooks[i].Reset();
     if (!hooks[i].IsEmpty()) {
-      persistent_hooks[i].Reset(env->isolate, hooks[i]);
+      env->promise_hooks[i].Reset(env->isolate, hooks[i]);
     }
   }
-  const bool has_hooks = HasPromiseHooks(persistent_hooks);
-
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    g_env_by_isolate[env->isolate] = env;
-
-    auto existing = g_promise_hooks.find(env->isolate);
-    if (existing != g_promise_hooks.end()) {
-      for (auto& hook : existing->second) {
-        hook.Reset();
-      }
-    }
-
-    if (has_hooks) {
-      g_promise_hooks[env->isolate] = std::move(persistent_hooks);
-    } else if (existing != g_promise_hooks.end()) {
-      g_promise_hooks.erase(existing);
-    }
-  }
+#ifndef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
+  const bool has_hooks = HasPromiseHooks(env->promise_hooks);
+#endif
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
   NapiV8ApplyPromiseHooksToContext(env, env->context());
@@ -2462,16 +2296,14 @@ napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
     return napi_ok;
   }
 
-  v8::Local<v8::Function> callback;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    const auto cb_it = g_promise_reject_callbacks.find(isolate);
-    if (cb_it == g_promise_reject_callbacks.end() || cb_it->second.IsEmpty()) {
-      return napi_ok;
-    }
-    callback = cb_it->second.Get(isolate);
+  // The reject callback is dispatched by the agent's principal env, as in
+  // PromiseRejectCallback.
+  napi_agent__* agent = env->agent;
+  napi_env reject_env = agent != nullptr ? agent->principal_env : nullptr;
+  if (reject_env == nullptr || reject_env->promise_reject_callback.IsEmpty()) {
+    return napi_ok;
   }
-  if (callback.IsEmpty()) return napi_ok;
+  v8::Local<v8::Function> callback = reject_env->promise_reject_callback.Get(isolate);
 
   v8::Local<v8::Value> args[3] = {
       v8::Integer::New(
@@ -2701,13 +2533,9 @@ napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
   if (env == nullptr || env->isolate == nullptr || hash_seed_out == nullptr) {
     return napi_invalid_arg;
   }
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_hash_seeds.find(env->isolate);
-    if (it != g_hash_seeds.end()) {
-      *hash_seed_out = it->second;
-      return napi_ok;
-    }
+  if (env->agent != nullptr && env->agent->hash_seed != 0) {
+    *hash_seed_out = env->agent->hash_seed;
+    return napi_ok;
   }
   *hash_seed_out = env->isolate->GetHashSeed();
   return napi_ok;
@@ -2745,12 +2573,10 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_statistics(
   stats_out->used_global_handles_size = stats.used_global_handles_size();
   stats_out->external_memory = stats.external_memory();
   stats_out->array_buffer_memory = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
-    if (it != g_tracking_allocators.end() && it->second) {
-      stats_out->array_buffer_memory = it->second->total_mem_usage();
-    }
+  if (env->agent != nullptr && env->agent->allocator != nullptr) {
+    stats_out->array_buffer_memory =
+        static_cast<TrackingArrayBufferAllocator*>(env->agent->allocator.get())
+            ->total_mem_usage();
   }
   return napi_ok;
 }
@@ -2817,21 +2643,18 @@ napi_status NAPI_CDECL unofficial_napi_profile_start(
   *result_out = unofficial_napi_profile_start_ok;
   *profile_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+  napi_agent__* agent = env->agent;
+  if (agent == nullptr) return napi_invalid_arg;
 
   if (kind == unofficial_napi_profile_heap) {
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      auto it = g_profiler_states.find(env);
-      if (it != g_profiler_states.end() &&
-          std::any_of(it->second.active_profiles.begin(),
-                      it->second.active_profiles.end(),
-                      [](unofficial_napi_profile profile) {
-                        return profile != nullptr &&
-                               profile->kind == unofficial_napi_profile_heap;
-                      })) {
-        *result_out = unofficial_napi_profile_start_busy;
-        return napi_ok;
-      }
+    if (std::any_of(agent->active_profiles.begin(),
+                    agent->active_profiles.end(),
+                    [](unofficial_napi_profile profile) {
+                      return profile != nullptr &&
+                             profile->kind == unofficial_napi_profile_heap;
+                    })) {
+      *result_out = unofficial_napi_profile_start_busy;
+      return napi_ok;
     }
     if (!env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler()) {
       *result_out = unofficial_napi_profile_start_busy;
@@ -2843,24 +2666,16 @@ napi_status NAPI_CDECL unofficial_napi_profile_start(
       return napi_generic_failure;
     }
     profile->kind = kind;
-    {
-      std::lock_guard<std::mutex> lock(g_runtime_mu);
-      EnsureProfilerState(env).active_profiles.push_back(profile);
-    }
+    agent->active_profiles.push_back(profile);
     *profile_out = profile;
     return napi_ok;
   }
 
-  v8::CpuProfiler* cpu_profiler = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    ProfilerState& state = EnsureProfilerState(env);
-    if (state.cpu_profiler == nullptr) {
-      state.cpu_profiler = v8::CpuProfiler::New(env->isolate);
-      if (state.cpu_profiler == nullptr) return napi_generic_failure;
-    }
-    cpu_profiler = state.cpu_profiler;
+  if (agent->cpu_profiler == nullptr) {
+    agent->cpu_profiler = v8::CpuProfiler::New(env->isolate);
+    if (agent->cpu_profiler == nullptr) return napi_generic_failure;
   }
+  v8::CpuProfiler* cpu_profiler = agent->cpu_profiler;
 
   v8::CpuProfilingResult result = cpu_profiler->Start(
       v8::CpuProfilingOptions{v8::CpuProfilingMode::kLeafNodeLineNumbers,
@@ -2882,13 +2697,7 @@ napi_status NAPI_CDECL unofficial_napi_profile_start(
   }
   profile->kind = kind;
   profile->provider_id = static_cast<uint32_t>(result.id);
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it != g_profiler_states.end()) {
-      it->second.active_profiles.push_back(profile);
-    }
-  }
+  agent->active_profiles.push_back(profile);
   *profile_out = profile;
   return napi_ok;
 }
@@ -2904,21 +2713,15 @@ napi_status NAPI_CDECL unofficial_napi_profile_stop(
   *json_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
 
-  v8::CpuProfiler* cpu_profiler = nullptr;
-  unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
-  uint32_t provider_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto it = g_profiler_states.find(env);
-    if (it == g_profiler_states.end()) return napi_invalid_arg;
-    auto active_it = std::find(it->second.active_profiles.begin(),
-                               it->second.active_profiles.end(), profile);
-    if (active_it == it->second.active_profiles.end()) return napi_invalid_arg;
-    kind = profile->kind;
-    provider_id = profile->provider_id;
-    it->second.active_profiles.erase(active_it);
-    cpu_profiler = it->second.cpu_profiler;
-  }
+  napi_agent__* agent = env->agent;
+  if (agent == nullptr) return napi_invalid_arg;
+  auto active_it = std::find(agent->active_profiles.begin(),
+                             agent->active_profiles.end(), profile);
+  if (active_it == agent->active_profiles.end()) return napi_invalid_arg;
+  const unofficial_napi_profile_kind kind = profile->kind;
+  const uint32_t provider_id = profile->provider_id;
+  agent->active_profiles.erase(active_it);
+  v8::CpuProfiler* cpu_profiler = agent->cpu_profiler;
 
   if (kind == unofficial_napi_profile_heap) {
     std::string json;
