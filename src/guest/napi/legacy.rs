@@ -929,7 +929,7 @@ fn legacy_process_memory_info(mut env: FunctionEnvMut<NapiEnv>, args: &[Value]) 
     }
     for arg in &args[1..] {
         let pointer = arg.unwrap_i32() as u32;
-        if (pointer != 0 && super::read_guest_bytes(&mut env, pointer, 8).is_none()) {
+        if pointer != 0 && super::read_guest_bytes(&mut env, pointer, 8).is_none() {
             return 1;
         }
     }
