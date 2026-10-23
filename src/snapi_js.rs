@@ -1443,6 +1443,10 @@ struct HostJsAgent {
     type_tags: IdHashMap<u32, (u64, u64)>,
     /// Embedder hooks are attached once per agent.
     embedder_hooks_attached: bool,
+    /// The exception pending for N-API calls on this agent. All its envs
+    /// share it, so an exception raised through one env reaches the callback
+    /// that called it, whichever env that callback belongs to.
+    last_exception: Option<JsValue>,
     /// The principal env's address; set for agents that have realm envs.
     principal_env: usize,
     /// Realm envs of this agent (`HostJsEnv` addresses), in creation order.
@@ -1489,8 +1493,6 @@ struct HostJsEnv {
     is_realm: bool,
     global_context: JsValue,
     live_env_addr: Rc<Cell<usize>>,
-    /// Pending exception of calls made through this environment.
-    last_exception: Option<JsValue>,
     next_callback: u32,
     callback_regs: IdHashMap<u32, CallbackReg>,
     closures: Vec<CallbackClosure>,
@@ -1546,7 +1548,6 @@ impl HostJsEnv {
             is_realm,
             global_context,
             live_env_addr: Rc::new(Cell::new(0)),
-            last_exception: None,
             next_callback: 1,
             callback_regs: IdHashMap::default(),
             closures: Vec::new(),
@@ -1596,6 +1597,7 @@ impl HostJsAgent {
             backing_tokens: IdHashMap::default(),
             type_tags: IdHashMap::default(),
             embedder_hooks_attached: false,
+            last_exception: None,
             principal_env: 0,
             realm_envs: Vec::new(),
         }
@@ -2179,7 +2181,7 @@ pub(crate) unsafe fn host_js_set_named_property(
     match Reflect::set(obj, key, value) {
         Ok(_) => NAPI_OK,
         Err(e) => {
-            state.last_exception = Some(e);
+            state.agent.last_exception = Some(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -2224,7 +2226,7 @@ pub(crate) unsafe fn host_js_has_named_property(
             unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -2823,7 +2825,7 @@ unsafe fn reflect_op(
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(err) => {
-            state.last_exception = Some(err);
+            state.agent.last_exception = Some(err);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -2849,7 +2851,7 @@ pub unsafe extern "C" fn snapi_bridge_set_property(
     match Reflect::set(obj, key, value) {
         Ok(_) => NAPI_OK,
         Err(e) => {
-            state.last_exception = Some(e);
+            state.agent.last_exception = Some(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -2914,7 +2916,7 @@ pub unsafe extern "C" fn snapi_bridge_set_element(
     match Reflect::set(obj, &JsValue::from_f64(index as f64), value) {
         Ok(_) => NAPI_OK,
         Err(e) => {
-            state.last_exception = Some(e);
+            state.agent.last_exception = Some(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -3043,7 +3045,7 @@ pub unsafe extern "C" fn snapi_bridge_throw(env: SnapiEnv, id: u32) -> i32 {
     let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
-    state.last_exception = Some(value);
+    state.agent.last_exception = Some(value);
     NAPI_OK
 }
 
@@ -3052,7 +3054,7 @@ pub unsafe extern "C" fn snapi_bridge_is_exception_pending(env: SnapiEnv, out: *
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { write(out, i32::from(state.last_exception.is_some())) }.map_or_else(|e| e, |_| NAPI_OK)
+    unsafe { write(out, i32::from(state.agent.last_exception.is_some())) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
 #[unsafe(no_mangle)]
@@ -3063,7 +3065,7 @@ pub unsafe extern "C" fn snapi_bridge_get_and_clear_last_exception(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let value = state.last_exception.take().unwrap_or(JsValue::UNDEFINED);
+    let value = state.agent.last_exception.take().unwrap_or(JsValue::UNDEFINED);
     let id = state.agent.insert(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
@@ -3109,7 +3111,7 @@ pub unsafe extern "C" fn snapi_bridge_call_function(
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -3172,7 +3174,7 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(e) => {
-            state.last_exception = Some(e);
+            state.agent.last_exception = Some(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -3230,7 +3232,7 @@ unsafe fn settle(env: SnapiEnv, deferred: u32, value: u32, reject: bool) -> i32 
     match result {
         Ok(_) => NAPI_OK,
         Err(e) => {
-            state.last_exception = Some(e);
+            state.agent.last_exception = Some(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -3297,7 +3299,7 @@ pub(crate) fn create_guest_typedarray_view(
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -3753,7 +3755,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return JsValue::UNDEFINED;
             };
-            let error = state.last_exception.take();
+            let error = state.agent.last_exception.take();
             let result_value = state.agent.get(result).cloned();
             if result_value.is_none() && result != 0 {
                 wasmer_napi_console_error(&format!(
@@ -3820,7 +3822,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
             let Ok(state) = (unsafe { env_mut(pending.env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let error = state.last_exception.take();
+            let error = state.agent.last_exception.take();
             let result = state
                 .agent
                 .get(result)
@@ -3839,7 +3841,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             return NAPI_PENDING_EXCEPTION;
         }
     }
@@ -4277,7 +4279,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
     let keys = match Reflect::own_keys(&object) {
         Ok(keys) => keys,
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -4299,7 +4301,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
             let descriptor = match Reflect::get_own_property_descriptor(&object, &key) {
                 Ok(descriptor) => descriptor,
                 Err(error) => {
-                    state.last_exception = Some(error);
+                    state.agent.last_exception = Some(error);
                     return NAPI_PENDING_EXCEPTION;
                 }
             };
@@ -4588,7 +4590,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_structured_clone(
             unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4619,7 +4621,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_message_create(
         },
         Err(error) => {
             wasmer_napi_release_message(payload);
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4643,7 +4645,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_message_take(
             unsafe { write(value_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4674,7 +4676,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_serdes_binding(
             unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4808,7 +4810,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4847,7 +4849,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
                     params.push(&JsValue::from_str(&value));
                 }
                 Err(error) => {
-                    state.last_exception = Some(error);
+                    state.agent.last_exception = Some(error);
                     return NAPI_PENDING_EXCEPTION;
                 }
             }
@@ -4904,7 +4906,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -4967,7 +4969,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
                     params.push(&JsValue::from_str(&value));
                 }
                 Err(error) => {
-                    state.last_exception = Some(error);
+                    state.agent.last_exception = Some(error);
                     return NAPI_PENDING_EXCEPTION;
                 }
             }
@@ -4987,7 +4989,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
             shape != 2 && wasmer_napi_compile_module(&scope, &source, &filename).is_ok();
         let _ = unsafe { write(cache_rejected_out, has_cache) };
         let _ = unsafe { write(can_parse_as_module_out, u8::from(can_parse_as_module)) };
-        state.last_exception = Some(error);
+        state.agent.last_exception = Some(error);
         return NAPI_PENDING_EXCEPTION;
     }
 
@@ -5079,7 +5081,7 @@ unsafe fn host_js_create_source_text_module(
     let compiled = match wasmer_napi_compile_module(&scope, &source, &url) {
         Ok(value) => value,
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -5660,7 +5662,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate(
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -5683,7 +5685,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate_sync(
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -5828,7 +5830,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_export(
         .iter()
         .any(|candidate| candidate == &name)
     {
-        state.last_exception =
+        state.agent.last_exception =
             Some(TypeError::new("Synthetic module export is not defined").into());
         return NAPI_PENDING_EXCEPTION;
     }
@@ -5836,7 +5838,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_export(
         Ok(true) => NAPI_OK,
         Ok(false) => NAPI_GENERIC_FAILURE,
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -5894,7 +5896,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_required_mod
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -5953,7 +5955,7 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_number(
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -5978,7 +5980,7 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_string(
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6019,7 +6021,7 @@ pub unsafe extern "C" fn snapi_bridge_has_property(
             unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6042,7 +6044,7 @@ pub unsafe extern "C" fn snapi_bridge_has_own_property(
         Ok(descriptor) => unsafe { write(result, i32::from(!descriptor.is_undefined())) }
             .map_or_else(|err| err, |()| NAPI_OK),
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6066,7 +6068,7 @@ pub unsafe extern "C" fn snapi_bridge_delete_property(
             unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6101,7 +6103,7 @@ pub unsafe extern "C" fn snapi_bridge_has_element(
             unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6125,7 +6127,7 @@ pub unsafe extern "C" fn snapi_bridge_delete_element(
             unsafe { write(result, i32::from(value)) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6151,7 +6153,7 @@ pub unsafe extern "C" fn snapi_bridge_get_all_property_names(
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -6213,7 +6215,7 @@ unsafe fn throw_c_error(env: SnapiEnv, code: *const i8, message: *const i8, kind
             &JsValue::from_str(&code),
         );
     }
-    state.last_exception = Some(error);
+    state.agent.last_exception = Some(error);
     NAPI_OK
 }
 
@@ -6481,7 +6483,7 @@ pub unsafe extern "C" fn snapi_bridge_create_typedarray(
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
-            state.last_exception = Some(error);
+            state.agent.last_exception = Some(error);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -7024,7 +7026,7 @@ unsafe fn define_properties_impl(
 
         if let Err(error) = Reflect::define_property(&object, &key, &descriptor) {
             if let Ok(state) = unsafe { env_mut(env) } {
-                state.last_exception = Some(error);
+                state.agent.last_exception = Some(error);
             }
             return NAPI_PENDING_EXCEPTION;
         }
@@ -7065,7 +7067,7 @@ pub unsafe extern "C" fn snapi_bridge_define_class(
         match Reflect::get(&ctor, &JsValue::from_str("prototype")) {
             Ok(value) => (ctor, value),
             Err(error) => {
-                state.last_exception = Some(error);
+                state.agent.last_exception = Some(error);
                 return NAPI_PENDING_EXCEPTION;
             }
         }
