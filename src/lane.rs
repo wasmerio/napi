@@ -333,9 +333,11 @@ unsafe extern "C" fn uncharge_wasm_code(context: *mut c_void, bytes: u64) {
 /// exceeded the code budget, or took the process past its hard code limit.
 /// Runs inside V8's code allocator with its locks held, possibly on the lane
 /// thread while another thread holds bridge locks and waits for the lane's
-/// current task, so it only sets the sticky stop flag here; the isolates are
-/// terminated and the embedder is told from a helper thread, so embedder
-/// locks are never taken under V8's.
+/// current task, so it only sets the sticky stop flag and queues the report
+/// here. A helper thread reports it and terminates the isolates, so embedder
+/// locks are never taken under V8's; the guest's next import return reports
+/// it too if the helper has not yet, so the embedder knows why the guest's
+/// JavaScript failed before the guest does.
 unsafe extern "C" fn on_wasm_code_limit(
     context: *mut c_void,
     reason: u32,
@@ -349,29 +351,30 @@ unsafe extern "C" fn on_wasm_code_limit(
         };
         control.mark_stopped();
         let budget = Arc::clone(&accountant.budget);
-        let notify = move || match reason {
-            WASM_CODE_LIMIT_BUDGET => {
-                budget.notify_limit_exceeded(NapiLimitExceeded::WasmCodeBudget {
-                    committed,
-                    budget: limit,
-                })
+        let exceeded = match reason {
+            WASM_CODE_LIMIT_BUDGET => Some(NapiLimitExceeded::WasmCodeBudget {
+                committed,
+                budget: limit,
+            }),
+            WASM_CODE_LIMIT_PROCESS => {
+                Some(NapiLimitExceeded::WasmProcessCode { committed, limit })
             }
-            WASM_CODE_LIMIT_PROCESS => budget
-                .notify_limit_exceeded(NapiLimitExceeded::WasmProcessCode { committed, limit }),
-            WASM_CODE_LIMIT_MEMORY => {
-                let limit = budget.memory_limit();
-                budget.notify_limit_exceeded(NapiLimitExceeded::WasmCodeMemory { committed, limit })
-            }
-            _ => {}
+            WASM_CODE_LIMIT_MEMORY => Some(NapiLimitExceeded::WasmCodeMemory {
+                committed,
+                limit: budget.memory_limit(),
+            }),
+            _ => None,
         };
+        if let Some(exceeded) = exceeded {
+            budget.queue_limit_exceeded(exceeded);
+        }
         let stop = move || {
+            budget.deliver_limits_exceeded();
             control.terminate_all();
-            notify();
         };
         // If no thread can be started, the stop flag still keeps imports
-        // and new isolates out, and the isolate that committed the code was
-        // already terminated; reporting inline could take embedder locks
-        // under V8's, so it is skipped.
+        // and new isolates out, the isolate that committed the code was
+        // already terminated, and the next import return reports the limit.
         let _ = std::thread::Builder::new()
             .name("napi-wasm-stop".into())
             .spawn(stop);

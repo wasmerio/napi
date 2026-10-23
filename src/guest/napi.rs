@@ -236,6 +236,9 @@ fn with_cb_context<R>(
 ) -> Result<R, WasiError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
+    // A provider limit may have stopped this JavaScript; the embedder must
+    // learn why before the guest sees the failure.
+    env.data().budget.deliver_limits_exceeded();
     if !snapi_env.is_null() {
         // JavaScript may have left a large object above the heap limit that no
         // collection has examined; settle it so the heap budget sees it before

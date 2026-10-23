@@ -3,7 +3,8 @@
 //! Metered V8 WebAssembly for WASIX guests in a managed context: the guest
 //! sees WebAssembly in its root and `vm` contexts, refused memory growth
 //! stays a recoverable JS error, and a context past its code budget is
-//! stopped through the provider's stop path and reported to the embedder.
+//! stopped through the provider's stop path and reported to the embedder
+//! before the guest sees its script fail.
 //!
 //! These need the guest `.wasm` files, which `tests/build-test-wasix.sh`
 //! builds with `wasixcc`.
@@ -31,6 +32,9 @@ const MIB: u64 = 1024 * 1024;
 #[derive(Default)]
 struct Accountant {
     limit: u64,
+    /// Wasm code bytes granted before code charges are refused.
+    code_quota: Option<u64>,
+    code_granted: AtomicU64,
     charged: AtomicU64,
     soft_denials: Mutex<Vec<Pool>>,
     exceeded: Mutex<Vec<NapiLimitExceeded>>,
@@ -53,7 +57,8 @@ impl NapiMemoryAccountant for Accountant {
             .is_ok()
     }
     fn try_charge_soft_for(&self, pool: Pool, bytes: u64) -> bool {
-        let granted = self.try_charge(bytes);
+        let granted =
+            (pool != Pool::V8WasmCode || self.grant_code(bytes)) && self.try_charge(bytes);
         if !granted {
             self.soft_denials.lock().unwrap().push(pool);
         }
@@ -63,7 +68,25 @@ impl NapiMemoryAccountant for Accountant {
         self.charged.fetch_sub(bytes, Ordering::SeqCst);
     }
     fn limit_exceeded(&self, limit: NapiLimitExceeded) {
+        // Hold back the provider's stop helper: the report then only arrives
+        // in time if the guest's failing N-API call delivers or awaits it.
+        if thread::current().name() == Some("napi-wasm-stop") {
+            thread::sleep(Duration::from_secs(1));
+        }
         self.exceeded.lock().unwrap().push(limit);
+    }
+}
+
+impl Accountant {
+    fn grant_code(&self, bytes: u64) -> bool {
+        let Some(quota) = self.code_quota else {
+            return true;
+        };
+        self.code_granted
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |granted| {
+                granted.checked_add(bytes).filter(|total| *total <= quota)
+            })
+            .is_ok()
     }
 }
 
@@ -116,19 +139,15 @@ fn metered_policy_exposes_webassembly_to_guests() {
     );
 }
 
-#[test]
-fn metered_guest_is_denied_softly_and_stopped_past_its_code_budget() {
+/// Runs the metered guest, whose code bomb must be stopped, and returns the
+/// limits reported by the time the guest has exited.
+fn run_code_bomb(accountant: &Arc<Accountant>, limits: WasmLimits) -> Vec<NapiLimitExceeded> {
     let wasm = build_wasix_test("test_js_wasm_metered");
-    let accountant = Arc::new(Accountant {
-        limit: 768 * MIB,
-        ..Default::default()
-    });
-    let mut limits = WasmLimits::default();
-    limits.code_budget_bytes = 512 * 1024;
-    let hooks = metered_hooks(Arc::clone(&accountant), limits);
+    let hooks = metered_hooks(Arc::clone(accountant), limits);
     let budget = hooks.budget();
     let (exit_code, stdout, stderr) =
         run_wasix_main_capture_stdio_with_hooks(&hooks, &wasm, &[], &[]).unwrap();
+    let exceeded = accountant.exceeded.lock().unwrap().clone();
     assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
     assert!(
         stdout.contains("WASM_SOFT_DENIALS_OK"),
@@ -145,17 +164,6 @@ fn metered_guest_is_denied_softly_and_stopped_past_its_code_budget() {
             .unwrap()
             .contains(&Pool::V8WasmMemory)
     );
-    wait_for("the code budget report", || {
-        !accountant.exceeded.lock().unwrap().is_empty()
-    });
-    let exceeded = accountant.exceeded.lock().unwrap().clone();
-    assert!(
-        matches!(
-            exceeded.as_slice(),
-            [NapiLimitExceeded::WasmCodeBudget { budget: 524288, committed }] if *committed > 524288
-        ),
-        "{exceeded:?}"
-    );
     // The guest's environments are gone; so is every wasm charge.
     wait_for("isolate teardown", || budget.snapshot().live_isolates == 0);
     let usage = budget.snapshot();
@@ -163,5 +171,41 @@ fn metered_guest_is_denied_softly_and_stopped_past_its_code_budget() {
         (usage.v8_wasm_memory, usage.v8_wasm_code),
         (0, 0),
         "{usage:?}"
+    );
+    exceeded
+}
+
+#[test]
+fn metered_guest_is_denied_softly_and_stopped_past_its_code_budget() {
+    let accountant = Arc::new(Accountant {
+        limit: 768 * MIB,
+        ..Default::default()
+    });
+    let mut limits = WasmLimits::default();
+    limits.code_budget_bytes = 512 * 1024;
+    let exceeded = run_code_bomb(&accountant, limits);
+    assert!(
+        matches!(
+            exceeded.as_slice(),
+            [NapiLimitExceeded::WasmCodeBudget { budget: 524288, committed }] if *committed > 524288
+        ),
+        "{exceeded:?}"
+    );
+}
+
+#[test]
+fn metered_guest_is_stopped_when_its_code_does_not_fit_in_memory() {
+    let accountant = Arc::new(Accountant {
+        limit: 768 * MIB,
+        code_quota: Some(512 * 1024),
+        ..Default::default()
+    });
+    let exceeded = run_code_bomb(&accountant, WasmLimits::default());
+    assert!(
+        matches!(
+            exceeded.as_slice(),
+            [NapiLimitExceeded::WasmCodeMemory { limit, .. }] if *limit == 768 * MIB
+        ),
+        "{exceeded:?}"
     );
 }

@@ -27,7 +27,6 @@
 //! [`ResourceBudget`] for provider-owned resources such as environments,
 //! value handles, and declared external memory.
 
-#[cfg(not(target_arch = "wasm32"))]
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::sync::{
@@ -238,7 +237,8 @@ pub trait NapiMemoryAccountant: Send + Sync {
     }
     /// N-API stopped the application's JavaScript because it exceeded a
     /// provider-enforced limit that is not part of the memory total. Called
-    /// at most once per limit and context, off V8's allocation path; the
+    /// at most once per limit and context, off V8's allocation path, and
+    /// before a guest N-API call that observed the stop returns. The
     /// embedder should treat it like an exhausted memory limit (for example
     /// end the workload). The default does nothing beyond the stop N-API
     /// already performed.
@@ -372,6 +372,22 @@ pub struct ResourceBudget {
     v8_heap_emergency: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
+    limit_reports: LimitReports,
+}
+
+/// Provider-enforced limit breaches not yet reported to the embedder. They
+/// are queued from inside V8 and delivered off its locks, by the stop helper
+/// or by the stopped guest's next import return, whichever comes first.
+#[derive(Default)]
+#[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+struct LimitReports {
+    /// Only held to push or take, never across a callback.
+    queue: Mutex<Vec<NapiLimitExceeded>>,
+    /// Reports queued or still being delivered. Drops only once the
+    /// accountant returned, so zero means every earlier report arrived.
+    undelivered: AtomicUsize,
+    /// Serializes delivery: a caller that finds reports in flight waits.
+    delivering: Mutex<()>,
 }
 
 impl std::fmt::Debug for ResourceBudget {
@@ -460,6 +476,7 @@ impl ResourceBudget {
             heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
             v8_heap_emergency: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
+            limit_reports: LimitReports::default(),
         })
     }
 
@@ -481,6 +498,7 @@ impl ResourceBudget {
             heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
             v8_heap_emergency: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
+            limit_reports: LimitReports::default(),
         }
     }
 
@@ -627,11 +645,40 @@ impl ResourceBudget {
         }
     }
 
-    /// Reports a provider-enforced limit breach to the embedder accountant,
-    /// if any (see [`NapiMemoryAccountant::limit_exceeded`]).
-    pub(crate) fn notify_limit_exceeded(&self, limit: NapiLimitExceeded) {
-        if let Some(accountant) = &self.accountant {
-            accountant.limit_exceeded(limit);
+    /// Queues a provider-enforced limit breach for the embedder accountant,
+    /// if any (see [`NapiMemoryAccountant::limit_exceeded`]). Safe under V8's
+    /// locks: it takes a leaf lock and never calls the embedder.
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+    pub(crate) fn queue_limit_exceeded(&self, limit: NapiLimitExceeded) {
+        if self.accountant.is_none() {
+            return;
+        }
+        let reports = &self.limit_reports;
+        reports.undelivered.fetch_add(1, Ordering::AcqRel);
+        reports.queue.lock().push(limit);
+    }
+
+    /// Reports every queued breach to the embedder exactly once, after any
+    /// delivery already in progress, so the guest never runs on after its
+    /// JavaScript was stopped before the embedder knows why. Calls the
+    /// embedder, so it must not run inside V8's allocation callbacks or
+    /// under N-API's own locks.
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
+    pub(crate) fn deliver_limits_exceeded(&self) {
+        let reports = &self.limit_reports;
+        if reports.undelivered.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(accountant) = &self.accountant else {
+            return;
+        };
+        let _delivering = reports.delivering.lock();
+        let queued = std::mem::take(&mut *reports.queue.lock());
+        for limit in queued {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                accountant.limit_exceeded(limit)
+            }));
+            reports.undelivered.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
