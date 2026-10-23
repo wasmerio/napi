@@ -965,10 +965,13 @@ mod tests {
                 .webassembly_policy(),
             WasmPolicy::Restricted
         );
-        let managed = NapiCtx::builder().build_managed_imports(Arc::new(|| {
-            unreachable!("building import hooks must not activate a lane")
-        }));
-        assert_eq!(managed.inner.webassembly, WasmPolicy::Restricted);
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            let managed = NapiCtx::builder().build_managed_imports(Arc::new(|| {
+                unreachable!("building import hooks must not activate a lane")
+            }));
+            assert_eq!(managed.inner.webassembly, WasmPolicy::Restricted);
+        }
         // Mirrors NapiWebAssemblyPolicy in restricted_context.h.
         assert_eq!(WasmPolicy::Restricted.bridge_code(), 0);
         assert_eq!(WasmPolicy::EnabledUnmetered.bridge_code(), 1);
