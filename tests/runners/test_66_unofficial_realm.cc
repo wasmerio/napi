@@ -431,3 +431,96 @@ TEST_F(Test66UnofficialRealm, RealmEnvsAreReleasedBeforeTheirAgent) {
   // Realm envs go first, newest first; the principal env goes last.
   EXPECT_EQ(order, std::vector<int>({3, 2, 1, 0}));
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+// Records which env's hook ran and the import specifier it saw.
+struct ImportProbe {
+  napi_env env = nullptr;
+  std::string specifier;
+};
+
+napi_value ProbeDynamicImport(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok || argc < 2) {
+    return nullptr;
+  }
+  auto* probe = static_cast<ImportProbe*>(data);
+  probe->env = env;
+  probe->specifier = Utf8(env, argv[1]);
+  napi_value result = nullptr;
+  napi_create_object(env, &result);
+  return result;
+}
+
+bool SetImportHook(napi_env env, ImportProbe* probe) {
+  napi_value callback = nullptr;
+  if (napi_create_function(env, "import", NAPI_AUTO_LENGTH, ProbeDynamicImport, probe,
+                           &callback) != napi_ok) {
+    return false;
+  }
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks), UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION, callback,
+      nullptr};
+  return unofficial_napi_module_wrap_set_hooks(env, &hooks) == napi_ok;
+}
+
+}  // namespace
+
+TEST_F(Test66UnofficialRealm, DynamicImportFallsBackToTheParentHook) {
+  EnvScope s(runtime_.get());
+  napi_env realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+
+  ImportProbe parent_probe;
+  ASSERT_TRUE(SetImportHook(s.env, &parent_probe));
+  ASSERT_NE(Eval(realm, "import('from-realm'); 0"), nullptr);
+  EXPECT_EQ(parent_probe.env, s.env);
+  EXPECT_EQ(parent_probe.specifier, "from-realm");
+
+  ImportProbe realm_probe;
+  ASSERT_TRUE(SetImportHook(realm, &realm_probe));
+  ASSERT_NE(Eval(realm, "import('own'); 0"), nullptr);
+  EXPECT_EQ(realm_probe.env, realm);
+  EXPECT_EQ(realm_probe.specifier, "own");
+  EXPECT_EQ(parent_probe.specifier, "from-realm");
+}
+
+TEST_F(Test66UnofficialRealm, PrepareStackTraceFallsBackToTheParent) {
+  EnvScope s(runtime_.get());
+  napi_env realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(
+                s.env, Eval(s.env, "() => 'parent stack'")),
+            napi_ok);
+  EXPECT_EQ(Utf8(realm, Eval(realm, "new Error('x').stack")), "parent stack");
+
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(
+                realm, Eval(realm, "() => 'realm stack'")),
+            napi_ok);
+  EXPECT_EQ(Utf8(realm, Eval(realm, "new Error('x').stack")), "realm stack");
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "new Error('x').stack")), "parent stack");
+}
+
+TEST_F(Test66UnofficialRealm, OwnMicrotaskQueueDrainsAfterEvaluationInTheRealm) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.own_microtask_queue = true;
+  napi_env realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(
+      Str(realm, "globalThis.ran = 0; Promise.resolve().then(() => { ran = 1; }); 0"));
+  napi_value result = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_run_script(realm, nullptr, &source, Str(realm, "q.js"),
+                                                  0, 0, -1, true, false, false, nullptr,
+                                                  &result),
+            napi_ok);
+  EXPECT_EQ(Int32(realm, Eval(realm, "ran")), 1);
+}
+#endif
