@@ -66,6 +66,25 @@ typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
                                                          void* data);
 typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
                                                         void* data);
+// Embedder hook that queues provider work (engine tasks, finalizer drains) to
+// run on the env's thread. The provider may call it from any thread, including
+// from the middle of a garbage collection. Each call hands over one task:
+//
+// - The hook owns `data` from the moment it is called, whatever it returns.
+//   The provider never touches `data` after handing it over, so the hook may
+//   run or release the task, on any thread, before the call has returned.
+// - The hook never runs `callback` from inside the call. It runs
+//   `callback(env, data)` at most once, later, on the env's thread, no sooner
+//   than `delay_millis` from now.
+// - When `cleanup` is not NULL, the hook calls `cleanup(env, data)` exactly
+//   once, as the last use of `data`: right after `callback` returns, or
+//   instead of it when the task is dropped (refused, or discarded when the env
+//   shuts down). This holds when the hook returns an error, too. `cleanup` may
+//   be called from any thread, including from inside the call.
+// - The hook returns napi_ok when the task may still run, and an error only
+//   when `callback` will never run.
+//
+// The provider does not retry or reroute a refused task; it is dropped.
 typedef napi_status (*unofficial_napi_enqueue_foreground_task_callback)(
     void* target,
     unofficial_napi_foreground_task_callback callback,

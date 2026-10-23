@@ -220,23 +220,25 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
     if (enqueue != nullptr && target != nullptr) {
       ForegroundTaskRecord* record = new (std::nothrow) ForegroundTaskRecord();
       if (record != nullptr) {
-        record->isolate_state.reset();
+        // The hook owns the record from the moment it is called, whatever it
+        // returns (see unofficial_napi_enqueue_foreground_task_callback): it
+        // may refuse and release the record, or have another thread run and
+        // release it, before the call returns. So the record is complete,
+        // including the pending-task count its cleanup gives back, before it
+        // is handed over, and it is never touched afterwards. A refused task
+        // is dropped rather than rerouted; V8 tolerates dropped foreground
+        // tasks.
         record->task = std::move(task);
-        if (enqueue(target,
-                    RunForegroundTaskRecord,
-                    record,
-                    CleanupForegroundTaskRecord,
-                    delay_ms) == napi_ok) {
-          if (isolate_state != nullptr &&
-              isolate_state->platform != nullptr) {
-            isolate_state->platform->AddPendingForegroundTask(isolate_state);
-            record->isolate_state = isolate_state;
-          }
-          return;
+        if (isolate_state != nullptr && isolate_state->platform != nullptr) {
+          isolate_state->platform->AddPendingForegroundTask(isolate_state);
+          record->isolate_state = isolate_state;
         }
-        task = std::move(record->task);
-        record->isolate_state.reset();
-        delete record;
+        (void)enqueue(target,
+                      RunForegroundTaskRecord,
+                      record,
+                      CleanupForegroundTaskRecord,
+                      delay_ms);
+        return;
       }
     }
 
