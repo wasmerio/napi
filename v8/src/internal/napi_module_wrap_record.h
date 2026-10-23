@@ -34,6 +34,7 @@ struct ModuleWrapRecord {
   std::vector<ModuleRequestRecord> module_requests;
   std::unordered_map<std::string, uint32_t> resolve_cache;
   std::vector<ModuleWrapRecord*> linked_requests;
+  size_t request_metadata_bytes = 0;
 };
 
 }  // namespace v8impl::detail

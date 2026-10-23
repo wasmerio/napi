@@ -173,6 +173,40 @@ if [[ -z "${V8_INCLUDE_DIR:-}" || -z "${V8_LIBRARY_PATH:-}" ]]; then
   exit 1
 fi
 
+# Keep the test embedder's V8 ABI in sync with the selected archive. Pointer
+# compression alone is insufficient when the sandbox changes public structs.
+V8_BUILD_CONFIG="$(dirname "$(dirname "$V8_LIBRARY_PATH")")/build-config.txt"
+if [[ -f "$V8_BUILD_CONFIG" ]]; then
+  V8_DEFINES_NORMALIZED=",${V8_DEFINES//;/,},"
+  if grep -qx 'v8_enable_sandbox=true' "$V8_BUILD_CONFIG"; then
+    case "$V8_DEFINES_NORMALIZED" in
+      *,V8_ENABLE_SANDBOX,*|*,V8_ENABLE_SANDBOX=1,*) ;;
+      *,V8_ENABLE_SANDBOX=0,*)
+        echo "V8_ENABLE_SANDBOX=0 conflicts with the selected archive" >&2
+        exit 1
+        ;;
+      *) V8_DEFINES="$V8_DEFINES,V8_ENABLE_SANDBOX" ;;
+    esac
+  elif grep -qx 'v8_enable_sandbox=false' "$V8_BUILD_CONFIG"; then
+    case "$V8_DEFINES_NORMALIZED" in
+      *,V8_ENABLE_SANDBOX,*|*,V8_ENABLE_SANDBOX=1,*)
+        echo "V8_ENABLE_SANDBOX conflicts with the selected archive" >&2
+        exit 1
+        ;;
+    esac
+  else
+    echo "invalid V8 sandbox metadata: $V8_BUILD_CONFIG" >&2
+    exit 1
+  fi
+fi
+IFS=',; ' read -r -a V8_DEFINE_LIST <<< "$V8_DEFINES"
+V8_DEFINE_ARGS=()
+for define in "${V8_DEFINE_LIST[@]}"; do
+  if [[ -n "$define" ]]; then
+    V8_DEFINE_ARGS+=("-D$define")
+  fi
+done
+
 TEST_SRC=""
 for ext in c cc cpp; do
   candidate="$ROOT_DIR/tests/programs/${TEST_NAME}.${ext}"
@@ -267,7 +301,7 @@ esac
   -w \
   -DNAPI_EXTERN= \
   -DNAPI_VERSION=8 \
-  $(echo "$V8_DEFINES" | tr ';,' '\n' | sed '/^[[:space:]]*$/d; s/^[[:space:]]*/-D/; s/[[:space:]]*$//' | tr '\n' ' ') \
+  "${V8_DEFINE_ARGS[@]}" \
   -I"$NAPI_INCLUDE_DIR" \
   -I"$NAPI_LIB_SRC" \
   -I"$NAPI_V8_INCLUDE" \
