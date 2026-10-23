@@ -135,6 +135,10 @@ pub(crate) struct NapiEnv {
     pub(crate) napi_envs: IdHashMap<u32, usize>,
     pub(crate) napi_state_to_guest_env: IdHashMap<usize, u32>,
     pub(crate) napi_scopes: IdHashMap<u32, u32>,
+    /// Realm env id to the id of the principal env that owns its isolate.
+    /// Realm envs have no owner scope; they are unregistered with it.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    realm_principals: IdHashMap<u32, u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) guest_buffer_pool: Vec<(u32, usize)>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -193,6 +197,8 @@ impl NapiEnv {
             napi_envs: IdHashMap::default(),
             napi_state_to_guest_env: IdHashMap::default(),
             napi_scopes: IdHashMap::default(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            realm_principals: IdHashMap::default(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             guest_buffer_pool: Vec::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -407,6 +413,41 @@ impl NapiEnv {
         (env_id, scope_id)
     }
 
+    /// Gives a realm env made through `parent_env_id` (a principal env or
+    /// another realm env) a guest id. It gets no owner scope, budget charge or
+    /// registry entry: its isolate belongs to the principal env, and it is
+    /// unregistered with that env.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn register_realm_env(&mut self, parent_env_id: u32, realm: SnapiEnv) -> u32 {
+        let principal = self
+            .realm_principals
+            .get(&parent_env_id)
+            .copied()
+            .unwrap_or(parent_env_id);
+        let env_id = self.next_napi_env_id.max(1);
+        self.next_napi_env_id = env_id.saturating_add(1);
+        self.napi_envs.insert(env_id, realm as usize);
+        self.napi_state_to_guest_env.insert(realm as usize, env_id);
+        self.realm_principals.insert(env_id, principal);
+        env_id
+    }
+
+    /// The guest id of a registered env, if any.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn guest_env_id(&self, env: SnapiEnv) -> Option<u32> {
+        self.napi_state_to_guest_env.get(&(env as usize)).copied()
+    }
+
+    /// Ids of the realm envs whose isolate belongs to `principal_env_id`.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn realm_env_ids(&self, principal_env_id: u32) -> Vec<u32> {
+        self.realm_principals
+            .iter()
+            .filter(|(_, principal)| **principal == principal_env_id)
+            .map(|(realm, _)| *realm)
+            .collect()
+    }
+
     fn discard_buffer_leases_for_env(&mut self, env_id: u32) {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         {
@@ -467,6 +508,10 @@ impl NapiEnv {
         // writes; environment teardown only discards snapshots and returns any
         // guest allocations because the JavaScript value is being destroyed.
         self.discard_buffer_leases_for_env(env_id);
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        for realm_id in self.realm_env_ids(env_id) {
+            self.discard_buffer_leases_for_env(realm_id);
+        }
         Some((env_id, env as SnapiEnv))
     }
 
@@ -495,6 +540,15 @@ impl NapiEnv {
             self.persistent_callback_contexts.remove(&env_id);
         }
         self.napi_state_to_guest_env.remove(&(env as usize));
+        // The release freed the agent's realm envs too; their ids must stop
+        // resolving.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        for realm_id in self.realm_env_ids(env_id) {
+            self.realm_principals.remove(&realm_id);
+            if let Some(realm) = self.napi_envs.remove(&realm_id) {
+                self.napi_state_to_guest_env.remove(&realm);
+            }
+        }
     }
 
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
