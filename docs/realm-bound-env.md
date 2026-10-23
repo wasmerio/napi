@@ -1,6 +1,6 @@
 # Realm-bound `napi_env`
 
-Status: Phases 0 and 1 implemented (see §11 and §12). Phases 2–4 are not started.
+Status: Phases 0–2 implemented (see §11–§13). Phases 3 and 4 are not started.
 
 **Proposal:** split each provider into an **agent**, which is the engine
 instance and its thread, and **realm envs**. A realm env is a `napi_env` whose
@@ -754,3 +754,63 @@ What the new tests cover:
   inside a sandbox still lands on the host global.
 - **Next phase.** Phase 2 moves EdgeJS to realm envs (§6). Phase 3 then removes
   the context arguments and the context-token hooks.
+
+## 13. Phase 2: EdgeJS on realm envs
+
+EdgeJS now acts in a vm context through that context's realm env, instead of
+passing the contextified object to the provider. The work is on the EdgeJS
+branch `feat/napi-realm-envs`, which pins napi to this branch.
+
+### napi changes it needed
+
+Calling into a realm env from a binding that belongs to the principal env
+showed two gaps, both now fixed on this branch:
+
+- **Pending exceptions were per env on V8 and host-JS.** An exception raised
+  through a realm env stayed on that env, so the calling binding returned
+  without rethrowing it. The pending exception now belongs to the agent, as it
+  already did on QuickJS. One thread runs one agent's JavaScript, so only one
+  exception can be in flight at a time.
+- **V8 module handles were per env.** Destroying a module through an env other
+  than the one that made it did nothing until teardown. Handles are now
+  agent-scoped, as they already were on QuickJS.
+
+New shared tests: `PendingExceptionsAreSharedAcrossRealms` and
+`ModuleHandlesWorkThroughAnyEnvOfTheAgent`.
+
+### EdgeJS changes
+
+- **`makeContext`** calls `unofficial_napi_create_realm`.
+- **`runInContext`, `compileFunction` and `moveMessagePortToContext`** resolve
+  the contextified object with `unofficial_napi_get_realm` and run through that
+  env, with no context argument. They share one helper, `src/edge_realm.h`.
+- **`compileFunction`** opens its bytecode through the realm env.
+- **ModuleWrap** creates a module through its realm env; its other methods are
+  unchanged.
+- **The context-token hooks** and `Environment::attached_contexts_`, which
+  nothing read, are removed.
+
+### Results
+
+Each variant ran 26 Node test categories: the CI set plus vm, module,
+async_hooks and worker_threads.
+
+| | A: EdgeJS main, napi a65e9cb | B: napi Phase 1 | C: B + migration |
+|---|---|---|---|
+| V8, failing of 2467 | 99 | 98 | 103 |
+| QuickJS, failing of 2459 | 168 | 168 | 168 |
+
+- **V8:** every test whose result differs between A, B and C passes three
+  times out of three when run on its own, on both binaries. They are vm and
+  worker tests that fail only under the harness's parallel load.
+- **QuickJS:** the three runs are identical, test for test.
+- **A crash that predates this work:**
+  `parallel/test-vm-global-configurable-properties` segfaults about 1–3 times
+  in 100 on A as well as on B and C.
+- **Not run:** the EdgeJS WASIX lanes, `test-intl` and `test-lang`.
+
+### Next
+
+Phase 3 removes what EdgeJS no longer uses: the sandbox, parsing-context and
+module-context arguments, `contextify_make_context`, and the context-token
+hooks.
