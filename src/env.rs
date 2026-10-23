@@ -258,7 +258,7 @@ impl NapiEnv {
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn enter_background_lane(&mut self) -> anyhow::Result<Option<ManagedV8LaneScope>> {
-        if self.host_stopped.load(Ordering::Acquire) {
+        if self.stopped_for_guest() {
             anyhow::bail!("N-API instance has been stopped");
         }
         let Some(activate) = &self.managed_lane_activator else {
@@ -268,7 +268,7 @@ impl NapiEnv {
             let lane = activate()?;
             // Activation can race a host stop. Edge rejects late activation,
             // and the provider rechecks its own sticky stop flag before V8.
-            if self.host_stopped.load(Ordering::Acquire) {
+            if self.stopped_for_guest() {
                 anyhow::bail!("N-API instance stopped during activation");
             }
             let wasm = match self.webassembly {
@@ -438,6 +438,19 @@ impl NapiEnv {
 
     pub(crate) fn host_stopped(&self) -> bool {
         self.host_stopped.load(Ordering::Acquire)
+    }
+
+    /// [`Self::host_stopped`] for a guest import about to refuse because of
+    /// the stop: a provider limit behind it reaches the embedder first (see
+    /// [`ResourceBudget::deliver_limits_exceeded`]). Not for use under the
+    /// env registry lock.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn stopped_for_guest(&self) -> bool {
+        let stopped = self.host_stopped();
+        if stopped {
+            self.budget.deliver_limits_exceeded();
+        }
+        stopped
     }
 
     pub(crate) fn terminate_all(&self) {

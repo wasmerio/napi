@@ -88,7 +88,7 @@ pub(super) fn register(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>, i
 fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<i32, RuntimeError> {
     // Control shutdown is sticky across cloned WASIX worker import sets.
     // Release is still available so an instance can tear down admitted envs.
-    if env.data().host_stopped()
+    if env.data().stopped_for_guest()
         && name != "unofficial_napi_release_env"
         && name != "unofficial_napi_release_env_with_loop"
         && name != "unofficial_napi_release_serialized_value"

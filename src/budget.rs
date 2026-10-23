@@ -383,8 +383,9 @@ pub struct ResourceBudget {
 struct LimitReports {
     /// Only held to push or take, never across a callback.
     queue: Mutex<Vec<NapiLimitExceeded>>,
-    /// Reports queued or still being delivered. Drops only once the
-    /// accountant returned, so zero means every earlier report arrived.
+    /// Reports queued or still being delivered: raised with the push, under
+    /// the queue lock, and dropped only once the accountant returned, so
+    /// zero means every earlier report arrived.
     undelivered: AtomicUsize,
     /// Serializes delivery: a caller that finds reports in flight waits.
     delivering: Mutex<()>,
@@ -654,15 +655,18 @@ impl ResourceBudget {
             return;
         }
         let reports = &self.limit_reports;
-        reports.undelivered.fetch_add(1, Ordering::AcqRel);
-        reports.queue.lock().push(limit);
+        let mut queue = reports.queue.lock();
+        queue.push(limit);
+        reports.undelivered.fetch_add(1, Ordering::Release);
     }
 
     /// Reports every queued breach to the embedder exactly once, after any
     /// delivery already in progress, so the guest never runs on after its
     /// JavaScript was stopped before the embedder knows why. Calls the
     /// embedder, so it must not run inside V8's allocation callbacks or
-    /// under N-API's own locks.
+    /// under N-API's own locks; no N-API lock is held across the call, so
+    /// the accountant may use this budget and limits may be queued
+    /// meanwhile. It must not deliver again from inside the callback.
     #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]
     pub(crate) fn deliver_limits_exceeded(&self) {
         let reports = &self.limit_reports;
@@ -678,7 +682,8 @@ impl ResourceBudget {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 accountant.limit_exceeded(limit)
             }));
-            reports.undelivered.fetch_sub(1, Ordering::AcqRel);
+            // Release: a caller that then reads zero sees the report's effects.
+            reports.undelivered.fetch_sub(1, Ordering::Release);
         }
     }
 
@@ -2196,6 +2201,153 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8BackingPages, 80);
         assert_eq!(budget.snapshot().v8_backing_pages, 0);
         assert_eq!(budget.memory_charged(), 0);
+    }
+
+    struct CountingReporter {
+        inner: Arc<TestAccountant>,
+        reports: AtomicUsize,
+    }
+
+    impl NapiMemoryAccountant for CountingReporter {
+        fn memory_limit(&self) -> u64 {
+            self.inner.memory_limit()
+        }
+        fn memory_charged(&self) -> u64 {
+            self.inner.memory_charged()
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            self.inner.try_charge(bytes)
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.inner.uncharge(bytes);
+        }
+        fn limit_exceeded(&self, _limit: NapiLimitExceeded) {
+            self.reports.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A delivery that sees a report pending, however early, delivers it.
+    #[test]
+    fn a_visible_limit_report_is_delivered() {
+        let reporter = Arc::new(CountingReporter {
+            inner: TestAccountant::new(100),
+            reports: AtomicUsize::new(0),
+        });
+        let budget = ResourceBudget::with_accountant(reporter.clone());
+        for round in 1..=2000 {
+            let publisher = std::thread::spawn({
+                let budget = Arc::clone(&budget);
+                move || {
+                    budget.queue_limit_exceeded(NapiLimitExceeded::WasmCodeBudget {
+                        committed: 2,
+                        budget: 1,
+                    })
+                }
+            });
+            while budget.limit_reports.undelivered.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+            budget.deliver_limits_exceeded();
+            assert_eq!(reporter.reports.load(Ordering::Acquire), round);
+            publisher.join().unwrap();
+        }
+    }
+
+    /// Blocks in its first report until released, then uses the budget and
+    /// queues another limit, as a second stopped context would.
+    struct BlockingReporter {
+        inner: Arc<TestAccountant>,
+        budget: Mutex<std::sync::Weak<ResourceBudget>>,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        reports: Mutex<Vec<NapiLimitExceeded>>,
+    }
+
+    impl NapiMemoryAccountant for BlockingReporter {
+        fn memory_limit(&self) -> u64 {
+            self.inner.memory_limit()
+        }
+        fn memory_charged(&self) -> u64 {
+            self.inner.memory_charged()
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            self.inner.try_charge(bytes)
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.inner.uncharge(bytes);
+        }
+        fn limit_exceeded(&self, limit: NapiLimitExceeded) {
+            let first = {
+                let mut reports = self.reports.lock();
+                reports.push(limit);
+                reports.len() == 1
+            };
+            if first {
+                self.entered.lock().send(()).unwrap();
+                self.release.lock().recv().unwrap();
+                let budget = self.budget.lock().upgrade().unwrap();
+                budget.snapshot();
+                budget.queue_limit_exceeded(NapiLimitExceeded::WasmProcessCode {
+                    committed: 2,
+                    limit: 1,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn limit_reports_are_delivered_once_and_awaited_while_in_flight() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let reporter = Arc::new(BlockingReporter {
+            inner: TestAccountant::new(100),
+            budget: Mutex::new(std::sync::Weak::new()),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+            reports: Mutex::new(Vec::new()),
+        });
+        let budget = ResourceBudget::with_accountant(reporter.clone());
+        *reporter.budget.lock() = Arc::downgrade(&budget);
+        budget.queue_limit_exceeded(NapiLimitExceeded::WasmCodeBudget {
+            committed: 2,
+            budget: 1,
+        });
+
+        // The stop helper wins the delivery and is held in the accountant.
+        let helper = std::thread::spawn({
+            let budget = Arc::clone(&budget);
+            move || budget.deliver_limits_exceeded()
+        });
+        entered.recv().unwrap();
+        // A guest import returning now must not get ahead of that report.
+        let returned = Arc::new(AtomicBool::new(false));
+        let import = std::thread::spawn({
+            let (budget, returned) = (Arc::clone(&budget), Arc::clone(&returned));
+            move || {
+                budget.deliver_limits_exceeded();
+                returned.store(true, Ordering::Release);
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!returned.load(Ordering::Acquire));
+
+        release.send(()).unwrap();
+        helper.join().unwrap();
+        import.join().unwrap();
+        let delivered = reporter.reports.lock().clone();
+        assert!(
+            matches!(
+                delivered.as_slice(),
+                [
+                    NapiLimitExceeded::WasmCodeBudget { .. },
+                    NapiLimitExceeded::WasmProcessCode { .. }
+                ]
+            ),
+            "{delivered:?}"
+        );
+        budget.deliver_limits_exceeded();
+        assert_eq!(reporter.reports.lock().len(), 2);
+        assert_eq!(budget.limit_reports.undelivered.load(Ordering::Acquire), 0);
     }
 
     #[cfg(all(napi_standalone_legacy_wait, not(target_arch = "wasm32")))]

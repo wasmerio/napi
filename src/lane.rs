@@ -349,7 +349,6 @@ unsafe extern "C" fn on_wasm_code_limit(
         let Some(control) = accountant.control.clone() else {
             return;
         };
-        control.mark_stopped();
         let budget = Arc::clone(&accountant.budget);
         let exceeded = match reason {
             WASM_CODE_LIMIT_BUDGET => Some(NapiLimitExceeded::WasmCodeBudget {
@@ -365,9 +364,12 @@ unsafe extern "C" fn on_wasm_code_limit(
             }),
             _ => None,
         };
+        // Queued before the stop is visible, so an import refused for the
+        // stop finds the report to deliver.
         if let Some(exceeded) = exceeded {
             budget.queue_limit_exceeded(exceeded);
         }
+        control.mark_stopped();
         let stop = move || {
             budget.deliver_limits_exceeded();
             control.terminate_all();

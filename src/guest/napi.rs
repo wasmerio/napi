@@ -184,7 +184,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
 // would make this guest look like an unrestricted native embedder.
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 fn ensure_guest_heap(env: &mut FunctionEnvMut<NapiEnv>) -> bool {
-    if env.data().host_stopped() {
+    if env.data().stopped_for_guest() {
         return false;
     }
     if env.data().guest_heap.is_some() {
@@ -237,7 +237,10 @@ fn with_cb_context<R>(
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
     // A provider limit may have stopped this JavaScript; the embedder must
-    // learn why before the guest sees the failure.
+    // learn why before the guest sees the failure. The bridge call has
+    // returned, so no V8 allocator or env-registry lock is held here; an
+    // outer call may still have the isolate entered, as when a heap denial
+    // reaches the embedder.
     env.data().budget.deliver_limits_exceeded();
     if !snapi_env.is_null() {
         // JavaScript may have left a large object above the heap limit that no
@@ -370,7 +373,7 @@ fn guest_unofficial_napi_configure_runtime(
     let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
         return 1;
     };
-    if env.data().host_stopped() {
+    if env.data().stopped_for_guest() {
         return 1;
     }
     // Configuration has no per-guest mutable options. Defer native V8
