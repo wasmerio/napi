@@ -974,14 +974,22 @@ void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const st
   context->GetIsolate()->ThrowException(napi_v8_unwrap_value(error));
 }
 
+// `module` if it is a live record of any env of `env`'s agent. Module handles
+// are agent-scoped: any env of the agent may operate on them.
 ModuleWrapRecord* FindModuleRecordForHandle(napi_env env,
                                             unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return nullptr;
-  auto* state = GetModuleWrapState(env);
-  if (state == nullptr) return nullptr;
   ModuleWrapRecord* candidate = ModuleRecord(module);
-  auto it = std::find(state->modules.begin(), state->modules.end(), candidate);
-  return it != state->modules.end() ? candidate : nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  for (napi_env owner : AgentEnvs(env->isolate)) {
+    auto it = g_module_wrap_states.find(owner);
+    if (it == g_module_wrap_states.end()) continue;
+    const auto& modules = it->second.modules;
+    if (std::find(modules.begin(), modules.end(), candidate) != modules.end()) {
+      return candidate;
+    }
+  }
+  return nullptr;
 }
 
 bool SetHostDefinedOptionSymbolOnWrapper(napi_env env, napi_value wrapper, napi_value id_value) {
@@ -2787,16 +2795,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
     napi_env env,
     unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = ModuleRecord(module);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    auto it = g_module_wrap_states.find(env);
-    if (it == g_module_wrap_states.end()) return napi_ok;
-    auto& modules = it->second.modules;
-    if (std::find(modules.begin(), modules.end(), record) == modules.end()) {
-      return napi_ok;
-    }
-  }
+  ModuleWrapRecord* record = FindModuleRecordForHandle(env, module);
+  if (record == nullptr) return napi_ok;
   DestroyModuleRecord(record);
   return napi_ok;
 }

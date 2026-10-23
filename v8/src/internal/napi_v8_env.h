@@ -101,10 +101,6 @@ struct napi_env__ {
   v8::MicrotaskQueue* own_microtask_queue = nullptr;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
-  v8::Global<v8::Value> last_exception;
-  v8::Global<v8::Message> last_exception_message;
-  std::string last_exception_source_line;
-  std::string last_exception_thrown_at;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;

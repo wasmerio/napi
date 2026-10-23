@@ -350,25 +350,25 @@ inline bool CheckValue(napi_env env, napi_value value) {
 
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
 }
 
 void SetLastException(napi_env env,
                       v8::Local<v8::Value> exception,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
   if (exception.IsEmpty()) return;
 
-  env->last_exception.Reset(env->isolate, exception);
+  env->agent->last_exception.Reset(env->isolate, exception);
   if (!message.IsEmpty()) {
-    env->last_exception_message.Reset(env->isolate, message);
+    env->agent->last_exception_message.Reset(env->isolate, message);
   }
 }
 
@@ -455,9 +455,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->last_exception.IsEmpty();
+  bool pending_exception = !env->agent->last_exception.IsEmpty();
   if (pending_exception) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -475,8 +475,8 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -495,8 +495,8 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   }
 }
@@ -597,6 +597,8 @@ napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
 }
 
 napi_agent__::~napi_agent__() {
+  last_exception.Reset();
+  last_exception_message.Reset();
   wrap_private_key.Reset();
   buffer_private_key.Reset();
   type_tag_private_key.Reset();
@@ -2912,22 +2914,22 @@ napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
 
 napi_status NAPI_CDECL napi_is_exception_pending(napi_env env, bool* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = !env->last_exception.IsEmpty();
+  *result = !env->agent->last_exception.IsEmpty();
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
                                                          napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  if (env->last_exception.IsEmpty()) return napi_generic_failure;
-  v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
+  if (env->agent->last_exception.IsEmpty()) return napi_generic_failure;
+  v8::Local<v8::Value> ex = env->agent->last_exception.Get(env->isolate);
   napi_value wrapped = napi_v8_wrap_value(env, ex);
   if (wrapped != nullptr &&
-      env->last_exception_source_line.empty() &&
-      env->last_exception_thrown_at.empty()) {
+      env->agent->last_exception_source_line.empty() &&
+      env->agent->last_exception_thrown_at.empty()) {
     v8::Local<v8::Message> message;
-    if (!env->last_exception_message.IsEmpty()) {
-      message = env->last_exception_message.Get(env->isolate);
+    if (!env->agent->last_exception_message.IsEmpty()) {
+      message = env->agent->last_exception_message.Get(env->isolate);
     }
     if (!message.IsEmpty()) {
       const std::string source_line =
@@ -2946,10 +2948,10 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
     unofficial_napi_internal::PreserveErrorFormatting(
         env,
         ex,
-        env->last_exception_source_line,
-        env->last_exception_thrown_at);
+        env->agent->last_exception_source_line,
+        env->agent->last_exception_thrown_at);
   }
-  env->last_exception_message.Reset();
+  env->agent->last_exception_message.Reset();
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;

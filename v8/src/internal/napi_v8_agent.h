@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <v8.h>
@@ -45,6 +46,14 @@ struct napi_agent__ {
   std::shared_ptr<v8::ArrayBuffer::Allocator> allocator;
   // Provider-generated seed; zero means "ask the isolate".
   uint64_t hash_seed = 0;
+
+  // The exception pending for N-API calls on the isolate's thread. All envs
+  // of the agent share it, so an exception raised through one env reaches the
+  // callback that called it, whichever env that callback belongs to.
+  v8::Global<v8::Value> last_exception;
+  v8::Global<v8::Message> last_exception_message;
+  std::string last_exception_source_line;
+  std::string last_exception_thrown_at;
 
   // Isolate-wide keys for wraps, buffer records and type tags.
   v8::Global<v8::Private> wrap_private_key;
