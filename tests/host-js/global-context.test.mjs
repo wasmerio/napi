@@ -18,7 +18,7 @@ const directory = await mkdtemp(join(tmpdir(), 'napi-context-test-'));
 let runtime;
 try {
   const modulePath = join(directory, 'context.mjs');
-  await writeFile(modulePath, 'let wasmerNapiActiveGlobalContext;\n' + inline.slice(start, end));
+  await writeFile(modulePath, inline.slice(start, end));
   runtime = await import(pathToFileURL(modulePath));
 } finally {
   await rm(directory, {recursive:true,force:true});
@@ -27,6 +27,8 @@ try {
 const create = runtime.wasmer_napi_create_global_context;
 const evaluate = runtime.wasmer_napi_context_eval;
 const callback = runtime.wasmer_napi_make_callback;
+// VM sandboxes evaluate the same whichever environment runs them.
+const host = create();
 const stackFormattingSupported = (() => {
   const saved=Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),marker={};
   try {
@@ -40,31 +42,44 @@ const stackFormattingSupported = (() => {
 
 test('script this and globalThis refer to the virtual global', () => {
   const context = create();
-  const values = evaluate(context.scope,'[this, globalThis, global]');
+  const values = evaluate(context,context.scope,'[this, globalThis, global]');
   assert.ok(values.every(value => value === context.scope));
+});
+
+test('a null sandbox evaluates in the given context, whatever ran last', () => {
+  const a=create(), b=create();
+  for (const sandbox of [null, undefined, globalThis]) {
+    assert.equal(evaluate(a,sandbox,'globalThis'),a.scope);
+    assert.equal(evaluate(b,sandbox,'globalThis'),b.scope);
+    assert.equal(evaluate(a,sandbox,'globalThis'),a.scope);
+  }
+  evaluate(a,null,'var answer=1');
+  assert.equal(evaluate(b,null,'typeof answer'),'undefined');
+  runtime.wasmer_napi_release_global_context(a);
+  runtime.wasmer_napi_release_global_context(b);
 });
 
 test('VM script globals expose builtins without writing to the host global', () => {
   const sandbox = { answer:42 };
   const other = {};
-  const values = evaluate(sandbox,'[this, globalThis, global, this.RegExp, RegExp, answer]');
+  const values = evaluate(host,sandbox,'[this, globalThis, global, this.RegExp, RegExp, answer]');
   assert.ok(values.slice(0,3).every(value => value === values[0]));
   assert.notEqual(values[0],globalThis);
   assert.equal(values[3],RegExp);
   assert.equal(values[4],RegExp);
   assert.equal(values[5],42);
-  assert.equal(evaluate(sandbox,'this'),values[0], 'reuse the VM global across scripts');
+  assert.equal(evaluate(host,sandbox,'this'),values[0], 'reuse the VM global across scripts');
   // Edge stream cleanup uses vm.runInNewContext('this').RegExp this way.
-  assert.equal(evaluate(sandbox,'new this.RegExp("released", "g")[Symbol.replace]("released", "closed")'),'closed');
+  assert.equal(evaluate(host,sandbox,'new this.RegExp("released", "g")[Symbol.replace]("released", "closed")'),'closed');
   const hostProcess = globalThis.process;
   const hostFormatter = Error.prepareStackTrace;
-  evaluate(sandbox,'this.process={vm:true}; Error.prepareStackTrace=()=>"vm stack"; this.answer++');
+  evaluate(host,sandbox,'this.process={vm:true}; Error.prepareStackTrace=()=>"vm stack"; this.answer++');
   assert.equal(globalThis.process,hostProcess);
   assert.equal(Error.prepareStackTrace,hostFormatter);
   assert.equal(sandbox.answer,43);
   assert.deepEqual(sandbox.process,{vm:true});
-  assert.notEqual(evaluate(other,'Error'),evaluate(sandbox,'Error'));
-  assert.notEqual(evaluate(other,'Error.prepareStackTrace'),evaluate(sandbox,'Error.prepareStackTrace'));
+  assert.notEqual(evaluate(host,other,'Error'),evaluate(host,sandbox,'Error'));
+  assert.notEqual(evaluate(host,other,'Error.prepareStackTrace'),evaluate(host,sandbox,'Error.prepareStackTrace'));
 });
 
 test('global accessors retain lazy reads and context-owned writes', () => {
@@ -90,7 +105,7 @@ test('global accessors retain lazy reads and context-owned writes', () => {
 test('a guest process assignment does not replace the worker process', () => {
   const original=globalThis.process;
   const a=create(), b=create();
-  evaluate(a.scope,'globalThis.process={guest:"a"}');
+  evaluate(a,a.scope,'globalThis.process={guest:"a"}');
   assert.equal(globalThis.process,original);
   assert.equal(b.scope.process,original);
   assert.deepEqual(a.scope.process,{guest:'a'});
@@ -105,10 +120,9 @@ test('closing an inactive context disables only its callbacks', () => {
   assert.deepEqual(fnA.call(receiver,1,2),{receiver,args:[1,2]});
   assert.equal(fnA2(),42);
   assert.throws(()=>fnB(),/active callback/);
-  runtime.wasmer_napi_activate_global_context(a);
   runtime.wasmer_napi_release_global_context(b);
   assert.equal(fnB(),undefined);
-  assert.equal(evaluate(undefined,'globalThis'),a.scope);
+  assert.equal(evaluate(a,undefined,'globalThis'),a.scope);
   assert.deepEqual(fnA.call(receiver,3),{receiver,args:[3]});
   runtime.wasmer_napi_release_global_context(a);
   assert.equal(fnA(),undefined);
@@ -158,7 +172,7 @@ test('retained callback wrappers do not retain closed contexts or dispatch captu
 test('Error constructors, static hooks and prototype writes stay local', () => {
   const a=create(), b=create();
   const hook=Error.prepareStackTrace;
-  evaluate(a.scope,'Error.prepareStackTrace=()=>"guest-a"; Error.prototype.guest="a"; Error.stackTraceLimit=3;');
+  evaluate(a,a.scope,'Error.prepareStackTrace=()=>"guest-a"; Error.prototype.guest="a"; Error.stackTraceLimit=3;');
   assert.equal(Error.prepareStackTrace,hook);
   assert.equal(Error.prototype.guest,undefined);
   assert.notEqual(a.scope.Error,b.scope.Error);
@@ -169,15 +183,15 @@ test('Error constructors, static hooks and prototype writes stay local', () => {
   assert.equal(ownMethods.toString.value,Error.prototype.toString);
   assert.equal(ownMethods.name.value,'Error');
   assert.equal(ownMethods.message.value,'');
-  assert.equal(evaluate(a.scope,'Error.prototype.toString.call(new Error("details"))'),'Error: details');
+  assert.equal(evaluate(a,a.scope,'Error.prototype.toString.call(new Error("details"))'),'Error: details');
   assert.equal(Object.getPrototypeOf(a.scope.TypeError.prototype),a.scope.Error.prototype);
-  assert.equal(evaluate(a.scope,'new TypeError("typed").guest'),'a');
-  assert.equal(evaluate(b.scope,'new TypeError("typed").guest'),undefined);
+  assert.equal(evaluate(a,a.scope,'new TypeError("typed").guest'),'a');
+  assert.equal(evaluate(b,b.scope,'new TypeError("typed").guest'),undefined);
 });
 
 test('callable errors, subclasses, causes and native N-API errors work', () => {
   const c=create();
-  const values=evaluate(c.scope,`class CustomError extends Error {}; [Error('called'),new TypeError('typed',{cause:42}),new AggregateError([1,2],'many'),new CustomError('custom')]`);
+  const values=evaluate(c,c.scope,`class CustomError extends Error {}; [Error('called'),new TypeError('typed',{cause:42}),new AggregateError([1,2],'many'),new CustomError('custom')]`);
   for (const value of values) assert.ok(value instanceof c.scope.Error);
   assert.equal(values[0].message,'called');
   assert.ok(values[1] instanceof c.scope.TypeError);
@@ -195,7 +209,7 @@ test('callable errors, subclasses, causes and native N-API errors work', () => {
 test('custom stack formatting is lazy, receives the actual error and restores the host hook', {skip:!stackFormattingSupported}, () => {
   const c=create(), host=Object.getOwnPropertyDescriptor(Error,'prepareStackTrace');
   c.scope.state={calls:0};
-  const error=evaluate(c.scope,`Error.prepareStackTrace=(error,frames)=>{state.calls++;return {error,frames}}; new Error('custom',{cause:42})`);
+  const error=evaluate(c,c.scope,`Error.prepareStackTrace=(error,frames)=>{state.calls++;return {error,frames}}; new Error('custom',{cause:42})`);
   assert.equal(c.scope.state.calls,0);
   const stack=error.stack;
   assert.equal(stack.error,error);
@@ -203,15 +217,15 @@ test('custom stack formatting is lazy, receives the actual error and restores th
   assert.equal(c.scope.state.calls,1);
   assert.equal(error.stack,stack);
   assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),host);
-  evaluate(c.scope,'Error.prepareStackTrace=()=>{throw new RangeError("formatter failed")}');
-  const bad=evaluate(c.scope,'new Error("bad")');
+  evaluate(c,c.scope,'Error.prepareStackTrace=()=>{throw new RangeError("formatter failed")}');
+  const bad=evaluate(c,c.scope,'new Error("bad")');
   assert.throws(()=>bad.stack,/formatter failed/);
   assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),host);
 });
 
 test('Error.captureStackTrace targets use the local formatter', {skip:!stackFormattingSupported}, () => {
   const c=create();
-  const object=evaluate(c.scope,`Error.prepareStackTrace=(object,frames)=>({object,frames}); const target={}; Error.captureStackTrace(target); target`);
+  const object=evaluate(c,c.scope,`Error.prepareStackTrace=(object,frames)=>({object,frames}); const target={}; Error.captureStackTrace(target); target`);
   assert.equal(object.stack.object,object);
   assert.ok(object.stack.frames.length>0);
   object.stack='overridden';
@@ -259,7 +273,7 @@ test('delayed stacks keep their owner and capture its frame limit', {skip:!stack
   a.scope.Error.prepareStackTrace=(error,frames)=>({owner:'a',error,frames});
   b.scope.Error.prepareStackTrace=(error,frames)=>({owner:'b',error,frames});
   const source='function first(){return second()} function second(){return third()} function third(){return new TypeError("delayed")} first()';
-  const errorA=evaluate(a.scope,source), errorB=evaluate(b.scope,source);
+  const errorA=evaluate(a,a.scope,source), errorB=evaluate(b,b.scope,source);
   const stackB=errorB.stack, stackA=errorA.stack;
   assert.equal(stackA.owner,'a');
   assert.equal(stackB.owner,'b');
@@ -276,8 +290,7 @@ function releasedGuestBufferReferences() {
     const context=create();
     const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
     context.scope.buffer=new Int32Array(memory.buffer);
-    evaluate(context.scope,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
-    runtime.wasmer_napi_activate_global_context(context);
+    evaluate(context,context.scope,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
     runtime.wasmer_napi_release_global_context(context);
     references.push(new WeakRef(memory.buffer));
   }
@@ -289,7 +302,7 @@ function releasedVmReferences() {
   for(let i=0;i<12;i++) {
     const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
     const sandbox={buffer:new Int32Array(memory.buffer)};
-    const scope=evaluate(sandbox,'Error.prepareStackTrace=()=>buffer; this');
+    const scope=evaluate(host,sandbox,'Error.prepareStackTrace=()=>buffer; this');
     references.push(new WeakRef(sandbox),new WeakRef(scope),new WeakRef(memory.buffer));
   }
   return references;
