@@ -9,6 +9,8 @@ bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
+// Clears context records' pointers to `realm`, which is being torn down.
+void NapiV8ForgetRealmEnv(napi_env realm);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
 void NapiV8TrackProviderPromise(v8::Isolate* isolate,

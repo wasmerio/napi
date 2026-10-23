@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -92,6 +93,12 @@ struct napi_env__ {
   std::unique_ptr<napi_agent__> owned_agent;
   // The env's realm. Never changes.
   v8::Global<v8::Context> context_ref;
+  // The env this realm env was created from (unofficial_napi_create_realm);
+  // null for the principal env. Hooks an env has not set fall back to it.
+  napi_env parent = nullptr;
+  // The realm's own microtask queue, owned by its context record; null when
+  // it uses the isolate's default queue.
+  v8::MicrotaskQueue* own_microtask_queue = nullptr;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
   v8::Global<v8::Value> last_exception;
@@ -122,6 +129,31 @@ struct napi_env__ {
 
  private:
   v8impl::detail::napi_factory__ factory_;
+};
+
+// The env bound to `context`, or null.
+napi_env NapiV8EnvForContext(v8::Local<v8::Context> context);
+
+// The env of `context`'s realm, else `isolate`'s principal env.
+inline napi_env NapiV8RealmEnvOrPrincipal(v8::Isolate* isolate,
+                                          v8::Local<v8::Context> context) {
+  napi_env env = NapiV8EnvForContext(context);
+  if (env != nullptr) return env;
+  napi_agent__* agent = napi_agent__::From(isolate);
+  return agent != nullptr ? agent->principal_env : nullptr;
+}
+
+// Enters `env`'s realm for V8 calls that create objects in the current
+// context, unless that realm is already current.
+class NapiV8RealmScope {
+ public:
+  explicit NapiV8RealmScope(napi_env env) {
+    v8::Local<v8::Context> context = env->context();
+    if (env->isolate->GetCurrentContext() != context) scope_.emplace(context);
+  }
+
+ private:
+  std::optional<v8::Context::Scope> scope_;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,
