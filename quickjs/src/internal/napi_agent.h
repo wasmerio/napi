@@ -7,6 +7,7 @@
 #include "napi_scope.h"
 
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include <quickjs.h>
@@ -28,6 +29,32 @@ struct napi_agent__
   void set_principal_env(napi_env env);
   // The env of the realm `ctx` belongs to, or the principal env.
   napi_env env_for_context(JSContext *ctx) const;
+
+  // Envs of the realms made with unofficial_napi_create_realm, in creation
+  // order. The agent owns them until it is destroyed, after the runtime is
+  // freed, because objects the runtime finalizes last still point at them.
+  void add_realm_env(std::unique_ptr<napi_env__> env);
+  // Tears the realm envs down, newest first. Runs before the principal env's
+  // own teardown.
+  void teardown_realm_envs();
+  // Calls `fn` with the principal env, then every realm env.
+  template <typename Fn>
+  void for_each_env(Fn fn) const
+  {
+    if (principal_env_ != nullptr)
+      fn(principal_env_);
+    for (const auto &env : realm_envs_)
+      fn(env.get());
+  }
+  // The env of the realm `object` belongs to: a realm's global object, or the
+  // realm whose Object.prototype ends the object's prototype chain. Null when
+  // no env of this agent matches.
+  napi_env env_for_object(JSContext *ctx, JSValueConst object) const;
+  // The env whose module_wrap created `module`, or null.
+  napi_env env_for_module(unofficial_napi_module module) const;
+  napi_env env_for_module_def(JSModuleDef *module) const;
+  // Turns the rejection tracker on while any env has a reject callback.
+  void update_rejection_tracking();
 
   // Handle scopes. Values in them are usable with every env of this agent.
   bool open_root_scope(napi_env env);
@@ -106,6 +133,7 @@ private:
 
   JSRuntime *runtime_ = nullptr;
   napi_env principal_env_ = nullptr;
+  std::vector<std::unique_ptr<napi_env__>> realm_envs_;
 
   // Handle scope stack.
   napi_allocator__<napi_scope__, napi_agent__> scopes_;

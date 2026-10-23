@@ -309,6 +309,7 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
                                          std::shared_ptr<v8::BackingStore> backing_store,
                                          size_t offset,
                                          size_t length) {
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Object> global = context->Global();
@@ -349,25 +350,25 @@ inline bool CheckValue(napi_env env, napi_value value) {
 
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
 }
 
 void SetLastException(napi_env env,
                       v8::Local<v8::Value> exception,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
   if (exception.IsEmpty()) return;
 
-  env->last_exception.Reset(env->isolate, exception);
+  env->agent->last_exception.Reset(env->isolate, exception);
   if (!message.IsEmpty()) {
-    env->last_exception_message.Reset(env->isolate, message);
+    env->agent->last_exception_message.Reset(env->isolate, message);
   }
 }
 
@@ -454,9 +455,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->last_exception.IsEmpty();
+  bool pending_exception = !env->agent->last_exception.IsEmpty();
   if (pending_exception) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -474,8 +475,8 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -494,8 +495,8 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   }
 }
@@ -563,8 +564,20 @@ namespace {
 
 // Isolate data slot that points at the isolate's napi_agent__.
 constexpr uint32_t kNapiAgentDataSlot = 0;
+// Context embedder data slot that points at the context's env. Kept clear of
+// the low slots V8 and debuggers use.
+constexpr int kNapiEnvContextSlot = 33;
 
 }  // namespace
+
+napi_env NapiV8EnvForContext(v8::Local<v8::Context> context) {
+  if (context.IsEmpty() ||
+      context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(kNapiEnvContextSlot)) {
+    return nullptr;
+  }
+  return static_cast<napi_env>(
+      context->GetAlignedPointerFromEmbedderData(kNapiEnvContextSlot));
+}
 
 napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
   isolate->SetData(kNapiAgentDataSlot, this);
@@ -584,6 +597,8 @@ napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
 }
 
 napi_agent__::~napi_agent__() {
+  last_exception.Reset();
+  last_exception_message.Reset();
   wrap_private_key.Reset();
   buffer_private_key.Reset();
   type_tag_private_key.Reset();
@@ -610,6 +625,7 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
   if (agent->principal_env == nullptr) {
     agent->principal_env = this;
   }
+  context->SetAlignedPointerInEmbedderData(kNapiEnvContextSlot, this);
   napi_v8_clear_last_error(this);
 }
 
@@ -629,6 +645,13 @@ napi_env__::~napi_env__() {
   }
   if (agent != nullptr && agent->principal_env == this) {
     agent->principal_env = nullptr;
+  }
+  {
+    v8::HandleScope handle_scope(isolate);
+    v8::Local<v8::Context> own_context = context();
+    if (NapiV8EnvForContext(own_context) == this) {
+      own_context->SetAlignedPointerInEmbedderData(kNapiEnvContextSlot, nullptr);
+    }
   }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
@@ -824,12 +847,14 @@ napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* r
 
 napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Object::New(env->isolate));
   return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_array(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate));
   return napi_v8_clear_last_error(env);
 }
@@ -861,6 +886,7 @@ napi_status NAPI_CDECL napi_create_arraybuffer(napi_env env,
                                                void** data,
                                                napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, byte_length);
   if (data != nullptr) *data = ab->Data();
   *result = napi_v8_wrap_value(env, ab);
@@ -875,6 +901,7 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     void* finalize_hint,
     napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
 
   v8::Local<v8::ArrayBuffer> out;
   if (external_data == nullptr && byte_length == 0) {
@@ -999,6 +1026,7 @@ napi_status NAPI_CDECL napi_create_array_with_length(napi_env env,
                                                      size_t length,
                                                      napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate, length));
   return napi_v8_clear_last_error(env);
 }
@@ -2705,6 +2733,7 @@ napi_status NAPI_CDECL napi_throw_error(napi_env env,
                                         const char* code,
                                         const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(
            env->isolate, (msg == nullptr) ? "N-API error" : msg, v8::NewStringType::kNormal)
@@ -2748,6 +2777,7 @@ static napi_status CreateErrorCommon(napi_env env,
   v8::Local<v8::Value> msg_val = napi_v8_unwrap_value(msg);
   if (!msg_val->IsString()) return napi_string_expected;
   v8::Local<v8::String> message = msg_val.As<v8::String>();
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::Value> created = factory(message);
   if (!created->IsObject()) return napi_generic_failure;
   v8::Local<v8::Object> err_obj = created.As<v8::Object>();
@@ -2811,6 +2841,7 @@ napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
                                              const char* code,
                                              const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Type error" : msg,
@@ -2835,6 +2866,7 @@ napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
                                               const char* code,
                                               const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Range error" : msg,
@@ -2859,6 +2891,7 @@ napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
                                                    const char* code,
                                                    const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Syntax error" : msg,
@@ -2881,22 +2914,22 @@ napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
 
 napi_status NAPI_CDECL napi_is_exception_pending(napi_env env, bool* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = !env->last_exception.IsEmpty();
+  *result = !env->agent->last_exception.IsEmpty();
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
                                                          napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  if (env->last_exception.IsEmpty()) return napi_generic_failure;
-  v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
+  if (env->agent->last_exception.IsEmpty()) return napi_generic_failure;
+  v8::Local<v8::Value> ex = env->agent->last_exception.Get(env->isolate);
   napi_value wrapped = napi_v8_wrap_value(env, ex);
   if (wrapped != nullptr &&
-      env->last_exception_source_line.empty() &&
-      env->last_exception_thrown_at.empty()) {
+      env->agent->last_exception_source_line.empty() &&
+      env->agent->last_exception_thrown_at.empty()) {
     v8::Local<v8::Message> message;
-    if (!env->last_exception_message.IsEmpty()) {
-      message = env->last_exception_message.Get(env->isolate);
+    if (!env->agent->last_exception_message.IsEmpty()) {
+      message = env->agent->last_exception_message.Get(env->isolate);
     }
     if (!message.IsEmpty()) {
       const std::string source_line =
@@ -2915,10 +2948,10 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
     unofficial_napi_internal::PreserveErrorFormatting(
         env,
         ex,
-        env->last_exception_source_line,
-        env->last_exception_thrown_at);
+        env->agent->last_exception_source_line,
+        env->agent->last_exception_thrown_at);
   }
-  env->last_exception_message.Reset();
+  env->agent->last_exception_message.Reset();
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3302,6 +3335,7 @@ node_api_create_object_with_properties(napi_env env,
   if ((property_count > 0) && (property_names == nullptr || property_values == nullptr)) {
     return napi_invalid_arg;
   }
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::Object> obj = v8::Object::New(env->isolate);
   if (prototype_or_null != nullptr) {
     v8::Local<v8::Value> proto = napi_v8_unwrap_value(prototype_or_null);

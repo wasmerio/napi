@@ -43,6 +43,9 @@ struct napi_env__
   // Makes this env own its agent (an env made from an embedder's context).
   void adopt_agent(std::unique_ptr<napi_agent__> agent);
   bool is_principal() const;
+  // The env whose hooks this realm falls back to; null for the principal env.
+  napi_env parent() const;
+  void set_parent(napi_env parent);
   JSContext *context() const;
   int32_t module_api_version() const;
 
@@ -126,9 +129,10 @@ private:
   // Set only when this env owns its agent; destroyed last.
   std::unique_ptr<napi_agent__> owned_agent_;
 
-  // Agent, realm and API version.
+  // Agent, realm, parent realm and API version.
   napi_agent__ *agent_;
   JSContext *context_;
+  napi_env parent_ = nullptr;
   int32_t module_api_version_ = 8;
 
   // Last native error state.

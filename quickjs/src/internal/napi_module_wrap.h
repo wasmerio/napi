@@ -81,6 +81,10 @@ public:
   void unregister_dynamic_import_referrer(napi_value referrer_name,
                                           napi_value host_defined_option_id);
 
+  // Whether this env created the module.
+  bool owns(unofficial_napi_module module) const;
+  bool owns_module_def(JSModuleDef *module) const;
+
   int initialize_synthetic_module(JSModuleDef *module);
   int initialize_import_meta(JSModuleDef *module, JSValueConst meta);
   JSValue import_module_dynamically(JSModuleDef *referrer,
@@ -98,6 +102,17 @@ private:
   struct request_record;
   struct record;
   struct script_referrer;
+
+  // The nearest module_wrap, this env's or a parent realm's, with the given
+  // host callback set. A realm uses its parent's hooks until it sets its own.
+  const napi_module_wrap__ *import_hook_owner() const;
+  const napi_module_wrap__ *import_meta_hook_owner() const;
+  // The nearest module_wrap whose realm has internalBinding; vm realms use
+  // their parent's bindings.
+  const napi_module_wrap__ *binding_owner() const;
+  bool has_internal_binding() const;
+  JSValue get_host_defined_option_symbol_here() const;
+  JSValue get_symbols_binding_property_here(const char *name) const;
 
   record *find(unofficial_napi_module module) const;
   record *find_by_module(JSModuleDef *module) const;

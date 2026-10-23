@@ -98,7 +98,13 @@ napi_status napi_promises__::set_reject_callback(napi_value callback)
 
 bool napi_promises__::has_reject_callback() const
 {
-  return JS_IsFunction(context_, promise_reject_callback_);
+  return !torn_down_ && JS_IsFunction(context_, promise_reject_callback_);
+}
+
+bool napi_promises__::has_hook(size_t index) const
+{
+  return !torn_down_ && index < promise_hooks_.size() &&
+         JS_IsFunction(context_, promise_hooks_[index]);
 }
 
 napi_status napi_promises__::set_hooks(napi_value init,

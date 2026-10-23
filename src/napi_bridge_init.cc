@@ -484,7 +484,8 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
 napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
   SnapiAgentState* agent = state->agent;
-  napi_env env = state->env;
+  // Agent-wide resources are released through the principal env.
+  napi_env env = agent->envs.empty() ? state->env : agent->envs.front()->env;
   for (const auto& entry : agent->buffer_lease_handles.handles) {
     (void)unofficial_napi_release_buffer_lease(
         env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
@@ -3147,6 +3148,95 @@ extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_
   (void)loop_id;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   return DisposeBridgeStateLocked(env_state);
+}
+
+// Creates a realm env on `parent_state`'s agent. Value ids of 0 mean NULL.
+// On success `*realm_out` is a new env state of the same agent and
+// `*global_out_id` the realm's global (or sandbox) value id.
+extern "C" int snapi_bridge_unofficial_create_realm(SnapiEnvState* parent_state,
+                                                    uint32_t sandbox_id,
+                                                    uint32_t name_id,
+                                                    uint32_t origin_id,
+                                                    uint32_t host_defined_option_id,
+                                                    int32_t allow_code_gen_strings,
+                                                    int32_t allow_code_gen_wasm,
+                                                    int32_t own_microtask_queue,
+                                                    SnapiEnvState** realm_out,
+                                                    uint32_t* global_out_id) {
+  auto* parent = RequireEnvState(parent_state);
+  if (parent == nullptr || realm_out == nullptr) return napi_invalid_arg;
+  *realm_out = nullptr;
+  if (global_out_id != nullptr) *global_out_id = 0;
+
+  // A nonzero id must resolve; 0 means the field is NULL.
+  auto load_optional = [parent](uint32_t id, napi_value* out) {
+    *out = nullptr;
+    if (id == 0) return true;
+    *out = LoadValue(*parent, id);
+    return *out != nullptr;
+  };
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  if (!load_optional(sandbox_id, &options.sandbox_or_null) ||
+      !load_optional(name_id, &options.name) ||
+      !load_optional(origin_id, &options.origin) ||
+      !load_optional(host_defined_option_id, &options.host_defined_option_id)) {
+    return napi_invalid_arg;
+  }
+  options.allow_code_gen_strings = allow_code_gen_strings != 0;
+  options.allow_code_gen_wasm = allow_code_gen_wasm != 0;
+  options.own_microtask_queue = own_microtask_queue != 0;
+
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_env realm_env = nullptr;
+  napi_value global = nullptr;
+  napi_status s = unofficial_napi_create_realm(parent->env, &options, &realm_env, &global);
+  if (s != napi_ok) return s;
+  // The provider keeps the realm env until its agent is released; on a
+  // bookkeeping failure it is reclaimed then.
+  auto* state = new (std::nothrow) SnapiEnvState();
+  if (state == nullptr) return napi_generic_failure;
+  state->agent = parent->agent;
+  state->env = realm_env;
+  parent->agent->envs.push_back(state);
+  g_envs.insert(state);
+  *realm_out = state;
+  if (global_out_id != nullptr) *global_out_id = StoreValue(*parent, global);
+  return napi_ok;
+}
+
+// The env state of the realm `value_id` belongs to, or null when that realm
+// has no env. A realm env the provider made on its own (make_context) gets an
+// env state on first lookup; like every env state it lives as long as its
+// agent.
+extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
+                                                 uint32_t value_id,
+                                                 SnapiEnvState** realm_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || realm_out == nullptr) return napi_invalid_arg;
+  *realm_out = nullptr;
+  napi_value value = LoadValue(*bridge_state, value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  napi_env realm_env = nullptr;
+  napi_status s = unofficial_napi_get_realm(bridge_state->env, value, &realm_env);
+  if (s != napi_ok || realm_env == nullptr) return s;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  SnapiAgentState* agent = bridge_state->agent;
+  for (SnapiEnvState* candidate : agent->envs) {
+    if (candidate->env == realm_env) {
+      *realm_out = candidate;
+      return napi_ok;
+    }
+  }
+  // The provider only returns envs of the caller's engine instance.
+  auto* state = new (std::nothrow) SnapiEnvState();
+  if (state == nullptr) return napi_generic_failure;
+  state->agent = agent;
+  state->env = realm_env;
+  agent->envs.push_back(state);
+  g_envs.insert(state);
+  *realm_out = state;
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_collect_garbage(

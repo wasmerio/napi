@@ -40,10 +40,13 @@ namespace {
 constexpr int kHostDefinedOptionsId = 8;
 constexpr int kHostDefinedOptionsLength = 9;
 
+// One realm made with make_context or create_realm. Records live with the
+// agent's principal env, so every env of the agent finds them.
 struct ContextRecord {
   napi_ref key_ref = nullptr;
   v8::Global<v8::Context> context;
   std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+  napi_env realm_env = nullptr;
 };
 
 std::mutex g_context_mu;
@@ -606,6 +609,46 @@ ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
   return &g_module_wrap_states[env];
 }
 
+// Every env of `isolate`'s agent: the principal env, then its realm envs.
+std::vector<napi_env> AgentEnvs(v8::Isolate* isolate) {
+  std::vector<napi_env> envs;
+  napi_agent__* agent = napi_agent__::From(isolate);
+  if (agent == nullptr) return envs;
+  if (agent->principal_env != nullptr) envs.push_back(agent->principal_env);
+  envs.insert(envs.end(), agent->realm_envs.begin(), agent->realm_envs.end());
+  return envs;
+}
+
+// The record of `module` among all envs of the agent, and the env that owns it.
+ModuleWrapRecord* FindModuleRecordInAgent(v8::Isolate* isolate,
+                                          v8::Local<v8::Module> module,
+                                          napi_env* owner_out) {
+  if (module.IsEmpty() || owner_out == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  for (napi_env env : AgentEnvs(isolate)) {
+    auto it = g_module_wrap_states.find(env);
+    if (it == g_module_wrap_states.end()) continue;
+    for (ModuleWrapRecord* record : it->second.modules) {
+      if (record != nullptr && !record->module.IsEmpty() &&
+          record->module.Get(isolate) == module) {
+        *owner_out = env;
+        return record;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// From `env` up its realm chain, the first env that set the module hook `hook`.
+napi_env FindModuleHookEnv(napi_env env, napi_ref ModuleWrapBindingState::*hook) {
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  for (; env != nullptr; env = env->parent) {
+    auto it = g_module_wrap_states.find(env);
+    if (it != g_module_wrap_states.end() && it->second.*hook != nullptr) return env;
+  }
+  return nullptr;
+}
+
 void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
   if (env == nullptr || record == nullptr) return;
   auto* state = GetModuleWrapState(env);
@@ -782,6 +825,14 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
   return true;
 }
 
+// The env that holds `env`'s agent's context records.
+napi_env RecordOwner(napi_env env) {
+  if (env != nullptr && env->agent != nullptr && env->agent->principal_env != nullptr) {
+    return env->agent->principal_env;
+  }
+  return env;
+}
+
 void CleanupContextRecords(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
 
@@ -848,12 +899,13 @@ void EnsureModuleWrapCleanupHook(napi_env env) {
 }
 
 ContextRecord* FindRecordByKey(napi_env env, napi_value key) {
-  auto it = g_context_records.find(env);
+  napi_env owner = RecordOwner(env);
+  auto it = g_context_records.find(owner);
   if (it == g_context_records.end()) return nullptr;
   for (auto& rec : it->second) {
     if (rec.key_ref == nullptr) continue;
     napi_value candidate = nullptr;
-    if (napi_get_reference_value(env, rec.key_ref, &candidate) != napi_ok || candidate == nullptr) continue;
+    if (napi_get_reference_value(owner, rec.key_ref, &candidate) != napi_ok || candidate == nullptr) continue;
     bool same = false;
     if (napi_strict_equals(env, candidate, key, &same) == napi_ok && same) {
       return &rec;
@@ -911,7 +963,7 @@ std::string RequireAsyncModuleMessage(const std::string& filename,
 }
 
 void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const std::string& message) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = NapiV8RealmEnvOrPrincipal(context->GetIsolate(), context);
   if (env == nullptr) {
     context->GetIsolate()->ThrowException(v8::Exception::Error(
         v8::String::NewFromUtf8(context->GetIsolate(), message.c_str(), v8::NewStringType::kNormal).ToLocalChecked()));
@@ -922,24 +974,22 @@ void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const st
   context->GetIsolate()->ThrowException(napi_v8_unwrap_value(error));
 }
 
-ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> module) {
-  auto* state = GetModuleWrapState(env);
-  if (state == nullptr || module.IsEmpty()) return nullptr;
-  for (ModuleWrapRecord* record : state->modules) {
-    if (record == nullptr || record->module.IsEmpty()) continue;
-    if (record->module.Get(env->isolate) == module) return record;
-  }
-  return nullptr;
-}
-
+// `module` if it is a live record of any env of `env`'s agent. Module handles
+// are agent-scoped: any env of the agent may operate on them.
 ModuleWrapRecord* FindModuleRecordForHandle(napi_env env,
                                             unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return nullptr;
-  auto* state = GetModuleWrapState(env);
-  if (state == nullptr) return nullptr;
   ModuleWrapRecord* candidate = ModuleRecord(module);
-  auto it = std::find(state->modules.begin(), state->modules.end(), candidate);
-  return it != state->modules.end() ? candidate : nullptr;
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  for (napi_env owner : AgentEnvs(env->isolate)) {
+    auto it = g_module_wrap_states.find(owner);
+    if (it == g_module_wrap_states.end()) continue;
+    const auto& modules = it->second.modules;
+    if (std::find(modules.begin(), modules.end(), candidate) != modules.end()) {
+      return candidate;
+    }
+  }
+  return nullptr;
 }
 
 bool SetHostDefinedOptionSymbolOnWrapper(napi_env env, napi_value wrapper, napi_value id_value) {
@@ -1056,9 +1106,9 @@ v8::MaybeLocal<v8::Module> ModuleResolveCallback(v8::Local<v8::Context> context,
                                                  v8::Local<v8::String> specifier,
                                                  v8::Local<v8::FixedArray> import_attributes,
                                                  v8::Local<v8::Module> referrer) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Module>();
-  ModuleWrapRecord* dependent = FindModuleRecordForModule(env, referrer);
+  napi_env env = nullptr;
+  ModuleWrapRecord* dependent =
+      FindModuleRecordInAgent(context->GetIsolate(), referrer, &env);
   if (dependent == nullptr || dependent->linked_requests.empty()) {
     ThrowV8CodeError(context, "ERR_VM_MODULE_LINK_FAILURE", "Module is not linked");
     return v8::MaybeLocal<v8::Module>();
@@ -1088,9 +1138,9 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
                                                        v8::Local<v8::String> specifier,
                                                        v8::Local<v8::FixedArray> import_attributes,
                                                        v8::Local<v8::Module> referrer) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Object>();
-  ModuleWrapRecord* dependent = FindModuleRecordForModule(env, referrer);
+  napi_env env = nullptr;
+  ModuleWrapRecord* dependent =
+      FindModuleRecordInAgent(context->GetIsolate(), referrer, &env);
   if (dependent == nullptr || dependent->linked_requests.empty()) {
     ThrowV8CodeError(context, "ERR_VM_MODULE_LINK_FAILURE", "Module is not linked");
     return v8::MaybeLocal<v8::Object>();
@@ -1135,9 +1185,8 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
 
 v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> context,
                                                          v8::Local<v8::Module> module) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Value>();
-  ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
+  napi_env env = nullptr;
+  ModuleWrapRecord* record = FindModuleRecordInAgent(context->GetIsolate(), module, &env);
   if (record == nullptr) return v8::MaybeLocal<v8::Value>();
 
   napi_value wrapper = GetRefValue(env, record->wrapper_ref);
@@ -1192,7 +1241,10 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     v8::Local<v8::String> specifier,
     v8::ModuleImportPhase phase,
     v8::Local<v8::FixedArray> import_attributes) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  // The import hook of the referrer's realm, else of the nearest parent.
+  napi_env env = FindModuleHookEnv(
+      NapiV8RealmEnvOrPrincipal(context->GetIsolate(), context),
+      &ModuleWrapBindingState::import_module_dynamically_ref);
   if (env == nullptr) return v8::MaybeLocal<v8::Promise>();
 
   auto* state = GetModuleWrapState(env);
@@ -1276,16 +1328,16 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamically(
 void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
                                     v8::Local<v8::Module> module,
                                     v8::Local<v8::Object> meta) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return;
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
-  ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
+  napi_env record_env = nullptr;
+  ModuleWrapRecord* record = FindModuleRecordInAgent(context->GetIsolate(), module, &record_env);
   if (record == nullptr) return;
+  // The hook of the module's env, else of the nearest parent that set one.
+  napi_env env = FindModuleHookEnv(record_env, &ModuleWrapBindingState::initialize_import_meta_ref);
+  if (env == nullptr) return;
 
-  napi_value callback = GetRefValue(env, it->second.initialize_import_meta_ref);
-  napi_value wrapper = GetRefValue(env, record->wrapper_ref);
-  napi_value id_value = GetRefValue(env, record->host_defined_option_ref);
+  napi_value callback = GetRefValue(env, GetModuleWrapState(env)->initialize_import_meta_ref);
+  napi_value wrapper = GetRefValue(record_env, record->wrapper_ref);
+  napi_value id_value = GetRefValue(record_env, record->host_defined_option_ref);
   if (callback == nullptr || wrapper == nullptr || id_value == nullptr) return;
 
   napi_value meta_value = napi_v8_wrap_value(env, meta);
@@ -1300,9 +1352,19 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
                                                       v8::Local<v8::String> specifier,
                                                       v8::Local<v8::FixedArray> /*import_attributes*/,
                                                       v8::Local<v8::Module> /*referrer*/) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Module>();
-  auto* state = GetModuleWrapState(env);
+  // The env that is building a facade has its original set.
+  ModuleWrapBindingState* state = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    for (napi_env candidate : AgentEnvs(context->GetIsolate())) {
+      auto it = g_module_wrap_states.find(candidate);
+      if (it != g_module_wrap_states.end() &&
+          it->second.temporary_required_module_facade_original != nullptr) {
+        state = &it->second;
+        break;
+      }
+    }
+  }
   if (state == nullptr || state->temporary_required_module_facade_original == nullptr ||
       state->temporary_required_module_facade_original->module.IsEmpty()) {
     return v8::MaybeLocal<v8::Module>();
@@ -1316,20 +1378,24 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
 bool StoreRecord(napi_env env,
                  napi_value key,
                  v8::Local<v8::Context> context,
-                 std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue) {
-  EnsureContextCleanupHook(env);
+                 std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue,
+                 napi_env realm_env) {
+  napi_env owner = RecordOwner(env);
+  EnsureContextCleanupHook(owner);
 
   ContextRecord record;
-  if (napi_create_reference(env, key, 1, &record.key_ref) != napi_ok || record.key_ref == nullptr) {
+  if (napi_create_reference(owner, key, 1, &record.key_ref) != napi_ok ||
+      record.key_ref == nullptr) {
     return false;
   }
-  record.context.Reset(env->isolate, context);
+  record.context.Reset(owner->isolate, context);
   record.own_microtask_queue = std::move(own_microtask_queue);
-  if (env->agent != nullptr && env->agent->context_token_assign_callback != nullptr) {
-    env->agent->context_token_assign_callback(
-        env, record.key_ref, env->agent->context_token_callback_data);
+  record.realm_env = realm_env;
+  if (owner->agent != nullptr && owner->agent->context_token_assign_callback != nullptr) {
+    owner->agent->context_token_assign_callback(
+        owner, record.key_ref, owner->agent->context_token_callback_data);
   }
-  g_context_records[env].push_back(std::move(record));
+  g_context_records[owner].push_back(std::move(record));
   return true;
 }
 
@@ -1635,7 +1701,7 @@ bool CompileBytecodeRecord(napi_env env,
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) return false;
   std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
+  auto it = g_context_records.find(RecordOwner(env));
   if (it == g_context_records.end()) return false;
   for (auto& rec : it->second) {
     v8::Local<v8::Context> candidate = rec.context.Get(env->isolate);
@@ -1646,51 +1712,62 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return false;
 }
 
+void NapiV8ForgetRealmEnv(napi_env realm) {
+  if (realm == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_context_mu);
+  auto it = g_context_records.find(RecordOwner(realm));
+  if (it == g_context_records.end()) return;
+  for (auto& rec : it->second) {
+    if (rec.realm_env == realm) rec.realm_env = nullptr;
+  }
+}
+
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
 
   std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
+  auto it = g_context_records.find(RecordOwner(env));
   if (it == g_context_records.end()) return;
 
   for (auto& rec : it->second) {
     v8::Local<v8::Context> context = rec.context.Get(env->isolate);
     if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(env, context);
+      NapiV8ApplyPromiseHooksToContext(rec.realm_env != nullptr ? rec.realm_env : env, context);
     }
   }
 }
 
 extern "C" {
 
-napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
-    napi_env env,
-    napi_value sandbox_or_symbol,
-    napi_value name,
-    napi_value origin_or_undefined,
-    bool allow_code_gen_strings,
-    bool allow_code_gen_wasm,
-    bool own_microtask_queue,
-    napi_value host_defined_option_id,
-    napi_value* result_out) {
-  if (env == nullptr || sandbox_or_symbol == nullptr || name == nullptr || result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  (void)allow_code_gen_wasm;
+}  // extern "C"
 
-  v8::Isolate* isolate = env->isolate;
+namespace {
+
+// Makes a realm in `parent`'s agent and the env bound to it. A symbol or null
+// `sandbox_or_symbol` gives a fresh global; an object becomes the realm's
+// global, keeping its own properties. `key_out` receives that global.
+napi_status CreateRealmImpl(napi_env parent,
+                            napi_value sandbox_or_symbol,
+                            bool allow_code_gen_strings,
+                            bool own_microtask_queue,
+                            napi_value host_defined_option_id,
+                            napi_env* realm_out,
+                            napi_value* key_out) {
+  v8::Isolate* isolate = parent->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> current = env->context();
+  v8::Local<v8::Context> current = parent->context();
   v8::Context::Scope current_scope(current);
 
-  napi_valuetype sandbox_type = napi_undefined;
-  if (napi_typeof(env, sandbox_or_symbol, &sandbox_type) != napi_ok) {
-    return napi_invalid_arg;
-  }
-
-  const bool vanilla = sandbox_type == napi_symbol;
-  if (!vanilla && sandbox_type != napi_object && sandbox_type != napi_function) {
-    return napi_invalid_arg;
+  bool vanilla = sandbox_or_symbol == nullptr;
+  if (!vanilla) {
+    napi_valuetype sandbox_type = napi_undefined;
+    if (napi_typeof(parent, sandbox_or_symbol, &sandbox_type) != napi_ok) {
+      return napi_invalid_arg;
+    }
+    vanilla = sandbox_type == napi_symbol;
+    if (!vanilla && sandbox_type != napi_object && sandbox_type != napi_function) {
+      return napi_invalid_arg;
+    }
   }
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -1727,7 +1804,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
             isolate, current, sandbox_object, &saved_properties)) {
       if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
         napi_v8_set_last_exception(
-            env, try_catch.Exception(), try_catch.Message());
+            parent, try_catch.Exception(), try_catch.Message());
       }
       return napi_pending_exception;
     }
@@ -1748,7 +1825,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
 
   context->SetSecurityToken(current->GetSecurityToken());
   context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
-  NapiV8ApplyPromiseHooksToContext(env, context);
 
   v8::Local<v8::Object> key_object;
   if (vanilla) {
@@ -1761,18 +1837,25 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
     }
   }
 
-  napi_value key_napi = napi_v8_wrap_value(env, handle_scope.Escape(key_object));
+  napi_value key_napi = napi_v8_wrap_value(parent, handle_scope.Escape(key_object));
   if (key_napi == nullptr) return napi_generic_failure;
+
+  auto* realm = new (std::nothrow) napi_env__(context, NAPI_VERSION);
+  if (realm == nullptr) return napi_generic_failure;
+  realm->parent = parent;
+  realm->own_microtask_queue = queue;
+  NapiV8ApplyPromiseHooksToContext(realm, context);
 
   {
     std::lock_guard<std::mutex> lock(g_context_mu);
-    if (FindRecordByKey(env, key_napi) != nullptr) {
-      return napi_invalid_arg;
-    }
-    if (!StoreRecord(env, key_napi, context, std::move(own_queue))) {
-      return napi_generic_failure;
+    if (FindRecordByKey(parent, key_napi) != nullptr ||
+        !StoreRecord(parent, key_napi, context, std::move(own_queue), realm)) {
+      delete realm;
+      return FindRecordByKey(parent, key_napi) != nullptr ? napi_invalid_arg
+                                                           : napi_generic_failure;
     }
   }
+  parent->agent->realm_envs.push_back(realm);
 
   // Align with lib internal/vm.js isContext() checks in Edge.
   v8::Local<v8::Context> property_context = vanilla ? context : current;
@@ -1782,7 +1865,91 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
                 "node:host_defined_option_symbol",
                 host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
 
-  *result_out = key_napi;
+  *realm_out = realm;
+  *key_out = key_napi;
+  return napi_ok;
+}
+
+}  // namespace
+
+extern "C" {
+
+napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
+    napi_env env,
+    napi_value sandbox_or_symbol,
+    napi_value name,
+    napi_value origin_or_undefined,
+    bool allow_code_gen_strings,
+    bool allow_code_gen_wasm,
+    bool own_microtask_queue,
+    napi_value host_defined_option_id,
+    napi_value* result_out) {
+  if (env == nullptr || env->agent == nullptr || sandbox_or_symbol == nullptr ||
+      name == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  (void)origin_or_undefined;
+  (void)allow_code_gen_wasm;
+  napi_env realm = nullptr;
+  return CreateRealmImpl(env, sandbox_or_symbol, allow_code_gen_strings, own_microtask_queue,
+                         host_defined_option_id, &realm, result_out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_realm(
+    napi_env parent,
+    const unofficial_napi_realm_options* options_or_null,
+    napi_env* realm_out,
+    napi_value* global_out) {
+  if (parent == nullptr || parent->agent == nullptr || realm_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  if (options_or_null != nullptr) {
+    if (options_or_null->size < sizeof(options) ||
+        options_or_null->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION) {
+      return napi_invalid_arg;
+    }
+    options = *options_or_null;
+  }
+  *realm_out = nullptr;
+  if (options.sandbox_or_null != nullptr) {
+    v8::Local<v8::Value> sandbox = napi_v8_unwrap_value(options.sandbox_or_null);
+    if (sandbox.IsEmpty() || !sandbox->IsObject()) return napi_object_expected;
+  }
+  napi_value key = nullptr;
+  napi_status status = CreateRealmImpl(parent,
+                                       options.sandbox_or_null,
+                                       options.allow_code_gen_strings,
+                                       options.own_microtask_queue,
+                                       options.host_defined_option_id,
+                                       realm_out,
+                                       &key);
+  if (status == napi_ok && global_out != nullptr) *global_out = key;
+  return status;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_realm(napi_env env,
+                                                 napi_value value,
+                                                 napi_env* realm_out) {
+  if (env == nullptr || value == nullptr || realm_out == nullptr) return napi_invalid_arg;
+  *realm_out = nullptr;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
+
+  v8::HandleScope handle_scope(env->isolate);
+  v8::Local<v8::Context> creation_context;
+  if (raw.As<v8::Object>()->GetCreationContext().ToLocal(&creation_context)) {
+    napi_env found = NapiV8EnvForContext(creation_context);
+    if (found != nullptr && found->agent == env->agent) {
+      *realm_out = found;
+      return napi_ok;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_context_mu);
+  if (ContextRecord* record = FindRecordByKey(env, value)) {
+    *realm_out = record->realm_env;
+  }
   return napi_ok;
 }
 
@@ -2014,7 +2181,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   v8::Context::Scope current_scope(current);
 
   v8::Local<v8::Context> target_context = current;
-  v8::MicrotaskQueue* target_queue = nullptr;
+  v8::MicrotaskQueue* target_queue = env->own_microtask_queue;
 
   if (!IsNullish(env, sandbox_or_null)) {
     std::lock_guard<std::mutex> lock(g_context_mu);
@@ -2628,16 +2795,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
     napi_env env,
     unofficial_napi_module module) {
   if (env == nullptr || module == nullptr) return napi_invalid_arg;
-  ModuleWrapRecord* record = ModuleRecord(module);
-  {
-    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    auto it = g_module_wrap_states.find(env);
-    if (it == g_module_wrap_states.end()) return napi_ok;
-    auto& modules = it->second.modules;
-    if (std::find(modules.begin(), modules.end(), record) == modules.end()) {
-      return napi_ok;
-    }
-  }
+  ModuleWrapRecord* record = FindModuleRecordForHandle(env, module);
+  if (record == nullptr) return napi_ok;
   DestroyModuleRecord(record);
   return napi_ok;
 }

@@ -20,6 +20,7 @@ public:
 
   napi_status set_reject_callback(napi_value callback);
   bool has_reject_callback() const;
+  bool has_hook(size_t index) const;
 
   napi_status set_hooks(napi_value init,
                         napi_value before,

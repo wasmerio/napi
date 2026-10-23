@@ -223,7 +223,80 @@ void napi_module_wrap__::free_record(record *entry)
   delete entry;
 }
 
+bool napi_module_wrap__::owns(unofficial_napi_module module) const
+{
+  return !torn_down_ && find(module) != nullptr;
+}
+
+bool napi_module_wrap__::owns_module_def(JSModuleDef *module) const
+{
+  return !torn_down_ && find_by_module(module) != nullptr;
+}
+
+const napi_module_wrap__ *napi_module_wrap__::import_hook_owner() const
+{
+  for (napi_env env = env_; env != nullptr; env = env->parent())
+  {
+    const napi_module_wrap__ &candidate = env->module_wrap();
+    if (!candidate.torn_down_ &&
+        JS_IsFunction(candidate.ctx_, candidate.import_module_dynamically_callback_))
+      return &candidate;
+  }
+  return nullptr;
+}
+
+const napi_module_wrap__ *napi_module_wrap__::import_meta_hook_owner() const
+{
+  for (napi_env env = env_; env != nullptr; env = env->parent())
+  {
+    const napi_module_wrap__ &candidate = env->module_wrap();
+    if (!candidate.torn_down_ &&
+        JS_IsFunction(candidate.ctx_, candidate.initialize_import_meta_callback_))
+      return &candidate;
+  }
+  return nullptr;
+}
+
+bool napi_module_wrap__::has_internal_binding() const
+{
+  if (torn_down_ || ctx_ == nullptr)
+    return false;
+  JSValue global = JS_GetGlobalObject(ctx_);
+  bool found = false;
+  for (const char *name : {"internalBinding", "getInternalBinding"})
+  {
+    JSValue fn = JS_GetPropertyStr(ctx_, global, name);
+    if (JS_IsException(fn))
+      JS_FreeValue(ctx_, JS_GetException(ctx_));
+    found = found || JS_IsFunction(ctx_, fn);
+    JS_FreeValue(ctx_, fn);
+  }
+  JS_FreeValue(ctx_, global);
+  return found;
+}
+
+const napi_module_wrap__ *napi_module_wrap__::binding_owner() const
+{
+  for (napi_env env = env_; env != nullptr; env = env->parent())
+  {
+    const napi_module_wrap__ &candidate = env->module_wrap();
+    if (candidate.has_internal_binding())
+      return &candidate;
+  }
+  return this;
+}
+
 JSValue napi_module_wrap__::get_host_defined_option_symbol() const
+{
+  return binding_owner()->get_host_defined_option_symbol_here();
+}
+
+JSValue napi_module_wrap__::get_symbols_binding_property(const char *name) const
+{
+  return binding_owner()->get_symbols_binding_property_here(name);
+}
+
+JSValue napi_module_wrap__::get_host_defined_option_symbol_here() const
 {
   JSValue global = JS_GetGlobalObject(ctx_);
   JSValue binding_fn = JS_GetPropertyStr(ctx_, global, "internalBinding");
@@ -259,7 +332,7 @@ JSValue napi_module_wrap__::get_host_defined_option_symbol() const
   return symbol;
 }
 
-JSValue napi_module_wrap__::get_symbols_binding_property(const char *name) const
+JSValue napi_module_wrap__::get_symbols_binding_property_here(const char *name) const
 {
   JSValue global = JS_GetGlobalObject(ctx_);
   JSValue binding_fn = JS_GetPropertyStr(ctx_, global, "internalBinding");
@@ -948,7 +1021,8 @@ napi_status napi_module_wrap__::import_module_dynamically(size_t argc,
 {
   if (result_out == nullptr)
     return napi_util__::invalid_arg(env_);
-  if (!JS_IsFunction(ctx_, import_module_dynamically_callback_))
+  const napi_module_wrap__ *hooks = import_hook_owner();
+  if (hooks == nullptr)
     return napi_util__::create_undefined(env_, result_out);
 
   JSValue args[5] = {JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
@@ -966,7 +1040,7 @@ napi_status napi_module_wrap__::import_module_dynamically(size_t argc,
     args[4] = argc >= 2 ? js_dup_or_undefined(env_, ctx_, argv[1]) : JS_UNDEFINED;
   }
 
-  JSValue result = call_callback(import_module_dynamically_callback_, 5, args);
+  JSValue result = hooks->call_callback(hooks->import_module_dynamically_callback_, 5, args);
   for (JSValue arg : args)
     JS_FreeValue(ctx_, arg);
   if (JS_IsException(result))
@@ -1134,7 +1208,8 @@ int napi_module_wrap__::initialize_synthetic_module(JSModuleDef *module)
 int napi_module_wrap__::initialize_import_meta(JSModuleDef *module, JSValueConst meta)
 {
   record *entry = find_by_module(module);
-  if (entry == nullptr || !JS_IsFunction(ctx_, initialize_import_meta_callback_))
+  const napi_module_wrap__ *hooks = import_meta_hook_owner();
+  if (entry == nullptr || hooks == nullptr)
     return 0;
 
   JSValue args[3] = {
@@ -1142,7 +1217,7 @@ int napi_module_wrap__::initialize_import_meta(JSModuleDef *module, JSValueConst
       JS_DupValue(ctx_, meta),
       JS_DupValue(ctx_, entry->wrapper),
   };
-  JSValue result = call_callback(initialize_import_meta_callback_, 3, args);
+  JSValue result = hooks->call_callback(hooks->initialize_import_meta_callback_, 3, args);
   for (JSValue arg : args)
     JS_FreeValue(ctx_, arg);
   if (JS_IsException(result))
@@ -1157,7 +1232,8 @@ JSValue napi_module_wrap__::import_module_dynamically(JSModuleDef *referrer,
                                                       JSValueConst attributes,
                                                       JSModuleImportPhaseEnum phase)
 {
-  if (!JS_IsFunction(ctx_, import_module_dynamically_callback_))
+  const napi_module_wrap__ *hooks = import_hook_owner();
+  if (hooks == nullptr)
     return JS_ThrowTypeError(ctx_, "Dynamic import callback is not registered");
 
   record *entry = find_by_module(referrer);
@@ -1210,7 +1286,7 @@ JSValue napi_module_wrap__::import_module_dynamically(JSModuleDef *referrer,
       attrs,
       JS_DupValue(ctx_, referrer_name),
   };
-  JSValue result = call_callback(import_module_dynamically_callback_, 5, args);
+  JSValue result = hooks->call_callback(hooks->import_module_dynamically_callback_, 5, args);
   for (JSValue arg : args)
     JS_FreeValue(ctx_, arg);
   if (JS_PromiseState(ctx_, result) != JS_PROMISE_NOT_A_PROMISE)
@@ -1223,6 +1299,9 @@ int napi_module_wrap__::synthetic_init(JSContext *ctx, JSModuleDef *module)
   auto *env = static_cast<napi_env>(JS_GetContextOpaque(ctx));
   if (!napi_util__::check_env(env))
     return -1;
+  napi_env owner = env->agent()->env_for_module_def(module);
+  if (owner != nullptr)
+    env = owner;
   return env->module_wrap().initialize_synthetic_module(module);
 }
 
