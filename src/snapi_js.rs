@@ -93,7 +93,6 @@ export function wasmer_napi_number(value) {
 export function wasmer_napi_console_error(message) {
   console.error(message);
 }
-let wasmerNapiActiveGlobalContext;
 const wasmerNapiBuffers = new WeakSet();
 const wasmerNapiHostSetTimeout = globalThis.setTimeout.bind(globalThis);
 const wasmerNapiHostQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
@@ -517,21 +516,16 @@ export function wasmer_napi_create_global_context() {
 export function wasmer_napi_global_context_scope(context) {
   return context.scope;
 }
-export function wasmer_napi_activate_global_context(context) {
-  wasmerNapiActiveGlobalContext = context;
-}
 export function wasmer_napi_release_global_context(context) {
   // Retained JS wrappers must stop calling Rust before its closures are dropped.
   context.callbacks.dispatches = undefined;
-  if (wasmerNapiActiveGlobalContext === context) wasmerNapiActiveGlobalContext = undefined;
 }
-export function wasmer_napi_context_eval(sandbox, source) {
-  if (wasmerNapiActiveGlobalContext !== undefined &&
-      (sandbox == null || sandbox === globalThis ||
-       sandbox === wasmerNapiActiveGlobalContext.scope)) {
-    sandbox = wasmerNapiActiveGlobalContext.scope;
+// Evaluates `source` for the environment that owns `context`. A null sandbox,
+// the host global and the context's own global all mean that context.
+export function wasmer_napi_context_eval(context, sandbox, source) {
+  if (sandbox == null || sandbox === globalThis || sandbox === context.scope) {
+    sandbox = context.scope;
   }
-  if (sandbox == null) return (0, eval)(source);
   // A VM's global facade exposes the same builtins as bare identifiers while
   // preserving the caller's sandbox bindings. Keep its defaults context-local
   // so writes to process and Error hooks cannot reach the worker global.
@@ -904,20 +898,21 @@ export function wasmer_napi_is_dataview(value) {
     return false;
   }
 }
-export function wasmer_napi_is_buffer(value) {
+// `context` is the calling environment's global context.
+export function wasmer_napi_is_buffer(context, value) {
   if (wasmerNapiBuffers.has(value)) return true;
-  const activeBuffer = wasmerNapiActiveGlobalContext?.scopeTarget?.Buffer;
-  if (typeof activeBuffer?.isBuffer === 'function' && activeBuffer.isBuffer(value)) {
+  const contextBuffer = context.scopeTarget.Buffer;
+  if (typeof contextBuffer?.isBuffer === 'function' && contextBuffer.isBuffer(value)) {
     return true;
   }
   const hostBuffer = globalThis.Buffer;
-  return hostBuffer !== activeBuffer &&
+  return hostBuffer !== contextBuffer &&
     typeof hostBuffer?.isBuffer === 'function' && hostBuffer.isBuffer(value);
 }
-export function wasmer_napi_buffer_view(buffer, offset, length) {
+export function wasmer_napi_buffer_view(context, buffer, offset, length) {
   const view = new Uint8Array(buffer, offset, length);
   wasmerNapiBuffers.add(view);
-  const BufferCtor = wasmerNapiActiveGlobalContext?.scopeTarget?.Buffer ?? globalThis.Buffer;
+  const BufferCtor = context.scopeTarget.Buffer ?? globalThis.Buffer;
   if (typeof BufferCtor === 'function' && BufferCtor.prototype != null) {
     Object.setPrototypeOf(view, BufferCtor.prototype);
   }
@@ -1139,10 +1134,13 @@ extern "C" {
     fn wasmer_napi_console_error(message: &str);
     fn wasmer_napi_create_global_context() -> JsValue;
     fn wasmer_napi_global_context_scope(context: &JsValue) -> JsValue;
-    fn wasmer_napi_activate_global_context(context: &JsValue);
     fn wasmer_napi_release_global_context(context: &JsValue);
     #[wasm_bindgen(catch)]
-    fn wasmer_napi_context_eval(sandbox: &JsValue, source: &str) -> Result<JsValue, JsValue>;
+    fn wasmer_napi_context_eval(
+        context: &JsValue,
+        sandbox: &JsValue,
+        source: &str,
+    ) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_compile_function(
         scope: &JsValue,
@@ -1182,8 +1180,13 @@ extern "C" {
     fn wasmer_napi_typed_array_kind(value: &JsValue) -> i32;
     fn wasmer_napi_is_arraybuffer(value: &JsValue) -> bool;
     fn wasmer_napi_is_dataview(value: &JsValue) -> bool;
-    fn wasmer_napi_is_buffer(value: &JsValue) -> bool;
-    fn wasmer_napi_buffer_view(buffer: &JsValue, offset: u32, length: u32) -> JsValue;
+    fn wasmer_napi_is_buffer(context: &JsValue, value: &JsValue) -> bool;
+    fn wasmer_napi_buffer_view(
+        context: &JsValue,
+        buffer: &JsValue,
+        offset: u32,
+        length: u32,
+    ) -> JsValue;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_get_all_property_names(
         value: &JsValue,
@@ -1341,7 +1344,11 @@ struct SourceTextModule {
     evaluation: Option<JsValue>,
 }
 
-struct HostJsEnv {
+/// State shared by every environment of one host JavaScript agent (a worker
+/// or page): the handle space that gives napi_value, napi_ref and the other
+/// per-handle records their meaning, plus agent-wide callback and finalizer
+/// bookkeeping. Today each environment owns its own agent.
+struct HostJsAgent {
     values: Vec<UnsafeCell<JsValue>>,
     value_live: Vec<bool>,
     value_free_slots: Vec<u32>,
@@ -1354,33 +1361,44 @@ struct HostJsEnv {
     next_wrap_id: u32,
     backing_store_ids: WeakMap,
     next_backing_store_id: u32,
-    global_context: JsValue,
-    live_env_addr: Rc<Cell<usize>>,
-    last_exception: Option<JsValue>,
+    /// The Wasmer store a guest callback runs in; one per agent thread.
     active_callback_ctx: *mut c_void,
     next_deferred: u32,
     deferreds: IdHashMap<u32, Deferred>,
     next_reference: u32,
     references: IdHashMap<u32, Reference>,
-    next_callback: u32,
-    callback_regs: IdHashMap<u32, CallbackReg>,
     next_cbinfo: u32,
     callback_infos: IdHashMap<u32, CallbackInfo>,
+    /// JS-to-guest calls deferred while JSPI is suspended.
     pending_callbacks: VecDeque<PendingCallback>,
-    closures: Vec<CallbackClosure>,
-    instance_data: u64,
     wraps: IdHashMap<u32, u64>,
     guest_finalizers: Vec<GuestFinalizer>,
     guest_buffer_finalizers: Vec<GuestBufferFinalizer>,
     externals: IdHashMap<u32, u64>,
     backing_tokens: IdHashMap<u32, u64>,
     type_tags: IdHashMap<u32, (u64, u64)>,
+    /// Embedder hooks are attached once per agent.
+    embedder_hooks_attached: bool,
+}
+
+/// One N-API environment: its realm (the virtual global context, fixed for
+/// the environment's life), the callbacks and modules created through it,
+/// and addon state.
+struct HostJsEnv {
+    agent: Box<HostJsAgent>,
+    global_context: JsValue,
+    live_env_addr: Rc<Cell<usize>>,
+    /// Pending exception of calls made through this environment.
+    last_exception: Option<JsValue>,
+    next_callback: u32,
+    callback_regs: IdHashMap<u32, CallbackReg>,
+    closures: Vec<CallbackClosure>,
+    instance_data: u64,
     next_module: u32,
     next_bytecode: u32,
     bytecodes: IdHashMap<u32, HostJsBytecode>,
     synthetic_modules: IdHashMap<u32, SyntheticModule>,
     source_text_modules: IdHashMap<u32, SourceTextModule>,
-    embedder_hooks_attached: bool,
 }
 
 struct HostJsBytecode {
@@ -1396,6 +1414,7 @@ fn host_js_source_for_shape(
 ) -> Result<String, i32> {
     if source_text_id != 0 {
         return state
+            .agent
             .get(source_text_id)
             .and_then(JsValue::as_string)
             .ok_or(NAPI_STRING_EXPECTED);
@@ -1411,6 +1430,26 @@ fn host_js_source_for_shape(
 }
 
 impl HostJsEnv {
+    fn new() -> Self {
+        Self {
+            agent: Box::new(HostJsAgent::new()),
+            global_context: wasmer_napi_create_global_context(),
+            live_env_addr: Rc::new(Cell::new(0)),
+            last_exception: None,
+            next_callback: 1,
+            callback_regs: IdHashMap::default(),
+            closures: Vec::new(),
+            instance_data: 0,
+            next_module: 1,
+            next_bytecode: 1,
+            bytecodes: IdHashMap::default(),
+            synthetic_modules: IdHashMap::default(),
+            source_text_modules: IdHashMap::default(),
+        }
+    }
+}
+
+impl HostJsAgent {
     fn new() -> Self {
         // Handle zero is N-API's null pointer sentinel, never a JS value.
         Self {
@@ -1431,32 +1470,20 @@ impl HostJsEnv {
             next_wrap_id: 1,
             backing_store_ids: WeakMap::new(),
             next_backing_store_id: 1,
-            global_context: wasmer_napi_create_global_context(),
-            live_env_addr: Rc::new(Cell::new(0)),
-            last_exception: None,
             active_callback_ctx: ptr::null_mut(),
             next_deferred: 1,
             deferreds: IdHashMap::default(),
             next_reference: 1,
             references: IdHashMap::default(),
-            next_callback: 1,
-            callback_regs: IdHashMap::default(),
             next_cbinfo: 1,
             callback_infos: IdHashMap::default(),
             pending_callbacks: VecDeque::new(),
-            closures: Vec::new(),
-            instance_data: 0,
             wraps: IdHashMap::default(),
             guest_finalizers: Vec::new(),
             guest_buffer_finalizers: Vec::new(),
             externals: IdHashMap::default(),
             backing_tokens: IdHashMap::default(),
             type_tags: IdHashMap::default(),
-            next_module: 1,
-            next_bytecode: 1,
-            bytecodes: IdHashMap::default(),
-            synthetic_modules: IdHashMap::default(),
-            source_text_modules: IdHashMap::default(),
             embedder_hooks_attached: false,
         }
     }
@@ -1645,10 +1672,6 @@ impl HostJsEnv {
         Some(unsafe { &*value.get() })
     }
 
-    fn activate(&self) {
-        wasmer_napi_activate_global_context(&self.global_context);
-    }
-
     fn open_value_frame(&mut self) -> u32 {
         let id = self.next_value_frame.max(1);
         self.next_value_frame = id.saturating_add(1);
@@ -1711,11 +1734,6 @@ impl HostJsEnv {
 
 thread_local! {
     static BUFFER_ALLOCS: RefCell<IdHashMap<usize, Box<[u8]>>> = RefCell::new(IdHashMap::default());
-    // N-API calls normally arrive in long runs from one guest environment.
-    // Realm activation is only a context switch; repeating its wasm-bindgen
-    // call before every operation doubles the host boundary crossings on the
-    // hottest path without changing observable state.
-    static ACTIVE_HOST_JS_ENV: Cell<usize> = const { Cell::new(0) };
 }
 
 #[unsafe(no_mangle)]
@@ -1750,22 +1768,14 @@ unsafe fn env_mut<'a>(env: SnapiEnv) -> Result<&'a mut HostJsEnv, i32> {
     if env.is_null() {
         return Err(NAPI_INVALID_ARG);
     }
-    let state = unsafe { &mut *env.cast::<HostJsEnv>() };
-    let env_addr = env as usize;
-    ACTIVE_HOST_JS_ENV.with(|active| {
-        if active.get() != env_addr {
-            state.activate();
-            active.set(env_addr);
-        }
-    });
-    Ok(state)
+    Ok(unsafe { &mut *env.cast::<HostJsEnv>() })
 }
 
 fn evaluation_scope(state: &HostJsEnv, context_id: u32) -> Result<JsValue, i32> {
     if context_id == 0 {
         return Ok(wasmer_napi_global_context_scope(&state.global_context));
     }
-    let Some(context) = state.get(context_id) else {
+    let Some(context) = state.agent.get(context_id) else {
         return Err(NAPI_INVALID_ARG);
     };
     if context.is_null() || context.is_undefined() {
@@ -1850,9 +1860,9 @@ fn value_bytes(value: &JsValue) -> Option<Vec<u8>> {
 
 pub(crate) fn get_value_byte_length_and_token(env: SnapiEnv, id: u32) -> Result<(u32, u64), i32> {
     let state = unsafe { env_mut(env) }?;
-    let value = state.get(id).ok_or(NAPI_INVALID_ARG)?;
+    let value = state.agent.get(id).ok_or(NAPI_INVALID_ARG)?;
     let byte_len = value_byte_view(value).ok_or(NAPI_INVALID_ARG)?.length();
-    let token = state.backing_store_token(id).unwrap_or(id as u64);
+    let token = state.agent.backing_store_token(id).unwrap_or(id as u64);
     Ok((byte_len, token))
 }
 
@@ -1866,7 +1876,7 @@ pub(crate) fn copy_value_bytes_to_memory(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(source) = value_byte_view(value) else {
@@ -1892,7 +1902,7 @@ pub(crate) fn copy_value_range_to_memory(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(source) = value_byte_view(value) else {
@@ -1920,7 +1930,7 @@ pub(crate) fn copy_memory_bytes_to_reference(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(reference) = state.references.get(&reference_id) else {
+    let Some(reference) = state.agent.references.get(&reference_id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(value) = reference.strong.clone().or_else(|| {
@@ -1953,7 +1963,7 @@ pub(crate) fn copy_reference_bytes_to_memory(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(reference) = state.references.get(&reference_id) else {
+    let Some(reference) = state.agent.references.get(&reference_id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(value) = reference.strong.clone().or_else(|| {
@@ -1988,7 +1998,7 @@ pub(crate) fn copy_memory_range_to_reference(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(reference) = state.references.get(&reference_id) else {
+    let Some(reference) = state.agent.references.get(&reference_id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(value) = reference.strong.as_ref() else {
@@ -2012,7 +2022,7 @@ unsafe fn put_value(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert(value);
+    let id = state.agent.insert(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -2021,7 +2031,7 @@ unsafe fn put_primitive(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert_primitive(value);
+    let id = state.agent.insert_primitive(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -2031,7 +2041,7 @@ unsafe fn put_primitive(env: SnapiEnv, out: *mut u32, value: JsValue) -> i32 {
 
 pub(crate) unsafe fn host_js_value(env: SnapiEnv, id: u32) -> Result<JsValue, i32> {
     let state = unsafe { env_mut(env) }?;
-    state.get(id).cloned().ok_or(NAPI_INVALID_ARG)
+    state.agent.get(id).cloned().ok_or(NAPI_INVALID_ARG)
 }
 
 pub(crate) unsafe fn host_js_put_primitive(env: SnapiEnv, value: JsValue, out: *mut u32) -> i32 {
@@ -2047,7 +2057,7 @@ pub(crate) unsafe fn host_js_set_named_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(obj), Some(value)) = (state.get(obj), state.get(value)) else {
+    let (Some(obj), Some(value)) = (state.agent.get(obj), state.agent.get(value)) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::set(obj, key, value) {
@@ -2068,7 +2078,7 @@ pub(crate) unsafe fn host_js_get_named_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(obj) else {
+    let Some(value) = state.agent.get(obj) else {
         return NAPI_INVALID_ARG;
     };
     if !wasmer_napi_is_object_like(value) {
@@ -2076,7 +2086,7 @@ pub(crate) unsafe fn host_js_get_named_property(
     }
     unsafe {
         reflect_op(env, out, |s| {
-            Reflect::get(s.get(obj).ok_or(JsValue::NULL)?, key)
+            Reflect::get(s.agent.get(obj).ok_or(JsValue::NULL)?, key)
         })
     }
 }
@@ -2090,7 +2100,7 @@ pub(crate) unsafe fn host_js_has_named_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::has(object, key) {
@@ -2171,12 +2181,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
         return NAPI_INVALID_ARG;
     }
     let state = unsafe { Box::from_raw(env.cast::<HostJsEnv>()) };
-    let env_addr = env as usize;
-    ACTIVE_HOST_JS_ENV.with(|active| {
-        if active.get() == env_addr {
-            active.set(0);
-        }
-    });
     state.live_env_addr.set(0);
     wasmer_napi_release_global_context(&state.global_context);
     // JS dispatch slots are now empty, so dropping the environment can free all
@@ -2223,7 +2227,7 @@ pub unsafe extern "C" fn snapi_bridge_get_global(env: SnapiEnv, out: *mut u32) -
         return NAPI_INVALID_ARG;
     };
     let global = wasmer_napi_global_context_scope(&state.global_context);
-    let id = state.insert(global);
+    let id = state.agent.insert(global);
     unsafe { write(out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 
@@ -2293,7 +2297,7 @@ unsafe fn read_string_bytes(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(text) = value.as_string() else {
@@ -2351,7 +2355,7 @@ pub unsafe extern "C" fn snapi_bridge_get_value_string_utf16(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(text) = state.get(id).and_then(JsValue::as_string) else {
+    let Some(text) = state.agent.get(id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
     let encoded: Vec<u16> = text.encode_utf16().collect();
@@ -2415,7 +2419,7 @@ macro_rules! read_number {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(value) = state.get(id) else {
+            let Some(value) = state.agent.get(id) else {
                 return NAPI_INVALID_ARG;
             };
             let Some(value) = value.as_f64() else {
@@ -2435,7 +2439,7 @@ pub unsafe extern "C" fn snapi_bridge_get_value_bool(env: SnapiEnv, id: u32, out
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).and_then(JsValue::as_bool) else {
+    let Some(value) = state.agent.get(id).and_then(JsValue::as_bool) else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(out, i32::from(value)) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -2465,10 +2469,10 @@ pub unsafe extern "C" fn snapi_bridge_typeof(env: SnapiEnv, id: u32, out: *mut i
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
-    let typ = if state.externals.contains_key(&id) {
+    let typ = if state.agent.externals.contains_key(&id) {
         8 // napi_external
     } else {
         napi_typeof(value)
@@ -2483,7 +2487,7 @@ macro_rules! type_test {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(value) = state.get(id) else {
+            let Some(value) = state.agent.get(id) else {
                 return NAPI_INVALID_ARG;
             };
             unsafe { write(out, i32::from(($test)(value))) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -2507,9 +2511,19 @@ type_test!(snapi_bridge_is_date, |v: &JsValue| v
     .is_instance_of::<Date>());
 type_test!(snapi_bridge_is_promise, |v: &JsValue| v
     .is_instance_of::<Promise>());
-type_test!(snapi_bridge_is_buffer, |v: &JsValue| {
-    wasmer_napi_is_buffer(v)
-});
+// A Buffer is recognised through the calling environment's Buffer, so this
+// test needs the environment's context and cannot use `type_test!`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_is_buffer(env: SnapiEnv, id: u32, out: *mut i32) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.agent.get(id) else {
+        return NAPI_INVALID_ARG;
+    };
+    let is_buffer = wasmer_napi_is_buffer(&state.global_context, value);
+    unsafe { write(out, i32::from(is_buffer)) }.map_or_else(|e| e, |_| NAPI_OK)
+}
 
 unsafe fn reflect_op(
     env: SnapiEnv,
@@ -2521,7 +2535,7 @@ unsafe fn reflect_op(
     };
     match f(state) {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(err) => {
@@ -2541,8 +2555,11 @@ pub unsafe extern "C" fn snapi_bridge_set_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(obj), Some(key), Some(value)) = (state.get(obj), state.get(key), state.get(value))
-    else {
+    let (Some(obj), Some(key), Some(value)) = (
+        state.agent.get(obj),
+        state.agent.get(key),
+        state.agent.get(value),
+    ) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::set(obj, key, value) {
@@ -2564,8 +2581,8 @@ pub unsafe extern "C" fn snapi_bridge_get_property(
     unsafe {
         reflect_op(env, out, |s| {
             Reflect::get(
-                s.get(obj).ok_or(JsValue::NULL)?,
-                s.get(key).ok_or(JsValue::NULL)?,
+                s.agent.get(obj).ok_or(JsValue::NULL)?,
+                s.agent.get(key).ok_or(JsValue::NULL)?,
             )
         })
     }
@@ -2607,7 +2624,7 @@ pub unsafe extern "C" fn snapi_bridge_set_element(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(obj), Some(value)) = (state.get(obj), state.get(value)) else {
+    let (Some(obj), Some(value)) = (state.agent.get(obj), state.agent.get(value)) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::set(obj, &JsValue::from_f64(index as f64), value) {
@@ -2629,7 +2646,7 @@ pub unsafe extern "C" fn snapi_bridge_get_element(
     unsafe {
         reflect_op(env, out, |s| {
             Reflect::get(
-                s.get(obj).ok_or(JsValue::NULL)?,
+                s.agent.get(obj).ok_or(JsValue::NULL)?,
                 &JsValue::from_f64(index as f64),
             )
         })
@@ -2645,7 +2662,7 @@ pub unsafe extern "C" fn snapi_bridge_get_array_length(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     if !Array::is_array(value) {
@@ -2662,7 +2679,7 @@ pub unsafe extern "C" fn snapi_bridge_get_property_names(
 ) -> i32 {
     unsafe {
         reflect_op(env, out, |s| {
-            Ok(Object::keys(&Object::from(s.get(id).ok_or(JsValue::NULL)?.clone())).into())
+            Ok(Object::keys(&Object::from(s.agent.get(id).ok_or(JsValue::NULL)?.clone())).into())
         })
     }
 }
@@ -2677,7 +2694,7 @@ pub unsafe extern "C" fn snapi_bridge_strict_equals(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(a), Some(b)) = (state.get(a), state.get(b)) else {
+    let (Some(a), Some(b)) = (state.agent.get(a), state.agent.get(b)) else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(out, i32::from(a == b)) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -2688,6 +2705,7 @@ unsafe fn create_error(env: SnapiEnv, code: u32, message: u32, out: *mut u32, ki
         return NAPI_INVALID_ARG;
     };
     let message = state
+        .agent
         .get(message)
         .and_then(|value| js_string(value).ok())
         .unwrap_or_default();
@@ -2697,11 +2715,11 @@ unsafe fn create_error(env: SnapiEnv, code: u32, message: u32, out: *mut u32, ki
         _ => Error::new(&message).into(),
     };
     if code != 0
-        && let Some(code) = state.get(code)
+        && let Some(code) = state.agent.get(code)
     {
         let _ = Reflect::set(&value, &JsValue::from_str("code"), code);
     }
-    let id = state.insert(value);
+    let id = state.agent.insert(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -2738,7 +2756,7 @@ pub unsafe extern "C" fn snapi_bridge_throw(env: SnapiEnv, id: u32) -> i32 {
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).cloned() else {
+    let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     state.last_exception = Some(value);
@@ -2762,7 +2780,7 @@ pub unsafe extern "C" fn snapi_bridge_get_and_clear_last_exception(
         return NAPI_INVALID_ARG;
     };
     let value = state.last_exception.take().unwrap_or(JsValue::UNDEFINED);
-    let id = state.insert(value);
+    let id = state.agent.insert(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -2779,13 +2797,14 @@ pub unsafe extern "C" fn snapi_bridge_call_function(
         return NAPI_INVALID_ARG;
     };
     let Some(function) = state
+        .agent
         .get(func)
         .and_then(|v| v.dyn_ref::<Function>())
         .cloned()
     else {
         return NAPI_FUNCTION_EXPECTED;
     };
-    let this = state.get(recv).cloned().unwrap_or(JsValue::UNDEFINED);
+    let this = state.agent.get(recv).cloned().unwrap_or(JsValue::UNDEFINED);
     let ids = if argv.is_null() && argc != 0 {
         return NAPI_INVALID_ARG;
     } else if argc == 0 {
@@ -2795,14 +2814,14 @@ pub unsafe extern "C" fn snapi_bridge_call_function(
     };
     let args = Array::new();
     for id in ids {
-        let Some(value) = state.get(*id) else {
+        let Some(value) = state.agent.get(*id) else {
             return NAPI_INVALID_ARG;
         };
         args.push(value);
     }
     match function.apply(&this, &args) {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(error) => {
@@ -2824,6 +2843,7 @@ pub unsafe extern "C" fn snapi_bridge_new_instance(
         return NAPI_INVALID_ARG;
     };
     let Some(ctor) = state
+        .agent
         .get(ctor)
         .and_then(|v| v.dyn_ref::<Function>())
         .cloned()
@@ -2839,13 +2859,13 @@ pub unsafe extern "C" fn snapi_bridge_new_instance(
     };
     let args = Array::new();
     for id in ids {
-        let Some(v) = state.get(*id) else {
+        let Some(v) = state.agent.get(*id) else {
             return NAPI_INVALID_ARG;
         };
         args.push(v);
     }
     let value = wasmer_napi_new(&ctor, &args);
-    let id = state.insert(value);
+    let id = state.agent.insert(value);
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -2854,7 +2874,7 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source) = state.get(script).and_then(JsValue::as_string) else {
+    let Some(source) = state.agent.get(script).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
     // napi_run_script executes in the environment's context. Evaluating with
@@ -2862,10 +2882,9 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
     // realm, allowing Node bootstrap code from one N-API environment to mutate
     // the SDK scheduler and leak state into every other environment hosted by
     // that worker.
-    let global = wasmer_napi_global_context_scope(&state.global_context);
-    match wasmer_napi_context_eval(&global, &source) {
+    match wasmer_napi_context_eval(&state.global_context, &JsValue::NULL, &source) {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
         }
         Err(e) => {
@@ -2892,16 +2911,16 @@ pub unsafe extern "C" fn snapi_bridge_create_promise(
         *rs.borrow_mut() = Some(resolve);
         *rj.borrow_mut() = Some(reject);
     });
-    let deferred = state.next_deferred;
-    state.next_deferred = deferred.saturating_add(1);
-    state.deferreds.insert(
+    let deferred = state.agent.next_deferred;
+    state.agent.next_deferred = deferred.saturating_add(1);
+    state.agent.deferreds.insert(
         deferred,
         Deferred {
             resolve: resolve_slot.borrow_mut().take().unwrap(),
             reject: reject_slot.borrow_mut().take().unwrap(),
         },
     );
-    let id = state.insert(promise.into());
+    let id = state.agent.insert(promise.into());
     if unsafe { write(deferred_out, deferred) }.is_err() || unsafe { write(out, id) }.is_err() {
         NAPI_INVALID_ARG
     } else {
@@ -2913,10 +2932,10 @@ unsafe fn settle(env: SnapiEnv, deferred: u32, value: u32, reject: bool) -> i32 
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(d) = state.deferreds.remove(&deferred) else {
+    let Some(d) = state.agent.deferreds.remove(&deferred) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(v) = state.get(value) else {
+    let Some(v) = state.agent.get(value) else {
         return NAPI_INVALID_ARG;
     };
     let result = if reject {
@@ -2947,13 +2966,17 @@ unsafe fn create_bytes_value(
     out: *mut u32,
     data_out: *mut u64,
 ) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
     let array = Uint8Array::from(bytes.as_slice());
-    let value = wasmer_napi_buffer_view(&array.buffer(), 0, array.length());
+    let value = wasmer_napi_buffer_view(&state.global_context, &array.buffer(), 0, array.length());
     if !data_out.is_null() {
         let host = store_bytes(bytes);
         unsafe { data_out.write(host) }
     }
-    unsafe { put_value(env, out, value) }
+    let id = state.agent.insert(value);
+    unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
 pub(crate) fn create_guest_buffer_view(
@@ -2963,8 +2986,17 @@ pub(crate) fn create_guest_buffer_view(
     byte_length: u32,
     out: *mut u32,
 ) -> i32 {
-    let view = wasmer_napi_buffer_view(memory_buffer, byte_offset, byte_length);
-    unsafe { put_value(env, out, view) }
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let view = wasmer_napi_buffer_view(
+        &state.global_context,
+        memory_buffer,
+        byte_offset,
+        byte_length,
+    );
+    let id = state.agent.insert(view);
+    unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
 pub(crate) fn create_guest_typedarray_view(
@@ -3024,7 +3056,7 @@ pub unsafe extern "C" fn snapi_bridge_snapshot_value_bytes(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(bytes) = value_bytes(value) else {
@@ -3048,7 +3080,7 @@ pub unsafe extern "C" fn snapi_bridge_overwrite_value_bytes(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let Ok(bytes) = (unsafe { bytes(data.cast(), len as usize) }) else {
@@ -3076,7 +3108,7 @@ pub unsafe extern "C" fn snapi_bridge_get_buffer_info(
     if status == NAPI_OK && !t.is_null() {
         let token = unsafe { env_mut(e) }
             .ok()
-            .and_then(|state| state.backing_store_token(id))
+            .and_then(|state| state.agent.backing_store_token(id))
             .unwrap_or(id as u64);
         unsafe { t.write(token) }
     }
@@ -3092,7 +3124,7 @@ pub unsafe extern "C" fn snapi_bridge_get_backing_store_token(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(token) = state.backing_store_token(id) else {
+    let Some(token) = state.agent.backing_store_token(id) else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(token_out, token) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -3118,7 +3150,7 @@ pub unsafe extern "C" fn snapi_bridge_create_reference(
     let Ok(s) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = s.get(value).cloned() else {
+    let Some(value) = s.agent.get(value).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let (strong, weak) = if count == 0 && (value.is_object() || value.is_function()) {
@@ -3127,9 +3159,9 @@ pub unsafe extern "C" fn snapi_bridge_create_reference(
     } else {
         (Some(value), None)
     };
-    let id = s.next_reference;
-    s.next_reference = id.saturating_add(1);
-    s.references.insert(
+    let id = s.agent.next_reference;
+    s.agent.next_reference = id.saturating_add(1);
+    s.agent.references.insert(
         id,
         Reference {
             strong,
@@ -3144,7 +3176,7 @@ pub unsafe extern "C" fn snapi_bridge_delete_reference(e: SnapiEnv, id: u32) -> 
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    if s.references.remove(&id).is_some() {
+    if s.agent.references.remove(&id).is_some() {
         NAPI_OK
     } else {
         NAPI_INVALID_ARG
@@ -3155,7 +3187,7 @@ pub unsafe extern "C" fn snapi_bridge_reference_ref(e: SnapiEnv, id: u32, o: *mu
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(r) = s.references.get_mut(&id) else {
+    let Some(r) = s.agent.references.get_mut(&id) else {
         return NAPI_INVALID_ARG;
     };
     if r.count == 0 && r.strong.is_none() {
@@ -3170,7 +3202,7 @@ pub unsafe extern "C" fn snapi_bridge_reference_unref(e: SnapiEnv, id: u32, o: *
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(r) = s.references.get_mut(&id) else {
+    let Some(r) = s.agent.references.get_mut(&id) else {
         return NAPI_INVALID_ARG;
     };
     r.count = r.count.saturating_sub(1);
@@ -3197,14 +3229,14 @@ pub unsafe extern "C" fn snapi_bridge_get_reference_value(
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(r) = s.references.get(&id) else {
+    let Some(r) = s.agent.references.get(&id) else {
         return NAPI_INVALID_ARG;
     };
     let value = r
         .strong
         .clone()
         .or_else(|| r.weak.as_ref().and_then(WeakRef::deref).map(Into::into));
-    let value_id = value.map(|value| s.insert(value)).unwrap_or(0);
+    let value_id = value.map(|value| s.agent.insert(value)).unwrap_or(0);
     unsafe { write(o, value_id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -3218,7 +3250,7 @@ pub unsafe extern "C" fn snapi_bridge_overwrite_reference_bytes(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(reference) = state.references.get(&reference_id) else {
+    let Some(reference) = state.agent.references.get(&reference_id) else {
         return NAPI_INVALID_ARG;
     };
     let Some(value) = reference.strong.clone().or_else(|| {
@@ -3265,11 +3297,11 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(record) = state.take_ready_guest_finalizer(force) else {
+            let Some(record) = state.agent.take_ready_guest_finalizer(force) else {
                 return NAPI_OK;
             };
-            let value_frame = state.open_value_frame();
-            (record, state.active_callback_ctx, value_frame)
+            let value_frame = state.agent.open_value_frame();
+            (record, state.agent.active_callback_ctx, value_frame)
         };
         let result = unsafe {
             snapi_host_invoke_wasm_finalizer(
@@ -3283,13 +3315,13 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
         let Ok(state) = (unsafe { env_mut(env) }) else {
             return NAPI_INVALID_ARG;
         };
-        state.close_value_frame(value_frame);
+        state.agent.close_value_frame(value_frame);
         if result == CALLBACK_DEFERRED {
-            state.guest_finalizers.push(record);
+            state.agent.guest_finalizers.push(record);
             return NAPI_OK;
         }
         if let Some(wrap_id) = record.wrap_id {
-            state.wraps.remove(&wrap_id);
+            state.agent.wraps.remove(&wrap_id);
         }
     }
 }
@@ -3330,7 +3362,7 @@ pub unsafe extern "C" fn snapi_bridge_swap_active_callback_ctx(
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return ptr::null_mut();
     };
-    std::mem::replace(&mut s.active_callback_ctx, c)
+    std::mem::replace(&mut s.agent.active_callback_ctx, c)
 }
 
 #[unsafe(no_mangle)]
@@ -3375,20 +3407,20 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                     ));
                     return JsValue::UNDEFINED;
                 };
-                let value_frame = state.open_value_frame();
+                let value_frame = state.agent.open_value_frame();
                 let mut ids = Vec::with_capacity(args.length() as usize);
                 for v in args.iter() {
-                    ids.push(state.insert(v));
+                    ids.push(state.agent.insert(v));
                 }
-                let this_value = state.insert(this);
+                let this_value = state.agent.insert(this);
                 let new_target = if new_target.is_undefined() {
                     0
                 } else {
-                    state.insert(new_target)
+                    state.agent.insert(new_target)
                 };
-                let cb = state.next_cbinfo;
-                state.next_cbinfo = cb.saturating_add(1);
-                state.callback_infos.insert(
+                let cb = state.agent.next_cbinfo;
+                state.agent.next_cbinfo = cb.saturating_add(1);
+                state.agent.callback_infos.insert(
                     cb,
                     CallbackInfo {
                         args: ids,
@@ -3397,7 +3429,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                         data: registration.data,
                     },
                 );
-                (value_frame, cb, state.active_callback_ctx)
+                (value_frame, cb, state.agent.active_callback_ctx)
             };
             if callback_ctx.is_null() {
                 wasmer_napi_console_error(&format!(
@@ -3424,7 +3456,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                 let Ok(state) = (unsafe { env_mut(env) }) else {
                     return JsValue::UNDEFINED;
                 };
-                state.pending_callbacks.push_back(PendingCallback {
+                state.agent.pending_callbacks.push_back(PendingCallback {
                     registration,
                     cbinfo: cb,
                     value_frame,
@@ -3437,20 +3469,20 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                 return JsValue::UNDEFINED;
             };
             let error = state.last_exception.take();
-            let result_value = state.get(result).cloned();
+            let result_value = state.agent.get(result).cloned();
             if result_value.is_none() && result != 0 {
                 wasmer_napi_console_error(&format!(
                     "[wasmer-napi-callback] invalid result callback={callback_name} handle={result} guest_env={} wasm_fn={} value_slots={} free_slots={} scope_depth={}",
                     registration.guest_env,
                     registration.wasm_fn_ptr,
-                    state.values.len(),
-                    state.value_free_slots.len(),
-                    state.value_frames.len(),
+                    state.agent.values.len(),
+                    state.agent.value_free_slots.len(),
+                    state.agent.value_frames.len(),
                 ));
             }
             let result = result_value.unwrap_or(JsValue::UNDEFINED);
-            state.callback_infos.remove(&cb);
-            state.close_value_frame(value_frame);
+            state.agent.callback_infos.remove(&cb);
+            state.agent.close_value_frame(value_frame);
             if let Some(error) = error {
                 wasm_bindgen::throw_val(error);
             }
@@ -3466,7 +3498,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
         );
     }
     s.closures.push(closure);
-    let id = s.insert(function.into());
+    let id = s.agent.insert(function.into());
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -3477,10 +3509,10 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(pending) = state.pending_callbacks.pop_front() else {
+            let Some(pending) = state.agent.pending_callbacks.pop_front() else {
                 return unsafe { drain_guest_finalizers(env, false) };
             };
-            (pending, state.active_callback_ctx)
+            (pending, state.agent.active_callback_ctx)
         };
 
         let result = unsafe {
@@ -3495,7 +3527,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            state.pending_callbacks.push_front(pending);
+            state.agent.pending_callbacks.push_front(pending);
             return NAPI_OK;
         }
 
@@ -3504,9 +3536,13 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
                 return NAPI_INVALID_ARG;
             };
             let error = state.last_exception.take();
-            let result = state.get(result).cloned().unwrap_or(JsValue::UNDEFINED);
-            state.callback_infos.remove(&pending.cbinfo);
-            state.close_value_frame(pending.value_frame);
+            let result = state
+                .agent
+                .get(result)
+                .cloned()
+                .unwrap_or(JsValue::UNDEFINED);
+            state.agent.callback_infos.remove(&pending.cbinfo);
+            state.agent.close_value_frame(pending.value_frame);
             (error, result)
         };
         let settled = if let Some(error) = error {
@@ -3539,18 +3575,21 @@ pub unsafe extern "C" fn snapi_bridge_register_guest_buffer_finalizer(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(value_id).cloned() else {
+    let Some(value) = state.agent.get(value_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     if !value.is_object() && !value.is_function() {
         return NAPI_INVALID_ARG;
     }
-    state.guest_buffer_finalizers.push(GuestBufferFinalizer {
-        target: WeakRef::new(&value.unchecked_into::<Object>()),
-        handle_id: value_id,
-        guest_ptr,
-        recyclable: recyclable != 0,
-    });
+    state
+        .agent
+        .guest_buffer_finalizers
+        .push(GuestBufferFinalizer {
+            target: WeakRef::new(&value.unchecked_into::<Object>()),
+            handle_id: value_id,
+            guest_ptr,
+            recyclable: recyclable != 0,
+        });
     NAPI_OK
 }
 
@@ -3565,7 +3604,7 @@ pub unsafe extern "C" fn snapi_bridge_take_ready_guest_buffer_finalizer(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(record) = state.take_ready_guest_buffer_finalizer(force != 0) else {
+    let Some(record) = state.agent.take_ready_guest_buffer_finalizer(force != 0) else {
         return 1;
     };
     if unsafe { write(handle_id_out, record.handle_id) }.is_err()
@@ -3590,7 +3629,7 @@ pub unsafe extern "C" fn snapi_bridge_get_cb_info(
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(info) = s.callback_infos.get(&id) else {
+    let Some(info) = s.agent.callback_infos.get(&id) else {
         return NAPI_INVALID_ARG;
     };
     let requested = if argc.is_null() {
@@ -3634,10 +3673,10 @@ pub unsafe extern "C" fn snapi_bridge_wrap(e: SnapiEnv, o: u32, d: u64, r: *mut 
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrap_id) = s.wrap_id(o, true) else {
+    let Some(wrap_id) = s.agent.wrap_id(o, true) else {
         return NAPI_INVALID_ARG;
     };
-    s.wraps.insert(wrap_id, d);
+    s.agent.wraps.insert(wrap_id, d);
     if r.is_null() {
         NAPI_OK
     } else {
@@ -3649,10 +3688,10 @@ pub unsafe extern "C" fn snapi_bridge_unwrap(e: SnapiEnv, o: u32, d: *mut u64) -
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrap_id) = s.wrap_id(o, false) else {
+    let Some(wrap_id) = s.agent.wrap_id(o, false) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(v) = s.wraps.get(&wrap_id).copied() else {
+    let Some(v) = s.agent.wraps.get(&wrap_id).copied() else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(d, v) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -3662,13 +3701,14 @@ pub unsafe extern "C" fn snapi_bridge_remove_wrap(e: SnapiEnv, o: u32, d: *mut u
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrap_id) = s.wrap_id(o, false) else {
+    let Some(wrap_id) = s.agent.wrap_id(o, false) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(v) = s.wraps.remove(&wrap_id) else {
+    let Some(v) = s.agent.wraps.remove(&wrap_id) else {
         return NAPI_INVALID_ARG;
     };
-    s.guest_finalizers
+    s.agent
+        .guest_finalizers
         .retain(|record| record.wrap_id != Some(wrap_id));
     unsafe { write(d, v) }.map_or_else(|e| e, |_| NAPI_OK)
 }
@@ -3677,7 +3717,7 @@ pub unsafe extern "C" fn snapi_bridge_type_tag_object(e: SnapiEnv, o: u32, l: u6
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    s.type_tags.insert(o, (l, u));
+    s.agent.type_tags.insert(o, (l, u));
     NAPI_OK
 }
 #[unsafe(no_mangle)]
@@ -3691,7 +3731,7 @@ pub unsafe extern "C" fn snapi_bridge_check_object_type_tag(
     let Ok(s) = (unsafe { env_mut(e) }) else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { write(r, i32::from(s.type_tags.get(&o) == Some(&(l, u)))) }
+    unsafe { write(r, i32::from(s.agent.type_tags.get(&o) == Some(&(l, u)))) }
         .map_or_else(|e| e, |_| NAPI_OK)
 }
 
@@ -3773,7 +3813,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_promise_details(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(promise) = state.get(promise_id).cloned() else {
+    let Some(promise) = state.agent.get(promise_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     if !promise.is_instance_of::<Promise>() {
@@ -3790,7 +3830,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_promise_details(
         return NAPI_INVALID_ARG;
     }
     if has_result && !result_out.is_null() {
-        let result_id = state.insert(details.get(1));
+        let result_id = state.agent.insert(details.get(1));
         if unsafe { write(result_out, result_id) }.is_err() {
             return NAPI_INVALID_ARG;
         }
@@ -3887,7 +3927,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if state.embedder_hooks_attached || accepted_hooks_out.is_null() {
+    if state.agent.embedder_hooks_attached || accepted_hooks_out.is_null() {
         return NAPI_INVALID_ARG;
     }
     let _ = (fatal_callback_id, oom_callback_id);
@@ -3895,7 +3935,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     // browser/Node host owns fatal JavaScript and OOM handling. Accept the same
     // single attachment transition while reporting that no guest callback can
     // be invoked as a native provider function pointer.
-    state.embedder_hooks_attached = true;
+    state.agent.embedder_hooks_attached = true;
     unsafe { accepted_hooks_out.write(0) };
     NAPI_OK
 }
@@ -3913,6 +3953,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_enqueue_microtask(
         return NAPI_INVALID_ARG;
     };
     let Some(callback) = state
+        .agent
         .get(callback_id)
         .and_then(|value| value.dyn_ref::<Function>())
         .cloned()
@@ -3940,7 +3981,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(value_id).cloned() else {
+    let Some(value) = state.agent.get(value_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     if !value.is_object() && !value.is_function() {
@@ -4004,7 +4045,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
         filtered.push(&key);
     }
 
-    let id = state.insert(filtered.into());
+    let id = state.agent.insert(filtered.into());
     unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -4246,19 +4287,19 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_structured_clone(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(value_id).cloned() else {
+    let Some(value) = state.agent.get(value_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let transfer_list = if transfer_list_id == 0 {
         JsValue::UNDEFINED
-    } else if let Some(value) = state.get(transfer_list_id).cloned() {
+    } else if let Some(value) = state.agent.get(transfer_list_id).cloned() {
         value
     } else {
         return NAPI_INVALID_ARG;
     };
     match wasmer_napi_structured_clone(&value, &transfer_list) {
         Ok(cloned) => {
-            let id = state.insert(cloned);
+            let id = state.agent.insert(cloned);
             unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -4277,7 +4318,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_message_create(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(value_id).cloned() else {
+    let Some(value) = state.agent.get(value_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let Some(payload) = next_serialized_message(wasmer_napi_message_scope()) else {
@@ -4313,7 +4354,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_message_take(
     wasmer_napi_release_message(payload);
     match obtained {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(value_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -4344,7 +4385,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_serdes_binding(
     };
     match wasmer_napi_create_serdes_binding() {
         Ok(binding) => {
-            let id = state.insert(binding);
+            let id = state.agent.insert(binding);
             unsafe { write(out_id, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -4366,7 +4407,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_contains_module_synt
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source) = state.get(code_id).and_then(JsValue::as_string) else {
+    let Some(source) = state.agent.get(code_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
     let params = Array::new();
@@ -4415,13 +4456,14 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_make_context(
         Object::new().into()
     } else {
         state
+            .agent
             .get(sandbox_or_symbol_id)
             .cloned()
             .unwrap_or_else(|| Object::new().into())
     };
     let _ = Reflect::set(&sandbox, &JsValue::from_str("global"), &sandbox);
     let _ = Reflect::set(&sandbox, &JsValue::from_str("globalThis"), &sandbox);
-    let id = state.insert(sandbox);
+    let id = state.agent.insert(sandbox);
     unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -4459,12 +4501,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
         Err(status) => return status,
     };
     let sandbox = state
+        .agent
         .get(sandbox_or_null_id)
         .cloned()
         .unwrap_or(JsValue::NULL);
-    match wasmer_napi_context_eval(&sandbox, &source) {
+    match wasmer_napi_context_eval(&state.global_context, &sandbox, &source) {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -4496,7 +4539,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
         Err(status) => return status,
     };
     let params = Array::new();
-    if let Some(values) = state.get(params_id).filter(|value| Array::is_array(value)) {
+    if let Some(values) = state
+        .agent
+        .get(params_id)
+        .filter(|value| Array::is_array(value))
+    {
         for value in Array::from(values).iter() {
             match js_string(&value) {
                 Ok(value) => {
@@ -4510,6 +4557,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
         }
     }
     let filename = state
+        .agent
         .get(filename_id)
         .and_then(JsValue::as_string)
         .unwrap_or_default();
@@ -4519,7 +4567,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
     };
     let context_extensions = if context_extensions_id == 0 {
         Array::new()
-    } else if let Some(value) = state.get(context_extensions_id) {
+    } else if let Some(value) = state.agent.get(context_extensions_id) {
         if value.is_null() || value.is_undefined() {
             Array::new()
         } else if Array::is_array(value) {
@@ -4549,12 +4597,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
                 &JsValue::UNDEFINED,
             );
             let source_url = state
+                .agent
                 .get(filename_id)
                 .cloned()
                 .unwrap_or(JsValue::UNDEFINED);
             let _ = Reflect::set(&result, &JsValue::from_str("sourceURL"), &source_url);
             let _ = Reflect::set(&result, &JsValue::from_str("function"), function.as_ref());
-            let id = state.insert(result.into());
+            let id = state.agent.insert(result.into());
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -4586,7 +4635,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source_value) = state.get(source_text_id).cloned() else {
+    let Some(source_value) = state.agent.get(source_text_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let Some(source) = source_value.as_string() else {
@@ -4602,12 +4651,17 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
         return NAPI_OK;
     }
     let filename = state
+        .agent
         .get(filename_id)
         .and_then(JsValue::as_string)
         .unwrap_or_default();
     let params = Array::new();
     if params_id != 0 {
-        let Some(values) = state.get(params_id).filter(|value| Array::is_array(value)) else {
+        let Some(values) = state
+            .agent
+            .get(params_id)
+            .filter(|value| Array::is_array(value))
+        else {
             return NAPI_ARRAY_EXPECTED;
         };
         for value in Array::from(values).iter() {
@@ -4675,7 +4729,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_serialize(
     if !state.bytecodes.contains_key(&bytecode_id) {
         return NAPI_INVALID_ARG;
     }
-    let id = state.insert(Uint8Array::new_with_length(0).into());
+    let id = state.agent.insert(Uint8Array::new_with_length(0).into());
     unsafe { write(buffer_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -4710,10 +4764,10 @@ unsafe fn host_js_create_source_text_module(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if state.get(wrapper_id).is_none() {
+    if state.agent.get(wrapper_id).is_none() {
         return NAPI_INVALID_ARG;
     }
-    let Some(url) = state.get(url_id).and_then(JsValue::as_string) else {
+    let Some(url) = state.agent.get(url_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
     let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 2) {
@@ -4768,7 +4822,7 @@ unsafe fn host_js_create_source_text_module(
 
     let handle = state.next_module;
     state.next_module = state.next_module.wrapping_add(1).max(1);
-    let requests_id = state.insert(requests.clone().into());
+    let requests_id = state.agent.insert(requests.clone().into());
     state.source_text_modules.insert(
         handle,
         SourceTextModule {
@@ -4809,10 +4863,11 @@ unsafe fn host_js_create_synthetic_module(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(wrapper) = state.get(wrapper_id).cloned() else {
+    let Some(wrapper) = state.agent.get(wrapper_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let Some(export_names_value) = state
+        .agent
         .get(export_names_id)
         .filter(|value| Array::is_array(value))
         .cloned()
@@ -4820,6 +4875,7 @@ unsafe fn host_js_create_synthetic_module(
         return NAPI_INVALID_ARG;
     };
     let Some(evaluate) = state
+        .agent
         .get(synthetic_eval_steps_id)
         .and_then(|value| value.dyn_ref::<Function>())
         .cloned()
@@ -4854,7 +4910,7 @@ unsafe fn host_js_create_synthetic_module(
             evaluation: None,
         },
     );
-    let requests_id = state.insert(Array::new().into());
+    let requests_id = state.agent.insert(Array::new().into());
     for result in [
         unsafe { write(handle_out, handle) },
         unsafe { write(requests_out, requests_id) },
@@ -5303,7 +5359,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate(
     };
     match start_module_evaluation(state, handle_id) {
         Ok(promise) => {
-            let id = state.insert(promise);
+            let id = state.agent.insert(promise);
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5326,7 +5382,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate_sync(
     };
     match evaluate_module_sync(state, handle_id, &mut Vec::new()) {
         Ok(namespace) => {
-            let id = state.insert(namespace.into());
+            let id = state.agent.insert(namespace.into());
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5347,7 +5403,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_namespace(
     let Some(namespace) = module_namespace(state, handle_id) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert(namespace.into());
+    let id = state.agent.insert(namespace.into());
     unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 
@@ -5417,7 +5473,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
                     .and_then(|module| module.error.clone())
             })
             .unwrap_or(JsValue::UNDEFINED);
-        let error_id = state.insert(error);
+        let error_id = state.agent.insert(error);
         if let Err(error) = unsafe { write(error_out, error_id) } {
             return error;
         }
@@ -5461,10 +5517,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_export(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(name) = state.get(export_name_id).and_then(JsValue::as_string) else {
+    let Some(name) = state.agent.get(export_name_id).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
-    let Some(value) = state.get(export_value_id).cloned() else {
+    let Some(value) = state.agent.get(export_value_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let Some(module) = state.synthetic_modules.get_mut(&handle_id) else {
@@ -5537,7 +5593,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_required_mod
         .and_then(|namespace| wasmer_napi_create_module_facade(&namespace))
     {
         Ok(facade) => {
-            let id = state.insert(facade.into());
+            let id = state.agent.insert(facade.into());
             unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5557,7 +5613,7 @@ pub unsafe extern "C" fn snapi_bridge_instanceof(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(object), Some(ctor)) = (state.get(obj_id), state.get(ctor_id)) else {
+    let (Some(object), Some(ctor)) = (state.agent.get(obj_id), state.agent.get(ctor_id)) else {
         return NAPI_INVALID_ARG;
     };
     if !ctor.is_function() {
@@ -5575,11 +5631,11 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_bool(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     let coerced = JsValue::from_bool(value.is_truthy());
-    let id = state.insert(coerced);
+    let id = state.agent.insert(coerced);
     unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -5591,12 +5647,12 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_number(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).cloned() else {
+    let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     match wasmer_napi_number(&value) {
         Ok(number) => {
-            let id = state.insert(number);
+            let id = state.agent.insert(number);
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5614,14 +5670,14 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_string(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).cloned() else {
+    let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     // Convert in JS: a round trip through a Rust String would cost two
     // transcodes and replace lone surrogates with U+FFFD.
     match wasmer_napi_string(&value) {
         Ok(text) => {
-            let id = state.insert_primitive(text);
+            let id = state.agent.insert_primitive(text);
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5639,13 +5695,13 @@ pub unsafe extern "C" fn snapi_bridge_coerce_to_object(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).cloned() else {
+    let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     if value.is_null() || value.is_undefined() {
         return NAPI_OBJECT_EXPECTED;
     }
-    let id = state.insert(Object::from(value).into());
+    let id = state.agent.insert(Object::from(value).into());
     unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -5658,7 +5714,7 @@ pub unsafe extern "C" fn snapi_bridge_has_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(object), Some(key)) = (state.get(obj_id), state.get(key_id)) else {
+    let (Some(object), Some(key)) = (state.agent.get(obj_id), state.agent.get(key_id)) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::has(object, key) {
@@ -5681,7 +5737,7 @@ pub unsafe extern "C" fn snapi_bridge_has_own_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(object), Some(key)) = (state.get(obj_id), state.get(key_id)) else {
+    let (Some(object), Some(key)) = (state.agent.get(obj_id), state.agent.get(key_id)) else {
         return NAPI_INVALID_ARG;
     };
     let object = Object::from(object.clone());
@@ -5704,7 +5760,7 @@ pub unsafe extern "C" fn snapi_bridge_delete_property(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(object), Some(key)) = (state.get(obj_id), state.get(key_id)) else {
+    let (Some(object), Some(key)) = (state.agent.get(obj_id), state.agent.get(key_id)) else {
         return NAPI_INVALID_ARG;
     };
     let object = Object::from(object.clone());
@@ -5740,7 +5796,7 @@ pub unsafe extern "C" fn snapi_bridge_has_element(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     match Reflect::has(object, &JsValue::from_f64(index as f64)) {
@@ -5763,7 +5819,7 @@ pub unsafe extern "C" fn snapi_bridge_delete_element(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     let object = Object::from(object.clone());
@@ -5789,12 +5845,12 @@ pub unsafe extern "C" fn snapi_bridge_get_all_property_names(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     match wasmer_napi_get_all_property_names(object, mode, filter, conversion) {
         Ok(keys) => {
-            let id = state.insert(keys.into());
+            let id = state.agent.insert(keys.into());
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -5812,11 +5868,11 @@ pub unsafe extern "C" fn snapi_bridge_get_prototype(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     let proto = Object::get_prototype_of(&Object::from(object.clone()));
-    let id = state.insert(proto.into());
+    let id = state.agent.insert(proto.into());
     unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -5824,7 +5880,7 @@ pub unsafe extern "C" fn snapi_bridge_object_freeze(env: SnapiEnv, obj_id: u32) 
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     Object::freeze(&Object::from(object.clone()));
@@ -5835,7 +5891,7 @@ pub unsafe extern "C" fn snapi_bridge_object_seal(env: SnapiEnv, obj_id: u32) ->
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(object) = state.get(obj_id) else {
+    let Some(object) = state.agent.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
     Object::seal(&Object::from(object.clone()));
@@ -5901,7 +5957,7 @@ pub unsafe extern "C" fn snapi_bridge_create_symbol(
         if description_id == 0 {
             JsValue::UNDEFINED
         } else {
-            let Some(value) = state.get(description_id).cloned() else {
+            let Some(value) = state.agent.get(description_id).cloned() else {
                 return NAPI_INVALID_ARG;
             };
             if !value.is_string() {
@@ -5967,7 +6023,11 @@ pub unsafe extern "C" fn snapi_bridge_get_date_value(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(date) = state.get(id).and_then(|value| value.dyn_ref::<Date>()) else {
+    let Some(date) = state
+        .agent
+        .get(id)
+        .and_then(|value| value.dyn_ref::<Date>())
+    else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(result, date.get_time()) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -5992,8 +6052,8 @@ pub unsafe extern "C" fn snapi_bridge_create_external_arraybuffer(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert(buffer.into());
-    state.backing_tokens.insert(id, data_addr);
+    let id = state.agent.insert(buffer.into());
+    state.agent.backing_tokens.insert(id, data_addr);
     if unsafe { write(out_id, id) }.is_err() {
         return NAPI_INVALID_ARG;
     }
@@ -6021,9 +6081,9 @@ pub unsafe extern "C" fn snapi_bridge_create_external_buffer(
         return NAPI_INVALID_ARG;
     };
     let array = Uint8Array::from(source);
-    let value = wasmer_napi_buffer_view(&array.buffer(), 0, array.length());
-    let id = state.insert(value);
-    state.backing_tokens.insert(id, data_addr);
+    let value = wasmer_napi_buffer_view(&state.global_context, &array.buffer(), 0, array.length());
+    let id = state.agent.insert(value);
+    state.agent.backing_tokens.insert(id, data_addr);
     if unsafe { write(out_id, id) }.is_err() {
         return NAPI_INVALID_ARG;
     }
@@ -6055,7 +6115,7 @@ pub unsafe extern "C" fn snapi_bridge_is_sharedarraybuffer(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id) else {
+    let Some(value) = state.agent.get(id) else {
         return NAPI_INVALID_ARG;
     };
     unsafe {
@@ -6076,7 +6136,9 @@ pub unsafe extern "C" fn snapi_bridge_create_sharedarraybuffer(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert(SharedArrayBuffer::new(byte_length).into());
+    let id = state
+        .agent
+        .insert(SharedArrayBuffer::new(byte_length).into());
     if unsafe { write(data_out, 0) }.is_err() || unsafe { write(out_id, id) }.is_err() {
         NAPI_INVALID_ARG
     } else {
@@ -6092,7 +6154,9 @@ pub unsafe extern "C" fn snapi_bridge_node_api_set_prototype(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let (Some(object), Some(prototype)) = (state.get(object_id), state.get(prototype_id)) else {
+    let (Some(object), Some(prototype)) =
+        (state.agent.get(object_id), state.agent.get(prototype_id))
+    else {
         return NAPI_INVALID_ARG;
     };
     let prototype = Object::from(prototype.clone());
@@ -6111,12 +6175,12 @@ pub unsafe extern "C" fn snapi_bridge_create_typedarray(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(buffer) = state.get(arraybuffer_id).cloned() else {
+    let Some(buffer) = state.agent.get(arraybuffer_id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     match wasmer_napi_typed_array(typ, &buffer, byte_offset, length) {
         Ok(value) => {
-            let id = state.insert(value);
+            let id = state.agent.insert(value);
             unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
         }
         Err(error) => {
@@ -6139,7 +6203,7 @@ pub unsafe extern "C" fn snapi_bridge_get_typedarray_info(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.get(id).cloned() else {
+    let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
     let kind = wasmer_napi_typed_array_kind(&value);
@@ -6175,14 +6239,14 @@ pub unsafe extern "C" fn snapi_bridge_get_typedarray_info(
             return NAPI_INVALID_ARG;
         }
         if !backing_store_token_out.is_null() {
-            let backing_store_token = state.backing_store_token(id).unwrap_or(id as u64);
+            let backing_store_token = state.agent.backing_store_token(id).unwrap_or(id as u64);
             if unsafe { write(backing_store_token_out, backing_store_token) }.is_err() {
                 return NAPI_INVALID_ARG;
             }
         }
     }
     if !arraybuffer_out.is_null() {
-        let buffer_id = state.insert(buffer);
+        let buffer_id = state.agent.insert(buffer);
         if unsafe { write(arraybuffer_out, buffer_id) }.is_err() {
             return NAPI_INVALID_ARG;
         }
@@ -6230,8 +6294,8 @@ pub unsafe extern "C" fn snapi_bridge_create_external(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.insert(Object::new().into());
-    state.externals.insert(id, data_val);
+    let id = state.agent.insert(Object::new().into());
+    state.agent.externals.insert(id, data_val);
     unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -6239,7 +6303,7 @@ pub unsafe extern "C" fn snapi_bridge_open_handle_scope(env: SnapiEnv, scope_out
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let id = state.open_value_frame();
+    let id = state.agent.open_value_frame();
     unsafe { write(scope_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -6247,7 +6311,7 @@ pub unsafe extern "C" fn snapi_bridge_close_handle_scope(env: SnapiEnv, scope_id
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if state.close_value_frame(scope_id) {
+    if state.agent.close_value_frame(scope_id) {
         NAPI_OK
     } else {
         NAPI_INVALID_ARG
@@ -6262,7 +6326,7 @@ pub unsafe extern "C" fn snapi_bridge_get_value_external(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(value) = state.externals.get(&id).copied() else {
+    let Some(value) = state.agent.externals.get(&id).copied() else {
         return NAPI_INVALID_ARG;
     };
     unsafe { write(data_out, value) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -6291,7 +6355,7 @@ pub unsafe extern "C" fn snapi_bridge_escape_handle(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if state.get(escapee_id).is_none() || !state.escape_value(scope_id, escapee_id) {
+    if state.agent.get(escapee_id).is_none() || !state.agent.escape_value(scope_id, escapee_id) {
         return NAPI_INVALID_ARG;
     }
     unsafe { write(out_id, escapee_id) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -6381,14 +6445,14 @@ pub unsafe extern "C" fn snapi_bridge_wrap_finalized(
             }
             return NAPI_INVALID_ARG;
         };
-        let Some(wrap_id) = state.wrap_id(obj_id, true) else {
+        let Some(wrap_id) = state.agent.wrap_id(obj_id, true) else {
             if reference_id != 0 {
                 let _ = unsafe { snapi_bridge_delete_reference(env, reference_id) };
             }
             return NAPI_INVALID_ARG;
         };
-        if state.wraps.contains_key(&wrap_id)
-            || !state.register_guest_finalizer(
+        if state.agent.wraps.contains_key(&wrap_id)
+            || !state.agent.register_guest_finalizer(
                 obj_id,
                 guest_env,
                 wasm_fn_ptr,
@@ -6399,7 +6463,7 @@ pub unsafe extern "C" fn snapi_bridge_wrap_finalized(
         {
             false
         } else {
-            state.wraps.insert(wrap_id, native_data);
+            state.agent.wraps.insert(wrap_id, native_data);
             true
         }
     };
@@ -6436,7 +6500,7 @@ pub unsafe extern "C" fn snapi_bridge_add_finalizer_cb(
         }
     }
     let registered = unsafe { env_mut(env) }.is_ok_and(|state| {
-        state.register_guest_finalizer(
+        state.agent.register_guest_finalizer(
             obj_id,
             guest_env,
             wasm_fn_ptr,
@@ -6495,7 +6559,7 @@ pub unsafe extern "C" fn snapi_bridge_get_new_target(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(info) = state.callback_infos.get(&cbinfo_id) else {
+    let Some(info) = state.agent.callback_infos.get(&cbinfo_id) else {
         return NAPI_INVALID_ARG;
     };
     // A non-constructor callback succeeds with a null napi_value. The handle
@@ -6534,7 +6598,11 @@ unsafe fn define_properties_impl(
                 unsafe { *name_ids.add(index) }
             };
             if name_id != 0 {
-                state.get(name_id).cloned().unwrap_or(JsValue::UNDEFINED)
+                state
+                    .agent
+                    .get(name_id)
+                    .cloned()
+                    .unwrap_or(JsValue::UNDEFINED)
             } else {
                 if names.is_null() {
                     return NAPI_INVALID_ARG;
@@ -6580,7 +6648,7 @@ unsafe fn define_properties_impl(
                 return Err(status);
             }
             let state = unsafe { env_mut(env) }?;
-            state.get(id).cloned().ok_or(NAPI_INVALID_ARG)
+            state.agent.get(id).cloned().ok_or(NAPI_INVALID_ARG)
         };
 
         match property_type {
@@ -6592,7 +6660,7 @@ unsafe fn define_properties_impl(
                 };
                 let value = unsafe { env_mut(env) }
                     .ok()
-                    .and_then(|state| state.get(value_id).cloned())
+                    .and_then(|state| state.agent.get(value_id).cloned())
                     .unwrap_or(JsValue::UNDEFINED);
                 let _ = Reflect::set(&descriptor, &JsValue::from_str("value"), &value);
                 let _ = Reflect::set(
@@ -6694,7 +6762,7 @@ pub unsafe extern "C" fn snapi_bridge_define_class(
         let Ok(state) = (unsafe { env_mut(env) }) else {
             return NAPI_INVALID_ARG;
         };
-        let Some(ctor) = state.get(ctor_id).cloned() else {
+        let Some(ctor) = state.agent.get(ctor_id).cloned() else {
             return NAPI_INVALID_ARG;
         };
         match Reflect::get(&ctor, &JsValue::from_str("prototype")) {
@@ -6787,7 +6855,7 @@ pub unsafe extern "C" fn snapi_bridge_define_properties(
         let Ok(state) = (unsafe { env_mut(env) }) else {
             return NAPI_INVALID_ARG;
         };
-        let Some(object) = state.get(obj_id).cloned() else {
+        let Some(object) = state.agent.get(obj_id).cloned() else {
             return NAPI_INVALID_ARG;
         };
         object
@@ -6830,9 +6898,9 @@ mod tests {
     #[wasm_bindgen_test]
     fn get_new_target_reports_the_constructor_or_null() {
         with_env(|env, state| {
-            let target = state.insert(Object::new().into());
+            let target = state.agent.insert(Object::new().into());
             for (id, new_target) in [(7, target), (8, 0)] {
-                state.callback_infos.insert(
+                state.agent.callback_infos.insert(
                     id,
                     CallbackInfo {
                         args: Vec::new(),
@@ -6868,25 +6936,25 @@ mod tests {
 
     fn objects_keep_their_handle(state: &mut HostJsEnv) {
         let object: JsValue = Object::new().into();
-        let id = state.insert(object.clone());
-        assert_eq!(state.insert(object.clone()), id);
+        let id = state.agent.insert(object.clone());
+        assert_eq!(state.agent.insert(object.clone()), id);
         assert_ne!(
-            state.insert_primitive("x".into()),
-            state.insert_primitive("x".into())
+            state.agent.insert_primitive("x".into()),
+            state.agent.insert_primitive("x".into())
         );
 
-        let frame = state.open_value_frame();
+        let frame = state.agent.open_value_frame();
         let scoped: JsValue = Object::new().into();
-        let stale = state.insert(scoped.clone());
-        state.externals.insert(stale, 7);
-        assert!(state.close_value_frame(frame));
-        assert!(state.get(stale).is_none());
+        let stale = state.agent.insert(scoped.clone());
+        state.agent.externals.insert(stale, 7);
+        assert!(state.agent.close_value_frame(frame));
+        assert!(state.agent.get(stale).is_none());
         // A closed frame's handle is stale: the object moves, with its data.
-        let fresh = state.insert(scoped.clone());
+        let fresh = state.agent.insert(scoped.clone());
         assert_ne!(fresh, stale);
-        assert!(Object::is(state.get(fresh).unwrap(), &scoped));
-        assert_eq!(state.externals.get(&fresh), Some(&7));
-        assert_eq!(state.insert(scoped), fresh);
+        assert!(Object::is(state.agent.get(fresh).unwrap(), &scoped));
+        assert_eq!(state.agent.externals.get(&fresh), Some(&7));
+        assert_eq!(state.agent.insert(scoped), fresh);
     }
 
     #[wasm_bindgen_test]
@@ -6895,24 +6963,28 @@ mod tests {
     }
 
     fn wrap_ids_are_recorded_once(state: &mut HostJsEnv) {
-        let object = state.insert(Object::new().into());
-        let number = state.insert_primitive(JsValue::from_f64(1.0));
-        assert_eq!(state.wrap_id(object, false), None);
-        let id = state.wrap_id(object, true).unwrap();
-        assert_eq!(state.wrap_id(object, false), Some(id));
-        assert_eq!(state.wrap_id(object, true), Some(id));
-        assert_eq!(state.wrap_id(number, true), None);
-        let other = state.insert(Object::new().into());
-        assert_eq!(state.wrap_id(other, true), Some(id + 1));
+        let object = state.agent.insert(Object::new().into());
+        let number = state.agent.insert_primitive(JsValue::from_f64(1.0));
+        assert_eq!(state.agent.wrap_id(object, false), None);
+        let id = state.agent.wrap_id(object, true).unwrap();
+        assert_eq!(state.agent.wrap_id(object, false), Some(id));
+        assert_eq!(state.agent.wrap_id(object, true), Some(id));
+        assert_eq!(state.agent.wrap_id(number, true), None);
+        let other = state.agent.insert(Object::new().into());
+        assert_eq!(state.agent.wrap_id(other, true), Some(id + 1));
     }
 
     #[wasm_bindgen_test]
     fn number_getters_convert_like_node() {
         with_env(|env, state| {
-            let big = state.insert_primitive(JsValue::from_f64(4294967301.0));
-            let negative = state.insert_primitive(JsValue::from_f64(-1.0));
-            let infinite = state.insert_primitive(JsValue::from_f64(f64::INFINITY));
-            let text = state.insert_primitive("1".into());
+            let big = state
+                .agent
+                .insert_primitive(JsValue::from_f64(4294967301.0));
+            let negative = state.agent.insert_primitive(JsValue::from_f64(-1.0));
+            let infinite = state
+                .agent
+                .insert_primitive(JsValue::from_f64(f64::INFINITY));
+            let text = state.agent.insert_primitive("1".into());
             let (mut int32, mut uint32, mut int64) = (0i32, 0u32, 1i64);
             unsafe {
                 assert_eq!(snapi_bridge_get_value_int32(env, big, &mut int32), NAPI_OK);
@@ -6954,8 +7026,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn coerce_to_string_keeps_lone_surrogates() {
         with_env(|env, state| {
-            let lone = state.insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
-            let number = state.insert_primitive(JsValue::from_f64(1.5));
+            let lone = state
+                .agent
+                .insert_primitive(js_sys::JsString::from_char_code1(0xd800).into());
+            let number = state.agent.insert_primitive(JsValue::from_f64(1.5));
             let mut out = 0;
             assert_eq!(
                 unsafe { snapi_bridge_coerce_to_string(env, lone, &mut out) },
@@ -6963,6 +7037,7 @@ mod tests {
             );
             let text: js_sys::JsString = unsafe { env_mut(env) }
                 .unwrap()
+                .agent
                 .get(out)
                 .unwrap()
                 .clone()
@@ -6974,6 +7049,7 @@ mod tests {
             );
             let text = unsafe { env_mut(env) }
                 .unwrap()
+                .agent
                 .get(out)
                 .and_then(JsValue::as_string);
             assert_eq!(text.as_deref(), Some("1.5"));
@@ -7008,6 +7084,7 @@ mod tests {
         }
         let retained: Function = unsafe { env_mut(env) }
             .unwrap()
+            .agent
             .get(handle)
             .unwrap()
             .clone()

@@ -27,23 +27,18 @@ size_t napi_scope__::level() const
 
 napi_value napi_scope__::wrap_value(JSValue value, bool owned)
 {
-  return wrap_value(env_ == nullptr ? nullptr : env_->context(), value, owned);
-}
-
-napi_value napi_scope__::wrap_value(JSContext *context, JSValue value, bool owned)
-{
   if (closed_)
   {
-    if (owned && env_ != nullptr && context != nullptr)
-      JS_FreeValue(context, value);
+    if (owned && env_ != nullptr)
+      JS_FreeValueRT(env_->agent()->runtime(), value);
     return nullptr;
   }
 
-  napi_value wrapped = values_.allocate(env_, context, value, owned);
+  napi_value wrapped = values_.allocate(env_, value, owned);
   if (wrapped == nullptr)
   {
-    if (owned && env_ != nullptr && context != nullptr)
-      JS_FreeValue(context, value);
+    if (owned && env_ != nullptr)
+      JS_FreeValueRT(env_->agent()->runtime(), value);
     return nullptr;
   }
 
@@ -68,7 +63,7 @@ napi_value napi_scope__::escape_value(napi_value value)
     return record_escape(nullptr);
 
   napi_scope__ *parent_scope = parent();
-  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(value->context(), value->get_inner(), false));
+  return record_escape(parent_scope == nullptr ? nullptr : parent_scope->wrap_value(value->get_inner(), false));
 }
 
 void napi_scope__::delete_value(napi_value value)

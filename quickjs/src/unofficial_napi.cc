@@ -35,10 +35,13 @@ namespace
     bool g_runtime_configured = false;
     std::string g_runtime_engine_flags;
 
+    // The owner handle: the runtime, its main context, the agent and the
+    // principal env.
     struct UnofficialEnvScope
     {
         JSRuntime *rt = nullptr;
         JSContext *ctx = nullptr;
+        std::unique_ptr<napi_agent__> agent;
         napi_env env = nullptr;
     };
 
@@ -48,7 +51,7 @@ namespace
             return napi_invalid_arg;
 
         JSContext *ctx = env->context();
-        env->promises().clear_runtime_hooks();
+        env->agent()->clear_promise_hooks();
         JS_SetContextOpaque(ctx, nullptr);
         env->prepare_teardown();
         return napi_ok;
@@ -137,6 +140,36 @@ namespace
         JS_FreeValue(ctx, symbol_ctor);
         return ok;
     }
+
+    // Makes the env for `context` on `agent`; the first env becomes the
+    // agent's principal env.
+    napi_status CreateEnvOnAgent(napi_agent__ *agent,
+                                 JSContext *context,
+                                 int32_t module_api_version,
+                                 napi_env *result)
+    {
+        auto rt = JS_GetRuntime(context);
+        if (0 != napi_external__::register_class(rt))
+            return napi_generic_failure;
+        if (!EnsureNodeWellKnownSymbols(context))
+            return JS_HasException(context) ? napi_pending_exception : napi_generic_failure;
+
+        auto env = new (std::nothrow) napi_env__{agent, context, module_api_version};
+        if (env == nullptr)
+            return napi_generic_failure;
+        if (env->root_scope() == nullptr)
+        {
+            delete env;
+            return napi_generic_failure;
+        }
+
+        JS_SetContextOpaque(context, env);
+        agent->attach_promise_hook();
+        agent->attach_module_hooks();
+
+        *result = env;
+        return napi_ok;
+    }
 }
 
 extern "C"
@@ -207,24 +240,15 @@ extern "C"
         if (result == nullptr || context == nullptr)
             return napi_invalid_arg;
 
-        auto rt = JS_GetRuntime(context);
-        if (0 != napi_external__::register_class(rt))
+        // No owner handle exists on this path, so the env owns its agent.
+        std::unique_ptr<napi_agent__> agent{new (std::nothrow) napi_agent__{JS_GetRuntime(context)}};
+        if (agent == nullptr)
             return napi_generic_failure;
-        if (!EnsureNodeWellKnownSymbols(context))
-            return JS_HasException(context) ? napi_pending_exception : napi_generic_failure;
-
-        auto env = new (std::nothrow) napi_env__{context, module_api_version};
-        if (env == nullptr)
-            return napi_generic_failure;
-        if (env->root_scope() == nullptr)
-        {
-            delete env;
-            return napi_generic_failure;
-        }
-
-        JS_SetContextOpaque(context, env);
-        env->promises().attach_runtime_hooks();
-
+        napi_env env = nullptr;
+        napi_status status = CreateEnvOnAgent(agent.get(), context, module_api_version, &env);
+        if (status != napi_ok)
+            return status;
+        env->adopt_agent(std::move(agent));
         *result = env;
         return napi_ok;
     }
@@ -286,6 +310,15 @@ extern "C"
         }
 
         auto scope = new (std::nothrow) UnofficialEnvScope{.rt = rt, .ctx = ctx};
+        if (scope != nullptr)
+        {
+            scope->agent.reset(new (std::nothrow) napi_agent__{rt});
+            if (scope->agent == nullptr)
+            {
+                delete scope;
+                scope = nullptr;
+            }
+        }
         if (scope == nullptr)
         {
             JS_FreeContext(ctx);
@@ -293,7 +326,7 @@ extern "C"
             return napi_generic_failure;
         }
 
-        auto status = unofficial_napi_create_env_from_context(ctx, module_api_version, &scope->env);
+        auto status = CreateEnvOnAgent(scope->agent.get(), ctx, module_api_version, &scope->env);
         if (status != napi_ok || scope->env == nullptr)
         {
             delete scope;
@@ -439,7 +472,7 @@ extern "C"
         napi_status status = env->promises().set_reject_callback(callback);
         if (status != napi_ok)
             return status;
-        env->promises().update_rejection_tracker();
+        env->agent()->set_rejection_tracking(env->promises().has_reject_callback());
         return napi_ok;
     }
 
@@ -454,7 +487,7 @@ extern "C"
         napi_status status = env->promises().set_hooks(init, before, after, resolve);
         if (status != napi_ok)
             return status;
-        env->promises().attach_runtime_hooks();
+        env->agent()->attach_promise_hook();
         return napi_ok;
     }
 
@@ -530,7 +563,7 @@ extern "C"
         JSValueConst raw = napi_quickjs_value_inner(env, promise);
         if (!JS_IsPromise(raw))
             return napi_invalid_arg;
-        JS_PromiseMarkAsHandled(napi_quickjs_value_context(env, promise), raw);
+        JS_PromiseMarkAsHandled(env->context(), raw);
         return napi_ok;
     }
 
@@ -544,22 +577,18 @@ extern "C"
         *target_out = nullptr;
         *handler_out = nullptr;
 
-        JSContext *ctx = napi_quickjs_value_context(env, proxy);
-        if (ctx == nullptr)
-            return napi_invalid_arg;
-
+        JSContext *ctx = env->context();
         JSValueConst raw = napi_quickjs_value_inner(env, proxy);
         if (!JS_IsProxy(raw))
             return napi_invalid_arg;
 
-        napi_env_context_scope__ context_scope{env, ctx};
         JSValue target = JS_GetProxyTarget(ctx, raw);
         if (JS_IsException(target))
         {
             JSValue exception = JS_GetException(ctx);
             JS_FreeValue(ctx, exception);
-            *target_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
-            *handler_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            *target_out = env->wrap_value_in_current_scope(JS_NULL, true);
+            *handler_out = env->wrap_value_in_current_scope(JS_NULL, true);
             return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
@@ -569,13 +598,13 @@ extern "C"
             JS_FreeValue(ctx, target);
             JSValue exception = JS_GetException(ctx);
             JS_FreeValue(ctx, exception);
-            *target_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
-            *handler_out = env->wrap_value_in_current_scope(ctx, JS_NULL, true);
+            *target_out = env->wrap_value_in_current_scope(JS_NULL, true);
+            *handler_out = env->wrap_value_in_current_scope(JS_NULL, true);
             return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
-        *target_out = env->wrap_value_in_current_scope(ctx, target, true);
-        *handler_out = env->wrap_value_in_current_scope(ctx, handler, true);
+        *target_out = env->wrap_value_in_current_scope(target, true);
+        *handler_out = env->wrap_value_in_current_scope(handler, true);
         return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
@@ -994,7 +1023,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        JSValueConst value = env->promises().continuation_preserved_embedder_data();
+        JSValueConst value = env->agent()->continuation_preserved_embedder_data();
         if (JS_IsUndefined(value))
             return napi_util__::create_undefined(env, result_out);
         return napi_util__::wrap_dup(env, value, result_out);
@@ -1006,7 +1035,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr)
             return napi_invalid_arg;
-        env->promises().set_continuation_preserved_embedder_data(napi_quickjs_value_inner(env, value));
+        env->agent()->set_continuation_preserved_embedder_data(napi_quickjs_value_inner(env, value));
         return napi_ok;
     }
 

@@ -135,9 +135,6 @@ napi_module_wrap__::napi_module_wrap__(napi_env env, JSContext *context)
       import_module_dynamically_callback_{JS_UNDEFINED},
       initialize_import_meta_callback_{JS_UNDEFINED}
 {
-  JSRuntime *rt = JS_GetRuntime(ctx_);
-  JS_SetModuleImportMetaInitFunc(rt, host_import_meta_init, this);
-  JS_SetModuleDynamicImportFunc(rt, host_dynamic_import, this);
 }
 
 napi_module_wrap__::~napi_module_wrap__()
@@ -149,10 +146,6 @@ void napi_module_wrap__::teardown()
 {
   if (torn_down_)
     return;
-
-  JSRuntime *rt = JS_GetRuntime(ctx_);
-  JS_SetModuleImportMetaInitFunc(rt, nullptr, nullptr);
-  JS_SetModuleDynamicImportFunc(rt, nullptr, nullptr);
 
   while (!records_.empty())
     free_record(records_.back());
@@ -1231,32 +1224,6 @@ int napi_module_wrap__::synthetic_init(JSContext *ctx, JSModuleDef *module)
   if (!napi_util__::check_env(env))
     return -1;
   return env->module_wrap().initialize_synthetic_module(module);
-}
-
-int napi_module_wrap__::host_import_meta_init(JSContext *ctx,
-                                              JSModuleDef *module,
-                                              JSValueConst meta,
-                                              void *opaque)
-{
-  auto *self = static_cast<napi_module_wrap__ *>(opaque);
-  if (self == nullptr)
-    return 0;
-  return self->initialize_import_meta(module, meta);
-}
-
-JSValue napi_module_wrap__::host_dynamic_import(JSContext *ctx,
-                                                JSModuleDef *referrer,
-                                                JSValueConst referrer_name,
-                                                JSValueConst specifier,
-                                                JSValueConst attributes,
-                                                JSModuleImportPhaseEnum phase,
-                                                void *opaque)
-{
-  auto *self = static_cast<napi_module_wrap__ *>(opaque);
-  if (self == nullptr)
-    return JS_ThrowTypeError(ctx, "Dynamic import callback is not registered");
-  return self->import_module_dynamically(referrer, referrer_name, specifier,
-                                         attributes, phase);
 }
 
 } // namespace quickjs::detail
