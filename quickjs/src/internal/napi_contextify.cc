@@ -40,6 +40,18 @@ namespace quickjs::detail
             return JS_IsObject(a) && JS_IsObject(b) && JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
         }
 
+        // Private links between a sandbox and its context: invisible to script,
+        // removable by the provider.
+        constexpr int k_contextify_link_flags =
+            JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
+            JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+            JS_PROP_HAS_ENUMERABLE;
+
+        JSValue contextify_anchor(JSContext *, JSValueConst, int, JSValueConst *)
+        {
+            return JS_UNDEFINED;
+        }
+
         bool atom_equals_cstr(JSContext *ctx, JSAtom atom, const char *name)
         {
             JSAtom expected = JS_NewAtom(ctx, name);
@@ -91,18 +103,24 @@ namespace quickjs::detail
         }
     } // namespace
 
+    // A context belongs to its sandbox, not to this record. Under private
+    // symbols, the sandbox holds a function of the context's realm (which keeps
+    // the context alive) and the context's global holds the sandbox, so the
+    // garbage collector sees both edges and collects the pair together. The
+    // record holds the sandbox weakly and borrows the context and its global,
+    // which stay valid while the sandbox lives.
     struct napi_contextify__::context_record
     {
         explicit context_record(napi_env owner,
                                 JSContext *parent_context,
                                 JSValueConst parent_sandbox,
                                 JSContext *child_context,
-                                JSValue child_global,
+                                JSValueConst child_global,
                                 JSValueConst host_defined_option)
             : env{owner},
               parent_ctx{parent_context},
               ctx{child_context},
-              sandbox{JS_DupValue(parent_context, parent_sandbox)},
+              sandbox{parent_sandbox},
               global{child_global},
               host_defined_option_id{JS_DupValue(parent_context, host_defined_option)}
         {
@@ -113,30 +131,35 @@ namespace quickjs::detail
             close();
         }
 
+        bool live() const
+        {
+            return !disposed && !collected;
+        }
+
+        static void sandbox_collected(JSRuntime *, void *opaque)
+        {
+            // Runs while the collector frees the sandbox; the context may go in
+            // the same pass. Only mark the record: it is released later.
+            static_cast<context_record *>(opaque)->collected = true;
+        }
+
         void close()
         {
             if (disposed)
                 return;
             disposed = true;
-            if (ctx != nullptr)
-            {
-                for (JSAtom atom : baseline_atoms)
-                    JS_FreeAtom(ctx, atom);
-                baseline_atoms.clear();
-                JS_FreeValue(ctx, global);
-                global = JS_UNDEFINED;
-                JS_SetContextOpaque(ctx, nullptr);
+            JSRuntime *rt = JS_GetRuntime(parent_ctx);
+            JS_DeleteNativeWeakRefLink(rt, &sandbox_link);
+            if (owns_context && ctx != nullptr)
                 JS_FreeContext(ctx);
-                ctx = nullptr;
-            }
-            if (parent_ctx != nullptr)
-            {
-                JS_FreeValue(parent_ctx, sandbox);
-                JS_FreeValue(parent_ctx, host_defined_option_id);
-            }
-            sandbox = JS_UNDEFINED;
+            for (JSAtom atom : baseline_atoms)
+                JS_FreeAtomRT(rt, atom);
+            baseline_atoms.clear();
+            JS_FreeValueRT(rt, host_defined_option_id);
             host_defined_option_id = JS_UNDEFINED;
-            parent_ctx = nullptr;
+            sandbox = JS_UNDEFINED;
+            global = JS_UNDEFINED;
+            ctx = nullptr;
         }
 
         bool has_baseline_atom(JSAtom atom) const
@@ -146,11 +169,18 @@ namespace quickjs::detail
 
         napi_env env = nullptr;
         JSContext *parent_ctx = nullptr;
-        JSContext *ctx = nullptr;
-        JSValue sandbox = JS_UNDEFINED;
-        JSValue global = JS_UNDEFINED;
+        JSContext *ctx = nullptr;          // Borrowed; valid while live().
+        JSValueConst sandbox = JS_UNDEFINED; // Borrowed; valid while live().
+        JSValueConst global = JS_UNDEFINED;  // Borrowed; valid while live().
         JSValue host_defined_option_id = JS_UNDEFINED;
         std::vector<JSAtom> baseline_atoms;
+        JSNativeWeakRefLink sandbox_link{};
+        // The sandbox holds the link to its context.
+        bool anchored = false;
+        // The sandbox cannot hold the link (it is not extensible): the record
+        // keeps the context until the sandbox is collected.
+        bool owns_context = false;
+        bool collected = false;
         bool disposed = false;
     };
 
@@ -170,7 +200,19 @@ namespace quickjs::detail
     {
         if (torn_down_)
             return;
+        // Contexts that outlive the environment must not point at it.
+        for (const auto &record : contexts_)
+        {
+            if (record != nullptr && !record->disposed && (record->live() || record->owns_context))
+                JS_SetContextOpaque(record->ctx, nullptr);
+        }
         contexts_.clear();
+        if (context_link_atom_ != JS_ATOM_NULL)
+            JS_FreeAtom(ctx_, context_link_atom_);
+        if (sandbox_link_atom_ != JS_ATOM_NULL)
+            JS_FreeAtom(ctx_, sandbox_link_atom_);
+        context_link_atom_ = JS_ATOM_NULL;
+        sandbox_link_atom_ = JS_ATOM_NULL;
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ = JS_UNDEFINED;
         torn_down_ = true;
@@ -323,7 +365,7 @@ namespace quickjs::detail
     {
         for (const auto &record : contexts_)
         {
-            if (record != nullptr && !record->disposed && is_same_object(record->sandbox, sandbox))
+            if (record != nullptr && record->live() && is_same_object(record->sandbox, sandbox))
                 return record.get();
         }
         return nullptr;
@@ -333,6 +375,9 @@ namespace quickjs::detail
         JSValueConst sandbox,
         JSValueConst host_defined_option_id)
     {
+        prune_collected_records();
+        if (!ensure_link_atoms())
+            return nullptr;
         JSRuntime *rt = JS_GetRuntime(ctx_);
         JSContext *child_ctx = JS_NewContext(rt);
         if (child_ctx == nullptr)
@@ -352,24 +397,90 @@ namespace quickjs::detail
                                                        child_ctx,
                                                        child_global,
                                                        host_defined_option_id);
+        // The context keeps its global alive; the record borrows it.
+        JS_FreeValue(child_ctx, child_global);
         context_record *raw = record.get();
         contexts_.push_back(std::move(record));
-        if (collect_global_baseline(raw) != napi_ok)
+
+        // A function made in the context keeps the context alive (its realm).
+        // The links are own properties even on a Proxy sandbox: no trap sees
+        // them.
+        bool linked = false;
+        JSValue anchor = JS_NewCFunction(child_ctx, contextify_anchor, "contextify", 0);
+        if (!JS_IsException(anchor))
         {
+            int stored = JS_DefinePropertyValue(ctx_, sandbox, context_link_atom_, anchor,
+                                                k_contextify_link_flags | JS_PROP_NO_EXOTIC);
+            raw->anchored = stored > 0;
+            if (stored > 0)
+                linked = JS_DefinePropertyValue(child_ctx, raw->global, sandbox_link_atom_,
+                                                JS_DupValue(child_ctx, sandbox),
+                                                k_contextify_link_flags | JS_PROP_NO_EXOTIC) > 0;
+            else if (stored == 0)
+                linked = raw->owns_context = true;
+        }
+        linked = linked && JS_AddNativeWeakRefLink(ctx_, sandbox, &raw->sandbox_link,
+                                                   context_record::sandbox_collected, raw) >= 0;
+        if (!linked || collect_global_baseline(raw) != napi_ok)
+        {
+            if (JS_HasException(child_ctx))
+                JS_FreeValue(child_ctx, JS_GetException(child_ctx));
+            JS_SetContextOpaque(child_ctx, nullptr);
+            // A record that owns the context releases it; otherwise drop ours.
+            const bool owned = raw->owns_context;
             destroy_context_record(raw);
+            if (!owned)
+                JS_FreeContext(child_ctx);
             return nullptr;
         }
+        // From here the sandbox (or, when it cannot hold the link, the record)
+        // owns the context.
+        if (!raw->owns_context)
+            JS_FreeContext(child_ctx);
         return raw;
+    }
+
+    void napi_contextify__::unlink_context(context_record *record)
+    {
+        if (record == nullptr || !record->live() || !record->anchored)
+            return;
+        JS_DeleteProperty(ctx_, record->sandbox, context_link_atom_, 0);
+        JS_DeleteProperty(record->ctx, record->global, sandbox_link_atom_, 0);
     }
 
     void napi_contextify__::destroy_context_record(context_record *record)
     {
         if (record == nullptr)
             return;
+        unlink_context(record);
         auto it = std::find_if(contexts_.begin(), contexts_.end(), [record](const auto &entry)
                                { return entry.get() == record; });
         if (it != contexts_.end())
             contexts_.erase(it);
+    }
+
+    // Releases the records of collected sandboxes.
+    void napi_contextify__::prune_collected_records()
+    {
+        contexts_.erase(std::remove_if(contexts_.begin(), contexts_.end(), [](const auto &entry)
+                                       { return entry == nullptr || entry->collected; }),
+                        contexts_.end());
+    }
+
+    bool napi_contextify__::ensure_link_atoms()
+    {
+        if (context_link_atom_ != JS_ATOM_NULL && sandbox_link_atom_ != JS_ATOM_NULL)
+            return true;
+        JSValue context_symbol = JS_NewPrivateSymbol(ctx_, "contextify context");
+        JSValue sandbox_symbol = JS_NewPrivateSymbol(ctx_, "contextify sandbox");
+        if (!JS_IsException(context_symbol) && !JS_IsException(sandbox_symbol))
+        {
+            context_link_atom_ = JS_ValueToAtom(ctx_, context_symbol);
+            sandbox_link_atom_ = JS_ValueToAtom(ctx_, sandbox_symbol);
+        }
+        JS_FreeValue(ctx_, context_symbol);
+        JS_FreeValue(ctx_, sandbox_symbol);
+        return context_link_atom_ != JS_ATOM_NULL && sandbox_link_atom_ != JS_ATOM_NULL;
     }
 
     bool napi_contextify__::compile_trace_enabled() const
@@ -721,6 +832,7 @@ namespace quickjs::detail
         JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
         if (!JS_IsObject(sandbox))
             return napi_invalid_arg;
+        prune_collected_records();
         context_record *record = find_context_record(sandbox);
         if (record == nullptr)
         {
@@ -780,7 +892,7 @@ namespace quickjs::detail
                 return napi_invalid_arg;
             }
             record = find_context_record(napi_quickjs_value_inner(env_, sandbox_or_null));
-            if (record == nullptr || record->disposed)
+            if (record == nullptr || !record->live())
             {
                 env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return napi_invalid_arg;

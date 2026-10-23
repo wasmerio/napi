@@ -13,6 +13,10 @@ napi_value__::napi_value__(napi_env env, JSContext *context, JSValue value, bool
       context_{context},
       value_{owned ? value : JS_DupValue(context, value)}
 {
+  // A contextify context can be collected while its values are still in a
+  // handle scope; each value keeps its context alive instead.
+  if (env_ != nullptr && context_ != nullptr && context_ != env_->main_context())
+    JS_DupContext(context_);
 }
 
 napi_value__::~napi_value__()
@@ -28,7 +32,11 @@ napi_value__::~napi_value__()
   value_ = JS_UNDEFINED;
 
   if (env != nullptr && context != nullptr)
+  {
     JS_FreeValue(context, value);
+    if (context != env->main_context())
+      JS_FreeContext(context);
+  }
 }
 
 bool napi_value__::is_active() const

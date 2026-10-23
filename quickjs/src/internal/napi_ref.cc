@@ -17,7 +17,11 @@ napi_ref__::napi_ref__(napi_env env,
                        JSValueConst value,
                        uint32_t initial_ref_count)
     : env_{env},
-      context_{env == nullptr ? nullptr : env->context()},
+      // Contextify contexts can be collected while a reference lives (a weak
+      // one must not keep its context alive), so references use the main
+      // context, which lives as long as the environment. Its only uses are
+      // runtime-wide: duplicating, freeing and weakly linking the value.
+      context_{env == nullptr ? nullptr : env->main_context()},
       value_{value},
       ref_count_{initial_ref_count}
 {

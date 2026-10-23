@@ -2884,7 +2884,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = env->wrap_value_in_current_scope(slot->context(), slot->dup_inner(), true);
+    *result = env->wrap_value_in_current_scope(slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
