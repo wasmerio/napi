@@ -38,6 +38,10 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
+  // Realm envs go first, while the principal env still accepts calls.
+  if (is_principal())
+    agent_->teardown_realm_envs();
+
   closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   while (!env_cleanup_hooks_.empty())
@@ -119,6 +123,16 @@ void napi_env__::adopt_agent(std::unique_ptr<napi_agent__> agent)
 bool napi_env__::is_principal() const
 {
   return agent_->principal_env() == this;
+}
+
+napi_env napi_env__::parent() const
+{
+  return parent_;
+}
+
+void napi_env__::set_parent(napi_env parent)
+{
+  parent_ = parent;
 }
 
 JSContext *napi_env__::context() const
