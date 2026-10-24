@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -57,11 +58,14 @@ struct napi_callback_info__ {
   virtual void* data() const = 0;
 };
 
+// A realm. It owns nothing but its context: everything else N-API keeps is
+// on its agent and shared by every env of the isolate.
 struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
 
   v8::Local<v8::Context> context() const;
+  // Calls `cb` with this env, in this env's realm.
   void CallFinalizer(node_api_basic_finalize cb, void* data, void* hint);
   void InvokeFinalizerFromGC(napi_ref_tracker__* finalizer);
   void EnqueueFinalizer(napi_ref_tracker__* finalizer);
@@ -71,12 +75,12 @@ struct napi_env__ {
 
   template <typename T, typename... Args>
   T* allocate(Args&&... args) {
-    return factory_.allocate<T>(std::forward<Args>(args)...);
+    return agent->factory->allocate<T>(std::forward<Args>(args)...);
   }
 
   template <typename T>
   void release(T* value) {
-    factory_.release<T>(value);
+    agent->factory->release<T>(value);
   }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -92,36 +96,34 @@ struct napi_env__ {
   std::unique_ptr<napi_agent__> owned_agent;
   // The env's realm. Never changes.
   v8::Global<v8::Context> context_ref;
-  napi::error_state__ error_state;
-  std::vector<void*> open_handle_scope_stack;
-  v8::Global<v8::Value> last_exception;
-  v8::Global<v8::Message> last_exception_message;
-  std::string last_exception_source_line;
-  std::string last_exception_thrown_at;
-  void* instance_data = nullptr;
-  napi_finalize instance_data_finalize_cb = nullptr;
-  void* instance_data_finalize_hint = nullptr;
-  std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
-  uint64_t env_cleanup_hook_counter = 0;
-  std::vector<napi_buffer_record__*> buffer_records;
-  std::unordered_set<napi_external_backing_store_hint__*> external_backing_store_hints;
-  napi_ref_tracker__::RefList reflist;
-  napi_ref_tracker__::RefList finalizing_reflist;
-  std::unordered_set<napi_ref_tracker__*> pending_finalizers;
-  std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
-  bool finalization_scheduled = false;
-  // Realm hooks: unofficial_napi_set_promise_reject_callback and
-  // unofficial_napi_set_promise_hooks (init, before, after, resolve).
-  v8::Global<v8::Function> promise_reject_callback;
-  std::array<v8::Global<v8::Function>, 4> promise_hooks;
+  // The realm's own microtask queue (unofficial_napi_realm_options
+  // .own_microtask_queue); null when it uses the isolate's default queue.
+  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+};
 
-#if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
-  napi::periodic_gate__ lifetime_stats_gate_{2000};
-  napi::periodic_gate__ lifetime_string_symbol_values_gate_{10000};
-#endif
+// The env bound to `context`, or null.
+napi_env NapiV8EnvForContext(v8::Local<v8::Context> context);
+
+// The env of `context`'s realm, else `isolate`'s principal env.
+inline napi_env NapiV8EnvForContextOrPrincipal(v8::Isolate* isolate,
+                                               v8::Local<v8::Context> context) {
+  napi_env env = NapiV8EnvForContext(context);
+  if (env != nullptr) return env;
+  napi_agent__* agent = napi_agent__::From(isolate);
+  return agent != nullptr ? agent->principal_env : nullptr;
+}
+
+// Enters `env`'s realm for V8 calls that create objects in the current
+// context, unless that realm is already current.
+class NapiV8RealmScope {
+ public:
+  explicit NapiV8RealmScope(napi_env env) {
+    v8::Local<v8::Context> context = env->context();
+    if (env->isolate->GetCurrentContext() != context) scope_.emplace(context);
+  }
 
  private:
-  v8impl::detail::napi_factory__ factory_;
+  std::optional<v8::Context::Scope> scope_;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

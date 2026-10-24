@@ -15,11 +15,11 @@ class quickjs_callback_handle_scope__
 public:
   explicit quickjs_callback_handle_scope__(napi_env env)
       : env_{env},
-        parent_{env != nullptr ? env->current_scope() : nullptr},
-        scope_{env != nullptr ? env->create_scope(parent_) : nullptr}
+        parent_{env != nullptr ? env->agent()->current_scope() : nullptr},
+        scope_{env != nullptr ? env->agent()->create_scope(env, parent_) : nullptr}
   {
     if (scope_ != nullptr)
-      env_->set_current_scope(scope_);
+      env_->agent()->set_current_scope(scope_);
   }
 
   ~quickjs_callback_handle_scope__()
@@ -27,9 +27,9 @@ public:
     if (scope_ == nullptr || env_ == nullptr)
       return;
 
-    if (env_->is_current_scope(scope_))
-      env_->set_current_scope(parent_);
-    env_->destroy_scope(scope_);
+    if (env_->agent()->is_current_scope(scope_))
+      env_->agent()->set_current_scope(parent_);
+    env_->agent()->destroy_scope(scope_);
   }
 
   bool is_open() const
@@ -68,7 +68,7 @@ JSValue napi_function__::trampoline(JSContext *caller_ctx,
                                     JSValue *func_data)
 {
   auto env = napi_external__::get_env(func_data[0]);
-  if (!napi_util__::check_env(env) || env->is_closing())
+  if (!napi_util__::check_env(env) || env->agent()->is_closing())
     return JS_ThrowReferenceError(caller_ctx, "Null NAPI env");
   JSContext *ctx = env->context();
 
@@ -117,7 +117,7 @@ JSValue napi_function__::trampoline(JSContext *caller_ctx,
     {
       JS_FreeValue(ctx, effective_this);
       returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-      env->delete_value_from_current_scope(result);
+      env->agent()->delete_value_from_current_scope(result);
     }
     else
     {
@@ -127,7 +127,7 @@ JSValue napi_function__::trampoline(JSContext *caller_ctx,
   else if (result != nullptr)
   {
     returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-    env->delete_value_from_current_scope(result);
+    env->agent()->delete_value_from_current_scope(result);
   }
 
   return returned;
@@ -184,6 +184,6 @@ napi_status napi_function__::create(napi_env env,
                               JS_PROP_CONFIGURABLE);
   }
 
-  *result = env->wrap_value_in_current_scope(fn, true);
+  *result = env->agent()->wrap_value_in_current_scope(fn, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

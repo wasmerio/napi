@@ -59,9 +59,6 @@ typedef struct {
   unofficial_napi_guest_heap guest_heap;
 } unofficial_napi_env_create_options;
 
-typedef void (*unofficial_napi_context_token_callback)(napi_env env,
-                                                       void* token,
-                                                       void* data);
 typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
                                                          void* data);
 typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
@@ -80,25 +77,24 @@ typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
                                                    bool is_heap_oom,
                                                    const char* detail);
 
+// Bits 0 and 1 belonged to the context-token callbacks that version 2 of the
+// hooks struct removed. They are not reused.
 typedef enum {
-  unofficial_napi_env_hook_context_token_assign = 1u << 0,
-  unofficial_napi_env_hook_context_token_unassign = 1u << 1,
   unofficial_napi_env_hook_enqueue_foreground_task = 1u << 2,
   unofficial_napi_env_hook_fatal_error = 1u << 3,
   unofficial_napi_env_hook_oom_error = 1u << 4,
 } unofficial_napi_env_hook;
 
-enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
+enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 2 };
 
 // Immutable embedder callbacks attached as one complete environment state
 // transition. `size` and `version` make additions ABI-compatible. `data` is
 // owned by the embedder and must remain valid until the environment is released.
+// Version 2 removed the context-token callbacks; providers reject version 1.
 typedef struct {
   uint32_t size;
   uint32_t version;
   void* data;
-  unofficial_napi_context_token_callback context_token_assign_callback;
-  unofficial_napi_context_token_callback context_token_unassign_callback;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback;
   unofficial_napi_fatal_error_callback fatal_error_callback;
   unofficial_napi_oom_error_callback oom_error_callback;
@@ -108,10 +104,6 @@ static inline uint64_t unofficial_napi_env_hooks_requested(
     const unofficial_napi_env_hooks* hooks) {
   if (hooks == NULL) return 0;
   uint64_t requested = 0;
-  if (hooks->context_token_assign_callback != NULL)
-    requested |= unofficial_napi_env_hook_context_token_assign;
-  if (hooks->context_token_unassign_callback != NULL)
-    requested |= unofficial_napi_env_hook_context_token_unassign;
   if (hooks->enqueue_foreground_task_callback != NULL)
     requested |= unofficial_napi_env_hook_enqueue_foreground_task;
   if (hooks->fatal_error_callback != NULL)
@@ -133,6 +125,71 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
+
+// Realms. A napi_env is a realm: a global object and its intrinsics. Calls
+// through an env create objects and run code in that realm, and a native
+// function runs in the realm of the env that created it.
+//
+// An env owns nothing else. Values, handle scopes, references, wraps, the
+// pending exception, instance data, cleanup hooks, modules, bytecode and every
+// hook belong to the engine instance the realm lives in, and any env of that
+// instance may be used with them. unofficial_napi_create_env makes an engine
+// instance and its first realm; unofficial_napi_release_env frees the engine
+// instance and all of its realms.
+
+enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
+
+// With a sandbox object, global property access in the new realm reads and
+// writes the sandbox, as with vm.createContext(sandbox). Otherwise the realm
+// gets a fresh global. `name`, `origin` and `host_defined_option_id` may be
+// NULL. The descriptor is observed only for the duration of the call.
+typedef struct {
+  uint32_t size;
+  uint32_t version;
+  napi_value sandbox_or_null;
+  napi_value name;
+  napi_value origin;
+  napi_value host_defined_option_id;
+  bool allow_code_gen_strings;
+  bool allow_code_gen_wasm;
+  bool own_microtask_queue;
+} unofficial_napi_realm_options;
+
+static inline void unofficial_napi_realm_options_init(
+    unofficial_napi_realm_options* options) {
+  if (options == NULL) return;
+#ifdef __cplusplus
+  *options = {};
+#else
+  *options = (unofficial_napi_realm_options){0};
+#endif
+  options->size = sizeof(*options);
+  options->version = UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION;
+  options->allow_code_gen_strings = true;
+  options->allow_code_gen_wasm = true;
+}
+
+// Creates a realm in `parent`'s engine instance and returns its env.
+// `global_out` receives the sandbox when one was given, else the realm's
+// global; it may be NULL. A NULL `options` means the defaults of
+// unofficial_napi_realm_options_init. A sandbox belongs to at most one realm.
+//
+// The env lives until its engine instance is released with
+// unofficial_napi_release_env. Call on the engine instance's thread.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_realm(
+    napi_env parent,
+    const unofficial_napi_realm_options* options_or_null,
+    napi_env* realm_out,
+    napi_value* global_out);
+
+// Returns the env of the realm whose global is `value`: a realm's own global,
+// or the sandbox given to unofficial_napi_create_realm. `*realm_out` is NULL
+// for any other object. Fails with napi_object_expected when `value` is not
+// an object.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_realm(
+    napi_env env,
+    napi_value value,
+    napi_env* realm_out);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage(
     napi_env env);
@@ -584,21 +641,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_notify_datetime_configu
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(napi_env env,
                                                               napi_value* result_out);
 
-// Unofficial helpers for implementing internalBinding('contextify') on embedders.
-// These are engine-specific APIs and are not part of the public Node-API.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context(
-    napi_env env,
-    napi_value sandbox_or_symbol,
-    napi_value name,
-    napi_value origin_or_undefined,
-    bool allow_code_gen_strings,
-    bool allow_code_gen_wasm,
-    bool own_microtask_queue,
-    napi_value host_defined_option_id,
-    napi_value* result_out);
+// Script, function and module compilation. These are engine-specific APIs
+// and are not part of the public Node-API. Each one acts in `env`'s realm: to
+// run code in a vm context, call it through that context's env, made by
+// unofficial_napi_create_realm and found with unofficial_napi_get_realm.
 
-// Provider-owned compiled JavaScript. The handle is bound to its creating
-// environment and must be released explicitly.
+// Provider-owned compiled JavaScript. The handle belongs to the engine
+// instance, so any of its envs may use and release it; it must be released
+// explicitly.
 typedef struct unofficial_napi_bytecode__* unofficial_napi_bytecode;
 
 // A tagged JS source for compile/eval APIs. Providers reject descriptors whose
@@ -693,9 +743,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_release(
     napi_env env,
     unofficial_napi_bytecode bytecode);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
+// Runs a script in `env`'s realm. When that realm has its own microtask queue
+// (unofficial_napi_realm_options.own_microtask_queue), the queue is drained
+// after the script returns.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_run_script(
     napi_env env,
-    napi_value sandbox_or_null,
     const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
@@ -707,13 +759,13 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
     napi_value host_defined_option_id,
     napi_value* result_out);
 
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function(
+// Compiles a function in `env`'s realm, as vm.compileFunction does.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_compile_function(
     napi_env env,
     const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
     int32_t column_offset,
-    napi_value parsing_context_or_undefined,
     napi_value context_extensions_or_undefined,
     napi_value params_or_undefined,
     napi_value host_defined_option_id,
@@ -733,8 +785,10 @@ typedef struct unofficial_napi_module__* unofficial_napi_module;
 
 // Versioned, tagged transaction for creating either kind of module. Keeping
 // creation behind one descriptor gives providers one validation boundary and
-// lets the ABI grow without adding one import per module kind.
-#define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 1u
+// lets the ABI grow without adding one import per module kind. The module
+// lives in `env`'s realm. Version 2 removed `context_or_undefined`; providers
+// reject version 1.
+#define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 2u
 
 typedef enum {
   unofficial_napi_module_source_text = 1,
@@ -759,7 +813,6 @@ typedef struct {
   unofficial_napi_module_kind kind;
   napi_value wrapper;
   napi_value url;
-  napi_value context_or_undefined;
   union {
     unofficial_napi_source_text_module_options source_text;
     unofficial_napi_synthetic_module_options synthetic;
@@ -877,15 +930,17 @@ static_assert(sizeof(unofficial_napi_env_create_options) ==
 static_assert(sizeof(unofficial_napi_runtime_options) ==
               sizeof(unofficial_napi_wasm32_runtime_options_v1));
 static_assert(sizeof(unofficial_napi_env_hooks) ==
-              sizeof(unofficial_napi_wasm32_env_hooks_v1));
+              sizeof(unofficial_napi_wasm32_env_hooks_v2));
 static_assert(sizeof(unofficial_napi_js_source) ==
               sizeof(unofficial_napi_wasm32_js_source));
 static_assert(sizeof(unofficial_napi_bytecode_open_options) ==
               sizeof(unofficial_napi_wasm32_bytecode_open_options_v1));
 static_assert(sizeof(unofficial_napi_module_create_options) ==
-              sizeof(unofficial_napi_wasm32_module_create_options_v1));
+              sizeof(unofficial_napi_wasm32_module_create_options_v2));
 static_assert(sizeof(unofficial_napi_module_hooks) ==
               sizeof(unofficial_napi_wasm32_module_hooks_v1));
+static_assert(sizeof(unofficial_napi_realm_options) ==
+              sizeof(unofficial_napi_wasm32_realm_options_v1));
 #else
 _Static_assert(sizeof(unofficial_napi_env_create_options) ==
                    sizeof(unofficial_napi_wasm32_env_create_options_v1),
@@ -894,7 +949,7 @@ _Static_assert(sizeof(unofficial_napi_runtime_options) ==
                    sizeof(unofficial_napi_wasm32_runtime_options_v1),
                "public runtime-options layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_env_hooks) ==
-                   sizeof(unofficial_napi_wasm32_env_hooks_v1),
+                   sizeof(unofficial_napi_wasm32_env_hooks_v2),
                "public env-hooks layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_js_source) ==
                    sizeof(unofficial_napi_wasm32_js_source),
@@ -903,11 +958,14 @@ _Static_assert(sizeof(unofficial_napi_bytecode_open_options) ==
                    sizeof(unofficial_napi_wasm32_bytecode_open_options_v1),
                "public bytecode-open layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_module_create_options) ==
-                   sizeof(unofficial_napi_wasm32_module_create_options_v1),
+                   sizeof(unofficial_napi_wasm32_module_create_options_v2),
                "public module-create layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_module_hooks) ==
                    sizeof(unofficial_napi_wasm32_module_hooks_v1),
                "public module-hooks layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(unofficial_napi_realm_options) ==
+                   sizeof(unofficial_napi_wasm32_realm_options_v1),
+               "public realm-options layout differs from its wasm32 wire ABI");
 #endif
 #endif
 

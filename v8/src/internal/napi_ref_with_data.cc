@@ -12,7 +12,7 @@ napi_ref_with_data__* napi_ref_with_data__::New(napi_env__* env,
   napi_ref_with_data__* reference = env->allocate<napi_ref_with_data__>(
       env, value, initial_refcount, ownership, data);
   if (reference != nullptr) {
-    reference->Link(&env->reflist);
+    reference->Link(&env->agent->reflist);
   }
   return reference;
 }

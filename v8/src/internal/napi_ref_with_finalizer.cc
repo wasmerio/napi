@@ -22,7 +22,7 @@ napi_ref_with_finalizer__* napi_ref_with_finalizer__::New(
           finalize_data,
           finalize_hint);
   if (reference != nullptr) {
-    reference->Link(&env->finalizing_reflist);
+    reference->Link(&env->agent->finalizing_reflist);
   }
   return reference;
 }

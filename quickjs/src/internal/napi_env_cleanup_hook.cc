@@ -25,7 +25,7 @@ napi_env_cleanup_hook__ *napi_env_cleanup_hook__::create(napi_env env, napi_clea
 {
   if (env == nullptr || env->context() == nullptr || hook == nullptr)
     return nullptr;
-  return env->create_cleanup_hook(hook, arg);
+  return env->agent()->create_cleanup_hook(env, hook, arg);
 }
 
 void napi_env_cleanup_hook__::destroy(napi_env_cleanup_hook__ *entry)
@@ -35,7 +35,7 @@ void napi_env_cleanup_hook__::destroy(napi_env_cleanup_hook__ *entry)
 
   napi_env env = entry->env_;
   if (env != nullptr)
-    env->destroy_cleanup_hook(entry);
+    env->agent()->destroy_cleanup_hook(entry);
 }
 
 void napi_env_cleanup_hook__::run() const

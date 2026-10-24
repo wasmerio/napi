@@ -38,9 +38,9 @@ void DrainFinalizerQueueForegroundTask(napi_env env, void* data) {
 }
 
 void ScheduleFinalizerQueueDrain(napi_env env) {
-  if (env == nullptr || env->finalization_scheduled) return;
+  if (env == nullptr || env->agent->finalization_scheduled) return;
 
-  env->finalization_scheduled = true;
+  env->agent->finalization_scheduled = true;
   napi_agent__* agent = env->agent;
   if (agent != nullptr && agent->enqueue_foreground_task_callback != nullptr) {
     napi_status status = agent->enqueue_foreground_task_callback(
@@ -52,7 +52,7 @@ void ScheduleFinalizerQueueDrain(napi_env env) {
     if (status == napi_ok) return;
   }
 
-  env->finalization_scheduled = false;
+  env->agent->finalization_scheduled = false;
 }
 
 v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
@@ -137,10 +137,10 @@ void RunEnvCleanupHooks(napi_env env) {
     });
   };
 
-  while (!env->env_cleanup_hooks.empty()) {
+  while (!env->agent->env_cleanup_hooks.empty()) {
     std::vector<CleanupHookSnapshot> hooks;
-    hooks.reserve(env->env_cleanup_hooks.size());
-    for (auto* entry : env->env_cleanup_hooks) {
+    hooks.reserve(env->agent->env_cleanup_hooks.size());
+    for (auto* entry : env->agent->env_cleanup_hooks) {
       if (entry != nullptr && entry->hook != nullptr) {
         hooks.push_back({entry->hook, entry->arg, entry->order});
       }
@@ -151,17 +151,17 @@ void RunEnvCleanupHooks(napi_env env) {
                  const CleanupHookSnapshot& b) { return a.order > b.order; });
 
     for (const auto& snapshot : hooks) {
-      auto it = find_hook(env->env_cleanup_hooks, snapshot);
-      if (it == env->env_cleanup_hooks.end()) {
+      auto it = find_hook(env->agent->env_cleanup_hooks, snapshot);
+      if (it == env->agent->env_cleanup_hooks.end()) {
         continue;
       }
 
       snapshot.hook(snapshot.arg);
 
-      it = find_hook(env->env_cleanup_hooks, snapshot);
-      if (it != env->env_cleanup_hooks.end()) {
+      it = find_hook(env->agent->env_cleanup_hooks, snapshot);
+      if (it != env->agent->env_cleanup_hooks.end()) {
         env->release(*it);
-        env->env_cleanup_hooks.erase(it);
+        env->agent->env_cleanup_hooks.erase(it);
       }
     }
   }
@@ -169,7 +169,7 @@ void RunEnvCleanupHooks(napi_env env) {
 
 napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
   if (!CheckEnv(env) || record == nullptr) return nullptr;
-  auto& records = env->buffer_records;
+  auto& records = env->agent->buffer_records;
   for (auto it = records.begin(); it != records.end(); ++it) {
     if (*it == record) {
       records.erase(it);
@@ -239,7 +239,7 @@ void ExternalBackingStoreDeleter(void* data,
     if (env != nullptr) {
       v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
           record_release(env, hint);
-      env->external_backing_store_hints.erase(hint);
+      env->agent->external_backing_store_hints.erase(hint);
       hint->env = nullptr;
     }
     // Claim the callback under the lock so a concurrent teardown sweep cannot
@@ -266,27 +266,27 @@ void FinalizeExternalBackingStoreHints(napi_env env) {
   // Each entry is the callback claimed from one hint, plus its arguments. The
   // hints themselves are not touched after the lock is dropped: a concurrent
   // deleter may already be freeing them.
-  std::vector<std::tuple<napi_finalize, void*, void*>> pending;
+  std::vector<std::tuple<napi_finalize, napi_env, void*, void*>> pending;
   {
     std::lock_guard<std::mutex> lock(ExternalHintsMutex());
     std::unordered_set<napi_external_backing_store_hint__*> hints;
-    hints.swap(env->external_backing_store_hints);
+    hints.swap(env->agent->external_backing_store_hints);
     pending.reserve(hints.size());
     for (auto* hint : hints) {
       if (hint == nullptr) continue;
       v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
           record_release(env, hint);
-      hint->env = nullptr;
       if (hint->finalize_cb != nullptr) {
-        pending.emplace_back(hint->finalize_cb, hint->external_data,
+        pending.emplace_back(hint->finalize_cb, hint->env, hint->external_data,
                              hint->finalize_hint);
         hint->finalize_cb = nullptr;
       }
+      hint->env = nullptr;
     }
   }
 
-  for (auto& [finalize_cb, external_data, finalize_hint] : pending) {
-    finalize_cb(env, external_data, finalize_hint);
+  for (auto& [finalize_cb, hint_env, external_data, finalize_hint] : pending) {
+    finalize_cb(hint_env, external_data, finalize_hint);
   }
 }
 
@@ -309,6 +309,7 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
                                          std::shared_ptr<v8::BackingStore> backing_store,
                                          size_t offset,
                                          size_t length) {
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Object> global = context->Global();
@@ -349,25 +350,25 @@ inline bool CheckValue(napi_env env, napi_value value) {
 
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
 }
 
 void SetLastException(napi_env env,
                       v8::Local<v8::Value> exception,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  env->agent->last_exception.Reset();
+  env->agent->last_exception_message.Reset();
+  env->agent->last_exception_source_line.clear();
+  env->agent->last_exception_thrown_at.clear();
   if (exception.IsEmpty()) return;
 
-  env->last_exception.Reset(env->isolate, exception);
+  env->agent->last_exception.Reset(env->isolate, exception);
   if (!message.IsEmpty()) {
-    env->last_exception_message.Reset(env->isolate, message);
+    env->agent->last_exception_message.Reset(env->isolate, message);
   }
 }
 
@@ -454,9 +455,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->last_exception.IsEmpty();
+  bool pending_exception = !env->agent->last_exception.IsEmpty();
   if (pending_exception) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -474,8 +475,8 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
@@ -494,8 +495,8 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+  if (!env->agent->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
     ClearLastException(env);
   }
 }
@@ -527,32 +528,34 @@ void napi_env__::InvokeFinalizerFromGC(napi_ref_tracker__* finalizer) {
 
 void napi_env__::EnqueueFinalizer(napi_ref_tracker__* finalizer) {
   if (finalizer == nullptr) return;
-  pending_finalizers.emplace(finalizer);
+  agent->pending_finalizers.emplace(finalizer);
   ScheduleFinalizerQueueDrain(this);
 }
 
 void napi_env__::EnqueueBufferFinalizer(napi_buffer_record__* record) {
   if (record == nullptr) return;
-  pending_buffer_finalizers.emplace(record);
+  agent->pending_buffer_finalizers.emplace(record);
   ScheduleFinalizerQueueDrain(this);
 }
 
 void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
-  pending_finalizers.erase(finalizer);
+  agent->pending_finalizers.erase(finalizer);
 }
 
 void napi_env__::DrainFinalizerQueue() {
-  finalization_scheduled = false;
-  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty()) {
-    while (!pending_finalizers.empty()) {
-      napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
-      pending_finalizers.erase(ref_tracker);
+  auto& finalizers = agent->pending_finalizers;
+  auto& buffer_finalizers = agent->pending_buffer_finalizers;
+  agent->finalization_scheduled = false;
+  while (!finalizers.empty() || !buffer_finalizers.empty()) {
+    while (!finalizers.empty()) {
+      napi_ref_tracker__* ref_tracker = *finalizers.begin();
+      finalizers.erase(ref_tracker);
       ref_tracker->Finalize();
     }
 
-    while (!pending_buffer_finalizers.empty()) {
-      napi_buffer_record__* record = *pending_buffer_finalizers.begin();
-      pending_buffer_finalizers.erase(record);
+    while (!buffer_finalizers.empty()) {
+      napi_buffer_record__* record = *buffer_finalizers.begin();
+      buffer_finalizers.erase(record);
       FinalizeBufferRecord(record);
       release(record);
     }
@@ -563,10 +566,23 @@ namespace {
 
 // Isolate data slot that points at the isolate's napi_agent__.
 constexpr uint32_t kNapiAgentDataSlot = 0;
+// Context embedder data slot that points at the context's env. Kept clear of
+// the low slots V8 and debuggers use.
+constexpr int kNapiEnvContextSlot = 33;
 
 }  // namespace
 
-napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
+napi_env NapiV8EnvForContext(v8::Local<v8::Context> context) {
+  if (context.IsEmpty() ||
+      context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(kNapiEnvContextSlot)) {
+    return nullptr;
+  }
+  return static_cast<napi_env>(
+      context->GetAlignedPointerFromEmbedderData(kNapiEnvContextSlot));
+}
+
+napi_agent__::napi_agent__(v8::Isolate* isolate_in)
+    : isolate(isolate_in), factory(std::make_unique<v8impl::detail::napi_factory__>(this)) {
   isolate->SetData(kNapiAgentDataSlot, this);
   isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
@@ -584,6 +600,9 @@ napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
 }
 
 napi_agent__::~napi_agent__() {
+  ReleaseState();
+  last_exception.Reset();
+  last_exception_message.Reset();
   wrap_private_key.Reset();
   buffer_private_key.Reset();
   type_tag_private_key.Reset();
@@ -600,37 +619,61 @@ napi_agent__* napi_agent__::From(v8::Isolate* isolate) {
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
       agent(napi_agent__::From(isolate)),
-      context_ref(isolate, context),
-      factory_(this) {
-  (void)module_api_version;
+      context_ref(isolate, context) {
   if (agent == nullptr) {
     owned_agent = std::make_unique<napi_agent__>(isolate);
     agent = owned_agent.get();
   }
   if (agent->principal_env == nullptr) {
     agent->principal_env = this;
+    agent->module_api_version = module_api_version;
+  } else {
+    agent->realm_envs.push_back(this);
   }
+  context->SetAlignedPointerInEmbedderData(kNapiEnvContextSlot, this);
   napi_v8_clear_last_error(this);
 }
 
 napi_env__::~napi_env__() {
-  NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  RunEnvCleanupHooks(this);
+  // The principal env takes the agent's state and the other realms with it.
+  if (agent != nullptr && agent->principal_env == this) {
+    agent->ReleaseState();
+    agent->principal_env = nullptr;
+  }
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> own_context = context();
+  if (NapiV8EnvForContext(own_context) == this) {
+    own_context->SetAlignedPointerInEmbedderData(kNapiEnvContextSlot, nullptr);
+  }
+}
+
+void napi_agent__::ReleaseState() {
+  napi_env env = principal_env;
+  if (env == nullptr || factory == nullptr) return;
+  NAPI_V8_LIFETIME_DUMP(env, "napi_agent__ teardown begin");
+  RunEnvCleanupHooks(env);
   napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
   napi_ref_tracker__::FinalizeAll(&reflist);
   pending_finalizers.clear();
   pending_buffer_finalizers.clear();
   finalization_scheduled = false;
-  FinalizeExternalBackingStoreHints(this);
-  napi_v8_finalize_buffer_records(this);
-
+  FinalizeExternalBackingStoreHints(env);
+  napi_v8_finalize_buffer_records(env);
   if (instance_data_finalize_cb != nullptr) {
-    instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
+    napi_finalize finalize_cb = instance_data_finalize_cb;
+    instance_data_finalize_cb = nullptr;
+    finalize_cb(instance_data_env, instance_data, instance_data_finalize_hint);
   }
-  if (agent != nullptr && agent->principal_env == this) {
-    agent->principal_env = nullptr;
+  promise_reject_callback.Reset();
+  prepare_stack_trace_callback.Reset();
+  for (auto& hook : promise_hooks) hook.Reset();
+  NAPI_V8_LIFETIME_DUMP(env, "napi_agent__ teardown end");
+  while (!realm_envs.empty()) {
+    napi_env realm = realm_envs.back();
+    realm_envs.pop_back();
+    delete realm;
   }
-  NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
+  factory.reset();
 }
 
 v8::Local<v8::Context> napi_env__::context() const {
@@ -639,11 +682,15 @@ v8::Local<v8::Context> napi_env__::context() const {
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
 bool napi_env__::should_dump_lifetime_stats(int64_t now_ms) {
-  return lifetime_stats_gate_.should_fire(now_ms);
+  return agent->lifetime_stats_gate_.should_fire(now_ms);
 }
 
 bool napi_env__::should_dump_lifetime_string_symbol_values(int64_t now_ms) {
-  return lifetime_string_symbol_values_gate_.should_fire(now_ms);
+  return agent->lifetime_string_symbol_values_gate_.should_fire(now_ms);
+}
+
+napi_env__* napi_v8_lifetime_owner(napi_agent__* agent) {
+  return agent != nullptr ? agent->principal_env : nullptr;
 }
 #endif
 
@@ -651,11 +698,11 @@ napi_status napi_v8_set_last_error(napi_env env,
                                    napi_status status,
                                    const char* message) {
   if (env == nullptr) return status;
-  return env->error_state.set(status, message);
+  return env->agent->error_state.set(status, message);
 }
 
 napi_status napi_v8_clear_last_error(napi_env env) {
-  return env == nullptr ? napi_ok : env->error_state.clear();
+  return env == nullptr ? napi_ok : env->agent->error_state.clear();
 }
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
@@ -670,14 +717,14 @@ v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value) {
 
 void napi_v8_finalize_buffer_records(napi_env env) {
   if (!CheckEnv(env)) return;
-  for (auto* record : env->buffer_records) {
+  for (auto* record : env->agent->buffer_records) {
     if (record != nullptr) {
       FinalizeBufferRecord(record);
       record->holder.Reset();
       env->release(record);
     }
   }
-  env->buffer_records.clear();
+  env->agent->buffer_records.clear();
 }
 
 extern "C" {
@@ -702,7 +749,7 @@ napi_status NAPI_CDECL napi_get_last_error_info(
   if (result == nullptr) return napi_invalid_arg;
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv)) return napi_invalid_arg;
-  *result = napiEnv->error_state.info();
+  *result = napiEnv->agent->error_state.info();
   return napi_ok;
 }
 
@@ -824,12 +871,14 @@ napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* r
 
 napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Object::New(env->isolate));
   return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_array(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate));
   return napi_v8_clear_last_error(env);
 }
@@ -861,6 +910,7 @@ napi_status NAPI_CDECL napi_create_arraybuffer(napi_env env,
                                                void** data,
                                                napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, byte_length);
   if (data != nullptr) *data = ab->Data();
   *result = napi_v8_wrap_value(env, ab);
@@ -875,6 +925,7 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     void* finalize_hint,
     napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
 
   v8::Local<v8::ArrayBuffer> out;
   if (external_data == nullptr && byte_length == 0) {
@@ -897,7 +948,7 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     {
       // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
       std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-      env->external_backing_store_hints.insert(hint.release());
+      env->agent->external_backing_store_hints.insert(hint.release());
     }
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
@@ -999,6 +1050,7 @@ napi_status NAPI_CDECL napi_create_array_with_length(napi_env env,
                                                      size_t length,
                                                      napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate, length));
   return napi_v8_clear_last_error(env);
 }
@@ -1656,19 +1708,19 @@ napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope* r
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   auto* scope = env->allocate<napi_handle_scope__>(env);
   if (scope == nullptr) return napi_generic_failure;
-  env->open_handle_scope_stack.push_back(scope);
+  env->agent->open_handle_scope_stack.push_back(scope);
   *result = scope;
   return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope) {
   if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
-  if (scope->env != env || env->open_handle_scope_stack.empty() ||
-      env->open_handle_scope_stack.back() != scope) {
+  if (scope->env != env || env->agent->open_handle_scope_stack.empty() ||
+      env->agent->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
         env, napi_handle_scope_mismatch, "Handle scope close mismatch");
   }
-  env->open_handle_scope_stack.pop_back();
+  env->agent->open_handle_scope_stack.pop_back();
   v8impl::detail::napi_lifetime_tracker__::record_scope_values_release(env,
                                                                        scope);
   env->release(scope);
@@ -1680,7 +1732,7 @@ napi_status NAPI_CDECL napi_open_escapable_handle_scope(
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   auto* scope = env->allocate<napi_escapable_handle_scope__>(env);
   if (scope == nullptr) return napi_generic_failure;
-  env->open_handle_scope_stack.push_back(scope);
+  env->agent->open_handle_scope_stack.push_back(scope);
   *result = scope;
   return napi_v8_clear_last_error(env);
 }
@@ -1688,12 +1740,12 @@ napi_status NAPI_CDECL napi_open_escapable_handle_scope(
 napi_status NAPI_CDECL napi_close_escapable_handle_scope(
     napi_env env, napi_escapable_handle_scope scope) {
   if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
-  if (scope->env != env || env->open_handle_scope_stack.empty() ||
-      env->open_handle_scope_stack.back() != scope) {
+  if (scope->env != env || env->agent->open_handle_scope_stack.empty() ||
+      env->agent->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
         env, napi_handle_scope_mismatch, "Handle scope close mismatch");
   }
-  env->open_handle_scope_stack.pop_back();
+  env->agent->open_handle_scope_stack.pop_back();
   v8impl::detail::napi_lifetime_tracker__::record_scope_values_release(env,
                                                                        scope);
   env->release(scope);
@@ -2705,6 +2757,7 @@ napi_status NAPI_CDECL napi_throw_error(napi_env env,
                                         const char* code,
                                         const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(
            env->isolate, (msg == nullptr) ? "N-API error" : msg, v8::NewStringType::kNormal)
@@ -2748,6 +2801,7 @@ static napi_status CreateErrorCommon(napi_env env,
   v8::Local<v8::Value> msg_val = napi_v8_unwrap_value(msg);
   if (!msg_val->IsString()) return napi_string_expected;
   v8::Local<v8::String> message = msg_val.As<v8::String>();
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::Value> created = factory(message);
   if (!created->IsObject()) return napi_generic_failure;
   v8::Local<v8::Object> err_obj = created.As<v8::Object>();
@@ -2811,6 +2865,7 @@ napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
                                              const char* code,
                                              const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Type error" : msg,
@@ -2835,6 +2890,7 @@ napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
                                               const char* code,
                                               const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Range error" : msg,
@@ -2859,6 +2915,7 @@ napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
                                                    const char* code,
                                                    const char* msg) {
   if (!CheckEnv(env)) return napi_invalid_arg;
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
   if (!v8::String::NewFromUtf8(env->isolate,
                                (msg == nullptr) ? "Syntax error" : msg,
@@ -2881,22 +2938,22 @@ napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
 
 napi_status NAPI_CDECL napi_is_exception_pending(napi_env env, bool* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = !env->last_exception.IsEmpty();
+  *result = !env->agent->last_exception.IsEmpty();
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
                                                          napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  if (env->last_exception.IsEmpty()) return napi_generic_failure;
-  v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
+  if (env->agent->last_exception.IsEmpty()) return napi_generic_failure;
+  v8::Local<v8::Value> ex = env->agent->last_exception.Get(env->isolate);
   napi_value wrapped = napi_v8_wrap_value(env, ex);
   if (wrapped != nullptr &&
-      env->last_exception_source_line.empty() &&
-      env->last_exception_thrown_at.empty()) {
+      env->agent->last_exception_source_line.empty() &&
+      env->agent->last_exception_thrown_at.empty()) {
     v8::Local<v8::Message> message;
-    if (!env->last_exception_message.IsEmpty()) {
-      message = env->last_exception_message.Get(env->isolate);
+    if (!env->agent->last_exception_message.IsEmpty()) {
+      message = env->agent->last_exception_message.Get(env->isolate);
     }
     if (!message.IsEmpty()) {
       const std::string source_line =
@@ -2915,10 +2972,10 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
     unofficial_napi_internal::PreserveErrorFormatting(
         env,
         ex,
-        env->last_exception_source_line,
-        env->last_exception_thrown_at);
+        env->agent->last_exception_source_line,
+        env->agent->last_exception_thrown_at);
   }
-  env->last_exception_message.Reset();
+  env->agent->last_exception_message.Reset();
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -2930,9 +2987,10 @@ napi_status NAPI_CDECL napi_set_instance_data(node_api_basic_env basic_env,
                                               void* finalize_hint) {
   napi_env env = const_cast<napi_env>(basic_env);
   if (!CheckEnv(env)) return napi_invalid_arg;
-  env->instance_data = data;
-  env->instance_data_finalize_cb = finalize_cb;
-  env->instance_data_finalize_hint = finalize_hint;
+  env->agent->instance_data = data;
+  env->agent->instance_data_env = env;
+  env->agent->instance_data_finalize_cb = finalize_cb;
+  env->agent->instance_data_finalize_hint = finalize_hint;
   return napi_ok;
 }
 
@@ -2940,7 +2998,7 @@ napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
                                               void** data) {
   napi_env env = const_cast<napi_env>(basic_env);
   if (!CheckEnv(env) || data == nullptr) return napi_invalid_arg;
-  *data = env->instance_data;
+  *data = env->agent->instance_data;
   return napi_ok;
 }
 
@@ -2987,8 +3045,8 @@ napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
   if (entry == nullptr) return napi_generic_failure;
   entry->hook = fun;
   entry->arg = arg;
-  entry->order = napiEnv->env_cleanup_hook_counter++;
-  napiEnv->env_cleanup_hooks.push_back(entry);
+  entry->order = napiEnv->agent->env_cleanup_hook_counter++;
+  napiEnv->agent->env_cleanup_hooks.push_back(entry);
   return napi_ok;
 }
 
@@ -2997,7 +3055,7 @@ napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env env,
                                                     void* arg) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
-  auto& hooks = napiEnv->env_cleanup_hooks;
+  auto& hooks = napiEnv->agent->env_cleanup_hooks;
   for (auto it = hooks.begin(); it != hooks.end(); ++it) {
     auto* entry = *it;
     if (entry != nullptr && entry->hook == fun && entry->arg == arg) {
@@ -3032,7 +3090,7 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
-  env->buffer_records.push_back(record);
+  env->agent->buffer_records.push_back(record);
 
   *result = napi_v8_wrap_value(env, buffer_obj);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3080,7 +3138,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   {
     // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
     std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    env->external_backing_store_hints.insert(hint.release());
+    env->agent->external_backing_store_hints.insert(hint.release());
   }
 
   auto* record = env->allocate<napi_buffer_record__>(env);
@@ -3094,7 +3152,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
-  env->buffer_records.push_back(record);
+  env->agent->buffer_records.push_back(record);
 
   *result = napi_v8_wrap_value(env, buffer_obj);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3145,7 +3203,7 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
-  env->buffer_records.push_back(record);
+  env->agent->buffer_records.push_back(record);
 
   *result = napi_v8_wrap_value(env, buffer_obj);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3302,6 +3360,7 @@ node_api_create_object_with_properties(napi_env env,
   if ((property_count > 0) && (property_names == nullptr || property_values == nullptr)) {
     return napi_invalid_arg;
   }
+  NapiV8RealmScope realm_scope(env);
   v8::Local<v8::Object> obj = v8::Object::New(env->isolate);
   if (prototype_or_null != nullptr) {
     v8::Local<v8::Value> proto = napi_v8_unwrap_value(prototype_or_null);

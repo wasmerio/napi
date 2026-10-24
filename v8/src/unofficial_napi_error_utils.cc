@@ -41,10 +41,10 @@ struct ErrorFormattingState {
 };
 
 std::mutex g_error_formatting_mu;
-// Never destroyed: static destructors race concurrent env teardown at process
-// exit (see the runtime-globals comment in unofficial_napi.cc).
-std::unordered_map<napi_env, ErrorFormattingState>& g_error_formatting_states =
-    *new std::unordered_map<napi_env, ErrorFormattingState>();
+// Per agent. Never destroyed: static destructors race concurrent env teardown
+// at process exit (see the runtime-globals comment in unofficial_napi.cc).
+std::unordered_map<napi_agent__*, ErrorFormattingState>& g_error_formatting_states =
+    *new std::unordered_map<napi_agent__*, ErrorFormattingState>();
 
 std::string FormatStackTrace(v8::Isolate* isolate, v8::Local<v8::StackTrace> stack) {
   if (stack.IsEmpty()) return {};
@@ -124,7 +124,7 @@ std::string GetErrorSourceLineForStderrImpl(napi_env env, v8::Local<v8::Message>
   ErrorFormattingState state;
   {
     std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-    auto it = g_error_formatting_states.find(env);
+    auto it = g_error_formatting_states.find(env->agent);
     if (it != g_error_formatting_states.end()) {
       state.source_maps_enabled = it->second.source_maps_enabled;
       if (!it->second.get_source_map_error_source.IsEmpty()) {
@@ -194,7 +194,7 @@ bool TakePreservedErrorFormattingImpl(napi_env env,
   if (env == nullptr || env->isolate == nullptr || raw.IsEmpty()) return false;
 
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  auto it = g_error_formatting_states.find(env);
+  auto it = g_error_formatting_states.find(env->agent);
   if (it == g_error_formatting_states.end()) return false;
 
   ErrorFormattingState& state = it->second;
@@ -249,7 +249,7 @@ void PreserveErrorFormatting(napi_env env,
   if (env == nullptr || env->isolate == nullptr || exception.IsEmpty()) return;
 
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  ErrorFormattingState& state = g_error_formatting_states[env];
+  ErrorFormattingState& state = g_error_formatting_states[env->agent];
   ClearPreservedErrorFormatting(&state);
   state.preserved_exception.Reset(env->isolate, exception);
   state.preserved_exception_line = source_line;
@@ -375,7 +375,7 @@ napi_status ConfigureSourceMaps(napi_env env,
   if (!raw.IsEmpty() && !raw->IsFunction()) return napi_invalid_arg;
 
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  ErrorFormattingState& state = g_error_formatting_states[env];
+  ErrorFormattingState& state = g_error_formatting_states[env->agent];
   state.source_maps_enabled = enabled;
   state.get_source_map_error_source.Reset();
   if (!raw.IsEmpty()) {
@@ -480,7 +480,7 @@ napi_status GetErrorMetadata(napi_env env,
 void ResetErrorFormattingState(napi_env env) {
   if (env == nullptr) return;
   std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-  auto it = g_error_formatting_states.find(env);
+  auto it = g_error_formatting_states.find(env->agent);
   if (it == g_error_formatting_states.end()) return;
   ClearPreservedErrorFormatting(&it->second);
   it->second.get_source_map_error_source.Reset();
