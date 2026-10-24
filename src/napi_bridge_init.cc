@@ -3206,9 +3206,8 @@ extern "C" int snapi_bridge_unofficial_create_realm(SnapiEnvState* parent_state,
 }
 
 // The env state of the realm `value_id` belongs to, or null when that realm
-// has no env. A realm env the provider made on its own (make_context) gets an
-// env state on first lookup; like every env state it lives as long as its
-// agent.
+// has no env. Every realm env a guest can reach was made by
+// snapi_bridge_unofficial_create_realm, so it already has an env state.
 extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
                                                  uint32_t value_id,
                                                  SnapiEnvState** realm_out) {
@@ -3221,21 +3220,12 @@ extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
   napi_status s = unofficial_napi_get_realm(bridge_state->env, value, &realm_env);
   if (s != napi_ok || realm_env == nullptr) return s;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  SnapiAgentState* agent = bridge_state->agent;
-  for (SnapiEnvState* candidate : agent->envs) {
+  for (SnapiEnvState* candidate : bridge_state->agent->envs) {
     if (candidate->env == realm_env) {
       *realm_out = candidate;
-      return napi_ok;
+      break;
     }
   }
-  // The provider only returns envs of the caller's engine instance.
-  auto* state = new (std::nothrow) SnapiEnvState();
-  if (state == nullptr) return napi_generic_failure;
-  state->agent = agent;
-  state->env = realm_env;
-  agent->envs.push_back(state);
-  g_envs.insert(state);
-  *realm_out = state;
   return napi_ok;
 }
 
@@ -3877,47 +3867,8 @@ extern "C" int snapi_bridge_unofficial_contextify_contains_module_syntax(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_contextify_make_context(
+extern "C" int snapi_bridge_unofficial_run_script(
     SnapiEnvState* env_state,
-    uint32_t sandbox_or_symbol_id,
-    uint32_t name_id,
-    uint32_t origin_id,
-    int allow_code_gen_strings,
-    int allow_code_gen_wasm,
-    int own_microtask_queue,
-    uint32_t host_defined_option_id,
-    uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value sandbox_or_symbol = LoadValue(*bridge_state, sandbox_or_symbol_id);
-  napi_value name = LoadValue(*bridge_state, name_id);
-  napi_value origin = origin_id == 0 ? nullptr : LoadValue(*bridge_state, origin_id);
-  napi_value host_defined_option =
-      host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
-  if (sandbox_or_symbol == nullptr || name == nullptr) return napi_invalid_arg;
-  if (origin_id != 0 && origin == nullptr) return napi_invalid_arg;
-  if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
-  napi_value result = nullptr;
-  napi_status s = unofficial_napi_contextify_make_context(
-      env,
-      sandbox_or_symbol,
-      name,
-      origin,
-      allow_code_gen_strings != 0,
-      allow_code_gen_wasm != 0,
-      own_microtask_queue != 0,
-      host_defined_option,
-      &result);
-  if (s != napi_ok) return s;
-  if (result_out != nullptr) *result_out = StoreValue(*bridge_state, result);
-  return napi_ok;
-}
-
-extern "C" int snapi_bridge_unofficial_contextify_run_script(
-    SnapiEnvState* env_state,
-    uint32_t sandbox_or_null_id,
     uint32_t source_text_id,
     uint32_t source_bytecode_id,
     uint32_t filename_id,
@@ -3933,23 +3884,20 @@ extern "C" int snapi_bridge_unofficial_contextify_run_script(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  napi_value sandbox_or_null = sandbox_or_null_id == 0 ? nullptr : LoadValue(*bridge_state, sandbox_or_null_id);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
   unofficial_napi_bytecode source_bytecode =
       LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
   napi_value host_defined_option =
       host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
-  if (sandbox_or_null_id != 0 && sandbox_or_null == nullptr) return napi_invalid_arg;
   if ((source_text == nullptr && source_bytecode == nullptr) || filename == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
   const unofficial_napi_js_source source = source_text != nullptr
                                                ? unofficial_napi_js_source_from_text(source_text)
                                                : unofficial_napi_js_source_from_bytecode(source_bytecode);
   napi_value result = nullptr;
-  napi_status s = unofficial_napi_contextify_run_script(
+  napi_status s = unofficial_napi_run_script(
       env,
-      sandbox_or_null,
       &source,
       filename,
       line_offset,
@@ -3965,14 +3913,13 @@ extern "C" int snapi_bridge_unofficial_contextify_run_script(
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_contextify_compile_function(
+extern "C" int snapi_bridge_unofficial_compile_function(
     SnapiEnvState* env_state,
     uint32_t source_text_id,
     uint32_t source_bytecode_id,
     uint32_t filename_id,
     int32_t line_offset,
     int32_t column_offset,
-    uint32_t parsing_context_id,
     uint32_t context_extensions_id,
     uint32_t params_id,
     uint32_t host_defined_option_id,
@@ -3985,14 +3932,12 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   unofficial_napi_bytecode source_bytecode =
       LoadBytecodeHandle(*bridge_state, source_bytecode_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
-  napi_value parsing_context = parsing_context_id == 0 ? nullptr : LoadValue(*bridge_state, parsing_context_id);
   napi_value context_extensions =
       context_extensions_id == 0 ? nullptr : LoadValue(*bridge_state, context_extensions_id);
   napi_value params = params_id == 0 ? nullptr : LoadValue(*bridge_state, params_id);
   napi_value host_defined_option =
       host_defined_option_id == 0 ? nullptr : LoadValue(*bridge_state, host_defined_option_id);
   if ((source_text == nullptr && source_bytecode == nullptr) || filename == nullptr) return napi_invalid_arg;
-  if (parsing_context_id != 0 && parsing_context == nullptr) return napi_invalid_arg;
   if (context_extensions_id != 0 && context_extensions == nullptr) return napi_invalid_arg;
   if (params_id != 0 && params == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
@@ -4000,13 +3945,12 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
                                                ? unofficial_napi_js_source_from_text(source_text)
                                                : unofficial_napi_js_source_from_bytecode(source_bytecode);
   napi_value result = nullptr;
-  napi_status s = unofficial_napi_contextify_compile_function(
+  napi_status s = unofficial_napi_compile_function(
       env,
       &source,
       filename,
       line_offset,
       column_offset,
-      parsing_context,
       context_extensions,
       params,
       host_defined_option,
@@ -4107,7 +4051,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
     int32_t kind,
     uint32_t wrapper_id,
     uint32_t url_id,
-    uint32_t context_id,
     uint32_t source_text_id,
     uint32_t source_bytecode_id,
     int32_t line_offset,
@@ -4124,7 +4067,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value wrapper = LoadValue(*bridge_state, wrapper_id);
   napi_value url = LoadValue(*bridge_state, url_id);
-  napi_value context = context_id == 0 ? nullptr : LoadValue(*bridge_state, context_id);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
   unofficial_napi_bytecode source_bytecode =
       LoadBytecodeHandle(*bridge_state, source_bytecode_id);
@@ -4136,7 +4078,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
                                         ? nullptr
                                         : LoadValue(*bridge_state, synthetic_eval_steps_id);
   if (wrapper == nullptr || url == nullptr) return napi_invalid_arg;
-  if (context_id != 0 && context == nullptr) return napi_invalid_arg;
   if (host_defined_option_id != 0 && host_defined_option == nullptr) return napi_invalid_arg;
   if (export_names_id != 0 && export_names == nullptr) return napi_invalid_arg;
   if (synthetic_eval_steps_id != 0 && synthetic_eval_steps == nullptr) {
@@ -4150,7 +4091,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
   options.kind = static_cast<unofficial_napi_module_kind>(kind);
   options.wrapper = wrapper;
   options.url = url;
-  options.context_or_undefined = context;
   switch (options.kind) {
     case unofficial_napi_module_source_text:
       if (source_text == nullptr && source_bytecode == nullptr) return napi_invalid_arg;
