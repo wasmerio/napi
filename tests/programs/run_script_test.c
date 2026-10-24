@@ -140,7 +140,6 @@ static int CreateSourceModule(napi_env env, const char* url, const char* text,
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = wrapper;
   options.url = url_value;
-  options.context_or_undefined = undefined;
   options.payload.source_text.source = &source;
   options.payload.source_text.host_defined_option_id = undefined;
   unofficial_napi_module_create_result result = {0};
@@ -346,10 +345,10 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
 
-  // Every code-generation path must select its execution scope explicitly.
-  // In particular, vm compile-function and module compilation must honor the
-  // supplied context rather than falling back to the active environment or
-  // the Wasmer worker's control-plane global.
+  // Every code-generation call runs in its env's realm. In particular, vm
+  // scripts, compiled functions and modules made through a realm env must
+  // not fall back to the parent environment or the Wasmer worker's
+  // control-plane global.
   napi_value undefined_value;
   NAPI_CALL(env, napi_get_undefined(env, &undefined_value));
   napi_value sandbox;
@@ -358,17 +357,13 @@ int main(void) {
   NAPI_CALL(env, napi_create_int32(env, 73, &context_marker));
   NAPI_CALL(env, napi_set_named_property(
                      env, sandbox, "__napi_context_marker", context_marker));
-  napi_value context;
-  NAPI_CALL(env, unofficial_napi_contextify_make_context(
-                     env,
-                     sandbox,
-                     undefined_value,
-                     undefined_value,
-                     true,
-                     true,
-                     true,
-                     undefined_value,
-                     &context));
+  unofficial_napi_realm_options realm_options;
+  unofficial_napi_realm_options_init(&realm_options);
+  realm_options.sandbox_or_null = sandbox;
+  realm_options.own_microtask_queue = true;
+  napi_env context_env = NULL;
+  NAPI_CALL(env, unofficial_napi_create_realm(
+                     env, &realm_options, &context_env, NULL));
 
   napi_value context_source_text;
   NAPI_CALL(env, napi_create_string_utf8(
@@ -379,9 +374,8 @@ int main(void) {
   const unofficial_napi_js_source context_source =
       unofficial_napi_js_source_from_text(context_source_text);
   napi_value context_result;
-  NAPI_CALL(env, unofficial_napi_contextify_run_script(
-                     env,
-                     context,
+  NAPI_CALL(context_env, unofficial_napi_run_script(
+                     context_env,
                      &context_source,
                      undefined_value,
                      0,
@@ -394,7 +388,7 @@ int main(void) {
                      &context_result));
   NAPI_CALL(env, napi_get_value_int32(env, context_result, &marker));
   CHECK_OR_FAIL(marker == 73,
-                "contextify_run_script escaped its explicit context");
+                "run_script escaped its env's realm");
 
   napi_value parameters;
   napi_value context_extensions;
@@ -421,13 +415,12 @@ int main(void) {
   const unofficial_napi_js_source function_source =
       unofficial_napi_js_source_from_text(function_source_text);
   napi_value compiled;
-  NAPI_CALL(env, unofficial_napi_contextify_compile_function(
-                     env,
+  NAPI_CALL(context_env, unofficial_napi_compile_function(
+                     context_env,
                      &function_source,
                      undefined_value,
                      0,
                      0,
-                     context,
                      context_extensions,
                      parameters,
                      undefined_value,
@@ -447,7 +440,7 @@ int main(void) {
                      &function_result));
   NAPI_CALL(env, napi_get_value_int32(env, function_result, &marker));
   CHECK_OR_FAIL(marker == 147,
-                "compile_function escaped its parsing context");
+                "compile_function escaped its env's realm");
 
   napi_value module_wrapper;
   napi_value module_url;
@@ -472,12 +465,11 @@ int main(void) {
   module_options.kind = unofficial_napi_module_source_text;
   module_options.wrapper = module_wrapper;
   module_options.url = module_url;
-  module_options.context_or_undefined = context;
   module_options.payload.source_text.source = &module_source;
   module_options.payload.source_text.host_defined_option_id = undefined_value;
   unofficial_napi_module_create_result module_create_result = {0};
-  NAPI_CALL(env, unofficial_napi_module_wrap_create(
-                     env, &module_options, &module_create_result));
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_create(
+                     context_env, &module_options, &module_create_result));
   unofficial_napi_module module = module_create_result.module;
   CHECK_OR_FAIL(module != NULL,
                 "module compilation did not return a handle");
@@ -488,8 +480,8 @@ int main(void) {
   int32_t module_status = -1;
   napi_value module_error = NULL;
   bool module_has_async_graph = false;
-  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env,
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_get_state(
+                     context_env,
                      module,
                      &module_status,
                      &module_error,
@@ -500,13 +492,13 @@ int main(void) {
                 "module snapshot did not return an undefined error value");
   CHECK_OR_FAIL(!module_has_async_graph,
                 "uninstantiated module reported an async graph");
-  NAPI_CALL(env, unofficial_napi_module_wrap_link(
-                     env, module, 0, NULL));
-  NAPI_CALL(env, unofficial_napi_module_wrap_instantiate(env, module));
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_link(
+                     context_env, module, 0, NULL));
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_instantiate(context_env, module));
   module_status = -1;
   module_has_async_graph = true;
-  NAPI_CALL(env, unofficial_napi_module_wrap_get_state(
-                     env,
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_get_state(
+                     context_env,
                      module,
                      &module_status,
                      NULL,
@@ -516,22 +508,22 @@ int main(void) {
   CHECK_OR_FAIL(!module_has_async_graph,
                 "synchronous module reported an async graph");
   napi_value module_result;
-  NAPI_CALL(env, unofficial_napi_module_wrap_evaluate_sync(
-                     env,
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_evaluate_sync(
+                     context_env,
                      module,
                      module_url,
                      module_url,
                      &module_result));
   napi_value module_namespace;
   napi_value module_observed;
-  NAPI_CALL(env, unofficial_napi_module_wrap_get_namespace(
-                     env, module, &module_namespace));
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_get_namespace(
+                     context_env, module, &module_namespace));
   NAPI_CALL(env, napi_get_named_property(
                      env, module_namespace, "observed", &module_observed));
   NAPI_CALL(env, napi_get_value_int32(env, module_observed, &marker));
   CHECK_OR_FAIL(marker == 73,
-                "module evaluation escaped its explicit context");
-  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
+                "module evaluation escaped its env's realm");
+  NAPI_CALL(context_env, unofficial_napi_module_wrap_destroy(context_env, module));
 
   // Creating the CommonJS facade evaluates the original module internally,
   // so a synthetic module's guest evaluation callback must be able to re-enter
@@ -561,7 +553,6 @@ int main(void) {
   synthetic_options.kind = unofficial_napi_module_synthetic;
   synthetic_options.wrapper = module_wrapper;
   synthetic_options.url = module_url;
-  synthetic_options.context_or_undefined = undefined_value;
   synthetic_options.payload.synthetic.export_names = facade_exports;
   synthetic_options.payload.synthetic.synthetic_evaluation_steps =
       facade_evaluation_steps;
