@@ -277,22 +277,21 @@ TEST_F(Test66UnofficialRealm, SandboxRealmReadsAndWritesTheSandbox) {
   ASSERT_EQ(unofficial_napi_get_realm(s.env, sandbox, &found), napi_ok);
   EXPECT_EQ(found, realm);
 
-  // Running in the realm env with no sandbox argument uses the realm's sandbox.
+  // Running in the realm env reads and writes the realm's sandbox.
   const unofficial_napi_js_source source =
       unofficial_napi_js_source_from_text(Str(s.env, "output = input * 2; input"));
   napi_value result = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_run_script(realm,
-                                                  nullptr,
-                                                  &source,
-                                                  Str(s.env, "sandbox.js"),
-                                                  0,
-                                                  0,
-                                                  -1,
-                                                  true,
-                                                  false,
-                                                  false,
-                                                  nullptr,
-                                                  &result),
+  ASSERT_EQ(unofficial_napi_run_script(realm,
+                                       &source,
+                                       Str(s.env, "sandbox.js"),
+                                       0,
+                                       0,
+                                       -1,
+                                       true,
+                                       false,
+                                       false,
+                                       nullptr,
+                                       &result),
             napi_ok);
   EXPECT_EQ(Int32(s.env, result), 5);
   napi_value output = nullptr;
@@ -301,40 +300,38 @@ TEST_F(Test66UnofficialRealm, SandboxRealmReadsAndWritesTheSandbox) {
   EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof output")), "undefined");
 }
 
-TEST_F(Test66UnofficialRealm, MakeContextCreatesARealmEnv) {
+TEST_F(Test66UnofficialRealm, ScriptsAndFunctionsRunInTheirEnvsRealm) {
   EnvScope s(runtime_.get());
-  napi_value sandbox = nullptr;
-  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
-  napi_value three = nullptr;
-  ASSERT_EQ(napi_create_int32(s.env, 3, &three), napi_ok);
-  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "x", three), napi_ok);
-
-  napi_value name = Str(s.env, "ctx");
-  napi_value contextified = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_make_context(
-                s.env, sandbox, name, nullptr, true, true, false, nullptr, &contextified),
-            napi_ok);
-
-  napi_env realm = nullptr;
-  ASSERT_EQ(unofficial_napi_get_realm(s.env, sandbox, &realm), napi_ok);
+  napi_value realm_global = nullptr;
+  napi_env realm = CreateRealm(s.env, &realm_global);
   ASSERT_NE(realm, nullptr);
-  EXPECT_NE(realm, s.env);
 
-  // The old sandbox argument and the realm env select the same realm.
-  const unofficial_napi_js_source source =
-      unofficial_napi_js_source_from_text(Str(s.env, "x + 1"));
-  napi_value via_sandbox = nullptr;
-  napi_value via_realm = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_run_script(s.env, sandbox, &source, Str(s.env, "a.js"),
-                                                  0, 0, -1, true, false, false, nullptr,
-                                                  &via_sandbox),
+  const unofficial_napi_js_source script =
+      unofficial_napi_js_source_from_text(Str(s.env, "globalThis"));
+  napi_value in_realm = nullptr;
+  napi_value in_parent = nullptr;
+  ASSERT_EQ(unofficial_napi_run_script(realm, &script, Str(s.env, "a.js"), 0, 0, -1, true,
+                                       false, false, nullptr, &in_realm),
             napi_ok);
-  ASSERT_EQ(unofficial_napi_contextify_run_script(realm, nullptr, &source, Str(s.env, "b.js"),
-                                                  0, 0, -1, true, false, false, nullptr,
-                                                  &via_realm),
+  ASSERT_EQ(unofficial_napi_run_script(s.env, &script, Str(s.env, "b.js"), 0, 0, -1, true,
+                                       false, false, nullptr, &in_parent),
             napi_ok);
-  EXPECT_EQ(Int32(s.env, via_sandbox), 4);
-  EXPECT_EQ(Int32(s.env, via_realm), 4);
+  EXPECT_TRUE(StrictEquals(s.env, in_realm, realm_global));
+  EXPECT_TRUE(StrictEquals(s.env, in_parent, Global(s.env)));
+
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source body =
+      unofficial_napi_js_source_from_text(Str(s.env, "return globalThis;"));
+  napi_value compiled = nullptr;
+  ASSERT_EQ(unofficial_napi_compile_function(realm, &body, Str(s.env, "f.js"), 0, 0, undefined,
+                                             undefined, undefined, &compiled),
+            napi_ok);
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, compiled, "function", &fn), napi_ok);
+  napi_value returned = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, undefined, fn, 0, nullptr, &returned), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, returned, realm_global));
 }
 
 TEST_F(Test66UnofficialRealm, PromiseRejectCallbackFallsBackToTheParent) {
@@ -413,7 +410,6 @@ TEST_F(Test66UnofficialRealm, ModulesEvaluateInTheirRealm) {
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = wrapper;
   options.url = Str(realm, "realm.mjs");
-  options.context_or_undefined = undefined;
   options.payload.source_text.source = &source;
   options.payload.source_text.host_defined_option_id = undefined;
   unofficial_napi_module_create_result created{};
@@ -452,7 +448,6 @@ TEST_F(Test66UnofficialRealm, ModuleHandlesWorkThroughAnyEnvOfTheAgent) {
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = wrapper;
   options.url = Str(s.env, "shared.mjs");
-  options.context_or_undefined = undefined;
   options.payload.source_text.source = &source;
   options.payload.source_text.host_defined_option_id = undefined;
   unofficial_napi_module_create_result created{};
@@ -609,9 +604,8 @@ TEST_F(Test66UnofficialRealm, OwnMicrotaskQueueDrainsAfterEvaluationInTheRealm) 
   const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(
       Str(realm, "globalThis.ran = 0; Promise.resolve().then(() => { ran = 1; }); 0"));
   napi_value result = nullptr;
-  ASSERT_EQ(unofficial_napi_contextify_run_script(realm, nullptr, &source, Str(realm, "q.js"),
-                                                  0, 0, -1, true, false, false, nullptr,
-                                                  &result),
+  ASSERT_EQ(unofficial_napi_run_script(realm, &source, Str(realm, "q.js"), 0, 0, -1, true,
+                                       false, false, nullptr, &result),
             napi_ok);
   EXPECT_EQ(Int32(realm, Eval(realm, "ran")), 1);
 }

@@ -182,8 +182,8 @@
     },
     {
       "name": "test_realm",
-      "description": "Realm envs: own globals, shared values, callbacks in their realm, get_realm, sandbox and make_context realms, release with live realms",
-      "expected_stdout": "realm has its own global\nvalues cross envs: x=7\ncallback saw the realm env and the realm global\nget_realm finds both envs\nsandbox realm: input=5 output=10\nmake_context realm env: x+1=4\nreleased an env with live realm envs\nTEST_REALM_OK=1\n"
+      "description": "Realm envs: own globals, shared values, callbacks in their realm, get_realm, sandbox realms, modules and vm calls through realm envs (and the legacy imports on wasm), release with live realms",
+      "expected_stdout": "realm has its own global\nvalues cross envs: x=7\ncallback saw the realm env and the realm global\nget_realm finds both envs\nsandbox realm: input=5 output=10\nrealm module through the parent env: tag=21\nvm results: run=4 function=30 module=5\nreleased an env with live realm envs\nTEST_REALM_OK=1\n"
     }
   ]
 }
