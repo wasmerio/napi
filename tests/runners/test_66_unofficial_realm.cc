@@ -143,6 +143,15 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = number;
   EXPECT_NE(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+
+  // A sandbox belongs to one realm.
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  options.sandbox_or_null = sandbox;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  napi_env second = nullptr;
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, &second, nullptr), napi_invalid_arg);
+  EXPECT_EQ(second, nullptr);
 }
 
 TEST_F(Test66UnofficialRealm, RealmHasItsOwnGlobal) {
@@ -590,6 +599,11 @@ TEST_F(Test66UnofficialRealm, PrepareStackTraceFallsBackToTheParent) {
                 realm, Eval(realm, "() => 'realm stack'")),
             napi_ok);
   EXPECT_EQ(Utf8(realm, Eval(realm, "new Error('x').stack")), "realm stack");
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "new Error('x').stack")), "parent stack");
+
+  // Clearing the realm's callback falls back to the parent's again.
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(realm, nullptr), napi_ok);
+  EXPECT_EQ(Utf8(realm, Eval(realm, "new Error('x').stack")), "parent stack");
   EXPECT_EQ(Utf8(s.env, Eval(s.env, "new Error('x').stack")), "parent stack");
 }
 
