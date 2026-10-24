@@ -38,7 +38,7 @@ napi_deferred__ *napi_deferred__::create(napi_env env, JSValue resolve, JSValue 
 {
   if (env == nullptr)
     return nullptr;
-  return env->create_deferred(resolve, reject);
+  return env->agent()->create_deferred(env, resolve, reject);
 }
 
 void napi_deferred__::destroy(napi_deferred__ *deferred)
@@ -48,7 +48,7 @@ void napi_deferred__::destroy(napi_deferred__ *deferred)
 
   napi_env env = deferred->env_;
   if (env != nullptr)
-    env->destroy_deferred(deferred);
+    env->agent()->destroy_deferred(deferred);
 }
 
 JSValue napi_deferred__::call_resolve(napi_value resolution)

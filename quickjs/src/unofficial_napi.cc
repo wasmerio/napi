@@ -4,7 +4,6 @@
 #include "internal/napi_serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
-#include "internal/napi_promises.h"
 #include "internal/napi_util.h"
 #include "internal/napi_shared_array_buffer.h"
 #include "internal/quickjs_trace.h"
@@ -35,27 +34,12 @@ namespace
     bool g_runtime_configured = false;
     std::string g_runtime_engine_flags;
 
-    // The owner handle: the runtime, its main context, the agent and the
-    // principal env.
+    // The owner handle: the runtime and its agent.
     struct UnofficialEnvScope
     {
         JSRuntime *rt = nullptr;
-        JSContext *ctx = nullptr;
         std::unique_ptr<napi_agent__> agent;
-        napi_env env = nullptr;
     };
-
-    napi_status DestroyEnvInstance(napi_env env)
-    {
-        if (env == nullptr)
-            return napi_invalid_arg;
-
-        JSContext *ctx = env->context();
-        env->agent()->clear_promise_hooks();
-        JS_SetContextOpaque(ctx, nullptr);
-        env->prepare_teardown();
-        return napi_ok;
-    }
 
     napi_status ReleaseEnvScope(unofficial_napi_env_owner owner)
     {
@@ -63,31 +47,14 @@ namespace
             return napi_invalid_arg;
 
         auto *scope = reinterpret_cast<UnofficialEnvScope *>(owner);
-        napi_status status = napi_ok;
-        napi_env env_to_delete = nullptr;
-        if (scope->env != nullptr)
-        {
-            env_to_delete = scope->env;
-            status = DestroyEnvInstance(scope->env);
-            scope->env = nullptr;
-        }
-        if (scope->ctx != nullptr)
-        {
-            JS_FreeContext(scope->ctx);
-            scope->ctx = nullptr;
-        }
-        if (scope->rt != nullptr)
-        {
-            JS_FreeRuntime(scope->rt);
-            scope->rt = nullptr;
-        }
-        if (env_to_delete != nullptr)
-        {
-            env_to_delete->finalize_instance_data();
-        }
-        delete env_to_delete;
+        // Frees every realm's JSContext too.
+        scope->agent->teardown();
+        // Freeing the runtime may still finalize externals, which reach their
+        // env through the agent.
+        JS_FreeRuntime(scope->rt);
+        scope->agent->finalize_instance_data();
         delete scope;
-        return status;
+        return napi_ok;
     }
 
     bool EnsureSymbolProperty(JSContext *ctx,
@@ -141,34 +108,11 @@ namespace
         return ok;
     }
 
-    // Makes the env for `context` on `agent`; the first env becomes the
-    // agent's principal env.
-    napi_status CreateEnvOnAgent(napi_agent__ *agent,
-                                 JSContext *context,
-                                 int32_t module_api_version,
-                                 napi_env *result)
+    JSValue RunMicrotask(JSContext *ctx, int argc, JSValueConst *argv)
     {
-        auto rt = JS_GetRuntime(context);
-        if (0 != napi_external__::register_class(rt))
-            return napi_generic_failure;
-        if (!EnsureNodeWellKnownSymbols(context))
-            return JS_HasException(context) ? napi_pending_exception : napi_generic_failure;
-
-        auto env = new (std::nothrow) napi_env__{agent, context, module_api_version};
-        if (env == nullptr)
-            return napi_generic_failure;
-        if (env->root_scope() == nullptr)
-        {
-            delete env;
-            return napi_generic_failure;
-        }
-
-        JS_SetContextOpaque(context, env);
-        agent->attach_promise_hook();
-        agent->attach_module_hooks();
-
-        *result = env;
-        return napi_ok;
+        if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+            return JS_UNDEFINED;
+        return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, nullptr);
     }
 }
 
@@ -234,25 +178,6 @@ extern "C"
         return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
     }
 
-    napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
-        JSContext *context, int32_t module_api_version, napi_env *result)
-    {
-        if (result == nullptr || context == nullptr)
-            return napi_invalid_arg;
-
-        // No owner handle exists on this path, so the env owns its agent.
-        std::unique_ptr<napi_agent__> agent{new (std::nothrow) napi_agent__{JS_GetRuntime(context)}};
-        if (agent == nullptr)
-            return napi_generic_failure;
-        napi_env env = nullptr;
-        napi_status status = CreateEnvOnAgent(agent.get(), context, module_api_version, &env);
-        if (status != napi_ok)
-            return status;
-        env->adopt_agent(std::move(agent));
-        *result = env;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_create_env(
         int32_t module_api_version,
         const unofficial_napi_env_create_options *options,
@@ -309,34 +234,24 @@ extern "C"
             return napi_generic_failure;
         }
 
-        auto scope = new (std::nothrow) UnofficialEnvScope{.rt = rt, .ctx = ctx};
+        (void)module_api_version;
+        auto *scope = new (std::nothrow) UnofficialEnvScope{.rt = rt};
         if (scope != nullptr)
-        {
             scope->agent.reset(new (std::nothrow) napi_agent__{rt});
-            if (scope->agent == nullptr)
-            {
-                delete scope;
-                scope = nullptr;
-            }
-        }
-        if (scope == nullptr)
+        napi_env env = nullptr;
+        if (scope != nullptr && scope->agent != nullptr &&
+            napi_external__::register_class(rt) == 0 && EnsureNodeWellKnownSymbols(ctx))
+            env = scope->agent->add_realm(ctx);
+        if (env == nullptr)
         {
+            delete scope;
             JS_FreeContext(ctx);
             JS_FreeRuntime(rt);
             return napi_generic_failure;
         }
 
-        auto status = CreateEnvOnAgent(scope->agent.get(), ctx, module_api_version, &scope->env);
-        if (status != napi_ok || scope->env == nullptr)
-        {
-            delete scope;
-            JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
-            return (status == napi_ok) ? napi_generic_failure : status;
-        }
-
         *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
-        *env_out = scope->env;
+        *env_out = env;
 
         return napi_ok;
     }
@@ -349,7 +264,7 @@ extern "C"
         if (!napi_util__::check_env(env) || hooks == nullptr || accepted_hooks_out == nullptr ||
             hooks->size < sizeof(unofficial_napi_env_hooks) ||
             hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
-            !env->attach_embedder_hooks(*hooks))
+            !env->agent()->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
         // QuickJS currently drives none of the remaining provider-owned hook
         // classes. Attaching the transaction is valid, but no capability is
@@ -364,6 +279,86 @@ extern "C"
     {
         (void)loop;
         return ReleaseEnvScope(owner);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_create_realm(
+        napi_env parent,
+        const unofficial_napi_realm_options *options,
+        napi_env *realm_out,
+        napi_value *global_out)
+    {
+        if (!napi_util__::check_env(parent) || parent->agent()->is_closing() || realm_out == nullptr)
+            return napi_invalid_arg;
+        if (options != nullptr &&
+            (options->size < sizeof(*options) ||
+             options->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION))
+            return napi_invalid_arg;
+        *realm_out = nullptr;
+
+        // QuickJS has no per-realm code-generation switch or microtask queue,
+        // and name, origin and the host-defined option only label the realm.
+        // Those options are accepted and have no effect.
+        napi_agent__ *agent = parent->agent();
+        JSValueConst sandbox = JS_UNDEFINED;
+        if (options != nullptr && options->sandbox_or_null != nullptr)
+        {
+            sandbox = napi_quickjs_value_inner(parent, options->sandbox_or_null);
+            if (JS_IsNull(sandbox) || JS_IsUndefined(sandbox))
+                sandbox = JS_UNDEFINED;
+            else if (!JS_IsObject(sandbox))
+                return napi_invalid_arg;
+        }
+        // A sandbox belongs to one realm; the principal global may still be one.
+        napi_env existing = JS_IsObject(sandbox) ? agent->env_for_global(sandbox) : nullptr;
+        if (existing != nullptr && existing != agent->principal_env())
+            return napi_invalid_arg;
+
+        JSContext *ctx = JS_NewContext(agent->runtime());
+        if (ctx == nullptr)
+            return napi_generic_failure;
+        if (!EnsureNodeWellKnownSymbols(ctx))
+        {
+            napi_status status = napi_util__::return_pending_if_caught(parent, "Failed to set up realm");
+            JS_FreeContext(ctx);
+            return status == napi_ok ? napi_generic_failure : status;
+        }
+        // From here on the agent owns the context.
+        napi_env realm = agent->add_realm(ctx);
+        if (realm == nullptr)
+        {
+            JS_FreeContext(ctx);
+            return napi_generic_failure;
+        }
+        if (JS_IsObject(sandbox))
+        {
+            napi_status status = agent->contextify().add_sandbox(parent, realm, sandbox);
+            if (status != napi_ok)
+                return status;
+        }
+
+        if (global_out != nullptr)
+        {
+            JSValue global = JS_IsObject(sandbox) ? JS_DupValue(ctx, sandbox) : JS_GetGlobalObject(ctx);
+            *global_out = agent->wrap_value_in_current_scope(global, true);
+            if (*global_out == nullptr)
+                return napi_generic_failure;
+        }
+        *realm_out = realm;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_realm(
+        napi_env env,
+        napi_value value,
+        napi_env *realm_out)
+    {
+        if (!napi_util__::check_env(env) || value == nullptr || realm_out == nullptr)
+            return napi_invalid_arg;
+        JSValueConst raw = napi_quickjs_value_inner(env, value);
+        if (!JS_IsObject(raw))
+            return napi_object_expected;
+        *realm_out = env->agent()->env_for_global(raw);
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env)
@@ -400,9 +395,11 @@ extern "C"
         if (status != napi_ok)
             return status;
         if (state_out != nullptr)
-            *state_out = env->module_wrap().has_pending_provider_work()
+        {
+            *state_out = env->agent()->module_wrap().has_pending_provider_work()
                              ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
                              : unofficial_napi_event_loop_checkpoint_state_none;
+        }
         return napi_ok;
     }
 
@@ -459,7 +456,7 @@ extern "C"
             return napi_invalid_arg;
         JSContext *ctx = napi_util__::context(env);
         JSValueConst argv[] = {napi_quickjs_value_inner(env, callback)};
-        if (JS_EnqueueJob(ctx, napi_promises__::microtask_job, 1, argv) < 0)
+        if (JS_EnqueueJob(ctx, RunMicrotask, 1, argv) < 0)
             return JS_HasException(ctx) ? napi_pending_exception : napi_generic_failure;
         return napi_ok;
     }
@@ -469,11 +466,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        napi_status status = env->promises().set_reject_callback(callback);
-        if (status != napi_ok)
-            return status;
-        env->agent()->set_rejection_tracking(env->promises().has_reject_callback());
-        return napi_ok;
+        return env->agent()->set_promise_reject_callback(env, callback);
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
@@ -484,11 +477,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        napi_status status = env->promises().set_hooks(init, before, after, resolve);
-        if (status != napi_ok)
-            return status;
-        env->agent()->attach_promise_hook();
-        return napi_ok;
+        return env->agent()->set_promise_hooks(env, init, before, after, resolve);
     }
 
     napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
@@ -536,14 +525,14 @@ extern "C"
         unofficial_napi_error_metadata_mode mode,
         unofficial_napi_error_metadata *out)
     {
-        return napi_util__::check_env(env) ? env->contextify().get_error_metadata(error, mode, out) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->agent()->contextify().get_error_metadata(error, mode, out) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
         napi_env env,
         napi_value error)
     {
-        return napi_util__::check_env(env) ? env->contextify().preserve_error_source_message(error) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->agent()->contextify().preserve_error_source_message(error) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_configure_source_maps(
@@ -551,7 +540,7 @@ extern "C"
         bool enabled,
         napi_value callback)
     {
-        return napi_util__::check_env(env) ? env->contextify().configure_source_maps(enabled, callback) : napi_invalid_arg;
+        return napi_util__::check_env(env) ? env->agent()->contextify().configure_source_maps(enabled, callback) : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
@@ -587,8 +576,8 @@ extern "C"
         {
             JSValue exception = JS_GetException(ctx);
             JS_FreeValue(ctx, exception);
-            *target_out = env->wrap_value_in_current_scope(JS_NULL, true);
-            *handler_out = env->wrap_value_in_current_scope(JS_NULL, true);
+            *target_out = env->agent()->wrap_value_in_current_scope(JS_NULL, true);
+            *handler_out = env->agent()->wrap_value_in_current_scope(JS_NULL, true);
             return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
@@ -598,13 +587,13 @@ extern "C"
             JS_FreeValue(ctx, target);
             JSValue exception = JS_GetException(ctx);
             JS_FreeValue(ctx, exception);
-            *target_out = env->wrap_value_in_current_scope(JS_NULL, true);
-            *handler_out = env->wrap_value_in_current_scope(JS_NULL, true);
+            *target_out = env->agent()->wrap_value_in_current_scope(JS_NULL, true);
+            *handler_out = env->agent()->wrap_value_in_current_scope(JS_NULL, true);
             return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
-        *target_out = env->wrap_value_in_current_scope(target, true);
-        *handler_out = env->wrap_value_in_current_scope(handler, true);
+        *target_out = env->agent()->wrap_value_in_current_scope(target, true);
+        *handler_out = env->agent()->wrap_value_in_current_scope(handler, true);
         return (*target_out == nullptr || *handler_out == nullptr) ? napi_generic_failure : napi_ok;
     }
 
@@ -1111,31 +1100,8 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
+    napi_status NAPI_CDECL unofficial_napi_run_script(
         napi_env env,
-        napi_value sandbox_or_symbol,
-        napi_value name,
-        napi_value origin_or_undefined,
-        bool allow_code_gen_strings,
-        bool allow_code_gen_wasm,
-        bool own_microtask_queue,
-        napi_value host_defined_option_id,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().make_context(sandbox_or_symbol,
-                                                              name,
-                                                              origin_or_undefined,
-                                                              allow_code_gen_strings,
-                                                              allow_code_gen_wasm,
-                                                              own_microtask_queue,
-                                                              host_defined_option_id,
-                                                              result_out)
-                             : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
-        napi_env env,
-        napi_value sandbox_or_null,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
@@ -1147,8 +1113,7 @@ extern "C"
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().run_script(sandbox_or_null,
-                                                            source,
+        return napi_util__::check_env(env) ? env->agent()->contextify().run_script(env, source,
                                                             filename,
                                                             line_offset,
                                                             column_offset,
@@ -1179,7 +1144,7 @@ extern "C"
             options->cache_byte_length != 0)
         {
             bool rejected = false;
-            napi_status status = env->contextify().bytecode_deserialize(options->cache_bytes,
+            napi_status status = env->agent()->contextify().bytecode_deserialize(env, options->cache_bytes,
                                                                         options->cache_byte_length,
                                                                         options->source_text,
                                                                         options->filename,
@@ -1204,7 +1169,7 @@ extern "C"
             options->cache_policy == unofficial_napi_bytecode_cache_validate_only)
             return napi_ok;
         bool can_parse_as_module = false;
-        napi_status status = env->contextify().bytecode_compile(options->source_text,
+        napi_status status = env->agent()->contextify().bytecode_compile(env, options->source_text,
                                                                 options->filename,
                                                                 options->shape,
                                                                 options->params_or_undefined,
@@ -1222,34 +1187,32 @@ extern "C"
         unofficial_napi_bytecode bytecode,
         napi_value *buffer_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_serialize(bytecode, buffer_out)
+        return napi_util__::check_env(env) ? env->agent()->contextify().bytecode_serialize(bytecode, buffer_out)
                              : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_bytecode_release(
         napi_env env, unofficial_napi_bytecode bytecode)
     {
-        return napi_util__::check_env(env) ? env->contextify().bytecode_release(bytecode)
+        return napi_util__::check_env(env) ? env->agent()->contextify().bytecode_release(bytecode)
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
+    napi_status NAPI_CDECL unofficial_napi_compile_function(
         napi_env env,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
         int32_t column_offset,
-        napi_value parsing_context_or_undefined,
         napi_value context_extensions_or_undefined,
         napi_value params_or_undefined,
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().compile_function(source,
+        return napi_util__::check_env(env) ? env->agent()->contextify().compile_function(env, source,
                                                                   filename,
                                                                   line_offset,
                                                                   column_offset,
-                                                                  parsing_context_or_undefined,
                                                                   context_extensions_or_undefined,
                                                                   params_or_undefined,
                                                                   host_defined_option_id,
@@ -1265,7 +1228,7 @@ extern "C"
         bool cjs_var_in_scope,
         bool *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().contains_module_syntax(code,
+        return napi_util__::check_env(env) ? env->agent()->contextify().contains_module_syntax(code,
                                                                         filename,
                                                                         resource_name_or_undefined,
                                                                         cjs_var_in_scope,
@@ -1284,14 +1247,14 @@ extern "C"
             result_out == nullptr)
             return napi_invalid_arg;
         *result_out = {};
+        // The module lives in env's realm.
         napi_status status = napi_invalid_arg;
         switch (options->kind)
         {
         case unofficial_napi_module_source_text:
-            status = env->module_wrap().create_source_text(
+            status = env->agent()->module_wrap().create_source_text(env, 
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.source_text.source,
                 options->payload.source_text.line_offset,
                 options->payload.source_text.column_offset,
@@ -1299,10 +1262,9 @@ extern "C"
                 &result_out->module);
             break;
         case unofficial_napi_module_synthetic:
-            status = env->module_wrap().create_synthetic(
+            status = env->agent()->module_wrap().create_synthetic(env, 
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.synthetic.export_names,
                 options->payload.synthetic.synthetic_evaluation_steps,
                 &result_out->module);
@@ -1312,13 +1274,13 @@ extern "C"
         }
         if (status != napi_ok)
             return status;
-        status = env->module_wrap().get_creation_metadata(
+        status = env->agent()->module_wrap().get_creation_metadata(
             result_out->module,
             &result_out->module_requests,
             &result_out->has_top_level_await);
         if (status != napi_ok)
         {
-            env->module_wrap().destroy(result_out->module);
+            env->agent()->module_wrap().destroy(result_out->module);
             *result_out = {};
         }
         return status;
@@ -1330,7 +1292,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        return env->module_wrap().destroy(module);
+        return env->agent()->module_wrap().destroy(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
@@ -1341,7 +1303,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().link(module, count, linked_modules);
+        return env->agent()->module_wrap().link(module, count, linked_modules);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
@@ -1350,7 +1312,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().instantiate(module);
+        return env->agent()->module_wrap().instantiate(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
@@ -1364,7 +1326,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate(module, timeout, break_on_sigint, result_out);
+        return env->agent()->module_wrap().evaluate(module, timeout, break_on_sigint, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
@@ -1378,7 +1340,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate_sync(module, filename, parent_filename, result_out);
+        return env->agent()->module_wrap().evaluate_sync(module, filename, parent_filename, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
@@ -1390,7 +1352,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_namespace(module, result_out);
+        return env->agent()->module_wrap().get_namespace(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
@@ -1406,7 +1368,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_state(
+        return env->agent()->module_wrap().get_state(
             module, status_out, error_out, has_async_graph_out);
     }
 
@@ -1418,7 +1380,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr || settled_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().check_unsettled_top_level_await(module,
+        return env->agent()->module_wrap().check_unsettled_top_level_await(module,
                                                                   warnings,
                                                                   settled_out);
     }
@@ -1431,7 +1393,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_export(module, export_name, export_value);
+        return env->agent()->module_wrap().set_export(module, export_name, export_value);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_module_source_object(
@@ -1441,7 +1403,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_module_source_object(module, source_object);
+        return env->agent()->module_wrap().set_module_source_object(module, source_object);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_source_object(
@@ -1453,7 +1415,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_module_source_object(module, result_out);
+        return env->agent()->module_wrap().get_module_source_object(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
@@ -1463,7 +1425,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_cached_data(module, result_out);
+        return env->agent()->module_wrap().create_cached_data(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
@@ -1472,7 +1434,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || hooks == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_hooks(hooks);
+        return env->agent()->module_wrap().set_hooks(hooks);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade(
@@ -1484,17 +1446,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_required_module_facade(module, result_out);
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env)
-    {
-        if (env == nullptr)
-            return napi_invalid_arg;
-        JSContext *ctx = env->context();
-        napi_status status = DestroyEnvInstance(env);
-        JS_FreeContext(ctx);
-        return status;
+        return env->agent()->module_wrap().create_required_module_facade(module, result_out);
     }
 
 } // extern "C"

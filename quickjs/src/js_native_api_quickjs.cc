@@ -143,7 +143,7 @@ extern "C"
     auto *napiEnv = const_cast<napi_env>(env);
     if (!napi_util__::check_env(napiEnv))
       return napi_invalid_arg;
-    *result = napiEnv->last_error_info();
+    *result = napiEnv->agent()->last_error_info();
     return napi_ok;
   }
 
@@ -151,7 +151,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_UNDEFINED, true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_UNDEFINED, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -159,7 +159,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NULL, true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NULL, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -168,7 +168,7 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
     auto context = env->context();
-    *result = env->wrap_value_in_current_scope(JS_GetGlobalObject(context), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_GetGlobalObject(context), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -178,7 +178,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewBool(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewBool(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -188,7 +188,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewFloat64(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewFloat64(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -198,7 +198,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewInt32(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewInt32(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -208,7 +208,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewInt64(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewInt64(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -218,7 +218,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewUint32(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewUint32(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -228,7 +228,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewBigInt64(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewBigInt64(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -238,7 +238,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewBigUint64(env->context(), value), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewBigUint64(env->context(), value), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -271,7 +271,7 @@ extern "C"
 
     if (used_words == 0)
     {
-      *result = env->wrap_value_in_current_scope(JS_NewBigInt64(env->context(), 0), true);
+      *result = env->agent()->wrap_value_in_current_scope(JS_NewBigInt64(env->context(), 0), true);
       return (*result == nullptr) ? napi_generic_failure : napi_ok;
     }
 
@@ -299,7 +299,7 @@ extern "C"
     if (JS_IsException(bigint))
       return napi_util__::return_pending_if_caught(env, "Failed to create BigInt from words");
 
-    *result = env->wrap_value_in_current_scope(bigint, true);
+    *result = env->agent()->wrap_value_in_current_scope(bigint, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -312,7 +312,7 @@ extern "C"
     {
       return napi_util__::return_pending_if_caught(env, "Failed to create date");
     }
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -320,7 +320,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewObject(env->context()), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewObject(env->context()), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -328,7 +328,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    *result = env->wrap_value_in_current_scope(JS_NewArray(env->context()), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewArray(env->context()), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -347,7 +347,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Failed to create external object");
     }
 
-    *result = env->wrap_value_in_current_scope(obj, true);
+    *result = env->agent()->wrap_value_in_current_scope(obj, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -391,7 +391,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Failed to create array buffer");
     }
 
-    *result = env->wrap_value_in_current_scope(ab, true);
+    *result = env->agent()->wrap_value_in_current_scope(ab, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -441,7 +441,7 @@ extern "C"
       }
     }
 
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -479,7 +479,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Failed to create TypedArray");
     }
 
-    *result = env->wrap_value_in_current_scope(view, true);
+    *result = env->agent()->wrap_value_in_current_scope(view, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -564,7 +564,7 @@ extern "C"
 
     if (arraybuffer != nullptr)
     {
-      *arraybuffer = env->wrap_value_in_current_scope(abuf, true);
+      *arraybuffer = env->agent()->wrap_value_in_current_scope(abuf, true);
       if (*arraybuffer == nullptr)
       {
         JS_FreeValue(env->context(), abuf);
@@ -672,7 +672,7 @@ extern "C"
       }
     }
 
-    *result = env->wrap_value_in_current_scope(arr, true);
+    *result = env->agent()->wrap_value_in_current_scope(arr, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -707,7 +707,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Cannot create string");
     }
 
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
@@ -793,7 +793,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Cannot create string");
     }
 
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
@@ -833,7 +833,7 @@ extern "C"
       return napi_util__::return_pending_if_caught(env, "Cannot create string");
     }
 
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
@@ -902,7 +902,7 @@ extern "C"
     if (length == NAPI_AUTO_LENGTH)
       length = strlen(str);
 
-    *result = env->wrap_value_in_current_scope(JS_NewStringLen(env->context(), str, length), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewStringLen(env->context(), str, length), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -925,7 +925,7 @@ extern "C"
       length = static_cast<size_t>(p - str);
     }
 
-    *result = env->wrap_value_in_current_scope(
+    *result = env->agent()->wrap_value_in_current_scope(
         JS_NewStringUTF16(env->context(), reinterpret_cast<const uint16_t *>(str), length), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
@@ -951,7 +951,7 @@ extern "C"
     if (desc_str != nullptr)
       JS_FreeCString(env->context(), desc_str);
 
-    *result = env->wrap_value_in_current_scope(sym, true);
+    *result = env->agent()->wrap_value_in_current_scope(sym, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -970,7 +970,7 @@ extern "C"
     // JS_NewSymbol with is_global=true mirrors Symbol.for() — same key returns same symbol.
     JSValue sym = JS_NewSymbol(env->context(), desc, true);
 
-    *result = env->wrap_value_in_current_scope(sym, true);
+    *result = env->agent()->wrap_value_in_current_scope(sym, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -1349,7 +1349,7 @@ extern "C"
 
     if (data != nullptr)
       *data = buf;
-    *result = env->wrap_value_in_current_scope(sab, true);
+    *result = env->agent()->wrap_value_in_current_scope(sab, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
@@ -1384,7 +1384,7 @@ extern "C"
     if (JS_IsException(view))
       return napi_util__::return_pending_if_caught(env, "DataView construction threw");
 
-    *result = env->wrap_value_in_current_scope(view, true);
+    *result = env->agent()->wrap_value_in_current_scope(view, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
   }
 
@@ -1444,7 +1444,7 @@ extern "C"
     }
     if (arraybuffer != nullptr)
     {
-      *arraybuffer = env->wrap_value_in_current_scope(buffer_val, true);
+      *arraybuffer = env->agent()->wrap_value_in_current_scope(buffer_val, true);
       if (*arraybuffer == nullptr)
       {
         JS_FreeValue(env->context(), buffer_val);
@@ -1508,7 +1508,7 @@ extern "C"
     {
       return napi_util__::return_pending_if_caught(env, "Exception while getting element");
     }
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -1646,14 +1646,14 @@ extern "C"
 
         for (i = 0; i < count; i++)
         {
-          argv[i] = env->wrap_value_in_current_scope(info->arg(i), false);
+          argv[i] = env->agent()->wrap_value_in_current_scope(info->arg(i), false);
         }
 
         // Node-API Rule: If the user provided a larger buffer than actual arguments,
         // fill the remaining slots with 'undefined'.
         for (; i < *argc; i++)
         {
-          argv[i] = env->wrap_value_in_current_scope(JS_UNDEFINED, true);
+          argv[i] = env->agent()->wrap_value_in_current_scope(JS_UNDEFINED, true);
         }
       }
 
@@ -1664,7 +1664,7 @@ extern "C"
     // 2. Handle the 'this' argument
     if (this_arg != nullptr)
     {
-      *this_arg = env->wrap_value_in_current_scope(info->this_value(), false);
+      *this_arg = env->agent()->wrap_value_in_current_scope(info->this_value(), false);
     }
 
     // 3. Handle the user data pointer
@@ -1693,7 +1693,7 @@ extern "C"
     }
     else
     {
-      *result = env->wrap_value_in_current_scope(cbinfo->new_target(), false);
+      *result = env->agent()->wrap_value_in_current_scope(cbinfo->new_target(), false);
     }
 
     return napi_ok;
@@ -1704,11 +1704,11 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
 
-    napi_handle_scope scope = env->create_scope(env->current_scope());
+    napi_handle_scope scope = env->agent()->create_scope(env, env->agent()->current_scope());
     if (scope == nullptr)
       return napi_generic_failure;
 
-    env->set_current_scope(scope);
+    env->agent()->set_current_scope(scope);
     *result = scope;
     return napi_ok;
   }
@@ -1717,14 +1717,14 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || scope == nullptr)
       return napi_invalid_arg;
-    if (!env->is_current_scope(scope))
+    if (!env->agent()->is_current_scope(scope))
       return napi_util__::invalid_arg(env);
 
-    napi_scope__ *inner = env->scope_from_handle(scope);
+    napi_scope__ *inner = env->agent()->scope_from_handle(scope);
     if (inner == nullptr)
       return napi_util__::invalid_arg(env);
-    env->set_current_scope(inner->parent_handle());
-    env->destroy_scope(scope);
+    env->agent()->set_current_scope(inner->parent_handle());
+    env->agent()->destroy_scope(scope);
     return napi_ok;
   }
 
@@ -1734,11 +1734,11 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
 
-    napi_handle_scope scope = env->create_scope(env->current_scope());
+    napi_handle_scope scope = env->agent()->create_scope(env, env->agent()->current_scope());
     if (scope == nullptr)
       return napi_generic_failure;
 
-    env->set_current_scope(scope);
+    env->agent()->set_current_scope(scope);
     *result = reinterpret_cast<napi_escapable_handle_scope>(scope);
     return napi_ok;
   }
@@ -1749,14 +1749,14 @@ extern "C"
     if (!napi_util__::check_env(env) || scope == nullptr)
       return napi_invalid_arg;
     napi_handle_scope handle = reinterpret_cast<napi_handle_scope>(scope);
-    if (!env->is_current_scope(handle))
+    if (!env->agent()->is_current_scope(handle))
       return napi_util__::invalid_arg(env);
 
-    napi_scope__ *inner = env->scope_from_handle(handle);
+    napi_scope__ *inner = env->agent()->scope_from_handle(handle);
     if (inner == nullptr)
       return napi_util__::invalid_arg(env);
-    env->set_current_scope(inner->parent_handle());
-    env->destroy_scope(handle);
+    env->agent()->set_current_scope(inner->parent_handle());
+    env->agent()->destroy_scope(handle);
     return napi_ok;
   }
 
@@ -1769,7 +1769,7 @@ extern "C"
       return napi_invalid_arg;
 
     napi_handle_scope handle = reinterpret_cast<napi_handle_scope>(scope);
-    napi_scope__ *inner = env->scope_from_handle(handle);
+    napi_scope__ *inner = env->agent()->scope_from_handle(handle);
     if (inner == nullptr)
       return napi_util__::invalid_arg(env);
 
@@ -1979,7 +1979,7 @@ extern "C"
 
     // 6. Wrap and return
     // 'wrap_value' converts the JSValue back into the napi_value handle
-    *result = env->wrap_value_in_current_scope(instance, true);
+    *result = env->agent()->wrap_value_in_current_scope(instance, true);
 
     return napi_ok;
   }
@@ -2035,7 +2035,7 @@ extern "C"
     if (result != nullptr)
     {
       // wrap the result; the current handle scope now owns the returned JSValue
-      *result = env->wrap_value_in_current_scope(js_result, true);
+      *result = env->agent()->wrap_value_in_current_scope(js_result, true);
     }
     else
     {
@@ -2202,7 +2202,7 @@ extern "C"
     }
 
     *deferred = d;
-    *promise = env->wrap_value_in_current_scope(p, true);
+    *promise = env->agent()->wrap_value_in_current_scope(p, true);
     return (*promise == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2338,7 +2338,7 @@ extern "C"
     {
       return napi_util__::return_pending_if_caught(env, "Exception while getting property");
     }
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2518,7 +2518,7 @@ extern "C"
     {
       return napi_util__::return_pending_if_caught(env, "Exception while getting named property");
     }
-    *result = env->wrap_value_in_current_scope(prop, true);
+    *result = env->agent()->wrap_value_in_current_scope(prop, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2537,7 +2537,7 @@ extern "C"
     if (JS_IsException(proto))
       return napi_util__::return_pending_if_caught(env, "Exception while getting prototype");
 
-    *result = env->wrap_value_in_current_scope(proto, true);
+    *result = env->agent()->wrap_value_in_current_scope(proto, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2728,7 +2728,7 @@ extern "C"
     if (JS_IsException(coerced))
       return napi_util__::return_pending_if_caught(env, "Failed to coerce to bool");
 
-    *result = env->wrap_value_in_current_scope(coerced, true);
+    *result = env->agent()->wrap_value_in_current_scope(coerced, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2750,7 +2750,7 @@ extern "C"
     if (JS_ToFloat64(env->context(), &d, napi_quickjs_value_inner(env, value)) != 0)
       return napi_util__::return_pending_if_caught(env, "Failed to coerce to number");
 
-    *result = env->wrap_value_in_current_scope(JS_NewFloat64(env->context(), d), true);
+    *result = env->agent()->wrap_value_in_current_scope(JS_NewFloat64(env->context(), d), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2763,7 +2763,7 @@ extern "C"
     if (JS_IsException(obj))
       return napi_util__::return_pending_if_caught(env, "Failed to coerce to object");
 
-    *result = env->wrap_value_in_current_scope(obj, true);
+    *result = env->agent()->wrap_value_in_current_scope(obj, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2776,7 +2776,7 @@ extern "C"
     if (JS_IsException(str))
       return napi_util__::return_pending_if_caught(env, "Failed to coerce to string");
 
-    *result = env->wrap_value_in_current_scope(str, true);
+    *result = env->agent()->wrap_value_in_current_scope(str, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2785,7 +2785,7 @@ extern "C"
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_invalid_arg;
 
-    *result = env->wrap_ref_in_root_scope(napi_quickjs_value_inner(env, value), initial_ref_count);
+    *result = env->agent()->create_ref(env, napi_quickjs_value_inner(env, value), initial_ref_count);
     if (*result == nullptr)
       return napi_generic_failure;
 
@@ -2797,7 +2797,7 @@ extern "C"
     if (!napi_util__::check_env(env) || ref == nullptr)
       return napi_invalid_arg;
 
-    env->delete_ref_from_root_scope(ref);
+    env->agent()->delete_ref(ref);
     return napi_ok;
   }
 
@@ -2869,7 +2869,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = env->wrap_value_in_current_scope(slot->dup_inner(), true);
+    *result = env->agent()->wrap_value_in_current_scope(slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -3090,7 +3090,7 @@ extern "C"
     }
 
     // Check both the engine state and our internal environment cache
-    *result = JS_HasException(env->context()) || env->has_last_exception();
+    *result = JS_HasException(env->context()) || env->agent()->has_pending_exception();
 
     return napi_ok;
   }
@@ -3100,13 +3100,13 @@ extern "C"
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
 
-    if (!env->has_last_exception())
+    if (!env->agent()->has_pending_exception())
       return napi_generic_failure;
 
     // Take ownership of the exception before clearing
-    JSValue ex = env->take_last_exception();
+    JSValue ex = env->agent()->take_pending_exception();
 
-    *result = env->wrap_value_in_current_scope(ex, true);
+    *result = env->agent()->wrap_value_in_current_scope(ex, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -3120,7 +3120,7 @@ extern "C"
 
     // Node-API Requirement: If instance data was previously set,
     // the previous data's finalizer should be called before overwriting.
-    env->set_instance_data(data, finalize_cb, finalize_hint);
+    env->agent()->set_instance_data(data, finalize_cb, finalize_hint);
 
     return napi_ok;
   }
@@ -3130,7 +3130,7 @@ extern "C"
     if (env == nullptr || data == nullptr)
       return napi_invalid_arg;
 
-    *data = env->instance_data();
+    *data = env->agent()->instance_data();
     return napi_ok;
   }
 
@@ -3172,7 +3172,7 @@ extern "C"
 
     JS_FreeCString(env->context(), str);
 
-    *result = env->wrap_value_in_current_scope(out, true);
+    *result = env->agent()->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -3191,7 +3191,7 @@ extern "C"
     if (!napi_util__::check_env(env) || fun == nullptr)
       return napi_invalid_arg;
 
-    return env->add_cleanup_hook(fun, arg);
+    return env->agent()->add_cleanup_hook(env, fun, arg);
   }
 
   napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env basic_env,
@@ -3202,7 +3202,7 @@ extern "C"
     if (!napi_util__::check_env(env) || fun == nullptr)
       return napi_invalid_arg;
 
-    return env->remove_cleanup_hook(fun, arg);
+    return env->agent()->remove_cleanup_hook(fun, arg);
   }
 
   napi_status NAPI_CDECL napi_create_buffer(napi_env env,
@@ -3266,7 +3266,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
-    *result = env->buffers().is_buffer(napi_quickjs_value_inner(env, value));
+    *result = env->agent()->buffers().is_buffer(napi_quickjs_value_inner(env, value));
     return napi_quickjs_clear_last_error(env);
   }
 
@@ -3277,7 +3277,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, value))
       return napi_util__::invalid_arg(env);
-    return env->buffers().get_buffer_info(napi_quickjs_value_inner(env, value), data, length);
+    return env->agent()->buffers().get_buffer_info(napi_quickjs_value_inner(env, value), data, length);
   }
 
   napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
@@ -3312,13 +3312,13 @@ extern "C"
     if (JS_IsException(buffer))
       return napi_util__::return_pending_if_caught(env, "Failed to create Buffer");
 
-    napi_status status = env->buffers().adopt_native_buffer(buffer);
+    napi_status status = env->agent()->buffers().adopt_native_buffer(buffer);
     if (status != napi_ok)
     {
       JS_FreeValue(env->context(), buffer);
       return status;
     }
-    *result = env->wrap_value_in_current_scope(buffer, true);
+    *result = env->agent()->wrap_value_in_current_scope(buffer, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -3329,7 +3329,7 @@ extern "C"
     if (!napi_util__::check_env(env) || adjusted_value == nullptr)
       return napi_invalid_arg;
 
-    *adjusted_value = env->adjust_external_memory(change_in_bytes);
+    *adjusted_value = env->agent()->adjust_external_memory(change_in_bytes);
     return napi_ok;
   }
 
@@ -3525,7 +3525,7 @@ extern "C"
       }
     }
 
-    *result = env->wrap_value_in_current_scope(obj, true);
+    *result = env->agent()->wrap_value_in_current_scope(obj, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 

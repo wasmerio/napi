@@ -110,7 +110,7 @@ napi_handle_scope napi_scope__::parent_handle() const
 
 napi_scope__ *napi_scope__::parent() const
 {
-  return env_ == nullptr || parent_ == nullptr ? nullptr : env_->scope_from_handle(parent_);
+  return env_ == nullptr || parent_ == nullptr ? nullptr : env_->agent()->scope_from_handle(parent_);
 }
 
 napi_env napi_scope__::env() const

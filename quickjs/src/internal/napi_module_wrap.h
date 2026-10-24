@@ -13,6 +13,9 @@
 namespace quickjs::detail
 {
 
+// The modules of every realm of an agent, and its module hooks. A module
+// lives in the realm whose env created it; the other operations work through
+// any env of the agent.
 class napi_module_wrap__
 {
 public:
@@ -21,17 +24,17 @@ public:
 
   void teardown();
 
-  napi_status create_source_text(napi_value wrapper,
+  napi_status create_source_text(napi_env env,
+                                 napi_value wrapper,
                                  napi_value url,
-                                 napi_value context_or_undefined,
                                  const unofficial_napi_js_source *source,
                                  int32_t line_offset,
                                  int32_t column_offset,
                                  napi_value host_defined_option_id,
                                  unofficial_napi_module *module_out);
-  napi_status create_synthetic(napi_value wrapper,
+  napi_status create_synthetic(napi_env env,
+                               napi_value wrapper,
                                napi_value url,
-                               napi_value context_or_undefined,
                                napi_value export_names,
                                napi_value synthetic_eval_steps,
                                unofficial_napi_module *module_out);
@@ -123,7 +126,7 @@ private:
 
   static int synthetic_init(JSContext *ctx, JSModuleDef *module);
 
-  // Owning environment and QuickJS context.
+  // The principal realm, whose global has internalBinding.
   napi_env env_;
   JSContext *ctx_;
 

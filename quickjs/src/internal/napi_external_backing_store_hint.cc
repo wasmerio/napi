@@ -34,7 +34,7 @@ napi_external_backing_store_hint__ *napi_external_backing_store_hint__::create(
 {
   if (env == nullptr || env->context() == nullptr)
     return nullptr;
-  return env->create_external_backing_store(external_data, finalize_cb, finalize_hint);
+  return env->agent()->create_external_backing_store(env, external_data, finalize_cb, finalize_hint);
 }
 
 void napi_external_backing_store_hint__::destroy(napi_external_backing_store_hint__ *hint)
@@ -55,7 +55,7 @@ void napi_external_backing_store_hint__::destroy_with_runtime(
   (void)rt;
   napi_env env = hint->env_;
   if (env != nullptr)
-    env->destroy_external_backing_store(hint);
+    env->agent()->destroy_external_backing_store(hint);
 }
 
 void napi_external_backing_store_hint__::invoke_finalizer()

@@ -36,6 +36,6 @@ JSValueConst napi_quickjs_value_inner(napi_env env, napi_value value)
   assert(env != nullptr);
   assert(value != nullptr);
 
-  napi_value__ *data = env->value_from_handle(value);
+  napi_value__ *data = env->agent()->value_from_handle(value);
   return data->get_inner();
 }

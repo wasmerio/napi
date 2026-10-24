@@ -12,6 +12,9 @@
 
 namespace quickjs::detail
 {
+    // The agent's vm support: script and function compilation, bytecode, and
+    // the records of the realms create_realm made. Calls that compile or run
+    // code take the env whose realm they act in.
     class napi_contextify__ final
     {
     public:
@@ -31,15 +34,9 @@ namespace quickjs::detail
         napi_status preserve_error_source_message(napi_value error);
         napi_status configure_source_maps(bool enabled, napi_value callback);
 
-        napi_status make_context(napi_value sandbox_or_symbol,
-                                 napi_value name,
-                                 napi_value origin_or_undefined,
-                                 bool allow_code_gen_strings,
-                                 bool allow_code_gen_wasm,
-                                 bool own_microtask_queue,
-                                 napi_value host_defined_option_id,
-                                 napi_value *result_out);
-        napi_status run_script(napi_value sandbox_or_null,
+        // Runs in `env`'s realm. A sandbox realm reads its sandbox before the
+        // script and writes it back after.
+        napi_status run_script(napi_env env,
                                const unofficial_napi_js_source *source,
                                napi_value filename,
                                int32_t line_offset,
@@ -50,12 +47,12 @@ namespace quickjs::detail
                                bool break_on_first_line,
                                napi_value host_defined_option_id,
                                napi_value *result_out);
-        napi_status dispose_context(napi_value sandbox_or_context_global);
-        napi_status compile_function(const unofficial_napi_js_source *source,
+        // Compiles in `env`'s realm.
+        napi_status compile_function(napi_env env,
+                                     const unofficial_napi_js_source *source,
                                      napi_value filename,
                                      int32_t line_offset,
                                      int32_t column_offset,
-                                     napi_value parsing_context_or_undefined,
                                      napi_value context_extensions_or_undefined,
                                      napi_value params_or_undefined,
                                      napi_value host_defined_option_id,
@@ -65,7 +62,8 @@ namespace quickjs::detail
                                            napi_value resource_name_or_undefined,
                                            bool cjs_var_in_scope,
                                            bool *result_out);
-        napi_status bytecode_compile(napi_value source_text,
+        napi_status bytecode_compile(napi_env env,
+                                     napi_value source_text,
                                      napi_value filename,
                                      int32_t shape,
                                      napi_value params_or_undefined,
@@ -74,7 +72,8 @@ namespace quickjs::detail
                                      int32_t column_offset,
                                      unofficial_napi_bytecode *bytecode_out,
                                      bool *can_parse_as_module_out);
-        napi_status bytecode_deserialize(const uint8_t *bytes,
+        napi_status bytecode_deserialize(napi_env env,
+                                         const uint8_t *bytes,
                                          size_t byte_length,
                                          napi_value source_text,
                                          napi_value filename,
@@ -85,6 +84,11 @@ namespace quickjs::detail
                                          bool *rejected_out);
         napi_status bytecode_serialize(unofficial_napi_bytecode bytecode, napi_value *buffer_out);
         napi_status bytecode_release(unofficial_napi_bytecode bytecode);
+
+        // Makes `realm`, which create_realm just made, read and write
+        // `sandbox` as vm.createContext does. The sandbox becomes findable as
+        // the realm's global.
+        napi_status add_sandbox(napi_env parent, napi_env realm, JSValueConst sandbox);
 
     private:
         bool compile_trace_enabled() const;
@@ -106,17 +110,16 @@ namespace quickjs::detail
         bool can_parse_as_module(const std::string &source,
                                  const std::string &source_url) const;
         void set_int32_property(JSValueConst object, const char *name, int32_t value) const;
+        napi_status contextify_sandbox(JSValueConst sandbox);
         void annotate_compile_exception(JSValueConst exception,
                                         const std::string &source,
                                         const std::string &resource_name,
                                         int32_t line_offset,
                                         int32_t column_offset);
-        context_record *find_context_record(JSValueConst sandbox) const;
-        context_record *create_context_record(JSValueConst sandbox,
-                                              JSValueConst host_defined_option_id);
-        void destroy_context_record(context_record *record);
+        // The sandbox record of `realm`, if it was made with a sandbox.
+        context_record *find_sandbox_record_for_env(napi_env realm) const;
 
-        // Owning environment and QuickJS context.
+        // The principal realm.
         napi_env env_;
         JSContext *ctx_;
 

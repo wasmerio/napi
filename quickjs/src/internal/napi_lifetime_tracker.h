@@ -8,6 +8,7 @@ template <typename T, typename Owner>
 struct napi_allocator_lifetime__;
 
 struct napi_deferred__;
+struct napi_agent__;
 struct napi_env__;
 struct napi_env_cleanup_hook__;
 struct napi_external_backing_store_hint__;
@@ -38,29 +39,29 @@ struct napi_lifetime__<napi_value__>
 template <>
 struct napi_lifetime__<napi_ref__>
 {
-  static void record_create(napi_env__ *owner, napi_ref__ *val);
-  static void record_release(napi_env__ *owner, napi_ref__ *val);
+  static void record_create(napi_agent__ *owner, napi_ref__ *val);
+  static void record_release(napi_agent__ *owner, napi_ref__ *val);
 };
 
 template <>
 struct napi_lifetime__<napi_env_cleanup_hook__>
 {
-  static void record_create(napi_env__ *owner, napi_env_cleanup_hook__ *val);
-  static void record_release(napi_env__ *owner, napi_env_cleanup_hook__ *val);
+  static void record_create(napi_agent__ *owner, napi_env_cleanup_hook__ *val);
+  static void record_release(napi_agent__ *owner, napi_env_cleanup_hook__ *val);
 };
 
 template <>
 struct napi_lifetime__<napi_deferred__>
 {
-  static void record_create(napi_env__ *owner, napi_deferred__ *val);
-  static void record_release(napi_env__ *owner, napi_deferred__ *val);
+  static void record_create(napi_agent__ *owner, napi_deferred__ *val);
+  static void record_release(napi_agent__ *owner, napi_deferred__ *val);
 };
 
 template <>
 struct napi_lifetime__<napi_external_backing_store_hint__>
 {
-  static void record_create(napi_env__ *owner, napi_external_backing_store_hint__ *val);
-  static void record_release(napi_env__ *owner, napi_external_backing_store_hint__ *val);
+  static void record_create(napi_agent__ *owner, napi_external_backing_store_hint__ *val);
+  static void record_release(napi_agent__ *owner, napi_external_backing_store_hint__ *val);
 };
 #else
 template <typename T, typename Owner>
@@ -118,56 +119,56 @@ struct napi_allocator_lifetime__<napi_value__, napi_scope__>
 };
 
 template <>
-struct napi_allocator_lifetime__<napi_ref__, napi_env__>
+struct napi_allocator_lifetime__<napi_ref__, napi_agent__>
 {
-  static void record_create(napi_env__ *owner, napi_ref__ *val)
+  static void record_create(napi_agent__ *owner, napi_ref__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_ref__>::record_create(owner, val);
   }
 
-  static void record_release(napi_env__ *owner, napi_ref__ *val)
+  static void record_release(napi_agent__ *owner, napi_ref__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_ref__>::record_release(owner, val);
   }
 };
 
 template <>
-struct napi_allocator_lifetime__<napi_env_cleanup_hook__, napi_env__>
+struct napi_allocator_lifetime__<napi_env_cleanup_hook__, napi_agent__>
 {
-  static void record_create(napi_env__ *owner, napi_env_cleanup_hook__ *val)
+  static void record_create(napi_agent__ *owner, napi_env_cleanup_hook__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_create(owner, val);
   }
 
-  static void record_release(napi_env__ *owner, napi_env_cleanup_hook__ *val)
+  static void record_release(napi_agent__ *owner, napi_env_cleanup_hook__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_env_cleanup_hook__>::record_release(owner, val);
   }
 };
 
 template <>
-struct napi_allocator_lifetime__<napi_deferred__, napi_env__>
+struct napi_allocator_lifetime__<napi_deferred__, napi_agent__>
 {
-  static void record_create(napi_env__ *owner, napi_deferred__ *val)
+  static void record_create(napi_agent__ *owner, napi_deferred__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_deferred__>::record_create(owner, val);
   }
 
-  static void record_release(napi_env__ *owner, napi_deferred__ *val)
+  static void record_release(napi_agent__ *owner, napi_deferred__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_deferred__>::record_release(owner, val);
   }
 };
 
 template <>
-struct napi_allocator_lifetime__<napi_external_backing_store_hint__, napi_env__>
+struct napi_allocator_lifetime__<napi_external_backing_store_hint__, napi_agent__>
 {
-  static void record_create(napi_env__ *owner, napi_external_backing_store_hint__ *val)
+  static void record_create(napi_agent__ *owner, napi_external_backing_store_hint__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_external_backing_store_hint__>::record_create(owner, val);
   }
 
-  static void record_release(napi_env__ *owner, napi_external_backing_store_hint__ *val)
+  static void record_release(napi_agent__ *owner, napi_external_backing_store_hint__ *val)
   {
     quickjs::detail::napi_lifetime__<napi_external_backing_store_hint__>::record_release(owner, val);
   }

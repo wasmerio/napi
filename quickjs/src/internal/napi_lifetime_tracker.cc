@@ -328,12 +328,12 @@ napi::lifetime::env_slot_scan scan_env_slots(napi_env env)
   if (env == nullptr)
     return scan;
 
-  scan.scope_slots_total = env->scope_storage_slot_count();
-  scan.active_scopes = env->active_scope_count();
-  scan.ref_slots_total = env->ref_storage_slot_count();
-  scan.active_refs = env->active_ref_count();
+  scan.scope_slots_total = env->agent()->scope_storage_slot_count();
+  scan.active_scopes = env->agent()->active_scope_count();
+  scan.ref_slots_total = env->agent()->ref_storage_slot_count();
+  scan.active_refs = env->agent()->active_ref_count();
   std::unordered_map<size_t, size_t> active_values_by_scope_level;
-  env->for_each_active_scope([&](const napi_scope__ &scope) {
+  env->agent()->for_each_active_scope([&](const napi_scope__ &scope) {
     size_t active_values = scope.active_value_count();
     scan.value_slots_total += scope.value_storage_slot_count();
     scan.active_values += active_values;
@@ -432,10 +432,10 @@ void maybe_dump_periodic_stats(napi_env env)
     return;
 
   int64_t now = monotonic_milliseconds();
-  bool should_dump_summary = env->should_dump_lifetime_stats(now);
+  bool should_dump_summary = env->agent()->should_dump_lifetime_stats(now);
   bool should_dump_full = false;
 #ifdef NAPI_ENABLE_LIFETIME_STRING_SYMBOL_DUMP
-  should_dump_full = env->should_dump_lifetime_string_symbol_values(now);
+  should_dump_full = env->agent()->should_dump_lifetime_string_symbol_values(now);
 #endif
 
   if (should_dump_full)
@@ -513,18 +513,18 @@ void napi_lifetime__<napi_value__>::record_release(napi_scope__ *owner, napi_val
   maybe_dump_periodic_stats(env);
 }
 
-void napi_lifetime__<napi_ref__>::record_create(napi_env__ *owner, napi_ref__ *val)
+void napi_lifetime__<napi_ref__>::record_create(napi_agent__ *owner, napi_ref__ *val)
 {
   if (owner == nullptr || val == nullptr)
     return;
 
-  value_snapshot snapshot = capture_value_snapshot(owner, val->get_inner());
+  value_snapshot snapshot = capture_value_snapshot(owner->principal_env(), val->get_inner());
   napi_env env = snapshot.env;
   record_value_create(g_lifetime.refs, val, std::move(snapshot));
   maybe_dump_periodic_stats(env);
 }
 
-void napi_lifetime__<napi_ref__>::record_release(napi_env__ *owner, napi_ref__ *val)
+void napi_lifetime__<napi_ref__>::record_release(napi_agent__ *owner, napi_ref__ *val)
 {
   (void)owner;
   napi_env env = record_value_release(g_lifetime.refs, val);
@@ -532,20 +532,20 @@ void napi_lifetime__<napi_ref__>::record_release(napi_env__ *owner, napi_ref__ *
 }
 
 void napi_lifetime__<napi_env_cleanup_hook__>::record_create(
-    napi_env__ *owner,
+    napi_agent__ *owner,
     napi_env_cleanup_hook__ *val)
 {
   if (owner == nullptr || val == nullptr)
     return;
 
-  basic_snapshot snapshot{owner};
+  basic_snapshot snapshot{owner->principal_env()};
   napi_env env = snapshot.env;
   record_basic_create(g_lifetime.cleanup_hooks, val, snapshot);
   maybe_dump_periodic_stats(env);
 }
 
 void napi_lifetime__<napi_env_cleanup_hook__>::record_release(
-    napi_env__ *owner,
+    napi_agent__ *owner,
     napi_env_cleanup_hook__ *val)
 {
   (void)owner;
@@ -553,18 +553,18 @@ void napi_lifetime__<napi_env_cleanup_hook__>::record_release(
   maybe_dump_periodic_stats(env);
 }
 
-void napi_lifetime__<napi_deferred__>::record_create(napi_env__ *owner, napi_deferred__ *val)
+void napi_lifetime__<napi_deferred__>::record_create(napi_agent__ *owner, napi_deferred__ *val)
 {
   if (owner == nullptr || val == nullptr)
     return;
 
-  basic_snapshot snapshot{owner};
+  basic_snapshot snapshot{owner->principal_env()};
   napi_env env = snapshot.env;
   record_basic_create(g_lifetime.deferreds, val, snapshot);
   maybe_dump_periodic_stats(env);
 }
 
-void napi_lifetime__<napi_deferred__>::record_release(napi_env__ *owner, napi_deferred__ *val)
+void napi_lifetime__<napi_deferred__>::record_release(napi_agent__ *owner, napi_deferred__ *val)
 {
   (void)owner;
   napi_env env = record_basic_release(g_lifetime.deferreds, val);
@@ -572,20 +572,20 @@ void napi_lifetime__<napi_deferred__>::record_release(napi_env__ *owner, napi_de
 }
 
 void napi_lifetime__<napi_external_backing_store_hint__>::record_create(
-    napi_env__ *owner,
+    napi_agent__ *owner,
     napi_external_backing_store_hint__ *val)
 {
   if (owner == nullptr || val == nullptr)
     return;
 
-  basic_snapshot snapshot{owner};
+  basic_snapshot snapshot{owner->principal_env()};
   napi_env env = snapshot.env;
   record_basic_create(g_lifetime.external_backing_store_hints, val, snapshot);
   maybe_dump_periodic_stats(env);
 }
 
 void napi_lifetime__<napi_external_backing_store_hint__>::record_release(
-    napi_env__ *owner,
+    napi_agent__ *owner,
     napi_external_backing_store_hint__ *val)
 {
   (void)owner;
