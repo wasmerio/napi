@@ -1601,12 +1601,17 @@ void NapiV8ApplyPromiseHooksToRealms(napi_agent__* agent) {
 
 namespace {
 
-// Whether `object` is a realm's global: a realm's own global, or a sandbox
-// that unofficial_napi_create_realm made one.
-bool IsRealmGlobal(v8::Local<v8::Object> object) {
+// Whether `object` is the global of a realm unofficial_napi_create_realm
+// made: that realm's own global, or a sandbox that became it. The principal
+// realm's global may still be a sandbox, as with vm.createContext(globalThis).
+bool IsCreatedRealmGlobal(v8::Local<v8::Object> object) {
   v8::Local<v8::Context> creation_context;
-  return object->GetCreationContext().ToLocal(&creation_context) &&
-         creation_context->Global() == object;
+  if (!object->GetCreationContext().ToLocal(&creation_context) ||
+      creation_context->Global() != object) {
+    return false;
+  }
+  napi_env env = NapiV8EnvForContext(creation_context);
+  return env != nullptr && env->parent != nullptr;
 }
 
 }  // namespace
@@ -1637,15 +1642,14 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   v8::Local<v8::Context> current = parent->context();
   v8::Context::Scope current_scope(current);
 
-  // A sandbox becomes the new realm's global and keeps its own properties.
-  // A global cannot become another realm's, so neither can a sandbox that
-  // already is one.
+  // A sandbox becomes the new realm's global and keeps its own properties. A
+  // sandbox belongs to one realm.
   v8::Local<v8::Object> sandbox;
   if (options.sandbox_or_null != nullptr) {
     v8::Local<v8::Value> raw = napi_v8_unwrap_value(options.sandbox_or_null);
     if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
     sandbox = raw.As<v8::Object>();
-    if (IsRealmGlobal(sandbox)) return napi_invalid_arg;
+    if (IsCreatedRealmGlobal(sandbox)) return napi_invalid_arg;
   }
 
   v8::Local<v8::Symbol> host_id_symbol;

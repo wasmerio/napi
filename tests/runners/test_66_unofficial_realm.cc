@@ -154,6 +154,18 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   EXPECT_EQ(second, nullptr);
 }
 
+// As with vm.createContext(globalThis) in Node.
+TEST_F(Test66UnofficialRealm, ThePrincipalGlobalCanBeASandbox) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = Global(s.env);
+  napi_env realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  EXPECT_NE(realm, nullptr);
+  EXPECT_NE(Eval(realm, "!function() { var x = Object; }()"), nullptr);
+}
+
 TEST_F(Test66UnofficialRealm, RealmHasItsOwnGlobal) {
   EnvScope s(runtime_.get());
   napi_value realm_global = nullptr;
