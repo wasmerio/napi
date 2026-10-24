@@ -42,7 +42,7 @@ napi_ref__* napi_ref__::New(napi_env__* env,
   napi_ref__* reference = env->allocate<napi_ref__>(
       env, value, initial_refcount, ownership);
   if (reference != nullptr) {
-    reference->Link(&env->reflist);
+    reference->Link(&env->agent->reflist);
   }
   return reference;
 }

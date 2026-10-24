@@ -245,18 +245,18 @@ const void* value_scope_key(napi_env env, std::size_t parent_scope_depth) {
   if (env == nullptr) {
     return nullptr;
   }
-  if (env->open_handle_scope_stack.size() <= parent_scope_depth) {
+  if (env->agent->open_handle_scope_stack.size() <= parent_scope_depth) {
     return env;
   }
-  return env->open_handle_scope_stack[env->open_handle_scope_stack.size() - 1 -
+  return env->agent->open_handle_scope_stack[env->agent->open_handle_scope_stack.size() - 1 -
                                       parent_scope_depth];
 }
 
 std::size_t value_scope_level(napi_env env, std::size_t parent_scope_depth) {
-  if (env == nullptr || env->open_handle_scope_stack.size() <= parent_scope_depth) {
+  if (env == nullptr || env->agent->open_handle_scope_stack.size() <= parent_scope_depth) {
     return 0;
   }
-  return env->open_handle_scope_stack.size() - parent_scope_depth;
+  return env->agent->open_handle_scope_stack.size() - parent_scope_depth;
 }
 
 value_snapshot capture_value_snapshot(napi_env env,

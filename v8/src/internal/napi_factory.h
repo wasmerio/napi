@@ -14,7 +14,7 @@
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_serdes_context.h"
 
-struct napi_env__;
+struct napi_agent__;
 
 namespace v8impl::detail
 {
@@ -25,20 +25,20 @@ namespace v8impl::detail
   class napi_factory__
   {
   public:
-    explicit napi_factory__(napi_env__ *env)
-        : napi_ref_allocator_(env),
-          napi_ref_with_data_allocator_(env),
-          napi_ref_with_finalizer_allocator_(env),
-          napi_callback_payload_allocator_(env),
-          napi_external_wrapper_allocator_(env),
-          napi_env_cleanup_hook_allocator_(env),
-          napi_deferred_allocator_(env),
-          napi_handle_scope_allocator_(env),
-          napi_escapable_handle_scope_allocator_(env),
-          napi_buffer_record_allocator_(env),
-          module_wrap_record_allocator_(env),
-          serializer_context_allocator_(env),
-          deserializer_context_allocator_(env) {}
+    explicit napi_factory__(napi_agent__ *agent)
+        : napi_ref_allocator_(agent),
+          napi_ref_with_data_allocator_(agent),
+          napi_ref_with_finalizer_allocator_(agent),
+          napi_callback_payload_allocator_(agent),
+          napi_external_wrapper_allocator_(agent),
+          napi_env_cleanup_hook_allocator_(agent),
+          napi_deferred_allocator_(agent),
+          napi_handle_scope_allocator_(agent),
+          napi_escapable_handle_scope_allocator_(agent),
+          napi_buffer_record_allocator_(agent),
+          module_wrap_record_allocator_(agent),
+          serializer_context_allocator_(agent),
+          deserializer_context_allocator_(agent) {}
 
     napi_factory__(const napi_factory__ &) = delete;
     napi_factory__ &operator=(const napi_factory__ &) = delete;
@@ -120,20 +120,20 @@ namespace v8impl::detail
       }
     }
 
-    napi_allocator__<napi_ref__, napi_env__> napi_ref_allocator_;
-    napi_allocator__<napi_ref_with_data__, napi_env__> napi_ref_with_data_allocator_;
-    napi_allocator__<napi_ref_with_finalizer__, napi_env__> napi_ref_with_finalizer_allocator_;
-    napi_allocator__<napi_deferred__, napi_env__> napi_deferred_allocator_;
-    napi_allocator__<napi_handle_scope__, napi_env__> napi_handle_scope_allocator_;
-    napi_allocator__<napi_escapable_handle_scope__, napi_env__> napi_escapable_handle_scope_allocator_;
+    napi_allocator__<napi_ref__, napi_agent__> napi_ref_allocator_;
+    napi_allocator__<napi_ref_with_data__, napi_agent__> napi_ref_with_data_allocator_;
+    napi_allocator__<napi_ref_with_finalizer__, napi_agent__> napi_ref_with_finalizer_allocator_;
+    napi_allocator__<napi_deferred__, napi_agent__> napi_deferred_allocator_;
+    napi_allocator__<napi_handle_scope__, napi_agent__> napi_handle_scope_allocator_;
+    napi_allocator__<napi_escapable_handle_scope__, napi_agent__> napi_escapable_handle_scope_allocator_;
 
-    napi_allocator__<napi_callback_payload__, napi_env__> napi_callback_payload_allocator_;
-    napi_allocator__<napi_external_wrapper__, napi_env__> napi_external_wrapper_allocator_;
-    napi_allocator__<napi_env_cleanup_hook__, napi_env__> napi_env_cleanup_hook_allocator_;
-    napi_allocator__<napi_buffer_record__, napi_env__> napi_buffer_record_allocator_;
-    napi_allocator__<ModuleWrapRecord, napi_env__> module_wrap_record_allocator_;
-    napi_allocator__<SerializerContext, napi_env__> serializer_context_allocator_;
-    napi_allocator__<DeserializerContext, napi_env__> deserializer_context_allocator_;
+    napi_allocator__<napi_callback_payload__, napi_agent__> napi_callback_payload_allocator_;
+    napi_allocator__<napi_external_wrapper__, napi_agent__> napi_external_wrapper_allocator_;
+    napi_allocator__<napi_env_cleanup_hook__, napi_agent__> napi_env_cleanup_hook_allocator_;
+    napi_allocator__<napi_buffer_record__, napi_agent__> napi_buffer_record_allocator_;
+    napi_allocator__<ModuleWrapRecord, napi_agent__> module_wrap_record_allocator_;
+    napi_allocator__<SerializerContext, napi_agent__> serializer_context_allocator_;
+    napi_allocator__<DeserializerContext, napi_agent__> deserializer_context_allocator_;
   };
 
 } // namespace v8impl::detail

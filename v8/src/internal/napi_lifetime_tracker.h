@@ -148,14 +148,18 @@ struct napi_lifetime__ {
 }  // namespace v8impl::detail
 
 #ifdef NAPI_ENABLE_LIFETIME_TRACKER
+struct napi_agent__;
+// The env the tracker files an agent's allocations under.
+napi_env__* napi_v8_lifetime_owner(napi_agent__* agent);
+
 template <typename T>
-struct napi_allocator_lifetime__<T, napi_env__> {
-  static void record_create(napi_env__* owner, T* val) {
-    v8impl::detail::napi_lifetime__<T>::record_create(owner, val);
+struct napi_allocator_lifetime__<T, napi_agent__> {
+  static void record_create(napi_agent__* owner, T* val) {
+    v8impl::detail::napi_lifetime__<T>::record_create(napi_v8_lifetime_owner(owner), val);
   }
 
-  static void record_release(napi_env__* owner, T* val) {
-    v8impl::detail::napi_lifetime__<T>::record_release(owner, val);
+  static void record_release(napi_agent__* owner, T* val) {
+    v8impl::detail::napi_lifetime__<T>::record_release(napi_v8_lifetime_owner(owner), val);
   }
 };
 #endif
