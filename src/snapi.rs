@@ -76,6 +76,26 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapi_bridge_unofficial_create_realm(
+        parent: SnapiEnv,
+        sandbox_id: u32,
+        name_id: u32,
+        origin_id: u32,
+        host_defined_option_id: u32,
+        allow_code_gen_strings: i32,
+        allow_code_gen_wasm: i32,
+        own_microtask_queue: i32,
+        realm_out: *mut SnapiEnv,
+        global_out_id: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_get_realm(
+        env: SnapiEnv,
+        value_id: u32,
+        realm_out: *mut SnapiEnv,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
@@ -281,20 +301,8 @@ unsafe extern "C" {
         cjs_var_in_scope: i32,
         result_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_make_context(
+    pub fn snapi_bridge_unofficial_run_script(
         env: SnapiEnv,
-        sandbox_or_symbol_id: u32,
-        name_id: u32,
-        origin_id: u32,
-        allow_code_gen_strings: i32,
-        allow_code_gen_wasm: i32,
-        own_microtask_queue: i32,
-        host_defined_option_id: u32,
-        result_out: *mut u32,
-    ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_run_script(
-        env: SnapiEnv,
-        sandbox_or_null_id: u32,
         source_text_id: u32,
         source_bytecode_id: u32,
         filename_id: u32,
@@ -307,14 +315,13 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_compile_function(
+    pub fn snapi_bridge_unofficial_compile_function(
         env: SnapiEnv,
         source_text_id: u32,
         source_bytecode_id: u32,
         filename_id: u32,
         line_offset: i32,
         column_offset: i32,
-        parsing_context_id: u32,
         context_extensions_id: u32,
         params_id: u32,
         host_defined_option_id: u32,
@@ -348,7 +355,6 @@ unsafe extern "C" {
         kind: i32,
         wrapper_id: u32,
         url_id: u32,
-        context_id: u32,
         source_text_id: u32,
         source_bytecode_id: u32,
         line_offset: i32,
