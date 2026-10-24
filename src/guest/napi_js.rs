@@ -1834,20 +1834,6 @@ fn guest_unofficial_napi_contextify_make_context(
     } else {
         return 1;
     };
-    if sandbox != 0 {
-        let mut existing: SnapiEnv = std::ptr::null_mut();
-        let status =
-            unsafe { snapi_bridge_unofficial_get_realm(env_handle, sandbox, &mut existing) };
-        if status != 0 {
-            return status;
-        }
-        if !existing.is_null() {
-            if result_ptr != 0 {
-                write_guest_u32(&mut env, result_ptr, sandbox);
-            }
-            return 0;
-        }
-    }
     let mut realm: SnapiEnv = std::ptr::null_mut();
     let mut global = 0u32;
     let status = unsafe {
@@ -1864,6 +1850,18 @@ fn guest_unofficial_napi_contextify_make_context(
             &mut global,
         )
     };
+    if status == 1 && sandbox != 0 {
+        // A sandbox that already has a realm keeps it, as make_context did.
+        let mut existing: SnapiEnv = std::ptr::null_mut();
+        if unsafe { snapi_bridge_unofficial_get_realm(env_handle, sandbox, &mut existing) } == 0
+            && !existing.is_null()
+        {
+            if result_ptr != 0 {
+                write_guest_u32(&mut env, result_ptr, sandbox);
+            }
+            return 0;
+        }
+    }
     if status != 0 {
         return status;
     }

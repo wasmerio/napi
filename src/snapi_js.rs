@@ -2391,13 +2391,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_realm(
             return NAPI_INVALID_ARG;
         }
     };
-    // A sandbox has at most one realm, as on V8 and QuickJS.
+    // A sandbox has at most one realm, as on V8 and QuickJS. The principal
+    // realm's global may still be one, as with vm.createContext(globalThis).
     if let Some(sandbox) = &sandbox {
         let existing = wasmer_napi_context_env_of(sandbox) as usize;
-        if existing != 0
-            && (existing == state.principal_addr(parent)
-                || state.agent.realm_envs.contains(&existing))
-        {
+        if existing != 0 && state.agent.realm_envs.contains(&existing) {
             return NAPI_INVALID_ARG;
         }
     }
@@ -7556,6 +7554,46 @@ mod tests {
             function.call0(&JsValue::UNDEFINED).unwrap().as_f64(),
             Some(6.0)
         );
+        assert_eq!(
+            unsafe { snapi_bridge_unofficial_release_env(principal) },
+            NAPI_OK
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_sandbox_belongs_to_one_realm_but_the_principal_global_may_be_one() {
+        let principal = HostJsEnv::new().into_raw();
+        let state = unsafe { env_mut(principal) }.unwrap();
+        let sandbox_id = state.agent.insert(Object::new().into());
+        new_realm(principal, sandbox_id);
+        let mut realm = ptr::null_mut();
+        let mut global = 0;
+        assert_eq!(
+            unsafe {
+                snapi_bridge_unofficial_create_realm(
+                    principal,
+                    sandbox_id,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    &mut realm,
+                    &mut global,
+                )
+            },
+            NAPI_INVALID_ARG
+        );
+        assert!(realm.is_null());
+
+        // As with vm.createContext(globalThis).
+        let mut principal_global = 0;
+        assert_eq!(
+            unsafe { snapi_bridge_get_global(principal, &mut principal_global) },
+            NAPI_OK
+        );
+        new_realm(principal, principal_global);
         assert_eq!(
             unsafe { snapi_bridge_unofficial_release_env(principal) },
             NAPI_OK
