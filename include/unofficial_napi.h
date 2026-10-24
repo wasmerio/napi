@@ -184,8 +184,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_realm(
 
 // Returns the env of the realm `value` belongs to. `value` may be a realm's
 // global or sandbox (from unofficial_napi_create_realm) or a function;
-// providers may accept other objects. `*realm_out` is NULL when that realm has no env. Fails with
-// napi_object_expected when `value` is not an object.
+// providers may accept other objects. `*realm_out` is NULL when that realm has
+// no env. Fails with napi_object_expected when `value` is not an object.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_realm(
     napi_env env,
     napi_value value,
