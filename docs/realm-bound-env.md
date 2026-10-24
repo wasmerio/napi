@@ -802,7 +802,9 @@ async_hooks and worker_threads.
 
 - **V8:** every test whose result differs between A, B and C passes three
   times out of three when run on its own, on both binaries. They are vm and
-  worker tests that fail only under the harness's parallel load.
+  worker tests that crash under the harness's parallel load, from a
+  use-after-free in the provider's foreground-task path that is on `main`
+  too. #113 fixes it: with that fix C has 98 failing tests and one crash.
 - **QuickJS:** the three runs are identical, test for test.
 - **A crash that predates this work:**
   `parallel/test-vm-global-configurable-properties` segfaults about 1–3 times
@@ -814,3 +816,148 @@ async_hooks and worker_threads.
 Phase 3 removes what EdgeJS no longer uses: the sandbox, parsing-context and
 module-context arguments, `contextify_make_context`, and the context-token
 hooks.
+
+## 14. Phase 3: the old surface is removed
+
+Code always runs in its env's realm. The calls that took a context no longer
+do, and nothing creates a realm except `unofficial_napi_create_realm`.
+
+### API
+
+- **Removed:**
+  - `unofficial_napi_contextify_make_context`;
+  - `unofficial_napi_context_token_callback`, its two fields in
+    `unofficial_napi_env_hooks` and its two hook bits. The bits are retired,
+    not reused.
+- **Renamed, without their context argument:**
+  - `unofficial_napi_contextify_run_script` → `unofficial_napi_run_script`
+    (no sandbox);
+  - `unofficial_napi_contextify_compile_function` →
+    `unofficial_napi_compile_function` (no parsing context).
+- **Version 2 structs:** `unofficial_napi_env_hooks` and
+  `unofficial_napi_module_create_options`, which loses
+  `context_or_undefined`. Providers reject version 1.
+- **wasm32:** new `_v2` wire layouts of 24 and 36 bytes. The `_v1` layouts
+  stay in the header for older guests.
+
+### Guests built against older headers
+
+For one release, Wasmer keeps:
+
+- the imports `unofficial_napi_contextify_make_context`,
+  `unofficial_napi_contextify_run_script` and
+  `unofficial_napi_contextify_compile_function`;
+- version 1 of the env hooks, whose context-token callbacks are ignored;
+- version 1 of the module-create options, whose context creates the module in
+  that context's realm.
+
+These shims live in the guest layers (`src/guest/napi.rs`,
+`src/guest/napi_js.rs`). They resolve a context to its realm env with
+`get_realm` and call the new import, so the bridges and providers implement
+only the new surface. `test_realm` checks them on WASIX.
+
+### What each layer deleted
+
+**V8**
+- **Context records:** `g_context_records`, the `FindRecordByKey` scan,
+  `ResolveContextFromKey`, `NapiV8IsContextifyContext` and
+  `NapiV8ForgetRealmEnv`.
+  - A realm env owns its microtask queue.
+  - `get_realm` uses only an object's creation context. A sandbox becomes
+    its realm's global, so it resolves too.
+  - `create_realm` rejects a sandbox that already is the global of a realm
+    it made. The principal global may still be a sandbox, as with
+    `vm.createContext(globalThis)`.
+- **Prepare-stack-trace:** the per-context table is gone and the callback
+  lives on the env. Clearing a realm's callback no longer uninstalls the
+  parent's.
+- **Promise hooks** are reapplied to the agent's realm envs, not to a record
+  list.
+- **Context-token plumbing** in the agent and `attach_env`.
+
+**QuickJS**
+- `make_context`, `dispose_context` and the sandbox scan in
+  `find_context_record`.
+- The sandbox branch of `run_script` and the parsing-context branch of
+  `compile_function`.
+- The context parameters of the `module_wrap` internals.
+
+**host-JS**
+- `evaluation_scope(context_id)`, `wasmerNapiGlobalScopes`,
+  `wasmerNapiSandboxBases`, `wasmerNapiSandboxScope` and
+  `wasmer_napi_realm_scope_of`. `wasmer_napi_context_eval` takes only the
+  context.
+- **Module handles** move from the env to the agent, as on V8 and QuickJS, so
+  a module made through a realm env works through any env of the agent.
+
+**Bridge**
+- The `make_context` wrapper, and `get_realm`'s adoption of realm envs the
+  provider made on its own.
+
+### Behaviour changes
+
+- **One realm per sandbox.** A second `create_realm` over the same sandbox
+  fails with `napi_invalid_arg` on all three providers. host-JS used to reuse
+  the first realm.
+- **QuickJS `compile_function`** reuses a bytecode artifact only when the same
+  realm compiled it, and always annotates compile errors with source details.
+- **host-JS:** the old run-script import fails with `napi_invalid_arg` for a
+  sandbox that has no realm, as V8 did. Before, it evaluated in a scope made
+  over that sandbox on first use.
+
+### Tests
+
+| Suite | Phase 2 | Phase 3 |
+|---|---|---|
+| V8 | 116 | 117 |
+| QuickJS | 111 | 112 |
+| Rust lib / `v8_host_control` | 48 / 3 | 48 / 3 |
+| Manifest, native + WASIX | 37 | 37 |
+| host-JS node | 19 | 19 |
+| host-JS wasm-bindgen | 18 | 21 |
+
+- **test_65** makes its vm contexts with `create_realm`.
+- **test_66** replaces its `make_context` test with
+  `ScriptsAndFunctionsRunInTheirEnvsRealm`. It also checks that a sandbox
+  belongs to one realm, that the principal global can be a sandbox and, on
+  V8, the stack-trace fallback after clearing.
+- **test_21** checks that version 1 env hooks are rejected; test_65 does the
+  same for module-create options.
+- **test_realm** checks that a realm env's module works through its parent
+  env and, on wasm, that the old imports give the realm env's results.
+
+### EdgeJS
+
+The EdgeJS branch `feat/napi-realm-envs-phase3`, stacked on
+`feat/napi-realm-envs`, renames the calls and drops the context arguments it
+already passed as null or undefined. Its behaviour doesn't change.
+
+Running its tests found one regression in this phase: V8 and host-JS rejected
+the principal global as a sandbox, which `vm.createContext(globalThis)` needs
+(`test-vm-cross-context`). Both now accept it, and
+`ThePrincipalGlobalCanBeASandbox` covers it.
+
+| | Phase 2 | Phase 3 |
+|---|---|---|
+| V8, failing of 2467 | 103 | 99 |
+| QuickJS, failing of 2459 | 168 | 168 |
+
+- **V8:** every test that fails only on Phase 3 passes three times out of
+  three when run on its own. The remaining crashes are the foreground-task
+  use-after-free that #113 fixes. The two `process-exit` loader-hook tests
+  hang and leave their loader process running on both builds.
+- **QuickJS:** the two builds fail the same tests.
+- **On both builds,** QuickJS's `vm.compileFunction` doesn't see sandbox
+  globals or context extensions.
+
+### Known gaps
+
+- **QuickJS lookups** in `get_realm` and `create_realm` still scan the
+  agent's realm records (`realm_for_value`).
+- **QuickJS sandbox realms** copy sandbox properties into the realm only when
+  a script runs, so a function compiled before any script sees no sandbox
+  globals. This predates Phase 3.
+- **Realm collection** (#109, #110) is not done. Both PRs make the context
+  records weak, and those records are now gone; their lifetime model applies
+  to realm envs instead.
+- **The shims** for older guests go in a later release.
