@@ -39,16 +39,9 @@ namespace quickjs::detail
         napi_status preserve_error_source_message(napi_value error);
         napi_status configure_source_maps(bool enabled, napi_value callback);
 
-        napi_status make_context(napi_value sandbox_or_symbol,
-                                 napi_value name,
-                                 napi_value origin_or_undefined,
-                                 bool allow_code_gen_strings,
-                                 bool allow_code_gen_wasm,
-                                 bool own_microtask_queue,
-                                 napi_value host_defined_option_id,
-                                 napi_value *result_out);
-        napi_status run_script(napi_value sandbox_or_null,
-                               const unofficial_napi_js_source *source,
+        // Runs in this env's realm. A sandbox realm reads its sandbox before
+        // the script and writes it back after.
+        napi_status run_script(const unofficial_napi_js_source *source,
                                napi_value filename,
                                int32_t line_offset,
                                int32_t column_offset,
@@ -58,12 +51,11 @@ namespace quickjs::detail
                                bool break_on_first_line,
                                napi_value host_defined_option_id,
                                napi_value *result_out);
-        napi_status dispose_context(napi_value sandbox_or_context_global);
+        // Compiles in this env's realm.
         napi_status compile_function(const unofficial_napi_js_source *source,
                                      napi_value filename,
                                      int32_t line_offset,
                                      int32_t column_offset,
-                                     napi_value parsing_context_or_undefined,
                                      napi_value context_extensions_or_undefined,
                                      napi_value params_or_undefined,
                                      napi_value host_defined_option_id,
@@ -100,7 +92,7 @@ namespace quickjs::detail
                                    napi_env realm,
                                    JSValueConst sandbox_or_undefined,
                                    JSValueConst host_defined_option_id);
-        // Marks `sandbox` as contextified, as make_context does.
+        // Marks `sandbox` as contextified, as vm.createContext does.
         napi_status contextify_sandbox(JSValueConst sandbox);
         // The env of the realm whose sandbox or global is `value`, or null.
         napi_env realm_for_value(JSValueConst value) const;
@@ -132,7 +124,6 @@ namespace quickjs::detail
                                         int32_t column_offset);
         // The agent-wide registry: the principal env's contextify.
         napi_contextify__ &registry() const;
-        context_record *find_context_record(JSValueConst sandbox) const;
         // The sandbox record of `realm`, if it was made with a sandbox.
         context_record *find_sandbox_record_for_env(napi_env realm) const;
 

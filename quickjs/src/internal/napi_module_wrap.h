@@ -21,9 +21,9 @@ public:
 
   void teardown();
 
+  // Modules live in this env's realm.
   napi_status create_source_text(napi_value wrapper,
                                  napi_value url,
-                                 napi_value context_or_undefined,
                                  const unofficial_napi_js_source *source,
                                  int32_t line_offset,
                                  int32_t column_offset,
@@ -31,7 +31,6 @@ public:
                                  unofficial_napi_module *module_out);
   napi_status create_synthetic(napi_value wrapper,
                                napi_value url,
-                               napi_value context_or_undefined,
                                napi_value export_names,
                                napi_value synthetic_eval_steps,
                                unofficial_napi_module *module_out);

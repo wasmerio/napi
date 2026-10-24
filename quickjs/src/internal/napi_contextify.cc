@@ -321,16 +321,6 @@ namespace quickjs::detail
         return principal != nullptr ? principal->contextify() : env_->contextify();
     }
 
-    napi_contextify__::context_record *napi_contextify__::find_context_record(JSValueConst sandbox) const
-    {
-        for (const auto &record : registry().contexts_)
-        {
-            if (record != nullptr && !record->disposed && is_same_object(record->sandbox, sandbox))
-                return record.get();
-        }
-        return nullptr;
-    }
-
     napi_contextify__::context_record *napi_contextify__::find_sandbox_record_for_env(napi_env realm) const
     {
         for (const auto &record : registry().contexts_)
@@ -738,42 +728,7 @@ namespace quickjs::detail
         return napi_ok;
     }
 
-    napi_status napi_contextify__::make_context(napi_value sandbox_or_symbol,
-                                                napi_value name,
-                                                napi_value origin_or_undefined,
-                                                bool allow_code_gen_strings,
-                                                bool allow_code_gen_wasm,
-                                                bool own_microtask_queue,
-                                                napi_value host_defined_option_id,
-                                                napi_value *result_out)
-    {
-        (void)name;
-        (void)origin_or_undefined;
-        (void)allow_code_gen_strings;
-        (void)allow_code_gen_wasm;
-        (void)own_microtask_queue;
-        if (!napi_util__::check_env(env_) || sandbox_or_symbol == nullptr || result_out == nullptr)
-            return napi_invalid_arg;
-        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
-        if (!JS_IsObject(sandbox))
-            return napi_invalid_arg;
-        // Every vm context is a realm with its own env; get_realm finds it.
-        if (find_context_record(sandbox) == nullptr)
-        {
-            JSValue host_id = host_defined_option_id == nullptr ? JS_UNDEFINED : napi_quickjs_value_inner(env_, host_defined_option_id);
-            napi_env realm = nullptr;
-            napi_status status = napi_quickjs_create_realm(env_, sandbox, host_id, &realm);
-            if (status != napi_ok)
-                return status;
-        }
-        napi_status status = contextify_sandbox(sandbox);
-        if (status != napi_ok)
-            return status;
-        return napi_util__::wrap_dup(env_, sandbox, result_out);
-    }
-
-    napi_status napi_contextify__::run_script(napi_value sandbox_or_null,
-                                              const unofficial_napi_js_source *source,
+    napi_status napi_contextify__::run_script(const unofficial_napi_js_source *source,
                                               napi_value filename,
                                               int32_t line_offset,
                                               int32_t column_offset,
@@ -796,24 +751,10 @@ namespace quickjs::detail
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
-        // A sandbox selects its realm; without one the script runs in this
-        // env's realm, through its sandbox if it was made with one.
-        context_record *record = nullptr;
-        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))
-        {
-            if (!napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
-                return napi_invalid_arg;
-            record = find_context_record(napi_quickjs_value_inner(env_, sandbox_or_null));
-            if (record == nullptr || record->disposed)
-                return napi_invalid_arg;
-        }
-        else
-        {
-            record = find_sandbox_record_for_env(env_);
-        }
-        // Dynamic imports from the script dispatch through its realm's env.
-        napi_env script_env = record != nullptr && record->realm_env != nullptr ? record->realm_env : env_;
-        script_env->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
+        // The script runs in this env's realm, through its sandbox if it was
+        // made with one.
+        context_record *record = find_sandbox_record_for_env(env_);
+        env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
 
         std::string src = bytecode_record != nullptr ? bytecode_record->source_utf8
                                                      : napi_util__::to_utf8(env_, source->text);
@@ -824,7 +765,7 @@ namespace quickjs::detail
             napi_status sync_status = sync_sandbox_to_context(record);
             if (sync_status != napi_ok)
             {
-                script_env->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return sync_status;
             }
             JSEvalOptions options{
@@ -838,17 +779,17 @@ namespace quickjs::detail
             {
                 JSValue exc = JS_GetException(record->ctx);
                 napi_util__::set_last_exception(env_, exc);
-                script_env->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return napi_quickjs_set_last_error(env_, napi_pending_exception, "Exception while running contextify script");
             }
             sync_status = sync_context_to_sandbox(record);
             if (sync_status != napi_ok)
             {
                 JS_FreeValue(record->ctx, result);
-                script_env->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return sync_status;
             }
-            script_env->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+            env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
             *result_out = env_->wrap_value_in_current_scope(result, true);
             return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
         }
@@ -865,29 +806,16 @@ namespace quickjs::detail
         {
             result = JS_Eval(ctx_, src.c_str(), src.size(), label.c_str(), JS_EVAL_TYPE_GLOBAL);
         }
-        script_env->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
+        env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
         if (JS_IsException(result))
             return napi_util__::return_pending_if_caught(env_, "Exception while running contextify script");
         return napi_util__::wrap_owned(env_, result, result_out);
-    }
-
-    napi_status napi_contextify__::dispose_context(napi_value sandbox_or_context_global)
-    {
-        if (!napi_util__::check_env(env_) || sandbox_or_context_global == nullptr)
-            return napi_invalid_arg;
-        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_context_global);
-        if (!JS_IsObject(sandbox))
-            return napi_invalid_arg;
-        // The realm and its env live until the agent is released; disposing
-        // only stops the sandbox from selecting it.
-        return define_contextify_internal_property(env_, ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
     }
 
     napi_status napi_contextify__::compile_function(const unofficial_napi_js_source *source,
                                                     napi_value filename,
                                                     int32_t line_offset,
                                                     int32_t column_offset,
-                                                    napi_value parsing_context_or_undefined,
                                                     napi_value context_extensions_or_undefined,
                                                     napi_value params_or_undefined,
                                                     napi_value host_defined_option_id,
@@ -930,22 +858,13 @@ namespace quickjs::detail
             source_url = napi_util__::to_utf8(env_, filename);
         }
 
-        context_record *record = nullptr;
-        if (parsing_context_or_undefined != nullptr &&
-            !JS_IsUndefined(napi_quickjs_value_inner(env_, parsing_context_or_undefined)) &&
-            !JS_IsNull(napi_quickjs_value_inner(env_, parsing_context_or_undefined)))
-        {
-            record = find_context_record(napi_quickjs_value_inner(env_, parsing_context_or_undefined));
-        }
-
-        JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
-
         JSValue fn = JS_UNDEFINED;
         bool have_fn = false;
-        if (bytecode_record != nullptr && compile_ctx == ctx_ &&
+        if (bytecode_record != nullptr && bytecode_record->ctx == ctx_ &&
             !JS_IsUndefined(bytecode_record->artifact))
         {
-            // The handle's artifact is the compiled function; reuse it directly.
+            // The handle's artifact is the function compiled in this realm;
+            // reuse it directly.
             fn = JS_DupValue(ctx_, bytecode_record->artifact);
             have_fn = true;
         }
@@ -960,23 +879,22 @@ namespace quickjs::detail
                 cached_size = bytecode_record->bytes.size();
             }
             std::string diagnostic_source;
-            fn = compile_cjs_function(compile_ctx, source_text, source_url, params, &diagnostic_source,
+            fn = compile_cjs_function(ctx_, source_text, source_url, params, &diagnostic_source,
                                       cached_bytes, cached_size, false, nullptr, nullptr);
             if (JS_IsException(fn))
             {
-                JSValue exc = JS_GetException(compile_ctx);
-                if (compile_ctx == ctx_)
-                    annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
+                JSValue exc = JS_GetException(ctx_);
+                annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
                 napi_util__::set_last_exception(env_, exc);
                 return napi_pending_exception;
             }
         }
 
-        JSValue out = JS_NewObject(compile_ctx);
-        JS_SetPropertyStr(compile_ctx, out, "function", fn);
+        JSValue out = JS_NewObject(ctx_);
+        JS_SetPropertyStr(ctx_, out, "function", fn);
         if (!source_url.empty())
-            napi_util__::set_string_property(compile_ctx, out, "sourceURL", source_url);
-        JS_SetPropertyStr(compile_ctx, out, "sourceMapURL", JS_UNDEFINED);
+            napi_util__::set_string_property(ctx_, out, "sourceURL", source_url);
+        JS_SetPropertyStr(ctx_, out, "sourceMapURL", JS_UNDEFINED);
         *result_out = env_->wrap_value_in_current_scope(out, true);
         return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
     }
