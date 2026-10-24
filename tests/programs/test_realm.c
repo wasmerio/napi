@@ -54,6 +54,87 @@ static bool StrictEquals(napi_env env, napi_value a, napi_value b) {
   return napi_strict_equals(env, a, b, &same) == napi_ok && same;
 }
 
+static napi_value Str(napi_env env, const char* value) {
+  napi_value out = NULL;
+  if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &out) != napi_ok) return NULL;
+  return out;
+}
+
+static napi_status ReadInt32Export(napi_env env,
+                                   unofficial_napi_module module,
+                                   const char* name,
+                                   int32_t* out) {
+  napi_value ns = NULL;
+  napi_value value = NULL;
+  napi_status status = unofficial_napi_module_wrap_get_namespace(env, module, &ns);
+  if (status != napi_ok) return status;
+  status = napi_get_named_property(env, ns, name, &value);
+  if (status != napi_ok) return status;
+  return napi_get_value_int32(env, value, out);
+}
+
+// Links, instantiates and evaluates a module with no imports.
+static napi_status EvaluateModule(napi_env env, unofficial_napi_module module) {
+  napi_status status = unofficial_napi_module_wrap_link(env, module, 0, NULL);
+  if (status != napi_ok) return status;
+  status = unofficial_napi_module_wrap_instantiate(env, module);
+  if (status != napi_ok) return status;
+  napi_value result = NULL;
+  return unofficial_napi_module_wrap_evaluate(env, module, -1, false, &result);
+}
+
+#ifdef __wasm__
+// Imports and the module-create layout that guests built against older
+// headers use. Wasmer keeps them as shims over realm envs for one release.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context(
+    napi_env env,
+    napi_value sandbox_or_symbol,
+    napi_value name,
+    napi_value origin_or_undefined,
+    bool allow_code_gen_strings,
+    bool allow_code_gen_wasm,
+    bool own_microtask_queue,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
+    napi_env env,
+    napi_value sandbox_or_null,
+    const unofficial_napi_js_source* source,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    int64_t timeout,
+    bool display_errors,
+    bool break_on_sigint,
+    bool break_on_first_line,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function(
+    napi_env env,
+    const unofficial_napi_js_source* source,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value parsing_context_or_undefined,
+    napi_value context_extensions_or_undefined,
+    napi_value params_or_undefined,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+typedef struct {
+  size_t size;
+  uint32_t version;
+  unofficial_napi_module_kind kind;
+  napi_value wrapper;
+  napi_value url;
+  napi_value context_or_undefined;
+  union {
+    unofficial_napi_source_text_module_options source_text;
+    unofficial_napi_synthetic_module_options synthetic;
+  } payload;
+} module_create_options_v1;
+#endif
+
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -129,18 +210,17 @@ int main(void) {
   NAPI_CALL(env, napi_create_string_utf8(env, "sandbox.js", NAPI_AUTO_LENGTH, &filename));
   const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(source_text);
   napi_value run_result = NULL;
-  NAPI_CALL(sandbox_realm, unofficial_napi_contextify_run_script(sandbox_realm,
-                                                                 NULL,
-                                                                 &source,
-                                                                 filename,
-                                                                 0,
-                                                                 0,
-                                                                 -1,
-                                                                 true,
-                                                                 false,
-                                                                 false,
-                                                                 NULL,
-                                                                 &run_result));
+  NAPI_CALL(sandbox_realm, unofficial_napi_run_script(sandbox_realm,
+                                                      &source,
+                                                      filename,
+                                                      0,
+                                                      0,
+                                                      -1,
+                                                      true,
+                                                      false,
+                                                      false,
+                                                      NULL,
+                                                      &run_result));
   int32_t input = 0;
   NAPI_CALL(env, napi_get_value_int32(env, run_result, &input));
   napi_value output_value = NULL;
@@ -150,36 +230,135 @@ int main(void) {
   CHECK_OR_FAIL(input == 5 && output == 10, "the sandbox realm did not use the sandbox");
   printf("sandbox realm: input=%d output=%d\n", input, output);
 
-  // make_context makes a realm env that get_realm finds.
+  // A module made through a realm env evaluates in that realm, and its
+  // handle works through the parent env too.
+  int32_t tag = 0;
+  NAPI_CALL(realm, RunInt32(realm, "globalThis.tag = 21", &tag));
+  napi_value undefined = NULL;
+  NAPI_CALL(env, napi_get_undefined(env, &undefined));
+  napi_value wrapper = NULL;
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  const unofficial_napi_js_source module_source =
+      unofficial_napi_js_source_from_text(Str(env, "export const tag = globalThis.tag;"));
+  unofficial_napi_module_create_options module_options = {0};
+  module_options.size = sizeof(module_options);
+  module_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  module_options.kind = unofficial_napi_module_source_text;
+  module_options.wrapper = wrapper;
+  module_options.url = Str(env, "file:///realm.mjs");
+  module_options.payload.source_text.source = &module_source;
+  module_options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created = {0};
+  NAPI_CALL(realm, unofficial_napi_module_wrap_create(realm, &module_options, &created));
+  NAPI_CALL(env, EvaluateModule(env, created.module));
+  tag = 0;
+  NAPI_CALL(env, ReadInt32Export(env, created.module, "tag", &tag));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, created.module));
+  CHECK_OR_FAIL(tag == 21, "the module did not evaluate in the realm");
+  printf("realm module through the parent env: tag=%d\n", tag);
+
+  // vm results for a sandbox with x = 3. On wasm, the imports of older
+  // guests must give the same results as the realm env.
   napi_value context_sandbox = NULL;
   napi_value three = NULL;
   NAPI_CALL(env, napi_create_object(env, &context_sandbox));
   NAPI_CALL(env, napi_create_int32(env, 3, &three));
   NAPI_CALL(env, napi_set_named_property(env, context_sandbox, "x", three));
-  napi_value context_name = NULL;
-  napi_value contextified = NULL;
-  NAPI_CALL(env, napi_create_string_utf8(env, "ctx", NAPI_AUTO_LENGTH, &context_name));
-  NAPI_CALL(env, unofficial_napi_contextify_make_context(env,
-                                                         context_sandbox,
-                                                         context_name,
-                                                         NULL,
-                                                         true,
-                                                         true,
-                                                         false,
-                                                         NULL,
-                                                         &contextified));
+  unofficial_napi_realm_options context_options;
+  unofficial_napi_realm_options_init(&context_options);
+  context_options.sandbox_or_null = context_sandbox;
   napi_env context_realm = NULL;
-  NAPI_CALL(env, unofficial_napi_get_realm(env, context_sandbox, &context_realm));
-  CHECK_OR_FAIL(context_realm != NULL && context_realm != env,
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &context_options, &context_realm, NULL));
+  const unofficial_napi_js_source run_source =
+      unofficial_napi_js_source_from_text(Str(env, "x + 1"));
+  const unofficial_napi_js_source function_source =
+      unofficial_napi_js_source_from_text(Str(env, "return x * 10;"));
+  const unofficial_napi_js_source x_module_source =
+      unofficial_napi_js_source_from_text(Str(env, "export const y = x + 2;"));
+  napi_value value = NULL;
+  int32_t ran = 0;
+  NAPI_CALL(context_realm, unofficial_napi_run_script(context_realm, &run_source, Str(env, "a.js"),
+                                                      0, 0, -1, true, false, false, NULL,
+                                                      &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &ran));
+  napi_value compiled = NULL;
+  int32_t called = 0;
+  NAPI_CALL(context_realm, unofficial_napi_compile_function(context_realm, &function_source,
+                                                            Str(env, "f.js"), 0, 0, undefined,
+                                                            undefined, undefined, &compiled));
+  NAPI_CALL(env, napi_get_named_property(env, compiled, "function", &fn));
+  NAPI_CALL(env, napi_call_function(env, undefined, fn, 0, NULL, &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &called));
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  module_options.wrapper = wrapper;
+  module_options.url = Str(env, "file:///x.mjs");
+  module_options.payload.source_text.source = &x_module_source;
+  NAPI_CALL(context_realm, unofficial_napi_module_wrap_create(context_realm, &module_options,
+                                                              &created));
+  int32_t exported = 0;
+  NAPI_CALL(env, EvaluateModule(env, created.module));
+  NAPI_CALL(env, ReadInt32Export(env, created.module, "y", &exported));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, created.module));
+  CHECK_OR_FAIL(ran == 4 && called == 30 && exported == 5,
+                "the realm env did not run in its sandbox's realm");
+#ifdef __wasm__
+  napi_value legacy_sandbox = NULL;
+  NAPI_CALL(env, napi_create_object(env, &legacy_sandbox));
+  NAPI_CALL(env, napi_set_named_property(env, legacy_sandbox, "x", three));
+  napi_value contextified = NULL;
+  NAPI_CALL(env, unofficial_napi_contextify_make_context(env, legacy_sandbox, Str(env, "ctx"),
+                                                         undefined, true, true, false,
+                                                         undefined, &contextified));
+  CHECK_OR_FAIL(StrictEquals(env, contextified, legacy_sandbox),
+                "make_context did not return its sandbox");
+  napi_env legacy_realm = NULL;
+  NAPI_CALL(env, unofficial_napi_get_realm(env, legacy_sandbox, &legacy_realm));
+  CHECK_OR_FAIL(legacy_realm != NULL && legacy_realm != env,
                 "get_realm did not find make_context's realm env");
-  napi_env context_realm_again = NULL;
-  NAPI_CALL(env, unofficial_napi_get_realm(env, context_sandbox, &context_realm_again));
-  CHECK_OR_FAIL(context_realm_again == context_realm,
-                "get_realm returned a different env for the same realm");
-  int32_t x_plus_one = 0;
-  NAPI_CALL(context_realm, RunInt32(context_realm, "x + 1", &x_plus_one));
-  CHECK_OR_FAIL(x_plus_one == 4, "make_context's realm env did not run in its realm");
-  printf("make_context realm env: x+1=%d\n", x_plus_one);
+  int32_t legacy = 0;
+  NAPI_CALL(legacy_realm, RunInt32(legacy_realm, "x + 1", &legacy));
+  CHECK_OR_FAIL(legacy == ran, "make_context's realm env did not run in its realm");
+
+  NAPI_CALL(env, unofficial_napi_contextify_run_script(env, legacy_sandbox, &run_source,
+                                                       Str(env, "a.js"), 0, 0, -1, true, false,
+                                                       false, undefined, &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &legacy));
+  CHECK_OR_FAIL(legacy == ran, "contextify_run_script ignored its sandbox");
+  const unofficial_napi_js_source no_x_source =
+      unofficial_napi_js_source_from_text(Str(env, "typeof x === 'undefined' ? 1 : 0"));
+  NAPI_CALL(env, unofficial_napi_contextify_run_script(env, NULL, &no_x_source,
+                                                       Str(env, "b.js"), 0, 0, -1, true, false,
+                                                       false, undefined, &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &legacy));
+  CHECK_OR_FAIL(legacy == 1, "contextify_run_script without a sandbox left env's realm");
+
+  NAPI_CALL(env, unofficial_napi_contextify_compile_function(
+                     env, &function_source, Str(env, "f.js"), 0, 0, legacy_sandbox, undefined,
+                     undefined, undefined, &compiled));
+  NAPI_CALL(env, napi_get_named_property(env, compiled, "function", &fn));
+  NAPI_CALL(env, napi_call_function(env, undefined, fn, 0, NULL, &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &legacy));
+  CHECK_OR_FAIL(legacy == called, "contextify_compile_function ignored its parsing context");
+
+  module_create_options_v1 legacy_module = {0};
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  legacy_module.size = sizeof(legacy_module);
+  legacy_module.version = 1;
+  legacy_module.kind = unofficial_napi_module_source_text;
+  legacy_module.wrapper = wrapper;
+  legacy_module.url = Str(env, "file:///legacy.mjs");
+  legacy_module.context_or_undefined = legacy_sandbox;
+  legacy_module.payload.source_text.source = &x_module_source;
+  legacy_module.payload.source_text.host_defined_option_id = undefined;
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(
+                     env, (const unofficial_napi_module_create_options*)&legacy_module,
+                     &created));
+  NAPI_CALL(env, EvaluateModule(env, created.module));
+  NAPI_CALL(env, ReadInt32Export(env, created.module, "y", &legacy));
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, created.module));
+  CHECK_OR_FAIL(legacy == exported, "a version 1 module ignored its context");
+#endif
+  printf("vm results: run=%d function=%d module=%d\n", ran, called, exported);
 
   // Releasing an env with live realm envs, nested ones included, releases
   // them with it.

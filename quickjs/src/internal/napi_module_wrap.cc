@@ -512,14 +512,12 @@ napi_status napi_module_wrap__::cache_module_requests(record *entry)
 
 napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
                                                    napi_value url,
-                                                   napi_value context_or_undefined,
                                                    const unofficial_napi_js_source *source,
                                                    int32_t line_offset,
                                                    int32_t column_offset,
                                                    napi_value host_defined_option_id,
                                                    unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
   (void)column_offset;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
@@ -610,12 +608,10 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
 
 napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
                                                  napi_value url,
-                                                 napi_value context_or_undefined,
                                                  napi_value export_names,
                                                  napi_value synthetic_eval_steps,
                                                  unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
   if (!napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !napi_util__::check_value(env_, export_names) ||

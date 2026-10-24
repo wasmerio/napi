@@ -161,6 +161,9 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   invalid.version += 1;
   uint64_t accepted_hooks = 0;
   EXPECT_EQ(unofficial_napi_attach_env(env, &invalid, &accepted_hooks), napi_invalid_arg);
+  // Version 1 had the context-token callbacks, which version 2 removed.
+  invalid.version = 1;
+  EXPECT_EQ(unofficial_napi_attach_env(env, &invalid, &accepted_hooks), napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_ok);
   EXPECT_EQ(accepted_hooks, 0);
   EXPECT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_invalid_arg);

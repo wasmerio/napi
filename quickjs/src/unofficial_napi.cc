@@ -179,20 +179,6 @@ namespace
         return owner != nullptr ? owner : env;
     }
 
-    // The realm a sandbox, global or other context argument selects; the
-    // caller's own realm when the argument is missing or selects none.
-    napi_env RealmForContextArgument(napi_env env, napi_value context)
-    {
-        if (context == nullptr)
-            return env;
-        JSValueConst raw = napi_quickjs_value_inner(env, context);
-        if (!JS_IsObject(raw))
-            return env;
-        napi_env realm = env->contextify().realm_for_value(raw);
-        if (realm == nullptr)
-            realm = env->agent()->env_for_object(env->context(), raw);
-        return realm != nullptr ? realm : env;
-    }
 }
 
 napi_status napi_quickjs_create_realm(napi_env parent,
@@ -451,7 +437,7 @@ extern "C"
 
         // QuickJS has no per-realm code-generation switch or microtask queue;
         // name and origin only label the realm. Those options are accepted
-        // and have no effect, as with make_context.
+        // and have no effect.
         JSValueConst sandbox = JS_UNDEFINED;
         JSValueConst host_id = JS_UNDEFINED;
         if (options != nullptr)
@@ -1264,31 +1250,8 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
+    napi_status NAPI_CDECL unofficial_napi_run_script(
         napi_env env,
-        napi_value sandbox_or_symbol,
-        napi_value name,
-        napi_value origin_or_undefined,
-        bool allow_code_gen_strings,
-        bool allow_code_gen_wasm,
-        bool own_microtask_queue,
-        napi_value host_defined_option_id,
-        napi_value *result_out)
-    {
-        return napi_util__::check_env(env) ? env->contextify().make_context(sandbox_or_symbol,
-                                                              name,
-                                                              origin_or_undefined,
-                                                              allow_code_gen_strings,
-                                                              allow_code_gen_wasm,
-                                                              own_microtask_queue,
-                                                              host_defined_option_id,
-                                                              result_out)
-                             : napi_invalid_arg;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
-        napi_env env,
-        napi_value sandbox_or_null,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
@@ -1300,8 +1263,7 @@ extern "C"
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().run_script(sandbox_or_null,
-                                                            source,
+        return napi_util__::check_env(env) ? env->contextify().run_script(source,
                                                             filename,
                                                             line_offset,
                                                             column_offset,
@@ -1386,13 +1348,12 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
+    napi_status NAPI_CDECL unofficial_napi_compile_function(
         napi_env env,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
         int32_t column_offset,
-        napi_value parsing_context_or_undefined,
         napi_value context_extensions_or_undefined,
         napi_value params_or_undefined,
         napi_value host_defined_option_id,
@@ -1402,7 +1363,6 @@ extern "C"
                                                                   filename,
                                                                   line_offset,
                                                                   column_offset,
-                                                                  parsing_context_or_undefined,
                                                                   context_extensions_or_undefined,
                                                                   params_or_undefined,
                                                                   host_defined_option_id,
@@ -1437,17 +1397,14 @@ extern "C"
             result_out == nullptr)
             return napi_invalid_arg;
         *result_out = {};
-        // A context argument selects its realm; the module lives in that
-        // realm's env.
-        napi_env target = RealmForContextArgument(env, options->context_or_undefined);
+        // The module lives in env's realm.
         napi_status status = napi_invalid_arg;
         switch (options->kind)
         {
         case unofficial_napi_module_source_text:
-            status = target->module_wrap().create_source_text(
+            status = env->module_wrap().create_source_text(
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.source_text.source,
                 options->payload.source_text.line_offset,
                 options->payload.source_text.column_offset,
@@ -1455,10 +1412,9 @@ extern "C"
                 &result_out->module);
             break;
         case unofficial_napi_module_synthetic:
-            status = target->module_wrap().create_synthetic(
+            status = env->module_wrap().create_synthetic(
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.synthetic.export_names,
                 options->payload.synthetic.synthetic_evaluation_steps,
                 &result_out->module);
@@ -1468,13 +1424,13 @@ extern "C"
         }
         if (status != napi_ok)
             return status;
-        status = target->module_wrap().get_creation_metadata(
+        status = env->module_wrap().get_creation_metadata(
             result_out->module,
             &result_out->module_requests,
             &result_out->has_top_level_await);
         if (status != napi_ok)
         {
-            target->module_wrap().destroy(result_out->module);
+            env->module_wrap().destroy(result_out->module);
             *result_out = {};
         }
         return status;

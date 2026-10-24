@@ -1642,6 +1642,174 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_run_script(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    timeout: i64,
+    display_errors: i32,
+    break_on_sigint: i32,
+    break_on_first_line: i32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    run_script_on(
+        &mut env,
+        env_handle,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        timeout,
+        display_errors,
+        break_on_sigint,
+        break_on_first_line,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_script_on(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    env_handle: SnapiEnv,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    timeout: i64,
+    display_errors: i32,
+    break_on_sigint: i32,
+    break_on_first_line: i32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let Some((source_text, source_bytecode)) = abi::read_js_source(env, source_ptr) else {
+        return 1;
+    };
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_run_script(
+            env_handle,
+            source_text,
+            source_bytecode,
+            filename,
+            line_offset,
+            column_offset,
+            timeout,
+            display_errors,
+            break_on_sigint,
+            break_on_first_line,
+            host_defined_option_id,
+            &mut result_id,
+        )
+    };
+    if status == 0 && result_ptr != 0 {
+        write_guest_u32(env, result_ptr, result_id);
+    }
+    status
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_compile_function(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    context_extensions_or_undefined: u32,
+    params_or_undefined: u32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    compile_function_on(
+        &mut env,
+        env_handle,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        context_extensions_or_undefined,
+        params_or_undefined,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_function_on(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    env_handle: SnapiEnv,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    context_extensions_or_undefined: u32,
+    params_or_undefined: u32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let Some((source_text, source_bytecode)) = abi::read_js_source(env, source_ptr) else {
+        return 1;
+    };
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_compile_function(
+            env_handle,
+            source_text,
+            source_bytecode,
+            filename,
+            line_offset,
+            column_offset,
+            context_extensions_or_undefined,
+            params_or_undefined,
+            host_defined_option_id,
+            &mut result_id,
+        )
+    };
+    if status == 0 && result_ptr != 0 {
+        write_guest_u32(env, result_ptr, result_id);
+    }
+    status
+}
+
+// The imports below are the old contextify calls, kept for one release for
+// guests built against older headers. Each one resolves its context argument
+// to that context's realm env and calls the realm-env surface.
+
+/// The env a legacy call with a context argument runs on: `env_handle` when
+/// `context` is 0, null or undefined, otherwise the realm env of `context`.
+/// Fails with napi_invalid_arg when `context` belongs to no realm env of the
+/// agent.
+fn legacy_context_env(env_handle: SnapiEnv, context: u32) -> Result<SnapiEnv, i32> {
+    if context == 0 {
+        return Ok(env_handle);
+    }
+    let value = unsafe { host_js_value(env_handle, context) }?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(env_handle);
+    }
+    let mut realm: SnapiEnv = std::ptr::null_mut();
+    let status = unsafe { snapi_bridge_unofficial_get_realm(env_handle, context, &mut realm) };
+    if status != 0 {
+        return Err(status);
+    }
+    if realm.is_null() {
+        return Err(1);
+    }
+    Ok(realm)
+}
+
+/// make_context: a realm over `sandbox_or_symbol` (a symbol asks for a realm
+/// with its own global), returned as its sandbox or global. A sandbox that
+/// already has a realm keeps it.
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_make_context(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1655,24 +1823,65 @@ fn guest_unofficial_napi_contextify_make_context(
     result_ptr: u32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
+    let value = match unsafe { host_js_value(env_handle, sandbox_or_symbol) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let sandbox = if value.is_symbol() {
+        0
+    } else if value.is_object() || value.is_function() {
+        sandbox_or_symbol
+    } else {
+        return 1;
+    };
+    let mut realm: SnapiEnv = std::ptr::null_mut();
+    let mut global = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_make_context(
+        snapi_bridge_unofficial_create_realm(
             env_handle,
-            sandbox_or_symbol,
+            sandbox,
             name,
             origin_or_undefined,
+            host_defined_option_id,
             allow_code_gen_strings,
             allow_code_gen_wasm,
             own_microtask_queue,
-            host_defined_option_id,
-            &mut result_id,
+            &mut realm,
+            &mut global,
         )
     };
-    if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+    if status == 1 && sandbox != 0 {
+        // A sandbox that already has a realm keeps it, as make_context did.
+        let mut existing: SnapiEnv = std::ptr::null_mut();
+        if unsafe { snapi_bridge_unofficial_get_realm(env_handle, sandbox, &mut existing) } == 0
+            && !existing.is_null()
+        {
+            if result_ptr != 0 {
+                write_guest_u32(&mut env, result_ptr, sandbox);
+            }
+            return 0;
+        }
     }
-    status
+    if status != 0 {
+        return status;
+    }
+    env.data_mut().register_js_realm_env(realm);
+    if sandbox != 0 {
+        // make_context also exposed the sandbox as its own global and
+        // globalThis.
+        for key in ["global", "globalThis"] {
+            let status = unsafe {
+                host_js_set_named_property(env_handle, sandbox, &JsValue::from_str(key), sandbox)
+            };
+            if status != 0 {
+                return status;
+            }
+        }
+    }
+    if result_ptr != 0 {
+        write_guest_u32(&mut env, result_ptr, global);
+    }
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1691,32 +1900,24 @@ fn guest_unofficial_napi_contextify_run_script(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source_ptr) else {
-        return 1;
+    let run_env = match legacy_context_env(snapi_env(&env, napi_env), sandbox_or_null) {
+        Ok(run_env) => run_env,
+        Err(status) => return status,
     };
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_run_script(
-            env_handle,
-            sandbox_or_null,
-            source_text,
-            source_bytecode,
-            filename,
-            line_offset,
-            column_offset,
-            timeout,
-            display_errors,
-            break_on_sigint,
-            break_on_first_line,
-            host_defined_option_id,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
-    }
-    status
+    run_script_on(
+        &mut env,
+        run_env,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        timeout,
+        display_errors,
+        break_on_sigint,
+        break_on_first_line,
+        host_defined_option_id,
+        result_ptr,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1733,30 +1934,23 @@ fn guest_unofficial_napi_contextify_compile_function(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source_ptr) else {
-        return 1;
-    };
-    let mut result_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_contextify_compile_function(
-            env_handle,
-            source_text,
-            source_bytecode,
-            filename,
-            line_offset,
-            column_offset,
-            parsing_context_or_undefined,
-            context_extensions_or_undefined,
-            params_or_undefined,
-            host_defined_option_id,
-            &mut result_id,
-        )
-    };
-    if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
-    }
-    status
+    let compile_env =
+        match legacy_context_env(snapi_env(&env, napi_env), parsing_context_or_undefined) {
+            Ok(compile_env) => compile_env,
+            Err(status) => return status,
+        };
+    compile_function_on(
+        &mut env,
+        compile_env,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        context_extensions_or_undefined,
+        params_or_undefined,
+        host_defined_option_id,
+        result_ptr,
+    )
 }
 
 fn guest_unofficial_napi_bytecode_open(
@@ -1845,7 +2039,13 @@ fn guest_unofficial_napi_module_wrap_create(
     if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
         return 1;
     }
-    let env_handle = snapi_env(&env, napi_env);
+    // A version 1 descriptor may name a context: the module is made in that
+    // context's realm.
+    let env_handle =
+        match legacy_context_env(snapi_env(&env, napi_env), options.context_or_undefined) {
+            Ok(env_handle) => env_handle,
+            Err(status) => return status,
+        };
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
@@ -1855,7 +2055,6 @@ fn guest_unofficial_napi_module_wrap_create(
             options.kind,
             options.wrapper,
             options.url,
-            options.context_or_undefined,
             options.source_text,
             options.source_bytecode,
             options.line_offset,
@@ -5749,6 +5948,8 @@ pub fn register_napi_imports(
         "unofficial_napi_take_heap_snapshot" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_heap_snapshot),
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
+        "unofficial_napi_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_run_script),
+        "unofficial_napi_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_compile_function),
         "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
