@@ -77,16 +77,6 @@ struct UnofficialEnvScope {
   }
 };
 
-struct PrepareStackTraceContextCallback {
-  v8::Global<v8::Context> context;
-  v8::Global<v8::Function> callback;
-};
-
-struct PrepareStackTraceState {
-  v8::Global<v8::Function> principal_callback;
-  std::vector<PrepareStackTraceContextCallback> context_callbacks;
-};
-
 std::mutex g_runtime_mu;
 // Deliberately heap-allocated and never freed: process exit (std::process::exit
 // in the wasmer CLI, or exit() in any embedder) runs static destructors on the
@@ -95,8 +85,6 @@ std::mutex g_runtime_mu;
 // for the teardown thread (Isolate::Delete touches the platform's page
 // allocator and tracing controller). The OS reclaims everything at _exit.
 SharedRuntime& g_runtime = *new SharedRuntime();
-std::unordered_map<napi_env, PrepareStackTraceState>& g_prepare_stack_trace_callbacks =
-    *new std::unordered_map<napi_env, PrepareStackTraceState>();
 
 struct InterruptRequest {
   napi_env env = nullptr;
@@ -303,45 +291,16 @@ bool SerializeHeapProfile(v8::Isolate* isolate, std::string* out) {
   return true;
 }
 
-void ResetPrepareStackTraceState(PrepareStackTraceState* state) {
-  if (state == nullptr) return;
-  state->principal_callback.Reset();
-  for (auto& entry : state->context_callbacks) {
-    entry.context.Reset();
-    entry.callback.Reset();
+bool AgentHasPrepareStackTraceCallback(napi_agent__* agent) {
+  if (agent == nullptr) return false;
+  if (agent->principal_env != nullptr &&
+      !agent->principal_env->prepare_stack_trace_callback.IsEmpty()) {
+    return true;
   }
-  state->context_callbacks.clear();
-}
-
-v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
-                                                        v8::Local<v8::Context> context) {
-  if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) {
-    return v8::Local<v8::Function>();
+  for (napi_env realm : agent->realm_envs) {
+    if (!realm->prepare_stack_trace_callback.IsEmpty()) return true;
   }
-
-  auto state_it = g_prepare_stack_trace_callbacks.find(env);
-  if (state_it == g_prepare_stack_trace_callbacks.end()) {
-    return v8::Local<v8::Function>();
-  }
-
-  PrepareStackTraceState& state = state_it->second;
-  v8::Local<v8::Context> principal_context = env->context();
-  const bool use_principal_callback =
-      !principal_context.IsEmpty() &&
-      (context == principal_context || NapiV8IsContextifyContext(env, context));
-
-  if (use_principal_callback) {
-    return state.principal_callback.Get(context->GetIsolate());
-  }
-
-  for (const auto& entry : state.context_callbacks) {
-    v8::Local<v8::Context> candidate = entry.context.Get(context->GetIsolate());
-    if (!candidate.IsEmpty() && candidate == context) {
-      return entry.callback.Get(context->GetIsolate());
-    }
-  }
-
-  return state.principal_callback.Get(context->GetIsolate());
+  return false;
 }
 
 v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> context,
@@ -353,8 +312,7 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   for (napi_env env = NapiV8RealmEnvOrPrincipal(context->GetIsolate(), context);
        env != nullptr && callback.IsEmpty();
        env = env->parent) {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    callback = LookupPrepareStackTraceCallback(env, context);
+    callback = env->prepare_stack_trace_callback.Get(context->GetIsolate());
   }
 
   if (callback.IsEmpty()) {
@@ -1709,9 +1667,6 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   napi_agent__* agent = env->agent;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
-  agent->context_token_assign_callback = hooks->context_token_assign_callback;
-  agent->context_token_unassign_callback = hooks->context_token_unassign_callback;
-  agent->context_token_callback_data = hooks->data;
   agent->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
   agent->enqueue_foreground_task_target = hooks->data;
   agent->embedder_hooks_attached = true;
@@ -1737,18 +1692,13 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
 static void DestroyRealmEnv(napi_env env) {
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
-    auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
-    if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
-      ResetPrepareStackTraceState(&prepare_it->second);
-      g_prepare_stack_trace_callbacks.erase(prepare_it);
-    }
     unofficial_napi_internal::ResetErrorFormattingState(env);
   }
+  env->prepare_stack_trace_callback.Reset();
   env->promise_reject_callback.Reset();
   for (auto& hook : env->promise_hooks) {
     hook.Reset();
   }
-  NapiV8ForgetRealmEnv(env);
   delete env;
 }
 
@@ -1767,13 +1717,9 @@ static napi_status DestroyEnvInstance(napi_env env) {
     if (g_runtime.platform != nullptr) {
       g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
     }
-    auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
-    if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
-      ResetPrepareStackTraceState(&prepare_it->second);
-      g_prepare_stack_trace_callbacks.erase(prepare_it);
-    }
     unofficial_napi_internal::ResetErrorFormattingState(env);
   }
+  env->prepare_stack_trace_callback.Reset();
   env->promise_reject_callback.Reset();
   for (auto& hook : env->promise_hooks) {
     hook.Reset();
@@ -1968,55 +1914,13 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
 
   v8::Local<v8::Value> raw = callback != nullptr ? napi_v8_unwrap_value(callback) : v8::Local<v8::Value>();
   if (!raw.IsEmpty() && !raw->IsFunction()) return napi_invalid_arg;
-  v8::Local<v8::Context> current_context = env->isolate->GetCurrentContext();
-  if (current_context.IsEmpty()) {
-    current_context = env->context();
+  env->prepare_stack_trace_callback.Reset();
+  if (!raw.IsEmpty()) {
+    env->prepare_stack_trace_callback.Reset(env->isolate, raw.As<v8::Function>());
   }
-
-  bool has_prepare_stack_trace_callback = false;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    PrepareStackTraceState& state = g_prepare_stack_trace_callbacks[env];
-    v8::Local<v8::Context> principal_context = env->context();
-    const bool use_principal_callback =
-        current_context.IsEmpty() ||
-        NapiV8EnvForContext(current_context) != nullptr ||
-        (!principal_context.IsEmpty() &&
-         (current_context == principal_context ||
-          NapiV8IsContextifyContext(env, current_context)));
-
-    if (use_principal_callback) {
-      state.principal_callback.Reset();
-      if (!raw.IsEmpty()) {
-        state.principal_callback.Reset(env->isolate, raw.As<v8::Function>());
-      }
-    } else {
-      for (auto it = state.context_callbacks.begin(); it != state.context_callbacks.end(); ++it) {
-        v8::Local<v8::Context> candidate = it->context.Get(env->isolate);
-        if (!candidate.IsEmpty() && candidate == current_context) {
-          it->context.Reset();
-          it->callback.Reset();
-          state.context_callbacks.erase(it);
-          break;
-        }
-      }
-      if (!raw.IsEmpty()) {
-        PrepareStackTraceContextCallback entry;
-        entry.context.Reset(env->isolate, current_context);
-        entry.callback.Reset(env->isolate, raw.As<v8::Function>());
-        state.context_callbacks.push_back(std::move(entry));
-      }
-    }
-
-    if (state.principal_callback.IsEmpty() && state.context_callbacks.empty()) {
-      g_prepare_stack_trace_callbacks.erase(env);
-    } else {
-      has_prepare_stack_trace_callback = true;
-    }
-  }
-
+  // V8 has one callback per isolate; it dispatches to the realm's env.
   env->isolate->SetPrepareStackTraceCallback(
-      has_prepare_stack_trace_callback ? NapiPrepareStackTraceCallback : nullptr);
+      AgentHasPrepareStackTraceCallback(env->agent) ? NapiPrepareStackTraceCallback : nullptr);
   return napi_ok;
 }
 
@@ -2281,7 +2185,7 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
   NapiV8ApplyPromiseHooksToContext(env, env->context());
-  NapiV8ApplyPromiseHooksToContextifyContexts(env);
+  NapiV8ApplyPromiseHooksToRealms(env->agent);
 #else
   env->isolate->SetPromiseHook(has_hooks ? PromiseHookCallback : nullptr);
 #endif

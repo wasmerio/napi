@@ -40,19 +40,6 @@ namespace {
 constexpr int kHostDefinedOptionsId = 8;
 constexpr int kHostDefinedOptionsLength = 9;
 
-// One realm made with make_context or create_realm. Records live with the
-// agent's principal env, so every env of the agent finds them.
-struct ContextRecord {
-  napi_ref key_ref = nullptr;
-  v8::Global<v8::Context> context;
-  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
-  napi_env realm_env = nullptr;
-};
-
-std::mutex g_context_mu;
-std::unordered_map<napi_env, std::vector<ContextRecord>> g_context_records;
-std::unordered_set<napi_env> g_context_cleanup_hooks;
-
 struct SavedOwnProperty {
   v8::Global<v8::Name> key;
   v8::Global<v8::Value> value;
@@ -825,45 +812,6 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
   return true;
 }
 
-// The env that holds `env`'s agent's context records.
-napi_env RecordOwner(napi_env env) {
-  if (env != nullptr && env->agent != nullptr && env->agent->principal_env != nullptr) {
-    return env->agent->principal_env;
-  }
-  return env;
-}
-
-void CleanupContextRecords(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  g_context_cleanup_hooks.erase(env);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-  for (auto& rec : it->second) {
-    if (rec.key_ref != nullptr && env->agent != nullptr &&
-        env->agent->context_token_unassign_callback != nullptr) {
-      env->agent->context_token_unassign_callback(
-          env, rec.key_ref, env->agent->context_token_callback_data);
-    }
-    if (rec.key_ref != nullptr) {
-      napi_delete_reference(env, rec.key_ref);
-      rec.key_ref = nullptr;
-    }
-    rec.context.Reset();
-    rec.own_microtask_queue.reset();
-  }
-  g_context_records.erase(it);
-}
-
-void EnsureContextCleanupHook(napi_env env) {
-  auto [it, inserted] = g_context_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, CleanupContextRecords, env) != napi_ok) {
-    g_context_cleanup_hooks.erase(it);
-  }
-}
-
 void CleanupModuleWrapState(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
 
@@ -896,22 +844,6 @@ void EnsureModuleWrapCleanupHook(napi_env env) {
   if (napi_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
     g_module_wrap_cleanup_hooks.erase(it);
   }
-}
-
-ContextRecord* FindRecordByKey(napi_env env, napi_value key) {
-  napi_env owner = RecordOwner(env);
-  auto it = g_context_records.find(owner);
-  if (it == g_context_records.end()) return nullptr;
-  for (auto& rec : it->second) {
-    if (rec.key_ref == nullptr) continue;
-    napi_value candidate = nullptr;
-    if (napi_get_reference_value(owner, rec.key_ref, &candidate) != napi_ok || candidate == nullptr) continue;
-    bool same = false;
-    if (napi_strict_equals(env, candidate, key, &same) == napi_ok && same) {
-      return &rec;
-    }
-  }
-  return nullptr;
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -1375,45 +1307,6 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
   return state->temporary_required_module_facade_original->module.Get(context->GetIsolate());
 }
 
-bool StoreRecord(napi_env env,
-                 napi_value key,
-                 v8::Local<v8::Context> context,
-                 std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue,
-                 napi_env realm_env) {
-  napi_env owner = RecordOwner(env);
-  EnsureContextCleanupHook(owner);
-
-  ContextRecord record;
-  if (napi_create_reference(owner, key, 1, &record.key_ref) != napi_ok ||
-      record.key_ref == nullptr) {
-    return false;
-  }
-  record.context.Reset(owner->isolate, context);
-  record.own_microtask_queue = std::move(own_microtask_queue);
-  record.realm_env = realm_env;
-  if (owner->agent != nullptr && owner->agent->context_token_assign_callback != nullptr) {
-    owner->agent->context_token_assign_callback(
-        owner, record.key_ref, owner->agent->context_token_callback_data);
-  }
-  g_context_records[owner].push_back(std::move(record));
-  return true;
-}
-
-bool ResolveContextFromKey(napi_env env,
-                           napi_value key,
-                           v8::Local<v8::Context>* context_out,
-                           v8::MicrotaskQueue** microtask_queue_out) {
-  if (context_out == nullptr || microtask_queue_out == nullptr) return false;
-  *microtask_queue_out = nullptr;
-  ContextRecord* rec = FindRecordByKey(env, key);
-  if (rec == nullptr) return false;
-  v8::Local<v8::Context> context = rec->context.Get(env->isolate);
-  if (context.IsEmpty()) return false;
-  *context_out = context;
-  *microtask_queue_out = rec->own_microtask_queue ? rec->own_microtask_queue.get() : nullptr;
-  return true;
-}
-
 bool CompileAsModule(v8::Isolate* isolate,
                      v8::Local<v8::Context> context,
                      napi_env env,
@@ -1698,202 +1591,27 @@ bool CompileBytecodeRecord(napi_env env,
 
 }  // namespace
 
-bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
-  if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) return false;
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(RecordOwner(env));
-  if (it == g_context_records.end()) return false;
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> candidate = rec.context.Get(env->isolate);
-    if (!candidate.IsEmpty() && candidate == context) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void NapiV8ForgetRealmEnv(napi_env realm) {
-  if (realm == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(RecordOwner(realm));
-  if (it == g_context_records.end()) return;
-  for (auto& rec : it->second) {
-    if (rec.realm_env == realm) rec.realm_env = nullptr;
+// Applies each realm env's effective promise hooks to its context.
+void NapiV8ApplyPromiseHooksToRealms(napi_agent__* agent) {
+  if (agent == nullptr) return;
+  for (napi_env realm : agent->realm_envs) {
+    NapiV8ApplyPromiseHooksToContext(realm, realm->context());
   }
 }
-
-void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return;
-
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(RecordOwner(env));
-  if (it == g_context_records.end()) return;
-
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
-    if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(rec.realm_env != nullptr ? rec.realm_env : env, context);
-    }
-  }
-}
-
-extern "C" {
-
-}  // extern "C"
 
 namespace {
 
-// Makes a realm in `parent`'s agent and the env bound to it. A symbol or null
-// `sandbox_or_symbol` gives a fresh global; an object becomes the realm's
-// global, keeping its own properties. `key_out` receives that global.
-napi_status CreateRealmImpl(napi_env parent,
-                            napi_value sandbox_or_symbol,
-                            bool allow_code_gen_strings,
-                            bool own_microtask_queue,
-                            napi_value host_defined_option_id,
-                            napi_env* realm_out,
-                            napi_value* key_out) {
-  v8::Isolate* isolate = parent->isolate;
-  v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> current = parent->context();
-  v8::Context::Scope current_scope(current);
-
-  bool vanilla = sandbox_or_symbol == nullptr;
-  if (!vanilla) {
-    napi_valuetype sandbox_type = napi_undefined;
-    if (napi_typeof(parent, sandbox_or_symbol, &sandbox_type) != napi_ok) {
-      return napi_invalid_arg;
-    }
-    vanilla = sandbox_type == napi_symbol;
-    if (!vanilla && sandbox_type != napi_object && sandbox_type != napi_function) {
-      return napi_invalid_arg;
-    }
-  }
-
-  v8::Local<v8::Symbol> host_id_symbol;
-  if (host_defined_option_id != nullptr) {
-    v8::Local<v8::Value> host_raw = napi_v8_unwrap_value(host_defined_option_id);
-    if (!host_raw.IsEmpty() && host_raw->IsSymbol()) {
-      host_id_symbol = host_raw.As<v8::Symbol>();
-    }
-  }
-
-  std::unique_ptr<v8::MicrotaskQueue> own_queue;
-  v8::MicrotaskQueue* queue = nullptr;
-  if (own_microtask_queue) {
-    own_queue = v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
-    queue = own_queue.get();
-  }
-
-  std::vector<SavedOwnProperty> saved_properties;
-  v8::Local<v8::Object> sandbox_object;
-  v8::MaybeLocal<v8::Value> maybe_global_object;
-  if (!vanilla) {
-    v8::Local<v8::Value> sandbox_value =
-        napi_v8_unwrap_value(sandbox_or_symbol);
-    if (sandbox_value.IsEmpty() || !sandbox_value->IsObject()) {
-      return napi_invalid_arg;
-    }
-    sandbox_object = sandbox_value.As<v8::Object>();
-
-    // Reading a proxy's own keys or values may run JavaScript and throw. Keep
-    // the exception boundary local to that operation: successful context
-    // creation must retain V8's normal, uncaught lifecycle.
-    v8::TryCatch try_catch(isolate);
-    if (!SnapshotOwnProperties(
-            isolate, current, sandbox_object, &saved_properties)) {
-      if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-        napi_v8_set_last_exception(
-            parent, try_catch.Exception(), try_catch.Message());
-      }
-      return napi_pending_exception;
-    }
-    maybe_global_object = sandbox_value;
-  }
-
-  v8::Local<v8::Context> context =
-      v8::Context::New(isolate,
-                       nullptr,
-                       v8::MaybeLocal<v8::ObjectTemplate>(),
-                       maybe_global_object,
-                       v8::DeserializeInternalFieldsCallback(),
-                       queue);
-
-  if (context.IsEmpty()) {
-    return napi_pending_exception;
-  }
-
-  context->SetSecurityToken(current->GetSecurityToken());
-  context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
-
-  v8::Local<v8::Object> key_object;
-  if (vanilla) {
-    key_object = context->Global();
-  } else {
-    key_object = sandbox_object;
-    if (!RestoreOwnProperties(
-            isolate, context, key_object, saved_properties)) {
-      return napi_pending_exception;
-    }
-  }
-
-  napi_value key_napi = napi_v8_wrap_value(parent, handle_scope.Escape(key_object));
-  if (key_napi == nullptr) return napi_generic_failure;
-
-  auto* realm = new (std::nothrow) napi_env__(context, NAPI_VERSION);
-  if (realm == nullptr) return napi_generic_failure;
-  realm->parent = parent;
-  realm->own_microtask_queue = queue;
-  NapiV8ApplyPromiseHooksToContext(realm, context);
-
-  {
-    std::lock_guard<std::mutex> lock(g_context_mu);
-    if (FindRecordByKey(parent, key_napi) != nullptr ||
-        !StoreRecord(parent, key_napi, context, std::move(own_queue), realm)) {
-      delete realm;
-      return FindRecordByKey(parent, key_napi) != nullptr ? napi_invalid_arg
-                                                           : napi_generic_failure;
-    }
-  }
-  parent->agent->realm_envs.push_back(realm);
-
-  // Align with lib internal/vm.js isContext() checks in Edge.
-  v8::Local<v8::Context> property_context = vanilla ? context : current;
-  SetApiPrivate(property_context, key_object, "node:contextify:context", key_object);
-  SetApiPrivate(property_context,
-                key_object,
-                "node:host_defined_option_symbol",
-                host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
-
-  *realm_out = realm;
-  *key_out = key_napi;
-  return napi_ok;
+// Whether `object` is a realm's global: a realm's own global, or a sandbox
+// that unofficial_napi_create_realm made one.
+bool IsRealmGlobal(v8::Local<v8::Object> object) {
+  v8::Local<v8::Context> creation_context;
+  return object->GetCreationContext().ToLocal(&creation_context) &&
+         creation_context->Global() == object;
 }
 
 }  // namespace
 
 extern "C" {
-
-napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
-    napi_env env,
-    napi_value sandbox_or_symbol,
-    napi_value name,
-    napi_value origin_or_undefined,
-    bool allow_code_gen_strings,
-    bool allow_code_gen_wasm,
-    bool own_microtask_queue,
-    napi_value host_defined_option_id,
-    napi_value* result_out) {
-  if (env == nullptr || env->agent == nullptr || sandbox_or_symbol == nullptr ||
-      name == nullptr || result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  (void)origin_or_undefined;
-  (void)allow_code_gen_wasm;
-  napi_env realm = nullptr;
-  return CreateRealmImpl(env, sandbox_or_symbol, allow_code_gen_strings, own_microtask_queue,
-                         host_defined_option_id, &realm, result_out);
-}
 
 napi_status NAPI_CDECL unofficial_napi_create_realm(
     napi_env parent,
@@ -1913,20 +1631,93 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
     options = *options_or_null;
   }
   *realm_out = nullptr;
+
+  v8::Isolate* isolate = parent->isolate;
+  v8::EscapableHandleScope handle_scope(isolate);
+  v8::Local<v8::Context> current = parent->context();
+  v8::Context::Scope current_scope(current);
+
+  // A sandbox becomes the new realm's global and keeps its own properties.
+  // A global cannot become another realm's, so neither can a sandbox that
+  // already is one.
+  v8::Local<v8::Object> sandbox;
   if (options.sandbox_or_null != nullptr) {
-    v8::Local<v8::Value> sandbox = napi_v8_unwrap_value(options.sandbox_or_null);
-    if (sandbox.IsEmpty() || !sandbox->IsObject()) return napi_object_expected;
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(options.sandbox_or_null);
+    if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
+    sandbox = raw.As<v8::Object>();
+    if (IsRealmGlobal(sandbox)) return napi_invalid_arg;
   }
-  napi_value key = nullptr;
-  napi_status status = CreateRealmImpl(parent,
-                                       options.sandbox_or_null,
-                                       options.allow_code_gen_strings,
-                                       options.own_microtask_queue,
-                                       options.host_defined_option_id,
-                                       realm_out,
-                                       &key);
-  if (status == napi_ok && global_out != nullptr) *global_out = key;
-  return status;
+
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (options.host_defined_option_id != nullptr) {
+    v8::Local<v8::Value> host_raw = napi_v8_unwrap_value(options.host_defined_option_id);
+    if (!host_raw.IsEmpty() && host_raw->IsSymbol()) {
+      host_id_symbol = host_raw.As<v8::Symbol>();
+    }
+  }
+
+  std::unique_ptr<v8::MicrotaskQueue> own_queue;
+  if (options.own_microtask_queue) {
+    own_queue = v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
+  }
+
+  std::vector<SavedOwnProperty> saved_properties;
+  v8::MaybeLocal<v8::Value> maybe_global_object;
+  if (!sandbox.IsEmpty()) {
+    // Reading a proxy's own keys or values may run JavaScript and throw. Keep
+    // the exception boundary local to that operation: successful context
+    // creation must retain V8's normal, uncaught lifecycle.
+    v8::TryCatch try_catch(isolate);
+    if (!SnapshotOwnProperties(isolate, current, sandbox, &saved_properties)) {
+      if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+        napi_v8_set_last_exception(parent, try_catch.Exception(), try_catch.Message());
+      }
+      return napi_pending_exception;
+    }
+    maybe_global_object = sandbox;
+  }
+
+  v8::Local<v8::Context> context =
+      v8::Context::New(isolate,
+                       nullptr,
+                       v8::MaybeLocal<v8::ObjectTemplate>(),
+                       maybe_global_object,
+                       v8::DeserializeInternalFieldsCallback(),
+                       own_queue.get());
+  if (context.IsEmpty()) {
+    return napi_pending_exception;
+  }
+
+  context->SetSecurityToken(current->GetSecurityToken());
+  context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
+
+  v8::Local<v8::Object> global = sandbox.IsEmpty() ? context->Global() : sandbox;
+  if (!sandbox.IsEmpty() &&
+      !RestoreOwnProperties(isolate, context, sandbox, saved_properties)) {
+    return napi_pending_exception;
+  }
+
+  napi_value global_napi = napi_v8_wrap_value(parent, handle_scope.Escape(global));
+  if (global_napi == nullptr) return napi_generic_failure;
+
+  auto* realm = new (std::nothrow) napi_env__(context, NAPI_VERSION);
+  if (realm == nullptr) return napi_generic_failure;
+  realm->parent = parent;
+  realm->own_microtask_queue = std::move(own_queue);
+  NapiV8ApplyPromiseHooksToContext(realm, context);
+  parent->agent->realm_envs.push_back(realm);
+
+  // Align with lib internal/vm.js isContext() checks in Edge.
+  v8::Local<v8::Context> property_context = sandbox.IsEmpty() ? context : current;
+  SetApiPrivate(property_context, global, "node:contextify:context", global);
+  SetApiPrivate(property_context,
+                global,
+                "node:host_defined_option_symbol",
+                host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
+
+  *realm_out = realm;
+  if (global_out != nullptr) *global_out = global_napi;
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_realm(napi_env env,
@@ -1937,18 +1728,13 @@ napi_status NAPI_CDECL unofficial_napi_get_realm(napi_env env,
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
   if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
 
+  // A realm's global, its sandbox (which became its global) and anything made
+  // in it have that realm as their creation context.
   v8::HandleScope handle_scope(env->isolate);
   v8::Local<v8::Context> creation_context;
   if (raw.As<v8::Object>()->GetCreationContext().ToLocal(&creation_context)) {
     napi_env found = NapiV8EnvForContext(creation_context);
-    if (found != nullptr && found->agent == env->agent) {
-      *realm_out = found;
-      return napi_ok;
-    }
-  }
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  if (ContextRecord* record = FindRecordByKey(env, value)) {
-    *realm_out = record->realm_env;
+    if (found != nullptr && found->agent == env->agent) *realm_out = found;
   }
   return napi_ok;
 }
@@ -2156,9 +1942,8 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_release(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
+napi_status NAPI_CDECL unofficial_napi_run_script(
     napi_env env,
-    napi_value sandbox_or_null,
     const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
@@ -2177,18 +1962,9 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> current = env->context();
-  v8::Context::Scope current_scope(current);
-
-  v8::Local<v8::Context> target_context = current;
-  v8::MicrotaskQueue* target_queue = env->own_microtask_queue;
-
-  if (!IsNullish(env, sandbox_or_null)) {
-    std::lock_guard<std::mutex> lock(g_context_mu);
-    if (!ResolveContextFromKey(env, sandbox_or_null, &target_context, &target_queue)) {
-      return napi_invalid_arg;
-    }
-  }
+  v8::Local<v8::Context> target_context = env->context();
+  v8::Context::Scope context_scope(target_context);
+  v8::MicrotaskQueue* target_queue = env->own_microtask_queue.get();
 
   BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
@@ -2214,7 +1990,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   }
 
   v8::TryCatch try_catch(isolate);
-  v8::Context::Scope scope(target_context);
   v8::ScriptOrigin origin(filename_str,
                           line_offset,
                           column_offset,
@@ -2311,13 +2086,12 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
+napi_status NAPI_CDECL unofficial_napi_compile_function(
     napi_env env,
     const unofficial_napi_js_source* source,
     napi_value filename,
     int32_t line_offset,
     int32_t column_offset,
-    napi_value parsing_context_or_undefined,
     napi_value context_extensions_or_undefined,
     napi_value params_or_undefined,
     napi_value host_defined_option_id,
@@ -2329,17 +2103,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> current = env->context();
-  v8::Context::Scope current_scope(current);
-
-  v8::Local<v8::Context> parsing_context = current;
-  if (!IsNullish(env, parsing_context_or_undefined)) {
-    std::lock_guard<std::mutex> lock(g_context_mu);
-    v8::MicrotaskQueue* ignored = nullptr;
-    if (!ResolveContextFromKey(env, parsing_context_or_undefined, &parsing_context, &ignored)) {
-      return napi_invalid_arg;
-    }
-  }
+  v8::Local<v8::Context> parsing_context = env->context();
+  v8::Context::Scope context_scope(parsing_context);
 
   BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
@@ -2380,7 +2145,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     context_extensions.reserve(array->Length());
     for (uint32_t i = 0; i < array->Length(); ++i) {
       v8::Local<v8::Value> item;
-      if (!array->Get(current, i).ToLocal(&item) || !item->IsObject()) return napi_invalid_arg;
+      if (!array->Get(parsing_context, i).ToLocal(&item) || !item->IsObject()) return napi_invalid_arg;
       context_extensions.push_back(item.As<v8::Object>());
     }
   }
@@ -2449,7 +2214,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
                                                      : v8::ScriptCompiler::kNoCompileOptions;
 
     v8::TryCatch try_catch(isolate);
-    v8::Context::Scope parsing_scope(parsing_context);
     v8::MaybeLocal<v8::Function> maybe_fn = v8::ScriptCompiler::CompileFunction(
         parsing_context,
         &source_obj,
@@ -2478,20 +2242,20 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
     }
   }
 
-  SetApiPrivate(current,
+  SetApiPrivate(parsing_context,
                 fn.As<v8::Object>(),
                 "node:host_defined_option_symbol",
                 effective_symbol.IsEmpty() ? v8::Undefined(isolate) : effective_symbol.As<v8::Value>());
 
   v8::Local<v8::Object> out = v8::Object::New(isolate);
-  if (!SetNamed(current, out, "function", fn)) return napi_generic_failure;
+  if (!SetNamed(parsing_context, out, "function", fn)) return napi_generic_failure;
 
   v8::ScriptOrigin fn_origin = fn->GetScriptOrigin();
-  if (!SetNamed(current, out, "sourceURL", fn_origin.ResourceName())) return napi_generic_failure;
-  if (!SetNamed(current, out, "sourceMapURL", fn_origin.SourceMapUrl())) return napi_generic_failure;
+  if (!SetNamed(parsing_context, out, "sourceURL", fn_origin.ResourceName())) return napi_generic_failure;
+  if (!SetNamed(parsing_context, out, "sourceMapURL", fn_origin.SourceMapUrl())) return napi_generic_failure;
 
   if (consumed_cached_data) {
-    if (!SetNamed(current,
+    if (!SetNamed(parsing_context,
                   out,
                   "cachedDataRejected",
                   v8::Boolean::New(isolate, cached_data_rejected))) {
@@ -2549,7 +2313,6 @@ static napi_status CreateSourceTextModule(
     napi_env env,
     napi_value wrapper,
     napi_value url,
-    napi_value context_or_undefined,
     const unofficial_napi_js_source* source,
     int32_t line_offset,
     int32_t column_offset,
@@ -2565,10 +2328,7 @@ static napi_status CreateSourceTextModule(
   EnsureModuleWrapCleanupHook(env);
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context =
-      !IsNullish(env, context_or_undefined) && napi_v8_unwrap_value(context_or_undefined)->IsObject()
-          ? napi_v8_unwrap_value(context_or_undefined).As<v8::Object>()->GetCreationContextChecked()
-          : env->context();
+  v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
   BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
@@ -2600,7 +2360,7 @@ static napi_status CreateSourceTextModule(
   v8::Local<v8::Module> module;
   const bool artifact_reusable =
       bytecode_record != nullptr && !bytecode_record->module.IsEmpty() &&
-      context == env->context() && !host_id_symbol.IsEmpty() &&
+      !host_id_symbol.IsEmpty() &&
       !bytecode_record->host_symbol.IsEmpty() &&
       bytecode_record->host_symbol.Get(isolate) == host_id_symbol;
   if (artifact_reusable) {
@@ -2685,7 +2445,6 @@ static napi_status CreateSyntheticModule(
     napi_env env,
     napi_value wrapper,
     napi_value url,
-    napi_value context_or_undefined,
     napi_value export_names,
     napi_value synthetic_eval_steps,
     unofficial_napi_module* module_out) {
@@ -2701,10 +2460,7 @@ static napi_status CreateSyntheticModule(
   EnsureModuleWrapCleanupHook(env);
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context =
-      !IsNullish(env, context_or_undefined) && napi_v8_unwrap_value(context_or_undefined)->IsObject()
-          ? napi_v8_unwrap_value(context_or_undefined).As<v8::Object>()->GetCreationContextChecked()
-          : env->context();
+  v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
   uint32_t export_count = 0;
@@ -2757,7 +2513,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
           env,
           options->wrapper,
           options->url,
-          options->context_or_undefined,
           options->payload.source_text.source,
           options->payload.source_text.line_offset,
           options->payload.source_text.column_offset,
@@ -2769,7 +2524,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
           env,
           options->wrapper,
           options->url,
-          options->context_or_undefined,
           options->payload.synthetic.export_names,
           options->payload.synthetic.synthetic_evaluation_steps,
           &result_out->module);

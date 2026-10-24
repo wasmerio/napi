@@ -96,9 +96,9 @@ struct napi_env__ {
   // The env this realm env was created from (unofficial_napi_create_realm);
   // null for the principal env. Hooks an env has not set fall back to it.
   napi_env parent = nullptr;
-  // The realm's own microtask queue, owned by its context record; null when
-  // it uses the isolate's default queue.
-  v8::MicrotaskQueue* own_microtask_queue = nullptr;
+  // The realm's own microtask queue (unofficial_napi_realm_options
+  // .own_microtask_queue); null when it uses the isolate's default queue.
+  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
   void* instance_data = nullptr;
@@ -113,9 +113,11 @@ struct napi_env__ {
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
-  // Realm hooks: unofficial_napi_set_promise_reject_callback and
+  // Realm hooks: unofficial_napi_set_promise_reject_callback,
+  // unofficial_napi_set_prepare_stack_trace_callback and
   // unofficial_napi_set_promise_hooks (init, before, after, resolve).
   v8::Global<v8::Function> promise_reject_callback;
+  v8::Global<v8::Function> prepare_stack_trace_callback;
   std::array<v8::Global<v8::Function>, 4> promise_hooks;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
