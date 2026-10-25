@@ -321,6 +321,12 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
 )
+if(_napi_test_engine STREQUAL "v8")
+  # Only the V8 provider posts engine tasks through the enqueue hook.
+  add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
+    runners/test_66_foreground_task_handoff.cc
+  )
+endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
