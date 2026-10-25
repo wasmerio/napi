@@ -40,6 +40,18 @@ namespace quickjs::detail
             return JS_IsObject(a) && JS_IsObject(b) && JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
         }
 
+        // Private links between a realm's context and the object it belongs
+        // to: invisible to script, removable by the provider.
+        constexpr int k_contextify_link_flags =
+            JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
+            JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+            JS_PROP_HAS_ENUMERABLE | JS_PROP_NO_EXOTIC;
+
+        JSValue contextify_anchor(JSContext *, JSValueConst, int, JSValueConst *)
+        {
+            return JS_UNDEFINED;
+        }
+
         bool atom_equals_cstr(JSContext *ctx, JSAtom atom, const char *name)
         {
             JSAtom expected = JS_NewAtom(ctx, name);
@@ -91,18 +103,26 @@ namespace quickjs::detail
         }
     } // namespace
 
+    // A realm: a context on the env's runtime, and the sandbox it mirrors when
+    // it has one. The realm belongs to its key (the sandbox, or the realm's
+    // global when it has none), not to this record. Under private symbols the
+    // key holds a function of the realm (which keeps the context alive) and a
+    // sandbox realm's global holds its sandbox, so the collector sees every
+    // edge and collects the realm with its key. The record holds the key
+    // weakly and borrows the context, the global and the sandbox, which stay
+    // valid while the key lives.
     struct napi_contextify__::context_record
     {
-        explicit context_record(napi_env owner,
-                                JSContext *parent_context,
-                                JSValueConst parent_sandbox,
-                                JSContext *child_context,
-                                JSValue child_global,
-                                JSValueConst host_defined_option)
+        context_record(napi_env owner,
+                       JSContext *parent_context,
+                       JSValueConst sandbox_or_undefined,
+                       JSContext *child_context,
+                       JSValueConst child_global,
+                       JSValueConst host_defined_option)
             : env{owner},
               parent_ctx{parent_context},
               ctx{child_context},
-              sandbox{JS_DupValue(parent_context, parent_sandbox)},
+              sandbox{sandbox_or_undefined},
               global{child_global},
               host_defined_option_id{JS_DupValue(parent_context, host_defined_option)}
         {
@@ -113,30 +133,45 @@ namespace quickjs::detail
             close();
         }
 
+        bool live() const
+        {
+            return !disposed && !collected;
+        }
+
+        bool has_sandbox() const
+        {
+            return JS_IsObject(sandbox);
+        }
+
+        JSValueConst key() const
+        {
+            return has_sandbox() ? sandbox : global;
+        }
+
+        static void key_collected(JSRuntime *, void *opaque)
+        {
+            // Runs while the collector frees the key; the context may go in
+            // the same pass. Only mark the record: it is released later.
+            static_cast<context_record *>(opaque)->collected = true;
+        }
+
         void close()
         {
             if (disposed)
                 return;
             disposed = true;
-            if (ctx != nullptr)
-            {
-                for (JSAtom atom : baseline_atoms)
-                    JS_FreeAtom(ctx, atom);
-                baseline_atoms.clear();
-                JS_FreeValue(ctx, global);
-                global = JS_UNDEFINED;
-                JS_SetContextOpaque(ctx, nullptr);
+            JSRuntime *rt = JS_GetRuntime(parent_ctx);
+            JS_DeleteNativeWeakRefLink(rt, &key_link);
+            if (owns_context && ctx != nullptr)
                 JS_FreeContext(ctx);
-                ctx = nullptr;
-            }
-            if (parent_ctx != nullptr)
-            {
-                JS_FreeValue(parent_ctx, sandbox);
-                JS_FreeValue(parent_ctx, host_defined_option_id);
-            }
-            sandbox = JS_UNDEFINED;
+            for (JSAtom atom : baseline_atoms)
+                JS_FreeAtomRT(rt, atom);
+            baseline_atoms.clear();
+            JS_FreeValueRT(rt, host_defined_option_id);
             host_defined_option_id = JS_UNDEFINED;
-            parent_ctx = nullptr;
+            sandbox = JS_UNDEFINED;
+            global = JS_UNDEFINED;
+            ctx = nullptr;
         }
 
         bool has_baseline_atom(JSAtom atom) const
@@ -146,11 +181,18 @@ namespace quickjs::detail
 
         napi_env env = nullptr;
         JSContext *parent_ctx = nullptr;
-        JSContext *ctx = nullptr;
-        JSValue sandbox = JS_UNDEFINED;
-        JSValue global = JS_UNDEFINED;
+        JSContext *ctx = nullptr;            // Borrowed; valid while live().
+        JSValueConst sandbox = JS_UNDEFINED; // Borrowed; undefined without one.
+        JSValueConst global = JS_UNDEFINED;  // Borrowed; valid while live().
         JSValue host_defined_option_id = JS_UNDEFINED;
         std::vector<JSAtom> baseline_atoms;
+        JSNativeWeakRefLink key_link{};
+        // The key holds the link to the context.
+        bool anchored = false;
+        // The key cannot hold the link (a sandbox that is not extensible): the
+        // record keeps the context until the sandbox is collected.
+        bool owns_context = false;
+        bool collected = false;
         bool disposed = false;
     };
 
@@ -170,7 +212,20 @@ namespace quickjs::detail
     {
         if (torn_down_)
             return;
+        // Contexts that outlive the environment must not point at it.
+        for (const auto &record : contexts_)
+        {
+            if (record->live() || (!record->disposed && record->owns_context))
+                JS_SetContextOpaque(record->ctx, nullptr);
+        }
+        records_by_global_.clear();
         contexts_.clear();
+        if (context_link_atom_ != JS_ATOM_NULL)
+            JS_FreeAtom(ctx_, context_link_atom_);
+        if (sandbox_link_atom_ != JS_ATOM_NULL)
+            JS_FreeAtom(ctx_, sandbox_link_atom_);
+        context_link_atom_ = JS_ATOM_NULL;
+        sandbox_link_atom_ = JS_ATOM_NULL;
         JS_FreeValue(ctx_, source_map_error_source_callback_);
         source_map_error_source_callback_ = JS_UNDEFINED;
         torn_down_ = true;
@@ -313,20 +368,22 @@ namespace quickjs::detail
         return napi_ok;
     }
 
-    napi_contextify__::context_record *napi_contextify__::find_context_record(JSValueConst sandbox) const
+    napi_contextify__::context_record *napi_contextify__::find_live_record(JSValueConst global_or_sandbox) const
     {
-        for (const auto &record : contexts_)
-        {
-            if (record != nullptr && !record->disposed && is_same_object(record->sandbox, sandbox))
-                return record.get();
-        }
-        return nullptr;
+        if (!JS_IsObject(global_or_sandbox))
+            return nullptr;
+        auto it = records_by_global_.find(JS_VALUE_GET_PTR(global_or_sandbox));
+        return it != records_by_global_.end() && it->second->live() ? it->second : nullptr;
     }
 
     napi_contextify__::context_record *napi_contextify__::create_context_record(
-        JSValueConst sandbox,
-        JSValueConst host_defined_option_id)
+        JSValueConst sandbox_or_undefined,
+        JSValueConst host_defined_option_id,
+        napi_value *key_out)
     {
+        prune_collected_records();
+        if (!ensure_link_atoms())
+            return nullptr;
         JSRuntime *rt = JS_GetRuntime(ctx_);
         JSContext *child_ctx = JS_NewContext(rt);
         if (child_ctx == nullptr)
@@ -342,28 +399,89 @@ namespace quickjs::detail
 
         auto record = std::make_unique<context_record>(env_,
                                                        ctx_,
-                                                       sandbox,
+                                                       sandbox_or_undefined,
                                                        child_ctx,
                                                        child_global,
                                                        host_defined_option_id);
+        // The context keeps its global alive; the record borrows it.
+        JS_FreeValue(child_ctx, child_global);
         context_record *raw = record.get();
-        contexts_.push_back(std::move(record));
-        if (collect_global_baseline(raw) != napi_ok)
+
+        // A function made in the realm keeps its context alive. The links are
+        // own properties even on a Proxy sandbox: no trap sees them.
+        JSValueConst key = raw->key();
+        bool linked = false;
+        JSValue anchor = JS_NewCFunction(child_ctx, contextify_anchor, "contextify", 0);
+        if (!JS_IsException(anchor))
         {
-            destroy_context_record(raw);
+            int stored = JS_DefinePropertyValue(ctx_, key, context_link_atom_, anchor, k_contextify_link_flags);
+            raw->anchored = stored > 0;
+            if (stored > 0)
+                linked = !raw->has_sandbox() ||
+                         JS_DefinePropertyValue(child_ctx, raw->global, sandbox_link_atom_,
+                                                JS_DupValue(child_ctx, raw->sandbox),
+                                                k_contextify_link_flags) > 0;
+            else if (stored == 0)
+                linked = raw->owns_context = true;
+        }
+        linked = linked && JS_AddNativeWeakRefLink(ctx_, key, &raw->key_link,
+                                                   context_record::key_collected, raw) >= 0;
+        // The current scope holds the key, and so the realm, before this
+        // function lets go of the context.
+        if (!linked || (raw->has_sandbox() && collect_global_baseline(raw) != napi_ok) ||
+            napi_util__::wrap_dup(env_, key, key_out) != napi_ok)
+        {
+            if (JS_HasException(child_ctx))
+                JS_FreeValue(child_ctx, JS_GetException(child_ctx));
+            if (raw->anchored)
+            {
+                JS_DeleteProperty(ctx_, key, context_link_atom_, 0);
+                JS_DeleteProperty(child_ctx, raw->global, sandbox_link_atom_, 0);
+            }
+            JS_SetContextOpaque(child_ctx, nullptr);
+            // A record that owns the context releases it; otherwise drop ours.
+            const bool owned = raw->owns_context;
+            record.reset();
+            if (!owned)
+                JS_FreeContext(child_ctx);
             return nullptr;
         }
+
+        records_by_global_[JS_VALUE_GET_PTR(raw->global)] = raw;
+        if (raw->has_sandbox())
+            records_by_global_[JS_VALUE_GET_PTR(raw->sandbox)] = raw;
+        contexts_.push_back(std::move(record));
+        // From here the key (or, when it cannot hold the link, the record)
+        // owns the context.
+        if (!raw->owns_context)
+            JS_FreeContext(child_ctx);
         return raw;
     }
 
-    void napi_contextify__::destroy_context_record(context_record *record)
+    // Releases the records of collected realms.
+    void napi_contextify__::prune_collected_records()
     {
-        if (record == nullptr)
-            return;
-        auto it = std::find_if(contexts_.begin(), contexts_.end(), [record](const auto &entry)
-                               { return entry.get() == record; });
-        if (it != contexts_.end())
-            contexts_.erase(it);
+        for (auto it = records_by_global_.begin(); it != records_by_global_.end();)
+            it = it->second->collected ? records_by_global_.erase(it) : std::next(it);
+        contexts_.erase(std::remove_if(contexts_.begin(), contexts_.end(), [](const auto &entry)
+                                       { return entry->collected; }),
+                        contexts_.end());
+    }
+
+    bool napi_contextify__::ensure_link_atoms()
+    {
+        if (context_link_atom_ != JS_ATOM_NULL && sandbox_link_atom_ != JS_ATOM_NULL)
+            return true;
+        JSValue context_symbol = JS_NewPrivateSymbol(ctx_, "contextify context");
+        JSValue sandbox_symbol = JS_NewPrivateSymbol(ctx_, "contextify sandbox");
+        if (!JS_IsException(context_symbol) && !JS_IsException(sandbox_symbol))
+        {
+            context_link_atom_ = JS_ValueToAtom(ctx_, context_symbol);
+            sandbox_link_atom_ = JS_ValueToAtom(ctx_, sandbox_symbol);
+        }
+        JS_FreeValue(ctx_, context_symbol);
+        JS_FreeValue(ctx_, sandbox_symbol);
+        return context_link_atom_ != JS_ATOM_NULL && sandbox_link_atom_ != JS_ATOM_NULL;
     }
 
     bool napi_contextify__::compile_trace_enabled() const
@@ -696,51 +814,73 @@ namespace quickjs::detail
         return napi_ok;
     }
 
-    napi_status napi_contextify__::make_context(napi_value sandbox_or_symbol,
-                                                napi_value name,
-                                                napi_value origin_or_undefined,
-                                                bool allow_code_gen_strings,
-                                                bool allow_code_gen_wasm,
-                                                bool own_microtask_queue,
-                                                napi_value host_defined_option_id,
-                                                napi_value *result_out)
+    napi_status napi_contextify__::create_realm(const unofficial_napi_realm_options &options,
+                                                unofficial_napi_realm *realm_out,
+                                                napi_value *global_out)
     {
-        (void)name;
-        (void)origin_or_undefined;
-        (void)allow_code_gen_strings;
-        (void)allow_code_gen_wasm;
-        (void)own_microtask_queue;
-        if (!napi_util__::check_env(env_) || sandbox_or_symbol == nullptr || result_out == nullptr)
+        // QuickJS has no per-realm code-generation switches or microtask
+        // queues; name and origin only label V8 inspector contexts.
+        if (!napi_util__::check_env(env_) || realm_out == nullptr)
             return napi_invalid_arg;
-        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_symbol);
-        if (!JS_IsObject(sandbox))
-            return napi_invalid_arg;
-        context_record *record = find_context_record(sandbox);
-        if (record == nullptr)
+        JSValueConst sandbox = JS_UNDEFINED;
+        if (options.sandbox_or_null != nullptr)
         {
-            JSValue host_id = host_defined_option_id == nullptr ? JS_UNDEFINED : napi_quickjs_value_inner(env_, host_defined_option_id);
-            record = create_context_record(sandbox, host_id);
-            if (record == nullptr)
-                return napi_util__::return_pending_if_caught(env_, "Failed to create QuickJS context");
+            sandbox = napi_quickjs_value_inner(env_, options.sandbox_or_null);
+            if (!JS_IsObject(sandbox))
+                return napi_object_expected;
+            if (find_live_record(sandbox) != nullptr)
+                return napi_invalid_arg;
         }
-        napi_status status = define_contextify_internal_property(env_,
-                                                                 ctx_,
-                                                                 sandbox,
-                                                                 "__quickjs_contextified",
-                                                                 JS_NewBool(ctx_, true));
-        if (status != napi_ok)
-            return status;
-        status = define_contextify_internal_property(env_,
-                                                     ctx_,
-                                                     sandbox,
-                                                     "globalThis",
-                                                     JS_DupValue(ctx_, sandbox));
-        if (status != napi_ok)
-            return status;
-        return napi_util__::wrap_dup(env_, sandbox, result_out);
+        JSValueConst host_id = options.host_defined_option_id == nullptr
+                                   ? JS_UNDEFINED
+                                   : napi_quickjs_value_inner(env_, options.host_defined_option_id);
+        napi_value key = nullptr;
+        context_record *record = create_context_record(sandbox, host_id, &key);
+        if (record == nullptr)
+            return napi_util__::return_pending_if_caught(env_, "Failed to create QuickJS context");
+        if (record->has_sandbox())
+        {
+            napi_status status = define_contextify_internal_property(env_,
+                                                                     ctx_,
+                                                                     sandbox,
+                                                                     "__quickjs_contextified",
+                                                                     JS_NewBool(ctx_, true));
+            if (status == napi_ok)
+                status = define_contextify_internal_property(env_,
+                                                             ctx_,
+                                                             sandbox,
+                                                             "globalThis",
+                                                             JS_DupValue(ctx_, sandbox));
+            if (status != napi_ok)
+                return status;
+        }
+        // The handle is valid while the current scope holds the key.
+        *realm_out = reinterpret_cast<unofficial_napi_realm>(record);
+        if (global_out != nullptr)
+            *global_out = key;
+        return napi_ok;
     }
 
-    napi_status napi_contextify__::run_script(napi_value sandbox_or_null,
+    napi_status napi_contextify__::get_realm(napi_value value, unofficial_napi_realm *realm_out) const
+    {
+        if (!napi_util__::check_env(env_) || value == nullptr || realm_out == nullptr)
+            return napi_invalid_arg;
+        JSValueConst object = napi_quickjs_value_inner(env_, value);
+        if (!JS_IsObject(object))
+            return napi_object_expected;
+        *realm_out = reinterpret_cast<unofficial_napi_realm>(find_live_record(object));
+        return napi_ok;
+    }
+
+    JSContext *napi_contextify__::realm_context(unofficial_napi_realm realm) const
+    {
+        if (realm == nullptr)
+            return ctx_;
+        auto *record = reinterpret_cast<context_record *>(realm);
+        return record->live() ? record->ctx : nullptr;
+    }
+
+    napi_status napi_contextify__::run_script(unofficial_napi_realm realm,
                                               const unofficial_napi_js_source *source,
                                               napi_value filename,
                                               int32_t line_offset,
@@ -764,22 +904,10 @@ namespace quickjs::detail
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
+        auto *record = reinterpret_cast<context_record *>(realm);
+        if (record != nullptr && !record->live())
+            return napi_invalid_arg;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
-        context_record *record = nullptr;
-        if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))
-        {
-            if (!napi_util__::is_truthy_property(env_, sandbox_or_null, "__quickjs_contextified"))
-            {
-                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
-                return napi_invalid_arg;
-            }
-            record = find_context_record(napi_quickjs_value_inner(env_, sandbox_or_null));
-            if (record == nullptr || record->disposed)
-            {
-                env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
-                return napi_invalid_arg;
-            }
-        }
 
         std::string src = bytecode_record != nullptr ? bytecode_record->source_utf8
                                                      : napi_util__::to_utf8(env_, source->text);
@@ -787,19 +915,27 @@ namespace quickjs::detail
         JSValue result = JS_UNDEFINED;
         if (record != nullptr)
         {
-            napi_status sync_status = sync_sandbox_to_context(record);
+            napi_status sync_status = record->has_sandbox() ? sync_sandbox_to_context(record) : napi_ok;
             if (sync_status != napi_ok)
             {
                 env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return sync_status;
             }
-            JSEvalOptions options{
-                .version = JS_EVAL_OPTIONS_VERSION,
-                .eval_flags = JS_EVAL_TYPE_GLOBAL,
-                .filename = label.c_str(),
-                .line_num = std::max<int32_t>(1, line_offset + 1),
-            };
-            result = JS_EvalThis2(record->ctx, record->global, src.c_str(), src.size(), &options);
+            if (bytecode_record != nullptr && bytecode_record->ctx == record->ctx &&
+                !JS_IsUndefined(bytecode_record->artifact))
+            {
+                result = JS_EvalFunction(record->ctx, JS_DupValue(record->ctx, bytecode_record->artifact));
+            }
+            else
+            {
+                JSEvalOptions options{
+                    .version = JS_EVAL_OPTIONS_VERSION,
+                    .eval_flags = JS_EVAL_TYPE_GLOBAL,
+                    .filename = label.c_str(),
+                    .line_num = std::max<int32_t>(1, line_offset + 1),
+                };
+                result = JS_EvalThis2(record->ctx, record->global, src.c_str(), src.size(), &options);
+            }
             if (JS_IsException(result))
             {
                 JSValue exc = JS_GetException(record->ctx);
@@ -807,7 +943,7 @@ namespace quickjs::detail
                 env_->module_wrap().unregister_dynamic_import_referrer(filename, host_defined_option_id);
                 return napi_quickjs_set_last_error(env_, napi_pending_exception, "Exception while running contextify script");
             }
-            sync_status = sync_context_to_sandbox(record);
+            sync_status = record->has_sandbox() ? sync_context_to_sandbox(record) : napi_ok;
             if (sync_status != napi_ok)
             {
                 JS_FreeValue(record->ctx, result);
@@ -819,7 +955,8 @@ namespace quickjs::detail
             return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
         }
 
-        if (bytecode_record != nullptr && !JS_IsUndefined(bytecode_record->artifact))
+        if (bytecode_record != nullptr && bytecode_record->ctx == ctx_ &&
+            !JS_IsUndefined(bytecode_record->artifact))
         {
             // JS_EvalFunction consumes its argument; the artifact stays reusable.
             result = JS_EvalFunction(ctx_, JS_DupValue(ctx_, bytecode_record->artifact));
@@ -834,24 +971,11 @@ namespace quickjs::detail
         return napi_util__::wrap_owned(env_, result, result_out);
     }
 
-    napi_status napi_contextify__::dispose_context(napi_value sandbox_or_context_global)
-    {
-        if (!napi_util__::check_env(env_) || sandbox_or_context_global == nullptr)
-            return napi_invalid_arg;
-        JSValue sandbox = napi_quickjs_value_inner(env_, sandbox_or_context_global);
-        if (!JS_IsObject(sandbox))
-            return napi_invalid_arg;
-        context_record *record = find_context_record(sandbox);
-        if (record != nullptr)
-            destroy_context_record(record);
-        return define_contextify_internal_property(env_, ctx_, sandbox, "__quickjs_contextified", JS_NewBool(ctx_, false));
-    }
-
-    napi_status napi_contextify__::compile_function(const unofficial_napi_js_source *source,
+    napi_status napi_contextify__::compile_function(unofficial_napi_realm realm,
+                                                    const unofficial_napi_js_source *source,
                                                     napi_value filename,
                                                     int32_t line_offset,
                                                     int32_t column_offset,
-                                                    napi_value parsing_context_or_undefined,
                                                     napi_value context_extensions_or_undefined,
                                                     napi_value params_or_undefined,
                                                     napi_value host_defined_option_id,
@@ -866,6 +990,9 @@ namespace quickjs::detail
         auto *bytecode_record = napi_bytecode_record_from_source(source);
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function)
+            return napi_invalid_arg;
+        auto *record = reinterpret_cast<context_record *>(realm);
+        if (record != nullptr && !record->live())
             return napi_invalid_arg;
 
         std::vector<std::string> params;
@@ -894,23 +1021,22 @@ namespace quickjs::detail
             source_url = napi_util__::to_utf8(env_, filename);
         }
 
-        context_record *record = nullptr;
-        if (parsing_context_or_undefined != nullptr &&
-            !JS_IsUndefined(napi_quickjs_value_inner(env_, parsing_context_or_undefined)) &&
-            !JS_IsNull(napi_quickjs_value_inner(env_, parsing_context_or_undefined)))
-        {
-            record = find_context_record(napi_quickjs_value_inner(env_, parsing_context_or_undefined));
-        }
-
         JSContext *compile_ctx = record == nullptr ? ctx_ : record->ctx;
+        // The function sees the sandbox's globals as they are now.
+        if (record != nullptr && record->has_sandbox())
+        {
+            napi_status sync_status = sync_sandbox_to_context(record);
+            if (sync_status != napi_ok)
+                return sync_status;
+        }
 
         JSValue fn = JS_UNDEFINED;
         bool have_fn = false;
-        if (bytecode_record != nullptr && compile_ctx == ctx_ &&
+        if (bytecode_record != nullptr && bytecode_record->ctx == compile_ctx &&
             !JS_IsUndefined(bytecode_record->artifact))
         {
             // The handle's artifact is the compiled function; reuse it directly.
-            fn = JS_DupValue(ctx_, bytecode_record->artifact);
+            fn = JS_DupValue(compile_ctx, bytecode_record->artifact);
             have_fn = true;
         }
 
@@ -929,8 +1055,7 @@ namespace quickjs::detail
             if (JS_IsException(fn))
             {
                 JSValue exc = JS_GetException(compile_ctx);
-                if (compile_ctx == ctx_)
-                    annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
+                annotate_compile_exception(exc, diagnostic_source, source_url, line_offset, column_offset);
                 napi_util__::set_last_exception(env_, exc);
                 return napi_pending_exception;
             }
@@ -1047,7 +1172,8 @@ namespace quickjs::detail
         }
     }
 
-    napi_status napi_contextify__::bytecode_compile(napi_value source_text,
+    napi_status napi_contextify__::bytecode_compile(JSContext *target,
+                                                    napi_value source_text,
                                                     napi_value filename,
                                                     int32_t shape,
                                                     napi_value params_or_undefined,
@@ -1059,14 +1185,15 @@ namespace quickjs::detail
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
         (void)column_offset;           // QuickJS JS_Eval2 keys only on line_num.
-        if (!napi_util__::check_env(env_) || source_text == nullptr || bytecode_out == nullptr)
+        if (!napi_util__::check_env(env_) || target == nullptr || source_text == nullptr ||
+            bytecode_out == nullptr)
             return napi_invalid_arg;
         *bytecode_out = nullptr;
         if (can_parse_as_module_out != nullptr)
             *can_parse_as_module_out = false;
 
         auto record = std::make_unique<napi_bytecode_record__>();
-        record->ctx = ctx_;
+        record->ctx = target;
         record->source_utf8 = napi_util__::to_utf8(env_, source_text);
         record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
         record->shape = shape;
@@ -1075,11 +1202,11 @@ namespace quickjs::detail
         if (shape == unofficial_napi_bytecode_shape_cjs_function)
         {
             std::vector<uint8_t> produced;
-            JSValue fn = compile_cjs_function(ctx_, record->source_utf8, record->filename_utf8,
+            JSValue fn = compile_cjs_function(target, record->source_utf8, record->filename_utf8,
                                               record->params, nullptr, nullptr, 0, true, &produced, nullptr);
             if (JS_IsException(fn))
             {
-                JSValue exc = JS_GetException(ctx_);
+                JSValue exc = JS_GetException(target);
                 if (can_parse_as_module_out != nullptr)
                     *can_parse_as_module_out = can_parse_as_module(record->source_utf8, record->filename_utf8);
                 napi_util__::set_last_exception(env_, exc);
@@ -1099,10 +1226,10 @@ namespace quickjs::detail
                 .filename = record->filename_utf8.empty() ? "<bytecode>" : record->filename_utf8.c_str(),
                 .line_num = std::max<int32_t>(1, line_offset + 1),
             };
-            JSValue compiled = JS_Eval2(ctx_, record->source_utf8.c_str(), record->source_utf8.size(), &options);
+            JSValue compiled = JS_Eval2(target, record->source_utf8.c_str(), record->source_utf8.size(), &options);
             if (JS_IsException(compiled))
             {
-                JSValue exc = JS_GetException(ctx_);
+                JSValue exc = JS_GetException(target);
                 if (!is_module && can_parse_as_module_out != nullptr)
                     *can_parse_as_module_out = can_parse_as_module(record->source_utf8, record->filename_utf8);
                 napi_util__::set_last_exception(env_, exc);
@@ -1111,19 +1238,19 @@ namespace quickjs::detail
             size_t serialized_size = 0;
             const int write_flags = is_module ? (JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE)
                                               : JS_WRITE_OBJ_BYTECODE;
-            uint8_t *serialized = JS_WriteObject(ctx_, &serialized_size, compiled, write_flags);
+            uint8_t *serialized = JS_WriteObject(target, &serialized_size, compiled, write_flags);
             if (serialized != nullptr)
             {
                 record->bytes.assign(serialized, serialized + serialized_size);
-                js_free(ctx_, serialized);
+                js_free(target, serialized);
             }
             else
             {
                 // JS_WriteObject raised an exception (e.g. OOM); drop it so it
                 // does not leak pending out of this napi_ok return. The handle
                 // still holds the live artifact; only serialization is lost.
-                JSValue exc = JS_GetException(ctx_);
-                JS_FreeValue(ctx_, exc);
+                JSValue exc = JS_GetException(target);
+                JS_FreeValue(target, exc);
             }
             record->artifact = compiled;
         }
@@ -1132,11 +1259,14 @@ namespace quickjs::detail
             return napi_invalid_arg;
         }
 
+        if (target != ctx_)
+            JS_DupContext(target);
         *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
         return napi_ok;
     }
 
-    napi_status napi_contextify__::bytecode_deserialize(const uint8_t *bytes,
+    napi_status napi_contextify__::bytecode_deserialize(JSContext *target,
+                                                        const uint8_t *bytes,
                                                         size_t byte_length,
                                                         napi_value source_text,
                                                         napi_value filename,
@@ -1147,15 +1277,15 @@ namespace quickjs::detail
                                                         bool *rejected_out)
     {
         (void)host_defined_option_id;  // QuickJS handles HDO at record registration.
-        if (!napi_util__::check_env(env_) || bytes == nullptr || byte_length == 0 ||
-            source_text == nullptr || bytecode_out == nullptr)
+        if (!napi_util__::check_env(env_) || target == nullptr || bytes == nullptr ||
+            byte_length == 0 || source_text == nullptr || bytecode_out == nullptr)
             return napi_invalid_arg;
         *bytecode_out = nullptr;
         if (rejected_out != nullptr)
             *rejected_out = false;
 
         auto record = std::make_unique<napi_bytecode_record__>();
-        record->ctx = ctx_;
+        record->ctx = target;
         record->source_utf8 = napi_util__::to_utf8(env_, source_text);
         record->filename_utf8 = filename != nullptr ? napi_util__::to_utf8(env_, filename) : std::string();
         record->shape = shape;
@@ -1187,15 +1317,15 @@ namespace quickjs::detail
         {
             std::unique_ptr<bytecode_module_loader_guard> guard;
             if (is_module)
-                guard = std::make_unique<bytecode_module_loader_guard>(JS_GetRuntime(ctx_));
+                guard = std::make_unique<bytecode_module_loader_guard>(JS_GetRuntime(target));
             const int read_flags = is_module ? (JS_READ_OBJ_BYTECODE | JS_READ_OBJ_REFERENCE)
                                              : JS_READ_OBJ_BYTECODE;
-            restored = JS_ReadObject(ctx_, record->bytes.data(), record->bytes.size(), read_flags);
+            restored = JS_ReadObject(target, record->bytes.data(), record->bytes.size(), read_flags);
         }
         if (JS_IsException(restored))
         {
-            JSValue exc = JS_GetException(ctx_);
-            JS_FreeValue(ctx_, exc);
+            JSValue exc = JS_GetException(target);
+            JS_FreeValue(target, exc);
             if (rejected_out != nullptr)
                 *rejected_out = true;
             return napi_ok;
@@ -1205,11 +1335,11 @@ namespace quickjs::detail
         {
             // Evaluating the serialized wrapper expression yields the function
             // without running its body.
-            JSValue fn = JS_EvalFunction(ctx_, restored);
+            JSValue fn = JS_EvalFunction(target, restored);
             if (JS_IsException(fn))
             {
-                JSValue exc = JS_GetException(ctx_);
-                JS_FreeValue(ctx_, exc);
+                JSValue exc = JS_GetException(target);
+                JS_FreeValue(target, exc);
                 if (rejected_out != nullptr)
                     *rejected_out = true;
                 return napi_ok;
@@ -1221,6 +1351,8 @@ namespace quickjs::detail
             record->artifact = restored;
         }
 
+        if (target != ctx_)
+            JS_DupContext(target);
         *bytecode_out = reinterpret_cast<unofficial_napi_bytecode>(record.release());
         return napi_ok;
     }
@@ -1255,8 +1387,12 @@ namespace quickjs::detail
         if (bytecode == nullptr)
             return napi_invalid_arg;
         auto *record = reinterpret_cast<napi_bytecode_record__ *>(bytecode);
-        if (record->ctx != nullptr && !JS_IsUndefined(record->artifact))
-            JS_FreeValue(record->ctx, record->artifact);
+        if (record->ctx != nullptr)
+        {
+            JS_FreeValueRT(JS_GetRuntime(record->ctx), record->artifact);
+            if (record->ctx != ctx_)
+                JS_FreeContext(record->ctx);
+        }
         delete record;
         return napi_ok;
     }

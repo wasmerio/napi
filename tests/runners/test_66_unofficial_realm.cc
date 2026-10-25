@@ -530,6 +530,12 @@ TEST_F(Test66UnofficialRealm, RealmOutlivesItsGlobalHandleWhileReachable) {
     // script runs there.
     ASSERT_NE(RunIn(s.env, realm, "0"), nullptr);
     EXPECT_EQ(Int32(s.env, RunIn(s.env, realm, "state")), 1);
+#else
+    // The microtask went to the engine's one job queue; until it runs, the
+    // pending job keeps its realm alive.
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+              napi_ok);
 #endif
     ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
   }

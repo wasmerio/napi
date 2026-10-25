@@ -106,7 +106,8 @@ struct napi_module_wrap__::request_record
 
 struct napi_module_wrap__::record
 {
-  napi_module_wrap__ *owner = nullptr;
+  // The realm the module lives in; the record holds it unless it is the env's.
+  JSContext *ctx = nullptr;
   JSModuleDef *module = nullptr;
   JSValue module_value = JS_UNDEFINED;
   JSValue wrapper = JS_UNDEFINED;
@@ -220,6 +221,8 @@ void napi_module_wrap__::free_record(record *entry)
   JS_FreeValue(ctx_, entry->host_defined_option_id);
   JS_FreeValue(ctx_, entry->synthetic_eval_steps);
   JS_FreeValue(ctx_, entry->source_object);
+  if (entry->ctx != nullptr && entry->ctx != ctx_)
+    JS_FreeContext(entry->ctx);
   delete entry;
 }
 
@@ -400,10 +403,7 @@ JSValue napi_module_wrap__::call_callback(JSValueConst callback,
 {
   if (!JS_IsFunction(ctx_, callback))
     return JS_UNDEFINED;
-  JSValue global = JS_GetGlobalObject(ctx_);
-  JSValue result = JS_Call(ctx_, callback, global, argc, argv);
-  JS_FreeValue(ctx_, global);
-  return result;
+  return JS_Call(ctx_, callback, JS_UNDEFINED, argc, argv);
 }
 
 napi_status napi_module_wrap__::cache_module_requests(record *entry)
@@ -437,18 +437,18 @@ napi_status napi_module_wrap__::cache_module_requests(record *entry)
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
+napi_status napi_module_wrap__::create_source_text(JSContext *ctx,
+                                                   napi_value wrapper,
                                                    napi_value url,
-                                                   napi_value context_or_undefined,
                                                    const unofficial_napi_js_source *source,
                                                    int32_t line_offset,
                                                    int32_t column_offset,
                                                    napi_value host_defined_option_id,
                                                    unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
   (void)column_offset;
-  if (!napi_util__::check_value(env_, wrapper) ||
+  if (ctx == nullptr ||
+      !napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !unofficial_napi_js_source_is_valid(source) ||
       module_out == nullptr)
@@ -473,7 +473,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
 
   JSValue module_value = JS_UNDEFINED;
   if (bytecode_record != nullptr && !JS_IsUndefined(bytecode_record->artifact) &&
-      bytecode_record->ctx == ctx_)
+      bytecode_record->ctx == ctx)
   {
     // Reuse the deserialized/compiled module artifact: same JSModuleDef the
     // bytecode handle registered, so import.meta/dynamic-import records and
@@ -488,7 +488,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
         .filename = url_string.empty() ? "<module>" : url_string.c_str(),
         .line_num = line_offset + 1,
     };
-    module_value = JS_Eval2(ctx_, source_string.c_str(),
+    module_value = JS_Eval2(ctx, source_string.c_str(),
                             source_string.size(), &options);
   }
   if (JS_IsException(module_value))
@@ -497,7 +497,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return return_pending_exception("Module compile failed");
   }
 
-  JSModuleDef *module = JS_GetModuleDef(ctx_, module_value);
+  JSModuleDef *module = JS_GetModuleDef(ctx, module_value);
   if (module == nullptr)
   {
     JS_FreeValue(ctx_, host_id);
@@ -512,7 +512,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     JS_FreeValue(ctx_, module_value);
     return napi_generic_failure;
   }
-  entry->owner = this;
+  entry->ctx = ctx == ctx_ ? ctx : JS_DupContext(ctx);
   entry->module = module;
   entry->module_value = module_value;
   entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
@@ -535,15 +535,15 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
+napi_status napi_module_wrap__::create_synthetic(JSContext *ctx,
+                                                 napi_value wrapper,
                                                  napi_value url,
-                                                 napi_value context_or_undefined,
                                                  napi_value export_names,
                                                  napi_value synthetic_eval_steps,
                                                  unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
-  if (!napi_util__::check_value(env_, wrapper) ||
+  if (ctx == nullptr ||
+      !napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !napi_util__::check_value(env_, export_names) ||
       !napi_util__::check_value(env_, synthetic_eval_steps) ||
@@ -552,7 +552,7 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
 
   *module_out = nullptr;
   std::string url_string = napi_util__::to_utf8(env_, url);
-  JSModuleDef *module = JS_NewCModule(ctx_,
+  JSModuleDef *module = JS_NewCModule(ctx,
                                       url_string.empty() ? "<synthetic>" : url_string.c_str(),
                                       synthetic_init);
   if (module == nullptr)
@@ -569,14 +569,14 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
       return return_pending_exception("Failed to read synthetic export name");
     std::string name = value_to_string(ctx_, name_value);
     JS_FreeValue(ctx_, name_value);
-    if (JS_AddModuleExport(ctx_, module, name.c_str()) < 0)
+    if (JS_AddModuleExport(ctx, module, name.c_str()) < 0)
       return return_pending_exception("Failed to add synthetic export");
   }
 
   auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
     return napi_generic_failure;
-  entry->owner = this;
+  entry->ctx = ctx == ctx_ ? ctx : JS_DupContext(ctx);
   entry->module = module;
   entry->module_value = JS_DupModuleValue(ctx_, module);
   entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
@@ -687,7 +687,7 @@ napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
   record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
-  if (JS_LinkModule(ctx_, entry->module) < 0)
+  if (JS_LinkModule(entry->ctx, entry->module) < 0)
     return return_pending_exception("Module linking failed");
   return napi_ok;
 }
@@ -702,7 +702,7 @@ napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
+  JSValue promise = JS_EvaluateModule(entry->ctx, entry->module);
   if (JS_IsException(promise))
     return return_pending_exception("Failed to evaluate module");
   return wrap_owned(promise, result_out);
@@ -719,7 +719,7 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
+  JSValue promise = JS_EvaluateModule(entry->ctx, entry->module);
   if (JS_IsException(promise))
     return return_pending_exception("Failed to evaluate module");
 
@@ -1007,6 +1007,7 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
+  JSContext *ctx = entry->ctx;
   std::string filename = "<required-module-facade:" +
                          std::to_string(++facade_counter_) + ">";
   static constexpr const char *kFacadeSource =
@@ -1019,50 +1020,50 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
       .filename = filename.c_str(),
       .line_num = 1,
   };
-  JSValue facade_value = JS_Eval2(ctx_, kFacadeSource, std::strlen(kFacadeSource),
+  JSValue facade_value = JS_Eval2(ctx, kFacadeSource, std::strlen(kFacadeSource),
                                   &options);
   if (JS_IsException(facade_value))
     return return_pending_exception("Failed to compile required module facade");
-  JSModuleDef *facade = JS_GetModuleDef(ctx_, facade_value);
+  JSModuleDef *facade = JS_GetModuleDef(ctx, facade_value);
   if (facade == nullptr)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return napi_generic_failure;
   }
 
-  if (JS_GetModuleRequestCount(ctx_, facade) < 1 ||
-      JS_SetModuleRequestModule(ctx_, facade, 0, entry->module) < 0 ||
-      JS_LinkModule(ctx_, facade) < 0)
+  if (JS_GetModuleRequestCount(ctx, facade) < 1 ||
+      JS_SetModuleRequestModule(ctx, facade, 0, entry->module) < 0 ||
+      JS_LinkModule(ctx, facade) < 0)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to link required module facade");
   }
 
-  JSValue promise = JS_EvaluateModule(ctx_, facade);
+  JSValue promise = JS_EvaluateModule(ctx, facade);
   if (JS_IsException(promise))
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to evaluate required module facade");
   }
-  JSPromiseStateEnum state = JS_PromiseState(ctx_, promise);
+  JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
   if (state == JS_PROMISE_REJECTED)
   {
-    JSValue reason = JS_PromiseResult(ctx_, promise);
-    JS_FreeValue(ctx_, promise);
-    JS_FreeValue(ctx_, facade_value);
+    JSValue reason = JS_PromiseResult(ctx, promise);
+    JS_FreeValue(ctx, promise);
+    JS_FreeValue(ctx, facade_value);
     env_->set_last_exception(reason);
     return napi_pending_exception;
   }
-  JS_FreeValue(ctx_, promise);
+  JS_FreeValue(ctx, promise);
   if (state != JS_PROMISE_FULFILLED)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return throw_error("ERR_REQUIRE_ASYNC_MODULE",
                        "require() cannot be used on an ESM graph with top-level await");
   }
 
-  JSValue ns = JS_GetModuleNamespace(ctx_, facade);
-  JS_FreeValue(ctx_, facade_value);
+  JSValue ns = JS_GetModuleNamespace(ctx, facade);
+  JS_FreeValue(ctx, facade_value);
   if (JS_IsException(ns))
     return return_pending_exception("Failed to get required module facade namespace");
   return wrap_owned(ns, result_out);

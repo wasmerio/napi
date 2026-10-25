@@ -80,9 +80,8 @@ void napi_promises__::call_function(JSValueConst function, int argc, JSValueCons
   if (context_ == nullptr || !JS_IsFunction(context_, function))
     return;
 
-  JSValue global = JS_GetGlobalObject(context_);
-  JSValue ret = JS_Call(context_, function, global, argc, argv);
-  JS_FreeValue(context_, global);
+  // A hook fires for code in any realm of the env, so it gets no receiver.
+  JSValue ret = JS_Call(context_, function, JS_UNDEFINED, argc, argv);
   if (JS_IsException(ret))
   {
     clear_pending_exception_if_any();

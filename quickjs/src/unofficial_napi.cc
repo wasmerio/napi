@@ -1111,31 +1111,37 @@ extern "C"
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
+    napi_status NAPI_CDECL unofficial_napi_create_realm(
         napi_env env,
-        napi_value sandbox_or_symbol,
-        napi_value name,
-        napi_value origin_or_undefined,
-        bool allow_code_gen_strings,
-        bool allow_code_gen_wasm,
-        bool own_microtask_queue,
-        napi_value host_defined_option_id,
-        napi_value *result_out)
+        const unofficial_napi_realm_options *options_or_null,
+        unofficial_napi_realm *realm_out,
+        napi_value *global_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().make_context(sandbox_or_symbol,
-                                                              name,
-                                                              origin_or_undefined,
-                                                              allow_code_gen_strings,
-                                                              allow_code_gen_wasm,
-                                                              own_microtask_queue,
-                                                              host_defined_option_id,
-                                                              result_out)
-                             : napi_invalid_arg;
+        unofficial_napi_realm_options options;
+        unofficial_napi_realm_options_init(&options);
+        if (options_or_null != nullptr)
+        {
+            if (options_or_null->size < sizeof(options) ||
+                options_or_null->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION)
+                return napi_invalid_arg;
+            options = *options_or_null;
+        }
+        return napi_util__::check_env(env) ? env->contextify().create_realm(options, realm_out, global_out)
+                                           : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
+    napi_status NAPI_CDECL unofficial_napi_get_realm(
         napi_env env,
-        napi_value sandbox_or_null,
+        napi_value value,
+        unofficial_napi_realm *realm_out)
+    {
+        return napi_util__::check_env(env) ? env->contextify().get_realm(value, realm_out)
+                                           : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_run_script(
+        napi_env env,
+        unofficial_napi_realm realm_or_null,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
@@ -1147,7 +1153,7 @@ extern "C"
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().run_script(sandbox_or_null,
+        return napi_util__::check_env(env) ? env->contextify().run_script(realm_or_null,
                                                             source,
                                                             filename,
                                                             line_offset,
@@ -1175,11 +1181,15 @@ extern "C"
             return napi_invalid_arg;
 
         *result = {};
+        JSContext *target = env->contextify().realm_context(options->realm_or_null);
+        if (target == nullptr)
+            return napi_invalid_arg;
         if (options->has_cache != 0 && options->cache_bytes != nullptr &&
             options->cache_byte_length != 0)
         {
             bool rejected = false;
-            napi_status status = env->contextify().bytecode_deserialize(options->cache_bytes,
+            napi_status status = env->contextify().bytecode_deserialize(target,
+                                                                        options->cache_bytes,
                                                                         options->cache_byte_length,
                                                                         options->source_text,
                                                                         options->filename,
@@ -1204,7 +1214,8 @@ extern "C"
             options->cache_policy == unofficial_napi_bytecode_cache_validate_only)
             return napi_ok;
         bool can_parse_as_module = false;
-        napi_status status = env->contextify().bytecode_compile(options->source_text,
+        napi_status status = env->contextify().bytecode_compile(target,
+                                                                options->source_text,
                                                                 options->filename,
                                                                 options->shape,
                                                                 options->params_or_undefined,
@@ -1233,23 +1244,23 @@ extern "C"
                              : napi_invalid_arg;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_contextify_compile_function(
+    napi_status NAPI_CDECL unofficial_napi_compile_function(
         napi_env env,
+        unofficial_napi_realm realm_or_null,
         const unofficial_napi_js_source *source,
         napi_value filename,
         int32_t line_offset,
         int32_t column_offset,
-        napi_value parsing_context_or_undefined,
         napi_value context_extensions_or_undefined,
         napi_value params_or_undefined,
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
-        return napi_util__::check_env(env) ? env->contextify().compile_function(source,
+        return napi_util__::check_env(env) ? env->contextify().compile_function(realm_or_null,
+                                                                  source,
                                                                   filename,
                                                                   line_offset,
                                                                   column_offset,
-                                                                  parsing_context_or_undefined,
                                                                   context_extensions_or_undefined,
                                                                   params_or_undefined,
                                                                   host_defined_option_id,
@@ -1284,14 +1295,17 @@ extern "C"
             result_out == nullptr)
             return napi_invalid_arg;
         *result_out = {};
+        JSContext *ctx = env->contextify().realm_context(options->realm_or_null);
+        if (ctx == nullptr)
+            return napi_invalid_arg;
         napi_status status = napi_invalid_arg;
         switch (options->kind)
         {
         case unofficial_napi_module_source_text:
             status = env->module_wrap().create_source_text(
+                ctx,
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.source_text.source,
                 options->payload.source_text.line_offset,
                 options->payload.source_text.column_offset,
@@ -1300,9 +1314,9 @@ extern "C"
             break;
         case unofficial_napi_module_synthetic:
             status = env->module_wrap().create_synthetic(
+                ctx,
                 options->wrapper,
                 options->url,
-                options->context_or_undefined,
                 options->payload.synthetic.export_names,
                 options->payload.synthetic.synthetic_evaluation_steps,
                 &result_out->module);
