@@ -160,11 +160,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
     napi_value callback);
 
 typedef enum unofficial_napi_event_loop_checkpoint_mode {
-  // Drain promise/microtask work without admitting a host task turn.
+  // Drain promise/microtask work without suspending for a host task turn. A
+  // synchronous provider still reports a provider task it ran (see
+  // unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted).
   unofficial_napi_event_loop_checkpoint_microtasks = 0,
   // Admit a host task turn as well as draining engine work. Host-JavaScript
   // providers suspend through JSPI. Synchronous providers report that no host
-  // task was admitted so the runtime can wait on its native event source.
+  // task was admitted, unless the checkpoint ran a provider task (see
+  // unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted), so the
+  // runtime can wait on its native event source.
   unofficial_napi_event_loop_checkpoint_host_tasks = 1,
 } unofficial_napi_event_loop_checkpoint_mode;
 
@@ -172,8 +176,19 @@ typedef enum unofficial_napi_event_loop_checkpoint_state {
   unofficial_napi_event_loop_checkpoint_state_none = 0,
   // The provider still owns work which can make JavaScript runnable.
   unofficial_napi_event_loop_checkpoint_state_pending_provider_work = 1 << 0,
-  // The checkpoint admitted a host task turn. When this bit is absent, the
-  // runtime remains responsible for waiting on its native event source.
+  // The checkpoint admitted a host task turn, so the runtime starts its next
+  // loop turn without waiting on its native event source.
+  //
+  // - Host-JavaScript providers set it after suspending through JSPI.
+  // - Synchronous providers set it, together with
+  //   unofficial_napi_event_loop_checkpoint_state_pending_provider_work, when
+  //   the checkpoint ran a provider task (for example a V8 foreground task),
+  //   in either mode. They run at most one such task per checkpoint, because
+  //   a task may queue its successor, so the event loop gets a turn between
+  //   them. A checkpoint that runs no task leaves the bit unset.
+  //
+  // When this bit is absent, the runtime remains responsible for waiting on
+  // its native event source.
   unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted = 1 << 1,
 } unofficial_napi_event_loop_checkpoint_state;
 
