@@ -378,14 +378,18 @@ inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const c
   return napi_v8_set_last_error(env, napi_generic_failure, message);
 }
 
-// Like Node's NAPI_PREAMBLE: once V8 is terminating execution (worker
-// terminate(), process.exit()), calls that may run JS fail without entering
-// V8. Entering V8 then clears the termination, so the thread would keep
-// running JS after it was told to stop.
+// Like Node's napi_env__::terminatedOrTerminating(): V8 is terminating the
+// env's JS (worker terminate(), process.exit()).
+inline bool TerminatedOrTerminating(napi_env env) {
+  return env != nullptr && env->isolate != nullptr && env->isolate->IsExecutionTerminating();
+}
+
+// Like Node's NAPI_PREAMBLE: while terminating, calls that may run JS fail
+// without entering V8. Entering V8 then clears the termination, so the thread
+// would keep running JS after it was told to stop.
 #define NAPI_V8_RETURN_IF_TERMINATING(env)                                   \
   do {                                                                       \
-    if ((env) != nullptr && (env)->isolate != nullptr &&                     \
-        (env)->isolate->IsExecutionTerminating()) {                          \
+    if (TerminatedOrTerminating(env)) {                                      \
       return napi_v8_set_last_error(                                         \
           (env), napi_pending_exception, "Execution is terminating");        \
     }                                                                        \
@@ -455,6 +459,20 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
   return true;
 }
 
+// Like Node's napi_env__::CallIntoModule() and HandleThrow(): after a native
+// callback returns, rethrow the exception it left pending, unless V8 is
+// terminating. TryCatch records a termination as a null exception, and
+// rethrowing that would turn the termination into a catchable throw and cancel
+// it. Returns whether an exception was pending.
+bool HandleCallbackException(napi_env env) {
+  if (env->last_exception.IsEmpty()) return false;
+  if (!TerminatedOrTerminating(env)) {
+    env->isolate->ThrowException(env->last_exception.Get(env->isolate));
+  }
+  ClearLastException(env);
+  return true;
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
@@ -466,15 +484,7 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->last_exception.IsEmpty();
-  if (pending_exception) {
-    // TryCatch records a termination as a null exception; rethrowing it
-    // would turn the termination into a catchable throw and cancel it.
-    if (!info.GetIsolate()->IsExecutionTerminating()) {
-      info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    }
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -490,14 +500,7 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    // TryCatch records a termination as a null exception; rethrowing it
-    // would turn the termination into a catchable throw and cancel it.
-    if (!info.GetIsolate()->IsExecutionTerminating()) {
-      info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    }
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -514,14 +517,7 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    // TryCatch records a termination as a null exception; rethrowing it
-    // would turn the termination into a catchable throw and cancel it.
-    if (!info.GetIsolate()->IsExecutionTerminating()) {
-      info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    }
-    ClearLastException(env);
-  }
+  (void)HandleCallbackException(env);
 }
 
 }  // namespace
