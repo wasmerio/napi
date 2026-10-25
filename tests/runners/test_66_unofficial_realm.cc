@@ -547,6 +547,53 @@ TEST_F(Test66UnofficialRealm, RealmOutlivesItsGlobalHandleWhileReachable) {
   ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
 }
 
+// A job queued by code in a realm can still run after nothing else refers to
+// that realm, even when the job's functions belong to the env's realm.
+TEST_F(Test66UnofficialRealm, PendingJobRunsAfterItsRealmIsUnreachable) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_global = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value resolve = Eval(s.env,
+                              "(() => {"
+                              "  let resolve;"
+                              "  new Promise((r) => { resolve = r; })"
+                              "      .then((value) => { globalThis.got = value; });"
+                              "  return resolve;"
+                              "})()");
+    ASSERT_NE(resolve, nullptr);
+    napi_value global = nullptr;
+    unofficial_napi_realm realm = CreateRealm(s.env, &global);
+    ASSERT_NE(realm, nullptr);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "resolve", resolve), napi_ok);
+    // Resolving from the realm queues the reaction job there.
+    ASSERT_NE(RunIn(s.env, realm, "resolve(5); 0"), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak_global), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  for (int i = 0; i < 4; ++i) {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    ASSERT_NE(CreateRealm(s.env), nullptr);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  EXPECT_EQ(Int32(s.env, Eval(s.env, "globalThis.got")), 5);
+
+  // Once the job has run, the realm is collected.
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_global));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_global), napi_ok);
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 namespace {
 
