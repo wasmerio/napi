@@ -30,7 +30,7 @@ class RepostingForegroundTask final : public v8::Task {
 // cannot interfere with the environments of other N-API test fixtures.
 int main() {
   EdgeV8Platform::SetWorkerThreadCount(1);
-  auto platform = EdgeV8Platform::Create(true);
+  auto platform = EdgeV8Platform::Create();
   if (!platform) return 1;
   v8::V8::InitializePlatform(platform.get());
   if (!v8::V8::Initialize()) return 1;
