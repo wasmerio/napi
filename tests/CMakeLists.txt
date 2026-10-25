@@ -326,6 +326,11 @@ if(_napi_test_engine STREQUAL "v8")
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
     runners/test_66_foreground_task_handoff.cc
   )
+  # V8-specific: covers how the V8 provider keeps a termination while native
+  # code keeps using N-API.
+  add_fixture_test(${_napi_test_prefix}_test_68_napi_calls_keep_termination
+    runners/test_68_napi_calls_keep_termination.cc
+  )
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
