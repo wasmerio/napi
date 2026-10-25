@@ -324,8 +324,9 @@ void napi_env__::clear_last_exception()
   if (!has_last_exception_)
     return;
 
-  JS_FreeValue(last_exception_context_ == nullptr ? main_context_ : last_exception_context_, last_exception_);
-  last_exception_context_ = nullptr;
+  // The exception's own context may have been collected; freeing a value
+  // only needs the runtime.
+  JS_FreeValue(main_context_, last_exception_);
   last_exception_ = JS_UNDEFINED;
   has_last_exception_ = false;
 }
@@ -333,7 +334,6 @@ void napi_env__::clear_last_exception()
 void napi_env__::set_last_exception(JSValue exception)
 {
   clear_last_exception();
-  last_exception_context_ = current_context_;
   last_exception_ = exception;
   has_last_exception_ = true;
 }
@@ -344,7 +344,6 @@ JSValue napi_env__::take_last_exception()
     return JS_UNDEFINED;
 
   JSValue exception = last_exception_;
-  last_exception_context_ = nullptr;
   last_exception_ = JS_UNDEFINED;
   has_last_exception_ = false;
   return exception;

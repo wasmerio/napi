@@ -133,7 +133,6 @@ private:
 
   // Last native/JS error state.
   napi::error_state__ error_state_;
-  JSContext *last_exception_context_ = nullptr;
   JSValue last_exception_;
   bool has_last_exception_ = false;
 

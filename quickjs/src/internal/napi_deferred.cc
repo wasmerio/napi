@@ -9,6 +9,10 @@ napi_deferred__::napi_deferred__(napi_env env, JSContext *context, JSValue resol
       resolve_{resolve},
       reject_{reject}
 {
+  // A contextify context can be collected before the environment; the
+  // deferred keeps the context it uses alive.
+  if (env_ != nullptr && context_ != nullptr && context_ != env_->main_context())
+    JS_DupContext(context_);
 }
 
 napi_deferred__::~napi_deferred__()
@@ -29,6 +33,8 @@ napi_deferred__::~napi_deferred__()
   {
     JS_FreeValue(context, resolve);
     JS_FreeValue(context, reject);
+    if (context != env->main_context())
+      JS_FreeContext(context);
   }
 }
 

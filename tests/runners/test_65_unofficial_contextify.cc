@@ -908,7 +908,6 @@ TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
 }
 #endif
 
-#if defined(NAPI_TEST_ENGINE_V8)
 namespace {
 
 napi_value RunIn(napi_env env, napi_value sandbox, const char* code) {
@@ -942,8 +941,13 @@ TEST_F(Test65UnofficialContextify, ContextIsCollectedWithItsSandbox) {
   for (int i = 0; i < kContexts; ++i) {
     napi_handle_scope scope = nullptr;
     ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+    const bool vanilla = i % 3 == 2;
+#else
+    const bool vanilla = false;  // QuickJS has no vanilla contexts.
+#endif
     napi_value sandbox = nullptr;
-    if (i % 3 == 2) {
+    if (vanilla) {
       sandbox = Sym(s.env, "vanilla");
     } else {
       ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
@@ -1011,8 +1015,8 @@ TEST_F(Test65UnofficialContextify, ContextOutlivesSandboxHandleWhileReachable) {
                                                       true, Sym(s.env, "hdo"), &key),
               napi_ok);
     napi_value made = RunIn(s.env, sandbox,
-                            "globalThis.state = 0;"
-                            "[() => { Promise.resolve().then(() => { state++; }); return 7; }]");
+                            "globalThis.box = { n: 0 };"
+                            "[() => { Promise.resolve().then(() => { box.n++; }); return 7; }]");
     ASSERT_NE(made, nullptr);
     ASSERT_EQ(napi_create_reference(s.env, made, 1, &functions), napi_ok);
     ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
@@ -1048,17 +1052,23 @@ TEST_F(Test65UnofficialContextify, ContextOutlivesSandboxHandleWhileReachable) {
     ASSERT_EQ(napi_get_reference_value(s.env, functions, &array), napi_ok);
     ASSERT_EQ(napi_get_element(s.env, array, 0, &function), napi_ok);
     ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
-    // Queues a microtask on the context's own queue.
+    // Queues a microtask (on V8, on the context's own queue).
     ASSERT_EQ(napi_call_function(s.env, undefined, function, 0, nullptr, &result), napi_ok);
     int32_t value = 0;
     ASSERT_EQ(napi_get_value_int32(s.env, result, &value), napi_ok);
     EXPECT_EQ(value, 7);
 
-    // Running a script in the context drains its queue afterwards.
+#if defined(NAPI_TEST_ENGINE_V8)
+    // Running a script in the context drains its own queue afterwards.
     ASSERT_NE(RunIn(s.env, sandbox, "0"), nullptr);
-    napi_value state = RunIn(s.env, sandbox, "state");
-    ASSERT_NE(state, nullptr);
-    ASSERT_EQ(napi_get_value_int32(s.env, state, &value), napi_ok);
+#else
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+              napi_ok);
+#endif
+    napi_value count = RunIn(s.env, sandbox, "box.n");
+    ASSERT_NE(count, nullptr);
+    ASSERT_EQ(napi_get_value_int32(s.env, count, &value), napi_ok);
     EXPECT_EQ(value, 1);
     ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
   }
@@ -1069,7 +1079,312 @@ TEST_F(Test65UnofficialContextify, ContextOutlivesSandboxHandleWhileReachable) {
   EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
   ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
 }
-#endif
+
+// A value made in a context stays usable while it is in a handle scope, after
+// its sandbox handle is gone; once released, the context is collected. A
+// string, unlike an object, does not keep its realm alive by itself.
+TEST_F(Test65UnofficialContextify, ContextValueOutlivesSandboxHandle) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_sandbox = nullptr;
+  napi_handle_scope outer = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &outer), napi_ok);
+  napi_value made = nullptr;
+  {
+    napi_escapable_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_escapable_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    napi_value key = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, "ctx"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      false, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    napi_value value = RunIn(s.env, sandbox, "'x'.repeat(40) + 'y'");
+    ASSERT_NE(value, nullptr);
+    ASSERT_EQ(napi_escape_handle(s.env, scope, value, &made), napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_close_escapable_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, made, nullptr, 0, &length), napi_ok);
+  EXPECT_EQ(length, 41u);
+  ASSERT_EQ(napi_close_handle_scope(s.env, outer), napi_ok);
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+
+// A weak reference to a context's object does not keep the context alive and
+// reads back as empty once it is collected.
+TEST_F(Test65UnofficialContextify, WeakReferenceToContextValue) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_sandbox = nullptr;
+  napi_ref weak_value = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    napi_value key = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_make_context(s.env, sandbox, Str(s.env, "ctx"),
+                                                      Str(s.env, "test://origin"), true, true,
+                                                      false, Sym(s.env, "hdo"), &key),
+              napi_ok);
+    napi_value value = RunIn(s.env, sandbox, "globalThis.kept = {}; kept");
+    ASSERT_NE(value, nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, value, 0, &weak_value), napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  EXPECT_TRUE(IsCollected(s.env, weak_value));
+  // A collected reference can still be made strong and deleted.
+  uint32_t count = 0;
+  ASSERT_EQ(napi_reference_ref(s.env, weak_value, &count), napi_ok);
+  ASSERT_EQ(napi_delete_reference(s.env, weak_value), napi_ok);
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+
+namespace {
+
+napi_value MakeContext(napi_env env, napi_value sandbox) {
+  napi_value key = nullptr;
+  if (unofficial_napi_contextify_make_context(env, sandbox, Str(env, "ctx"),
+                                              Str(env, "test://origin"), true, true, false,
+                                              Sym(env, "hdo"), &key) != napi_ok) {
+    return nullptr;
+  }
+  return key;
+}
+
+napi_value EnqueueArgument(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value callback = nullptr;
+  if (napi_get_cb_info(env, info, &argc, &callback, nullptr, nullptr) != napi_ok ||
+      unofficial_napi_enqueue_microtask(env, callback) != napi_ok) {
+    return nullptr;
+  }
+  return nullptr;
+}
+
+int32_t MainInt(napi_env env, const char* code) {
+  int32_t value = -1;
+  napi_value result = RunIn(env, nullptr, code);
+  if (result == nullptr || napi_get_value_int32(env, result, &value) != napi_ok) return -1;
+  return value;
+}
+
+}  // namespace
+
+// Code in a context resolves a promise of the main realm and returns. The
+// reaction job runs after the context is otherwise unreachable and collected,
+// and the context is collected once the job has run.
+TEST_F(Test65UnofficialContextify, JobQueuedFromContextRunsAfterCollection) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_sandbox = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    ASSERT_NE(RunIn(s.env, nullptr,
+                    "globalThis.hits = 0;"
+                    "globalThis.pending = new Promise(r => { globalThis.resolvePending = r; });"
+                    "pending.then(() => { hits++; }); 0"),
+              nullptr);
+    napi_value sandbox = nullptr, global = nullptr, resolve = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_get_named_property(s.env, global, "resolvePending", &resolve), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "resolvePending", resolve), napi_ok);
+    ASSERT_NE(MakeContext(s.env, sandbox), nullptr);
+    ASSERT_NE(RunIn(s.env, sandbox, "resolvePending(1); 0"), nullptr);
+    ASSERT_NE(RunIn(s.env, nullptr, "delete globalThis.resolvePending; 0"), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  EXPECT_EQ(MainInt(s.env, "hits"), 1);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+
+// A native function called from a context queues a main-realm callback; the
+// callback runs after the context is collected.
+TEST_F(Test65UnofficialContextify, MicrotaskQueuedFromContextRunsAfterCollection) {
+  EnvScope s(runtime_.get());
+
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    ASSERT_NE(RunIn(s.env, nullptr, "globalThis.calls = 0; globalThis.count = () => { calls++; }; 0"),
+              nullptr);
+    napi_value sandbox = nullptr, enqueue = nullptr, global = nullptr, count = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_create_function(s.env, "enqueue", NAPI_AUTO_LENGTH, EnqueueArgument, nullptr,
+                                   &enqueue),
+              napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "enqueue", enqueue), napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_get_named_property(s.env, global, "count", &count), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "count", count), napi_ok);
+    ASSERT_NE(MakeContext(s.env, sandbox), nullptr);
+    ASSERT_NE(RunIn(s.env, sandbox, "enqueue(count); 0"), nullptr);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  EXPECT_EQ(MainInt(s.env, "calls"), 1);
+}
+
+namespace {
+
+// A queued job: has the context queue a throwing callback, then drains the
+// queue itself (a nested checkpoint).
+napi_value DrainFromJob(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  size_t argc = 0;
+  napi_value sandbox = nullptr;
+  if (napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data) != napi_ok ||
+      napi_get_reference_value(env, *static_cast<napi_ref*>(data), &sandbox) != napi_ok ||
+      sandbox == nullptr) {
+    return nullptr;
+  }
+  RunIn(env, sandbox, "enqueue(thrower); 0");
+  unofficial_napi_event_loop_checkpoint(env, unofficial_napi_event_loop_checkpoint_microtasks, true,
+                                        nullptr);
+  return nullptr;
+}
+
+void ClearPendingException(napi_env env) {
+  bool pending = false;
+  napi_value exception = nullptr;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_get_and_clear_last_exception(env, &exception);
+  }
+}
+
+}  // namespace
+
+// A job queued from a context throws inside a nested checkpoint; the context
+// is still released once the queue is drained.
+TEST_F(Test65UnofficialContextify, ContextOfJobThrowingInNestedCheckpointIsReleased) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_sandbox = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr, enqueue = nullptr, drain = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_create_function(s.env, "enqueue", NAPI_AUTO_LENGTH, EnqueueArgument, nullptr,
+                                   &enqueue),
+              napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "enqueue", enqueue), napi_ok);
+    napi_value thrower = RunIn(s.env, nullptr, "() => { throw new Error('inner'); }");
+    ASSERT_NE(thrower, nullptr);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "thrower", thrower), napi_ok);
+    ASSERT_NE(MakeContext(s.env, sandbox), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_create_function(s.env, "drain", NAPI_AUTO_LENGTH, DrainFromJob, &weak_sandbox,
+                                   &drain),
+              napi_ok);
+    ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, drain), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  for (int i = 0; i < 2; ++i) {
+    unofficial_napi_event_loop_checkpoint(s.env, unofficial_napi_event_loop_checkpoint_microtasks,
+                                          true, nullptr);
+    ClearPendingException(s.env);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+
+// A frozen sandbox cannot hold anything new; its context stays usable while
+// the sandbox lives and is collected with it.
+TEST_F(Test65UnofficialContextify, FrozenSandboxContext) {
+  EnvScope s(runtime_.get());
+
+  napi_ref weak_sandbox = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_object_freeze(s.env, sandbox), napi_ok);
+    ASSERT_NE(MakeContext(s.env, sandbox), nullptr);
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_text(Str(s.env, "return 40 + 2"));
+    napi_value compiled = nullptr, function = nullptr, undefined = nullptr, result = nullptr;
+    ASSERT_EQ(unofficial_napi_contextify_compile_function(s.env, &source, Str(s.env, "f.js"), 0, 0,
+                                                          sandbox, nullptr, nullptr,
+                                                          Sym(s.env, "hdo"), &compiled),
+              napi_ok);
+    ASSERT_EQ(napi_get_named_property(s.env, compiled, "function", &function), napi_ok);
+    ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+    ASSERT_EQ(napi_call_function(s.env, undefined, function, 0, nullptr, &result), napi_ok);
+    int32_t value = 0;
+    ASSERT_EQ(napi_get_value_int32(s.env, result, &value), napi_ok);
+    EXPECT_EQ(value, 42);
+    ASSERT_EQ(napi_create_reference(s.env, sandbox, 0, &weak_sandbox), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_TRUE(IsCollected(s.env, weak_sandbox));
+  ASSERT_EQ(napi_delete_reference(s.env, weak_sandbox), napi_ok);
+}
+
+// A Proxy sandbox's traps never see the provider's own bookkeeping, and its
+// context stays usable.
+TEST_F(Test65UnofficialContextify, ProxySandboxTrapsSeeNoInternals) {
+  EnvScope s(runtime_.get());
+
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+  napi_value sandbox = RunIn(s.env, nullptr,
+                             "globalThis.seen = [];"
+                             "new Proxy({}, {"
+                             "  defineProperty(target, key, descriptor) {"
+                             "    if (typeof key === 'symbol') { seen.push(String(key)); return true; }"
+                             "    return Reflect.defineProperty(target, key, descriptor);"
+                             "  },"
+                             "  deleteProperty(target, key) {"
+                             "    if (typeof key === 'symbol') { seen.push(String(key)); return true; }"
+                             "    return Reflect.deleteProperty(target, key);"
+                             "  },"
+                             "})");
+  ASSERT_NE(sandbox, nullptr);
+  ASSERT_NE(MakeContext(s.env, sandbox), nullptr);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+
+  napi_value sum = RunIn(s.env, sandbox, "1 + 1");
+  ASSERT_NE(sum, nullptr);
+  int32_t value = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, sum, &value), napi_ok);
+  EXPECT_EQ(value, 2);
+  EXPECT_EQ(MainInt(s.env, "seen.length"), 0);
+  ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+}
 
 #if defined(NAPI_TEST_ENGINE_V8)
 // The provider releases the records of collected contexts (their references
