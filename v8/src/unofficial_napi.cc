@@ -1680,9 +1680,6 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   napi_agent__* agent = env->agent;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
-  agent->context_token_assign_callback = hooks->context_token_assign_callback;
-  agent->context_token_unassign_callback = hooks->context_token_unassign_callback;
-  agent->context_token_callback_data = hooks->data;
   agent->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
   agent->enqueue_foreground_task_target = hooks->data;
   agent->embedder_hooks_attached = true;

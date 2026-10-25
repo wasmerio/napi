@@ -52,9 +52,6 @@ struct napi_agent__ {
   bool embedder_hooks_attached = false;
   unofficial_napi_fatal_error_callback fatal_error_callback = nullptr;
   unofficial_napi_oom_error_callback oom_error_callback = nullptr;
-  unofficial_napi_context_token_callback context_token_assign_callback = nullptr;
-  unofficial_napi_context_token_callback context_token_unassign_callback = nullptr;
-  void* context_token_callback_data = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback =
       nullptr;
   void* enqueue_foreground_task_target = nullptr;
