@@ -83,6 +83,12 @@ unofficial_napi_realm CreateRealm(napi_env env,
   return realm;
 }
 
+// Two handles for one realm may differ, so realms compare by their globals.
+bool SameRealm(napi_env env, unofficial_napi_realm a, unofficial_napi_realm b) {
+  return a != nullptr && b != nullptr &&
+         StrictEquals(env, RunIn(env, a, "globalThis"), RunIn(env, b, "globalThis"));
+}
+
 bool IsCollected(napi_env env, napi_ref ref) {
   napi_value value = nullptr;
   return napi_get_reference_value(env, ref, &value) == napi_ok && value == nullptr;
@@ -225,10 +231,11 @@ TEST_F(Test66UnofficialRealm, GetRealmFindsRealmsByTheirGlobal) {
 
   unofficial_napi_realm found = nullptr;
   ASSERT_EQ(unofficial_napi_get_realm(s.env, realm_global, &found), napi_ok);
-  EXPECT_EQ(found, realm);
+  EXPECT_TRUE(SameRealm(s.env, found, realm));
   found = nullptr;
   ASSERT_EQ(unofficial_napi_get_realm(s.env, sandbox, &found), napi_ok);
-  EXPECT_EQ(found, sandbox_realm);
+  EXPECT_TRUE(SameRealm(s.env, found, sandbox_realm));
+  EXPECT_FALSE(SameRealm(s.env, found, realm));
 
   // The env's own global and other objects, functions included, are not a
   // realm's global.

@@ -140,8 +140,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
 //
 // A realm lives while its global (the sandbox, when it has one) or anything
 // made in it is reachable, and is then collected. A realm handle, like a
-// napi_value, is valid only while the handle scope it was obtained in is open;
-// unofficial_napi_get_realm finds the realm again from its global.
+// napi_value, is valid only while the handle scope it was obtained in is open,
+// and two handles for one realm may differ; unofficial_napi_get_realm finds
+// the realm again from its global.
 typedef struct unofficial_napi_realm__* unofficial_napi_realm;
 
 enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };

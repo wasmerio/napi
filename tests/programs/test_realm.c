@@ -141,9 +141,15 @@ int main(void) {
   printf("native function stays in the env's realm\n");
 
   // get_realm finds a realm by its global; the env's own global is not one.
+  // Like napi_values, two handles for one realm may differ, so the check runs
+  // code through the handle found.
   unofficial_napi_realm found = NULL;
+  napi_value found_global = NULL;
   NAPI_CALL(env, unofficial_napi_get_realm(env, realm_global, &found));
-  CHECK_OR_FAIL(found == realm, "get_realm(realm global) did not return the realm");
+  CHECK_OR_FAIL(found != NULL, "get_realm(realm global) found no realm");
+  NAPI_CALL(env, RunIn(env, found, "globalThis", &found_global));
+  CHECK_OR_FAIL(StrictEquals(env, found_global, realm_global),
+                "get_realm(realm global) returned another realm");
   found = realm;
   NAPI_CALL(env, unofficial_napi_get_realm(env, env_global, &found));
   CHECK_OR_FAIL(found == NULL, "get_realm(env global) returned a realm");
@@ -165,9 +171,9 @@ int main(void) {
                 "create_realm did not return the sandbox as the global");
   found = NULL;
   NAPI_CALL(env, unofficial_napi_get_realm(env, sandbox, &found));
-  CHECK_OR_FAIL(found == sandbox_realm, "get_realm(sandbox) did not return its realm");
+  CHECK_OR_FAIL(found != NULL, "get_realm(sandbox) found no realm");
   int32_t input = 0;
-  NAPI_CALL(env, RunInInt32(env, sandbox_realm, "output = input * 2; input", &input));
+  NAPI_CALL(env, RunInInt32(env, found, "output = input * 2; input", &input));
   napi_value output_value = NULL;
   int32_t output = 0;
   NAPI_CALL(env, napi_get_named_property(env, sandbox, "output", &output_value));
