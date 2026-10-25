@@ -35,16 +35,28 @@ static napi_value NAPI_CDECL RecordCallback(napi_env env, napi_callback_info inf
   return object;
 }
 
-static napi_status RunScript(napi_env env, const char* source, napi_value* result) {
-  napi_value script = NULL;
-  napi_status status = napi_create_string_utf8(env, source, NAPI_AUTO_LENGTH, &script);
+// Runs `source` in `realm`, or in the env's own realm when it is NULL.
+static napi_status RunIn(napi_env env,
+                         unofficial_napi_realm realm,
+                         const char* source,
+                         napi_value* result) {
+  napi_value text = NULL;
+  napi_value filename = NULL;
+  napi_status status = napi_create_string_utf8(env, source, NAPI_AUTO_LENGTH, &text);
   if (status != napi_ok) return status;
-  return napi_run_script(env, script, result);
+  status = napi_create_string_utf8(env, "realm.js", NAPI_AUTO_LENGTH, &filename);
+  if (status != napi_ok) return status;
+  const unofficial_napi_js_source script = unofficial_napi_js_source_from_text(text);
+  return unofficial_napi_run_script(
+      env, realm, &script, filename, 0, 0, -1, true, false, false, NULL, result);
 }
 
-static napi_status RunInt32(napi_env env, const char* source, int32_t* out) {
+static napi_status RunInInt32(napi_env env,
+                              unofficial_napi_realm realm,
+                              const char* source,
+                              int32_t* out) {
   napi_value result = NULL;
-  napi_status status = RunScript(env, source, &result);
+  napi_status status = RunIn(env, realm, source, &result);
   if (status != napi_ok) return status;
   return napi_get_value_int32(env, result, out);
 }
@@ -88,54 +100,54 @@ int main(void) {
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
 
   // A realm has its own global.
-  napi_env realm = NULL;
+  unofficial_napi_realm realm = NULL;
   napi_value realm_global = NULL;
   NAPI_CALL(env, unofficial_napi_create_realm(env, NULL, &realm, &realm_global));
-  CHECK_OR_FAIL(realm != NULL && realm != env, "create_realm did not return a new env");
+  CHECK_OR_FAIL(realm != NULL, "create_realm did not return a realm");
   napi_value env_global = NULL;
   napi_value realm_own_global = NULL;
   NAPI_CALL(env, napi_get_global(env, &env_global));
-  NAPI_CALL(realm, napi_get_global(realm, &realm_own_global));
+  NAPI_CALL(env, RunIn(env, realm, "globalThis", &realm_own_global));
   CHECK_OR_FAIL(StrictEquals(env, realm_own_global, realm_global),
-                "the realm env's global is not the one create_realm returned");
+                "the realm's global is not the one create_realm returned");
   CHECK_OR_FAIL(!StrictEquals(env, env_global, realm_global),
-                "the realm shares its parent's global");
+                "the realm shares the env's global");
   printf("realm has its own global\n");
 
-  // Values made through one env are usable through the other.
+  // Values cross realms.
   napi_value shared = NULL;
   NAPI_CALL(env, napi_create_object(env, &shared));
-  NAPI_CALL(realm, napi_set_named_property(realm, realm_global, "shared", shared));
+  NAPI_CALL(env, napi_set_named_property(env, realm_global, "shared", shared));
   int32_t x = 0;
-  NAPI_CALL(realm, RunInt32(realm, "shared.x = 7", &x));
+  NAPI_CALL(env, RunInInt32(env, realm, "shared.x = 7", &x));
   napi_value x_value = NULL;
   NAPI_CALL(env, napi_get_named_property(env, shared, "x", &x_value));
   NAPI_CALL(env, napi_get_value_int32(env, x_value, &x));
-  CHECK_OR_FAIL(x == 7, "a value did not cross envs");
-  printf("values cross envs: x=%d\n", x);
+  CHECK_OR_FAIL(x == 7, "a value did not cross realms");
+  printf("values cross realms: x=%d\n", x);
 
-  // A native function made through the realm env runs in that realm, also
-  // when the parent's script calls it.
-  callback_record record = {realm_global, NULL, false, 0};
+  // A native function belongs to the env's realm, also when code in another
+  // realm calls it.
+  callback_record record = {env_global, NULL, false, 0};
   napi_value fn = NULL;
-  NAPI_CALL(realm, napi_create_function(
-                       realm, "probe", NAPI_AUTO_LENGTH, RecordCallback, &record, &fn));
-  NAPI_CALL(env, napi_set_named_property(env, env_global, "probe", fn));
+  NAPI_CALL(env, napi_create_function(
+                     env, "probe", NAPI_AUTO_LENGTH, RecordCallback, &record, &fn));
+  NAPI_CALL(env, napi_set_named_property(env, realm_global, "probe", fn));
   napi_value probe_result = NULL;
-  NAPI_CALL(env, RunScript(env, "probe()", &probe_result));
+  NAPI_CALL(env, RunIn(env, realm, "probe()", &probe_result));
   CHECK_OR_FAIL(record.calls == 1, "the callback did not run");
-  CHECK_OR_FAIL(record.env == realm, "the callback did not get the realm env");
-  CHECK_OR_FAIL(record.saw_expected_global, "the callback did not see the realm's global");
-  printf("callback saw the realm env and the realm global\n");
+  CHECK_OR_FAIL(record.env == env, "the callback did not get its env");
+  CHECK_OR_FAIL(record.saw_expected_global, "the callback did not see the env's global");
+  printf("native function stays in the env's realm\n");
 
-  // get_realm maps globals back to their envs.
-  napi_env found = NULL;
+  // get_realm finds a realm by its global; the env's own global is not one.
+  unofficial_napi_realm found = NULL;
   NAPI_CALL(env, unofficial_napi_get_realm(env, realm_global, &found));
-  CHECK_OR_FAIL(found == realm, "get_realm(realm global) did not return the realm env");
-  found = NULL;
-  NAPI_CALL(realm, unofficial_napi_get_realm(realm, env_global, &found));
-  CHECK_OR_FAIL(found == env, "get_realm(parent global) did not return the parent env");
-  printf("get_realm finds both envs\n");
+  CHECK_OR_FAIL(found == realm, "get_realm(realm global) did not return the realm");
+  found = realm;
+  NAPI_CALL(env, unofficial_napi_get_realm(env, env_global, &found));
+  CHECK_OR_FAIL(found == NULL, "get_realm(env global) returned a realm");
+  printf("get_realm finds the realm by its global\n");
 
   // A sandbox realm reads and writes the sandbox.
   napi_value sandbox = NULL;
@@ -146,31 +158,16 @@ int main(void) {
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = sandbox;
-  napi_env sandbox_realm = NULL;
+  unofficial_napi_realm sandbox_realm = NULL;
   napi_value sandbox_global = NULL;
   NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &sandbox_realm, &sandbox_global));
   CHECK_OR_FAIL(StrictEquals(env, sandbox_global, sandbox),
                 "create_realm did not return the sandbox as the global");
-  napi_value source_text = NULL;
-  NAPI_CALL(env, napi_create_string_utf8(
-                     env, "output = input * 2; input", NAPI_AUTO_LENGTH, &source_text));
-  napi_value filename = NULL;
-  NAPI_CALL(env, napi_create_string_utf8(env, "sandbox.js", NAPI_AUTO_LENGTH, &filename));
-  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(source_text);
-  napi_value run_result = NULL;
-  NAPI_CALL(sandbox_realm, unofficial_napi_run_script(sandbox_realm,
-                                                      &source,
-                                                      filename,
-                                                      0,
-                                                      0,
-                                                      -1,
-                                                      true,
-                                                      false,
-                                                      false,
-                                                      NULL,
-                                                      &run_result));
+  found = NULL;
+  NAPI_CALL(env, unofficial_napi_get_realm(env, sandbox, &found));
+  CHECK_OR_FAIL(found == sandbox_realm, "get_realm(sandbox) did not return its realm");
   int32_t input = 0;
-  NAPI_CALL(env, napi_get_value_int32(env, run_result, &input));
+  NAPI_CALL(env, RunInInt32(env, sandbox_realm, "output = input * 2; input", &input));
   napi_value output_value = NULL;
   int32_t output = 0;
   NAPI_CALL(env, napi_get_named_property(env, sandbox, "output", &output_value));
@@ -178,101 +175,114 @@ int main(void) {
   CHECK_OR_FAIL(input == 5 && output == 10, "the sandbox realm did not use the sandbox");
   printf("sandbox realm: input=%d output=%d\n", input, output);
 
-  // A module made through a realm env evaluates in that realm, and its
-  // handle works through the parent env too.
-  int32_t tag = 0;
-  NAPI_CALL(realm, RunInt32(realm, "globalThis.tag = 21", &tag));
-  napi_value undefined = NULL;
-  NAPI_CALL(env, napi_get_undefined(env, &undefined));
-  napi_value wrapper = NULL;
-  NAPI_CALL(env, napi_create_object(env, &wrapper));
-  const unofficial_napi_js_source module_source =
-      unofficial_napi_js_source_from_text(Str(env, "export const tag = globalThis.tag;"));
-  unofficial_napi_module_create_options module_options = {0};
-  module_options.size = sizeof(module_options);
-  module_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
-  module_options.kind = unofficial_napi_module_source_text;
-  module_options.wrapper = wrapper;
-  module_options.url = Str(env, "file:///realm.mjs");
-  module_options.payload.source_text.source = &module_source;
-  module_options.payload.source_text.host_defined_option_id = undefined;
-  unofficial_napi_module_create_result created = {0};
-  NAPI_CALL(realm, unofficial_napi_module_wrap_create(realm, &module_options, &created));
-  NAPI_CALL(env, EvaluateModule(env, created.module));
-  tag = 0;
-  NAPI_CALL(env, ReadInt32Export(env, created.module, "tag", &tag));
-  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, created.module));
-  CHECK_OR_FAIL(tag == 21, "the module did not evaluate in the realm");
-  printf("realm module through the parent env: tag=%d\n", tag);
-
-  // A script, a compiled function and a module made through a sandbox
-  // realm's env all see the sandbox (x = 3).
+  // A script, a compiled function, a module and bytecode, all for a sandbox
+  // realm, see the sandbox (x = 3).
   napi_value context_sandbox = NULL;
   napi_value three = NULL;
   NAPI_CALL(env, napi_create_object(env, &context_sandbox));
   NAPI_CALL(env, napi_create_int32(env, 3, &three));
   NAPI_CALL(env, napi_set_named_property(env, context_sandbox, "x", three));
-  unofficial_napi_realm_options context_options;
-  unofficial_napi_realm_options_init(&context_options);
-  context_options.sandbox_or_null = context_sandbox;
-  napi_env context_realm = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &context_options, &context_realm, NULL));
-  const unofficial_napi_js_source run_source =
-      unofficial_napi_js_source_from_text(Str(env, "x + 1"));
+  options.sandbox_or_null = context_sandbox;
+  unofficial_napi_realm context_realm = NULL;
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &context_realm, NULL));
+  napi_value undefined = NULL;
+  NAPI_CALL(env, napi_get_undefined(env, &undefined));
+  int32_t ran = 0;
+  NAPI_CALL(env, RunInInt32(env, context_realm, "x + 1", &ran));
   const unofficial_napi_js_source function_source =
       unofficial_napi_js_source_from_text(Str(env, "return x * 10;"));
-  const unofficial_napi_js_source x_module_source =
-      unofficial_napi_js_source_from_text(Str(env, "export const y = x + 2;"));
-  napi_value value = NULL;
-  int32_t ran = 0;
-  NAPI_CALL(context_realm, unofficial_napi_run_script(context_realm, &run_source, Str(env, "a.js"),
-                                                      0, 0, -1, true, false, false, NULL,
-                                                      &value));
-  NAPI_CALL(env, napi_get_value_int32(env, value, &ran));
   napi_value compiled = NULL;
+  napi_value value = NULL;
   int32_t called = 0;
-  NAPI_CALL(context_realm, unofficial_napi_compile_function(context_realm, &function_source,
-                                                            Str(env, "f.js"), 0, 0, undefined,
-                                                            undefined, undefined, &compiled));
+  NAPI_CALL(env, unofficial_napi_compile_function(env, context_realm, &function_source,
+                                                  Str(env, "f.js"), 0, 0, undefined, undefined,
+                                                  undefined, &compiled));
   NAPI_CALL(env, napi_get_named_property(env, compiled, "function", &fn));
   NAPI_CALL(env, napi_call_function(env, undefined, fn, 0, NULL, &value));
   NAPI_CALL(env, napi_get_value_int32(env, value, &called));
+  napi_value wrapper = NULL;
   NAPI_CALL(env, napi_create_object(env, &wrapper));
+  const unofficial_napi_js_source module_source =
+      unofficial_napi_js_source_from_text(Str(env, "export const y = x + 2;"));
+  unofficial_napi_module_create_options module_options = {0};
+  module_options.size = sizeof(module_options);
+  module_options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  module_options.kind = unofficial_napi_module_source_text;
   module_options.wrapper = wrapper;
   module_options.url = Str(env, "file:///x.mjs");
-  module_options.payload.source_text.source = &x_module_source;
-  NAPI_CALL(context_realm, unofficial_napi_module_wrap_create(context_realm, &module_options,
-                                                              &created));
+  module_options.realm_or_null = context_realm;
+  module_options.payload.source_text.source = &module_source;
+  module_options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &module_options, &created));
   int32_t exported = 0;
   NAPI_CALL(env, EvaluateModule(env, created.module));
   NAPI_CALL(env, ReadInt32Export(env, created.module, "y", &exported));
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, created.module));
-  CHECK_OR_FAIL(ran == 4 && called == 30 && exported == 5,
-                "the realm env did not run in its sandbox's realm");
-  printf("vm results: run=%d function=%d module=%d\n", ran, called, exported);
+  unofficial_napi_bytecode_open_options open_options = {0};
+  open_options.size = sizeof(open_options);
+  open_options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  open_options.realm_or_null = context_realm;
+  open_options.source_text = Str(env, "x * 2");
+  open_options.filename = Str(env, "b.js");
+  open_options.shape = unofficial_napi_bytecode_shape_script;
+  open_options.params_or_undefined = undefined;
+  open_options.host_defined_option_id = undefined;
+  unofficial_napi_bytecode_open_result opened = {0};
+  NAPI_CALL(env, unofficial_napi_bytecode_open(env, &open_options, &opened));
+  const unofficial_napi_js_source bytecode_source =
+      unofficial_napi_js_source_from_bytecode(opened.bytecode);
+  int32_t from_bytecode = 0;
+  NAPI_CALL(env, unofficial_napi_run_script(env, context_realm, &bytecode_source,
+                                            Str(env, "b.js"), 0, 0, -1, true, false, false,
+                                            NULL, &value));
+  NAPI_CALL(env, napi_get_value_int32(env, value, &from_bytecode));
+  NAPI_CALL(env, unofficial_napi_bytecode_release(env, opened.bytecode));
+  CHECK_OR_FAIL(ran == 4 && called == 30 && exported == 5 && from_bytecode == 6,
+                "code did not run in its sandbox's realm");
+  printf("vm results: run=%d function=%d module=%d bytecode=%d\n", ran, called, exported,
+         from_bytecode);
 
-  // Releasing an env with live realm envs, nested ones included, releases
-  // them with it.
+  // Realms nothing refers to any more are collected.
+  enum { kDropped = 6 };
+  napi_ref dropped[kDropped];
+  for (int i = 0; i < kDropped; ++i) {
+    napi_handle_scope scope = NULL;
+    NAPI_CALL(env, napi_open_handle_scope(env, &scope));
+    napi_value dropped_sandbox = NULL;
+    if (i % 2 == 0) NAPI_CALL(env, napi_create_object(env, &dropped_sandbox));
+    options.sandbox_or_null = dropped_sandbox;
+    unofficial_napi_realm dropped_realm = NULL;
+    napi_value dropped_global = NULL;
+    NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &dropped_realm, &dropped_global));
+    napi_value ignored = NULL;
+    NAPI_CALL(env, RunIn(env, dropped_realm, "globalThis.payload = new Array(1024).fill(1)",
+                         &ignored));
+    NAPI_CALL(env, napi_create_reference(env, dropped_global, 0, &dropped[i]));
+    NAPI_CALL(env, napi_close_handle_scope(env, scope));
+  }
+  NAPI_CALL(env, unofficial_napi_collect_garbage(env));
+  int collected = 0;
+  for (int i = 0; i < kDropped; ++i) {
+    napi_value global = NULL;
+    NAPI_CALL(env, napi_get_reference_value(env, dropped[i], &global));
+    if (global == NULL) collected++;
+    NAPI_CALL(env, napi_delete_reference(env, dropped[i]));
+  }
+  CHECK_OR_FAIL(collected == kDropped, "a dropped realm was not collected");
+  printf("collected %d of %d dropped realms\n", collected, kDropped);
+
+  // Releasing an env with live realms releases them with it.
   napi_env env2 = NULL;
   unofficial_napi_env_owner env2_scope = NULL;
   NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &env2, &env2_scope));
-  napi_env env2_realm = NULL;
-  napi_env env2_nested = NULL;
+  unofficial_napi_realm env2_realm = NULL;
   NAPI_CALL(env2, unofficial_napi_create_realm(env2, NULL, &env2_realm, NULL));
-  NAPI_CALL(env2_realm, unofficial_napi_create_realm(env2_realm, NULL, &env2_nested, NULL));
-  int32_t nested_value = 0;
-  NAPI_CALL(env2_nested, RunInt32(env2_nested, "globalThis.v = 12", &nested_value));
-  CHECK_OR_FAIL(nested_value == 12, "the nested realm did not run");
+  int32_t realm_value = 0;
+  NAPI_CALL(env2, RunInInt32(env2, env2_realm, "globalThis.v = 12", &realm_value));
+  CHECK_OR_FAIL(realm_value == 12, "the second env's realm did not run");
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
-#ifdef __wasm__
-  // Guest env ids of released realm envs no longer resolve. (Natively the
-  // handles are freed pointers and must not be used.)
-  napi_value stale_global = NULL;
-  CHECK_OR_FAIL(napi_get_global(env2_realm, &stale_global) != napi_ok &&
-                    napi_get_global(env2_nested, &stale_global) != napi_ok,
-                "a released realm env still resolves");
-#endif
-  printf("released an env with live realm envs\n");
+  printf("released an env with live realms\n");
 
   return PrintSuccess("TEST_REALM");
 }
