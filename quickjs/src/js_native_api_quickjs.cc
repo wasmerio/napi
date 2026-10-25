@@ -1953,6 +1953,9 @@ extern "C"
       return napi_invalid_arg;
     }
     napi_env_context_scope__ context_scope{env, ctx};
+    napi_status terminating = napi_util__::fail_if_terminating(env, ctx);
+    if (terminating != napi_ok)
+      return terminating;
 
     // 2. Unwrap the constructor JSValue
     // Assuming 'unwrap_value' is your helper to get the JSValue from napi_value
@@ -2016,6 +2019,9 @@ extern "C"
     {
       return napi_quickjs_set_last_error(env, napi_function_expected, "Target is not a function");
     }
+    napi_status terminating = napi_util__::fail_if_terminating(env, ctx);
+    if (terminating != napi_ok)
+      return terminating;
 
     // 3. Resolve the receiver ('this' object)
     // If recv is null, Node-API defaults to 'undefined'
@@ -3159,6 +3165,9 @@ extern "C"
     JSValue source = napi_quickjs_value_inner(env, script);
     if (!JS_IsString(source))
       return napi_string_expected;
+    napi_status terminating = napi_util__::fail_if_terminating(env, env->context());
+    if (terminating != napi_ok)
+      return terminating;
 
     size_t len;
     const char *str = JS_ToCStringLen(env->context(), &len, source);

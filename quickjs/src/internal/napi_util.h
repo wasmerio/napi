@@ -25,6 +25,12 @@ public:
   static napi_status return_pending_if_caught(napi_env env, const char *message);
   static napi_status invalid_arg(napi_env env);
 
+  // Termination. QuickJS only polls its interrupt handler every few thousand
+  // calls and jumps, so the provider also stops JS itself at the points where
+  // native code hands control to JS or back.
+  static JSValue throw_termination(JSContext *ctx);
+  static napi_status fail_if_terminating(napi_env env, JSContext *ctx);
+
   static std::filesystem::path strip_file_url(std::string_view value);
   static std::filesystem::path resolve_symlink_components(const std::filesystem::path &path);
   static std::string read_text_file(const std::filesystem::path &path);
