@@ -1,7 +1,10 @@
 // Regression tests: unofficial_napi_terminate_execution must stop JS even when
 // native code keeps calling N-API afterwards.
 //
-// A native callback that sees a terminating isolate used to lose the
+// Like Node's NAPI_PREAMBLE, every N-API call that may run JS must fail while
+// the env is terminating, without running it.
+//
+// In the V8 provider a native callback that kept using N-API used to lose the
 // termination in three ways:
 // - the callback trampoline rethrew the (null) exception TryCatch records for
 //   a termination, which turned it into a catchable `null` and cancelled it;
@@ -10,8 +13,9 @@
 // EdgeJS workers then kept running after worker.terminate(), and
 // process.exit() waited for them forever.
 //
-// V8 provider only: it covers how the V8 provider keeps a termination while
-// native code keeps using N-API.
+// In the QuickJS provider the termination survived, but property access and
+// napi_instanceof still ran user JS (getters, Symbol.hasInstance) before
+// QuickJS next polled its interrupt handler.
 
 #include <string>
 
