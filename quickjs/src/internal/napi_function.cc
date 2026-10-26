@@ -74,6 +74,10 @@ JSValue napi_function__::trampoline(JSContext *ctx,
 
   auto cb = reinterpret_cast<napi_callback>(cb_ptr);
   auto user_data = napi_external__::get_value(func_data[1]);
+  // A terminating env runs no more native callbacks; JS that is still
+  // running between interrupt polls stops here.
+  if (env->termination_requested())
+    return napi_util__::throw_termination(ctx);
   napi_env_context_scope__ context_scope{env, ctx};
   quickjs_callback_handle_scope__ callback_scope{env};
   if (!callback_scope.is_open())
@@ -99,6 +103,18 @@ JSValue napi_function__::trampoline(JSContext *ctx,
 
   auto info = napi_callback_info__{env, effective_this, new_target, argc, argv, user_data};
   auto result = cb(env, reinterpret_cast<napi_callback_info>(&info));
+
+  // The callback may have requested termination itself (process.exit()), or
+  // swallowed the termination of JS it called. Either way the calling JS must
+  // not resume, matching V8, where termination keeps unwinding until every JS
+  // frame has exited or the embedder cancels it.
+  if (env->termination_requested())
+  {
+    napi_util__::clear_last_exception(env);
+    if (called_as_constructor)
+      JS_FreeValue(ctx, effective_this);
+    return napi_util__::throw_termination(ctx);
+  }
 
   if (napi_util__::rethrow_last_exception(env, ctx))
   {
