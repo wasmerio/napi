@@ -1274,7 +1274,7 @@ unofficial_napi_realm RealmForContext(v8::Local<v8::Context> context) {
 // The context code for `realm` runs in: the env's own for a null realm.
 // Empty when the realm is not one of `env`'s or was collected.
 v8::Local<v8::Context> RealmContext(napi_env env, unofficial_napi_realm realm) {
-  if (realm == nullptr) return env->context();
+  if (realm == nullptr) return env->main_context();
   if (realm->env != env) return v8::Local<v8::Context>();
   return realm->context.Get(env->isolate);
 }
@@ -1710,6 +1710,46 @@ napi_status NAPI_CDECL unofficial_napi_get_realm(napi_env env,
   }
   unofficial_napi_realm realm = RealmForContext(context);
   if (realm != nullptr && realm->env == env) *realm_out = realm;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_enter_realm(napi_env env,
+                                                   unofficial_napi_realm realm_or_null,
+                                                   unofficial_napi_realm_scope* scope_out) {
+  if (env == nullptr || scope_out == nullptr) return napi_invalid_arg;
+  *scope_out = 0;
+  // Only a realm this env made and still holds; the handle is not read
+  // before that is known.
+  if (realm_or_null != nullptr &&
+      std::none_of(env->realms.begin(), env->realms.end(),
+                   [&](const auto& realm) { return realm.get() == realm_or_null; })) {
+    return napi_invalid_arg;
+  }
+  v8::HandleScope handle_scope(env->isolate);
+  v8::Local<v8::Context> context = RealmContext(env, realm_or_null);
+  if (context.IsEmpty()) return napi_invalid_arg;
+
+  // The scope enters the realm's context, as v8::Context::Scope does, so
+  // that what V8 makes in the current context is made there too.
+  napi_realm_frame__ frame;
+  frame.scope = ++env->last_realm_scope;
+  frame.realm = realm_or_null;
+  frame.entered.Reset(env->isolate, context);
+  context->Enter();
+  env->realm_frames.push_back(std::move(frame));
+  *scope_out = env->last_realm_scope;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_leave_realm(napi_env env,
+                                                   unofficial_napi_realm_scope scope) {
+  if (env == nullptr || scope == 0) return napi_invalid_arg;
+  // A callback's frame has token 0, so a scope of an outer callback is never
+  // the innermost one.
+  if (env->realm_frames.empty() || env->realm_frames.back().scope != scope) {
+    return napi_invalid_arg;
+  }
+  env->PopRealmFrames(env->realm_frames.size() - 1);
   return napi_ok;
 }
 
@@ -2352,7 +2392,7 @@ static napi_status CreateSourceTextModule(
   v8::Local<v8::Module> module;
   const bool artifact_reusable =
       bytecode_record != nullptr && !bytecode_record->module.IsEmpty() &&
-      context == env->context() && !host_id_symbol.IsEmpty() &&
+      context == env->main_context() && !host_id_symbol.IsEmpty() &&
       !bytecode_record->host_symbol.IsEmpty() &&
       bytecode_record->host_symbol.Get(isolate) == host_id_symbol;
   if (artifact_reusable) {

@@ -1172,6 +1172,36 @@ fn guest_unofficial_napi_get_realm(
     status
 }
 
+/// `realm` is a guest realm id (0 for the env's own realm). The scope token is
+/// the provider's, written as a u64.
+fn guest_unofficial_napi_enter_realm(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    realm: u32,
+    scope_out_ptr: u32,
+) -> i32 {
+    if scope_out_ptr == 0 {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut scope = 0u64;
+    let status = unsafe { snapi_bridge_unofficial_enter_realm(env_handle, realm, &mut scope) };
+    if status == 0 && !write_guest_u64(&mut env, scope_out_ptr, scope) {
+        // The guest never learns the token, so close the scope again.
+        unsafe { snapi_bridge_unofficial_leave_realm(env_handle, scope) };
+        return 1;
+    }
+    status
+}
+
+fn guest_unofficial_napi_leave_realm(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    scope: i64,
+) -> i32 {
+    unsafe { snapi_bridge_unofficial_leave_realm(snapi_env(&env, napi_env), scope as u64) }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_run_script(
@@ -4939,6 +4969,8 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
         "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
         "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
+        "unofficial_napi_enter_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enter_realm),
+        "unofficial_napi_leave_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_leave_realm),
         "unofficial_napi_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_run_script),
         "unofficial_napi_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_compile_function),
         "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),

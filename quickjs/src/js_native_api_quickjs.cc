@@ -179,8 +179,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    auto context = env->context();
-    *result = env->wrap_value_in_current_scope(JS_GetGlobalObject(context), true);
+    *result = env->wrap_value_in_current_scope(env->current_global(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 

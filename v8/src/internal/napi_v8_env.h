@@ -68,11 +68,36 @@ struct unofficial_napi_realm__ {
   std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
 };
 
+// A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or
+// a native callback that is running. The innermost frame is the current
+// realm.
+struct napi_realm_frame__ {
+  // The scope's token; 0 for a callback.
+  uint64_t scope = 0;
+  // The realm; null for the env's own.
+  unofficial_napi_realm__* realm = nullptr;
+  // A scope enters its realm's context and holds it until it is left. A
+  // callback's realm is V8's current context already, and its function keeps
+  // it alive.
+  v8::Global<v8::Context> entered;
+};
+
 struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
 
+  // The current realm's context: the innermost realm frame's, else the env's
+  // own. N-API calls create what they make there.
   v8::Local<v8::Context> context() const;
+  // The env's own realm.
+  v8::Local<v8::Context> main_context() const;
+  // The current realm; null for the env's own.
+  unofficial_napi_realm__* current_realm() const;
+  // Pushes the frame of a callback running in `realm` (null: the env's own)
+  // and returns the depth PopRealmFrames restores.
+  size_t PushRealmFrame(unofficial_napi_realm__* realm);
+  // Pops the frames above `depth`, leaving the contexts their scopes entered.
+  void PopRealmFrames(size_t depth);
   void CallFinalizer(node_api_basic_finalize cb, void* data, void* hint);
   void InvokeFinalizerFromGC(napi_ref_tracker__* finalizer);
   void EnqueueFinalizer(napi_ref_tracker__* finalizer);
@@ -101,8 +126,12 @@ struct napi_env__ {
   // Set only when the env had to create its own agent (an isolate the
   // provider did not set up).
   std::unique_ptr<napi_agent__> owned_agent;
-  // The env's realm. Never changes.
+  // The env's own realm. Never changes.
   v8::Global<v8::Context> context_ref;
+  // The realms N-API acts in, innermost last. Empty means the env's own.
+  std::vector<napi_realm_frame__> realm_frames;
+  // The last scope token unofficial_napi_enter_realm handed out.
+  uint64_t last_realm_scope = 0;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
   v8::Global<v8::Value> last_exception;
@@ -135,6 +164,21 @@ struct napi_env__ {
 
  private:
   v8impl::detail::napi_factory__ factory_;
+};
+
+// Runs the enclosing code in a realm (null: the env's own) and closes any
+// scope it leaves open.
+class napi_realm_frame_scope__ {
+ public:
+  napi_realm_frame_scope__(napi_env env, unofficial_napi_realm__* realm)
+      : env_(env), depth_(env->PushRealmFrame(realm)) {}
+  ~napi_realm_frame_scope__() { env_->PopRealmFrames(depth_); }
+  napi_realm_frame_scope__(const napi_realm_frame_scope__&) = delete;
+  napi_realm_frame_scope__& operator=(const napi_realm_frame_scope__&) = delete;
+
+ private:
+  napi_env env_;
+  size_t depth_;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

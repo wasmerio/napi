@@ -353,6 +353,50 @@ test('realms nothing refers to are collected, also while their registry lives', 
   assert.equal(evaluate(realmOf(own,kept),'typeof payload'),'undefined');
 });
 
+// Callbacks made in realms of `own`, each realm referred to only by its
+// callback; `dispatch` is the env's.
+function realmCallbacks(context,own,dispatch) {
+  const callbacks=[], references=[];
+  for(let i=0;i<12;i++) {
+    const key=createRealm(own,i%2 ? {i} : null);
+    const realm=realmOf(own,key);
+    evaluate(realm,'globalThis.payload=new Array(1024).fill(1)');
+    callbacks.push(callback(context,dispatch,realm));
+    references.push(new WeakRef(key),new WeakRef(realm),new WeakRef(realm.scope));
+  }
+  return {callbacks,references};
+}
+
+test('a callback passes its realm to dispatch and alone keeps that realm alive', async () => {
+  const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
+  const context=create(), own=createRegistry(), seen=[];
+  const dispatch=(_receiver,_args,_target,realm)=>{seen.push(realm);};
+  callback(context,dispatch)();
+  assert.deepEqual(seen,[undefined]);
+  seen.length=0;
+  // Only `made` refers to the callbacks: the suspended async frame must not.
+  const made=realmCallbacks(context,own,dispatch), references=made.references;
+  for(let i=0;i<4;i++) { await setTimeout(0); gc(); }
+  assert.equal(references.filter(reference=>reference.deref()).length,references.length);
+  made.callbacks.forEach(fn=>fn());
+  assert.ok(seen.every((realm,i)=>realm===references[3*i+1].deref()));
+  // The env's dispatch table and the registry do not keep them alive.
+  seen.length=0;
+  made.callbacks=undefined;
+  await assertCollected(references);
+  runtime.wasmer_napi_release_global_context(context);
+});
+
+test('a realm\'s global is its sandbox, else its own global', () => {
+  const own=createRegistry(), sandbox={};
+  const sandboxed=realmOf(own,createRealm(own,sandbox));
+  const fresh=realmOf(own,createRealm(own,null));
+  assert.equal(runtime.wasmer_napi_realm_global(sandboxed),sandbox);
+  assert.equal(runtime.wasmer_napi_realm_global(fresh),fresh.scope);
+  assert.equal(realmOf(own,runtime.wasmer_napi_realm_global(fresh)),fresh);
+  assert.equal(runtime.wasmer_napi_realm_global(host),host.scope);
+});
+
 test('realms are found by their global or sandbox only', () => {
   const own=createRegistry();
   const sandbox={x:1};

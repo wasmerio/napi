@@ -63,8 +63,17 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   if (finalize_invoked_)
     return;
   finalize_invoked_ = true;
-  if (finalize_cb_ != nullptr)
+  if (finalize_cb_ == nullptr)
+    return;
+  if (env_ == nullptr)
+  {
     finalize_cb_(env_, external_data_, finalize_hint_);
+    return;
+  }
+  // Finalizers run in the env's own realm, also when the collector runs
+  // inside another realm.
+  napi_realm_frame_scope__ realm_frame{env_, nullptr, JS_UNDEFINED};
+  finalize_cb_(env_, external_data_, finalize_hint_);
 }
 
 napi_env napi_external_backing_store_hint__::env() const

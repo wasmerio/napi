@@ -122,6 +122,8 @@ void napi_env__::prepare_teardown()
 
   closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
+  // Every scope closes; cleanup hooks and finalizers run in the env's realm.
+  pop_realm_frames(0);
   while (!env_cleanup_hooks_.empty())
   {
     auto *entry = env_cleanup_hooks_.back();
@@ -210,7 +212,65 @@ bool napi_env__::is_principal() const
 
 JSContext *napi_env__::context() const
 {
+  return realm_frames_.empty() ? context_ : realm_frames_.back().ctx;
+}
+
+JSContext *napi_env__::main_context() const
+{
   return context_;
+}
+
+JSValueConst napi_env__::current_realm_anchor() const
+{
+  return realm_frames_.empty() ? JS_UNDEFINED : realm_frames_.back().anchor;
+}
+
+JSValue napi_env__::current_global()
+{
+  JSContext *ctx = context();
+  JSValue global = JS_GetGlobalObject(ctx);
+  if (ctx == context_)
+    return global;
+  // A sandbox realm reports its sandbox as its global.
+  JSValue key = contextify_.realm_key_for_global(global);
+  if (JS_IsUndefined(key))
+    return global;
+  JS_FreeValue(ctx, global);
+  return key;
+}
+
+size_t napi_env__::push_realm_frame(JSContext *ctx, JSValueConst anchor)
+{
+  const size_t depth = realm_frames_.size();
+  realm_frames_.push_back({0, ctx != nullptr ? ctx : context_, anchor});
+  return depth;
+}
+
+void napi_env__::pop_realm_frames(size_t depth)
+{
+  while (realm_frames_.size() > depth)
+  {
+    napi_realm_frame__ frame = realm_frames_.back();
+    realm_frames_.pop_back();
+    if (frame.scope != 0)
+      JS_FreeValue(context_, frame.anchor);
+  }
+}
+
+uint64_t napi_env__::enter_realm(JSContext *ctx, JSValue anchor)
+{
+  realm_frames_.push_back({++last_realm_scope_, ctx, anchor});
+  return last_realm_scope_;
+}
+
+bool napi_env__::leave_realm(uint64_t scope)
+{
+  // A callback's frame has token 0, so a scope of an outer callback is never
+  // the innermost one.
+  if (scope == 0 || realm_frames_.empty() || realm_frames_.back().scope != scope)
+    return false;
+  pop_realm_frames(realm_frames_.size() - 1);
+  return true;
 }
 
 int32_t napi_env__::module_api_version() const
