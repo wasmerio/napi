@@ -465,7 +465,6 @@ export function wasmer_napi_make_callback(context, dispatch) {
     return dispatch?.(this, args, new.target);
   };
 }
-const wasmerNapiGlobalScopes = new WeakMap();
 function wasmerNapiCreateGlobalScope(scopeTarget, fallback = globalThis) {
   const scope = new Proxy(scopeTarget, {
     has(target, key) {
@@ -500,7 +499,6 @@ function wasmerNapiCreateGlobalScope(scopeTarget, fallback = globalThis) {
       return true;
     },
   });
-  wasmerNapiGlobalScopes.set(scope,scope);
   return scope;
 }
 export function wasmer_napi_create_global_context() {
@@ -520,23 +518,47 @@ export function wasmer_napi_release_global_context(context) {
   // Retained JS wrappers must stop calling Rust before its closures are dropped.
   context.callbacks.dispatches = undefined;
 }
-// Evaluates `source` for the environment that owns `context`. A null sandbox,
-// the host global and the context's own global all mean that context.
-export function wasmer_napi_context_eval(context, sandbox, source) {
-  if (sandbox == null || sandbox === globalThis || sandbox === context.scope) {
-    sandbox = context.scope;
+// Realms made with create_realm, by their global and, for a sandbox realm,
+// by the sandbox. Each env has its own registry, so realms never cross envs.
+// It is weak: a realm is collected with its global and everything made in it.
+export function wasmer_napi_create_realm_registry() {
+  return new WeakMap();
+}
+// Makes a realm with a fresh global, or one whose global property access goes
+// to `sandbox` first, as with vm.createContext(sandbox), and returns its key:
+// the sandbox, or the realm's global. A key keeps the first realm made for it.
+export function wasmer_napi_create_realm_context(registry, sandbox) {
+  const base = wasmer_napi_create_global_context();
+  let context = base;
+  let key = base.scope;
+  if (sandbox != null) {
+    context = {
+      scopeTarget: base.scopeTarget,
+      callbacks: base.callbacks,
+      scope: wasmerNapiCreateGlobalScope(sandbox, base.scope),
+      sandbox,
+    };
+    key = sandbox;
   }
-  // A VM's global facade exposes the same builtins as bare identifiers while
-  // preserving the caller's sandbox bindings. Keep its defaults context-local
-  // so writes to process and Error hooks cannot reach the worker global.
-  let scope = wasmerNapiGlobalScopes.get(sandbox);
-  if (!scope) {
-    scope = wasmerNapiCreateGlobalScope(sandbox,wasmer_napi_create_global_context().scope);
-    wasmerNapiGlobalScopes.set(sandbox,scope);
+  for (const value of [key, context.scope]) {
+    if (!registry.has(value)) registry.set(value, context);
   }
-  sandbox = scope;
-  return Function('sandbox', 'source',
-    'with (sandbox) { return eval(source); }').call(sandbox, sandbox, source);
+  return key;
+}
+// The realm context whose global or sandbox is `value`, or undefined.
+export function wasmer_napi_realm_context(registry, value) {
+  const isObject = (typeof value === 'object' && value !== null) ||
+    typeof value === 'function';
+  return isObject ? registry.get(value) : undefined;
+}
+// Evaluates `source` in `context`. The context's scope exposes builtins as
+// bare identifiers and keeps its own defaults, so writes to process and Error
+// hooks cannot reach the worker global; a sandbox realm resolves identifiers
+// on its sandbox first.
+export function wasmer_napi_context_eval(context, source) {
+  const scope = context.scope;
+  return Function('scope', 'source',
+    'with (scope) { return eval(source); }').call(scope, scope, source);
 }
 function wasmerNapiLowerDynamicImports(params, source, filename) {
   const names = Array.from(params, String);
@@ -1135,12 +1157,11 @@ extern "C" {
     fn wasmer_napi_create_global_context() -> JsValue;
     fn wasmer_napi_global_context_scope(context: &JsValue) -> JsValue;
     fn wasmer_napi_release_global_context(context: &JsValue);
+    fn wasmer_napi_create_realm_registry() -> JsValue;
+    fn wasmer_napi_create_realm_context(registry: &JsValue, sandbox: &JsValue) -> JsValue;
+    fn wasmer_napi_realm_context(registry: &JsValue, value: &JsValue) -> JsValue;
     #[wasm_bindgen(catch)]
-    fn wasmer_napi_context_eval(
-        context: &JsValue,
-        sandbox: &JsValue,
-        source: &str,
-    ) -> Result<JsValue, JsValue>;
+    fn wasmer_napi_context_eval(context: &JsValue, source: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_compile_function(
         scope: &JsValue,
@@ -1387,6 +1408,8 @@ struct HostJsAgent {
 struct HostJsEnv {
     agent: Box<HostJsAgent>,
     global_context: JsValue,
+    /// The realms made with create_realm, by global and sandbox (a WeakMap).
+    realms: JsValue,
     live_env_addr: Rc<Cell<usize>>,
     /// Pending exception of calls made through this environment.
     last_exception: Option<JsValue>,
@@ -1434,6 +1457,7 @@ impl HostJsEnv {
         Self {
             agent: Box::new(HostJsAgent::new()),
             global_context: wasmer_napi_create_global_context(),
+            realms: wasmer_napi_create_realm_registry(),
             live_env_addr: Rc::new(Cell::new(0)),
             last_exception: None,
             next_callback: 1,
@@ -1771,18 +1795,24 @@ unsafe fn env_mut<'a>(env: SnapiEnv) -> Result<&'a mut HostJsEnv, i32> {
     Ok(unsafe { &mut *env.cast::<HostJsEnv>() })
 }
 
-fn evaluation_scope(state: &HostJsEnv, context_id: u32) -> Result<JsValue, i32> {
-    if context_id == 0 {
-        return Ok(wasmer_napi_global_context_scope(&state.global_context));
+/// The global context of the realm `realm_id` names: the env's own for 0,
+/// else the realm whose global or sandbox has that value id.
+fn realm_context(state: &HostJsEnv, realm_id: u32) -> Result<JsValue, i32> {
+    if realm_id == 0 {
+        return Ok(state.global_context.clone());
     }
-    let Some(context) = state.agent.get(context_id) else {
-        return Err(NAPI_INVALID_ARG);
-    };
-    if context.is_null() || context.is_undefined() {
-        Ok(wasmer_napi_global_context_scope(&state.global_context))
+    let key = state.agent.get(realm_id).ok_or(NAPI_INVALID_ARG)?;
+    let context = wasmer_napi_realm_context(&state.realms, key);
+    if context.is_undefined() {
+        Err(NAPI_INVALID_ARG)
     } else {
-        Ok(context.clone())
+        Ok(context)
     }
+}
+
+/// The scope code compiled for the realm `realm_id` resolves identifiers in.
+fn realm_scope(state: &HostJsEnv, realm_id: u32) -> Result<JsValue, i32> {
+    realm_context(state, realm_id).map(|context| wasmer_napi_global_context_scope(&context))
 }
 
 unsafe fn write<T>(out: *mut T, value: T) -> Result<(), i32> {
@@ -2882,7 +2912,7 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
     // realm, allowing Node bootstrap code from one N-API environment to mutate
     // the SDK scheduler and leak state into every other environment hosted by
     // that worker.
-    match wasmer_napi_context_eval(&state.global_context, &JsValue::NULL, &source) {
+    match wasmer_napi_context_eval(&state.global_context, &source) {
         Ok(value) => {
             let id = state.agent.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -4429,47 +4459,89 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_contains_module_synt
         });
     unsafe { write(result_out, i32::from(is_module)) }.map_or_else(|err| err, |()| NAPI_OK)
 }
+/// Makes a realm, with a fresh global or over the sandbox `sandbox_id`, and
+/// writes its key's value id (the sandbox, or the realm's global) to both
+/// outs: the key's value id is the realm id. The other options have no effect
+/// on host-JS realms, which share their intrinsics.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_make_context(
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_create_realm(
     env: SnapiEnv,
-    sandbox_or_symbol_id: u32,
+    sandbox_id: u32,
     name_id: u32,
     origin_id: u32,
+    host_defined_option_id: u32,
     allow_code_gen_strings: i32,
     allow_code_gen_wasm: i32,
     own_microtask_queue: i32,
-    host_defined_option_id: u32,
-    result_out: *mut u32,
+    realm_out: *mut u32,
+    global_out: *mut u32,
 ) -> i32 {
     let _ = (
         name_id,
         origin_id,
+        host_defined_option_id,
         allow_code_gen_strings,
         allow_code_gen_wasm,
         own_microtask_queue,
-        host_defined_option_id,
     );
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let sandbox = if sandbox_or_symbol_id == 0 {
-        Object::new().into()
+    if realm_out.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let sandbox = if sandbox_id == 0 {
+        JsValue::NULL
     } else {
-        state
-            .agent
-            .get(sandbox_or_symbol_id)
-            .cloned()
-            .unwrap_or_else(|| Object::new().into())
+        let Some(value) = state.agent.get(sandbox_id).cloned() else {
+            return NAPI_INVALID_ARG;
+        };
+        if !(value.is_object() || value.is_function()) {
+            return NAPI_OBJECT_EXPECTED;
+        }
+        // A sandbox belongs to one realm. The env's own global is not a
+        // realm's, so it may still be one, as with vm.createContext(globalThis).
+        if !wasmer_napi_realm_context(&state.realms, &value).is_undefined() {
+            return NAPI_INVALID_ARG;
+        }
+        value
     };
-    let _ = Reflect::set(&sandbox, &JsValue::from_str("global"), &sandbox);
-    let _ = Reflect::set(&sandbox, &JsValue::from_str("globalThis"), &sandbox);
-    let id = state.agent.insert(sandbox);
-    unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
+    let key = wasmer_napi_create_realm_context(&state.realms, &sandbox);
+    let id = state.agent.insert(key);
+    if !global_out.is_null() {
+        // Only a null out pointer makes write fail.
+        let _ = unsafe { write(global_out, id) };
+    }
+    unsafe { write(realm_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
+}
+/// Writes `value_id` when that value is a realm's global or sandbox, else 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_get_realm(
+    env: SnapiEnv,
+    value_id: u32,
+    realm_out: *mut u32,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if realm_out.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let Some(value) = state.agent.get(value_id) else {
+        return NAPI_INVALID_ARG;
+    };
+    if !(value.is_object() || value.is_function()) {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    let is_realm = !wasmer_napi_realm_context(&state.realms, value).is_undefined();
+    unsafe { write(realm_out, if is_realm { value_id } else { 0 }) }
+        .map_or_else(|err| err, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
+pub unsafe extern "C" fn snapi_bridge_unofficial_run_script(
     env: SnapiEnv,
-    sandbox_or_null_id: u32,
+    realm_id: u32,
     source_text_id: u32,
     source_bytecode_id: u32,
     filename_id: u32,
@@ -4500,12 +4572,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
         Ok(source) => source,
         Err(status) => return status,
     };
-    let sandbox = state
-        .agent
-        .get(sandbox_or_null_id)
-        .cloned()
-        .unwrap_or(JsValue::NULL);
-    match wasmer_napi_context_eval(&state.global_context, &sandbox, &source) {
+    let context = match realm_context(state, realm_id) {
+        Ok(context) => context,
+        Err(status) => return status,
+    };
+    match wasmer_napi_context_eval(&context, &source) {
         Ok(value) => {
             let id = state.agent.insert(value);
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -4517,14 +4588,14 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
+pub unsafe extern "C" fn snapi_bridge_unofficial_compile_function(
     env: SnapiEnv,
+    realm_id: u32,
     source_text_id: u32,
     source_bytecode_id: u32,
     filename_id: u32,
     line_offset: i32,
     column_offset: i32,
-    parsing_context_id: u32,
     context_extensions_id: u32,
     params_id: u32,
     host_defined_option_id: u32,
@@ -4561,7 +4632,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
         .get(filename_id)
         .and_then(JsValue::as_string)
         .unwrap_or_default();
-    let scope = match evaluation_scope(state, parsing_context_id) {
+    let scope = match realm_scope(state, realm_id) {
         Ok(scope) => scope,
         Err(status) => return status,
     };
@@ -4615,6 +4686,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_compile_function(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
     env: SnapiEnv,
+    realm_id: u32,
     source_text_id: u32,
     filename_id: u32,
     shape: i32,
@@ -4676,7 +4748,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_open(
             }
         }
     }
-    let scope = wasmer_napi_global_context_scope(&state.global_context);
+    let scope = match realm_scope(state, realm_id) {
+        Ok(scope) => scope,
+        Err(status) => return status,
+    };
     let context_extensions = Array::new();
     let compile_result = match shape {
         0 => wasmer_napi_validate_script(&source, &filename),
@@ -4750,7 +4825,7 @@ unsafe fn host_js_create_source_text_module(
     env: SnapiEnv,
     wrapper_id: u32,
     url_id: u32,
-    context_id: u32,
+    realm_id: u32,
     source_text_id: u32,
     source_bytecode_id: u32,
     line_offset: i32,
@@ -4775,7 +4850,7 @@ unsafe fn host_js_create_source_text_module(
         Err(status) => return status,
     };
 
-    let scope = match evaluation_scope(state, context_id) {
+    let scope = match realm_scope(state, realm_id) {
         Ok(scope) => scope,
         Err(status) => return status,
     };
@@ -4852,14 +4927,14 @@ unsafe fn host_js_create_synthetic_module(
     env: SnapiEnv,
     wrapper_id: u32,
     url_id: u32,
-    context_id: u32,
+    realm_id: u32,
     export_names_id: u32,
     synthetic_eval_steps_id: u32,
     handle_out: *mut u32,
     requests_out: *mut u32,
     has_top_level_await_out: *mut u8,
 ) -> i32 {
-    let _ = (url_id, context_id);
+    let _ = (url_id, realm_id);
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -4929,7 +5004,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
     kind: i32,
     wrapper_id: u32,
     url_id: u32,
-    context_id: u32,
+    realm_id: u32,
     source_text_id: u32,
     source_bytecode_id: u32,
     line_offset: i32,
@@ -4947,7 +5022,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
                 env,
                 wrapper_id,
                 url_id,
-                context_id,
+                realm_id,
                 source_text_id,
                 source_bytecode_id,
                 line_offset,
@@ -4963,7 +5038,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create(
                 env,
                 wrapper_id,
                 url_id,
-                context_id,
+                realm_id,
                 export_names_id,
                 synthetic_eval_steps_id,
                 handle_out,
@@ -7053,6 +7128,154 @@ mod tests {
                 .get(out)
                 .and_then(JsValue::as_string);
             assert_eq!(text.as_deref(), Some("1.5"));
+        });
+    }
+
+    /// Runs `source` in the realm `realm` (the env's own for 0).
+    fn run_in(env: SnapiEnv, realm: u32, source: &str) -> Result<JsValue, i32> {
+        let state = unsafe { env_mut(env) }.unwrap();
+        let script = state.agent.insert_primitive(source.into());
+        let mut out = 0;
+        let status = unsafe {
+            snapi_bridge_unofficial_run_script(env, realm, script, 0, 0, 0, 0, -1, 1, 0, 0, 0, &mut out)
+        };
+        if status != NAPI_OK {
+            return Err(status);
+        }
+        Ok(unsafe { env_mut(env) }.unwrap().agent.get(out).unwrap().clone())
+    }
+
+    fn new_realm(env: SnapiEnv, sandbox: u32) -> Result<u32, i32> {
+        let (mut realm, mut global) = (0, 0);
+        let status = unsafe {
+            snapi_bridge_unofficial_create_realm(env, sandbox, 0, 0, 0, 1, 1, 0, &mut realm, &mut global)
+        };
+        if status != NAPI_OK {
+            return Err(status);
+        }
+        assert_eq!(realm, global);
+        Ok(realm)
+    }
+
+    fn realm_of(env: SnapiEnv, value: u32) -> Result<u32, i32> {
+        let mut realm = u32::MAX;
+        match unsafe { snapi_bridge_unofficial_get_realm(env, value, &mut realm) } {
+            NAPI_OK => Ok(realm),
+            status => Err(status),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn realm_ids_name_the_realm_of_their_global_or_sandbox() {
+        with_env(|env, state| {
+            let sandbox: JsValue = Object::new().into();
+            Reflect::set(&sandbox, &"x".into(), &JsValue::from_f64(2.0)).unwrap();
+            let sandbox_id = state.agent.insert(sandbox);
+            let realm = new_realm(env, sandbox_id).unwrap();
+            assert_eq!(realm, sandbox_id);
+            assert_eq!(run_in(env, realm, "x + 1").unwrap().as_f64(), Some(3.0));
+            assert_eq!(
+                run_in(env, 0, "typeof x").unwrap().as_string().as_deref(),
+                Some("undefined")
+            );
+            assert_eq!(realm_of(env, sandbox_id), Ok(sandbox_id));
+
+            // A sandbox belongs to one realm.
+            assert_eq!(new_realm(env, sandbox_id), Err(NAPI_INVALID_ARG));
+
+            // A realm with a fresh global is named by its global.
+            let fresh = new_realm(env, 0).unwrap();
+            let global = run_in(env, fresh, "globalThis").unwrap();
+            let state = unsafe { env_mut(env) }.unwrap();
+            assert!(Object::is(&global, state.agent.get(fresh).unwrap()));
+            assert_eq!(realm_of(env, fresh), Ok(fresh));
+
+            // Other objects and the env's own global name no realm.
+            let state = unsafe { env_mut(env) }.unwrap();
+            let other = state.agent.insert(Object::new().into());
+            let number = state.agent.insert_primitive(JsValue::from_f64(1.0));
+            assert_eq!(realm_of(env, other), Ok(0));
+            assert_eq!(realm_of(env, number), Err(NAPI_OBJECT_EXPECTED));
+            assert_eq!(run_in(env, other, "1").unwrap_err(), NAPI_INVALID_ARG);
+            let mut env_global = 0;
+            assert_eq!(unsafe { snapi_bridge_get_global(env, &mut env_global) }, NAPI_OK);
+            assert_eq!(realm_of(env, env_global), Ok(0));
+            // It may still be a sandbox, as with vm.createContext(globalThis),
+            // and the env keeps evaluating in its own context.
+            assert!(new_realm(env, env_global).is_ok());
+            let own = run_in(env, 0, "globalThis").unwrap();
+            let state = unsafe { env_mut(env) }.unwrap();
+            assert!(Object::is(&own, state.agent.get(env_global).unwrap()));
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn functions_and_bytecode_compile_for_their_realm() {
+        with_env(|env, state| {
+            let sandbox: JsValue = Object::new().into();
+            Reflect::set(&sandbox, &"x".into(), &JsValue::from_f64(5.0)).unwrap();
+            let sandbox_id = state.agent.insert(sandbox);
+            let realm = new_realm(env, sandbox_id).unwrap();
+
+            let state = unsafe { env_mut(env) }.unwrap();
+            let body = state.agent.insert_primitive("return x * 2;".into());
+            let mut compiled = 0;
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_unofficial_compile_function(
+                        env, realm, body, 0, 0, 0, 0, 0, 0, 0, &mut compiled,
+                    )
+                },
+                NAPI_OK
+            );
+            let state = unsafe { env_mut(env) }.unwrap();
+            let function: Function =
+                Reflect::get(state.agent.get(compiled).unwrap(), &"function".into())
+                    .unwrap()
+                    .unchecked_into();
+            assert_eq!(function.call0(&JsValue::UNDEFINED).unwrap().as_f64(), Some(10.0));
+
+            let source = state.agent.insert_primitive("x".into());
+            let open = |realm_id: u32, out: &mut u32| {
+                let (mut rejected, mut module) = (0, 0);
+                unsafe {
+                    snapi_bridge_unofficial_bytecode_open(
+                        env,
+                        realm_id,
+                        source,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        0,
+                        out,
+                        &mut rejected,
+                        &mut module,
+                    )
+                }
+            };
+            let mut bytecode = 0;
+            assert_eq!(open(realm, &mut bytecode), NAPI_OK);
+            let state = unsafe { env_mut(env) }.unwrap();
+            let other = state.agent.insert(Object::new().into());
+            let mut unused = 0;
+            assert_eq!(open(other, &mut unused), NAPI_INVALID_ARG);
+            let mut out = 0;
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_unofficial_run_script(
+                        env, realm, 0, bytecode, 0, 0, 0, -1, 1, 0, 0, 0, &mut out,
+                    )
+                },
+                NAPI_OK
+            );
+            let state = unsafe { env_mut(env) }.unwrap();
+            assert_eq!(state.agent.get(out).unwrap().as_f64(), Some(5.0));
         });
     }
 

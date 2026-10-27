@@ -57,6 +57,17 @@ struct napi_callback_info__ {
   virtual void* data() const = 0;
 };
 
+// A realm made with unofficial_napi_create_realm (a vm context). Its context
+// is held weakly: the realm lives while its global, or anything made in it,
+// is reachable. The env frees the record once the context is gone, and only
+// then the realm's own microtask queue, which V8 holds by raw pointer for the
+// context's lifetime.
+struct unofficial_napi_realm__ {
+  napi_env env = nullptr;
+  v8::Global<v8::Context> context;
+  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+};
+
 struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
@@ -114,6 +125,8 @@ struct napi_env__ {
   // unofficial_napi_set_promise_hooks (init, before, after, resolve).
   v8::Global<v8::Function> promise_reject_callback;
   std::array<v8::Global<v8::Function>, 4> promise_hooks;
+  // The realms this env made, live or awaiting release.
+  std::vector<std::unique_ptr<unofficial_napi_realm__>> realms;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   napi::periodic_gate__ lifetime_stats_gate_{2000};

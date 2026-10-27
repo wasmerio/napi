@@ -281,20 +281,26 @@ unsafe extern "C" {
         cjs_var_in_scope: i32,
         result_out: *mut i32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_make_context(
+    // Realm ids are the value id of the realm's global (its sandbox, when it
+    // has one); 0 means the env's own realm. Like any value id, a realm id is
+    // valid only while its scope frame is open.
+    pub fn snapi_bridge_unofficial_create_realm(
         env: SnapiEnv,
-        sandbox_or_symbol_id: u32,
+        sandbox_id: u32,
         name_id: u32,
         origin_id: u32,
+        host_defined_option_id: u32,
         allow_code_gen_strings: i32,
         allow_code_gen_wasm: i32,
         own_microtask_queue: i32,
-        host_defined_option_id: u32,
-        result_out: *mut u32,
+        realm_out: *mut u32,
+        global_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_run_script(
+    pub fn snapi_bridge_unofficial_get_realm(env: SnapiEnv, value_id: u32, realm_out: *mut u32)
+        -> i32;
+    pub fn snapi_bridge_unofficial_run_script(
         env: SnapiEnv,
-        sandbox_or_null_id: u32,
+        realm_id: u32,
         source_text_id: u32,
         source_bytecode_id: u32,
         filename_id: u32,
@@ -307,14 +313,14 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         result_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_contextify_compile_function(
+    pub fn snapi_bridge_unofficial_compile_function(
         env: SnapiEnv,
+        realm_id: u32,
         source_text_id: u32,
         source_bytecode_id: u32,
         filename_id: u32,
         line_offset: i32,
         column_offset: i32,
-        parsing_context_id: u32,
         context_extensions_id: u32,
         params_id: u32,
         host_defined_option_id: u32,
@@ -322,6 +328,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_bytecode_open(
         env: SnapiEnv,
+        realm_id: u32,
         source_text_id: u32,
         filename_id: u32,
         shape: i32,
@@ -348,7 +355,7 @@ unsafe extern "C" {
         kind: i32,
         wrapper_id: u32,
         url_id: u32,
-        context_id: u32,
+        realm_id: u32,
         source_text_id: u32,
         source_bytecode_id: u32,
         line_offset: i32,
