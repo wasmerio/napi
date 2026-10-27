@@ -456,13 +456,16 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
   });
   return context.scope;
 }
-export function wasmer_napi_make_callback(context, dispatch) {
+// `realm` is the context of the realm the function belongs to, undefined for
+// the env's own. Only the returned function holds it, so a realm whose only
+// remaining reference is one of its functions is collected with that function.
+export function wasmer_napi_make_callback(context, dispatch, realm) {
   const callbacks = context.callbacks;
   const index = callbacks.dispatches.push(dispatch) - 1;
   return function (...args) {
     const dispatch = callbacks.dispatches?.[index];
     // new.target lets napi_get_new_target tell construction from a call.
-    return dispatch?.(this, args, new.target);
+    return dispatch?.(this, args, new.target, realm);
   };
 }
 function wasmerNapiCreateGlobalScope(scopeTarget, fallback = globalThis) {
@@ -550,6 +553,11 @@ export function wasmer_napi_realm_context(registry, value) {
   const isObject = (typeof value === 'object' && value !== null) ||
     typeof value === 'function';
   return isObject ? registry.get(value) : undefined;
+}
+// The global napi_get_global returns in `context`'s realm: the realm's key
+// (its sandbox, when it has one, else its global).
+export function wasmer_napi_realm_global(context) {
+  return context.sandbox ?? context.scope;
 }
 // Evaluates `source` in `context`. The context's scope exposes builtins as
 // bare identifiers and keeps its own defaults, so writes to process and Error
@@ -1137,7 +1145,11 @@ export function wasmer_napi_create_serdes_binding() {
 }
 "#)]
 extern "C" {
-    fn wasmer_napi_make_callback(context: &JsValue, dispatch: &Function) -> Function;
+    fn wasmer_napi_make_callback(
+        context: &JsValue,
+        dispatch: &Function,
+        realm: &JsValue,
+    ) -> Function;
     fn wasmer_napi_enqueue_microtask(callback: &Function);
     fn wasmer_napi_event_loop_checkpoint(
         allow_host_tasks: bool,
@@ -1160,6 +1172,7 @@ extern "C" {
     fn wasmer_napi_create_realm_registry() -> JsValue;
     fn wasmer_napi_create_realm_context(registry: &JsValue, sandbox: &JsValue) -> JsValue;
     fn wasmer_napi_realm_context(registry: &JsValue, value: &JsValue) -> JsValue;
+    fn wasmer_napi_realm_global(context: &JsValue) -> JsValue;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_context_eval(context: &JsValue, source: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
@@ -1304,8 +1317,10 @@ struct CallbackReg {
     data: u64,
 }
 
-/// A guest callback trampoline: receives `this`, the arguments and `new.target`.
-type CallbackClosure = Closure<dyn Fn(JsValue, Array, JsValue) -> JsValue>;
+/// A guest callback trampoline: receives `this`, the arguments, `new.target`
+/// and the context of the function's realm (undefined for the env's own).
+type CallbackFn = dyn Fn(JsValue, Array, JsValue, JsValue) -> JsValue;
+type CallbackClosure = Closure<CallbackFn>;
 
 struct CallbackInfo {
     args: Vec<u32>,
@@ -1318,8 +1333,20 @@ struct PendingCallback {
     registration: CallbackReg,
     cbinfo: u32,
     value_frame: u32,
+    /// The context of the function's realm, None for the env's own.
+    realm: Option<JsValue>,
     resolve: Function,
     reject: Function,
+}
+
+/// An entry of an env's realm stack: a scope opened with enter_realm, or a
+/// running native callback or finalizer.
+struct RealmEntry {
+    /// The scope's token; 0 for a callback, which leave_realm never closes.
+    token: u64,
+    /// The context of the realm current while this is the innermost entry,
+    /// None for the env's own.
+    realm: Option<JsValue>,
 }
 
 struct ValueFrame {
@@ -1402,14 +1429,18 @@ struct HostJsAgent {
     embedder_hooks_attached: bool,
 }
 
-/// One N-API environment: its realm (the virtual global context, fixed for
-/// the environment's life), the callbacks and modules created through it,
-/// and addon state.
+/// One N-API environment: its own realm (a virtual global context), the
+/// realms it made and which of them is current, the callbacks and modules
+/// created through it, and addon state.
 struct HostJsEnv {
     agent: Box<HostJsAgent>,
     global_context: JsValue,
     /// The realms made with create_realm, by global and sandbox (a WeakMap).
     realms: JsValue,
+    /// Open realm scopes and running callbacks, innermost last. The current
+    /// realm is the innermost entry's, else the env's own.
+    realm_stack: Vec<RealmEntry>,
+    next_realm_scope: u64,
     live_env_addr: Rc<Cell<usize>>,
     /// Pending exception of calls made through this environment.
     last_exception: Option<JsValue>,
@@ -1458,6 +1489,8 @@ impl HostJsEnv {
             agent: Box::new(HostJsAgent::new()),
             global_context: wasmer_napi_create_global_context(),
             realms: wasmer_napi_create_realm_registry(),
+            realm_stack: Vec::new(),
+            next_realm_scope: 1,
             live_env_addr: Rc::new(Cell::new(0)),
             last_exception: None,
             next_callback: 1,
@@ -1470,6 +1503,28 @@ impl HostJsEnv {
             synthetic_modules: IdHashMap::default(),
             source_text_modules: IdHashMap::default(),
         }
+    }
+
+    /// The context of the current realm, None for the env's own.
+    fn current_realm(&self) -> Option<&JsValue> {
+        self.realm_stack.last()?.realm.as_ref()
+    }
+
+    /// Makes `realm` (None: the env's own) current for a native callback or
+    /// finalizer about to run. Returns the depth to pass to `leave_callback`.
+    fn enter_callback(&mut self, realm: Option<JsValue>) -> usize {
+        self.realm_stack.push(RealmEntry { token: 0, realm });
+        self.realm_stack.len() - 1
+    }
+
+    /// Ends the callback `enter_callback` started at `depth`, closing the
+    /// scopes it left open, and returns the realm it ran in.
+    fn leave_callback(&mut self, depth: usize) -> Option<JsValue> {
+        if depth >= self.realm_stack.len() {
+            return None;
+        }
+        self.realm_stack.truncate(depth + 1);
+        self.realm_stack.pop()?.realm
     }
 }
 
@@ -2256,7 +2311,11 @@ pub unsafe extern "C" fn snapi_bridge_get_global(env: SnapiEnv, out: *mut u32) -
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let global = wasmer_napi_global_context_scope(&state.global_context);
+    // The current realm's key, so get_realm finds that realm again.
+    let global = match state.current_realm() {
+        Some(realm) => wasmer_napi_realm_global(realm),
+        None => wasmer_napi_global_context_scope(&state.global_context),
+    };
     let id = state.agent.insert(global);
     unsafe { write(out, id) }.map_or_else(|error| error, |()| NAPI_OK)
 }
@@ -2907,12 +2966,16 @@ pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out
     let Some(source) = state.agent.get(script).and_then(JsValue::as_string) else {
         return NAPI_STRING_EXPECTED;
     };
-    // napi_run_script executes in the environment's context. Evaluating with
-    // js_sys::eval here would instead target the Wasmer worker's real global
-    // realm, allowing Node bootstrap code from one N-API environment to mutate
-    // the SDK scheduler and leak state into every other environment hosted by
-    // that worker.
-    match wasmer_napi_context_eval(&state.global_context, &source) {
+    // napi_run_script executes in the current realm's context, the env's own
+    // when none is entered. Evaluating with js_sys::eval here would instead
+    // target the Wasmer worker's real global realm, allowing Node bootstrap
+    // code from one N-API environment to mutate the SDK scheduler and leak
+    // state into every other environment hosted by that worker.
+    let context = state
+        .current_realm()
+        .cloned()
+        .unwrap_or_else(|| state.global_context.clone());
+    match wasmer_napi_context_eval(&context, &source) {
         Ok(value) => {
             let id = state.agent.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -3305,6 +3368,7 @@ pub unsafe extern "C" fn snapi_bridge_overwrite_reference_bytes(
     NAPI_OK
 }
 
+#[cfg(not(test))]
 unsafe extern "C" {
     fn snapi_host_invoke_wasm_callback(
         ctx: *mut c_void,
@@ -3320,10 +3384,13 @@ unsafe extern "C" {
         hint: u32,
     ) -> u32;
 }
+// Tests run Rust closures in place of guest callbacks and finalizers.
+#[cfg(test)]
+use tests::{snapi_host_invoke_wasm_callback, snapi_host_invoke_wasm_finalizer};
 
 unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
     loop {
-        let (record, callback_ctx, value_frame) = {
+        let (record, callback_ctx, value_frame, realm_depth) = {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
@@ -3331,7 +3398,14 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
                 return NAPI_OK;
             };
             let value_frame = state.agent.open_value_frame();
-            (record, state.agent.active_callback_ctx, value_frame)
+            // Finalizers run in the env's own realm.
+            let realm_depth = state.enter_callback(None);
+            (
+                record,
+                state.agent.active_callback_ctx,
+                value_frame,
+                realm_depth,
+            )
         };
         let result = unsafe {
             snapi_host_invoke_wasm_finalizer(
@@ -3345,6 +3419,7 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
         let Ok(state) = (unsafe { env_mut(env) }) else {
             return NAPI_INVALID_ARG;
         };
+        state.leave_callback(realm_depth);
         state.agent.close_value_frame(value_frame);
         if result == CALLBACK_DEFERRED {
             state.agent.guest_finalizers.push(record);
@@ -3417,8 +3492,11 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
     };
     let live_env_addr = s.live_env_addr.clone();
     let callback_name = function_name.clone();
+    // The function belongs to the current realm. Its JS wrapper holds that
+    // realm's context and passes it in on every call; the closure must not
+    // capture it, since the env keeps every closure for its whole life.
     let closure = Closure::wrap(Box::new(
-        move |this: JsValue, args: Array, new_target: JsValue| -> JsValue {
+        move |this: JsValue, args: Array, new_target: JsValue, realm: JsValue| -> JsValue {
             let env_addr = live_env_addr.get();
             if env_addr == 0 {
                 wasmer_napi_console_error(&format!(
@@ -3430,7 +3508,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
             // Do not keep a mutable environment borrow across the guest callback:
             // invoking JavaScript from that callback may recursively enter this
             // same trampoline.
-            let (value_frame, cb, callback_ctx) = {
+            let (value_frame, cb, callback_ctx, realm_depth) = {
                 let Ok(state) = (unsafe { env_mut(env) }) else {
                     wasmer_napi_console_error(&format!(
                         "[wasmer-napi-callback] invalid env callback={callback_name}"
@@ -3459,7 +3537,14 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                         data: registration.data,
                     },
                 );
-                (value_frame, cb, state.agent.active_callback_ctx)
+                let realm = (!realm.is_undefined()).then_some(realm);
+                let realm_depth = state.enter_callback(realm);
+                (
+                    value_frame,
+                    cb,
+                    state.agent.active_callback_ctx,
+                    realm_depth,
+                )
             };
             if callback_ctx.is_null() {
                 wasmer_napi_console_error(&format!(
@@ -3474,7 +3559,11 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                     cb,
                 )
             };
+            let Ok(state) = (unsafe { env_mut(env) }) else {
+                return JsValue::UNDEFINED;
+            };
             if result == CALLBACK_DEFERRED {
+                let realm = state.leave_callback(realm_depth);
                 let resolve_slot = Rc::new(RefCell::new(None));
                 let reject_slot = Rc::new(RefCell::new(None));
                 let rs = resolve_slot.clone();
@@ -3483,21 +3572,18 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                     *rs.borrow_mut() = Some(resolve);
                     *rj.borrow_mut() = Some(reject);
                 });
-                let Ok(state) = (unsafe { env_mut(env) }) else {
-                    return JsValue::UNDEFINED;
-                };
                 state.agent.pending_callbacks.push_back(PendingCallback {
                     registration,
                     cbinfo: cb,
                     value_frame,
+                    realm,
                     resolve: resolve_slot.borrow_mut().take().unwrap(),
                     reject: reject_slot.borrow_mut().take().unwrap(),
                 });
                 return promise.into();
             }
-            let Ok(state) = (unsafe { env_mut(env) }) else {
-                return JsValue::UNDEFINED;
-            };
+            // Not kept in a local: throw_val below skips Rust destructors.
+            state.leave_callback(realm_depth);
             let error = state.last_exception.take();
             let result_value = state.agent.get(result).cloned();
             if result_value.is_none() && result != 0 {
@@ -3518,8 +3604,11 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
             }
             result
         },
-    ) as Box<dyn Fn(JsValue, Array, JsValue) -> JsValue>);
-    let function = wasmer_napi_make_callback(&s.global_context, closure.as_ref().unchecked_ref());
+    ) as Box<CallbackFn>);
+    let undefined = JsValue::UNDEFINED;
+    let realm = s.current_realm().unwrap_or(&undefined);
+    let function =
+        wasmer_napi_make_callback(&s.global_context, closure.as_ref().unchecked_ref(), realm);
     if !name.is_null() {
         let _ = Reflect::set(
             &function,
@@ -3535,14 +3624,16 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32 {
     loop {
-        let (pending, callback_ctx) = {
+        let (mut pending, callback_ctx, realm_depth) = {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
-            let Some(pending) = state.agent.pending_callbacks.pop_front() else {
+            let Some(mut pending) = state.agent.pending_callbacks.pop_front() else {
                 return unsafe { drain_guest_finalizers(env, false) };
             };
-            (pending, state.agent.active_callback_ctx)
+            // A deferred callback still runs in its function's realm.
+            let realm_depth = state.enter_callback(pending.realm.take());
+            (pending, state.agent.active_callback_ctx, realm_depth)
         };
 
         let result = unsafe {
@@ -3553,18 +3644,16 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
                 pending.cbinfo,
             )
         };
-        if result == CALLBACK_DEFERRED {
-            let Ok(state) = (unsafe { env_mut(env) }) else {
-                return NAPI_INVALID_ARG;
-            };
-            state.agent.pending_callbacks.push_front(pending);
-            return NAPI_OK;
-        }
-
         let (error, result) = {
             let Ok(state) = (unsafe { env_mut(env) }) else {
                 return NAPI_INVALID_ARG;
             };
+            if result == CALLBACK_DEFERRED {
+                pending.realm = state.leave_callback(realm_depth);
+                state.agent.pending_callbacks.push_front(pending);
+                return NAPI_OK;
+            }
+            state.leave_callback(realm_depth);
             let error = state.last_exception.take();
             let result = state
                 .agent
@@ -4537,6 +4626,50 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_realm(
     let is_realm = !wasmer_napi_realm_context(&state.realms, value).is_undefined();
     unsafe { write(realm_out, if is_realm { value_id } else { 0 }) }
         .map_or_else(|err| err, |()| NAPI_OK)
+}
+/// Makes the realm `realm_id` (0: the env's own) current until
+/// snapi_bridge_unofficial_leave_realm closes the scope written to
+/// `scope_out`. The scope holds the realm's context, which keeps it alive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_enter_realm(
+    env: SnapiEnv,
+    realm_id: u32,
+    scope_out: *mut u64,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if scope_out.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let realm = if realm_id == 0 {
+        None
+    } else {
+        match realm_context(state, realm_id) {
+            Ok(context) => Some(context),
+            Err(status) => return status,
+        }
+    };
+    let token = state.next_realm_scope;
+    state.next_realm_scope += 1;
+    state.realm_stack.push(RealmEntry { token, realm });
+    unsafe { scope_out.write(token) };
+    NAPI_OK
+}
+/// Closes `scope` when it is the innermost entry of the realm stack: a scope
+/// opened in the running callback (or outside any callback) with none nested
+/// in it still open. Anything else changes nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_leave_realm(env: SnapiEnv, scope: u64) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    // Callback entries have token 0, which no scope gets.
+    if scope == 0 || state.realm_stack.last().map(|entry| entry.token) != Some(scope) {
+        return NAPI_INVALID_ARG;
+    }
+    state.realm_stack.pop();
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_run_script(
@@ -6962,12 +7095,125 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    /// A fresh environment, live as snapi_bridge_unofficial_create_env makes it.
+    fn new_env() -> SnapiEnv {
+        let state = Box::new(HostJsEnv::new());
+        state
+            .live_env_addr
+            .set((&*state as *const HostJsEnv) as usize);
+        Box::into_raw(state).cast::<SnapiEnvState>()
+    }
+
     /// Runs `test` on a fresh environment and releases it afterwards, so its
     /// global context does not outlive the test.
     fn with_env(test: impl FnOnce(SnapiEnv, &mut HostJsEnv)) {
-        let env = Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
+        let env = new_env();
         test(env, unsafe { env_mut(env) }.unwrap());
         assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
+    }
+
+    /// A guest callback or finalizer body: takes the cbinfo id or the
+    /// finalizer's data, returns what the guest function would.
+    type GuestFunction = Rc<dyn Fn(u32) -> u32>;
+
+    thread_local! {
+        /// The guest functions tests make, by their `wasm_fn_ptr`.
+        static GUEST_FUNCTIONS: RefCell<Vec<GuestFunction>> = RefCell::default();
+    }
+
+    /// Registers `body` as a guest function and returns its `wasm_fn_ptr`.
+    fn guest_function(body: impl Fn(u32) -> u32 + 'static) -> u32 {
+        GUEST_FUNCTIONS.with(|functions| {
+            let mut functions = functions.borrow_mut();
+            functions.push(Rc::new(body));
+            functions.len() as u32 - 1
+        })
+    }
+
+    fn run_guest_function(wasm_fn: u32, arg: u32) -> u32 {
+        let body = GUEST_FUNCTIONS.with(|functions| functions.borrow()[wasm_fn as usize].clone());
+        body(arg)
+    }
+
+    /// Runs the guest function `wasm_fn` with the callback's cbinfo id.
+    pub(super) unsafe fn snapi_host_invoke_wasm_callback(
+        _ctx: *mut c_void,
+        _guest_env: u32,
+        wasm_fn: u32,
+        cbinfo: u32,
+    ) -> u32 {
+        run_guest_function(wasm_fn, cbinfo)
+    }
+
+    /// Runs the guest function `wasm_fn` with the finalizer's data.
+    pub(super) unsafe fn snapi_host_invoke_wasm_finalizer(
+        _ctx: *mut c_void,
+        _guest_env: u32,
+        wasm_fn: u32,
+        data: u32,
+        _hint: u32,
+    ) -> u32 {
+        run_guest_function(wasm_fn, data)
+    }
+
+    /// Makes a native function whose callback runs `body` with its cbinfo id,
+    /// and returns the function's value id.
+    fn native_function(env: SnapiEnv, body: impl Fn(u32) -> u32 + 'static) -> u32 {
+        // Any non-null context: the guest functions above do not read it.
+        unsafe { env_mut(env) }.unwrap().agent.active_callback_ctx = env.cast();
+        let reg = unsafe { snapi_bridge_alloc_cb_reg_id(env) };
+        unsafe { snapi_bridge_register_callback(env, reg, 0, guest_function(body), 0) };
+        let mut function = 0;
+        assert_eq!(
+            unsafe { snapi_bridge_create_function(env, ptr::null(), 0, reg, &mut function) },
+            NAPI_OK
+        );
+        function
+    }
+
+    /// Calls the function `function` with no arguments.
+    fn call(env: SnapiEnv, function: u32) {
+        let mut out = 0;
+        assert_eq!(
+            unsafe { snapi_bridge_call_function(env, 0, function, 0, ptr::null(), &mut out) },
+            NAPI_OK
+        );
+    }
+
+    fn value(env: SnapiEnv, id: u32) -> JsValue {
+        unsafe { env_mut(env) }
+            .unwrap()
+            .agent
+            .get(id)
+            .unwrap()
+            .clone()
+    }
+
+    /// The value id of what napi_get_global returns now.
+    fn global_id(env: SnapiEnv) -> u32 {
+        let mut global = 0;
+        assert_eq!(
+            unsafe { snapi_bridge_get_global(env, &mut global) },
+            NAPI_OK
+        );
+        global
+    }
+
+    /// The realm whose global napi_get_global returns now (0: the env's own).
+    fn current_realm(env: SnapiEnv) -> u32 {
+        realm_of(env, global_id(env)).unwrap()
+    }
+
+    fn enter(env: SnapiEnv, realm: u32) -> Result<u64, i32> {
+        let mut scope = 0;
+        match unsafe { snapi_bridge_unofficial_enter_realm(env, realm, &mut scope) } {
+            NAPI_OK => Ok(scope),
+            status => Err(status),
+        }
+    }
+
+    fn leave(env: SnapiEnv, scope: u64) -> i32 {
+        unsafe { snapi_bridge_unofficial_leave_realm(env, scope) }
     }
 
     #[wasm_bindgen_test]
@@ -7276,6 +7522,340 @@ mod tests {
             );
             let state = unsafe { env_mut(env) }.unwrap();
             assert_eq!(state.agent.get(out).unwrap().as_f64(), Some(5.0));
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn get_global_returns_the_global_of_the_entered_realm() {
+        with_env(|env, state| {
+            let sandbox = state.agent.insert(Object::new().into());
+            let sandboxed = new_realm(env, sandbox).unwrap();
+            let fresh = new_realm(env, 0).unwrap();
+            let own = value(env, global_id(env));
+
+            let outer = enter(env, fresh).unwrap();
+            assert!(Object::is(&value(env, global_id(env)), &value(env, fresh)));
+            assert_eq!(current_realm(env), fresh);
+            // napi_run_script runs in the current realm.
+            let script = state.agent.insert_primitive("globalThis".into());
+            let mut evaluated = 0;
+            assert_eq!(
+                unsafe { snapi_bridge_run_script(env, script, &mut evaluated) },
+                NAPI_OK
+            );
+            assert!(Object::is(&value(env, evaluated), &value(env, fresh)));
+            let inner = enter(env, sandboxed).unwrap();
+            // A sandbox realm's global is its sandbox.
+            assert!(Object::is(
+                &value(env, global_id(env)),
+                &value(env, sandbox)
+            ));
+            assert_eq!(current_realm(env), sandboxed);
+            // Realm id 0 is the env's own realm, also from inside another.
+            let own_scope = enter(env, 0).unwrap();
+            assert!(Object::is(&value(env, global_id(env)), &own));
+            assert_eq!(current_realm(env), 0);
+
+            assert_eq!(leave(env, own_scope), NAPI_OK);
+            assert_eq!(current_realm(env), sandboxed);
+            assert_eq!(leave(env, inner), NAPI_OK);
+            assert_eq!(current_realm(env), fresh);
+            assert_eq!(leave(env, outer), NAPI_OK);
+            assert!(Object::is(&value(env, global_id(env)), &own));
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn realm_scopes_close_innermost_first() {
+        with_env(|env, state| {
+            let error = state.agent.insert(Error::new("pending").into());
+            let a = new_realm(env, 0).unwrap();
+            let b = new_realm(env, 0).unwrap();
+            let outer = enter(env, a).unwrap();
+            let inner = enter(env, b).unwrap();
+            assert!(outer != 0 && inner != 0 && outer != inner);
+            // An outer, a null or an unknown token is refused and changes nothing.
+            for token in [outer, 0, inner + 100] {
+                assert_eq!(leave(env, token), NAPI_INVALID_ARG);
+                assert_eq!(current_realm(env), b);
+            }
+            // Leaving keeps a pending exception pending.
+            assert_eq!(unsafe { snapi_bridge_throw(env, error) }, NAPI_OK);
+            assert_eq!(leave(env, inner), NAPI_OK);
+            let mut pending = 0;
+            assert_eq!(
+                unsafe { snapi_bridge_is_exception_pending(env, &mut pending) },
+                NAPI_OK
+            );
+            assert_eq!(pending, 1);
+            // A scope closes once.
+            assert_eq!(leave(env, inner), NAPI_INVALID_ARG);
+            assert_eq!(current_realm(env), a);
+            assert_eq!(leave(env, outer), NAPI_OK);
+            assert_eq!(leave(env, outer), NAPI_INVALID_ARG);
+            assert_eq!(current_realm(env), 0);
+            // Tokens are not reused.
+            let again = enter(env, b).unwrap();
+            assert!(again != outer && again != inner);
+            assert_eq!(leave(env, again), NAPI_OK);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn only_realms_of_the_env_can_be_entered() {
+        with_env(|env, state| {
+            let object = state.agent.insert(Object::new().into());
+            let number = state.agent.insert_primitive(JsValue::from_f64(1.0));
+            // A realm of another env, also when this env has a handle to it.
+            let other = new_env();
+            let foreign = new_realm(other, 0).unwrap();
+            let foreign = state.agent.insert(value(other, foreign));
+            assert_eq!(
+                unsafe { snapi_bridge_unofficial_release_env(other) },
+                NAPI_OK
+            );
+            let own_global = global_id(env);
+            for id in [object, number, own_global, foreign, u32::MAX - 1] {
+                assert_eq!(enter(env, id), Err(NAPI_INVALID_ARG));
+            }
+            let realm = new_realm(env, 0).unwrap();
+            assert_eq!(
+                unsafe { snapi_bridge_unofficial_enter_realm(env, realm, ptr::null_mut()) },
+                NAPI_INVALID_ARG
+            );
+            // Nothing was entered.
+            assert_eq!(current_realm(env), 0);
+            assert_eq!(leave(env, 1), NAPI_INVALID_ARG);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn native_functions_run_in_the_realm_they_were_made_in() {
+        with_env(|env, state| {
+            let sandbox = state.agent.insert(Object::new().into());
+            let a = new_realm(env, sandbox).unwrap();
+            let b = new_realm(env, 0).unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            // A callback that records the realm it runs in.
+            let record = move |seen: &Rc<RefCell<Vec<u32>>>| {
+                let seen = seen.clone();
+                move |_: u32| -> u32 {
+                    seen.borrow_mut().push(current_realm(env));
+                    0
+                }
+            };
+            // A function made inside a callback, with no scope open, belongs to
+            // the callback's realm.
+            let made_inside = Rc::new(RefCell::new(None));
+
+            let scope = enter(env, a).unwrap();
+            let in_a = native_function(env, record(&seen));
+            let maker = native_function(env, {
+                let (seen, made_inside) = (seen.clone(), made_inside.clone());
+                move |_| {
+                    let function = native_function(env, record(&seen));
+                    *made_inside.borrow_mut() = Some(value(env, function));
+                    0
+                }
+            });
+            assert_eq!(leave(env, scope), NAPI_OK);
+            let in_env = native_function(env, record(&seen));
+
+            call(env, in_a);
+            let scope = enter(env, b).unwrap();
+            call(env, in_a);
+            call(env, in_env);
+            call(env, maker);
+            assert_eq!(leave(env, scope), NAPI_OK);
+            let made_inside: Function = made_inside.borrow_mut().take().unwrap().unchecked_into();
+            made_inside.call0(&JsValue::UNDEFINED).unwrap();
+            assert_eq!(*seen.borrow(), [a, a, 0, a]);
+            // The callbacks left the realm stack as they found it.
+            assert_eq!(current_realm(env), 0);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn a_callback_closes_the_scopes_it_leaves_open() {
+        with_env(|env, _| {
+            let a = new_realm(env, 0).unwrap();
+            let b = new_realm(env, 0).unwrap();
+            let outer = enter(env, a).unwrap();
+            let statuses = Rc::new(RefCell::new(Vec::new()));
+            let (left_open, realm_inside) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+            let function = native_function(env, {
+                let (statuses, left_open, realm_inside) =
+                    (statuses.clone(), left_open.clone(), realm_inside.clone());
+                move |_| {
+                    let mut statuses = statuses.borrow_mut();
+                    // A scope opened outside the callback is not its to close.
+                    statuses.push(leave(env, outer));
+                    let nested = enter(env, b).unwrap();
+                    let inner = enter(env, a).unwrap();
+                    statuses.push(leave(env, nested));
+                    statuses.push(leave(env, inner));
+                    realm_inside.set(current_realm(env));
+                    left_open.set(nested);
+                    0
+                }
+            });
+            call(env, function);
+            assert_eq!(
+                *statuses.borrow(),
+                [NAPI_INVALID_ARG, NAPI_INVALID_ARG, NAPI_OK]
+            );
+            assert_eq!(realm_inside.get(), b);
+            assert_eq!(current_realm(env), a);
+            assert_eq!(leave(env, left_open.get()), NAPI_INVALID_ARG);
+            assert_eq!(leave(env, outer), NAPI_OK);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn deferred_callbacks_run_in_their_realm_when_drained() {
+        with_env(|env, _| {
+            let a = new_realm(env, 0).unwrap();
+            let b = new_realm(env, 0).unwrap();
+            let deferred = Rc::new(Cell::new(false));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let scope = enter(env, a).unwrap();
+            let function = native_function(env, {
+                let (deferred, seen) = (deferred.clone(), seen.clone());
+                move |_| {
+                    // The first call does not run, as while JSPI holds the
+                    // guest suspended.
+                    if !deferred.replace(true) {
+                        return CALLBACK_DEFERRED;
+                    }
+                    seen.borrow_mut().push(current_realm(env));
+                    0
+                }
+            });
+            assert_eq!(leave(env, scope), NAPI_OK);
+
+            let outer = enter(env, b).unwrap();
+            call(env, function);
+            assert!(seen.borrow().is_empty());
+            assert_eq!(current_realm(env), b);
+            assert_eq!(
+                unsafe { snapi_bridge_drain_pending_callbacks(env) },
+                NAPI_OK
+            );
+            assert_eq!(*seen.borrow(), [a]);
+            assert_eq!(current_realm(env), b);
+            assert_eq!(leave(env, outer), NAPI_OK);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn finalizers_run_in_the_env_realm() {
+        with_env(|env, state| {
+            let seen = Rc::new(Cell::new(u32::MAX));
+            let finalizer = guest_function({
+                let seen = seen.clone();
+                move |_| {
+                    seen.set(current_realm(env));
+                    0
+                }
+            });
+            let target = state.agent.insert(Object::new().into());
+            assert!(
+                state
+                    .agent
+                    .register_guest_finalizer(target, 0, finalizer, 0, 0, None)
+            );
+            let realm = new_realm(env, 0).unwrap();
+            let scope = enter(env, realm).unwrap();
+            assert_eq!(unsafe { drain_guest_finalizers(env, true) }, NAPI_OK);
+            assert_eq!(seen.get(), 0);
+            assert_eq!(current_realm(env), realm);
+            assert_eq!(leave(env, scope), NAPI_OK);
+        });
+    }
+
+    // The env keeps every callback closure for its whole life, so a realm a
+    // closure referred to would live as long as the env. Only the function's
+    // JS wrapper refers to it; tests/host-js checks that the realm is
+    // collected with the wrapper. (Collection is not observable here: these
+    // tests cannot await, which the atomics build needs shared memory for.)
+    #[wasm_bindgen_test]
+    fn only_the_js_wrapper_of_a_native_function_refers_to_its_realm() {
+        with_env(|env, _| {
+            let roots = wasm_bindgen::externref_heap_live_count;
+            let before = roots();
+            native_function(env, |_| 0);
+            let per_function = roots() - before;
+
+            let ran_in_realm = Rc::new(Cell::new(false));
+            for sandboxed in [false, true] {
+                let state = unsafe { env_mut(env) }.unwrap();
+                let frame = state.agent.open_value_frame();
+                let sandbox = if sandboxed {
+                    state.agent.insert(Object::new().into())
+                } else {
+                    0
+                };
+                let realm = new_realm(env, sandbox).unwrap();
+                let scope = enter(env, realm).unwrap();
+                let before = roots();
+                let function = native_function(env, {
+                    let ran_in_realm = ran_in_realm.clone();
+                    move |_| {
+                        ran_in_realm.set(current_realm(env) != 0);
+                        0
+                    }
+                });
+                // The same roots as for a function of the env's own realm.
+                assert_eq!(roots() - before, per_function);
+                let function: Function = value(env, function).unchecked_into();
+                assert_eq!(leave(env, scope), NAPI_OK);
+                // With the realm's handles and scope gone, the function still
+                // runs in it.
+                assert!(
+                    unsafe { env_mut(env) }
+                        .unwrap()
+                        .agent
+                        .close_value_frame(frame)
+                );
+                ran_in_realm.set(false);
+                function.call0(&JsValue::UNDEFINED).unwrap();
+                assert!(ran_in_realm.get());
+            }
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn a_callback_that_throws_keeps_no_root_for_its_realm() {
+        with_env(|env, state| {
+            let error = state.agent.insert(Error::new("thrown").into());
+            let throwing = move |_: u32| -> u32 {
+                assert_eq!(unsafe { snapi_bridge_throw(env, error) }, NAPI_OK);
+                0
+            };
+            let in_env = native_function(env, throwing);
+            let realm = new_realm(env, 0).unwrap();
+            let scope = enter(env, realm).unwrap();
+            let in_realm = native_function(env, throwing);
+            assert_eq!(leave(env, scope), NAPI_OK);
+            // The roots a throwing call leaves behind, its exception cleared.
+            let left_behind = |function: u32| {
+                let before = wasm_bindgen::externref_heap_live_count();
+                let mut out = 0;
+                assert_eq!(
+                    unsafe {
+                        snapi_bridge_call_function(env, 0, function, 0, ptr::null(), &mut out)
+                    },
+                    NAPI_PENDING_EXCEPTION
+                );
+                assert_eq!(
+                    unsafe { snapi_bridge_get_and_clear_last_exception(env, &mut out) },
+                    NAPI_OK
+                );
+                assert_eq!(out, error);
+                wasm_bindgen::externref_heap_live_count() - before
+            };
+            assert_eq!(left_behind(in_realm), left_behind(in_env));
+            assert_eq!(current_realm(env), 0);
         });
     }
 

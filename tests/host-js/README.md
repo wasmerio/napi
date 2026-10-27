@@ -13,7 +13,8 @@ context-owned writes, Error constructor/prototype ownership, native error
 compatibility, causes/subclasses, stack formatting and collection of released
 contexts and their shared WebAssembly buffers. Retained callback wrappers must
 become inert on release and allow collection of their contexts and dispatch
-captures. The shared-object registry and
+captures. A callback wrapper passes the realm it was made in to its dispatch,
+and is all that keeps that realm alive. The shared-object registry and
 module loader are outside this isolated test.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
