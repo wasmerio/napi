@@ -166,6 +166,11 @@
       "expected_stdout": "TEST_UNOFFICIAL_EXTENSION_OK=1\n"
     },
     {
+      "name": "test_contextify_enter",
+      "description": "unofficial_napi_contextify_enter/leave: realm selection for N-API calls and callbacks, 64-bit LIFO tokens, output pointer validation",
+      "expected_stdout": "TEST_CONTEXTIFY_ENTER_OK=1\n"
+    },
+    {
       "name": "test_handle_scope_lifetime",
       "description": "Scope-bound value lifetimes: stale-after-close rejection, ref survival, LIFO mismatch error, slot reclamation under churn",
       "expected_stdout": "TEST_HANDLE_SCOPE_LIFETIME_OK=1\n"
