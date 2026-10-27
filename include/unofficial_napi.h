@@ -145,17 +145,47 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
 
-// Realms. An env acts in one realm, its engine instance's main realm, for its
-// whole life: every N-API call through it creates objects there, and the
-// native functions it makes run there.
+// Realms. An engine instance holds realms, each with its own global and
+// intrinsics: the env's own realm (the engine instance's main realm) and the
+// realms unofficial_napi_create_realm makes, such as vm contexts. A realm is
+// not an env: one env serves all of them, and its hooks, instance data and
+// cleanup hooks are shared by all of them. A hook fires for code running in
+// any realm.
 //
-// A vm context is another realm of the same engine instance. It is not an env:
-// unofficial_napi_create_realm makes one and returns an unofficial_napi_realm,
-// and only the calls that run code take one (unofficial_napi_run_script,
-// unofficial_napi_compile_function, module creation and
-// unofficial_napi_bytecode_open). A NULL realm means the env's own realm.
-// Hooks, instance data and cleanup hooks stay on the env: a hook fires for
-// code running in any of its realms.
+// N-API acts in one realm at a time, the current realm, as an ECMAScript
+// engine runs code in the realm of its running execution context:
+//
+// - A call that creates something creates it in the current realm, with that
+//   realm's intrinsics: objects, arrays, functions, classes, errors (also the
+//   ones napi_throw_* makes), promises, dates, typed arrays and buffers.
+//   napi_get_global returns the current realm's global (a sandbox realm's
+//   sandbox), and napi_run_script runs there.
+// - A native function belongs to the realm that was current when it was made,
+//   as an ECMAScript built-in function has a [[Realm]]. That covers
+//   napi_create_function, and the constructors, methods and accessors of
+//   napi_define_class and napi_define_properties. Its callback runs with that
+//   realm current, whichever realm calls it.
+// - A promise from napi_create_promise belongs to the current realm, and
+//   napi_resolve_deferred and napi_reject_deferred settle it in that realm.
+// - unofficial_napi_enter_realm makes a realm current until the matching
+//   unofficial_napi_leave_realm.
+// - Otherwise the current realm is the env's own. An embedder that never
+//   enters a realm only ever acts in the env's realm.
+// - Finalizers, cleanup hooks, env hooks and interrupt callbacks run in the
+//   env's realm.
+//
+// The calls that run code in a realm take it explicitly
+// (unofficial_napi_run_script, unofficial_napi_compile_function, module
+// creation and unofficial_napi_bytecode_open). There a NULL realm means the
+// env's own realm, also while another realm is current.
+//
+// N-API's threadsafe functions and async work belong to the embedder. To run
+// their callbacks in the realm that made them, it keeps a reference to the
+// global napi_get_global returns when they are made, and enters the realm
+// unofficial_napi_get_realm finds for that global around each callback.
+//
+// The host-JS provider's realms share the host realm's intrinsics: there,
+// entering a realm selects its global, and objects still come from the host.
 //
 // A realm lives while its global (the sandbox, when it has one) or anything
 // made in it is reachable, and is then collected. A realm handle, like a
@@ -214,6 +244,33 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_realm(
     napi_env env,
     napi_value value,
     unofficial_napi_realm* realm_out);
+
+// A scope opened by unofficial_napi_enter_realm. A token is never 0 and never
+// reused within its env.
+typedef uint64_t unofficial_napi_realm_scope;
+
+// Makes `realm_or_null` the current realm (NULL: the env's own) until
+// unofficial_napi_leave_realm closes the returned scope. Scopes nest and close
+// in LIFO order, and a scope keeps its realm alive until it is closed. A scope
+// that a native callback leaves open closes when that callback returns, and
+// every scope closes when the env is released.
+//
+// No JavaScript runs, so entering also succeeds while execution is
+// terminating. Fails with napi_invalid_arg for a realm of another env or one
+// that was collected.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enter_realm(
+    napi_env env,
+    unofficial_napi_realm realm_or_null,
+    unofficial_napi_realm_scope* scope_out);
+
+// Closes `scope`, which must be the innermost scope opened in the running
+// native callback (or outside any callback). A pending exception stays
+// pending. Any other token fails with napi_invalid_arg and changes nothing:
+// one already closed, one opened by an outer callback, or one with a scope
+// nested inside it still open.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_leave_realm(
+    napi_env env,
+    unofficial_napi_realm_scope scope);
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage(
     napi_env env);
