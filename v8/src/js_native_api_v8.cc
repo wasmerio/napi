@@ -380,6 +380,23 @@ inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const c
   return napi_v8_set_last_error(env, napi_generic_failure, message);
 }
 
+// Like Node's napi_env__::terminatedOrTerminating(): V8 is terminating the
+// env's JS (worker terminate(), process.exit()).
+inline bool TerminatedOrTerminating(napi_env env) {
+  return env != nullptr && env->isolate != nullptr && env->isolate->IsExecutionTerminating();
+}
+
+// Like Node's NAPI_PREAMBLE: while terminating, calls that may run JS fail
+// without entering V8. Entering V8 then clears the termination, so the thread
+// would keep running JS after it was told to stop.
+#define NAPI_V8_RETURN_IF_TERMINATING(env)                                   \
+  do {                                                                       \
+    if (TerminatedOrTerminating(env)) {                                      \
+      return napi_v8_set_last_error(                                         \
+          (env), napi_pending_exception, "Execution is terminating");        \
+    }                                                                        \
+  } while (0)
+
 inline napi_status InvalidArg(napi_env env) {
   if (CheckEnv(env)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -444,6 +461,20 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
   return true;
 }
 
+// Like Node's napi_env__::CallIntoModule() and HandleThrow(): after a native
+// callback returns, rethrow the exception it left pending, unless V8 is
+// terminating. TryCatch records a termination as a null exception, and
+// rethrowing that would turn the termination into a catchable throw and cancel
+// it. Returns whether an exception was pending.
+bool HandleCallbackException(napi_env env) {
+  if (env->agent->last_exception.IsEmpty()) return false;
+  if (!TerminatedOrTerminating(env)) {
+    env->isolate->ThrowException(env->agent->last_exception.Get(env->isolate));
+  }
+  ClearLastException(env);
+  return true;
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
@@ -455,11 +486,7 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->agent->last_exception.IsEmpty();
-  if (pending_exception) {
-    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -475,10 +502,7 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->agent->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -495,10 +519,7 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->agent->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->agent->last_exception.Get(env->isolate));
-    ClearLastException(env);
-  }
+  (void)HandleCallbackException(env);
 }
 
 }  // namespace
@@ -1574,6 +1595,7 @@ napi_status NAPI_CDECL napi_get_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1590,6 +1612,7 @@ napi_status NAPI_CDECL napi_set_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || value == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1606,14 +1629,20 @@ napi_status NAPI_CDECL napi_instanceof(napi_env env,
                                        napi_value object,
                                        napi_value constructor,
                                        bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, constructor) || result == nullptr) {
     return napi_invalid_arg;
   }
   v8::Local<v8::Value> ctor = napi_v8_unwrap_value(constructor);
   if (!ctor->IsFunction()) return napi_function_expected;
-  *result = napi_v8_unwrap_value(object)
-                ->InstanceOf(env->context(), ctor.As<v8::Object>())
-                .FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  v8::Maybe<bool> instance_of =
+      napi_v8_unwrap_value(object)->InstanceOf(env->context(), ctor.As<v8::Object>());
+  if (instance_of.IsNothing()) {
+    *result = false;
+    return ReturnPendingIfCaught(env, tc, "instanceof threw");
+  }
+  *result = instance_of.FromJust();
   return napi_ok;
 }
 
@@ -1621,6 +1650,7 @@ napi_status NAPI_CDECL napi_has_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1637,6 +1667,7 @@ napi_status NAPI_CDECL napi_delete_element(napi_env env,
                                            napi_value object,
                                            uint32_t index,
                                            bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1926,6 +1957,7 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
                                          size_t argc,
                                          const napi_value* argv,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, constructor) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> ctorValue = napi_v8_unwrap_value(constructor);
   if (!ctorValue->IsFunction()) return napi_function_expected;
@@ -1953,6 +1985,7 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
                                           size_t argc,
                                           const napi_value* argv,
                                           napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, recv) || !CheckValue(env, func)) return napi_invalid_arg;
   auto context = env->context();
   v8::Local<v8::Function> fn;
@@ -1988,6 +2021,7 @@ napi_status NAPI_CDECL napi_define_properties(
     napi_value object,
     size_t property_count,
     const napi_property_descriptor* properties) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || properties == nullptr) return InvalidArg(env);
   auto context = env->context();
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
@@ -2098,6 +2132,7 @@ napi_status NAPI_CDECL napi_create_promise(napi_env env,
 napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
                                              napi_deferred deferred,
                                              napi_value resolution) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || resolution == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2113,6 +2148,7 @@ napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
 napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
                                             napi_deferred deferred,
                                             napi_value rejection) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || rejection == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2137,6 +2173,7 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2162,6 +2199,7 @@ napi_status NAPI_CDECL napi_set_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || value == nullptr) {
     return InvalidArg(env);
   }
@@ -2180,6 +2218,7 @@ napi_status NAPI_CDECL napi_get_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2198,6 +2237,7 @@ napi_status NAPI_CDECL napi_has_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2216,6 +2256,7 @@ napi_status NAPI_CDECL napi_delete_property(napi_env env,
                                             napi_value object,
                                             napi_value key,
                                             bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key)) {
     return InvalidArg(env);
   }
@@ -2236,6 +2277,7 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
                                              napi_value object,
                                              napi_value key,
                                              bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2257,6 +2299,7 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
 napi_status NAPI_CDECL napi_get_property_names(napi_env env,
                                                napi_value object,
                                                napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -2281,6 +2324,7 @@ napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
                                                    napi_key_filter key_filter,
                                                    napi_key_conversion key_conversion,
                                                    napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -2318,6 +2362,7 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || value == nullptr) {
     return InvalidArg(env);
   }
@@ -2343,6 +2388,7 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2508,6 +2554,7 @@ napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2526,6 +2573,7 @@ napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2544,6 +2592,7 @@ napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2732,6 +2781,7 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
 napi_status NAPI_CDECL napi_throw_error(napi_env env,
                                         const char* code,
                                         const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
@@ -2754,6 +2804,7 @@ napi_status NAPI_CDECL napi_throw_error(napi_env env,
 }
 
 napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, error)) return napi_invalid_arg;
   v8::Local<v8::Value> ex = napi_v8_unwrap_value(error);
   env->isolate->ThrowException(ex);
@@ -2840,6 +2891,7 @@ napi_status NAPI_CDECL node_api_create_syntax_error(napi_env env,
 napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
                                              const char* code,
                                              const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
@@ -2865,6 +2917,7 @@ napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
 napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
                                               const char* code,
                                               const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
@@ -2890,6 +2943,7 @@ napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
 napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
                                                    const char* code,
                                                    const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   NapiV8RealmScope realm_scope(env);
   v8::Local<v8::String> message;
@@ -2980,6 +3034,7 @@ napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
 napi_status NAPI_CDECL napi_run_script(napi_env env,
                                        napi_value script,
                                        napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, script) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> source = napi_v8_unwrap_value(script);
   if (!source->IsString()) return napi_string_expected;
@@ -3229,6 +3284,7 @@ napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result
 }
 
 napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -3241,6 +3297,7 @@ napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object) {
 }
 
 napi_status NAPI_CDECL napi_object_seal(napi_env env, napi_value object) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;

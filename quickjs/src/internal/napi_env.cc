@@ -5,7 +5,88 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <new>
 #include <cassert>
+
+// The interrupt handler installed on a runtime. It reports an interrupt while
+// any env on the runtime has termination requested, and otherwise defers to
+// the handler that was installed before it. Only the runtime's own thread
+// touches this record.
+struct napi_runtime_interrupts__
+{
+  JSInterruptHandler *previous_handler = nullptr;
+  void *previous_opaque = nullptr;
+  std::vector<napi_env> envs;
+};
+
+namespace
+{
+// quickjs-ng exposes a runtime's current interrupt handler only through
+// js_std_cmd.
+constexpr int kStdCmdGetInterruptHandler = 5;
+constexpr int kStdCmdGetInterruptOpaque = 6;
+
+int runtime_interrupt_handler(JSRuntime *rt, void *opaque)
+{
+  auto *interrupts = static_cast<napi_runtime_interrupts__ *>(opaque);
+  for (napi_env env : interrupts->envs)
+  {
+    if (env->termination_requested())
+      return 1;
+  }
+  if (interrupts->previous_handler != nullptr)
+    return interrupts->previous_handler(rt, interrupts->previous_opaque);
+  return 0;
+}
+
+napi_runtime_interrupts__ *installed_runtime_interrupts(JSRuntime *rt)
+{
+  auto *handler = reinterpret_cast<JSInterruptHandler *>(
+      js_std_cmd(kStdCmdGetInterruptHandler, rt));
+  if (handler != runtime_interrupt_handler)
+    return nullptr;
+  return reinterpret_cast<napi_runtime_interrupts__ *>(
+      js_std_cmd(kStdCmdGetInterruptOpaque, rt));
+}
+
+napi_runtime_interrupts__ *attach_runtime_interrupts(JSRuntime *rt, napi_env env)
+{
+  napi_runtime_interrupts__ *interrupts = installed_runtime_interrupts(rt);
+  if (interrupts == nullptr)
+  {
+    interrupts = new (std::nothrow) napi_runtime_interrupts__{};
+    if (interrupts == nullptr)
+      return nullptr;
+    // Chain to an embedder's handler instead of replacing it.
+    interrupts->previous_handler = reinterpret_cast<JSInterruptHandler *>(
+        js_std_cmd(kStdCmdGetInterruptHandler, rt));
+    interrupts->previous_opaque = reinterpret_cast<void *>(
+        js_std_cmd(kStdCmdGetInterruptOpaque, rt));
+    JS_SetInterruptHandler(rt, runtime_interrupt_handler, interrupts);
+  }
+  interrupts->envs.push_back(env);
+  return interrupts;
+}
+
+void detach_runtime_interrupts(JSRuntime *rt,
+                               napi_runtime_interrupts__ *interrupts,
+                               napi_env env)
+{
+  if (interrupts == nullptr)
+    return;
+  auto &envs = interrupts->envs;
+  envs.erase(std::remove(envs.begin(), envs.end(), env), envs.end());
+  if (!envs.empty())
+    return;
+  // If another handler was installed on top of ours it may still call into
+  // this record, so keep it (now a plain forwarder) instead of freeing it.
+  if (installed_runtime_interrupts(rt) != interrupts)
+    return;
+  JS_SetInterruptHandler(rt, interrupts->previous_handler, interrupts->previous_opaque);
+  delete interrupts;
+}
+} // namespace
 
 napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version)
     : agent_{agent},
@@ -25,6 +106,7 @@ napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_a
   if (context_ != nullptr)
     agent_->open_root_scope(this);
   clear_last_error();
+  runtime_interrupts_ = attach_runtime_interrupts(JS_GetRuntime(context), this);
 }
 
 napi_env__::~napi_env__()
@@ -79,6 +161,11 @@ void napi_env__::prepare_teardown()
   promises_.teardown();
   if (principal)
     agent_->clear_values();
+  // Detach before the runtime can be freed. The termination flag itself stays
+  // valid for the env's whole lifetime, since other threads may still set it.
+  if (context_ != nullptr)
+    detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
+  runtime_interrupts_ = nullptr;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
 }
@@ -320,6 +407,26 @@ napi_status napi_env__::clear_last_error()
 bool napi_env__::has_last_exception() const
 {
   return agent_->has_pending_exception();
+}
+
+bool napi_env__::last_exception_is_uncatchable() const
+{
+  return agent_->pending_exception_is_uncatchable();
+}
+
+void napi_env__::request_termination()
+{
+  termination_requested_.store(true, std::memory_order_release);
+}
+
+void napi_env__::cancel_termination()
+{
+  termination_requested_.store(false, std::memory_order_release);
+}
+
+bool napi_env__::termination_requested() const
+{
+  return termination_requested_.load(std::memory_order_acquire);
 }
 
 void napi_env__::clear_last_exception()

@@ -262,6 +262,11 @@ bool napi_agent__::has_pending_exception() const
   return has_pending_exception_;
 }
 
+bool napi_agent__::pending_exception_is_uncatchable() const
+{
+  return has_pending_exception_ && JS_IsUncatchableError(pending_exception_);
+}
+
 void napi_agent__::set_pending_exception(JSValue exception)
 {
   clear_pending_exception();
