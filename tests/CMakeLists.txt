@@ -330,6 +330,9 @@ add_fixture_test(${_napi_test_prefix}_test_67_terminate_execution
 add_fixture_test(${_napi_test_prefix}_test_68_napi_calls_keep_termination
   runners/test_68_napi_calls_keep_termination.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_69_unofficial_realm_entry
+  runners/test_69_unofficial_realm_entry.cc
+)
 if(_napi_test_engine STREQUAL "v8")
   # Only the V8 provider posts engine tasks through the enqueue hook.
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff

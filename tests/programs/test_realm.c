@@ -249,6 +249,50 @@ int main(void) {
   printf("vm results: run=%d function=%d module=%d bytecode=%d\n", ran, called, exported,
          from_bytecode);
 
+  // While a realm is entered, N-API creates in it and napi_get_global returns
+  // its global. Scopes nest, NULL enters the env's realm, and only the
+  // innermost scope can be left, once.
+  unofficial_napi_realm_scope outer = 0;
+  unofficial_napi_realm_scope inner = 0;
+  napi_value current = NULL;
+  napi_value made = NULL;
+  NAPI_CALL(env, unofficial_napi_enter_realm(env, realm, &outer));
+  CHECK_OR_FAIL(outer != 0, "enter_realm returned no scope");
+  NAPI_CALL(env, napi_get_global(env, &current));
+  CHECK_OR_FAIL(StrictEquals(env, current, realm_global),
+                "napi_get_global did not return the entered realm's global");
+  NAPI_CALL(env, napi_create_object(env, &made));
+  NAPI_CALL(env, unofficial_napi_enter_realm(env, NULL, &inner));
+  NAPI_CALL(env, napi_get_global(env, &current));
+  CHECK_OR_FAIL(StrictEquals(env, current, env_global), "NULL did not enter the env's realm");
+  CHECK_OR_FAIL(unofficial_napi_leave_realm(env, outer) == napi_invalid_arg,
+                "an outer scope was left before an inner one");
+  NAPI_CALL(env, unofficial_napi_leave_realm(env, inner));
+  // A native function made while the realm is entered runs in it.
+  callback_record realm_record = {realm_global, NULL, false, 0};
+  napi_value realm_fn = NULL;
+  NAPI_CALL(env, napi_create_function(env, "realmProbe", NAPI_AUTO_LENGTH, RecordCallback,
+                                      &realm_record, &realm_fn));
+  NAPI_CALL(env, unofficial_napi_leave_realm(env, outer));
+  CHECK_OR_FAIL(unofficial_napi_leave_realm(env, outer) == napi_invalid_arg,
+                "a scope was left twice");
+  NAPI_CALL(env, napi_get_global(env, &current));
+  CHECK_OR_FAIL(StrictEquals(env, current, env_global),
+                "leaving did not make the env's realm current again");
+  napi_value made_by_fn = NULL;
+  NAPI_CALL(env, napi_call_function(env, undefined, realm_fn, 0, NULL, &made_by_fn));
+  CHECK_OR_FAIL(realm_record.calls == 1 && realm_record.saw_expected_global,
+                "a function made in the realm did not run in it");
+  NAPI_CALL(env, napi_set_named_property(env, realm_global, "made", made));
+  NAPI_CALL(env, napi_set_named_property(env, realm_global, "madeByFn", made_by_fn));
+  int32_t own = 0;
+  NAPI_CALL(env, RunInInt32(env, realm,
+                            "(Object.getPrototypeOf(made) === Object.prototype) +"
+                            " (Object.getPrototypeOf(madeByFn) === Object.prototype)",
+                            &own));
+  CHECK_OR_FAIL(own == 2, "an object made in the realm has another realm's prototype");
+  printf("entered realm: its global, objects and functions\n");
+
   // Realms nothing refers to any more are collected.
   enum { kDropped = 6 };
   napi_ref dropped[kDropped];
