@@ -1318,8 +1318,9 @@ struct CallbackReg {
 }
 
 /// A guest callback trampoline: receives `this`, the arguments, `new.target`
-/// and the context of the function's realm (undefined for the env's own).
-type CallbackFn = dyn Fn(JsValue, Array, JsValue, JsValue) -> JsValue;
+/// and the context of the function's realm (undefined for the env's own), and
+/// returns the result or the exception to throw.
+type CallbackFn = dyn Fn(JsValue, Array, JsValue, JsValue) -> Result<JsValue, JsValue>;
 type CallbackClosure = Closure<CallbackFn>;
 
 struct CallbackInfo {
@@ -3496,13 +3497,17 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
     // realm's context and passes it in on every call; the closure must not
     // capture it, since the env keeps every closure for its whole life.
     let closure = Closure::wrap(Box::new(
-        move |this: JsValue, args: Array, new_target: JsValue, realm: JsValue| -> JsValue {
+        move |this: JsValue,
+              args: Array,
+              new_target: JsValue,
+              realm: JsValue|
+              -> Result<JsValue, JsValue> {
             let env_addr = live_env_addr.get();
             if env_addr == 0 {
                 wasmer_napi_console_error(&format!(
                     "[wasmer-napi-callback] released env callback={callback_name}"
                 ));
-                return JsValue::UNDEFINED;
+                return Ok(JsValue::UNDEFINED);
             }
             let env = env_addr as SnapiEnv;
             // Do not keep a mutable environment borrow across the guest callback:
@@ -3513,7 +3518,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                     wasmer_napi_console_error(&format!(
                         "[wasmer-napi-callback] invalid env callback={callback_name}"
                     ));
-                    return JsValue::UNDEFINED;
+                    return Ok(JsValue::UNDEFINED);
                 };
                 let value_frame = state.agent.open_value_frame();
                 let mut ids = Vec::with_capacity(args.length() as usize);
@@ -3560,7 +3565,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                 )
             };
             let Ok(state) = (unsafe { env_mut(env) }) else {
-                return JsValue::UNDEFINED;
+                return Ok(JsValue::UNDEFINED);
             };
             if result == CALLBACK_DEFERRED {
                 let realm = state.leave_callback(realm_depth);
@@ -3580,9 +3585,8 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                     resolve: resolve_slot.borrow_mut().take().unwrap(),
                     reject: reject_slot.borrow_mut().take().unwrap(),
                 });
-                return promise.into();
+                return Ok(promise.into());
             }
-            // Not kept in a local: throw_val below skips Rust destructors.
             state.leave_callback(realm_depth);
             let error = state.last_exception.take();
             let result_value = state.agent.get(result).cloned();
@@ -3599,10 +3603,10 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
             let result = result_value.unwrap_or(JsValue::UNDEFINED);
             state.agent.callback_infos.remove(&cb);
             state.agent.close_value_frame(value_frame);
-            if let Some(error) = error {
-                wasm_bindgen::throw_val(error);
-            }
-            result
+            // wasm-bindgen throws an Err once this closure has returned and
+            // dropped what it owns. throw_val here would skip those
+            // destructors and leak the arguments' externref slots.
+            error.map_or(Ok(result), Err)
         },
     ) as Box<CallbackFn>);
     let undefined = JsValue::UNDEFINED;
@@ -7214,6 +7218,37 @@ mod tests {
 
     fn leave(env: SnapiEnv, scope: u64) -> i32 {
         unsafe { snapi_bridge_unofficial_leave_realm(env, scope) }
+    }
+
+    // throw_val unwinds without running Rust destructors, so a callback must
+    // not throw while it still owns its arguments or its result.
+    #[wasm_bindgen_test]
+    fn a_callback_that_throws_keeps_no_more_roots_than_one_that_returns() {
+        with_env(|env, state| {
+            let error = state.agent.insert(Error::new("thrown").into());
+            let throwing = native_function(env, move |_| {
+                assert_eq!(unsafe { snapi_bridge_throw(env, error) }, NAPI_OK);
+                0
+            });
+            let returning = native_function(env, |_| 0);
+            // JavaScript catches the exception: one caught by a wasm-bindgen
+            // catch import, as napi_call_function's is, costs a root of its own.
+            let call =
+                Function::new_with_args("f", "try { return f(1, {}); } catch (e) { return e; }");
+            let error = value(env, error);
+            // The roots a call leaves behind, and whether it threw `error`.
+            let left_behind = |function: u32| {
+                let function = value(env, function);
+                let before = wasm_bindgen::externref_heap_live_count();
+                let result = call.call1(&JsValue::UNDEFINED, &function).unwrap();
+                let threw = Object::is(&result, &error);
+                drop(result);
+                let after = wasm_bindgen::externref_heap_live_count();
+                (i64::from(after) - i64::from(before), threw)
+            };
+            assert_eq!(left_behind(returning), (0, false));
+            assert_eq!(left_behind(throwing), (0, true));
+        });
     }
 
     #[wasm_bindgen_test]
