@@ -907,6 +907,9 @@ namespace quickjs::detail
         auto *record = reinterpret_cast<context_record *>(realm);
         if (record != nullptr && !record->live())
             return napi_invalid_arg;
+        napi_status terminating = napi_util__::fail_if_terminating(env_, ctx_);
+        if (terminating != napi_ok)
+            return terminating;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
 
         std::string src = bytecode_record != nullptr ? bytecode_record->source_utf8

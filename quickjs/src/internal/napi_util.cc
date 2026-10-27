@@ -156,6 +156,31 @@ napi_status napi_util__::invalid_arg(napi_env env)
   return napi_invalid_arg;
 }
 
+JSValue napi_util__::throw_termination(JSContext *ctx)
+{
+  if (JS_HasException(ctx))
+  {
+    JSValue pending = JS_GetException(ctx);
+    if (JS_IsUncatchableError(pending))
+      return JS_Throw(ctx, pending);
+    JS_FreeValue(ctx, pending);
+  }
+  // The same error QuickJS raises when its interrupt handler fires: catch and
+  // finally blocks do not run for it.
+  JS_ThrowInternalError(ctx, "interrupted");
+  JSValue error = JS_GetException(ctx);
+  JS_SetUncatchableError(ctx, error);
+  return JS_Throw(ctx, error);
+}
+
+napi_status napi_util__::fail_if_terminating(napi_env env, JSContext *ctx)
+{
+  if (!env->termination_requested())
+    return napi_ok;
+  throw_termination(ctx);
+  return return_pending_if_caught(env, ctx, "JavaScript execution is terminating");
+}
+
 std::filesystem::path napi_util__::strip_file_url(std::string_view value)
 {
   constexpr std::string_view kScheme = "file://";
@@ -401,6 +426,9 @@ std::vector<JSValue> napi_util__::prepare_call_args(napi_env env, size_t argc, c
 
 napi_status napi_util__::run_pending_jobs(napi_env env)
 {
+  napi_status status = fail_if_terminating(env, context(env));
+  if (status != napi_ok)
+    return status;
   JSContext *job_ctx = nullptr;
   for (;;)
   {
@@ -408,7 +436,14 @@ napi_status napi_util__::run_pending_jobs(napi_env env)
     if (rc == 0)
       return napi_ok;
     if (rc < 0)
+    {
+      // A terminated job leaves QuickJS's uncatchable error in the runtime.
+      // Make it the env's pending exception, as the other entry points do,
+      // so the embedder can take it with napi_get_and_clear_last_exception.
+      if (env->termination_requested())
+        return fail_if_terminating(env, job_ctx != nullptr ? job_ctx : context(env));
       return napi_pending_exception;
+    }
   }
 }
 

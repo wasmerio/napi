@@ -53,6 +53,9 @@ struct napi_agent__
 
   // Pending exception, kept until N-API hands it back to JavaScript.
   bool has_pending_exception() const;
+  // True when the pending exception is QuickJS's uncatchable error (an
+  // interrupt, such as a termination).
+  bool pending_exception_is_uncatchable() const;
   void set_pending_exception(JSValue exception);
   JSValue take_pending_exception();
   void clear_pending_exception();
