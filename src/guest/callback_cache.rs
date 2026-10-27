@@ -186,6 +186,8 @@ mod tests {
     }
 
     #[test]
+    // WASIX's own host functions return WasiError the same way.
+    #[allow(clippy::result_large_err)]
     fn guest_exit_stays_a_wasi_error_through_the_typed_path() {
         let mut store = Store::default();
         let exit = Function::new_typed(&mut store, || -> Result<i32, WasiError> {
