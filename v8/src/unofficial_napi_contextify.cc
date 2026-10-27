@@ -781,6 +781,19 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
   return true;
 }
 
+void ReleaseContextRecord(napi_env env, ContextRecord& rec) {
+  if (rec.key_ref != nullptr && env->context_token_unassign_callback != nullptr) {
+    env->context_token_unassign_callback(
+        env, rec.key_ref, env->context_token_callback_data);
+  }
+  if (rec.key_ref != nullptr) {
+    napi_delete_reference(env, rec.key_ref);
+    rec.key_ref = nullptr;
+  }
+  rec.context.Reset();
+  rec.own_microtask_queue.reset();
+}
+
 void CleanupContextRecords(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
 
@@ -789,16 +802,7 @@ void CleanupContextRecords(void* arg) {
   auto it = g_context_records.find(env);
   if (it == g_context_records.end()) return;
   for (auto& rec : it->second) {
-    if (rec.key_ref != nullptr && env->context_token_unassign_callback != nullptr) {
-      env->context_token_unassign_callback(
-          env, rec.key_ref, env->context_token_callback_data);
-    }
-    if (rec.key_ref != nullptr) {
-      napi_delete_reference(env, rec.key_ref);
-      rec.key_ref = nullptr;
-    }
-    rec.context.Reset();
-    rec.own_microtask_queue.reset();
+    ReleaseContextRecord(env, rec);
   }
   g_context_records.erase(it);
 }
@@ -1311,17 +1315,41 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
   return state->temporary_required_module_facade_original->module.Get(context->GetIsolate());
 }
 
+// Records hold their key and context weakly, as Node's contextify does: a
+// context lives while its key (the sandbox) or anything made in it is
+// reachable, and is collected with them. Holding them strongly kept every
+// context, and everything reachable from it, until the environment closed.
+//
+// A record is released once both its key and its context are collected. Its
+// microtask queue must outlive the context (V8 holds it by raw pointer).
+void PruneCollectedRecords(napi_env env) {
+  auto it = g_context_records.find(env);
+  if (it == g_context_records.end()) return;
+  auto& records = it->second;
+  for (size_t index = 0; index < records.size();) {
+    ContextRecord& rec = records[index];
+    if (!rec.context.IsEmpty() || GetRefValue(env, rec.key_ref) != nullptr) {
+      ++index;
+      continue;
+    }
+    ReleaseContextRecord(env, rec);
+    records.erase(records.begin() + index);
+  }
+}
+
 bool StoreRecord(napi_env env,
                  napi_value key,
                  v8::Local<v8::Context> context,
                  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue) {
   EnsureContextCleanupHook(env);
+  PruneCollectedRecords(env);
 
   ContextRecord record;
-  if (napi_create_reference(env, key, 1, &record.key_ref) != napi_ok || record.key_ref == nullptr) {
+  if (napi_create_reference(env, key, 0, &record.key_ref) != napi_ok || record.key_ref == nullptr) {
     return false;
   }
   record.context.Reset(env->isolate, context);
+  record.context.SetWeak();
   record.own_microtask_queue = std::move(own_microtask_queue);
   if (env->context_token_assign_callback != nullptr) {
     env->context_token_assign_callback(env, record.key_ref, env->context_token_callback_data);
