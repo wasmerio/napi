@@ -161,8 +161,8 @@ void napi_env__::prepare_teardown()
   promises_.teardown();
   if (principal)
     agent_->clear_values();
-  // Detach before the runtime can be freed. The termination flag itself stays
-  // valid for the env's whole lifetime, since other threads may still set it.
+  // Detach before the runtime can be freed. The termination flag lives on the
+  // agent, which outlives this env, since other threads may still set it.
   if (context_ != nullptr)
     detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
   runtime_interrupts_ = nullptr;
@@ -416,17 +416,17 @@ bool napi_env__::last_exception_is_uncatchable() const
 
 void napi_env__::request_termination()
 {
-  termination_requested_.store(true, std::memory_order_release);
+  agent_->request_termination();
 }
 
 void napi_env__::cancel_termination()
 {
-  termination_requested_.store(false, std::memory_order_release);
+  agent_->cancel_termination();
 }
 
 bool napi_env__::termination_requested() const
 {
-  return termination_requested_.load(std::memory_order_acquire);
+  return agent_->termination_requested();
 }
 
 void napi_env__::clear_last_exception()

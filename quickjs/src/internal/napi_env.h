@@ -99,8 +99,9 @@ struct napi_env__
   void set_last_exception(JSValue exception);
   JSValue take_last_exception();
 
-  // unofficial_napi_terminate_execution state. Any thread may request
-  // termination; everything else runs on the env's engine thread.
+  // unofficial_napi_terminate_execution state, kept by the agent so that a
+  // termination stops every env of it. Any thread may request termination;
+  // everything else runs on the env's engine thread.
   void request_termination();
   void cancel_termination();
   bool termination_requested() const;
@@ -149,7 +150,6 @@ private:
 
   // Termination. QuickJS polls one interrupt handler per runtime, so the
   // handler lives in a record shared by every env on this env's runtime.
-  std::atomic<bool> termination_requested_{false};
   napi_runtime_interrupts__ *runtime_interrupts_ = nullptr;
 
   // Instance data finalizer.

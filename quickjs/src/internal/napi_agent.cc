@@ -262,6 +262,21 @@ bool napi_agent__::has_pending_exception() const
   return has_pending_exception_;
 }
 
+void napi_agent__::request_termination()
+{
+  termination_requested_.store(true, std::memory_order_release);
+}
+
+void napi_agent__::cancel_termination()
+{
+  termination_requested_.store(false, std::memory_order_release);
+}
+
+bool napi_agent__::termination_requested() const
+{
+  return termination_requested_.load(std::memory_order_acquire);
+}
+
 bool napi_agent__::pending_exception_is_uncatchable() const
 {
   return has_pending_exception_ && JS_IsUncatchableError(pending_exception_);

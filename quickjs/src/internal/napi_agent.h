@@ -6,6 +6,7 @@
 #include "napi_allocator.h"
 #include "napi_scope.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -55,6 +56,13 @@ struct napi_agent__
   napi_env env_for_module_def(JSModuleDef *module) const;
   // Turns the rejection tracker on while any env has a reject callback.
   void update_rejection_tracking();
+
+  // unofficial_napi_terminate_execution state. A termination stops JS in every
+  // env of this agent, as V8 terminates its whole isolate. Any thread may
+  // request it; everything else runs on the agent's engine thread.
+  void request_termination();
+  void cancel_termination();
+  bool termination_requested() const;
 
   // Handle scopes. Values in them are usable with every env of this agent.
   bool open_root_scope(napi_env env);
@@ -146,6 +154,8 @@ private:
   // Pending exception.
   JSValue pending_exception_ = JS_UNDEFINED;
   bool has_pending_exception_ = false;
+
+  std::atomic<bool> termination_requested_{false};
 
   // Declared external memory.
   int64_t external_memory_ = 0;

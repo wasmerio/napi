@@ -395,6 +395,35 @@ TEST_F(Test66UnofficialRealm, PendingExceptionsAreSharedAcrossRealms) {
             "inside realm");
 }
 
+// A termination belongs to the engine instance: requested through one env, it
+// stops calls into JS made through any realm env of the instance until it is
+// cancelled.
+TEST_F(Test66UnofficialRealm, TerminationStopsCallsThroughEveryRealmEnv) {
+  EnvScope s(runtime_.get());
+  napi_env realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  napi_value fn = Eval(realm, "() => 1");
+  ASSERT_NE(fn, nullptr);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(napi_call_function(realm, Global(realm), fn, 0, nullptr, &result),
+            napi_pending_exception);
+
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  if (pending) {
+    napi_value exception = nullptr;
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+
+  int32_t value = 0;
+  ASSERT_EQ(napi_call_function(realm, Global(realm), fn, 0, nullptr, &result), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(realm, result, &value), napi_ok);
+  EXPECT_EQ(value, 1);
+}
+
 TEST_F(Test66UnofficialRealm, ModulesEvaluateInTheirRealm) {
   EnvScope s(runtime_.get());
   napi_value realm_global = nullptr;
