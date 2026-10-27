@@ -50,7 +50,7 @@ namespace
         if (env == nullptr)
             return napi_invalid_arg;
 
-        JSContext *ctx = env->context();
+        JSContext *ctx = env->main_context();
         env->agent()->clear_promise_hooks();
         JS_SetContextOpaque(ctx, nullptr);
         env->prepare_teardown();
@@ -478,6 +478,8 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || callback == nullptr)
             return napi_invalid_arg;
+        // Interrupt callbacks run in the env's own realm.
+        napi_realm_frame_scope__ realm_frame{env, nullptr, JS_UNDEFINED};
         callback(env, data);
         return napi_ok;
     }
@@ -1168,6 +1170,33 @@ extern "C"
                                            : napi_invalid_arg;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_enter_realm(napi_env env,
+                                                       unofficial_napi_realm realm_or_null,
+                                                       unofficial_napi_realm_scope *scope_out)
+    {
+        if (!napi_util__::check_env(env) || scope_out == nullptr)
+            return napi_invalid_arg;
+        *scope_out = 0;
+        JSContext *ctx = env->main_context();
+        JSValue anchor = JS_UNDEFINED;
+        if (realm_or_null != nullptr)
+        {
+            napi_status status = env->contextify().realm_to_enter(realm_or_null, &ctx, &anchor);
+            if (status != napi_ok)
+                return status;
+        }
+        *scope_out = env->enter_realm(ctx, anchor);
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_leave_realm(napi_env env,
+                                                       unofficial_napi_realm_scope scope)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        return env->leave_realm(scope) ? napi_ok : napi_invalid_arg;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_run_script(
         napi_env env,
         unofficial_napi_realm realm_or_null,
@@ -1534,7 +1563,7 @@ extern "C"
     {
         if (env == nullptr)
             return napi_invalid_arg;
-        JSContext *ctx = env->context();
+        JSContext *ctx = env->main_context();
         napi_status status = DestroyEnvInstance(env);
         JS_FreeContext(ctx);
         return status;

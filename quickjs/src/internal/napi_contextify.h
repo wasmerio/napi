@@ -38,6 +38,15 @@ namespace quickjs::detail
                                  unofficial_napi_realm *realm_out,
                                  napi_value *global_out);
         napi_status get_realm(napi_value value, unofficial_napi_realm *realm_out) const;
+        // The context of a live realm of this env and, as a new reference, a
+        // function of the realm that keeps it alive.
+        napi_status realm_to_enter(unofficial_napi_realm realm,
+                                   JSContext **ctx_out,
+                                   JSValue *anchor_out) const;
+        // The key of the realm whose own global is `global` (its sandbox, or
+        // the global itself), as a new reference; undefined for any other
+        // object.
+        JSValue realm_key_for_global(JSValueConst global) const;
         // The context code for `realm` runs in: the realm's, or the env's
         // for NULL.
         JSContext *realm_context(unofficial_napi_realm realm) const;

@@ -30,7 +30,22 @@
 struct napi_external_backing_store_hint__;
 struct napi_runtime_interrupts__;
 
-// One realm (JSContext) of an agent. The context never changes.
+// A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or
+// a native callback that is running. The innermost frame is the current
+// realm.
+struct napi_realm_frame__
+{
+  // The scope's token; 0 for a callback.
+  uint64_t scope = 0;
+  JSContext *ctx = nullptr;
+  // A function of the realm, which keeps its context alive; undefined for the
+  // env's own realm. A scope owns it until it is left; a callback borrows its
+  // function's.
+  JSValue anchor = JS_UNDEFINED;
+};
+
+// One env of an agent. Its own realm (JSContext) never changes; the realm it
+// acts in is the innermost realm frame's.
 struct napi_env__
 {
   napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version);
@@ -45,7 +60,26 @@ struct napi_env__
   // Makes this env own its agent (an env made from an embedder's context).
   void adopt_agent(std::unique_ptr<napi_agent__> agent);
   bool is_principal() const;
+  // The current realm's context: the innermost realm frame's, else the env's
+  // own. N-API calls create what they make there.
   JSContext *context() const;
+  // The env's own realm.
+  JSContext *main_context() const;
+  // A function of the current realm that keeps it alive; undefined for the
+  // env's own realm.
+  JSValueConst current_realm_anchor() const;
+  // The current realm's global as unofficial_napi_create_realm reports it:
+  // a sandbox realm's sandbox. A new reference.
+  JSValue current_global();
+  // Pushes the frame of a callback running in `ctx` (borrowing `anchor`) and
+  // returns the depth pop_realm_frames restores.
+  size_t push_realm_frame(JSContext *ctx, JSValueConst anchor);
+  // Pops the frames above `depth`.
+  void pop_realm_frames(size_t depth);
+  // unofficial_napi_enter_realm and unofficial_napi_leave_realm. The scope
+  // takes `anchor`.
+  uint64_t enter_realm(JSContext *ctx, JSValue anchor);
+  bool leave_realm(uint64_t scope);
   int32_t module_api_version() const;
 
   napi_handle_scope root_scope() const;
@@ -140,6 +174,11 @@ private:
   JSContext *context_;
   int32_t module_api_version_ = 8;
 
+  // The realms N-API acts in, innermost last. Empty means the env's own.
+  std::vector<napi_realm_frame__> realm_frames_;
+  // The last scope token enter_realm handed out.
+  uint64_t last_realm_scope_ = 0;
+
   // Last native error state.
   napi::error_state__ error_state_;
 
@@ -178,6 +217,24 @@ private:
   bool closing_ = false;
   bool torn_down_ = false;
   bool clearing_refs_for_teardown_ = false;
+};
+
+// Runs the enclosing code in a realm (null: the env's own) and closes any
+// scope it leaves open.
+class napi_realm_frame_scope__
+{
+public:
+  napi_realm_frame_scope__(napi_env env, JSContext *ctx, JSValueConst anchor)
+      : env_{env}, depth_{env->push_realm_frame(ctx, anchor)}
+  {
+  }
+  ~napi_realm_frame_scope__() { env_->pop_realm_frames(depth_); }
+  napi_realm_frame_scope__(const napi_realm_frame_scope__ &) = delete;
+  napi_realm_frame_scope__ &operator=(const napi_realm_frame_scope__ &) = delete;
+
+private:
+  napi_env env_;
+  size_t depth_;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

@@ -162,6 +162,9 @@ namespace quickjs::detail
             disposed = true;
             JSRuntime *rt = JS_GetRuntime(parent_ctx);
             JS_DeleteNativeWeakRefLink(rt, &key_link);
+            if (owns_anchor)
+                JS_FreeValueRT(rt, anchor);
+            anchor = JS_UNDEFINED;
             if (owns_context && ctx != nullptr)
                 JS_FreeContext(ctx);
             for (JSAtom atom : baseline_atoms)
@@ -184,6 +187,10 @@ namespace quickjs::detail
         JSContext *ctx = nullptr;            // Borrowed; valid while live().
         JSValueConst sandbox = JS_UNDEFINED; // Borrowed; undefined without one.
         JSValueConst global = JS_UNDEFINED;  // Borrowed; valid while live().
+        // A function of the realm, which keeps its context alive. The key
+        // holds it, or the record when the key cannot.
+        JSValue anchor = JS_UNDEFINED;
+        bool owns_anchor = false;
         JSValue host_defined_option_id = JS_UNDEFINED;
         std::vector<JSAtom> baseline_atoms;
         JSNativeWeakRefLink key_link{};
@@ -414,15 +421,25 @@ namespace quickjs::detail
         JSValue anchor = JS_NewCFunction(child_ctx, contextify_anchor, "contextify", 0);
         if (!JS_IsException(anchor))
         {
-            int stored = JS_DefinePropertyValue(ctx_, key, context_link_atom_, anchor, k_contextify_link_flags);
+            int stored = JS_DefinePropertyValue(ctx_, key, context_link_atom_,
+                                                JS_DupValue(child_ctx, anchor), k_contextify_link_flags);
             raw->anchored = stored > 0;
+            raw->anchor = anchor;
             if (stored > 0)
+            {
+                // The key holds the anchor; the record borrows it.
+                JS_FreeValue(child_ctx, anchor);
                 linked = !raw->has_sandbox() ||
                          JS_DefinePropertyValue(child_ctx, raw->global, sandbox_link_atom_,
                                                 JS_DupValue(child_ctx, raw->sandbox),
                                                 k_contextify_link_flags) > 0;
-            else if (stored == 0)
-                linked = raw->owns_context = true;
+            }
+            else
+            {
+                raw->owns_anchor = true;
+                if (stored == 0)
+                    linked = raw->owns_context = true;
+            }
         }
         linked = linked && JS_AddNativeWeakRefLink(ctx_, key, &raw->key_link,
                                                    context_record::key_collected, raw) >= 0;
@@ -870,6 +887,30 @@ namespace quickjs::detail
             return napi_object_expected;
         *realm_out = reinterpret_cast<unofficial_napi_realm>(find_live_record(object));
         return napi_ok;
+    }
+
+    napi_status napi_contextify__::realm_to_enter(unofficial_napi_realm realm,
+                                                  JSContext **ctx_out,
+                                                  JSValue *anchor_out) const
+    {
+        // Only a realm this env made and still holds; the handle is not read
+        // before that is known.
+        auto *record = reinterpret_cast<context_record *>(realm);
+        const bool known = std::any_of(contexts_.begin(), contexts_.end(), [&](const auto &entry)
+                                       { return entry.get() == record; });
+        if (!known || !record->live())
+            return napi_invalid_arg;
+        *ctx_out = record->ctx;
+        *anchor_out = JS_DupValue(record->ctx, record->anchor);
+        return napi_ok;
+    }
+
+    JSValue napi_contextify__::realm_key_for_global(JSValueConst global) const
+    {
+        context_record *record = find_live_record(global);
+        if (record == nullptr || !is_same_object(record->global, global))
+            return JS_UNDEFINED;
+        return JS_DupValue(ctx_, record->key());
     }
 
     JSContext *napi_contextify__::realm_context(unofficial_napi_realm realm) const

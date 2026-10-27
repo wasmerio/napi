@@ -22,10 +22,16 @@ struct napi_deferred__
   JSValue call_reject(napi_value rejection);
 
 private:
+  JSValue call(JSValueConst function, napi_value argument);
+
   // Owning environment and stored promise callbacks.
   napi_env env_ = nullptr;
   JSValue resolve_ = JS_UNDEFINED;
   JSValue reject_ = JS_UNDEFINED;
+  // The promise's realm, where it settles, and an anchor that keeps it alive
+  // until then (undefined for the env's own realm).
+  JSContext *realm_ctx_ = nullptr;
+  JSValue realm_anchor_ = JS_UNDEFINED;
 };
 
 #endif // NAPI_QUICKJS_DEFERRED_H_

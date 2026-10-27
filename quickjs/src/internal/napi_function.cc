@@ -57,19 +57,26 @@ JSValue napi_function__::create_internal(napi_env env,
   return JS_DupValue(env->context(), napi_quickjs_value_inner(env, fn_val));
 }
 
-// QuickJS passes the caller's realm as `ctx` for C function data (it does not
-// switch realms). The callback runs in the realm of the env that created the
-// function instead, as in V8 and Node.
-JSValue napi_function__::trampoline(JSContext *caller_ctx,
-                                    JSValueConst this_val,
-                                    int argc,
-                                    JSValueConst *argv,
-                                    int magic,
-                                    JSValue *func_data)
+namespace
+{
+// QuickJS passes the caller's realm as `ctx` for C function data: it does not
+// switch realms as it does for its own built-in functions. The callback runs
+// in the function's realm instead (`realm_ctx`, or the env's own when null),
+// as in V8, and N-API acts in that realm while it runs.
+JSValue invoke_callback(JSContext *caller_ctx,
+                        JSContext *realm_ctx,
+                        JSValueConst realm_anchor,
+                        JSValueConst this_val,
+                        int argc,
+                        JSValueConst *argv,
+                        int magic,
+                        JSValue *func_data)
 {
   auto env = napi_external__::get_env(func_data[0]);
   if (!napi_util__::check_env(env) || env->is_closing())
     return JS_ThrowReferenceError(caller_ctx, "Null NAPI env");
+  // Closes the scopes the callback leaves open once everything below is done.
+  napi_realm_frame_scope__ realm_frame{env, realm_ctx, realm_anchor};
   JSContext *ctx = env->context();
 
   auto cb_ptr = napi_external__::get_value(func_data[0]);
@@ -148,6 +155,28 @@ JSValue napi_function__::trampoline(JSContext *caller_ctx,
 
   return returned;
 }
+} // namespace
+
+JSValue napi_function__::trampoline(JSContext *caller_ctx,
+                                    JSValueConst this_val,
+                                    int argc,
+                                    JSValueConst *argv,
+                                    int magic,
+                                    JSValue *func_data)
+{
+  return invoke_callback(caller_ctx, nullptr, JS_UNDEFINED, this_val, argc, argv, magic, func_data);
+}
+
+JSValue napi_function__::realm_trampoline(JSContext *caller_ctx,
+                                          JSValueConst this_val,
+                                          int argc,
+                                          JSValueConst *argv,
+                                          int magic,
+                                          JSValue *func_data)
+{
+  auto *realm_ctx = static_cast<JSContext *>(napi_external__::get_value(func_data[3]));
+  return invoke_callback(caller_ctx, realm_ctx, func_data[2], this_val, argc, argv, magic, func_data);
+}
 
 napi_status napi_function__::make_constructible(napi_env env, JSValue fn)
 {
@@ -172,7 +201,19 @@ napi_status napi_function__::create(napi_env env,
   if (!napi_util__::check_env(env) || cb == nullptr || result == nullptr)
     return napi_util__::invalid_arg(env);
 
-  JSValue data_values[2];
+  // The function belongs to the current realm. One of another realm also
+  // holds that realm's anchor, which keeps the realm alive exactly as long as
+  // the function and lets the collector see the edge.
+  JSContext *ctx = env->context();
+  JSValueConst realm_anchor = env->current_realm_anchor();
+  const bool own_realm = JS_IsUndefined(realm_anchor);
+  JSValue data_values[4] = {JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
+  const int data_count = own_realm ? 2 : 4;
+  auto free_data = [&]()
+  {
+    for (JSValue &value : data_values)
+      JS_FreeValue(ctx, value);
+  };
   data_values[0] = env->wrap_external_data(reinterpret_cast<void *>(cb));
   if (JS_IsException(data_values[0]))
   {
@@ -181,13 +222,25 @@ napi_status napi_function__::create(napi_env env,
   data_values[1] = env->wrap_external_data(data);
   if (JS_IsException(data_values[1]))
   {
-    JS_FreeValue(env->context(), data_values[0]);
+    data_values[1] = JS_UNDEFINED;
+    free_data();
     return napi_util__::return_pending_if_caught(env, "Failed to create function data");
   }
+  if (!own_realm)
+  {
+    data_values[2] = JS_DupValue(ctx, realm_anchor);
+    data_values[3] = env->wrap_external_data(ctx);
+    if (JS_IsException(data_values[3]))
+    {
+      data_values[3] = JS_UNDEFINED;
+      free_data();
+      return napi_util__::return_pending_if_caught(env, "Failed to create function data");
+    }
+  }
 
-  JSValue fn = JS_NewCFunctionData(env->context(), trampoline, 0, magic, 2, data_values);
-  JS_FreeValue(env->context(), data_values[0]);
-  JS_FreeValue(env->context(), data_values[1]);
+  JSValue fn = JS_NewCFunctionData(ctx, own_realm ? trampoline : realm_trampoline, 0, magic,
+                                   data_count, data_values);
+  free_data();
 
   if (JS_IsException(fn))
     return napi_util__::return_pending_if_caught(env, "Failed to create function");
