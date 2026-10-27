@@ -474,6 +474,13 @@ bool HandleCallbackException(napi_env env) {
   return true;
 }
 
+// A promise settles in its own realm, the one it was made in.
+v8::Local<v8::Context> PromiseContext(napi_env env, v8::Local<v8::Promise::Resolver> resolver) {
+  v8::Local<v8::Context> context;
+  if (!resolver->GetCreationContext().ToLocal(&context)) context = env->main_context();
+  return context;
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
@@ -482,6 +489,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   napi_env env = payload->env;
+  // V8 already runs the callback in the function's creation context; N-API
+  // acts in that realm too, and closes the scopes the callback leaves open.
+  napi_realm_frame_scope__ realm_frame(env, payload->realm);
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
@@ -535,10 +545,12 @@ napi_handle_scope__::napi_handle_scope__(napi_env env)
 napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 
+// Finalizers run in the env's own realm.
 void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
   if (cb == nullptr) return;
   v8::HandleScope handle_scope(isolate);
-  v8::Context::Scope context_scope(context());
+  v8::Context::Scope context_scope(main_context());
+  napi_realm_frame_scope__ realm_frame(this, nullptr);
   cb(this, data, hint);
 }
 
@@ -564,6 +576,10 @@ void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
 
 void napi_env__::DrainFinalizerQueue() {
   finalization_scheduled = false;
+  if (pending_finalizers.empty() && pending_buffer_finalizers.empty()) return;
+  v8::HandleScope handle_scope(isolate);
+  v8::Context::Scope context_scope(main_context());
+  napi_realm_frame_scope__ realm_frame(this, nullptr);
   while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty()) {
     while (!pending_finalizers.empty()) {
       napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
@@ -636,6 +652,8 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 
 napi_env__::~napi_env__() {
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
+  // Every scope closes; cleanup hooks and finalizers run in the env's realm.
+  PopRealmFrames(0);
   RunEnvCleanupHooks(this);
   napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
   napi_ref_tracker__::FinalizeAll(&reflist);
@@ -655,7 +673,34 @@ napi_env__::~napi_env__() {
 }
 
 v8::Local<v8::Context> napi_env__::context() const {
+  unofficial_napi_realm__* realm = current_realm();
+  return realm != nullptr ? realm->context.Get(isolate) : context_ref.Get(isolate);
+}
+
+v8::Local<v8::Context> napi_env__::main_context() const {
   return context_ref.Get(isolate);
+}
+
+unofficial_napi_realm__* napi_env__::current_realm() const {
+  return realm_frames.empty() ? nullptr : realm_frames.back().realm;
+}
+
+size_t napi_env__::PushRealmFrame(unofficial_napi_realm__* realm) {
+  size_t depth = realm_frames.size();
+  realm_frames.emplace_back();
+  realm_frames.back().realm = realm;
+  return depth;
+}
+
+void napi_env__::PopRealmFrames(size_t depth) {
+  while (realm_frames.size() > depth) {
+    napi_realm_frame__& frame = realm_frames.back();
+    if (!frame.entered.IsEmpty()) {
+      v8::HandleScope handle_scope(isolate);
+      frame.entered.Get(isolate)->Exit();
+    }
+    realm_frames.pop_back();
+  }
 }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -1766,7 +1811,7 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (cb == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
-  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data);
+  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data, env->current_realm());
   if (payload == nullptr) return napi_generic_failure;
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
@@ -1811,7 +1856,8 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   }
 
   v8::Local<v8::Context> context = env->context();
-  auto* payload = env->allocate<napi_callback_payload__>(env, constructor, data);
+  auto* payload =
+      env->allocate<napi_callback_payload__>(env, constructor, data, env->current_realm());
   if (payload == nullptr) return napi_generic_failure;
 
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
@@ -2110,7 +2156,8 @@ napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
   }
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  if (!resolver->Resolve(env->context(), napi_v8_unwrap_value(resolution)).FromMaybe(false)) {
+  if (!resolver->Resolve(PromiseContext(env, resolver), napi_v8_unwrap_value(resolution))
+           .FromMaybe(false)) {
     return ReturnPendingIfCaught(env, tc, "Failed to resolve promise");
   }
   env->release(deferred);
@@ -2126,7 +2173,8 @@ napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
   }
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  if (!resolver->Reject(env->context(), napi_v8_unwrap_value(rejection)).FromMaybe(false)) {
+  if (!resolver->Reject(PromiseContext(env, resolver), napi_v8_unwrap_value(rejection))
+           .FromMaybe(false)) {
     return ReturnPendingIfCaught(env, tc, "Failed to reject promise");
   }
   env->release(deferred);
