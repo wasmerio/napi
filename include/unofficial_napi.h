@@ -246,11 +246,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_ar
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must
-// survive but the current env must stop executing JS immediately.
+// survive but the current env must stop executing JS immediately. The JS stack
+// unwinds without running catch or finally blocks, and calls into JS fail with
+// napi_pending_exception until the termination is cancelled. Any thread may
+// call this.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
 // Clears a previously requested engine termination on the current env. This is
 // used when embedder code intentionally stops a worker but still needs the
-// current JS stack to unwind normally.
+// current JS stack to unwind normally. Call it on the env's engine thread.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
