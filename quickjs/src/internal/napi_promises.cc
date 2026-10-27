@@ -79,6 +79,10 @@ void napi_promises__::call_function(JSValueConst function, int argc, JSValueCons
 {
   if (context_ == nullptr || !JS_IsFunction(context_, function))
     return;
+  // Hooks run from inside the engine and cannot report a failure, so a
+  // terminating env skips them rather than running more JS.
+  if (env_ != nullptr && env_->termination_requested())
+    return;
 
   JSValue global = JS_GetGlobalObject(context_);
   JSValue ret = JS_Call(context_, function, global, argc, argv);

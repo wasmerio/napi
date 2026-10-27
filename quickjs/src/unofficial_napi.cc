@@ -432,14 +432,43 @@ extern "C"
         return status;
     }
 
+    // Termination mirrors V8's TerminateExecution. While the flag is set the
+    // runtime's interrupt handler reports an interrupt, so running JS (a busy
+    // loop included) throws QuickJS's uncatchable "interrupted" error and
+    // unwinds without running catch or finally blocks. The provider also
+    // raises that error wherever native code and JS hand over: native
+    // callbacks, napi_call_function, napi_new_instance, script and module
+    // evaluation, and microtask checkpoints. Those calls return
+    // napi_pending_exception with the error as the pending exception.
     napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env)
     {
-        return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
+        // Any thread may call this (worker.terminate() does), so touch only
+        // the atomic flag.
+        if (env == nullptr)
+            return napi_invalid_arg;
+        env->request_termination();
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env)
     {
-        return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        env->cancel_termination();
+        // Drop a termination still pending in the runtime or the env, so the
+        // env can run its exit and cleanup callbacks. Other exceptions stay.
+        JSContext *ctx = napi_util__::context(env);
+        if (JS_HasException(ctx))
+        {
+            JSValue pending = JS_GetException(ctx);
+            if (JS_IsUncatchableError(pending))
+                JS_FreeValue(ctx, pending);
+            else
+                JS_Throw(ctx, pending);
+        }
+        if (env->last_exception_is_uncatchable())
+            env->clear_last_exception();
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_request_interrupt(

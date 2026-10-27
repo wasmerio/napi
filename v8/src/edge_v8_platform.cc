@@ -220,23 +220,25 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
     if (enqueue != nullptr && target != nullptr) {
       ForegroundTaskRecord* record = new (std::nothrow) ForegroundTaskRecord();
       if (record != nullptr) {
-        record->isolate_state.reset();
+        // The hook owns the record from the moment it is called, whatever it
+        // returns (see unofficial_napi_enqueue_foreground_task_callback): it
+        // may refuse and release the record, or have another thread run and
+        // release it, before the call returns. So the record is complete,
+        // including the pending-task count its cleanup gives back, before it
+        // is handed over, and it is never touched afterwards. A refused task
+        // is dropped rather than rerouted; V8 tolerates dropped foreground
+        // tasks.
         record->task = std::move(task);
-        if (enqueue(target,
-                    RunForegroundTaskRecord,
-                    record,
-                    CleanupForegroundTaskRecord,
-                    delay_ms) == napi_ok) {
-          if (isolate_state != nullptr &&
-              isolate_state->platform != nullptr) {
-            isolate_state->platform->AddPendingForegroundTask(isolate_state);
-            record->isolate_state = isolate_state;
-          }
-          return;
+        if (isolate_state != nullptr && isolate_state->platform != nullptr) {
+          isolate_state->platform->AddPendingForegroundTask(isolate_state);
+          record->isolate_state = isolate_state;
         }
-        task = std::move(record->task);
-        record->isolate_state.reset();
-        delete record;
+        (void)enqueue(target,
+                      RunForegroundTaskRecord,
+                      record,
+                      CleanupForegroundTaskRecord,
+                      delay_ms);
+        return;
       }
     }
 
@@ -510,8 +512,8 @@ void EdgeV8Platform::ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env en
   state->runner->ClearTarget(env);
 }
 
-void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
-  if (fallback_ == nullptr || isolate == nullptr) return;
+bool EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
+  if (fallback_ == nullptr || isolate == nullptr) return false;
   // ForegroundTaskRunner::PostTaskCommon forwards to the guest's bound
   // enqueue callback when one is set, but falls back to fallback_'s own
   // GetForegroundTaskRunner() when no guest target is bound (e.g. the guest
@@ -519,9 +521,10 @@ void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   // calls BindForegroundTaskTarget). Nothing else pumps that fallback
   // runner's queue, so tasks routed there -- including V8-internal work like
   // Heap::PostFinalizationRegistryCleanupTaskIfNeeded's cleanup task -- would
-  // otherwise be posted and never run. Drain it explicitly.
-  while (v8::platform::PumpMessageLoop(fallback_.get(), isolate)) {
-  }
+  // otherwise be posted and never run. Admit one task per checkpoint so
+  // self-rescheduling GC work cannot monopolize the guest's event-loop turn.
+  // The caller reports progress to keep the loop runnable for the next task.
+  return v8::platform::PumpMessageLoop(fallback_.get(), isolate);
 }
 
 int EdgeV8Platform::NumberOfWorkerThreads() {

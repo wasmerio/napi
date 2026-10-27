@@ -19,6 +19,7 @@
 #include "napi_error_state.h"
 #include "napi_periodic_gate.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -27,6 +28,7 @@
 #include <quickjs.h>
 
 struct napi_external_backing_store_hint__;
+struct napi_runtime_interrupts__;
 
 // One realm (JSContext) of an agent. The context never changes.
 struct napi_env__
@@ -89,9 +91,16 @@ struct napi_env__
   napi_status clear_last_error();
 
   bool has_last_exception() const;
+  bool last_exception_is_uncatchable() const;
   void clear_last_exception();
   void set_last_exception(JSValue exception);
   JSValue take_last_exception();
+
+  // unofficial_napi_terminate_execution state. Any thread may request
+  // termination; everything else runs on the env's engine thread.
+  void request_termination();
+  void cancel_termination();
+  bool termination_requested() const;
 
   void *instance_data() const;
   void set_instance_data(void *data, napi_finalize finalize_cb, void *finalize_hint);
@@ -133,6 +142,11 @@ private:
 
   // Last native error state.
   napi::error_state__ error_state_;
+
+  // Termination. QuickJS polls one interrupt handler per runtime, so the
+  // handler lives in a record shared by every env on this env's runtime.
+  std::atomic<bool> termination_requested_{false};
+  napi_runtime_interrupts__ *runtime_interrupts_ = nullptr;
 
   // Instance data finalizer.
   void *instance_data_ = nullptr;

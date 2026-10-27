@@ -321,7 +321,36 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_67_terminate_execution
+  runners/test_67_terminate_execution.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_68_napi_calls_keep_termination
+  runners/test_68_napi_calls_keep_termination.cc
+)
+if(_napi_test_engine STREQUAL "v8")
+  # Only the V8 provider posts engine tasks through the enqueue hook.
+  add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
+    runners/test_66_foreground_task_handoff.cc
+  )
+endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
 )
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_checkpoint_test src/v8_foreground_checkpoint_test.cc)
+  target_include_directories(napi_v8_foreground_checkpoint_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_checkpoint_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_checkpoint_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_checkpoint_fairness
+    COMMAND napi_v8_foreground_checkpoint_test)
+endif()

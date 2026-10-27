@@ -66,6 +66,25 @@ typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
                                                          void* data);
 typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
                                                         void* data);
+// Embedder hook that queues provider work (engine tasks, finalizer drains) to
+// run on the env's thread. The provider may call it from any thread, including
+// from the middle of a garbage collection. Each call hands over one task:
+//
+// - The hook owns `data` from the moment it is called, whatever it returns.
+//   The provider never touches `data` after handing it over, so the hook may
+//   run or release the task, on any thread, before the call has returned.
+// - The hook never runs `callback` from inside the call. It runs
+//   `callback(env, data)` at most once, later, on the env's thread, no sooner
+//   than `delay_millis` from now.
+// - When `cleanup` is not NULL, the hook calls `cleanup(env, data)` exactly
+//   once, as the last use of `data`: right after `callback` returns, or
+//   instead of it when the task is dropped (refused, or discarded when the env
+//   shuts down). This holds when the hook returns an error, too. `cleanup` may
+//   be called from any thread, including from inside the call.
+// - The hook returns napi_ok when the task may still run, and an error only
+//   when `callback` will never run.
+//
+// The provider does not retry or reroute a refused task; it is dropped.
 typedef napi_status (*unofficial_napi_enqueue_foreground_task_callback)(
     void* target,
     unofficial_napi_foreground_task_callback callback,
@@ -141,11 +160,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace
     napi_value callback);
 
 typedef enum unofficial_napi_event_loop_checkpoint_mode {
-  // Drain promise/microtask work without admitting a host task turn.
+  // Drain promise/microtask work without suspending for a host task turn. A
+  // synchronous provider still reports a provider task it ran (see
+  // unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted).
   unofficial_napi_event_loop_checkpoint_microtasks = 0,
   // Admit a host task turn as well as draining engine work. Host-JavaScript
   // providers suspend through JSPI. Synchronous providers report that no host
-  // task was admitted so the runtime can wait on its native event source.
+  // task was admitted, unless the checkpoint ran a provider task (see
+  // unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted), so the
+  // runtime can wait on its native event source.
   unofficial_napi_event_loop_checkpoint_host_tasks = 1,
 } unofficial_napi_event_loop_checkpoint_mode;
 
@@ -153,8 +176,19 @@ typedef enum unofficial_napi_event_loop_checkpoint_state {
   unofficial_napi_event_loop_checkpoint_state_none = 0,
   // The provider still owns work which can make JavaScript runnable.
   unofficial_napi_event_loop_checkpoint_state_pending_provider_work = 1 << 0,
-  // The checkpoint admitted a host task turn. When this bit is absent, the
-  // runtime remains responsible for waiting on its native event source.
+  // The checkpoint admitted a host task turn, so the runtime starts its next
+  // loop turn without waiting on its native event source.
+  //
+  // - Host-JavaScript providers set it after suspending through JSPI.
+  // - Synchronous providers set it, together with
+  //   unofficial_napi_event_loop_checkpoint_state_pending_provider_work, when
+  //   the checkpoint ran a provider task (for example a V8 foreground task),
+  //   in either mode. They run at most one such task per checkpoint, because
+  //   a task may queue its successor, so the event loop gets a turn between
+  //   them. A checkpoint that runs no task leaves the bit unset.
+  //
+  // When this bit is absent, the runtime remains responsible for waiting on
+  // its native event source.
   unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted = 1 << 1,
 } unofficial_napi_event_loop_checkpoint_state;
 
@@ -212,11 +246,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_ar
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must
-// survive but the current env must stop executing JS immediately.
+// survive but the current env must stop executing JS immediately. The JS stack
+// unwinds without running catch or finally blocks, and calls into JS fail with
+// napi_pending_exception until the termination is cancelled. Any thread may
+// call this.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
 // Clears a previously requested engine termination on the current env. This is
 // used when embedder code intentionally stops a worker but still needs the
-// current JS stack to unwind normally.
+// current JS stack to unwind normally. Call it on the env's engine thread.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);

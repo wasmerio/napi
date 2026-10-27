@@ -764,6 +764,9 @@ namespace quickjs::detail
         if (bytecode_record != nullptr &&
             bytecode_record->shape != unofficial_napi_bytecode_shape_script)
             return napi_invalid_arg;
+        napi_status terminating = napi_util__::fail_if_terminating(env_, ctx_);
+        if (terminating != napi_ok)
+            return terminating;
         env_->module_wrap().register_dynamic_import_referrer(filename, host_defined_option_id);
         context_record *record = nullptr;
         if (sandbox_or_null != nullptr && !JS_IsNull(napi_quickjs_value_inner(env_, sandbox_or_null)))

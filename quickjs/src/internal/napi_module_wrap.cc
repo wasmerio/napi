@@ -692,6 +692,26 @@ napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
   return napi_ok;
 }
 
+napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValue *promise_out)
+{
+  napi_status status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+    return status;
+  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
+  if (JS_IsException(promise))
+    return return_pending_exception("Failed to evaluate module");
+  // QuickJS settles an interrupted evaluation as a rejected promise. Report
+  // it as a failed call instead, as V8 does for a terminated evaluation.
+  if (env_->termination_requested())
+  {
+    JS_PromiseMarkAsHandled(ctx_, promise);
+    JS_FreeValue(ctx_, promise);
+    return napi_util__::fail_if_terminating(env_, ctx_);
+  }
+  *promise_out = promise;
+  return napi_ok;
+}
+
 napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
                                          int64_t timeout,
                                          bool break_on_sigint,
@@ -702,9 +722,10 @@ napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
-  if (JS_IsException(promise))
-    return return_pending_exception("Failed to evaluate module");
+  JSValue promise = JS_UNDEFINED;
+  napi_status status = evaluate_unless_terminated(entry, &promise);
+  if (status != napi_ok)
+    return status;
   return wrap_owned(promise, result_out);
 }
 
@@ -719,9 +740,10 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
-  if (JS_IsException(promise))
-    return return_pending_exception("Failed to evaluate module");
+  JSValue promise = JS_UNDEFINED;
+  napi_status status = evaluate_unless_terminated(entry, &promise);
+  if (status != napi_ok)
+    return status;
 
   JSPromiseStateEnum state = JS_PromiseState(ctx_, promise);
   if (state == JS_PROMISE_FULFILLED)
