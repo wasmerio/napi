@@ -298,6 +298,15 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_realm(env: SnapiEnv, value_id: u32, realm_out: *mut u32)
         -> i32;
+    // Makes the realm `realm_id` (0: the env's own) current until
+    // snapi_bridge_unofficial_leave_realm closes the scope written to
+    // `scope_out`, as unofficial_napi_enter_realm does.
+    pub fn snapi_bridge_unofficial_enter_realm(
+        env: SnapiEnv,
+        realm_id: u32,
+        scope_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_leave_realm(env: SnapiEnv, scope: u64) -> i32;
     pub fn snapi_bridge_unofficial_run_script(
         env: SnapiEnv,
         realm_id: u32,

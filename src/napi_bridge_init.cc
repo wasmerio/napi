@@ -3853,6 +3853,29 @@ extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
   return napi_ok;
 }
 
+// The scope token is the provider's; the bridge keeps no scope table.
+extern "C" int snapi_bridge_unofficial_enter_realm(SnapiEnvState* env_state,
+                                                   uint32_t realm_id,
+                                                   uint64_t* scope_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || scope_out == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  unofficial_napi_realm realm = nullptr;
+  if (!ResolveRealm(*bridge_state, realm_id, &realm)) return napi_invalid_arg;
+  unofficial_napi_realm_scope scope = 0;
+  napi_status s = unofficial_napi_enter_realm(bridge_state->env, realm, &scope);
+  if (s != napi_ok) return s;
+  *scope_out = scope;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_leave_realm(SnapiEnvState* env_state, uint64_t scope) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  return unofficial_napi_leave_realm(bridge_state->env, scope);
+}
+
 extern "C" int snapi_bridge_unofficial_run_script(
     SnapiEnvState* env_state,
     uint32_t realm_id,
