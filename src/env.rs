@@ -24,9 +24,11 @@ use crate::snapi::{
     snapi_bridge_unofficial_set_value_limit,
 };
 
-/// The status the bridge returns when it refuses to release an env: a call
-/// from a thread other than the env's owner, or a release already under way.
-/// Any other status means the env was torn down.
+/// The status the bridge returns when it refuses to release an env. Natively:
+/// a call from a thread other than the env's owner, a release already under
+/// way, or a call from guest code the env called into. In host-JS, whose envs
+/// share one JavaScript realm: a call while any guest code runs. Any other
+/// status means the env was torn down.
 pub(crate) const RELEASE_REFUSED: i32 = 1;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -534,15 +536,19 @@ impl NapiEnv {
     /// Completes unregistration once the bridge release returned `status`.
     ///
     /// If the bridge refused the release ([`RELEASE_REFUSED`]: the caller is
-    /// not the env's owner thread, or a release is already under way), the
-    /// isolate still exists. Its heap charge, isolate slot and near-heap-limit
-    /// tracker are then kept, so the budget stays honest and the callback never
-    /// sees freed memory; an outer release in progress finishes the job.
+    /// not the env's owner thread, a release is already under way, or guest
+    /// code the env called into is running), the isolate still exists. Its
+    /// heap charge, isolate slot and near-heap-limit tracker are then kept, so
+    /// the budget stays honest and the callback never sees freed memory; an
+    /// outer release in progress finishes the job. The guest release import
+    /// asks the bridge first, so this only happens for other callers, such as
+    /// a store dropped on another thread.
     pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv, status: i32) {
         if status == RELEASE_REFUSED {
             eprintln!(
-                "[napi] N-API environment {env_id} was not released (wrong thread or \
-                 already releasing); its isolate and budget charge are kept"
+                "[napi] N-API environment {env_id} was not released (wrong thread, \
+                 already releasing or inside its own guest call); its isolate and \
+                 budget charge are kept"
             );
             return;
         }
@@ -592,6 +598,12 @@ impl NapiEnv {
         let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
         self.finish_unregister_napi_env(env_id, env, 0);
         Some(env)
+    }
+
+    /// The env an owner scope id stands for, if the scope is registered.
+    pub(crate) fn napi_scope_env(&self, scope_id: u32) -> Option<SnapiEnv> {
+        let env_id = self.napi_scopes.get(&scope_id)?;
+        self.napi_envs.get(env_id).map(|env| *env as SnapiEnv)
     }
 
     pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> SnapiEnv {
