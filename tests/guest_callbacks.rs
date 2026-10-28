@@ -1,7 +1,7 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
 //! bridge and V8: nested callbacks, scopes a callback leaves open, argument
-//! counts around the bridge's inline buffers, and envs created one after
-//! another on one thread.
+//! counts, missing arguments, and envs created one after another on one
+//! thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -36,12 +36,13 @@ const WAT: &str = r#"(module
   (import "napi" "napi_open_escapable_handle_scope"
     (func $open_esc (param i32 i32) (result i32)))
   (import "napi" "napi_escape_handle" (func $escape (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_typeof" (func $typeof (param i32 i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
   ;; 72 int out, 200..228 scratch. Callbacks take 64- or 256-byte frames from
   ;; a stack starting at 32768 so nested calls keep their own out-slots.
   (memory (export "memory") 2)
-  (table (export "__indirect_function_table") 8 funcref)
+  (table (export "__indirect_function_table") 16 funcref)
   (global $env (mut i32) (i32.const 0))
   (global $scope (mut i32) (i32.const 0))
   (global $sp (mut i32) (i32.const 32768))
@@ -53,6 +54,7 @@ const WAT: &str = r#"(module
   (data (i32.const 124) "stale\00")
   (data (i32.const 132) "probe\00")
   (data (i32.const 156) "many16\00")
+  (data (i32.const 164) "undef\00")
 
   ;; Records the first failing step; the host reads it through `err`.
   (func $fail (param $code i32)
@@ -78,7 +80,8 @@ const WAT: &str = r#"(module
     (call $define (i32.const 116) (i32.const 3))
     (call $define (i32.const 124) (i32.const 4))
     (call $define (i32.const 132) (i32.const 5))
-    (call $define (i32.const 156) (i32.const 6)))
+    (call $define (i32.const 156) (i32.const 6))
+    (call $define (i32.const 164) (i32.const 7)))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -235,7 +238,37 @@ const WAT: &str = r#"(module
     (if (call $create_int32 (local.get $env) (i32.load (i32.const 212)) (i32.const 228))
       (then (call $fail (i32.const 53))))
     (i32.load (i32.const 228)))
-  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16)
+
+  ;; undef(x): asks for 4 arguments into slots prefilled with -1. Returns
+  ;; argc * 100 + the napi_valuetype of argv[1] * 10 + that of argv[3], or
+  ;; -1 if either slot is not a valid value.
+  (func $undef (param $env i32) (param $info i32) (result i32)
+    (local $t1 i32) (local $t3 i32)
+    (i32.store (i32.const 400) (i32.const 4))
+    (i32.store (i32.const 404) (i32.const -1))
+    (i32.store (i32.const 408) (i32.const -1))
+    (i32.store (i32.const 412) (i32.const -1))
+    (i32.store (i32.const 416) (i32.const -1))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 400) (i32.const 404)
+          (i32.const 0) (i32.const 0))
+      (then (call $fail (i32.const 81))))
+    (local.set $t1 (i32.const -1))
+    (local.set $t3 (i32.const -1))
+    (if (i32.eqz (call $typeof (local.get $env) (i32.load (i32.const 408)) (i32.const 420)))
+      (then (local.set $t1 (i32.load (i32.const 420)))))
+    (if (i32.eqz (call $typeof (local.get $env) (i32.load (i32.const 416)) (i32.const 420)))
+      (then (local.set $t3 (i32.load (i32.const 420)))))
+    (if (call $create_int32 (local.get $env)
+          (select
+            (i32.add (i32.mul (i32.load (i32.const 400)) (i32.const 100))
+              (i32.add (i32.mul (local.get $t1) (i32.const 10)) (local.get $t3)))
+            (i32.const -1)
+            (i32.and (i32.ge_s (local.get $t1) (i32.const 0)) (i32.ge_s (local.get $t3) (i32.const 0))))
+          (i32.const 424))
+      (then (call $fail (i32.const 82))))
+    (i32.load (i32.const 424)))
+
+  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef)
 )"#;
 
 struct Guest {
@@ -347,6 +380,17 @@ fn nested_callbacks_scopes_and_arguments() {
     let (ctx, engine, module) = setup();
     let mut guest = Guest::new(&ctx, &engine, &module);
     assert_eq!(guest.eval(ROUNDS), (0, 300, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Asking for more arguments than were passed reports the actual count and
+/// fills the extra slots with undefined (`napi_undefined` is 0).
+#[test]
+fn missing_arguments_are_undefined() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    assert_eq!(guest.eval("undef(1)"), (0, 100, 0));
+    assert_eq!(guest.eval("undef()"), (0, 0, 0));
     assert_eq!(guest.release(), 0);
 }
 

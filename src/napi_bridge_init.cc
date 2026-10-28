@@ -2841,10 +2841,17 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
   }
   if (data_out) *data_out = data_val;
 
-  const uint32_t to_copy = static_cast<uint32_t>(std::min<size_t>(wanted, actual));
   if (argv_out != nullptr) {
-    for (uint32_t i = 0; i < to_copy; i++) {
-      argv_out[i] = StoreValue(*bridge_state, argv[i]);
+    // Slots past the actual arguments hold undefined (the engine filled
+    // them); one id serves them all.
+    uint32_t undefined_id = 0;
+    for (size_t i = 0; i < wanted; i++) {
+      if (i < actual) {
+        argv_out[i] = StoreValue(*bridge_state, argv[i]);
+      } else {
+        if (undefined_id == 0) undefined_id = StoreValue(*bridge_state, argv[i]);
+        argv_out[i] = undefined_id;
+      }
     }
   }
   return napi_ok;

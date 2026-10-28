@@ -3341,14 +3341,14 @@ fn guest_napi_get_cb_info(
         write_guest_u32(&mut env, argc_ptr, actual_argc);
     }
 
-    // Write argv (array of handle IDs) - only write up to min(wanted, actual)
+    // Write all `wanted` argv entries: those past the actual count are
+    // undefined.
     if argv_ptr != 0 {
-        let to_write = std::cmp::min(wanted, actual_argc);
         // The argv entries written must lie below 4 GiB.
-        if u64::from(argv_ptr) + u64::from(to_write) * 4 > 1u64 << 32 {
+        if u64::from(argv_ptr) + u64::from(wanted) * 4 > 1u64 << 32 {
             return 1;
         }
-        write_guest_pod_slice(&mut env, argv_ptr, &argv_ids[..to_write as usize]);
+        write_guest_pod_slice(&mut env, argv_ptr, &argv_ids);
     }
 
     // Write this_arg
