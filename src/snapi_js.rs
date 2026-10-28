@@ -3828,18 +3828,27 @@ pub unsafe extern "C" fn snapi_bridge_get_cb_info(
     } else {
         unsafe { argc.read() }.min(max)
     };
-    let n = (info.args.len() as u32).min(requested);
+    let actual = info.args.len() as u32;
+    let n = actual.min(requested);
+    let (this_value, data_value) = (info.this_value, info.data);
     if !argv.is_null() {
         unsafe { ptr::copy_nonoverlapping(info.args.as_ptr(), argv, n as usize) }
+        // Slots past the actual arguments hold undefined; one id serves them all.
+        if n < requested {
+            let undefined = s.agent.insert_primitive(JsValue::UNDEFINED);
+            for i in n..requested {
+                unsafe { argv.add(i as usize).write(undefined) }
+            }
+        }
     }
     if !argc.is_null() {
-        unsafe { argc.write(n) }
+        unsafe { argc.write(actual) }
     }
     if !this_out.is_null() {
-        unsafe { this_out.write(info.this_value) }
+        unsafe { this_out.write(this_value) }
     }
     if !data.is_null() {
-        unsafe { data.write(info.data) }
+        unsafe { data.write(data_value) }
     }
     NAPI_OK
 }
@@ -7117,6 +7126,60 @@ mod tests {
                 unsafe { snapi_bridge_get_new_target(env, 9, &mut out) },
                 NAPI_INVALID_ARG
             );
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn get_cb_info_reports_the_actual_count_and_undefined_for_missing_arguments() {
+        with_env(|env, state| {
+            let first = state.agent.insert(Object::new().into());
+            let second = state.agent.insert(Object::new().into());
+            for (id, args) in [(7, vec![first]), (8, vec![first, second])] {
+                state.agent.callback_infos.insert(
+                    id,
+                    CallbackInfo {
+                        args,
+                        this_value: 0,
+                        new_target: 0,
+                        data: 0,
+                    },
+                );
+            }
+            // More slots than arguments: the rest are undefined.
+            let (mut argc, mut argv) = (3u32, [u32::MAX; 3]);
+            let status = unsafe {
+                snapi_bridge_get_cb_info(
+                    env,
+                    7,
+                    &mut argc,
+                    argv.as_mut_ptr(),
+                    3,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, NAPI_OK);
+            assert_eq!(argc, 1);
+            assert_eq!(argv[0], first);
+            for id in &argv[1..] {
+                assert!(state.agent.get(*id).is_some_and(JsValue::is_undefined));
+            }
+            // Fewer slots than arguments: argc is still the actual count.
+            let (mut argc, mut argv) = (1u32, [u32::MAX; 1]);
+            let status = unsafe {
+                snapi_bridge_get_cb_info(
+                    env,
+                    8,
+                    &mut argc,
+                    argv.as_mut_ptr(),
+                    1,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, NAPI_OK);
+            assert_eq!(argc, 2);
+            assert_eq!(argv[0], first);
         });
     }
 
