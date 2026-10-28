@@ -2030,6 +2030,18 @@ impl HostJsAgent {
 
 thread_local! {
     static BUFFER_ALLOCS: RefCell<IdHashMap<usize, Box<[u8]>>> = RefCell::new(IdHashMap::default());
+    // Guest code running on this thread, called into by any env. All envs
+    // share one JavaScript realm, so guest code reached through one env can
+    // reach the others, whose bridge calls may be on the stack below it.
+    static GUEST_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs guest code, counted in `GUEST_CALL_DEPTH` meanwhile.
+pub(crate) fn call_guest<R>(call: impl FnOnce() -> R) -> R {
+    GUEST_CALL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = call();
+    GUEST_CALL_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -2492,6 +2504,11 @@ unsafe fn free_env(env: SnapiEnv) {
 /// first, newest first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32 {
+    // Guest code is running: bridge calls below it may still use this env or
+    // the realm envs released with it.
+    if unsafe { snapi_bridge_unofficial_env_release_refused(env) } != 0 {
+        return NAPI_INVALID_ARG;
+    }
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2654,6 +2671,13 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_realm(
     };
     unsafe { realm_out.write(realm) };
     NAPI_OK
+}
+
+/// Nonzero while guest code runs on this thread, called into by any env:
+/// releasing an env is refused meanwhile (see `GUEST_CALL_DEPTH`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_env_release_refused(_env: SnapiEnv) -> i32 {
+    i32::from(GUEST_CALL_DEPTH.with(Cell::get) != 0)
 }
 
 #[unsafe(no_mangle)]
@@ -3771,13 +3795,15 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
             (record, state.agent.active_callback_ctx, value_frame)
         };
         let result = unsafe {
-            snapi_host_invoke_wasm_finalizer(
-                callback_ctx,
-                record.guest_env,
-                record.wasm_fn_ptr,
-                record.data,
-                record.hint,
-            )
+            call_guest(|| {
+                snapi_host_invoke_wasm_finalizer(
+                    callback_ctx,
+                    record.guest_env,
+                    record.wasm_fn_ptr,
+                    record.data,
+                    record.hint,
+                )
+            })
         };
         let Ok(state) = (unsafe { env_mut(env) }) else {
             return NAPI_INVALID_ARG;
@@ -3910,12 +3936,14 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                 ));
             }
             let result = unsafe {
-                snapi_host_invoke_wasm_callback(
-                    callback_ctx,
-                    registration.guest_env,
-                    registration.wasm_fn_ptr,
-                    cb,
-                )
+                call_guest(|| {
+                    snapi_host_invoke_wasm_callback(
+                        callback_ctx,
+                        registration.guest_env,
+                        registration.wasm_fn_ptr,
+                        cb,
+                    )
+                })
             };
             if result == CALLBACK_DEFERRED {
                 let resolve_slot = Rc::new(RefCell::new(None));
@@ -3990,12 +4018,14 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
         };
 
         let result = unsafe {
-            snapi_host_invoke_wasm_callback(
-                callback_ctx,
-                pending.registration.guest_env,
-                pending.registration.wasm_fn_ptr,
-                pending.cbinfo,
-            )
+            call_guest(|| {
+                snapi_host_invoke_wasm_callback(
+                    callback_ctx,
+                    pending.registration.guest_env,
+                    pending.registration.wasm_fn_ptr,
+                    pending.cbinfo,
+                )
+            })
         };
         if result == CALLBACK_DEFERRED {
             let Ok(state) = (unsafe { env_mut(env) }) else {
@@ -4115,18 +4145,27 @@ pub unsafe extern "C" fn snapi_bridge_get_cb_info(
     } else {
         unsafe { argc.read() }.min(max)
     };
-    let n = (info.args.len() as u32).min(requested);
+    let actual = info.args.len() as u32;
+    let n = actual.min(requested);
+    let (this_value, data_value) = (info.this_value, info.data);
     if !argv.is_null() {
         unsafe { ptr::copy_nonoverlapping(info.args.as_ptr(), argv, n as usize) }
+        // Slots past the actual arguments hold undefined; one id serves them all.
+        if n < requested {
+            let undefined = s.agent.insert_primitive(JsValue::UNDEFINED);
+            for i in n..requested {
+                unsafe { argv.add(i as usize).write(undefined) }
+            }
+        }
     }
     if !argc.is_null() {
-        unsafe { argc.write(n) }
+        unsafe { argc.write(actual) }
     }
     if !this_out.is_null() {
-        unsafe { this_out.write(info.this_value) }
+        unsafe { this_out.write(this_value) }
     }
     if !data.is_null() {
-        unsafe { data.write(info.data) }
+        unsafe { data.write(data_value) }
     }
     NAPI_OK
 }
@@ -7417,6 +7456,80 @@ mod tests {
                 NAPI_INVALID_ARG
             );
         });
+    }
+
+    #[wasm_bindgen_test]
+    fn get_cb_info_reports_the_actual_count_and_undefined_for_missing_arguments() {
+        with_env(|env, state| {
+            let first = state.agent.insert(Object::new().into());
+            let second = state.agent.insert(Object::new().into());
+            for (id, args) in [(7, vec![first]), (8, vec![first, second])] {
+                state.agent.callback_infos.insert(
+                    id,
+                    CallbackInfo {
+                        args,
+                        this_value: 0,
+                        new_target: 0,
+                        data: 0,
+                    },
+                );
+            }
+            // More slots than arguments: the rest are undefined.
+            let (mut argc, mut argv) = (3u32, [u32::MAX; 3]);
+            let status = unsafe {
+                snapi_bridge_get_cb_info(
+                    env,
+                    7,
+                    &mut argc,
+                    argv.as_mut_ptr(),
+                    3,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, NAPI_OK);
+            assert_eq!(argc, 1);
+            assert_eq!(argv[0], first);
+            for id in &argv[1..] {
+                assert!(state.agent.get(*id).is_some_and(JsValue::is_undefined));
+            }
+            // Fewer slots than arguments: argc is still the actual count.
+            let (mut argc, mut argv) = (1u32, [u32::MAX; 1]);
+            let status = unsafe {
+                snapi_bridge_get_cb_info(
+                    env,
+                    8,
+                    &mut argc,
+                    argv.as_mut_ptr(),
+                    1,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, NAPI_OK);
+            assert_eq!(argc, 2);
+            assert_eq!(argv[0], first);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn release_is_refused_while_guest_code_runs() {
+        // Envs share one realm, so guest code reached through one env can
+        // release the other: both are refused while it runs.
+        let new_env = || Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
+        let (first, second) = (new_env(), new_env());
+        unsafe {
+            assert_eq!(snapi_bridge_unofficial_env_release_refused(first), 0);
+            call_guest(|| {
+                for env in [first, second] {
+                    assert_eq!(snapi_bridge_unofficial_env_release_refused(env), 1);
+                    assert_eq!(snapi_bridge_unofficial_release_env(env), NAPI_INVALID_ARG);
+                }
+            });
+            assert_eq!(snapi_bridge_unofficial_env_release_refused(first), 0);
+            assert_eq!(snapi_bridge_unofficial_release_env(first), NAPI_OK);
+            assert_eq!(snapi_bridge_unofficial_release_env(second), NAPI_OK);
+        }
     }
 
     #[wasm_bindgen_test]

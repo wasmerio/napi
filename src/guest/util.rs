@@ -60,6 +60,18 @@ pub fn read_guest_bytes(
     Some(out)
 }
 
+/// Reads a little-endian u32 from guest memory without allocating.
+pub fn read_guest_u32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<u32> {
+    let (state, store) = env.data_and_store_mut();
+    let memory = state.memory.clone()?;
+    let mut bytes = [0u8; 4];
+    memory
+        .view(&store)
+        .read(guest_ptr as u64, &mut bytes)
+        .ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
 /// Live size of the guest's linear memory in bytes, or 0 if it has none. Used
 /// to bound host allocations sized by a guest-supplied length: a guest can
 /// never reference more than its own memory holds.

@@ -435,7 +435,10 @@ pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize)
         let allocation_len = u32::try_from(required_capacity).ok()?;
         let guest_ptr: u32 = {
             let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, allocation_len as i32) {
+            // Guest code: releasing an env from inside it is refused.
+            match crate::snapi_js::call_guest(|| {
+                malloc_fn.call(&mut store_ref, allocation_len as i32)
+            }) {
                 Ok(ptr) => ptr as u32,
                 Err(error) => {
                     eprintln!(

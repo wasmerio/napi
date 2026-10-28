@@ -400,6 +400,48 @@ fn bridge_call_throughput() {
     }
 }
 
+/// Guest code an env called into runs on top of that env's engine frames,
+/// which still use it once the guest code returns. Releasing the env from a
+/// JavaScript call into the guest, an interrupt callback or a finalizer is
+/// refused, and the env keeps working and can be released afterwards.
+#[test]
+fn an_env_is_not_released_from_guest_code_it_called_into() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let (signal_tx, _signal_rx) = mpsc::channel();
+
+    let mut guest = Guest::new(&ctx, &engine, &module, signal_tx.clone());
+    guest.create();
+    assert_eq!(guest.eval("release_self()"), 0);
+    assert_eq!(guest.release_status(), NAPI_INVALID_ARG);
+    assert_eq!(guest.number("6 * 7"), 42);
+    assert_eq!(guest.release(), 0);
+
+    let mut guest = Guest::new(&ctx, &engine, &module, signal_tx.clone());
+    let env = guest.create();
+    assert_eq!(guest.interrupt_release(env), 0);
+    // The interrupt runs at the next stack check of this loop.
+    assert_eq!(guest.eval("for (let i = 0; i < 1e7; i++) {}"), 0);
+    assert_eq!(guest.release_status(), NAPI_INVALID_ARG);
+    assert_eq!(guest.number("6 * 7"), 42);
+    assert_eq!(guest.release(), 0);
+
+    let mut guest = Guest::new(&ctx, &engine, &module, signal_tx);
+    guest.create();
+    assert_eq!(guest.eval("for (let i = 0; i < 256; i++) attach({});"), 0);
+    // Finalizers run after a collection, at a later checkpoint.
+    for _ in 0..8 {
+        if guest.release_status() != -1 {
+            break;
+        }
+        assert_eq!(guest.collect(), 0);
+        assert_eq!(guest.checkpoint(), 0);
+    }
+    assert_eq!(guest.release_status(), NAPI_INVALID_ARG);
+    assert_eq!(guest.number("6 * 7"), 42);
+    assert_eq!(guest.release(), 0);
+}
+
 /// An isolate and its persistent scopes belong to the thread that created
 /// them. Another thread holding the raw bridge handle may stop it, but every
 /// ordinary call, release and dispose has to be refused rather than touching
