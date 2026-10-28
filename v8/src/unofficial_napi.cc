@@ -585,8 +585,17 @@ v8::IsolateGroup GetOrCreateIsolateGroup() {
   return v8::IsolateGroup::GetDefault();
 }
 
+// EdgeV8Platform keys per-isolate state by address. Envs on different threads
+// may create and release isolates at the same time, so a new isolate must not
+// be allocated (possibly at a just-freed address) and registered while another
+// isolate is between Dispose() and unregistration. Only construction and V8
+// disposal take this lock: not execution, env teardown or the wait for the
+// platform's pending tasks.
+std::mutex g_isolate_lifecycle_mu;
+
 v8::Isolate* CreateIsolateForEnv(EdgeV8Platform* platform,
                                  const v8::Isolate::CreateParams& params) {
+  std::lock_guard<std::mutex> lock(g_isolate_lifecycle_mu);
   v8::Isolate* isolate = v8::Isolate::Allocate(GetOrCreateIsolateGroup());
   if (isolate == nullptr) return nullptr;
   if (platform != nullptr && !platform->RegisterIsolate(isolate)) {
@@ -628,13 +637,16 @@ void DisposeIsolateAndWait(EdgeV8Platform* platform,
   if (isolate == nullptr) return;
 
   PlatformShutdownWaiter waiter;
-  if (platform != nullptr) {
-    platform->AddIsolateFinishedCallback(
-        isolate, OnPlatformShutdownFinished, &waiter);
-    platform->DisposeIsolate(isolate);
-  } else {
-    waiter.finished = true;
-    isolate->Dispose();
+  {
+    std::lock_guard<std::mutex> lock(g_isolate_lifecycle_mu);
+    if (platform != nullptr) {
+      platform->AddIsolateFinishedCallback(
+          isolate, OnPlatformShutdownFinished, &waiter);
+      platform->DisposeIsolate(isolate);
+    } else {
+      waiter.finished = true;
+      isolate->Dispose();
+    }
   }
   WaitForPlatformShutdown(&waiter, shutdown_pump_handle);
 }
@@ -1925,6 +1937,13 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
+
+  // An env lives on the thread that creates it, and that thread may predate
+  // the memory protection key V8 uses for thread-isolated JIT memory (Linux
+  // x64 pkeys), so it would lack even read access. Restore V8's default
+  // permissions before this thread builds and enters an isolate. This is a
+  // no-op where pkeys are unsupported.
+  v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {

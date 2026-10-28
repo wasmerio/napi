@@ -24,6 +24,11 @@ use crate::snapi::{
     snapi_bridge_unofficial_set_value_limit,
 };
 
+/// The status the bridge returns when it refuses to release an env: a call
+/// from a thread other than the env's owner, or a release already under way.
+/// Any other status means the env was torn down.
+pub(crate) const RELEASE_REFUSED: i32 = 1;
+
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_active_callback_ctx};
 
@@ -286,6 +291,13 @@ impl NapiEnv {
                 .lock()
                 .expect("poisoned N-API env registry");
             registry.insert(env as usize);
+            // The registry hands this pointer to other threads; keep it from
+            // being reused for another env until it leaves the registry.
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            // SAFETY: `env` is the isolate just created and is still live.
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_retain_env(env);
+            }
 
             // If the host already stopped this app's JS, an isolate created
             // afterwards must not start running either. Checking under the
@@ -462,13 +474,9 @@ impl NapiEnv {
             self.default_napi_env_id = None;
         }
         let env = *self.napi_envs.get(&env_id)?;
-        // Remove from the shared registry before any env- or isolate-owned
-        // state is reclaimed. This synchronizes against terminate_all, which
-        // holds the same mutex while calling into V8.
-        self.env_registry
-            .lock()
-            .expect("poisoned N-API env registry")
-            .remove(&env);
+        // The env stays in the shared registry until its release returns, so
+        // `NapiRuntimeControl::terminate_all` can still stop JavaScript that
+        // its finalizers run during the release.
 
         // Leases are environment-owned resources. Explicit release publishes
         // writes; environment teardown only discards snapshots and returns any
@@ -477,16 +485,41 @@ impl NapiEnv {
         Some((env_id, env as SnapiEnv))
     }
 
-    pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv) {
+    /// Completes unregistration once the bridge release returned `status`.
+    ///
+    /// If the bridge refused the release ([`RELEASE_REFUSED`]: the caller is
+    /// not the env's owner thread, or a release is already under way), the
+    /// isolate still exists. Its heap charge, isolate slot and near-heap-limit
+    /// tracker are then kept, so the budget stays honest and the callback never
+    /// sees freed memory; an outer release in progress finishes the job.
+    pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv, status: i32) {
+        if status == RELEASE_REFUSED {
+            eprintln!(
+                "[napi] N-API environment {env_id} was not released (wrong thread or \
+                 already releasing); its isolate and budget charge are kept"
+            );
+            return;
+        }
+        let registered = self
+            .env_registry
+            .lock()
+            .expect("poisoned N-API env registry")
+            .remove(&(env as usize));
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if registered {
+            // SAFETY: retained in `commit_isolate`; no longer reachable through
+            // the registry.
+            unsafe { crate::snapi::snapi_bridge_unofficial_unretain_env(env) };
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        let _ = registered;
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
             let granted = if handle.tracker != 0 {
-                // SAFETY: reclaim the box created in `commit_isolate`. The
-                // near-heap-limit callback holding this pointer only runs during
-                // JS execution, and no JS runs between here and the paired env
-                // release that removes the callback and disposes the isolate, so
-                // freeing it now is safe.
+                // SAFETY: reclaim the box created in `commit_isolate`. The env's
+                // release has returned: its isolate, and with it the
+                // near-heap-limit callback holding this pointer, are gone.
                 let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
                 boxed.granted.load(Ordering::Acquire)
             } else {
@@ -504,9 +537,12 @@ impl NapiEnv {
         self.napi_state_to_guest_env.remove(&(env as usize));
     }
 
+    /// Unregisters an env whose release does not depend on this bookkeeping
+    /// (the host-JS backend releases it right after).
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
-        self.finish_unregister_napi_env(env_id, env);
+        self.finish_unregister_napi_env(env_id, env, 0);
         Some(env)
     }
 
@@ -525,11 +561,15 @@ impl Drop for NapiEnv {
     fn drop(&mut self) {
         let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
         for scope_id in scope_ids {
-            if let Some(env) = self.unregister_napi_scope(scope_id) {
-                unsafe {
-                    let _ = snapi_bridge_unofficial_release_env(env);
-                }
-            }
+            let Some((env_id, env)) = self.begin_unregister_napi_scope(scope_id) else {
+                continue;
+            };
+            // Release before returning the env's budget: finalizers can run
+            // JavaScript, which may still reach its near-heap-limit tracker. A
+            // store dropped on a thread other than the env's owner gets the
+            // release refused, and the env stays charged.
+            let status = unsafe { snapi_bridge_unofficial_release_env(env) };
+            self.finish_unregister_napi_env(env_id, env, status);
         }
         // Release any external memory the guest declared but did not take back.
         if self.external_declared > 0 {

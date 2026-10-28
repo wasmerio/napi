@@ -29,7 +29,10 @@
 
 namespace {
 
-std::recursive_mutex g_mu;
+// Only shared registry/message ownership lives under this lock. Never enter
+// V8 or invoke guest code while holding it (except documented thread-safe
+// TerminateExecution/RequestInterrupt, which cannot invoke JS synchronously).
+std::mutex g_mu;
 
 struct CbRegistration {
   uint32_t guest_env;
@@ -116,7 +119,29 @@ struct ScopeFrame {
   uint32_t id = 0;
 };
 
+struct WasmInterruptRequest;
+
 struct SnapiEnvState {
+  // Isolates, their persistent scopes and all env-local handle tables stay on
+  // the creating VM thread (see OwnedByThisThread). Different environments may
+  // execute concurrently.
+  // Written under g_mu by the owner when teardown starts; the owner may read
+  // it without the lock.
+  bool closing = false;
+  // Under g_mu. Teardown runs guest finalizers, which can run JavaScript.
+  // teardown_guest_calls counts guest code running from teardown; while it is
+  // non-zero the napi_env and isolate are alive, so a foreign terminate can
+  // still stop it. A terminate during teardown also sets stop_requested, after
+  // which no more guest code starts.
+  uint32_t teardown_guest_calls = 0;
+  bool stop_requested = false;
+  // One reference held by the bridge until release, plus one per
+  // snapi_bridge_unofficial_retain_env. A retained pointer may be handed to
+  // other threads: it can outlive the env but is never reused for another.
+  std::atomic<uint32_t> holders{1};
+  // Under g_mu. Interrupt requests the engine has queued but not run yet; the
+  // engine drops them without a callback when the isolate is disposed.
+  std::unordered_set<WasmInterruptRequest*> pending_interrupts;
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
 
@@ -179,6 +204,75 @@ struct CallbackBinding {
 // Never destroyed: static destructors race concurrent env teardown at process
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_set<SnapiEnvState*>& g_envs = *new std::unordered_set<SnapiEnvState*>();
+
+// Envs created on this thread and not yet released. Only this thread inserts
+// or erases its entries, so membership proves both that an env is alive and
+// that the caller owns it, without taking g_mu on every N-API call. A plain
+// pointer (freed when the thread's last env goes) keeps it usable from other
+// thread-exit destructors that may still release envs.
+thread_local std::unordered_set<SnapiEnvState*>* t_owned_envs = nullptr;
+
+bool OwnedByThisThread(const SnapiEnvState* state) {
+  return state != nullptr && t_owned_envs != nullptr &&
+         t_owned_envs->count(const_cast<SnapiEnvState*>(state)) != 0;
+}
+
+void AdoptOnThisThread(SnapiEnvState* state) {
+  if (t_owned_envs == nullptr) {
+    t_owned_envs = new std::unordered_set<SnapiEnvState*>();
+  }
+  t_owned_envs->insert(state);
+}
+
+void ForgetOnThisThread(SnapiEnvState* state) {
+  if (t_owned_envs == nullptr) return;
+  t_owned_envs->erase(state);
+  if (t_owned_envs->empty()) {
+    delete t_owned_envs;
+    t_owned_envs = nullptr;
+  }
+}
+
+struct WasmInterruptRequest {
+  SnapiEnvState* state;
+  uint32_t guest_env;
+  uint32_t wasm_fn_ptr;
+  uint32_t callback_arg;
+};
+
+void DropEnvStateHolder(SnapiEnvState* state) {
+  if (state->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) delete state;
+}
+
+// Brackets guest code invoked by the bridge on the owner thread. While the env
+// is being released, it keeps the env stoppable (see teardown_guest_calls) and
+// refuses to start guest code once a stop was requested.
+class GuestCallScope {
+ public:
+  explicit GuestCallScope(SnapiEnvState* state) : state_(state) {
+    if (state_ == nullptr || !state_->closing) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (state_->stop_requested) {
+      allowed_ = false;
+      return;
+    }
+    ++state_->teardown_guest_calls;
+    counted_ = true;
+  }
+  ~GuestCallScope() {
+    if (!counted_) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    --state_->teardown_guest_calls;
+  }
+  GuestCallScope(const GuestCallScope&) = delete;
+  GuestCallScope& operator=(const GuestCallScope&) = delete;
+  bool allowed() const { return allowed_; }
+
+ private:
+  SnapiEnvState* state_;
+  bool allowed_ = true;
+  bool counted_ = false;
+};
 // Message resources cross environment boundaries, so their guest-visible IDs
 // cannot belong to either the source or destination environment. The table is
 // process-wide and each entry is removed atomically by take or drop.
@@ -199,10 +293,9 @@ SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
   if (env_state == nullptr) return nullptr;
   // The pointer originates from the guest (via the Rust env-id layer); gate it
   // on live-env membership before the first dereference so a stale or forged
-  // env handle fails cleanly instead of touching freed memory.
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (g_envs.find(env_state) == g_envs.end()) return nullptr;
-  if (env_state->env == nullptr) return nullptr;
+  // env handle fails cleanly instead of touching freed memory. Only envs this
+  // thread owns are usable here; other threads get null.
+  if (!OwnedByThisThread(env_state) || env_state->env == nullptr) return nullptr;
   return env_state;
 }
 
@@ -422,8 +515,18 @@ SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
   return bridge_state;
 }
 
-napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
+napi_status DisposeBridgeState(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
+  if (!OwnedByThisThread(state)) return napi_invalid_arg;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (state->closing) return napi_invalid_arg;
+    state->closing = true;
+  }
+  // Owner callbacks/finalizers may use their env while it unwinds. Foreign
+  // interrupts are now refused; a foreign terminate only reaches guest code
+  // that teardown runs (GuestCallScope). No registry lock spans reference
+  // deletion, finalizers, V8 shutdown or background-task draining.
   for (const auto& entry : state->buffer_lease_handles.handles) {
     (void)unofficial_napi_release_buffer_lease(
         state->env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
@@ -458,21 +561,27 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
   state->next_callback_invocation_id = 1;
   state->cb_registry.clear();
   state->next_cb_reg_id = 1;
-  state->callback_bindings.clear();
+  napi_status s = napi_ok;
   if (state->owner != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->owner, nullptr);
-    state->active_callback_ctx.store(nullptr, std::memory_order_release);
+    s = unofficial_napi_release_env(state->owner, nullptr);
     state->owner = nullptr;
+  }
+  // JS functions can still call their bindings while finalizers run above
+  // (with no registry entry they return undefined), so free them only now.
+  state->callback_bindings.clear();
+  state->active_callback_ctx.store(nullptr, std::memory_order_release);
+  std::unordered_set<WasmInterruptRequest*> unserviced;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
     state->env = nullptr;
     g_envs.erase(state);
-    delete state;
-    return s;
+    unserviced.swap(state->pending_interrupts);
   }
-  state->active_callback_ctx.store(nullptr, std::memory_order_release);
-  state->env = nullptr;
-  g_envs.erase(state);
-  delete state;
-  return napi_ok;
+  // The isolate is gone, so these callbacks can no longer run.
+  for (auto* request : unserviced) delete request;
+  ForgetOnThisThread(state);
+  DropEnvStateHolder(state);
+  return s;
 }
 
 }  // namespace
@@ -489,11 +598,9 @@ extern "C" int snapi_bridge_set_v8_worker_thread_count(uint32_t count) {
 }
 
 extern "C" int snapi_bridge_init() {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   // Intentionally do not create a N-API env here.
   // Env creation is deferred until the guest explicitly calls
   // `unofficial_napi_create_env`, so init happens on the execution thread.
-  (void)lock;
   return 1;
 }
 
@@ -1481,8 +1588,9 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void* /*data*/,
   auto* record = static_cast<GuestFinalizerRecord*>(hint);
   if (record == nullptr) return;
   auto* bridge_state = LookupEnvState(record->state);
+  GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
-      bridge_state != nullptr
+      bridge_state != nullptr && guest_call.allowed()
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
           : nullptr;
   if (callback_ctx != nullptr) {
@@ -2722,17 +2830,18 @@ extern "C" uint32_t snapi_host_invoke_wasm_callback(void* callback_ctx,
                                                     uint32_t wasm_fn_ptr,
                                                     uint32_t callback_arg);
 
-struct WasmInterruptRequest {
-  SnapiEnvState* state;
-  uint32_t guest_env;
-  uint32_t wasm_fn_ptr;
-  uint32_t callback_arg;
-};
-
 void WasmInterruptCallback(napi_env env, void* raw) {
   auto* request = static_cast<WasmInterruptRequest*>(raw);
   if (request == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    request->state->pending_interrupts.erase(request);
+  }
   auto* bridge_state = LookupEnvState(request->state);
+  // An env being released no longer runs guest interrupt callbacks: its scopes
+  // and handle tables are being torn down. `closing` is only written by the
+  // owner thread, which is the thread running this callback.
+  if (bridge_state != nullptr && bridge_state->closing) bridge_state = nullptr;
   void* callback_ctx =
       bridge_state != nullptr
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
@@ -2787,8 +2896,11 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
     napi_get_undefined(env, &undef);
     return undef;
   }
+  GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
-      bridge_state->active_callback_ctx.load(std::memory_order_acquire);
+      guest_call.allowed()
+          ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
+          : nullptr;
   if (callback_ctx == nullptr) {
     napi_value undef;
     napi_get_undefined(env, &undef);
@@ -2860,6 +2972,7 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState* env_state) {
+  env_state = RequireEnvState(env_state);
   if (env_state == nullptr) return 0;
   // Cap callback registrations alongside value handles: 0 signals failure so
   // the registration chain aborts instead of growing cb_registry unbounded.
@@ -2876,6 +2989,7 @@ extern "C" void snapi_bridge_register_callback(SnapiEnvState* env_state,
                                                uint32_t guest_env,
                                                uint32_t wasm_fn_ptr,
                                                uint64_t data_val) {
+  env_state = RequireEnvState(env_state);
   if (env_state == nullptr || reg_id == 0) return;
   env_state->cb_registry[reg_id] = { guest_env, wasm_fn_ptr, 0, data_val };
 }
@@ -2886,6 +3000,7 @@ extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState* env_state,
                                                     uint32_t wasm_getter_fn_ptr,
                                                     uint32_t wasm_setter_fn_ptr,
                                                     uint64_t data_val) {
+  env_state = RequireEnvState(env_state);
   if (env_state == nullptr || reg_id == 0) return;
   env_state->cb_registry[reg_id] = { guest_env, wasm_getter_fn_ptr, wasm_setter_fn_ptr, data_val };
 }
@@ -2914,7 +3029,6 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   const void* guest_heap_ctx,
                                                   SnapiEnvState** env_out) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   napi_status s;
@@ -2937,7 +3051,8 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   }
   state->env = env;
   state->owner = owner;
-  g_envs.insert(state);
+  { std::lock_guard<std::mutex> lock(g_mu); g_envs.insert(state); }
+  AdoptOnThisThread(state);
 
   if (env_out != nullptr) *env_out = state;
   return napi_ok;
@@ -2964,7 +3079,6 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t /*stack_limit*/,
     const void* guest_heap_ctx,
     SnapiEnvState** env_out) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_env_create_options options{};
   const bool has_options =
       max_young_generation_size_in_bytes > 0 ||
@@ -3000,7 +3114,8 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   }
   state->env = env;
   state->owner = owner;
-  g_envs.insert(state);
+  { std::lock_guard<std::mutex> lock(g_mu); g_envs.insert(state); }
+  AdoptOnThisThread(state);
 
   if (env_out != nullptr) *env_out = state;
   return napi_ok;
@@ -3024,12 +3139,10 @@ size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void* data,
 
 extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
     SnapiEnvState* env_state, const void* data) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (env_state == nullptr || env_state->env == nullptr) {
-    return napi_invalid_arg;
-  }
+  auto* state = RequireEnvState(env_state);
+  if (state == nullptr) return napi_invalid_arg;
   return unofficial_napi_configure_near_heap_limit_callback(
-      env_state->env,
+      state->env,
       HostNearHeapLimitTrampoline,
       const_cast<void*>(data),
       0);
@@ -3053,24 +3166,20 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
 
 extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState* env_state,
                                                        uint64_t limit) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  if (env_state == nullptr) {
-    return napi_invalid_arg;
-  }
-  env_state->value_limit = static_cast<size_t>(limit);
+  auto* state = RequireEnvState(env_state);
+  if (state == nullptr) return napi_invalid_arg;
+  state->value_limit = static_cast<size_t>(limit);
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return DisposeBridgeStateLocked(env_state);
+  return DisposeBridgeState(env_state);
 }
 
 extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_state,
                                                              uint32_t loop_id) {
   (void)loop_id;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return DisposeBridgeStateLocked(env_state);
+  return DisposeBridgeState(env_state);
 }
 
 extern "C" int snapi_bridge_unofficial_collect_garbage(
@@ -3078,7 +3187,6 @@ extern "C" int snapi_bridge_unofficial_collect_garbage(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_collect_garbage(env);
 }
 
@@ -3090,7 +3198,6 @@ extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   uint32_t state = unofficial_napi_event_loop_checkpoint_state_none;
   const int status = unofficial_napi_event_loop_checkpoint(
       env,
@@ -3109,7 +3216,6 @@ extern "C" int snapi_bridge_unofficial_set_prepare_stack_trace_callback(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_set_prepare_stack_trace_callback(env, callback);
@@ -3123,7 +3229,6 @@ extern "C" int snapi_bridge_unofficial_get_promise_details(SnapiEnvState* env_st
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value promise = LoadValue(*bridge_state, promise_id);
   if (promise == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -3143,7 +3248,6 @@ extern "C" int snapi_bridge_unofficial_get_proxy_details(SnapiEnvState* env_stat
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value proxy = LoadValue(*bridge_state, proxy_id);
   if (proxy == nullptr) return napi_invalid_arg;
   napi_value target = nullptr;
@@ -3162,7 +3266,6 @@ extern "C" int snapi_bridge_unofficial_preview_entries(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   napi_value entries = nullptr;
@@ -3180,7 +3283,6 @@ extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callsites = nullptr;
   napi_status s = unofficial_napi_get_call_sites(env, frames, &callsites);
   if (s != napi_ok) return s;
@@ -3194,7 +3296,6 @@ extern "C" int snapi_bridge_unofficial_arraybuffer_view_has_buffer(SnapiEnvState
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   bool result = false;
@@ -3210,7 +3311,6 @@ extern "C" int snapi_bridge_unofficial_get_constructor_name(SnapiEnvState* env_s
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   napi_value name = nullptr;
@@ -3227,7 +3327,6 @@ extern "C" int snapi_bridge_unofficial_create_private_symbol(SnapiEnvState* env_
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   size_t length =
       (wasm_length == 0xFFFFFFFFu) ? NAPI_AUTO_LENGTH : static_cast<size_t>(wasm_length);
   napi_value result = nullptr;
@@ -3244,7 +3343,6 @@ extern "C" int snapi_bridge_unofficial_get_continuation_preserved_embedder_data(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value result = nullptr;
   napi_status s =
       unofficial_napi_get_continuation_preserved_embedder_data(env, &result);
@@ -3259,7 +3357,6 @@ extern "C" int snapi_bridge_unofficial_set_continuation_preserved_embedder_data(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = value_id == 0 ? nullptr : LoadValue(*bridge_state, value_id);
   if (value_id != 0 && value == nullptr) return napi_invalid_arg;
   return unofficial_napi_set_continuation_preserved_embedder_data(env, value);
@@ -3273,7 +3370,6 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr || accepted_hooks_out == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   // Guest callbacks cannot be installed as native provider function pointers.
   // Guest lifecycle stays in the Wasmer bridge, while the provider receives
   // the same single immutable attachment transition with empty native hooks.
@@ -3283,12 +3379,30 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
 }
 
+// Keeps `env_state` allocated (not alive) until the matching unretain, so a
+// holder that hands the pointer to other threads never sees it reused for a
+// different env. Call while the env is alive, e.g. right after creation.
+extern "C" void snapi_bridge_unofficial_retain_env(SnapiEnvState* env_state) {
+  if (env_state != nullptr) env_state->holders.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void snapi_bridge_unofficial_unretain_env(SnapiEnvState* env_state) {
+  if (env_state != nullptr) DropEnvStateHolder(env_state);
+}
+
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return unofficial_napi_terminate_execution(env);
+  // V8 explicitly permits termination from another thread. Keep registry
+  // membership pinned only for this non-reentrant engine control operation.
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!g_envs.count(env_state)) return napi_invalid_arg;
+  if (env_state->closing) {
+    // Releasing: stop any guest code teardown is running now (finalizers can
+    // run JavaScript) and let no more start. Outside that guest code the
+    // isolate may already be going away, and no JavaScript can run anyway.
+    env_state->stop_requested = true;
+    if (env_state->teardown_guest_calls == 0) return napi_ok;
+  }
+  return unofficial_napi_terminate_execution(env_state->env);
 }
 
 extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
@@ -3296,7 +3410,6 @@ extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_cancel_terminate_execution(env);
 }
 
@@ -3304,17 +3417,26 @@ extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_stat
                                                          uint32_t guest_env,
                                                          uint32_t wasm_fn_ptr,
                                                          uint32_t data) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
-  napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (wasm_fn_ptr == 0) return napi_invalid_arg;
+  std::unique_lock<std::mutex> lock(g_mu);
+  auto* bridge_state = env_state;
+  if (!g_envs.count(bridge_state) || bridge_state->closing) return napi_invalid_arg;
   auto* request =
       new (std::nothrow) WasmInterruptRequest{bridge_state, guest_env, wasm_fn_ptr, data};
   if (request == nullptr) return napi_generic_failure;
+  bridge_state->pending_interrupts.insert(request);
+  // Only the owner thread releases an env, so an owner caller needs no lock to
+  // keep it alive. A foreign caller keeps registry membership pinned: the
+  // engine only enqueues the callback, which runs later on the owner thread.
+  if (OwnedByThisThread(bridge_state)) lock.unlock();
+  napi_env env = bridge_state->env;
   napi_status s =
       unofficial_napi_request_interrupt(env, WasmInterruptCallback, request);
-  if (s != napi_ok) delete request;
+  if (s != napi_ok) {
+    if (!lock.owns_lock()) lock.lock();
+    bridge_state->pending_interrupts.erase(request);
+    delete request;
+  }
   return s;
 }
 
@@ -3323,7 +3445,6 @@ extern "C" int snapi_bridge_unofficial_enqueue_microtask(SnapiEnvState* env_stat
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callback = LoadValue(*bridge_state, callback_id);
   if (callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_enqueue_microtask(env, callback);
@@ -3334,7 +3455,6 @@ extern "C" int snapi_bridge_unofficial_set_promise_reject_callback(SnapiEnvState
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_set_promise_reject_callback(env, callback);
@@ -3348,7 +3468,6 @@ extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr || out_id == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -3368,7 +3487,6 @@ extern "C" int snapi_bridge_unofficial_set_promise_hooks(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value init = init_callback_id == 0 ? nullptr : LoadValue(*bridge_state, init_callback_id);
   napi_value before =
       before_callback_id == 0 ? nullptr : LoadValue(*bridge_state, before_callback_id);
@@ -3389,7 +3507,6 @@ extern "C" int snapi_bridge_unofficial_get_hash_seed(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (
       hash_seed_out == nullptr) {
     return napi_invalid_arg;
@@ -3411,7 +3528,6 @@ extern "C" int snapi_bridge_unofficial_get_error_metadata(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value error = LoadValue(*bridge_state, error_id);
   if (error == nullptr) return napi_invalid_arg;
   unofficial_napi_error_metadata metadata{};
@@ -3447,7 +3563,6 @@ extern "C" int snapi_bridge_unofficial_configure_source_maps(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
   if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
   return unofficial_napi_configure_source_maps(env, enabled != 0, callback);
@@ -3459,7 +3574,6 @@ extern "C" int snapi_bridge_unofficial_preserve_error_source_message(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value error = LoadValue(*bridge_state, error_id);
   if (error == nullptr) return napi_invalid_arg;
   return unofficial_napi_preserve_error_source_message(env, error);
@@ -3471,7 +3585,6 @@ extern "C" int snapi_bridge_unofficial_mark_promise_as_handled(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value promise = LoadValue(*bridge_state, promise_id);
   if (promise == nullptr) return napi_invalid_arg;
   return unofficial_napi_mark_promise_as_handled(env, promise);
@@ -3483,7 +3596,6 @@ extern "C" int snapi_bridge_unofficial_get_heap_statistics(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (
       stats_out == nullptr) {
     return napi_invalid_arg;
@@ -3499,7 +3611,6 @@ extern "C" int snapi_bridge_unofficial_get_heap_space_statistics(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (count_out == nullptr || (capacity > 0 && stats_out == nullptr)) {
     return napi_invalid_arg;
   }
@@ -3512,7 +3623,6 @@ extern "C" int snapi_bridge_unofficial_get_heap_code_statistics(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (
       stats_out == nullptr) {
     return napi_invalid_arg;
@@ -3527,7 +3637,6 @@ extern "C" int snapi_bridge_unofficial_profile_start(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (result_out == nullptr || profile_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -3548,7 +3657,6 @@ extern "C" int snapi_bridge_unofficial_profile_stop(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (json_out == nullptr) return napi_invalid_arg;
   auto profile = reinterpret_cast<unofficial_napi_profile>(
       bridge_state->profile_handles.Load(profile_id));
@@ -3571,7 +3679,6 @@ extern "C" int snapi_bridge_unofficial_take_heap_snapshot(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (json_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -3597,7 +3704,6 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   // A zero id means "no transfer list" (the common case: structuredClone with
@@ -3618,15 +3724,17 @@ extern "C" int snapi_bridge_unofficial_message_create(
     uint32_t* message_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr || message_out == nullptr) return napi_invalid_arg;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   unofficial_napi_message message = nullptr;
   napi_status status =
       unofficial_napi_message_create(bridge_state->env, value, &message);
   if (status != napi_ok) return status;
-  const uint32_t message_id =
-      g_message_handles.Store(reinterpret_cast<void*>(message));
+  uint32_t message_id;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    message_id = g_message_handles.Store(reinterpret_cast<void*>(message));
+  }
   if (message_id == 0) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
@@ -3639,9 +3747,11 @@ extern "C" int snapi_bridge_unofficial_message_take(
     SnapiEnvState* env_state,
     uint32_t message_id,
     uint32_t* value_out) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  auto* message = reinterpret_cast<unofficial_napi_message>(
-      g_message_handles.Take(message_id));
+  unofficial_napi_message message;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    message = reinterpret_cast<unofficial_napi_message>(g_message_handles.Take(message_id));
+  }
   if (message == nullptr) return napi_invalid_arg;
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr || value_out == nullptr) {
@@ -3659,9 +3769,11 @@ extern "C" int snapi_bridge_unofficial_message_take(
 }
 
 extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  auto* message = reinterpret_cast<unofficial_napi_message>(
-      g_message_handles.Take(message_id));
+  unofficial_napi_message message;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    message = reinterpret_cast<unofficial_napi_message>(g_message_handles.Take(message_id));
+  }
   if (message != nullptr) unofficial_napi_message_drop(message);
 }
 
@@ -3670,7 +3782,6 @@ extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_notify_datetime_configuration_change(env);
 }
 
@@ -3679,7 +3790,6 @@ extern "C" int snapi_bridge_unofficial_create_serdes_binding(SnapiEnvState* env_
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value result = nullptr;
   napi_status s = unofficial_napi_create_serdes_binding(env, &result);
   if (s != napi_ok) return s;
@@ -3697,7 +3807,6 @@ extern "C" int snapi_bridge_unofficial_contextify_contains_module_syntax(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value code = LoadValue(*bridge_state, code_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
   napi_value resource_name = resource_name_id == 0 ? nullptr : LoadValue(*bridge_state, resource_name_id);
@@ -3724,7 +3833,6 @@ extern "C" int snapi_bridge_unofficial_contextify_make_context(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value sandbox_or_symbol = LoadValue(*bridge_state, sandbox_or_symbol_id);
   napi_value name = LoadValue(*bridge_state, name_id);
   napi_value origin = origin_id == 0 ? nullptr : LoadValue(*bridge_state, origin_id);
@@ -3766,7 +3874,6 @@ extern "C" int snapi_bridge_unofficial_contextify_run_script(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value sandbox_or_null = sandbox_or_null_id == 0 ? nullptr : LoadValue(*bridge_state, sandbox_or_null_id);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
   unofficial_napi_bytecode source_bytecode =
@@ -3814,7 +3921,6 @@ extern "C" int snapi_bridge_unofficial_contextify_compile_function(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
   unofficial_napi_bytecode source_bytecode =
       LoadBytecodeHandle(*bridge_state, source_bytecode_id);
@@ -3869,7 +3975,6 @@ extern "C" int snapi_bridge_unofficial_bytecode_open(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value source_text = LoadValue(*bridge_state, source_text_id);
   napi_value filename = LoadValue(*bridge_state, filename_id);
   napi_value params = params_id == 0 ? nullptr : LoadValue(*bridge_state, params_id);
@@ -3912,7 +4017,6 @@ extern "C" int snapi_bridge_unofficial_bytecode_serialize(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
   if (bytecode == nullptr) return napi_invalid_arg;
   napi_value buffer = nullptr;
@@ -3928,7 +4032,6 @@ extern "C" int snapi_bridge_unofficial_bytecode_release(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
   if (bytecode == nullptr) return napi_invalid_arg;
   napi_status s = unofficial_napi_bytecode_release(env, bytecode);
@@ -3955,7 +4058,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value wrapper = LoadValue(*bridge_state, wrapper_id);
   napi_value url = LoadValue(*bridge_state, url_id);
   napi_value context = context_id == 0 ? nullptr : LoadValue(*bridge_state, context_id);
@@ -4033,7 +4135,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_destroy(SnapiEnvState* env_st
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_status s = unofficial_napi_module_wrap_destroy(env, module);
@@ -4048,7 +4149,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_link(SnapiEnvState* env_state
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   std::vector<unofficial_napi_module> linked_modules(count, nullptr);
@@ -4069,7 +4169,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_instantiate(SnapiEnvState* en
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   return unofficial_napi_module_wrap_instantiate(env, module);
@@ -4083,7 +4182,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_evaluate(SnapiEnvState* env_s
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -4102,7 +4200,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_evaluate_sync(SnapiEnvState* 
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value filename = filename_id == 0 ? nullptr : LoadValue(*bridge_state, filename_id);
@@ -4126,7 +4223,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_namespace(SnapiEnvState* 
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -4145,7 +4241,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   if (status_out == nullptr && error_out == nullptr &&
@@ -4176,7 +4271,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_awa
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (settled_out == nullptr) return napi_invalid_arg;
   unofficial_napi_module module =
       LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4196,7 +4290,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_export(SnapiEnvState* env
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   napi_value export_name = LoadValue(*bridge_state, export_name_id);
   napi_value export_value = export_value_id == 0 ? nullptr : LoadValue(*bridge_state, export_value_id);
@@ -4212,7 +4305,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_module_source_object(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   napi_value source_object = source_object_id == 0 ? nullptr : LoadValue(*bridge_state, source_object_id);
   if (module == nullptr) return napi_invalid_arg;
@@ -4227,7 +4319,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_module_source_object(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -4244,7 +4335,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_cached_data(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -4261,7 +4351,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_hooks(
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   napi_value import_callback = import_callback_id == 0
                                    ? nullptr
                                    : LoadValue(*bridge_state, import_callback_id);
@@ -4288,7 +4377,6 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
   if (module == nullptr) return napi_invalid_arg;
   napi_value result = nullptr;
@@ -4303,17 +4391,16 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade
 // ============================================================
 
 extern "C" void snapi_bridge_dispose() {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  // An embedder may clean up its owner thread; it must never destroy another
+  // thread's entered isolate or persistent V8 scopes. Normal worker shutdown
+  // explicitly releases each env on its owner before joining that thread.
+  if (t_owned_envs == nullptr) return;
   std::vector<SnapiEnvState*> env_states;
-  env_states.reserve(g_envs.size());
-  for (auto* env_state : g_envs) {
-    env_states.push_back(env_state);
+  for (auto* state : *t_owned_envs) {
+    if (!state->closing) env_states.push_back(state);
   }
-  for (auto* env_state : env_states) {
-    (void)DisposeBridgeStateLocked(env_state);
-  }
-  for (void* handle : g_message_handles.TakeAll()) {
-    unofficial_napi_message_drop(
-        reinterpret_cast<unofficial_napi_message>(handle));
-  }
+  for (auto* state : env_states) (void)DisposeBridgeState(state);
+  // Opaque messages are owned by queues, not by a source env. They may remain
+  // live between source release and destination creation, so only take/drop
+  // retires them. Queue shutdown must explicitly drop its remaining tokens.
 }
