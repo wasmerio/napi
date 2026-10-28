@@ -3,8 +3,8 @@
 Run the context tests directly, without compiling Wasmer or installing npm dependencies:
 
 ```sh
-node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs
-bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs
+node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
+bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
 ```
 
 The tests extract the context implementation from the JavaScript embedded in
@@ -23,6 +23,16 @@ queued once; that removing an id cancels a queued or later collection; that
 author code replacing `Map` or `FinalizationRegistry` methods afterwards
 changes nothing; and, with the host's own GC, that a collected object is
 reported and a live one is not.
+
+`native-realm.test.mjs` loads the whole embedded JavaScript into a `vm`
+realm, with and without a fake `__wasmerNapiNativeRealm` bridge. With it,
+scripts run in the realm's global with their filename and offsets, global
+lexical declarations persist, the realm serves one environment and refuses
+secondary contexts, context extensions and modules, callbacks and drained guest
+code are bracketed, checkpoints, release and the bracketing hooks go to the
+bridge without letting its errors escape, and the bridge global is removed once
+captured; a bridge that can't be removed is refused. Without it, contexts stay
+isolated.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
 hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip
