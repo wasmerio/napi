@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::guest::callback_cache::CachedGuestCallback;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use wasmer::Function;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasmer::TypedFunction;
-use wasmer::{Function, Memory, Table};
+use wasmer::{Memory, Table};
 
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
@@ -128,7 +132,10 @@ pub(crate) struct NapiEnv {
     /// memory unboundedly. `Function` clones are cheap (a store handle), so
     /// caching by table index and cloning on repeat hits avoids the
     /// unconditional store growth. See `guest::callback::call_guest_callback`.
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) func_cache: HashMap<u32, Function>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) func_cache: HashMap<u32, CachedGuestCallback>,
     pub(crate) default_napi_env_id: Option<u32>,
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
