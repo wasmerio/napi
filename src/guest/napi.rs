@@ -6,6 +6,7 @@
 
 use std::ffi::{CString, c_char};
 
+use smallvec::{SmallVec, smallvec};
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 use wasmer_wasix::WasiError;
 
@@ -3291,10 +3292,10 @@ fn guest_napi_get_cb_info(
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr != 0 {
-        let Some(bytes) = read_guest_bytes(&mut env, argc_ptr, 4) else {
+        let Some(wanted) = read_guest_u32(&mut env, argc_ptr) else {
             return 1;
         };
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        wanted
     } else {
         0
     };
@@ -3304,9 +3305,10 @@ fn guest_napi_get_cb_info(
         return 1;
     }
 
-    // Query the bridge for callback context
+    // Query the bridge for callback context. Most callbacks take a few
+    // arguments, so only larger requests allocate.
+    let mut argv_ids: SmallVec<[u32; 16]> = smallvec![0; wanted as usize];
     let mut actual_argc: u32 = wanted;
-    let mut argv_ids = vec![0u32; wanted as usize];
     let mut this_id: u32 = 0;
     let mut data_val: u64 = 0;
 
@@ -3315,13 +3317,18 @@ fn guest_napi_get_cb_info(
             snapi_env(&env, e),
             _cbinfo,
             &mut actual_argc,
-            if wanted > 0 {
+            // Only mint ids for arguments and `this` if the guest asked.
+            if wanted > 0 && argv_ptr != 0 {
                 argv_ids.as_mut_ptr()
             } else {
                 std::ptr::null_mut()
             },
             wanted,
-            &mut this_id,
+            if this_ptr != 0 {
+                &mut this_id
+            } else {
+                std::ptr::null_mut()
+            },
             &mut data_val,
         )
     };
@@ -3341,9 +3348,7 @@ fn guest_napi_get_cb_info(
         if u64::from(argv_ptr) + u64::from(to_write) * 4 > 1u64 << 32 {
             return 1;
         }
-        for i in 0..to_write {
-            write_guest_u32(&mut env, argv_ptr + i * 4, argv_ids[i as usize]);
-        }
+        write_guest_pod_slice(&mut env, argv_ptr, &argv_ids[..to_write as usize]);
     }
 
     // Write this_arg
