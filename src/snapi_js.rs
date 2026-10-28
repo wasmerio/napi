@@ -200,6 +200,59 @@ export function wasmer_napi_console_error(message) {
   console.error(message);
 }
 let wasmerNapiActiveGlobalContext;
+// Native Worker realm: an embedder that dedicates a fresh classic Worker to one
+// environment can run its guest code in the Worker's own global instead of the
+// isolated compatibility scopes below, so author scripts see real globals and
+// keep their original source and stack positions. The embedder opts in by
+// defining globalThis.__wasmerNapiNativeRealm before this module loads; the
+// module captures it and deletes the global, so author code can't reach it.
+// No untrusted code may run in that global before then. The bridge has:
+//   evaluate(source, filename, lineOffset, columnOffset): runs a classic script
+//     (unofficial_napi_contextify_run_script); its return value is the result.
+//   binding(source): runs source text in the global scope and returns its
+//     completion value (napi_run_script).
+//   enterCallback() / leaveCallback(): bracket all guest code the environment
+//     runs: JavaScript calls into guest functions, deferred callbacks and
+//     finalizers. They must not throw; around deferred callbacks and
+//     finalizers, a throw is logged and the guest code still runs.
+//   release() (optional): the environment was released.
+//   checkpoint(allowHostTasks, hasRunnableWork) (optional): runs an event loop
+//     turn; returns a Promise. Without it, the default checkpoint runs. A
+//     failure is logged, and the guest sees a failure status.
+// It is never enabled implicitly, and the realm serves one environment only.
+const wasmerNapiNativeRealm = (() => {
+  const bridge = globalThis.__wasmerNapiNativeRealm;
+  if (bridge == null) return undefined;
+  try { delete globalThis.__wasmerNapiNativeRealm; } catch {}
+  // Author code must not reach the bridge: refuse one that can't be removed.
+  if ('__wasmerNapiNativeRealm' in globalThis) {
+    throw new TypeError('The native Worker realm bridge must be a configurable global property');
+  }
+  for (const name of ['evaluate', 'binding', 'enterCallback', 'leaveCallback']) {
+    if (typeof bridge[name] !== 'function') {
+      throw new TypeError(`Invalid native Worker realm bridge: ${name}`);
+    }
+  }
+  return {
+    global: globalThis,
+    Function,
+    evaluate: bridge.evaluate.bind(bridge),
+    binding: bridge.binding.bind(bridge),
+    enterCallback: bridge.enterCallback.bind(bridge),
+    leaveCallback: bridge.leaveCallback.bind(bridge),
+    release: typeof bridge.release === 'function' ? bridge.release.bind(bridge) : undefined,
+    checkpoint: typeof bridge.checkpoint === 'function' ? bridge.checkpoint.bind(bridge) : undefined,
+  };
+})();
+// Never recycle this realm after environment release: unmodified global
+// lexical declarations and intrinsic mutations belong to its first document.
+let wasmerNapiNativeRealmClaimed = false;
+export function wasmer_napi_can_create_global_context() {
+  return wasmerNapiNativeRealm === undefined || !wasmerNapiNativeRealmClaimed;
+}
+export function wasmer_napi_has_native_realm() {
+  return wasmerNapiNativeRealm !== undefined;
+}
 const wasmerNapiBuffers = new WeakSet();
 const wasmerNapiHostSetTimeout = globalThis.setTimeout.bind(globalThis);
 const wasmerNapiHostQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
@@ -256,6 +309,21 @@ if (wasmerNapiYieldChannel !== undefined) {
 }
 const wasmerNapiPromiseDetails = new WeakMap();
 export function wasmer_napi_event_loop_checkpoint(allowHostTasks, hasRunnableWork) {
+  if (wasmerNapiNativeRealm?.checkpoint !== undefined) {
+    // Always settle as a Promise, so a throw reaches the guest as a status.
+    // The guest sees only that status, so the error is logged.
+    let checkpoint;
+    try {
+      checkpoint = wasmerNapiHostPromise.resolve(
+        wasmerNapiNativeRealm.checkpoint(allowHostTasks, hasRunnableWork));
+    } catch (error) {
+      checkpoint = wasmerNapiHostPromise.reject(error);
+    }
+    return wasmerNapiHostPromiseThen.call(checkpoint, undefined, (error) => {
+      console.error('Native Worker realm checkpoint failed', error);
+      throw error;
+    });
+  }
   // A Node microtask checkpoint must not admit timers, I/O, or messages. JSPI
   // still needs one suspension so the host engine can drain its Promise queue.
   if (!allowHostTasks) {
@@ -566,10 +634,18 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
 export function wasmer_napi_make_callback(context, dispatch) {
   const callbacks = context.callbacks;
   const index = callbacks.dispatches.push(dispatch) - 1;
+  // Capture only the flag: a retained wrapper must not keep its context alive.
+  const nativeRealm = context.nativeRealm === true;
   return function (...args) {
     const dispatch = callbacks.dispatches?.[index];
     // new.target lets napi_get_new_target tell construction from a call.
-    return dispatch?.(this, args, new.target);
+    if (!nativeRealm || dispatch === undefined) return dispatch?.(this, args, new.target);
+    wasmerNapiNativeRealm.enterCallback();
+    try {
+      return dispatch(this, args, new.target);
+    } finally {
+      wasmerNapiNativeRealm.leaveCallback();
+    }
   };
 }
 const wasmerNapiGlobalScopes = new WeakMap();
@@ -611,6 +687,16 @@ function wasmerNapiCreateGlobalScope(scopeTarget, fallback = globalThis) {
   return scope;
 }
 export function wasmer_napi_create_global_context() {
+  if (wasmerNapiNativeRealm !== undefined) {
+    if (wasmerNapiNativeRealmClaimed) throw new Error('Native Worker realm lease already consumed');
+    wasmerNapiNativeRealmClaimed = true;
+    return {
+      nativeRealm: true,
+      scopeTarget: wasmerNapiNativeRealm.global,
+      scope: wasmerNapiNativeRealm.global,
+      callbacks: {dispatches: []},
+    };
+  }
   const context = {
     scopeTarget: Object.create(null),
     callbacks: {dispatches: []},
@@ -630,8 +716,51 @@ export function wasmer_napi_release_global_context(context) {
   // Retained JS wrappers must stop calling Rust before its closures are dropped.
   context.callbacks.dispatches = undefined;
   if (wasmerNapiActiveGlobalContext === context) wasmerNapiActiveGlobalContext = undefined;
+  if (context.nativeRealm) {
+    // The environment is gone either way; a failing notification must not
+    // interrupt its release.
+    try {
+      wasmerNapiNativeRealm.release?.();
+    } catch (error) {
+      console.error('Native Worker realm release failed', error);
+    }
+  }
+}
+// Guest code that a drain runs (deferred callbacks, finalizers) is bracketed
+// like a JavaScript call into a guest function. The drain has already taken
+// the callback or finalizer off its queue, so a throwing hook is logged
+// rather than allowed to skip it.
+export function wasmer_napi_native_realm_enter() {
+  try {
+    wasmerNapiNativeRealm?.enterCallback();
+  } catch (error) {
+    console.error('Native Worker realm enterCallback failed', error);
+  }
+}
+export function wasmer_napi_native_realm_leave() {
+  try {
+    wasmerNapiNativeRealm?.leaveCallback();
+  } catch (error) {
+    console.error('Native Worker realm leaveCallback failed', error);
+  }
+}
+function wasmerNapiRequireNativeRoot(sandbox) {
+  if (sandbox != null && sandbox !== wasmerNapiNativeRealm.global) {
+    throw new TypeError('Secondary contexts are unsupported in a native Worker realm');
+  }
+}
+export function wasmer_napi_context_run_script(sandbox, source, filename, lineOffset, columnOffset) {
+  if (wasmerNapiNativeRealm !== undefined) {
+    wasmerNapiRequireNativeRoot(sandbox);
+    return wasmerNapiNativeRealm.evaluate(source, filename, lineOffset, columnOffset);
+  }
+  return wasmer_napi_context_eval(sandbox, source);
 }
 export function wasmer_napi_context_eval(sandbox, source) {
+  if (wasmerNapiNativeRealm !== undefined) {
+    wasmerNapiRequireNativeRoot(sandbox);
+    return wasmerNapiNativeRealm.binding(source);
+  }
   if (wasmerNapiActiveGlobalContext !== undefined &&
       (sandbox == null || sandbox === globalThis ||
        sandbox === wasmerNapiActiveGlobalContext.scope)) {
@@ -700,6 +829,16 @@ function wasmerNapiLowerDynamicImports(params, source, filename) {
   return source;
 }
 export function wasmer_napi_compile_function(scope, contextExtensions, params, source, filename) {
+  if (wasmerNapiNativeRealm !== undefined) {
+    wasmerNapiRequireNativeRoot(scope);
+    if (Array.from(contextExtensions ?? []).length !== 0) {
+      throw new TypeError('Context extensions are unsupported in a native Worker realm');
+    }
+    // As below, a CommonJS entry may start with a hashbang. Dynamic import()
+    // is left to the Worker's own module loader.
+    if (source.startsWith('#!')) source = '//' + source.slice(2);
+    return wasmerNapiNativeRealm.Function(...Array.from(params, String), source);
+  }
   // V8's compile-function path accepts a hashbang for CommonJS entry files,
   // while the JavaScript Function constructor does not. Preserve byte and
   // line offsets by replacing only the hashbang marker with a line comment.
@@ -739,6 +878,9 @@ export function wasmer_napi_validate_script(source, filename) {
   });
 }
 export function wasmer_napi_compile_module(scope, source, filename) {
+  if (wasmerNapiNativeRealm !== undefined) {
+    throw new TypeError('Source text modules are unsupported in a native Worker realm');
+  }
   // Module bodies execute through Function below, which rejects hashbangs.
   // Keep offsets intact for Acorn's replacements and diagnostics.
   if (source.startsWith('#!')) source = '//' + source.slice(2);
@@ -1265,12 +1407,24 @@ extern "C" {
     #[wasm_bindgen(catch)]
     fn wasmer_napi_number(value: &JsValue) -> Result<JsValue, JsValue>;
     fn wasmer_napi_console_error(message: &str);
+    fn wasmer_napi_can_create_global_context() -> bool;
+    fn wasmer_napi_has_native_realm() -> bool;
+    fn wasmer_napi_native_realm_enter();
+    fn wasmer_napi_native_realm_leave();
     fn wasmer_napi_create_global_context() -> JsValue;
     fn wasmer_napi_global_context_scope(context: &JsValue) -> JsValue;
     fn wasmer_napi_activate_global_context(context: &JsValue);
     fn wasmer_napi_release_global_context(context: &JsValue);
     #[wasm_bindgen(catch)]
     fn wasmer_napi_context_eval(sandbox: &JsValue, source: &str) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_context_run_script(
+        sandbox: &JsValue,
+        source: &str,
+        filename: &str,
+        line_offset: i32,
+        column_offset: i32,
+    ) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_compile_function(
         scope: &JsValue,
@@ -2383,6 +2537,12 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
         .is_ok_and(|flags| flags.is_some());
     if out.is_null() || !runtime_configured {
         return NAPI_INVALID_ARG;
+    }
+    if !wasmer_napi_can_create_global_context() {
+        wasmer_napi_console_error(
+            "Native Worker realm lease already consumed; start a fresh Worker",
+        );
+        return NAPI_GENERIC_FAILURE;
     }
     let env = Box::new(HostJsEnv::new());
     env.live_env_addr.set((&*env as *const HostJsEnv) as usize);
@@ -3538,6 +3698,27 @@ unsafe extern "C" {
     ) -> u32;
 }
 
+thread_local! {
+    // The bridge is captured when this thread's module loads and never changes.
+    static HAS_NATIVE_REALM: bool = wasmer_napi_has_native_realm();
+}
+
+fn has_native_realm() -> bool {
+    HAS_NATIVE_REALM.with(|has| *has)
+}
+
+/// Runs guest code a drain enters (a deferred callback or a finalizer) rather
+/// than a JavaScript call; a native Worker realm brackets it like one.
+fn call_guest_from_drain<R>(call: impl FnOnce() -> R) -> R {
+    if !has_native_realm() {
+        return call_guest(call);
+    }
+    wasmer_napi_native_realm_enter();
+    let result = call_guest(call);
+    wasmer_napi_native_realm_leave();
+    result
+}
+
 unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
     loop {
         let (record, callback_ctx, value_frame) = {
@@ -3551,7 +3732,7 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
             (record, state.active_callback_ctx, value_frame)
         };
         let result = unsafe {
-            call_guest(|| {
+            call_guest_from_drain(|| {
                 snapi_host_invoke_wasm_finalizer(
                     callback_ctx,
                     record.guest_env,
@@ -3773,7 +3954,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
         };
 
         let result = unsafe {
-            call_guest(|| {
+            call_guest_from_drain(|| {
                 snapi_host_invoke_wasm_callback(
                     callback_ctx,
                     pending.registration.guest_env,
@@ -4718,6 +4899,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_make_context(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    if has_native_realm() {
+        state.last_exception = Some(
+            TypeError::new(
+                "Secondary contexts are unsupported in a native Worker realm; start a fresh Worker",
+            )
+            .into(),
+        );
+        return NAPI_PENDING_EXCEPTION;
+    }
     let sandbox = if sandbox_or_symbol_id == 0 {
         Object::new().into()
     } else {
@@ -4749,9 +4939,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
 ) -> i32 {
     let _ = (
         source_bytecode_id,
-        filename_id,
-        line_offset,
-        column_offset,
         timeout,
         display_errors,
         break_on_sigint,
@@ -4769,7 +4956,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
         .get(sandbox_or_null_id)
         .cloned()
         .unwrap_or(JsValue::NULL);
-    match wasmer_napi_context_eval(&sandbox, &source) {
+    let filename = state
+        .get(filename_id)
+        .and_then(JsValue::as_string)
+        .unwrap_or_default();
+    match wasmer_napi_context_run_script(&sandbox, &source, &filename, line_offset, column_offset) {
         Ok(value) => {
             let id = state.insert(value);
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)

@@ -18,7 +18,9 @@ const directory = await mkdtemp(join(tmpdir(), 'napi-context-test-'));
 let runtime;
 try {
   const modulePath = join(directory, 'context.mjs');
-  await writeFile(modulePath, 'let wasmerNapiActiveGlobalContext;\n' + inline.slice(start, end));
+  // Module-level state the extracted context code reads. Without a native
+  // Worker realm, contexts use the default isolated compatibility scopes.
+  await writeFile(modulePath, 'let wasmerNapiActiveGlobalContext;\nlet wasmerNapiNativeRealm;\nlet wasmerNapiNativeRealmClaimed = false;\n' + inline.slice(start, end));
   runtime = await import(pathToFileURL(modulePath));
 } finally {
   await rm(directory, {recursive:true,force:true});
