@@ -99,7 +99,7 @@ struct EnvHeapChargeHandle {
 
 /// The live envs of one application, shared by all of its stores. Ordinary
 /// operations still resolve through the caller's own store; only host
-/// `terminate_all` and the guest terminate/interrupt imports use this map.
+/// `terminate_all` and the guest terminate import use this map.
 #[derive(Debug, Default)]
 pub(crate) struct EnvRegistry {
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -412,21 +412,23 @@ impl NapiEnv {
 
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
         // Native ids are allocated by the application, not by this store, and
-        // the env is registered for foreign terminate/interrupt in the same
-        // step. WASIX threads are separate stores sharing one guest memory, so
-        // an id must mean the same env in all of them. Each env has exactly one
-        // owner scope; reusing the env id keeps scope tokens from one store
-        // from aliasing another store's scopes.
+        // the env is registered for foreign terminate in the same step. WASIX
+        // threads are separate stores sharing one guest memory, so an id must
+        // mean the same env in all of them. Each env has exactly one owner
+        // scope; reusing the env id keeps scope tokens from one store from
+        // aliasing another store's scopes.
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         let (env_id, scope_id) = {
             let mut registry = self
                 .env_registry
                 .lock()
                 .expect("poisoned N-API env registry");
-            let env_id = registry
-                .next_native_id
-                .checked_add(1)
-                .expect("N-API application environment ID space exhausted");
+            let Some(env_id) = registry.next_native_id.checked_add(1) else {
+                // Release the lock first: panicking while holding it would
+                // poison the registry for every store of the application.
+                drop(registry);
+                panic!("N-API application environment ID space exhausted");
+            };
             registry.next_native_id = env_id;
             registry.envs.insert(env_id, env as usize);
             // The registry hands this pointer to other threads; keep it from
