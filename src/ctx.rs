@@ -1,10 +1,7 @@
 use anyhow::{Context, Result, bail};
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use wasmer::{Extern, ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
@@ -72,6 +69,13 @@ pub struct NapiInstantiationState {
 /// thread, for example a WASIX thread woken from deep sleep on a different
 /// worker. An environment whose store is dropped on another thread is not
 /// released: its isolate leaks and stays charged to the budget.
+///
+/// Environment ids are allocated per [`NapiCtx`], so all stores created from
+/// one context (one application, e.g. a guest and its WASIX threads) share
+/// them. Any of those stores may terminate any of the application's
+/// environments; every other call, including interrupts, which run a guest
+/// function chosen by the caller, resolves only within the caller's own store.
+/// Instantiate untrusted, unrelated guests from separate contexts.
 // The import phase creates a per-instantiation session holding the function
 // env backing the imported host functions, and hands it to the caller as
 // opaque state. The hooks themselves are stateless, so concurrent
@@ -85,7 +89,7 @@ pub struct NapiRuntimeHooks {
 /// Opaque control surface for stopping every V8 isolate owned by a context.
 #[derive(Clone, Debug)]
 pub struct NapiRuntimeControl {
-    envs: Arc<Mutex<HashSet<usize>>>,
+    envs: Arc<Mutex<crate::env::EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
 }
 
@@ -104,7 +108,7 @@ impl NapiRuntimeControl {
     pub fn terminate_all(&self) {
         self.host_stopped.store(true, Ordering::Release);
         let envs = self.envs.lock().expect("poisoned N-API env registry");
-        for env in envs.iter().copied() {
+        for env in envs.envs.values().copied() {
             unsafe {
                 crate::snapi::snapi_bridge_unofficial_terminate_execution(
                     env as crate::snapi::SnapiEnv,
@@ -122,7 +126,7 @@ struct NapiCtxInner {
     /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
     /// external-memory, and CPU paths.
     budget: Arc<ResourceBudget>,
-    envs: Arc<Mutex<HashSet<usize>>>,
+    envs: Arc<Mutex<crate::env::EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
 }
 
@@ -192,7 +196,7 @@ impl NapiCtxBuilder {
                 limits: self.limits,
                 active_sessions: AtomicUsize::new(0),
                 budget,
-                envs: Arc::new(Mutex::new(HashSet::new())),
+                envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),
                 host_stopped: Arc::new(AtomicBool::new(false)),
             }),
         }

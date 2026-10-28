@@ -77,6 +77,9 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
+    /// Nonzero if releasing `env` from this thread now would be refused (see
+    /// `RELEASE_REFUSED`).
+    pub fn snapi_bridge_unofficial_env_release_refused(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
         env: SnapiEnv,

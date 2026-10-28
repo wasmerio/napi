@@ -145,6 +145,11 @@ struct SnapiAgentState {
   // which no more guest code starts.
   uint32_t teardown_guest_calls = 0;
   bool stop_requested = false;
+  // Owner thread only. Guest code that an env of this agent called into (a
+  // callback, finalizer or interrupt) and that is still running. The engine
+  // frames below it still use the isolate, so the agent can't be released
+  // meanwhile, through any of its envs.
+  uint32_t guest_calls = 0;
   // Under g_mu. Interrupt requests the engine has queued but not run yet; the
   // engine drops them without a callback when the isolate is disposed.
   std::unordered_set<WasmInterruptRequest*> pending_interrupts;
@@ -298,15 +303,18 @@ void DropEnvStateHolder(SnapiEnvState* state) {
   if (state->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) delete state;
 }
 
-// Brackets guest code invoked by the bridge on the owner thread. While the
-// env's agent is being released, it keeps the agent stoppable (see
-// teardown_guest_calls) and refuses to start guest code once a stop was
-// requested.
+// Brackets guest code invoked by the bridge on the owner thread. It counts as
+// one of the agent's guest_calls, so no env of the agent can be released from
+// inside it. While the env's agent is being released, it keeps the agent
+// stoppable (see teardown_guest_calls) and refuses to start guest code once a
+// stop was requested.
 class GuestCallScope {
  public:
   explicit GuestCallScope(SnapiEnvState* state)
       : agent_(state != nullptr ? state->agent : nullptr) {
-    if (agent_ == nullptr || !agent_->closing) return;
+    if (agent_ == nullptr) return;
+    ++agent_->guest_calls;
+    if (!agent_->closing) return;
     std::lock_guard<std::mutex> lock(g_mu);
     if (agent_->stop_requested) {
       allowed_ = false;
@@ -316,6 +324,8 @@ class GuestCallScope {
     counted_ = true;
   }
   ~GuestCallScope() {
+    if (agent_ == nullptr) return;
+    --agent_->guest_calls;
     if (!counted_) return;
     std::lock_guard<std::mutex> lock(g_mu);
     --agent_->teardown_guest_calls;
@@ -628,6 +638,9 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   if (state == nullptr) return napi_ok;
   if (!OwnedByThisThread(state)) return napi_invalid_arg;
   SnapiAgentState* agent = state->agent;
+  // Guest code an env of this agent called into is running: the engine still
+  // uses the isolate once that code returns.
+  if (agent->guest_calls != 0) return napi_invalid_arg;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     if (agent->closing) return napi_invalid_arg;
@@ -2988,6 +3001,7 @@ void WasmInterruptCallback(napi_env env, void* raw) {
   // only written by the owner thread, which is the thread running this
   // callback.
   if (bridge_state != nullptr && bridge_state->agent->closing) bridge_state = nullptr;
+  GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
       bridge_state != nullptr
           ? bridge_state->agent->active_callback_ctx.load(std::memory_order_acquire)
@@ -3518,6 +3532,17 @@ extern "C" void snapi_bridge_unofficial_retain_env(SnapiEnvState* env_state) {
 
 extern "C" void snapi_bridge_unofficial_unretain_env(SnapiEnvState* env_state) {
   if (env_state != nullptr) DropEnvStateHolder(env_state);
+}
+
+// Nonzero if releasing `env_state` from this thread now would be refused:
+// another thread owns it, its agent's release is under way, or guest code an
+// env of its agent called into (a callback, finalizer or interrupt) is
+// running.
+extern "C" int snapi_bridge_unofficial_env_release_refused(SnapiEnvState* env_state) {
+  if (env_state == nullptr) return 0;
+  if (!OwnedByThisThread(env_state)) return 1;
+  const SnapiAgentState& agent = *env_state->agent;
+  return agent.closing || agent.guest_calls != 0 ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {

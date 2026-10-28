@@ -285,6 +285,13 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: u32,
 ) -> Result<i32, WasiError> {
     let scope_id = scope_ptr;
+    // Refuse before touching any of the env's bookkeeping, so the env stays
+    // usable and releasable afterwards.
+    if let Some(snapi_env_state) = env.data().napi_scope_env(scope_id)
+        && unsafe { snapi_bridge_unofficial_env_release_refused(snapi_env_state) } != 0
+    {
+        return Ok(crate::env::RELEASE_REFUSED);
+    }
     let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
     else {
         return Ok(1);
@@ -599,8 +606,8 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
 }
 
 fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
+    // Any env of this application, including one owned by another store.
+    env.data().terminate_app_env(napi_env)
 }
 
 fn guest_unofficial_napi_cancel_terminate_execution(

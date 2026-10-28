@@ -75,5 +75,7 @@ jobs:
 
       # WAT guests, each in its own Wasmer store and thread, against the real
       # C++ bridge and V8. No WASIX C toolchain is needed.
-      - name: Test concurrent environments
-        run: ./cargo-standalone.sh test --locked --test concurrent_envs
+      - name: Test concurrent environments and stores
+        run: >-
+          ./cargo-standalone.sh test --locked
+          --test concurrent_envs --test concurrent_stores

@@ -525,7 +525,7 @@ Every phase leaves the tests passing on V8, QuickJS and host-JS.
 |---|---|
 | `feat/contextify-enter-leave` | Superseded: "one realm per document or frame" becomes `create_realm` plus that env. Its commits are a list of the costs of a selectable context, which this design avoids: root vs selected context, the microtask queue split, finalizers and interrupts running in the wrong realm, the handle leak, and callback cost going from 5.9 to 11 ns. |
 | `perf/concurrent-envs` | Landed as #107 and merged into this branch. Its teardown and interrupt state is per agent (§11). |
-| `feat/concurrent-stores` | Land first. "Ids never reused" and "scope id = env id" become "agent id = principal env id". Terminate and interrupt then target the agent. |
+| `feat/concurrent-stores` | Landed as #108 and merged into this branch. Env ids are allocated per application and never reused, and an env's scope id is its env id, so a principal env's id also names its agent. |
 | `fix/contextify-weak-records`, `fix/quickjs-contextify-collect` | Land first. Their lifetime model is the realm-env lifetime in §4.5. |
 | `feat/trusted-script` | No conflict. Its hook is installed once per isolate, which is agent-level. |
 
@@ -605,10 +605,11 @@ is the QuickJS trampoline.
   callback registry and bindings.
 - **Scope frames remember the env that opened them.**
 - **The value cap counts across the agent's envs.**
-- **Threads and teardown (from #107):** `g_envs`, each thread's set of owned
-  envs and the `holders` count stay per env. The teardown state is per agent,
-  because releasing an env tears down its agent: `closing`, `stop_requested`,
-  `teardown_guest_calls` and pending interrupt requests.
+- **Threads and teardown (from #107 and #124):** `g_envs`, each thread's set
+  of owned envs and the `holders` count stay per env. The teardown state is
+  per agent, because releasing an env tears down its agent: `closing`,
+  `stop_requested`, `teardown_guest_calls`, pending interrupt requests, and
+  `guest_calls`, the guest code its envs called into that is still running.
 
 ### host-JS (`src/snapi_js.rs`)
 
