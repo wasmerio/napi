@@ -68,6 +68,21 @@ fn with_cb_context<R>(
     f: impl FnOnce() -> R,
 ) -> R {
     let snapi_env = env.data().resolve_napi_env(guest_env);
+    // Some embedders initialize N-API before promoting their Store into a
+    // JSPI-aware AsyncStore. Install its durable callback owner as soon as it
+    // becomes available, before saving the synchronous import guard's prior
+    // pointer. Promise jobs after this import must not retain a stack guard.
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    if !snapi_env.is_null()
+        && !env
+            .data()
+            .persistent_callback_contexts
+            .contains_key(&guest_env)
+    {
+        if let Some(async_env) = env.as_async_mut() {
+            install_persistent_callback_state(env, guest_env, snapi_env, async_env);
+        }
+    }
     publish_pending_host_buffer_copies(env, snapi_env);
     let result = with_callback_state(env, snapi_env, f);
     refresh_host_buffer_copies(env, snapi_env);
@@ -684,9 +699,29 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
 ) -> i32 {
     // The host JavaScript realm owns its Promise and task queues. One explicit
     // JSPI suspension is the only async scheduling primitive exposed to Edge.
+    let async_callback_env = env.as_mut();
     let env_handle = {
-        let env = env.read().await;
-        env.data().resolve_napi_env(napi_env)
+        let mut locked = env.write().await;
+        let mut sync_env = locked.as_function_env_mut();
+        let env_handle = sync_env.data().resolve_napi_env(napi_env);
+        // Initialization can run in a synchronous Store, before as_async_mut
+        // can discover the later JSPI owner. This import already has that
+        // durable owner explicitly: install it before yielding to native VM
+        // Promise jobs, which execute after synchronous import guards drop.
+        if !env_handle.is_null()
+            && !sync_env
+                .data()
+                .persistent_callback_contexts
+                .contains_key(&napi_env)
+        {
+            install_persistent_callback_state(
+                &mut sync_env,
+                napi_env,
+                env_handle,
+                async_callback_env,
+            );
+        }
+        env_handle
     };
     let (status, checkpoint_state) =
         with_callback_state_async(env.as_mut(), env_handle, async move {
