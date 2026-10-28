@@ -152,8 +152,40 @@ export function wasmer_napi_has_jspi() {
 export function wasmer_napi_instanceof(value, ctor) {
   return value instanceof ctor;
 }
+// Intrinsics captured at load, so page code replacing them changes nothing.
+const wasmerNapiGetPrototypeOf = Object.getPrototypeOf;
+const wasmerNapiFreeze = Object.freeze;
+const wasmerNapiSeal = Object.seal;
+const wasmerNapiKeys = Object.keys;
+const wasmerNapiIsArray = Array.isArray;
+const wasmerNapiConstruct = Reflect.construct;
+export function wasmer_napi_get_prototype(value) {
+  return wasmerNapiGetPrototypeOf(value);
+}
+export function wasmer_napi_object_freeze(value) {
+  wasmerNapiFreeze(value);
+}
+export function wasmer_napi_object_seal(value) {
+  wasmerNapiSeal(value);
+}
+export function wasmer_napi_own_keys(value) {
+  return wasmerNapiKeys(value);
+}
+// A type test that never throws, like V8's IsArray: Array.isArray throws on a
+// revoked Proxy.
+export function wasmer_napi_is_array(value) {
+  try {
+    return wasmerNapiIsArray(value);
+  } catch {
+    return false;
+  }
+}
+// An array's length, or -1 for anything else. A Proxy's get trap can throw.
+export function wasmer_napi_array_length(value) {
+  return wasmer_napi_is_array(value) ? value.length >>> 0 : -1;
+}
 export function wasmer_napi_new(ctor, args) {
-  return Reflect.construct(ctor, args);
+  return wasmerNapiConstruct(ctor, args);
 }
 export function wasmer_napi_symbol(description) {
   return Symbol(description);
@@ -1209,8 +1241,24 @@ extern "C" {
     fn wasmer_napi_finalizer_remove(queue: &Object, id: f64);
     fn wasmer_napi_finalizer_retry(queue: &Object, id: f64);
     fn wasmer_napi_has_jspi() -> bool;
-    fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> bool;
-    fn wasmer_napi_new(ctor: &Function, args: &Array) -> JsValue;
+    // These can run author JavaScript (Symbol.hasInstance, Proxy traps,
+    // constructors) or throw on their own (freezing a typed array), so they
+    // report exceptions.
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> Result<bool, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_get_prototype(value: &JsValue) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_object_freeze(value: &JsValue) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_object_seal(value: &JsValue) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_own_keys(value: &JsValue) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_array_length(value: &JsValue) -> Result<f64, JsValue>;
+    fn wasmer_napi_is_array(value: &JsValue) -> bool;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_new(ctor: &Function, args: &Array) -> Result<JsValue, JsValue>;
     fn wasmer_napi_symbol(description: &JsValue) -> JsValue;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_string(value: &JsValue) -> Result<JsValue, JsValue>;
@@ -2693,7 +2741,7 @@ macro_rules! type_test {
         }
     };
 }
-type_test!(snapi_bridge_is_array, |v: &JsValue| Array::is_array(v));
+type_test!(snapi_bridge_is_array, |v: &JsValue| wasmer_napi_is_array(v));
 type_test!(snapi_bridge_is_error, |v: &JsValue| v
     .is_instance_of::<Error>());
 type_test!(snapi_bridge_is_arraybuffer, |v: &JsValue| {
@@ -2851,10 +2899,15 @@ pub unsafe extern "C" fn snapi_bridge_get_array_length(
     let Some(value) = state.get(id) else {
         return NAPI_INVALID_ARG;
     };
-    if !Array::is_array(value) {
-        return NAPI_OBJECT_EXPECTED;
+    // A Proxy around an array runs its `get` trap here, which can throw.
+    match wasmer_napi_array_length(value) {
+        Ok(length) if length < 0.0 => NAPI_ARRAY_EXPECTED,
+        Ok(length) => unsafe { write(out, length as u32) }.map_or_else(|e| e, |_| NAPI_OK),
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
     }
-    unsafe { write(out, Array::from(value).length()) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
 #[unsafe(no_mangle)]
@@ -2863,10 +2916,26 @@ pub unsafe extern "C" fn snapi_bridge_get_property_names(
     id: u32,
     out: *mut u32,
 ) -> i32 {
-    unsafe {
-        reflect_op(env, out, |s| {
-            Ok(Object::keys(&Object::from(s.get(id).ok_or(JsValue::NULL)?.clone())).into())
-        })
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.get(id) else {
+        return NAPI_INVALID_ARG;
+    };
+    // As in Node, null and undefined have no properties; a Proxy's ownKeys
+    // trap can throw.
+    if value.is_null() || value.is_undefined() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    match wasmer_napi_own_keys(value) {
+        Ok(keys) => {
+            let id = state.insert(keys);
+            unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
     }
 }
 
@@ -3047,9 +3116,16 @@ pub unsafe extern "C" fn snapi_bridge_new_instance(
         };
         args.push(v);
     }
-    let value = wasmer_napi_new(&ctor, &args);
-    let id = state.insert(value);
-    unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
+    match wasmer_napi_new(&ctor, &args) {
+        Ok(value) => {
+            let id = state.insert(value);
+            unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -5794,8 +5870,15 @@ pub unsafe extern "C" fn snapi_bridge_instanceof(
     if !ctor.is_function() {
         return NAPI_FUNCTION_EXPECTED;
     }
-    unsafe { write(result, i32::from(wasmer_napi_instanceof(object, ctor))) }
-        .map_or_else(|err| err, |()| NAPI_OK)
+    match wasmer_napi_instanceof(object, ctor) {
+        Ok(is_instance) => {
+            unsafe { write(result, i32::from(is_instance)) }.map_or_else(|err| err, |()| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_coerce_to_bool(
@@ -6046,9 +6129,16 @@ pub unsafe extern "C" fn snapi_bridge_get_prototype(
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
-    let proto = Object::get_prototype_of(&Object::from(object.clone()));
-    let id = state.insert(proto.into());
-    unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
+    match wasmer_napi_get_prototype(object) {
+        Ok(proto) => {
+            let id = state.insert(proto);
+            unsafe { write(out_id, id) }.map_or_else(|err| err, |()| NAPI_OK)
+        }
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_object_freeze(env: SnapiEnv, obj_id: u32) -> i32 {
@@ -6058,8 +6148,13 @@ pub unsafe extern "C" fn snapi_bridge_object_freeze(env: SnapiEnv, obj_id: u32) 
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
-    Object::freeze(&Object::from(object.clone()));
-    NAPI_OK
+    match wasmer_napi_object_freeze(object) {
+        Ok(()) => NAPI_OK,
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_object_seal(env: SnapiEnv, obj_id: u32) -> i32 {
@@ -6069,8 +6164,13 @@ pub unsafe extern "C" fn snapi_bridge_object_seal(env: SnapiEnv, obj_id: u32) ->
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
-    Object::seal(&Object::from(object.clone()));
-    NAPI_OK
+    match wasmer_napi_object_seal(object) {
+        Ok(()) => NAPI_OK,
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 
 unsafe fn throw_c_error(env: SnapiEnv, code: *const i8, message: *const i8, kind: u8) -> i32 {
@@ -7164,6 +7264,85 @@ mod tests {
             assert_eq!(snapi_bridge_unofficial_release_env(first), NAPI_OK);
             assert_eq!(snapi_bridge_unofficial_release_env(second), NAPI_OK);
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn throwing_javascript_becomes_a_pending_exception() {
+        with_env(|env, state| {
+            let make = |source: &str| js_sys::eval(source).unwrap();
+            let proxy = state.insert(make(
+                "new Proxy([], { get() { throw new Error('get'); }, \
+                 getPrototypeOf() { throw new Error('getPrototypeOf'); }, \
+                 preventExtensions() { throw new Error('preventExtensions'); }, \
+                 ownKeys() { throw new Error('ownKeys'); } })",
+            ));
+            let typed_array = state.insert(make("new Uint8Array(4)"));
+            let object = state.insert(make("({})"));
+            let ctor = state.insert(make(
+                "(() => { const f = function () {}; \
+                 Object.defineProperty(f, Symbol.hasInstance, { value() { throw new Error('hasInstance'); } }); \
+                 return f; })()",
+            ));
+            let throwing_ctor =
+                state.insert(make("(function () { throw new Error('construct'); })"));
+            let revoked = state.insert(make(
+                "(() => { const { proxy, revoke } = Proxy.revocable([], {}); revoke(); return proxy; })()",
+            ));
+            let null = state.insert(JsValue::NULL);
+            let check = |message: &str, status: i32| {
+                assert_eq!(status, NAPI_PENDING_EXCEPTION, "{message}");
+                let error = unsafe { env_mut(env) }
+                    .unwrap()
+                    .last_exception
+                    .take()
+                    .expect("exception recorded");
+                let text = Error::from(error).message().as_string().unwrap();
+                assert!(text.contains(message), "{text} lacks {message}");
+            };
+            let (mut out, mut flag) = (0u32, 0i32);
+            unsafe {
+                check(
+                    "getPrototypeOf",
+                    snapi_bridge_get_prototype(env, proxy, &mut out),
+                );
+                check("get", snapi_bridge_get_array_length(env, proxy, &mut out));
+                check("preventExtensions", snapi_bridge_object_seal(env, proxy));
+                check(
+                    "hasInstance",
+                    snapi_bridge_instanceof(env, object, ctor, &mut flag),
+                );
+                check(
+                    "Cannot freeze",
+                    snapi_bridge_object_freeze(env, typed_array),
+                );
+                check(
+                    "construct",
+                    snapi_bridge_new_instance(env, throwing_ctor, 0, std::ptr::null(), &mut out),
+                );
+                check(
+                    "ownKeys",
+                    snapi_bridge_get_property_names(env, proxy, &mut out),
+                );
+                // Type checks don't throw, even on a revoked Proxy, and
+                // report a status rather than an exception.
+                flag = 1;
+                assert_eq!(snapi_bridge_is_array(env, revoked, &mut flag), NAPI_OK);
+                assert_eq!(flag, 0);
+                assert_eq!(
+                    snapi_bridge_get_array_length(env, revoked, &mut out),
+                    NAPI_ARRAY_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_get_array_length(env, object, &mut out),
+                    NAPI_ARRAY_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_get_property_names(env, null, &mut out),
+                    NAPI_OBJECT_EXPECTED
+                );
+            }
+            assert!(unsafe { env_mut(env) }.unwrap().last_exception.is_none());
+        });
     }
 
     #[wasm_bindgen_test]
