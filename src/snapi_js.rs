@@ -71,6 +71,80 @@ fn next_serialized_message(scope: u32) -> Option<u32> {
 #[wasm_bindgen(inline_js = r#"
 import { parse as wasmerNapiParse } from 'acorn';
 
+// Objects with a guest finalizer. The host's FinalizationRegistry reports each
+// collection by queueing the object's id, so a drain takes only what is ready
+// instead of checking every object. Guest finalizers still run on the ordinary
+// N-API drain, never in a host GC callback. An env's two lists (finalizers and
+// buffer finalizers) share one registry, so the host reports an object's
+// collection to both in the same task. Host intrinsics are captured before
+// author code can replace globals or prototypes.
+const wasmerNapiFinalizerRegistry = globalThis.FinalizationRegistry;
+const wasmerNapiFinalizerMap = globalThis.Map;
+const wasmerNapiFinalizerGet = Function.call.bind(Map.prototype.get);
+const wasmerNapiFinalizerSet = Function.call.bind(Map.prototype.set);
+const wasmerNapiFinalizerDelete = Function.call.bind(Map.prototype.delete);
+const wasmerNapiFinalizerRegister = Function.call.bind(FinalizationRegistry.prototype.register);
+const wasmerNapiFinalizerUnregister = Function.call.bind(FinalizationRegistry.prototype.unregister);
+export function wasmer_napi_finalizer_registry_create() {
+  // id -> {token, queue} for each object still watched.
+  const watched = new wasmerNapiFinalizerMap();
+  const registry = new wasmerNapiFinalizerRegistry(id => {
+    const entry = wasmerNapiFinalizerGet(watched, id);
+    if (entry === undefined) return;
+    wasmerNapiFinalizerDelete(watched, id);
+    entry.queue.enqueue(id);
+  });
+  return {watched, registry, next: 1};
+}
+export function wasmer_napi_finalizer_queue_create(shared) {
+  const ready = new wasmerNapiFinalizerMap();
+  let head = null, tail = null;
+  const unqueue = id => {
+    const node = wasmerNapiFinalizerGet(ready, id);
+    if (node === undefined) return;
+    if (node.previous) node.previous.next = node.next; else head = node.next;
+    if (node.next) node.next.previous = node.previous; else tail = node.previous;
+    wasmerNapiFinalizerDelete(ready, id);
+  };
+  const queue = {
+    register(target) {
+      // Ids are never reused, including after remove_wrap or a failed call.
+      // They stay exact up to 2^53 - 1 (Number.MAX_SAFE_INTEGER).
+      if (shared.next > 9007199254740991) return 0;
+      const id = shared.next++, token = {};
+      wasmerNapiFinalizerRegister(shared.registry, target, id, token);
+      wasmerNapiFinalizerSet(shared.watched, id, {token, queue});
+      return id;
+    },
+    enqueue(id) {
+      if (wasmerNapiFinalizerGet(ready, id) !== undefined) return;
+      const node = {id, previous: tail, next: null};
+      wasmerNapiFinalizerSet(ready, id, node);
+      if (tail) tail.next = node; else head = node;
+      tail = node;
+    },
+    take() {
+      if (!head) return 0;
+      const id = head.id;
+      unqueue(id);
+      return id;
+    },
+    remove(id) {
+      const entry = wasmerNapiFinalizerGet(shared.watched, id);
+      if (entry !== undefined) {
+        wasmerNapiFinalizerDelete(shared.watched, id);
+        wasmerNapiFinalizerUnregister(shared.registry, entry.token);
+      }
+      unqueue(id);
+    },
+  };
+  return queue;
+}
+export function wasmer_napi_finalizer_register(queue, target) { return queue.register(target); }
+export function wasmer_napi_finalizer_take(queue) { return queue.take(); }
+export function wasmer_napi_finalizer_remove(queue, id) { queue.remove(id); }
+export function wasmer_napi_finalizer_retry(queue, id) { queue.enqueue(id); }
+
 export function wasmer_napi_has_jspi() {
   return typeof WebAssembly.Suspending === 'function' &&
          typeof WebAssembly.promising === 'function';
@@ -1128,6 +1202,12 @@ extern "C" {
     ) -> Promise;
     fn wasmer_napi_has_pending_provider_work() -> bool;
     fn wasmer_napi_get_promise_details(promise: &JsValue) -> Array;
+    fn wasmer_napi_finalizer_registry_create() -> Object;
+    fn wasmer_napi_finalizer_queue_create(shared: &Object) -> Object;
+    fn wasmer_napi_finalizer_register(queue: &Object, target: &JsValue) -> f64;
+    fn wasmer_napi_finalizer_take(queue: &Object) -> f64;
+    fn wasmer_napi_finalizer_remove(queue: &Object, id: f64);
+    fn wasmer_napi_finalizer_retry(queue: &Object, id: f64);
     fn wasmer_napi_has_jspi() -> bool;
     fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> bool;
     fn wasmer_napi_new(ctor: &Function, args: &Array) -> JsValue;
@@ -1304,7 +1384,7 @@ struct ValueFrame {
 }
 
 struct GuestFinalizer {
-    target: WeakRef<Object>,
+    id: u64,
     guest_env: u32,
     wasm_fn_ptr: u32,
     data: u32,
@@ -1313,10 +1393,48 @@ struct GuestFinalizer {
 }
 
 struct GuestBufferFinalizer {
-    target: WeakRef<Object>,
+    id: u64,
     handle_id: u32,
     guest_ptr: u32,
     recyclable: bool,
+}
+
+/// The host side of a finalizer list: which of its objects were collected.
+/// Ids are nonzero and never reused.
+struct FinalizerQueue(Object);
+
+impl FinalizerQueue {
+    /// An env's finalizer and buffer finalizer lists, watched by one registry
+    /// so that the host reports an object's collection to both together.
+    fn pair() -> (Self, Self) {
+        let shared = wasmer_napi_finalizer_registry_create();
+        (
+            Self(wasmer_napi_finalizer_queue_create(&shared)),
+            Self(wasmer_napi_finalizer_queue_create(&shared)),
+        )
+    }
+
+    /// Watches `target`; None once 2^53 - 1 ids have been handed out.
+    fn register(&self, target: &JsValue) -> Option<u64> {
+        let id = wasmer_napi_finalizer_register(&self.0, target);
+        (id > 0.0).then_some(id as u64)
+    }
+
+    /// The next collected object's id, oldest first.
+    fn take(&self) -> Option<u64> {
+        let id = wasmer_napi_finalizer_take(&self.0);
+        (id > 0.0).then_some(id as u64)
+    }
+
+    /// Stops watching `id` and drops it from the ready queue.
+    fn remove(&self, id: u64) {
+        wasmer_napi_finalizer_remove(&self.0, id as f64);
+    }
+
+    /// Queues `id` again, for a finalizer that was taken but couldn't run yet.
+    fn retry(&self, id: u64) {
+        wasmer_napi_finalizer_retry(&self.0, id as f64);
+    }
 }
 
 struct SyntheticModule {
@@ -1371,7 +1489,14 @@ struct HostJsEnv {
     instance_data: u64,
     wraps: IdHashMap<u32, u64>,
     guest_finalizers: Vec<GuestFinalizer>,
+    // Position of each finalizer in guest_finalizers, by id.
+    guest_finalizer_indices: IdHashMap<u64, usize>,
+    // The finalizer napi_wrap registered for each wrap id.
+    wrap_finalizers: IdHashMap<u32, u64>,
+    guest_finalizer_queue: FinalizerQueue,
     guest_buffer_finalizers: Vec<GuestBufferFinalizer>,
+    guest_buffer_finalizer_indices: IdHashMap<u64, usize>,
+    guest_buffer_finalizer_queue: FinalizerQueue,
     externals: IdHashMap<u32, u64>,
     backing_tokens: IdHashMap<u32, u64>,
     type_tags: IdHashMap<u32, (u64, u64)>,
@@ -1413,6 +1538,7 @@ fn host_js_source_for_shape(
 impl HostJsEnv {
     fn new() -> Self {
         // Handle zero is N-API's null pointer sentinel, never a JS value.
+        let (guest_finalizer_queue, guest_buffer_finalizer_queue) = FinalizerQueue::pair();
         Self {
             values: Vec::new(),
             value_live: Vec::new(),
@@ -1448,7 +1574,12 @@ impl HostJsEnv {
             instance_data: 0,
             wraps: IdHashMap::default(),
             guest_finalizers: Vec::new(),
+            guest_finalizer_indices: IdHashMap::default(),
+            wrap_finalizers: IdHashMap::default(),
+            guest_finalizer_queue,
             guest_buffer_finalizers: Vec::new(),
+            guest_buffer_finalizer_indices: IdHashMap::default(),
+            guest_buffer_finalizer_queue,
             externals: IdHashMap::default(),
             backing_tokens: IdHashMap::default(),
             type_tags: IdHashMap::default(),
@@ -1570,9 +1701,11 @@ impl HostJsEnv {
         if !value.is_object() && !value.is_function() {
             return false;
         }
-        let target = WeakRef::new(&value.unchecked_into::<Object>());
-        self.guest_finalizers.push(GuestFinalizer {
-            target,
+        let Some(id) = self.guest_finalizer_queue.register(&value) else {
+            return false;
+        };
+        self.push_guest_finalizer(GuestFinalizer {
+            id,
             guest_env,
             wasm_fn_ptr,
             data,
@@ -1582,20 +1715,67 @@ impl HostJsEnv {
         true
     }
 
-    fn take_ready_guest_finalizer(&mut self, force: bool) -> Option<GuestFinalizer> {
-        let index = self
-            .guest_finalizers
-            .iter()
-            .position(|record| force || record.target.deref().is_none())?;
-        Some(self.guest_finalizers.swap_remove(index))
+    fn push_guest_finalizer(&mut self, record: GuestFinalizer) {
+        self.guest_finalizer_indices
+            .insert(record.id, self.guest_finalizers.len());
+        if let Some(wrap_id) = record.wrap_id {
+            self.wrap_finalizers.insert(wrap_id, record.id);
+        }
+        self.guest_finalizers.push(record);
     }
 
+    fn remove_guest_finalizer(&mut self, id: u64) -> Option<GuestFinalizer> {
+        let index = self.guest_finalizer_indices.remove(&id)?;
+        let record = self.guest_finalizers.swap_remove(index);
+        if let Some(moved) = self.guest_finalizers.get(index) {
+            self.guest_finalizer_indices.insert(moved.id, index);
+        }
+        if let Some(wrap_id) = record.wrap_id
+            && self.wrap_finalizers.get(&wrap_id) == Some(&id)
+        {
+            self.wrap_finalizers.remove(&wrap_id);
+        }
+        self.guest_finalizer_queue.remove(id);
+        Some(record)
+    }
+
+    /// A finalizer whose object was collected (any finalizer when `force`).
+    fn take_ready_guest_finalizer(&mut self, force: bool) -> Option<GuestFinalizer> {
+        if force {
+            let id = self.guest_finalizers.last()?.id;
+            return self.remove_guest_finalizer(id);
+        }
+        loop {
+            let id = self.guest_finalizer_queue.take()?;
+            // An id removed after its collection was reported has no record.
+            if let Some(record) = self.remove_guest_finalizer(id) {
+                return Some(record);
+            }
+        }
+    }
+
+    fn remove_guest_buffer_finalizer(&mut self, id: u64) -> Option<GuestBufferFinalizer> {
+        let index = self.guest_buffer_finalizer_indices.remove(&id)?;
+        let record = self.guest_buffer_finalizers.swap_remove(index);
+        if let Some(moved) = self.guest_buffer_finalizers.get(index) {
+            self.guest_buffer_finalizer_indices.insert(moved.id, index);
+        }
+        self.guest_buffer_finalizer_queue.remove(id);
+        Some(record)
+    }
+
+    /// A buffer finalizer whose object was collected (any one when `force`).
     fn take_ready_guest_buffer_finalizer(&mut self, force: bool) -> Option<GuestBufferFinalizer> {
-        let index = self
-            .guest_buffer_finalizers
-            .iter()
-            .position(|record| force || record.target.deref().is_none())?;
-        Some(self.guest_buffer_finalizers.swap_remove(index))
+        if force {
+            let id = self.guest_buffer_finalizers.last()?.id;
+            return self.remove_guest_buffer_finalizer(id);
+        }
+        loop {
+            let id = self.guest_buffer_finalizer_queue.take()?;
+            if let Some(record) = self.remove_guest_buffer_finalizer(id) {
+                return Some(record);
+            }
+        }
     }
 
     fn backing_store_token(&mut self, id: u32) -> Option<u64> {
@@ -3285,7 +3465,13 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
         };
         state.close_value_frame(value_frame);
         if result == CALLBACK_DEFERRED {
-            state.guest_finalizers.push(record);
+            // Callback admission can defer after collection has been reported.
+            // Keep that record ready without needing another GC notification.
+            // A forced drain took it without a report, so it isn't ready.
+            if !force {
+                state.guest_finalizer_queue.retry(record.id);
+            }
+            state.push_guest_finalizer(record);
             return NAPI_OK;
         }
         if let Some(wrap_id) = record.wrap_id {
@@ -3545,8 +3731,14 @@ pub unsafe extern "C" fn snapi_bridge_register_guest_buffer_finalizer(
     if !value.is_object() && !value.is_function() {
         return NAPI_INVALID_ARG;
     }
+    let Some(id) = state.guest_buffer_finalizer_queue.register(&value) else {
+        return NAPI_GENERIC_FAILURE;
+    };
+    state
+        .guest_buffer_finalizer_indices
+        .insert(id, state.guest_buffer_finalizers.len());
     state.guest_buffer_finalizers.push(GuestBufferFinalizer {
-        target: WeakRef::new(&value.unchecked_into::<Object>()),
+        id,
         handle_id: value_id,
         guest_ptr,
         recyclable: recyclable != 0,
@@ -3668,8 +3860,9 @@ pub unsafe extern "C" fn snapi_bridge_remove_wrap(e: SnapiEnv, o: u32, d: *mut u
     let Some(v) = s.wraps.remove(&wrap_id) else {
         return NAPI_INVALID_ARG;
     };
-    s.guest_finalizers
-        .retain(|record| record.wrap_id != Some(wrap_id));
+    if let Some(id) = s.wrap_finalizers.get(&wrap_id).copied() {
+        s.remove_guest_finalizer(id);
+    }
     unsafe { write(d, v) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 #[unsafe(no_mangle)]
@@ -6904,6 +7097,120 @@ mod tests {
         assert_eq!(state.wrap_id(number, true), None);
         let other = state.insert(Object::new().into());
         assert_eq!(state.wrap_id(other, true), Some(id + 1));
+    }
+
+    fn assert_finalizers_indexed(state: &HostJsEnv) {
+        assert_eq!(
+            state.guest_finalizer_indices.len(),
+            state.guest_finalizers.len()
+        );
+        for (index, record) in state.guest_finalizers.iter().enumerate() {
+            assert_eq!(state.guest_finalizer_indices.get(&record.id), Some(&index));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn finalizers_are_taken_once_collected() {
+        with_env(|_, state| {
+            for data in 0..1000 {
+                let object = state.insert(Object::new().into());
+                assert!(state.register_guest_finalizer(object, 1, 2, data, 0, None));
+            }
+            // Nothing was collected, so there is nothing to take.
+            assert!(state.take_ready_guest_finalizer(false).is_none());
+            // Queue two ids as the host does when it collects their objects.
+            let ids: Vec<u64> = state.guest_finalizers.iter().map(|r| r.id).collect();
+            state.guest_finalizer_queue.retry(ids[10]);
+            state.guest_finalizer_queue.retry(ids[999]);
+            assert_eq!(state.take_ready_guest_finalizer(false).unwrap().data, 10);
+            assert_eq!(state.take_ready_guest_finalizer(false).unwrap().data, 999);
+            assert!(state.take_ready_guest_finalizer(false).is_none());
+            assert_finalizers_indexed(state);
+            // Releasing the env takes the rest.
+            let mut rest = 0;
+            while state.take_ready_guest_finalizer(true).is_some() {
+                rest += 1;
+            }
+            assert_eq!(rest, 998);
+            assert!(state.guest_finalizer_indices.is_empty());
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn remove_wrap_drops_its_finalizer() {
+        with_env(|env, state| {
+            let other = state.insert(Object::new().into());
+            assert!(state.register_guest_finalizer(other, 1, 2, 7, 0, None));
+            let object = state.insert(Object::new().into());
+            let wrap_id = state.wrap_id(object, true).unwrap();
+            assert!(state.register_guest_finalizer(object, 1, 2, 8, 0, Some(wrap_id)));
+            state.wraps.insert(wrap_id, 42);
+            // Even after its collection was reported, removing the wrap
+            // cancels the finalizer.
+            let first = state.wrap_finalizers[&wrap_id];
+            state.guest_finalizer_queue.retry(first);
+            let mut native = 0u64;
+            assert_eq!(
+                unsafe { snapi_bridge_remove_wrap(env, object, &mut native) },
+                NAPI_OK
+            );
+            assert_eq!(native, 42);
+            let state = unsafe { env_mut(env) }.unwrap();
+            assert!(state.wrap_finalizers.is_empty());
+            assert!(state.take_ready_guest_finalizer(false).is_none());
+            assert_finalizers_indexed(state);
+            // Wrapping the object again registers a new finalizer under the
+            // same wrap id; a late report of the first one finds nothing.
+            assert!(state.register_guest_finalizer(object, 1, 2, 9, 0, Some(wrap_id)));
+            state.wraps.insert(wrap_id, 43);
+            let second = state.wrap_finalizers[&wrap_id];
+            assert_ne!(second, first);
+            state.guest_finalizer_queue.retry(first);
+            assert!(state.take_ready_guest_finalizer(false).is_none());
+            state.guest_finalizer_queue.retry(second);
+            assert_eq!(state.take_ready_guest_finalizer(false).unwrap().data, 9);
+            assert!(state.wrap_finalizers.is_empty());
+            assert_eq!(state.take_ready_guest_finalizer(true).unwrap().data, 7);
+            assert!(state.take_ready_guest_finalizer(true).is_none());
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn buffer_finalizers_are_taken_once_collected() {
+        with_env(|env, state| {
+            let handles: Vec<u32> = (0..3).map(|_| state.insert(Object::new().into())).collect();
+            for (ptr, &handle) in handles.iter().enumerate() {
+                assert_eq!(
+                    unsafe {
+                        snapi_bridge_register_guest_buffer_finalizer(env, handle, ptr as u32, 1)
+                    },
+                    NAPI_OK
+                );
+            }
+            let state = unsafe { env_mut(env) }.unwrap();
+            let id = state.guest_buffer_finalizers[1].id;
+            state.guest_buffer_finalizer_queue.retry(id);
+            let take = |force| {
+                let (mut handle, mut ptr, mut recyclable) = (0, 0, 0);
+                let status = unsafe {
+                    snapi_bridge_take_ready_guest_buffer_finalizer(
+                        env,
+                        force,
+                        &mut handle,
+                        &mut ptr,
+                        &mut recyclable,
+                    )
+                };
+                (status == NAPI_OK).then_some((handle, ptr, recyclable))
+            };
+            assert_eq!(take(0), Some((handles[1], 1, 1)));
+            assert_eq!(take(0), None, "nothing else was collected");
+            // Releasing the env takes the rest, in any order.
+            let mut rest = vec![take(1).unwrap(), take(1).unwrap()];
+            rest.sort();
+            assert_eq!(rest, [(handles[0], 0, 1), (handles[2], 2, 1)]);
+            assert_eq!(take(1), None);
+        });
     }
 
     #[wasm_bindgen_test]
