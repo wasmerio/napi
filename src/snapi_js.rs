@@ -726,7 +726,15 @@ export function wasmer_napi_compile_module(scope, source, filename) {
   const requestIndex = (node) => {
     const specifier = String(node.source.value);
     const index = requests.length;
-    requests.push({ specifier, phase: 2, attributes: Object.create(null) });
+    // Acorn surfaces `with { ... }` import attributes on import/export
+    // declarations; Node's ESM loader rejects JSON modules without them.
+    const attributes = Object.create(null);
+    for (const attribute of node.attributes ?? []) {
+      const key = attribute.key.type === 'Identifier'
+        ? attribute.key.name : String(attribute.key.value);
+      attributes[key] = String(attribute.value.value);
+    }
+    requests.push({ specifier, phase: 2, attributes });
     return index;
   };
   const text = (node) => source.slice(node.start, node.end);
