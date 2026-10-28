@@ -601,9 +601,19 @@ napi_env GetModuleWrapEnvForIsolate(v8::Isolate* isolate) {
   return g_module_wrap_states.count(env) != 0 ? env : nullptr;
 }
 
-ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
+// g_module_wrap_states and g_module_wrap_cleanup_hooks are shared by every
+// env, and envs on different threads run concurrently, so every lookup,
+// insertion and erasure takes g_module_wrap_mu. Map nodes are stable and an
+// env's state is only used on that env's own thread, so a returned pointer
+// stays valid without the lock until the env's cleanup hook erases it.
+ModuleWrapBindingState* GetModuleWrapStateLocked(napi_env env) {
   if (env == nullptr) return nullptr;
   return &g_module_wrap_states[env];
+}
+
+ModuleWrapBindingState* GetModuleWrapState(napi_env env) {
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  return GetModuleWrapStateLocked(env);
 }
 
 void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
@@ -840,10 +850,13 @@ void CleanupModuleWrapState(void* arg) {
 }
 
 void EnsureModuleWrapCleanupHook(napi_env env) {
-  auto [it, inserted] = g_module_wrap_cleanup_hooks.emplace(env);
-  if (!inserted) return;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    if (!g_module_wrap_cleanup_hooks.emplace(env).second) return;
+  }
   if (napi_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
-    g_module_wrap_cleanup_hooks.erase(it);
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    g_module_wrap_cleanup_hooks.erase(env);
   }
 }
 
@@ -1278,12 +1291,17 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
                                     v8::Local<v8::Object> meta) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return;
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
+  ModuleWrapBindingState* state = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+    auto it = g_module_wrap_states.find(env);
+    if (it == g_module_wrap_states.end()) return;
+    state = &it->second;
+  }
   ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
   if (record == nullptr) return;
 
-  napi_value callback = GetRefValue(env, it->second.initialize_import_meta_ref);
+  napi_value callback = GetRefValue(env, state->initialize_import_meta_ref);
   napi_value wrapper = GetRefValue(env, record->wrapper_ref);
   napi_value id_value = GetRefValue(env, record->host_defined_option_ref);
   if (callback == nullptr || wrapper == nullptr || id_value == nullptr) return;
@@ -1649,15 +1667,21 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
 
-  std::lock_guard<std::mutex> lock(g_context_mu);
-  auto it = g_context_records.find(env);
-  if (it == g_context_records.end()) return;
-
-  for (auto& rec : it->second) {
-    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
-    if (!context.IsEmpty()) {
-      NapiV8ApplyPromiseHooksToContext(env, context);
+  // Collect the contexts first. Applying hooks takes g_runtime_mu, and the
+  // prepare-stack-trace path takes g_runtime_mu before g_context_mu, so
+  // g_context_mu must not be held here while envs run concurrently.
+  std::vector<v8::Local<v8::Context>> contexts;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mu);
+    auto it = g_context_records.find(env);
+    if (it == g_context_records.end()) return;
+    for (auto& rec : it->second) {
+      v8::Local<v8::Context> context = rec.context.Get(env->isolate);
+      if (!context.IsEmpty()) contexts.push_back(context);
     }
+  }
+  for (const auto& context : contexts) {
+    NapiV8ApplyPromiseHooksToContext(env, context);
   }
 }
 
@@ -2508,7 +2532,7 @@ static napi_status CreateSourceTextModule(
 
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
+    GetModuleWrapStateLocked(env)->modules.push_back(record);
   }
   *module_out = ModuleHandle(record);
   return napi_ok;
@@ -2567,7 +2591,7 @@ static napi_status CreateSyntheticModule(
 
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->modules.push_back(record);
+    GetModuleWrapStateLocked(env)->modules.push_back(record);
   }
   *module_out = ModuleHandle(record);
   return napi_ok;
@@ -3010,7 +3034,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
 
   EnsureModuleWrapCleanupHook(env);
   std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-  auto* state = GetModuleWrapState(env);
+  auto* state = GetModuleWrapStateLocked(env);
   ResetRef(env, &state->import_module_dynamically_ref);
   ResetRef(env, &state->initialize_import_meta_ref);
   state->import_module_dynamically_ref = import_ref;
@@ -3051,12 +3075,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = record;
+    GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = record;
   }
   const bool instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
-    GetModuleWrapState(env)->temporary_required_module_facade_original = nullptr;
+    GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;
   }
   if (!instantiated) return napi_pending_exception;
 

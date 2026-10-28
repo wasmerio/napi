@@ -437,9 +437,10 @@ realm can still be reachable.
 - **Guest value ids become agent-scoped**, so they stay valid across that
   agent's realms.
 - **`g_envs` validation** maps env → agent.
-- **Lock scope (side benefit).** With an agent object it is natural to replace
-  the process-global `g_mu`, taken on every `unofficial_*` call, with a
-  per-agent lock.
+- **Lock scope.** #107 already narrowed the process-global `g_mu`: it guards
+  only the env registry, teardown and interrupt bookkeeping, and the message
+  table. No call into the engine or guest holds it, except a terminate or
+  interrupt from another thread.
 
 ### Rust (`src/env.rs`, `src/guest/napi.rs`)
 
@@ -523,7 +524,8 @@ Every phase leaves the tests passing on V8, QuickJS and host-JS.
 | Branch | Recommendation |
 |---|---|
 | `feat/contextify-enter-leave` | Superseded: "one realm per document or frame" becomes `create_realm` plus that env. Its commits are a list of the costs of a selectable context, which this design avoids: root vs selected context, the microtask queue split, finalizers and interrupts running in the wrong realm, the handle leak, and callback cost going from 5.9 to 11 ns. |
-| `feat/concurrent-stores`, `perf/concurrent-envs` | Land first. "Ids never reused" and "scope id = env id" become "agent id = principal env id". Terminate and interrupt then target the agent. |
+| `perf/concurrent-envs` | Landed as #107 and merged into this branch. Its teardown and interrupt state is per agent (§11). |
+| `feat/concurrent-stores` | Land first. "Ids never reused" and "scope id = env id" become "agent id = principal env id". Terminate and interrupt then target the agent. |
 | `fix/contextify-weak-records`, `fix/quickjs-contextify-collect` | Land first. Their lifetime model is the realm-env lifetime in §4.5. |
 | `feat/trusted-script` | No conflict. Its hook is installed once per isolate, which is agent-level. |
 
@@ -603,7 +605,10 @@ is the QuickJS trampoline.
   callback registry and bindings.
 - **Scope frames remember the env that opened them.**
 - **The value cap counts across the agent's envs.**
-- **Unchanged:** `g_mu` and `g_envs`.
+- **Threads and teardown (from #107):** `g_envs`, each thread's set of owned
+  envs and the `holders` count stay per env. The teardown state is per agent,
+  because releasing an env tears down its agent: `closing`, `stop_requested`,
+  `teardown_guest_calls` and pending interrupt requests.
 
 ### host-JS (`src/snapi_js.rs`)
 
