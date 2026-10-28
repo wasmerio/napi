@@ -285,6 +285,13 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: u32,
 ) -> Result<i32, WasiError> {
     let scope_id = scope_ptr;
+    // Refuse from inside the env's own callbacks before touching any of its
+    // bookkeeping, so the guest can still use and release it afterwards.
+    if let Some(snapi_env_state) = env.data().napi_scope_env(scope_id)
+        && unsafe { snapi_bridge_unofficial_env_in_guest_call(snapi_env_state) } != 0
+    {
+        return Ok(crate::env::RELEASE_REFUSED);
+    }
     let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
     else {
         return Ok(1);

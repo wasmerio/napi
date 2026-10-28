@@ -81,15 +81,17 @@ const WAT: &str = r#"(module
   ;; 64..76 finalizer scratch, 128..168 module create options,
   ;; 168..177 module create result.
   (memory (export "memory") 2)
-  (table (export "__indirect_function_table") 4 funcref)
+  (table (export "__indirect_function_table") 6 funcref)
   (global $env (mut i32) (i32.const 0))
   (global $scope (mut i32) (i32.const 0))
   (global $interrupted (mut i32) (i32.const 0))
+  (global $release_status (mut i32) (i32.const -1))
   (data (i32.const 100) "shared\00")
   (data (i32.const 108) "signal\00")
   (data (i32.const 116) "test.js\00")
   (data (i32.const 180) "test.mjs\00")
   (data (i32.const 200) "const end = Date.now() + 30000; while (Date.now() < end) {}\00")
+  (data (i32.const 280) "release_self\00")
 
   (func $string (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -109,6 +111,13 @@ const WAT: &str = r#"(module
     (if (call $get_global (global.get $env) (i32.const 48)) (then unreachable))
     (if (call $set_named_property (global.get $env) (i32.load (i32.const 48))
           (i32.const 108) (i32.load (i32.const 52)))
+      (then unreachable))
+    ;; globalThis.release_self = <guest function releasing this env>
+    (if (call $create_function (global.get $env) (i32.const 280) (i32.const 12)
+          (i32.const 4) (i32.const 0) (i32.const 52))
+      (then unreachable))
+    (if (call $set_named_property (global.get $env) (i32.load (i32.const 48))
+          (i32.const 280) (i32.load (i32.const 52)))
       (then unreachable))
     (global.get $env))
 
@@ -188,6 +197,9 @@ const WAT: &str = r#"(module
   (func (export "interrupt") (param $env i32) (result i32)
     (call $request_interrupt (local.get $env) (i32.const 1) (i32.const 777)))
   (func (export "interrupted") (result i32) (global.get $interrupted))
+  (func (export "interrupt_release") (param $env i32) (result i32)
+    (call $request_interrupt (local.get $env) (i32.const 5) (i32.const 0)))
+  (func (export "release_status") (result i32) (global.get $release_status))
 
   ;; Interrupt callback: record `data` if it runs for this guest's own env.
   (func $on_interrupt (param $env i32) (param $data i32) (result i32)
@@ -205,7 +217,15 @@ const WAT: &str = r#"(module
     (if (call $create_string (local.get $env) (i32.const 200) (i32.const -1) (i32.const 68))
       (then (return)))
     (drop (call $run_script (local.get $env) (i32.load (i32.const 68)) (i32.const 72))))
-  (elem (i32.const 1) $on_interrupt $on_signal $on_finalize)
+  ;; globalThis.release_self() and the interrupt from `interrupt_release`:
+  ;; release this guest's own env and record the status.
+  (func $on_release_self (param $env i32) (param $info i32) (result i32)
+    (global.set $release_status (call $release_env (global.get $scope) (i32.const 0)))
+    (i32.const 0))
+  (func $on_interrupt_release (param $env i32) (param $data i32) (result i32)
+    (global.set $release_status (call $release_env (global.get $scope) (i32.const 0)))
+    (i32.const 0))
+  (elem (i32.const 1) $on_interrupt $on_signal $on_finalize $on_release_self $on_interrupt_release)
 
   ;; Attaches the spinning finalizer to an object that lives until the env is
   ;; released, so the finalizer runs during release.
@@ -405,5 +425,17 @@ impl Guest {
     /// env, -1 if it ran for another env, 0 if it never ran.
     pub fn interrupted(&mut self) -> i32 {
         self.call0("interrupted")
+    }
+
+    /// Requests an interrupt on `env` whose callback releases this guest's
+    /// own env; see [`Self::release_status`].
+    pub fn interrupt_release(&mut self, env: i32) -> i32 {
+        self.call1("interrupt_release", env)
+    }
+
+    /// The status of the last release attempted by `release_self()` or the
+    /// interrupt from [`Self::interrupt_release`], or -1 if none ran.
+    pub fn release_status(&mut self) -> i32 {
+        self.call0("release_status")
     }
 }

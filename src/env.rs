@@ -25,8 +25,9 @@ use crate::snapi::{
 };
 
 /// The status the bridge returns when it refuses to release an env: a call
-/// from a thread other than the env's owner, or a release already under way.
-/// Any other status means the env was torn down.
+/// from a thread other than the env's owner, a release already under way, or
+/// a call from guest code the env called into. Any other status means the env
+/// was torn down.
 pub(crate) const RELEASE_REFUSED: i32 = 1;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -592,6 +593,12 @@ impl NapiEnv {
         let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
         self.finish_unregister_napi_env(env_id, env, 0);
         Some(env)
+    }
+
+    /// The env an owner scope id stands for, if the scope is registered.
+    pub(crate) fn napi_scope_env(&self, scope_id: u32) -> Option<SnapiEnv> {
+        let env_id = self.napi_scopes.get(&scope_id)?;
+        self.napi_envs.get(env_id).map(|env| *env as SnapiEnv)
     }
 
     pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> SnapiEnv {
