@@ -587,10 +587,10 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: u32,
 ) -> i32 {
     let scope_id = scope_ptr;
-    // Refuse from inside the env's own callbacks before touching any of its
-    // bookkeeping, so the guest can still use and release it afterwards.
+    // Refuse before touching any of the env's bookkeeping, so the env stays
+    // usable and releasable afterwards.
     if let Some(snapi_env_state) = env.data().napi_scope_env(scope_id)
-        && unsafe { snapi_bridge_unofficial_env_in_guest_call(snapi_env_state) } != 0
+        && unsafe { snapi_bridge_unofficial_env_release_refused(snapi_env_state) } != 0
     {
         return crate::env::RELEASE_REFUSED;
     }

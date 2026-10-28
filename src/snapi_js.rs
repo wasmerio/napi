@@ -1483,10 +1483,6 @@ struct HostJsEnv {
     next_callback: u32,
     callback_regs: IdHashMap<u32, CallbackReg>,
     next_cbinfo: u32,
-    /// Guest code this env called into (a callback or finalizer) that is still
-    /// running. The env is used again once it returns, so it can't be
-    /// released meanwhile.
-    guest_calls: u32,
     callback_infos: IdHashMap<u32, CallbackInfo>,
     pending_callbacks: VecDeque<PendingCallback>,
     closures: Vec<CallbackClosure>,
@@ -1572,7 +1568,6 @@ impl HostJsEnv {
             next_callback: 1,
             callback_regs: IdHashMap::default(),
             next_cbinfo: 1,
-            guest_calls: 0,
             callback_infos: IdHashMap::default(),
             pending_callbacks: VecDeque::new(),
             closures: Vec::new(),
@@ -1901,6 +1896,18 @@ thread_local! {
     // call before every operation doubles the host boundary crossings on the
     // hottest path without changing observable state.
     static ACTIVE_HOST_JS_ENV: Cell<usize> = const { Cell::new(0) };
+    // Guest code running on this thread, called into by any env. All envs
+    // share one JavaScript realm, so guest code reached through one env can
+    // reach the others, whose bridge calls may be on the stack below it.
+    static GUEST_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs guest code, counted in `GUEST_CALL_DEPTH` meanwhile.
+pub(crate) fn call_guest<R>(call: impl FnOnce() -> R) -> R {
+    GUEST_CALL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = call();
+    GUEST_CALL_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -2355,9 +2362,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
     if env.is_null() {
         return NAPI_INVALID_ARG;
     }
-    // Guest code this env called into is running: the env is used again once
-    // that code returns.
-    if unsafe { snapi_bridge_unofficial_env_in_guest_call(env) } != 0 {
+    // Guest code is running: bridge calls below it may still use this env.
+    if unsafe { snapi_bridge_unofficial_env_release_refused(env) } != 0 {
         return NAPI_INVALID_ARG;
     }
     let state = unsafe { Box::from_raw(env.cast::<HostJsEnv>()) };
@@ -2375,13 +2381,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
     NAPI_OK
 }
 
+/// Nonzero while guest code runs on this thread, called into by any env:
+/// releasing an env is refused meanwhile (see `GUEST_CALL_DEPTH`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_env_in_guest_call(env: SnapiEnv) -> i32 {
-    if env.is_null() {
-        return 0;
-    }
-    // Read without activating the env.
-    i32::from(unsafe { &*env.cast::<HostJsEnv>() }.guest_calls != 0)
+pub unsafe extern "C" fn snapi_bridge_unofficial_env_release_refused(_env: SnapiEnv) -> i32 {
+    i32::from(GUEST_CALL_DEPTH.with(Cell::get) != 0)
 }
 
 #[unsafe(no_mangle)]
@@ -3458,18 +3462,6 @@ unsafe extern "C" {
     ) -> u32;
 }
 
-/// Runs guest code `env` calls into, counted in its `guest_calls` meanwhile.
-unsafe fn call_guest<R>(env: SnapiEnv, call: impl FnOnce() -> R) -> R {
-    if let Ok(state) = unsafe { env_mut(env) } {
-        state.guest_calls += 1;
-    }
-    let result = call();
-    if let Ok(state) = unsafe { env_mut(env) } {
-        state.guest_calls -= 1;
-    }
-    result
-}
-
 unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
     loop {
         let (record, callback_ctx, value_frame) = {
@@ -3483,7 +3475,7 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
             (record, state.active_callback_ctx, value_frame)
         };
         let result = unsafe {
-            call_guest(env, || {
+            call_guest(|| {
                 snapi_host_invoke_wasm_finalizer(
                     callback_ctx,
                     record.guest_env,
@@ -3624,7 +3616,7 @@ pub unsafe extern "C" fn snapi_bridge_create_function(
                 ));
             }
             let result = unsafe {
-                call_guest(env, || {
+                call_guest(|| {
                     snapi_host_invoke_wasm_callback(
                         callback_ctx,
                         registration.guest_env,
@@ -3705,7 +3697,7 @@ pub unsafe extern "C" fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> 
         };
 
         let result = unsafe {
-            call_guest(env, || {
+            call_guest(|| {
                 snapi_host_invoke_wasm_callback(
                     callback_ctx,
                     pending.registration.guest_env,
@@ -7155,16 +7147,23 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn release_is_refused_while_guest_code_the_env_called_runs() {
-        // `with_env` releases the env afterwards, which must then succeed.
-        with_env(|env, _| unsafe {
-            assert_eq!(snapi_bridge_unofficial_env_in_guest_call(env), 0);
-            call_guest(env, || {
-                assert_eq!(snapi_bridge_unofficial_env_in_guest_call(env), 1);
-                assert_eq!(snapi_bridge_unofficial_release_env(env), NAPI_INVALID_ARG);
+    fn release_is_refused_while_guest_code_runs() {
+        // Envs share one realm, so guest code reached through one env can
+        // release the other: both are refused while it runs.
+        let new_env = || Box::into_raw(Box::new(HostJsEnv::new())).cast::<SnapiEnvState>();
+        let (first, second) = (new_env(), new_env());
+        unsafe {
+            assert_eq!(snapi_bridge_unofficial_env_release_refused(first), 0);
+            call_guest(|| {
+                for env in [first, second] {
+                    assert_eq!(snapi_bridge_unofficial_env_release_refused(env), 1);
+                    assert_eq!(snapi_bridge_unofficial_release_env(env), NAPI_INVALID_ARG);
+                }
             });
-            assert_eq!(snapi_bridge_unofficial_env_in_guest_call(env), 0);
-        });
+            assert_eq!(snapi_bridge_unofficial_env_release_refused(first), 0);
+            assert_eq!(snapi_bridge_unofficial_release_env(first), NAPI_OK);
+            assert_eq!(snapi_bridge_unofficial_release_env(second), NAPI_OK);
+        }
     }
 
     #[wasm_bindgen_test]

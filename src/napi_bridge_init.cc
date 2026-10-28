@@ -3450,11 +3450,13 @@ extern "C" void snapi_bridge_unofficial_unretain_env(SnapiEnvState* env_state) {
   if (env_state != nullptr) DropEnvStateHolder(env_state);
 }
 
-// Nonzero while guest code this env called into (a callback, finalizer or
-// interrupt) runs on this thread. Releasing the env is refused meanwhile.
-extern "C" int snapi_bridge_unofficial_env_in_guest_call(SnapiEnvState* env_state) {
-  auto* state = LookupEnvState(env_state);
-  return state != nullptr && state->guest_calls != 0 ? 1 : 0;
+// Nonzero if releasing `env_state` from this thread now would be refused:
+// another thread owns it, its release is under way, or guest code it called
+// into (a callback, finalizer or interrupt) is running.
+extern "C" int snapi_bridge_unofficial_env_release_refused(SnapiEnvState* env_state) {
+  if (env_state == nullptr) return 0;
+  if (!OwnedByThisThread(env_state)) return 1;
+  return env_state->closing || env_state->guest_calls != 0 ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {
