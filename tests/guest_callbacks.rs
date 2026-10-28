@@ -1,7 +1,7 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
-//! bridge and V8: nested callbacks, scopes a callback leaves open, argument
-//! counts, missing arguments, and envs created one after another on one
-//! thread.
+//! bridge and V8: nested callbacks, scopes a callback leaves open, return
+//! values created in them, argument counts, missing arguments, and envs
+//! created one after another on one thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -55,6 +55,7 @@ const WAT: &str = r#"(module
   (data (i32.const 132) "probe\00")
   (data (i32.const 156) "many16\00")
   (data (i32.const 164) "undef\00")
+  (data (i32.const 172) "badret\00")
 
   ;; Records the first failing step; the host reads it through `err`.
   (func $fail (param $code i32)
@@ -81,7 +82,8 @@ const WAT: &str = r#"(module
     (call $define (i32.const 124) (i32.const 4))
     (call $define (i32.const 132) (i32.const 5))
     (call $define (i32.const 156) (i32.const 6))
-    (call $define (i32.const 164) (i32.const 7)))
+    (call $define (i32.const 164) (i32.const 7))
+    (call $define (i32.const 172) (i32.const 8)))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -268,7 +270,21 @@ const WAT: &str = r#"(module
       (then (call $fail (i32.const 82))))
     (i32.load (i32.const 424)))
 
-  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef)
+  ;; badret(): fills a scope it leaves open with enough handles to need new
+  ;; handle blocks, then returns a value created in it.
+  (func $badret (param $env i32) (param $info i32) (result i32)
+    (local $i i32)
+    (if (call $open_scope (local.get $env) (i32.const 300)) (then (call $fail (i32.const 71))))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (i32.const 3000)))
+        (drop (call $create_int32 (local.get $env) (local.get $i) (i32.const 304)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (if (call $create_int32 (local.get $env) (i32.const 1234) (i32.const 304))
+      (then (call $fail (i32.const 72))))
+    (i32.load (i32.const 304)))
+  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret)
 )"#;
 
 struct Guest {
@@ -391,6 +407,17 @@ fn missing_arguments_are_undefined() {
     let mut guest = Guest::new(&ctx, &engine, &module);
     assert_eq!(guest.eval("undef(1)"), (0, 100, 0));
     assert_eq!(guest.eval("undef()"), (0, 0, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A callback returns a value created in a scope it left open, after enough
+/// values to fill more than one handle block.
+#[test]
+fn a_return_value_from_a_scope_left_open_survives() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let script = "(() => { let s = 0; for (let i = 0; i < 200; i++) s += badret(); return s; })()";
+    assert_eq!(guest.eval(script), (0, 200 * 1234, 0));
     assert_eq!(guest.release(), 0);
 }
 

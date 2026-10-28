@@ -2989,26 +2989,26 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
   if (invocation != invocations.rend()) invocations.erase(std::next(invocation).base());
 
   napi_value result = LoadValue(*bridge_state, result_id);
-  if (cb_scope != nullptr) {
-    // Force-close any scopes the guest left unbalanced so LIFO holds, then
-    // escape the return value into the enclosing scope and pop our frame.
-    while (bridge_state->scope_frames.size() > 1 &&
-           bridge_state->scope_frames.back().esc_scope != cb_scope) {
+  auto& frames = bridge_state->scope_frames;
+  // Only while our frame is still open (it normally is the innermost one
+  // the guest did not close).
+  if (cb_scope != nullptr &&
+      std::find_if(frames.rbegin(), frames.rend(), [&](const ScopeFrame& frame) {
+        return frame.esc_scope == cb_scope;
+      }) != frames.rend()) {
+    // Escape first: the result may live in a scope the guest left open, which
+    // closing would free. The escape slot belongs to the scope around ours.
+    if (result != nullptr) {
+      napi_value escaped = nullptr;
+      result = napi_escape_handle(env, cb_scope, result, &escaped) == napi_ok
+                   ? escaped
+                   : nullptr;
+    }
+    // Then close the scopes the guest left open, and ours.
+    while (frames.back().esc_scope != cb_scope) {
       PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
     }
-    if (!bridge_state->scope_frames.empty() &&
-        bridge_state->scope_frames.back().esc_scope == cb_scope) {
-      if (result != nullptr) {
-        napi_value escaped = nullptr;
-        if (napi_escape_handle(env, cb_scope, result, &escaped) == napi_ok &&
-            escaped != nullptr) {
-          result = escaped;
-        } else {
-          result = nullptr;
-        }
-      }
-      PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
-    }
+    PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
   }
   if (!result) {
     napi_get_undefined(env, &result);
