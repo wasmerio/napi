@@ -537,6 +537,74 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
 
+// Node's ESM loader rejects JSON modules whose request lost its
+// `with { type: 'json' }` clause (ERR_IMPORT_ATTRIBUTE_MISSING), so every
+// provider must surface parsed import attributes on the created requests.
+TEST_F(Test65UnofficialContextify, ModuleRequestsPreserveImportAttributes) {
+  EnvScope s(runtime_.get());
+
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(s.env,
+          "import data from './data.json' with { type: 'json' };\n"
+          "export const ok = data;"));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "attributed.mjs");
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+  ASSERT_NE(created.module, nullptr);
+  ASSERT_NE(created.module_requests, nullptr);
+
+  uint32_t request_count = 0;
+  ASSERT_EQ(napi_get_array_length(s.env, created.module_requests, &request_count),
+            napi_ok);
+  ASSERT_EQ(request_count, 1u);
+  napi_value request = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, created.module_requests, 0, &request), napi_ok);
+
+  napi_value specifier = nullptr;
+  char text[64] = {0};
+  size_t text_length = 0;
+  ASSERT_EQ(napi_get_named_property(s.env, request, "specifier", &specifier),
+            napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, specifier, text, sizeof(text),
+                                       &text_length),
+            napi_ok);
+  EXPECT_STREQ(text, "./data.json");
+
+  napi_value attributes = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, request, "attributes", &attributes),
+            napi_ok);
+  napi_valuetype attributes_type = napi_undefined;
+  ASSERT_EQ(napi_typeof(s.env, attributes, &attributes_type), napi_ok);
+  ASSERT_EQ(attributes_type, napi_object);
+  napi_value type_value = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, attributes, "type", &type_value),
+            napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, type_value, text, sizeof(text),
+                                       &text_length),
+            napi_ok);
+  EXPECT_STREQ(text, "json");
+
+  napi_value phase = nullptr;
+  int32_t phase_number = 0;
+  ASSERT_EQ(napi_get_named_property(s.env, request, "phase", &phase), napi_ok);
+  ASSERT_EQ(napi_get_value_int32(s.env, phase, &phase_number), napi_ok);
+  EXPECT_EQ(phase_number, 2);
+
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, created.module), napi_ok);
+}
+
 TEST_F(Test65UnofficialContextify, SyncModuleErrorDoesNotLeaveUnhandledRejection) {
   EnvScope s(runtime_.get());
 

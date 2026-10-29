@@ -234,6 +234,74 @@ static int CheckModuleEvaluation(napi_env env) {
   return 0;
 }
 
+// Node's ESM loader rejects JSON modules whose request lost its
+// `with { type: 'json' }` attributes (ERR_IMPORT_ATTRIBUTE_MISSING), so every
+// provider must surface parsed import attributes on the created requests.
+static int CheckModuleRequestAttributes(napi_env env) {
+  napi_value wrapper, url_value, source_value, undefined;
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  NAPI_CALL(env, napi_create_string_utf8(
+      env, "file:///attributed.mjs", NAPI_AUTO_LENGTH, &url_value));
+  NAPI_CALL(env, napi_create_string_utf8(env,
+      "import data from './data.json' with { type: 'json' };\n"
+      "export const ok = data;",
+      NAPI_AUTO_LENGTH, &source_value));
+  NAPI_CALL(env, napi_get_undefined(env, &undefined));
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(source_value);
+  unofficial_napi_module_create_options options = {0};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = url_value;
+  options.context_or_undefined = undefined;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &options, &result));
+  CHECK_OR_FAIL(result.module != NULL,
+                "attributed module compilation did not return a handle");
+  CHECK_OR_FAIL(result.module_requests != NULL,
+                "attributed module compilation did not return requests");
+
+  bool is_array = false;
+  NAPI_CALL(env, napi_is_array(env, result.module_requests, &is_array));
+  CHECK_OR_FAIL(is_array, "module requests was not an array");
+  uint32_t request_count = 0;
+  NAPI_CALL(env, napi_get_array_length(
+      env, result.module_requests, &request_count));
+  CHECK_OR_FAIL(request_count == 1,
+                "attributed module reported the wrong request count");
+
+  napi_value request, specifier, attributes, type_value, phase_value;
+  char text[64];
+  size_t text_length = 0;
+  NAPI_CALL(env, napi_get_element(env, result.module_requests, 0, &request));
+  NAPI_CALL(env, napi_get_named_property(env, request, "specifier", &specifier));
+  NAPI_CALL(env, napi_get_value_string_utf8(
+      env, specifier, text, sizeof(text), &text_length));
+  CHECK_OR_FAIL(strcmp(text, "./data.json") == 0,
+                "attributed request reported the wrong specifier");
+  NAPI_CALL(env, napi_get_named_property(env, request, "attributes", &attributes));
+  napi_valuetype attributes_type = napi_undefined;
+  NAPI_CALL(env, napi_typeof(env, attributes, &attributes_type));
+  CHECK_OR_FAIL(attributes_type == napi_object,
+                "attributed request attributes was not an object");
+  NAPI_CALL(env, napi_get_named_property(env, attributes, "type", &type_value));
+  NAPI_CALL(env, napi_get_value_string_utf8(
+      env, type_value, text, sizeof(text), &text_length));
+  CHECK_OR_FAIL(strcmp(text, "json") == 0,
+                "import attribute 'type: json' was not preserved");
+  NAPI_CALL(env, napi_get_named_property(env, request, "phase", &phase_value));
+  int32_t phase = 0;
+  NAPI_CALL(env, napi_get_value_int32(env, phase_value, &phase));
+  CHECK_OR_FAIL(phase == 2,
+                "attributed request did not report the evaluation phase");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, result.module));
+  return 0;
+}
+
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -840,5 +908,6 @@ int main(void) {
   NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope, NULL));
 
   CHECK_OR_FAIL(CheckModuleEvaluation(env) == 0, "module evaluation regressions failed");
+  CHECK_OR_FAIL(CheckModuleRequestAttributes(env) == 0, "module request attribute regressions failed");
   return PrintSuccess("RUN_SCRIPT_TEST");
 }
