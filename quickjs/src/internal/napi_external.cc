@@ -54,6 +54,15 @@ void *napi_external__::get_value(JSValueConst value)
   return hint == nullptr ? nullptr : hint->external_data();
 }
 
+napi_env napi_external__::get_env(JSValueConst value)
+{
+  if (!is_external(value))
+    return nullptr;
+  auto *hint = static_cast<napi_external_backing_store_hint__ *>(
+      JS_GetOpaque(value, external_class_id));
+  return hint == nullptr ? nullptr : hint->env();
+}
+
 napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *ctx, JSValueConst object)
 {
   auto *wrap = static_cast<napi_external_backing_store_hint__ *>(

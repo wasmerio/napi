@@ -56,7 +56,109 @@ napi_value CaptureDynamicImportId(napi_env env, napi_callback_info info) {
 }
 #endif
 
+struct RealmProbe {
+  napi_ref main_global = nullptr;
+  napi_ref main_object_prototype = nullptr;
+  bool called = false;
+  bool sees_main_global = false;
+  bool creates_in_main_realm = false;
+};
+
+// Records which realm a native callback runs in.
+napi_value ProbeRealm(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok ||
+      data == nullptr) {
+    return nullptr;
+  }
+  auto* probe = static_cast<RealmProbe*>(data);
+  probe->called = true;
+
+  napi_value global = nullptr;
+  napi_value main_global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok ||
+      napi_get_reference_value(env, probe->main_global, &main_global) != napi_ok ||
+      napi_strict_equals(env, global, main_global, &probe->sees_main_global) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value object = nullptr;
+  napi_value prototype = nullptr;
+  napi_value main_prototype = nullptr;
+  if (napi_create_object(env, &object) != napi_ok ||
+      napi_get_prototype(env, object, &prototype) != napi_ok ||
+      napi_get_reference_value(env, probe->main_object_prototype, &main_prototype) != napi_ok ||
+      napi_strict_equals(env, prototype, main_prototype, &probe->creates_in_main_realm) != napi_ok) {
+    return nullptr;
+  }
+  return object;
+}
+
 }  // namespace
+
+// A native function keeps the realm it was created in, also when a script in
+// another context calls it (as in Node and V8).
+TEST_F(Test65UnofficialContextify, NativeFunctionCalledFromContextKeepsItsRealm) {
+  EnvScope s(runtime_.get());
+
+  RealmProbe probe;
+  napi_value global = nullptr;
+  napi_value object = nullptr;
+  napi_value object_prototype = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_get_prototype(s.env, object, &object_prototype), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, global, 1, &probe.main_global), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, object_prototype, 1, &probe.main_object_prototype),
+            napi_ok);
+
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "probe", NAPI_AUTO_LENGTH, ProbeRealm, &probe, &fn),
+            napi_ok);
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "probe", fn), napi_ok);
+
+  napi_value contextified = nullptr;
+  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
+                                                    sandbox,
+                                                    Str(s.env, "ctx"),
+                                                    Str(s.env, "test://origin"),
+                                                    true,
+                                                    true,
+                                                    false,
+                                                    Sym(s.env, "hdo"),
+                                                    &contextified),
+            napi_ok);
+
+  napi_value eval_result = nullptr;
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(
+      Str(s.env, "Object.getPrototypeOf(probe()) === Object.prototype"));
+  ASSERT_EQ(unofficial_napi_contextify_run_script(s.env,
+                                                  sandbox,
+                                                  &source,
+                                                  Str(s.env, "probe.js"),
+                                                  0,
+                                                  0,
+                                                  -1,
+                                                  true,
+                                                  false,
+                                                  false,
+                                                  Sym(s.env, "hdo"),
+                                                  &eval_result),
+            napi_ok);
+
+  EXPECT_TRUE(probe.called);
+  EXPECT_TRUE(probe.sees_main_global);
+  EXPECT_TRUE(probe.creates_in_main_realm);
+  // The object comes from the main realm, not the context's.
+  bool from_context_realm = true;
+  ASSERT_EQ(napi_get_value_bool(s.env, eval_result, &from_context_realm), napi_ok);
+  EXPECT_FALSE(from_context_realm);
+
+  ASSERT_EQ(napi_delete_reference(s.env, probe.main_global), napi_ok);
+  ASSERT_EQ(napi_delete_reference(s.env, probe.main_object_prototype), napi_ok);
+}
 
 TEST_F(Test65UnofficialContextify, MakeRunRoundTrip) {
   EnvScope s(runtime_.get());

@@ -4,6 +4,7 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 #include "../../../include/unofficial_napi.h"
+#include "napi_agent.h"
 #include "napi_callback_info.h"
 #include "napi_buffer.h"
 #include "napi_contextify.h"
@@ -20,6 +21,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,18 +30,22 @@
 struct napi_external_backing_store_hint__;
 struct napi_runtime_interrupts__;
 
+// One realm (JSContext) of an agent. The context never changes.
 struct napi_env__
 {
-  explicit napi_env__(JSContext *context, int32_t module_api_version);
+  napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version);
   ~napi_env__();
 
   void prepare_teardown();
   void finalize_instance_data();
+  // Native callbacks are refused once teardown has started.
+  bool is_closing() const;
 
+  napi_agent__ *agent() const;
+  // Makes this env own its agent (an env made from an embedder's context).
+  void adopt_agent(std::unique_ptr<napi_agent__> agent);
+  bool is_principal() const;
   JSContext *context() const;
-  JSContext *main_context() const;
-  JSContext *current_context() const;
-  void set_current_context(JSContext *context);
   int32_t module_api_version() const;
 
   napi_handle_scope root_scope() const;
@@ -48,7 +54,6 @@ struct napi_env__
   void destroy_scope(napi_handle_scope scope);
   napi_scope__ *scope_from_handle(napi_handle_scope scope) const;
   napi_value wrap_value_in_current_scope(JSValue value, bool owned);
-  napi_value wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned);
   JSValue wrap_external_data(void *data);
   JSValue wrap_external_data(void *data, node_api_basic_finalize finalize_cb, void *finalize_hint);
   napi_value__ *value_from_handle(napi_value value);
@@ -66,8 +71,7 @@ struct napi_env__
   template <typename Fn>
   void for_each_active_scope(Fn fn) const
   {
-    for (const auto &scope : scopes_)
-      fn(scope);
+    agent_->for_each_active_scope(fn);
   }
 
   template <typename Fn>
@@ -105,7 +109,7 @@ struct napi_env__
   napi_status remove_cleanup_hook(napi_cleanup_hook hook, void *arg);
   napi_env_cleanup_hook__ *create_cleanup_hook(napi_cleanup_hook hook, void *arg);
   void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
-  napi_deferred__ *create_deferred(JSContext *context, JSValue resolve, JSValue reject);
+  napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
   void destroy_deferred(napi_deferred__ *deferred);
   napi_external_backing_store_hint__ *create_external_backing_store(
       void *external_data,
@@ -123,28 +127,21 @@ struct napi_env__
   quickjs::detail::napi_module_wrap__ &module_wrap();
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
-  bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks)
-  {
-    if (embedder_hooks_attached_)
-      return false;
-    embedder_hooks_ = hooks;
-    embedder_hooks_attached_ = true;
-    return true;
-  }
+  bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
 
 private:
   void clear_refs_for_teardown();
 
-  // QuickJS contexts and API version.
-  JSContext *main_context_;
-  JSContext *current_context_;
+  // Set only when this env owns its agent; destroyed last.
+  std::unique_ptr<napi_agent__> owned_agent_;
+
+  // Agent, realm and API version.
+  napi_agent__ *agent_;
+  JSContext *context_;
   int32_t module_api_version_ = 8;
 
-  // Last native/JS error state.
+  // Last native error state.
   napi::error_state__ error_state_;
-  JSContext *last_exception_context_ = nullptr;
-  JSValue last_exception_;
-  bool has_last_exception_ = false;
 
   // Termination. QuickJS polls one interrupt handler per runtime, so the
   // handler lives in a record shared by every env on this env's runtime.
@@ -159,12 +156,7 @@ private:
   // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
 
-  // Scope stack.
-  napi_handle_scope root_scope_ = nullptr;
-  napi_handle_scope current_scope_ = nullptr;
-
   // Env-owned slot allocators.
-  napi_allocator__<napi_scope__, napi_env__> scopes_;
   napi_allocator__<napi_ref__, napi_env__> refs_;
   napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
   napi_allocator__<napi_deferred__, napi_env__> deferreds_;
@@ -176,9 +168,6 @@ private:
   napi::periodic_gate__ lifetime_string_symbol_values_gate_{10000};
 #endif
 
-  // External memory accounting.
-  int64_t external_memory_ = 0;
-
   // Env-owned subsystems.
   napi_buffer__ buffers_;
   napi_promises__ promises_;
@@ -186,24 +175,9 @@ private:
   quickjs::detail::napi_module_wrap__ module_wrap_;
 
   // Env teardown state.
+  bool closing_ = false;
   bool torn_down_ = false;
   bool clearing_refs_for_teardown_ = false;
-  bool embedder_hooks_attached_ = false;
-  unofficial_napi_env_hooks embedder_hooks_{};
-};
-
-class napi_env_context_scope__
-{
-public:
-  napi_env_context_scope__(napi_env env, JSContext *context);
-  ~napi_env_context_scope__();
-
-  napi_env_context_scope__(const napi_env_context_scope__ &) = delete;
-  napi_env_context_scope__ &operator=(const napi_env_context_scope__ &) = delete;
-
-private:
-  napi_env env_ = nullptr;
-  JSContext *previous_ = nullptr;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

@@ -138,7 +138,6 @@ napi_status napi_util__::return_pending_if_caught(napi_env env, JSContext *ctx, 
   if (ctx != nullptr && JS_HasException(ctx))
   {
     auto exc = JS_GetException(ctx);
-    napi_env_context_scope__ context_scope{env, ctx};
     set_last_exception(env, exc);
     return napi_quickjs_set_last_error(env, napi_pending_exception, message);
   }

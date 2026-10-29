@@ -123,17 +123,6 @@ private:
   napi_status cache_module_requests(record *entry);
 
   static int synthetic_init(JSContext *ctx, JSModuleDef *module);
-  static int host_import_meta_init(JSContext *ctx,
-                                   JSModuleDef *module,
-                                   JSValueConst meta,
-                                   void *opaque);
-  static JSValue host_dynamic_import(JSContext *ctx,
-                                     JSModuleDef *referrer,
-                                     JSValueConst referrer_name,
-                                     JSValueConst specifier,
-                                     JSValueConst attributes,
-                                     JSModuleImportPhaseEnum phase,
-                                     void *opaque);
 
   // Owning environment and QuickJS context.
   napi_env env_;

@@ -1964,12 +1964,11 @@ extern "C"
       return napi_invalid_arg;
     }
 
-    JSContext *ctx = napi_quickjs_value_context(env, constructor);
+    JSContext *ctx = env->context();
     if (ctx == nullptr)
     {
       return napi_invalid_arg;
     }
-    napi_env_context_scope__ context_scope{env, ctx};
     napi_status terminating = napi_util__::fail_if_terminating(env, ctx);
     if (terminating != napi_ok)
       return terminating;
@@ -2000,7 +1999,7 @@ extern "C"
 
     // 6. Wrap and return
     // 'wrap_value' converts the JSValue back into the napi_value handle
-    *result = env->wrap_value_in_current_scope(ctx, instance, true);
+    *result = env->wrap_value_in_current_scope(instance, true);
 
     return napi_ok;
   }
@@ -2022,12 +2021,7 @@ extern "C"
       return napi_util__::invalid_arg(env);
     }
 
-    JSContext *ctx = napi_quickjs_value_context(env, func);
-    if (ctx == nullptr)
-    {
-      return napi_util__::invalid_arg(env);
-    }
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
 
     JSValue js_func = napi_quickjs_value_inner(env, func);
 
@@ -2064,7 +2058,7 @@ extern "C"
     if (result != nullptr)
     {
       // wrap the result; the current handle scope now owns the returned JSValue
-      *result = env->wrap_value_in_current_scope(ctx, js_result, true);
+      *result = env->wrap_value_in_current_scope(js_result, true);
     }
     else
     {
@@ -2222,7 +2216,7 @@ extern "C"
     if (JS_IsException(p))
       return napi_util__::return_pending_if_caught(env, ctx, "Failed to create Promise");
 
-    auto *d = napi_deferred__::create(env, ctx, resolving_funcs[0], resolving_funcs[1]);
+    auto *d = napi_deferred__::create(env, resolving_funcs[0], resolving_funcs[1]);
     if (d == nullptr)
     {
       JS_FreeValue(ctx, resolving_funcs[0]);
@@ -2232,7 +2226,7 @@ extern "C"
     }
 
     *deferred = d;
-    *promise = env->wrap_value_in_current_scope(ctx, p, true);
+    *promise = env->wrap_value_in_current_scope(p, true);
     return (*promise == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2244,11 +2238,7 @@ extern "C"
     if (!napi_util__::check_env(env) || deferred == nullptr || resolution == nullptr)
       return napi_invalid_arg;
 
-    JSContext *ctx = deferred->context();
-    if (ctx == nullptr)
-      return napi_invalid_arg;
-
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
     JSValue ret = deferred->call_resolve(resolution);
     napi_deferred__::destroy(deferred);
 
@@ -2267,11 +2257,7 @@ extern "C"
     if (!napi_util__::check_env(env) || deferred == nullptr || rejection == nullptr)
       return napi_invalid_arg;
 
-    JSContext *ctx = deferred->context();
-    if (ctx == nullptr)
-      return napi_invalid_arg;
-
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
     JSValue ret = deferred->call_reject(rejection);
     napi_deferred__::destroy(deferred);
 
@@ -2838,7 +2824,6 @@ extern "C"
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_invalid_arg;
 
-    napi_env_context_scope__ context_scope{env, napi_quickjs_value_context(env, value)};
     *result = env->wrap_ref_in_root_scope(napi_quickjs_value_inner(env, value), initial_ref_count);
     if (*result == nullptr)
       return napi_generic_failure;
@@ -2923,7 +2908,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = env->wrap_value_in_current_scope(slot->context(), slot->dup_inner(), true);
+    *result = env->wrap_value_in_current_scope(slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 

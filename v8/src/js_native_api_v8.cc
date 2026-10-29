@@ -41,9 +41,10 @@ void ScheduleFinalizerQueueDrain(napi_env env) {
   if (env == nullptr || env->finalization_scheduled) return;
 
   env->finalization_scheduled = true;
-  if (env->enqueue_foreground_task_callback != nullptr) {
-    napi_status status = env->enqueue_foreground_task_callback(
-        env->enqueue_foreground_task_target,
+  napi_agent__* agent = env->agent;
+  if (agent != nullptr && agent->enqueue_foreground_task_callback != nullptr) {
+    napi_status status = agent->enqueue_foreground_task_callback(
+        agent->enqueue_foreground_task_target,
         DrainFinalizerQueueForegroundTask,
         env,
         nullptr,
@@ -579,21 +580,57 @@ void napi_env__::DrainFinalizerQueue() {
   }
 }
 
+namespace {
+
+// Isolate data slot that points at the isolate's napi_agent__.
+constexpr uint32_t kNapiAgentDataSlot = 0;
+
+}  // namespace
+
+napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
+  isolate->SetData(kNapiAgentDataSlot, this);
+  isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+  isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
+  v8::HandleScope handle_scope(isolate);
+  wrap_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap")));
+  buffer_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(
+          isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record")));
+  type_tag_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_type_tag")));
+}
+
+napi_agent__::~napi_agent__() {
+  wrap_private_key.Reset();
+  buffer_private_key.Reset();
+  type_tag_private_key.Reset();
+  if (From(isolate) == this) {
+    isolate->SetData(kNapiAgentDataSlot, nullptr);
+  }
+}
+
+napi_agent__* napi_agent__::From(v8::Isolate* isolate) {
+  if (isolate == nullptr) return nullptr;
+  return static_cast<napi_agent__*>(isolate->GetData(kNapiAgentDataSlot));
+}
+
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
+      agent(napi_agent__::From(isolate)),
       context_ref(isolate, context),
       factory_(this) {
   (void)module_api_version;
-  isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
-  v8::Local<v8::Private> wrapKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap"));
-  wrap_private_key.Reset(isolate, wrapKey);
-  v8::Local<v8::Private> bufferKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record"));
-  buffer_private_key.Reset(isolate, bufferKey);
-  v8::Local<v8::Private> typeTagKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_type_tag"));
-  type_tag_private_key.Reset(isolate, typeTagKey);
+  if (agent == nullptr) {
+    owned_agent = std::make_unique<napi_agent__>(isolate);
+    agent = owned_agent.get();
+  }
+  if (agent->principal_env == nullptr) {
+    agent->principal_env = this;
+  }
   napi_v8_clear_last_error(this);
 }
 
@@ -610,6 +647,9 @@ napi_env__::~napi_env__() {
 
   if (instance_data_finalize_cb != nullptr) {
     instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
+  }
+  if (agent != nullptr && agent->principal_env == this) {
+    agent->principal_env = nullptr;
   }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
@@ -2622,7 +2662,7 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), wrapKey).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2673,7 +2713,7 @@ napi_status NAPI_CDECL napi_unwrap(napi_env env, napi_value js_object, void** re
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   v8::Local<v8::Value> wrapped;
   if (!object->GetPrivate(env->context(), wrapKey).ToLocal(&wrapped) ||
       !wrapped->IsExternal()) {
@@ -2691,7 +2731,7 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   napi_status status = napi_unwrap(env, js_object, &out);
   if (status != napi_ok) return status;
   v8::Local<v8::Object> object = napi_v8_unwrap_value(js_object).As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   v8::Local<v8::Value> wrapped;
   if (!object->GetPrivate(env->context(), wrapKey).ToLocal(&wrapped) ||
       !wrapped->IsExternal()) {
@@ -3043,7 +3083,7 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
@@ -3105,7 +3145,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
@@ -3156,7 +3196,7 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
       CreateBufferObject(env, record->backing_store, byte_offset, byte_length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
@@ -3250,7 +3290,7 @@ napi_status NAPI_CDECL napi_type_tag_object(
   if (!target->IsObject()) return napi_invalid_arg;
 
   v8::Local<v8::Object> object = target.As<v8::Object>();
-  v8::Local<v8::Private> key = env->type_tag_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->type_tag_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), key).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -3283,7 +3323,7 @@ napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
   }
 
   v8::Local<v8::Object> object = target.As<v8::Object>();
-  v8::Local<v8::Private> key = env->type_tag_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->type_tag_private_key.Get(env->isolate);
   v8::Local<v8::Value> tag_value;
   *result = false;
   if (!object->GetPrivate(env->context(), key).ToLocal(&tag_value) ||

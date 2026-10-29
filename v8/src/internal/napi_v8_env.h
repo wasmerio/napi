@@ -1,8 +1,10 @@
 #ifndef NAPI_V8_ENV_H_
 #define NAPI_V8_ENV_H_
 
+#include <array>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -16,6 +18,7 @@
 #include "internal/napi_factory.h"
 #include "internal/napi_lifetime_tracker.h"
 #include "internal/napi_ref_tracker.h"
+#include "internal/napi_v8_agent.h"
 #include "unofficial_napi.h"
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
@@ -82,6 +85,12 @@ struct napi_env__ {
 #endif
 
   v8::Isolate* isolate = nullptr;
+  // The agent this env belongs to. Set at creation and never changed.
+  napi_agent__* agent = nullptr;
+  // Set only when the env had to create its own agent (an isolate the
+  // provider did not set up).
+  std::unique_ptr<napi_agent__> owned_agent;
+  // The env's realm. Never changes.
   v8::Global<v8::Context> context_ref;
   napi::error_state__ error_state;
   std::vector<void*> open_handle_scope_stack;
@@ -89,9 +98,6 @@ struct napi_env__ {
   v8::Global<v8::Message> last_exception_message;
   std::string last_exception_source_line;
   std::string last_exception_thrown_at;
-  v8::Global<v8::Private> wrap_private_key;
-  v8::Global<v8::Private> buffer_private_key;
-  v8::Global<v8::Private> type_tag_private_key;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
@@ -104,12 +110,10 @@ struct napi_env__ {
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
-  unofficial_napi_context_token_callback context_token_assign_callback = nullptr;
-  unofficial_napi_context_token_callback context_token_unassign_callback = nullptr;
-  void* context_token_callback_data = nullptr;
-  unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
-  void* enqueue_foreground_task_target = nullptr;
-  bool embedder_hooks_attached = false;
+  // Realm hooks: unofficial_napi_set_promise_reject_callback and
+  // unofficial_napi_set_promise_hooks (init, before, after, resolve).
+  v8::Global<v8::Function> promise_reject_callback;
+  std::array<v8::Global<v8::Function>, 4> promise_hooks;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   napi::periodic_gate__ lifetime_stats_gate_{2000};

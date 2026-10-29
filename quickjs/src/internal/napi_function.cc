@@ -57,16 +57,20 @@ JSValue napi_function__::create_internal(napi_env env,
   return JS_DupValue(env->context(), napi_quickjs_value_inner(env, fn_val));
 }
 
-JSValue napi_function__::trampoline(JSContext *ctx,
+// QuickJS passes the caller's realm as `ctx` for C function data (it does not
+// switch realms). The callback runs in the realm of the env that created the
+// function instead, as in V8 and Node.
+JSValue napi_function__::trampoline(JSContext *caller_ctx,
                                     JSValueConst this_val,
                                     int argc,
                                     JSValueConst *argv,
                                     int magic,
                                     JSValue *func_data)
 {
-  auto env = static_cast<napi_env>(JS_GetContextOpaque(ctx));
-  if (!napi_util__::check_env(env))
-    return JS_ThrowReferenceError(ctx, "Null NAPI env");
+  auto env = napi_external__::get_env(func_data[0]);
+  if (!napi_util__::check_env(env) || env->is_closing())
+    return JS_ThrowReferenceError(caller_ctx, "Null NAPI env");
+  JSContext *ctx = env->context();
 
   auto cb_ptr = napi_external__::get_value(func_data[0]);
   if (cb_ptr == nullptr)
@@ -78,7 +82,6 @@ JSValue napi_function__::trampoline(JSContext *ctx,
   // running between interrupt polls stops here.
   if (env->termination_requested())
     return napi_util__::throw_termination(ctx);
-  napi_env_context_scope__ context_scope{env, ctx};
   quickjs_callback_handle_scope__ callback_scope{env};
   if (!callback_scope.is_open())
     return JS_ThrowOutOfMemory(ctx);

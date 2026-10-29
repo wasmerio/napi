@@ -88,12 +88,10 @@ void detach_runtime_interrupts(JSRuntime *rt,
 }
 } // namespace
 
-napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
-    : main_context_{context},
-      current_context_{context},
+napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version)
+    : agent_{agent},
+      context_{context},
       module_api_version_{module_api_version},
-      last_exception_{JS_UNDEFINED},
-      scopes_{this},
       refs_{this},
       cleanup_hooks_{this},
       deferreds_{this},
@@ -103,8 +101,10 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       contextify_{this, context},
       module_wrap_{this, context}
 {
-  root_scope_ = create_scope(nullptr);
-  current_scope_ = root_scope_;
+  if (agent_->principal_env() == nullptr)
+    agent_->set_principal_env(this);
+  if (context_ != nullptr)
+    agent_->open_root_scope(this);
   clear_last_error();
   runtime_interrupts_ = attach_runtime_interrupts(JS_GetRuntime(context), this);
 }
@@ -120,6 +120,7 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
+  closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   while (!env_cleanup_hooks_.empty())
   {
@@ -137,24 +138,29 @@ void napi_env__::prepare_teardown()
   clear_last_exception();
   clear_refs_for_teardown();
 
-  napi_scope__ *root_scope = scope_from_handle(root_scope_);
-  if (root_scope != nullptr)
+  const bool principal = is_principal();
+  if (principal)
   {
-    root_scope->close();
-    if (main_context_ != nullptr)
-      JS_RunGC(JS_GetRuntime(main_context_));
+    if (agent_->root_scope() != nullptr)
+    {
+      agent_->close_root_scope();
+      JS_RunGC(agent_->runtime());
+    }
+    agent_->close_scopes();
+    agent_->clear_module_hooks();
   }
-  scopes_.close();
-  current_scope_ = nullptr;
-  root_scope_ = nullptr;
   module_wrap_.teardown();
   contextify_.teardown();
   buffers_.teardown();
+  if (principal)
+    agent_->clear_promise_hooks();
   promises_.teardown();
+  if (principal)
+    agent_->clear_values();
   // Detach before the runtime can be freed. The termination flag itself stays
   // valid for the env's whole lifetime, since other threads may still set it.
-  if (main_context_ != nullptr)
-    detach_runtime_interrupts(JS_GetRuntime(main_context_), runtime_interrupts_, this);
+  if (context_ != nullptr)
+    detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
   runtime_interrupts_ = nullptr;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
   torn_down_ = true;
@@ -182,24 +188,29 @@ void napi_env__::finalize_instance_data()
     finalize_cb(this, data, finalize_hint);
 }
 
+bool napi_env__::is_closing() const
+{
+  return closing_;
+}
+
+napi_agent__ *napi_env__::agent() const
+{
+  return agent_;
+}
+
+void napi_env__::adopt_agent(std::unique_ptr<napi_agent__> agent)
+{
+  owned_agent_ = std::move(agent);
+}
+
+bool napi_env__::is_principal() const
+{
+  return agent_->principal_env() == this;
+}
+
 JSContext *napi_env__::context() const
 {
-  return current_context_;
-}
-
-JSContext *napi_env__::main_context() const
-{
-  return main_context_;
-}
-
-JSContext *napi_env__::current_context() const
-{
-  return current_context_;
-}
-
-void napi_env__::set_current_context(JSContext *context)
-{
-  current_context_ = context == nullptr ? main_context_ : context;
+  return context_;
 }
 
 int32_t napi_env__::module_api_version() const
@@ -209,40 +220,29 @@ int32_t napi_env__::module_api_version() const
 
 napi_handle_scope napi_env__::root_scope() const
 {
-  return root_scope_;
+  return agent_->root_scope();
 }
 
 napi_handle_scope napi_env__::current_scope() const
 {
-  return current_scope_;
+  return agent_->current_scope();
 }
 
 napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 {
-  if (current_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
-  auto *handle = scopes_.allocate(this, parent);
-  return reinterpret_cast<napi_handle_scope>(handle);
+  return agent_->create_scope(this, parent);
 }
 
 void napi_env__::destroy_scope(napi_handle_scope scope)
 {
-  scopes_.destroy(reinterpret_cast<napi_scope__ *>(scope));
+  agent_->destroy_scope(scope);
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) const
 {
-  using Alloc = decltype(scopes_);
-#ifdef NDEBUG
-  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
-#else
-  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
-  assert(scopes_.owns(scope));
-  auto owner = Alloc::unsafe_owner(scope);
-  assert(owner == this);
-#endif
-
-  return scope;
+  return agent_->scope_from_handle(scope_handle);
 }
 
 JSValue napi_env__::wrap_external_data(void *data)
@@ -254,7 +254,7 @@ JSValue napi_env__::wrap_external_data(void *data,
                                        node_api_basic_finalize finalize_cb,
                                        void *finalize_hint)
 {
-  JSContext *ctx = current_context_;
+  JSContext *ctx = context_;
   if (ctx == nullptr)
     return JS_EXCEPTION;
 
@@ -276,40 +276,30 @@ JSValue napi_env__::wrap_external_data(void *data,
 
 napi_value napi_env__::wrap_value_in_current_scope(JSValue value, bool owned)
 {
-  napi_scope__ *scope = scope_from_handle(current_scope_);
+  napi_scope__ *scope = agent_->scope_from_handle(agent_->current_scope());
   return scope == nullptr ? nullptr : scope->wrap_value(value, owned);
-}
-
-napi_value napi_env__::wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned)
-{
-  napi_scope__ *scope = scope_from_handle(current_scope_);
-  return scope == nullptr ? nullptr : scope->wrap_value(context, value, owned);
 }
 
 void napi_env__::delete_value_from_current_scope(napi_value value)
 {
-  napi_scope__ *scope = scope_from_handle(current_scope_);
+  napi_scope__ *scope = agent_->scope_from_handle(agent_->current_scope());
   if (scope != nullptr)
     scope->delete_value(value);
 }
 
 napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 {
-  using Alloc = decltype(scopes_);
-#ifdef NDEBUG
-  auto value = value_handle;
-#else
-  auto value = value_handle;
+#ifndef NDEBUG
   auto owner = napi_scope__::ValuesAllocator::unsafe_owner(value_handle);
-  assert(scopes_.owns(owner));
+  assert(agent_->owns_scope(owner));
 #endif
 
-  return value;
+  return value_handle;
 }
 
 napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
 {
-  if (current_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
 
   napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
@@ -355,22 +345,22 @@ size_t napi_env__::active_ref_count() const
 
 bool napi_env__::is_current_scope(napi_handle_scope scope) const
 {
-  return current_scope_ == scope;
+  return agent_->is_current_scope(scope);
 }
 
 void napi_env__::set_current_scope(napi_handle_scope scope)
 {
-  current_scope_ = scope;
+  agent_->set_current_scope(scope);
 }
 
 size_t napi_env__::scope_storage_slot_count() const
 {
-  return scopes_.storage_slot_count();
+  return agent_->scope_storage_slot_count();
 }
 
 size_t napi_env__::active_scope_count() const
 {
-  return scopes_.count_active();
+  return agent_->active_scope_count();
 }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -402,12 +392,12 @@ napi_status napi_env__::clear_last_error()
 
 bool napi_env__::has_last_exception() const
 {
-  return has_last_exception_;
+  return agent_->has_pending_exception();
 }
 
 bool napi_env__::last_exception_is_uncatchable() const
 {
-  return has_last_exception_ && JS_IsUncatchableError(last_exception_);
+  return agent_->pending_exception_is_uncatchable();
 }
 
 void napi_env__::request_termination()
@@ -427,33 +417,17 @@ bool napi_env__::termination_requested() const
 
 void napi_env__::clear_last_exception()
 {
-  if (!has_last_exception_)
-    return;
-
-  JS_FreeValue(last_exception_context_ == nullptr ? main_context_ : last_exception_context_, last_exception_);
-  last_exception_context_ = nullptr;
-  last_exception_ = JS_UNDEFINED;
-  has_last_exception_ = false;
+  agent_->clear_pending_exception();
 }
 
 void napi_env__::set_last_exception(JSValue exception)
 {
-  clear_last_exception();
-  last_exception_context_ = current_context_;
-  last_exception_ = exception;
-  has_last_exception_ = true;
+  agent_->set_pending_exception(exception);
 }
 
 JSValue napi_env__::take_last_exception()
 {
-  if (!has_last_exception_)
-    return JS_UNDEFINED;
-
-  JSValue exception = last_exception_;
-  last_exception_context_ = nullptr;
-  last_exception_ = JS_UNDEFINED;
-  has_last_exception_ = false;
-  return exception;
+  return agent_->take_pending_exception();
 }
 
 void *napi_env__::instance_data() const
@@ -506,7 +480,7 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
 
 napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook, void *arg)
 {
-  if (main_context_ == nullptr || hook == nullptr)
+  if (context_ == nullptr || hook == nullptr)
     return nullptr;
   return cleanup_hooks_.allocate(this, hook, arg);
 }
@@ -516,11 +490,11 @@ void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
   cleanup_hooks_.destroy(entry);
 }
 
-napi_deferred__ *napi_env__::create_deferred(JSContext *context, JSValue resolve, JSValue reject)
+napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 {
-  if (context == nullptr)
+  if (context_ == nullptr)
     return nullptr;
-  return deferreds_.allocate(this, context, resolve, reject);
+  return deferreds_.allocate(this, resolve, reject);
 }
 
 void napi_env__::destroy_deferred(napi_deferred__ *deferred)
@@ -533,23 +507,9 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
     node_api_basic_finalize finalize_cb,
     void *finalize_hint)
 {
-  if (main_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
   return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
-}
-
-napi_env_context_scope__::napi_env_context_scope__(napi_env env, JSContext *context)
-    : env_{env},
-      previous_{env == nullptr ? nullptr : env->current_context()}
-{
-  if (env_ != nullptr && context != nullptr)
-    env_->set_current_context(context);
-}
-
-napi_env_context_scope__::~napi_env_context_scope__()
-{
-  if (env_ != nullptr)
-    env_->set_current_context(previous_);
 }
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
@@ -559,21 +519,12 @@ void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)
 {
-  if (change_in_bytes > 0 &&
-      external_memory_ > std::numeric_limits<int64_t>::max() - change_in_bytes)
-  {
-    external_memory_ = std::numeric_limits<int64_t>::max();
-  }
-  else if (change_in_bytes < 0 &&
-           external_memory_ < std::numeric_limits<int64_t>::min() - change_in_bytes)
-  {
-    external_memory_ = std::numeric_limits<int64_t>::min();
-  }
-  else
-  {
-    external_memory_ += change_in_bytes;
-  }
-  return external_memory_;
+  return agent_->adjust_external_memory(change_in_bytes);
+}
+
+bool napi_env__::attach_embedder_hooks(const unofficial_napi_env_hooks &hooks)
+{
+  return agent_->attach_embedder_hooks(hooks);
 }
 
 napi_promises__ &napi_env__::promises()
