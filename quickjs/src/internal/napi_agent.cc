@@ -14,6 +14,32 @@ void *js_identity(JSValueConst value)
 {
   return JS_IsObject(value) ? JS_VALUE_GET_PTR(value) : nullptr;
 }
+
+bool is_live(napi_env env)
+{
+  return napi_util__::check_env(env) && !env->is_closing();
+}
+
+// Each realm falls back to its parent's hooks until it sets its own.
+napi_env first_with_reject_callback(napi_env env)
+{
+  for (; env != nullptr; env = env->parent())
+  {
+    if (is_live(env) && env->promises().has_reject_callback())
+      return env;
+  }
+  return nullptr;
+}
+
+napi_env first_with_promise_hook(napi_env env, size_t index)
+{
+  for (; env != nullptr; env = env->parent())
+  {
+    if (is_live(env) && env->promises().has_hook(index))
+      return env;
+  }
+  return nullptr;
+}
 } // namespace
 
 napi_agent__::napi_agent__(JSRuntime *runtime)
@@ -50,6 +76,105 @@ napi_env napi_agent__::env_for_context(JSContext *ctx) const
       return env;
   }
   return principal_env_;
+}
+
+void napi_agent__::add_realm_env(std::unique_ptr<napi_env__> env)
+{
+  realm_envs_.push_back(std::move(env));
+}
+
+void napi_agent__::teardown_realm_envs()
+{
+  for (auto it = realm_envs_.rbegin(); it != realm_envs_.rend(); ++it)
+  {
+    (*it)->prepare_teardown();
+    (*it)->finalize_instance_data();
+  }
+}
+
+napi_env napi_agent__::env_for_object(JSContext *ctx, JSValueConst object) const
+{
+  if (ctx == nullptr || !JS_IsObject(object))
+    return nullptr;
+
+  napi_env found = nullptr;
+  for_each_env([&](napi_env env)
+               {
+    if (found != nullptr || !is_live(env))
+      return;
+    JSValue global = JS_GetGlobalObject(env->context());
+    if (js_identity(global) == js_identity(object))
+      found = env;
+    JS_FreeValue(env->context(), global); });
+  if (found != nullptr)
+    return found;
+
+  // The last prototype of an ordinary object or function is its realm's
+  // Object.prototype.
+  JSValue current = JS_DupValue(ctx, object);
+  for (int depth = 0; depth < 10000; ++depth)
+  {
+    JSValue proto = JS_GetPrototype(ctx, current);
+    if (JS_IsException(proto))
+    {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+      JS_FreeValue(ctx, current);
+      return nullptr;
+    }
+    if (!JS_IsObject(proto))
+    {
+      JS_FreeValue(ctx, proto);
+      break;
+    }
+    JS_FreeValue(ctx, current);
+    current = proto;
+  }
+
+  for_each_env([&](napi_env env)
+               {
+    if (found != nullptr || !is_live(env))
+      return;
+    JSValue probe = JS_NewObject(env->context());
+    if (JS_IsException(probe))
+    {
+      JS_FreeValue(env->context(), JS_GetException(env->context()));
+      return;
+    }
+    JSValue object_prototype = JS_GetPrototype(env->context(), probe);
+    if (js_identity(object_prototype) == js_identity(current))
+      found = env;
+    JS_FreeValue(env->context(), object_prototype);
+    JS_FreeValue(env->context(), probe); });
+  JS_FreeValue(ctx, current);
+  return found;
+}
+
+napi_env napi_agent__::env_for_module(unofficial_napi_module module) const
+{
+  napi_env found = nullptr;
+  for_each_env([&](napi_env env)
+               {
+    if (found == nullptr && env->module_wrap().owns(module))
+      found = env; });
+  return found;
+}
+
+napi_env napi_agent__::env_for_module_def(JSModuleDef *module) const
+{
+  napi_env found = nullptr;
+  for_each_env([&](napi_env env)
+               {
+    if (found == nullptr && env->module_wrap().owns_module_def(module))
+      found = env; });
+  return found;
+}
+
+void napi_agent__::update_rejection_tracking()
+{
+  bool any = false;
+  for_each_env([&](napi_env env)
+               { any = any || (is_live(env) && env->promises().has_reject_callback()); });
+  set_rejection_tracking(any);
 }
 
 bool napi_agent__::open_root_scope(napi_env env)
@@ -135,6 +260,21 @@ size_t napi_agent__::active_scope_count() const
 bool napi_agent__::has_pending_exception() const
 {
   return has_pending_exception_;
+}
+
+void napi_agent__::request_termination()
+{
+  termination_requested_.store(true, std::memory_order_release);
+}
+
+void napi_agent__::cancel_termination()
+{
+  termination_requested_.store(false, std::memory_order_release);
+}
+
+bool napi_agent__::termination_requested() const
+{
+  return termination_requested_.load(std::memory_order_acquire);
 }
 
 bool napi_agent__::pending_exception_is_uncatchable() const
@@ -334,8 +474,8 @@ void napi_agent__::promise_hook(JSContext *ctx,
   else if (type == JS_PROMISE_HOOK_BEFORE)
     agent->enter_context_frame(promise);
 
-  napi_env env = agent->env_for_context(ctx);
-  if (napi_util__::check_env(env))
+  napi_env env = first_with_promise_hook(agent->env_for_context(ctx), static_cast<size_t>(type));
+  if (env != nullptr)
   {
     if (type == JS_PROMISE_HOOK_INIT)
     {
@@ -367,8 +507,8 @@ void napi_agent__::rejection_tracker(JSContext *ctx,
 
   agent->release_context_frame(promise);
 
-  napi_env env = agent->env_for_context(ctx);
-  if (napi_util__::check_env(env))
+  napi_env env = first_with_reject_callback(agent->env_for_context(ctx));
+  if (env != nullptr)
     env->promises().call_reject_callback(promise, reason, is_handled);
 }
 
@@ -378,8 +518,12 @@ int napi_agent__::import_meta_init(JSContext *ctx,
                                    void *opaque)
 {
   auto *agent = static_cast<napi_agent__ *>(opaque);
-  napi_env env = agent == nullptr ? nullptr : agent->env_for_context(ctx);
-  if (!napi_util__::check_env(env))
+  if (agent == nullptr)
+    return 0;
+  napi_env env = agent->env_for_module_def(module);
+  if (env == nullptr)
+    env = agent->env_for_context(ctx);
+  if (!is_live(env))
     return 0;
   return env->module_wrap().initialize_import_meta(module, meta);
 }
@@ -393,8 +537,14 @@ JSValue napi_agent__::dynamic_import(JSContext *ctx,
                                      void *opaque)
 {
   auto *agent = static_cast<napi_agent__ *>(opaque);
-  napi_env env = agent == nullptr ? nullptr : agent->env_for_context(ctx);
-  if (!napi_util__::check_env(env))
+  napi_env env = nullptr;
+  if (agent != nullptr)
+  {
+    env = agent->env_for_module_def(referrer);
+    if (env == nullptr)
+      env = agent->env_for_context(ctx);
+  }
+  if (!is_live(env))
     return JS_ThrowTypeError(ctx, "Dynamic import callback is not registered");
   return env->module_wrap().import_module_dynamically(referrer, referrer_name, specifier,
                                                       attributes, phase);

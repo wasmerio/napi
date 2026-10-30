@@ -102,6 +102,20 @@ struct Wasm32ModuleHooksV1 {
     initialize_import_meta_object: u32,
 }
 
+#[repr(C)]
+struct Wasm32RealmOptionsV1 {
+    size: u32,
+    version: u32,
+    sandbox_or_null: u32,
+    name: u32,
+    origin: u32,
+    host_defined_option_id: u32,
+    allow_code_gen_strings: u8,
+    allow_code_gen_wasm: u8,
+    own_microtask_queue: u8,
+    reserved: u8,
+}
+
 const JS_SOURCE_SIZE: usize = std::mem::size_of::<Wasm32JsSource>();
 const RUNTIME_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RuntimeOptionsV1>();
 const ENV_CREATE_PREFIX_SIZE: usize = std::mem::size_of::<Wasm32EnvCreateOptionsV1>();
@@ -109,6 +123,7 @@ const BYTECODE_OPEN_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV
 const MODULE_CREATE_PREFIX_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV1>();
 const MODULE_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32ModuleHooksV1>();
 const ENV_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32EnvHooksV1>();
+const REALM_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RealmOptionsV1>();
 
 const _: () = assert!(std::mem::size_of::<Wasm32VersionedHeader>() == 8);
 const _: () = assert!(JS_SOURCE_SIZE == 12);
@@ -120,6 +135,7 @@ const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateJsPayload>() == 16);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateSyntheticPayload>() == 16);
 const _: () = assert!(MODULE_HOOKS_SIZE == 16);
 const _: () = assert!(ENV_HOOKS_SIZE == 32);
+const _: () = assert!(REALM_OPTIONS_SIZE == 28);
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -460,6 +476,72 @@ pub(crate) fn read_module_hooks(
             std::mem::offset_of!(Wasm32ModuleHooksV1, initialize_import_meta_object),
         )?,
     ))
+}
+
+/// `unofficial_napi_realm_options` read from guest memory. Value fields are
+/// guest napi_value ids; 0 means NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RealmOptions {
+    pub sandbox_or_null: u32,
+    pub name: u32,
+    pub origin: u32,
+    pub host_defined_option_id: u32,
+    pub allow_code_gen_strings: bool,
+    pub allow_code_gen_wasm: bool,
+    pub own_microtask_queue: bool,
+}
+
+impl Default for RealmOptions {
+    /// The defaults of `unofficial_napi_realm_options_init`.
+    fn default() -> Self {
+        Self {
+            sandbox_or_null: 0,
+            name: 0,
+            origin: 0,
+            host_defined_option_id: 0,
+            allow_code_gen_strings: true,
+            allow_code_gen_wasm: true,
+            own_microtask_queue: false,
+        }
+    }
+}
+
+/// Reads realm options at `guest_ptr`. A null pointer means the defaults;
+/// `None` means the descriptor is out of bounds or has the wrong size or
+/// version.
+pub(crate) fn read_realm_options(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+) -> Option<RealmOptions> {
+    if guest_ptr == 0 {
+        return Some(RealmOptions::default());
+    }
+    let bytes = read_versioned(env, guest_ptr, REALM_OPTIONS_SIZE, 1)?;
+    let flag = |offset: usize| bytes.get(offset).map(|byte| *byte != 0);
+    Some(RealmOptions {
+        sandbox_or_null: u32_at(
+            &bytes,
+            std::mem::offset_of!(Wasm32RealmOptionsV1, sandbox_or_null),
+        )?,
+        name: u32_at(&bytes, std::mem::offset_of!(Wasm32RealmOptionsV1, name))?,
+        origin: u32_at(&bytes, std::mem::offset_of!(Wasm32RealmOptionsV1, origin))?,
+        host_defined_option_id: u32_at(
+            &bytes,
+            std::mem::offset_of!(Wasm32RealmOptionsV1, host_defined_option_id),
+        )?,
+        allow_code_gen_strings: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            allow_code_gen_strings
+        ))?,
+        allow_code_gen_wasm: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            allow_code_gen_wasm
+        ))?,
+        own_microtask_queue: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            own_microtask_queue
+        ))?,
+    })
 }
 
 pub(crate) struct EnvHooks {

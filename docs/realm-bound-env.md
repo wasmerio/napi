@@ -1,6 +1,6 @@
 # Realm-bound `napi_env`
 
-Status: Phase 0 implemented (see §11). Phases 1–4 are not started.
+Status: Phases 0–2 implemented (see §11–§13). Phases 3 and 4 are not started.
 
 **Proposal:** split each provider into an **agent**, which is the engine
 instance and its thread, and **realm envs**. A realm env is a `napi_env` whose
@@ -656,3 +656,169 @@ with an equivalent script instead.
 - The per-env callback registry and the opener env on frames exist, but
   nothing exercises them yet.
 - `Box<HostJsAgent>` needs a shared handle once several envs share an agent.
+
+## 12. Phase 1: what landed
+
+Every realm now has an env. `unofficial_napi_create_realm` creates one;
+`contextify_make_context` is a shim over it, so every vm context has one too.
+The old context arguments still work: they resolve to the realm env.
+
+### API
+
+- **New C functions** in `include/unofficial_napi.h`:
+  `unofficial_napi_create_realm`, `unofficial_napi_get_realm`,
+  `unofficial_napi_realm_options` and `unofficial_napi_realm_options_init`.
+- **New wasm32 wire struct:** `unofficial_napi_wasm32_realm_options_v1`
+  (28 bytes).
+- **New guest imports** of the same names, on both the native and the host-JS
+  paths. Both read their options with `abi::read_realm_options`.
+- **Unchanged:** every existing signature.
+
+### What each layer does
+
+**V8**
+- **Lookup:** a context embedder-data slot (33) maps a context to its env.
+  `get_realm` goes through an object's creation context, then through the
+  context records.
+- **Ownership:** the agent owns its realm envs. Context records live with the
+  principal env, so every env of the agent finds them.
+- **Entering the realm:** twelve N-API creators that rely on V8's current
+  context first enter the env's realm when it isn't current
+  (`NapiV8RealmScope`). Calls that take a context already enter it.
+- **Hook fallback:** promise reject, promise hooks, prepare-stack-trace,
+  dynamic import and `import.meta` all fall back to the parent.
+- **Modules:** module records are found in any env of the agent.
+
+**QuickJS**
+- **One `JSContext` per realm**, on the agent's runtime, with one agent-wide
+  registry of realms.
+- **`get_realm`** matches globals and sandboxes in that registry. For other
+  objects it matches the `Object.prototype` at the end of their prototype
+  chain against each env's.
+- **Hook fallback:** the promise reject callback, promise hooks, `import.meta`
+  and dynamic import fall back to the parent. QuickJS has no
+  prepare-stack-trace or source-map hooks to fall back to.
+
+**host-JS**
+- **Shared agent:** realm envs share the principal's `HostJsAgent`.
+- **Globals:** each realm has its own virtual global. A sandbox realm uses the
+  same sandbox proxy as `contextify_run_script(env, sandbox)`.
+- **`get_realm`** uses WeakMaps from globals, sandboxes and native function
+  wrappers to their env.
+
+**Bridge and Rust**
+- **Bridge:** each realm env gets a `SnapiEnvState` on its agent. Realms made
+  by `make_context` are adopted the first time `get_realm` returns them. Like
+  the principal env, a realm env state belongs to the agent's thread and is
+  registered without holding `g_mu` across the provider call (#107).
+- **Rust:** realm envs get guest ids with no owner scope, budget charge or
+  registry entry. Their ids stop resolving when their principal env is
+  released.
+
+### Lifetime
+
+Realm envs live until their agent is released. They are then torn down newest
+first, before the principal env. Collecting them earlier, together with their
+sandbox, waits for #109 (V8) and #110 (QuickJS).
+
+### Behaviour changes
+
+- **QuickJS `module_wrap_create`** honours its context argument. Before, vm
+  modules lived in the main realm.
+- **host-JS `make_context` with a symbol** (`DONT_CONTEXTIFY`) returns the new
+  realm's global, as V8 does. Before, it returned the symbol.
+- **host-JS `compile_function` and `module_wrap`** with a context no longer let
+  missing names fall through to the host global.
+
+### Tests
+
+| Suite | Phase 0 | Phase 1 |
+|---|---|---|
+| V8 | 99 | 114 |
+| QuickJS | 97 | 109 |
+| Rust lib / `v8_host_control` | 48 / 3 | 48 / 3 |
+| Manifest, native + WASIX | 36 | 37 |
+| host-JS node | 16 | 19 |
+| host-JS wasm-bindgen | 15 | 18 |
+
+What the new tests cover:
+
+- **`test_66_unofficial_realm`:** 12 shared tests, plus 3 that run on V8 only
+  (dynamic-import fallback, prepare-stack-trace fallback, own microtask
+  queue).
+- **`test_realm`:** the guest ABI, natively and on WASIX.
+
+### Known gaps
+
+- **Ignored options.** `name`, `origin`, the code-generation flags and
+  `own_microtask_queue` have no effect on QuickJS or host-JS, as with
+  `make_context`.
+- **QuickJS `get_realm`** returns NULL for an object whose prototype chain was
+  changed or that has a null prototype.
+- **Teardown.** During teardown, a guest finalizer that calls N-API through a
+  realm env id after that realm was torn down would reach a freed env. That is
+  the same class of risk the principal env already has.
+- **host-JS global leak (pre-existing).** An assignment to an undeclared name
+  inside a sandbox still lands on the host global.
+- **Next phase.** Phase 2 moves EdgeJS to realm envs (§6). Phase 3 then removes
+  the context arguments and the context-token hooks.
+
+## 13. Phase 2: EdgeJS on realm envs
+
+EdgeJS now acts in a vm context through that context's realm env, instead of
+passing the contextified object to the provider. The work is on the EdgeJS
+branch `feat/napi-realm-envs`, which pins napi to this branch.
+
+### napi changes it needed
+
+Calling into a realm env from a binding that belongs to the principal env
+showed two gaps, both now fixed on this branch:
+
+- **Pending exceptions were per env on V8 and host-JS.** An exception raised
+  through a realm env stayed on that env, so the calling binding returned
+  without rethrowing it. The pending exception now belongs to the agent, as it
+  already did on QuickJS. One thread runs one agent's JavaScript, so only one
+  exception can be in flight at a time.
+- **V8 module handles were per env.** Destroying a module through an env other
+  than the one that made it did nothing until teardown. Handles are now
+  agent-scoped, as they already were on QuickJS.
+
+New shared tests: `PendingExceptionsAreSharedAcrossRealms` and
+`ModuleHandlesWorkThroughAnyEnvOfTheAgent`.
+
+### EdgeJS changes
+
+- **`makeContext`** calls `unofficial_napi_create_realm`.
+- **`runInContext`, `compileFunction` and `moveMessagePortToContext`** resolve
+  the contextified object with `unofficial_napi_get_realm` and run through that
+  env, with no context argument. They share one helper, `src/edge_realm.h`.
+- **`compileFunction`** opens its bytecode through the realm env.
+- **ModuleWrap** creates a module through its realm env; its other methods are
+  unchanged.
+- **The context-token hooks** and `Environment::attached_contexts_`, which
+  nothing read, are removed.
+
+### Results
+
+Each variant ran 26 Node test categories: the CI set plus vm, module,
+async_hooks and worker_threads.
+
+| | A: EdgeJS main, napi a65e9cb | B: napi Phase 1 | C: B + migration |
+|---|---|---|---|
+| V8, failing of 2467 | 99 | 98 | 103 |
+| QuickJS, failing of 2459 | 168 | 168 | 168 |
+
+- **V8:** every test whose result differs between A, B and C passes three
+  times out of three when run on its own, on both binaries. They are vm and
+  worker tests that fail only under the harness's parallel load.
+- **QuickJS:** the three runs are identical, test for test.
+- **A crash that predates this work:**
+  `parallel/test-vm-global-configurable-properties` segfaults about 1–3 times
+  in 100 on A as well as on B and C.
+- **Not run:** the EdgeJS WASIX lanes, `test-intl` and `test-lang`.
+
+### Next
+
+Phase 3 removes what EdgeJS no longer uses: the sandbox, parsing-context and
+module-context arguments, `contextify_make_context`, and the context-token
+hooks.

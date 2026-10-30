@@ -321,6 +321,9 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_66_unofficial_realm
+  runners/test_66_unofficial_realm.cc
+)
 add_fixture_test(${_napi_test_prefix}_test_67_terminate_execution
   runners/test_67_terminate_execution.cc
 )

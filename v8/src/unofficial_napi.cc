@@ -347,14 +347,12 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
 v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> context,
                                                         v8::Local<v8::Value> exception,
                                                         v8::Local<v8::Array> trace) {
-  napi_agent__* agent = napi_agent__::From(context->GetIsolate());
-  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
-  if (env == nullptr) {
-    return exception->ToString(context);
-  }
-
+  // The callback of the context's realm, else of the nearest parent that set
+  // one.
   v8::Local<v8::Function> callback;
-  {
+  for (napi_env env = NapiV8RealmEnvOrPrincipal(context->GetIsolate(), context);
+       env != nullptr && callback.IsEmpty();
+       env = env->parent) {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     callback = LookupPrepareStackTraceCallback(env, context);
   }
@@ -668,14 +666,23 @@ void ReleaseRuntime() {
   // repeated Dispose/Initialize instability in embedded setups.
 }
 
+// The env whose promise reject callback handles `promise`: the promise's
+// realm, else the nearest parent that set one.
+napi_env PromiseRejectEnv(v8::Isolate* isolate, v8::Local<v8::Promise> promise) {
+  v8::Local<v8::Context> creation_context;
+  (void)promise->GetCreationContext().ToLocal(&creation_context);
+  napi_env env = NapiV8RealmEnvOrPrincipal(isolate, creation_context);
+  while (env != nullptr && env->promise_reject_callback.IsEmpty()) env = env->parent;
+  return env;
+}
+
 void PromiseRejectCallback(v8::PromiseRejectMessage message) {
   v8::Local<v8::Promise> promise = message.GetPromise();
   if (promise.IsEmpty()) return;
 
   v8::Isolate* isolate = promise->GetIsolate();
-  napi_agent__* agent = napi_agent__::From(isolate);
-  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
-  if (env == nullptr || env->promise_reject_callback.IsEmpty()) return;
+  napi_env env = PromiseRejectEnv(isolate, promise);
+  if (env == nullptr) return;
   v8::Local<v8::Function> callback = env->promise_reject_callback.Get(isolate);
 
   v8::PromiseRejectEvent event = message.GetEvent();
@@ -756,6 +763,20 @@ bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
   return false;
 }
 
+// Whether any env of `agent` has promise hooks, so the isolate-wide hook must
+// stay installed.
+bool AgentHasPromiseHooks(napi_agent__* agent) {
+  if (agent == nullptr) return false;
+  if (agent->principal_env != nullptr &&
+      HasPromiseHooks(agent->principal_env->promise_hooks)) {
+    return true;
+  }
+  for (napi_env realm : agent->realm_envs) {
+    if (HasPromiseHooks(realm->promise_hooks)) return true;
+  }
+  return false;
+}
+
 size_t PromiseHookIndex(v8::PromiseHookType type) {
   switch (type) {
     case v8::PromiseHookType::kInit:
@@ -775,8 +796,9 @@ void PromiseHookCallback(v8::PromiseHookType type,
                          v8::Local<v8::Promise> promise,
                          v8::Local<v8::Value> parent) {
   v8::Isolate* isolate = promise->GetIsolate();
-  napi_agent__* agent = napi_agent__::From(isolate);
-  napi_env env = agent != nullptr ? agent->principal_env : nullptr;
+  napi_env env = NapiV8RealmEnvOrPrincipal(
+      isolate, isolate->InContext() ? isolate->GetCurrentContext() : v8::Local<v8::Context>());
+  while (env != nullptr && !HasPromiseHooks(env->promise_hooks)) env = env->parent;
   if (env == nullptr) return;
   const size_t index = PromiseHookIndex(type);
   if (index >= env->promise_hooks.size() || env->promise_hooks[index].IsEmpty()) return;
@@ -810,6 +832,13 @@ std::array<v8::Local<v8::Function>, 4> LookupPromiseHooksForContext(napi_env env
   std::array<v8::Local<v8::Function>, 4> hooks;
   if (env == nullptr || isolate == nullptr) return hooks;
 
+  auto has_hooks = [](napi_env candidate) {
+    for (const auto& hook : candidate->promise_hooks) {
+      if (!hook.IsEmpty()) return true;
+    }
+    return false;
+  };
+  while (env->parent != nullptr && !has_hooks(env)) env = env->parent;
   for (size_t i = 0; i < hooks.size(); ++i) {
     if (!env->promise_hooks[i].IsEmpty()) {
       hooks[i] = env->promise_hooks[i].Get(isolate);
@@ -1716,8 +1745,35 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
   return napi_ok;
 }
 
+// Tears down one realm env: its realm-level hook state, then the env.
+static void DestroyRealmEnv(napi_env env) {
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
+    if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
+      ResetPrepareStackTraceState(&prepare_it->second);
+      g_prepare_stack_trace_callbacks.erase(prepare_it);
+    }
+    unofficial_napi_internal::ResetErrorFormattingState(env);
+  }
+  env->promise_reject_callback.Reset();
+  for (auto& hook : env->promise_hooks) {
+    hook.Reset();
+  }
+  NapiV8ForgetRealmEnv(env);
+  delete env;
+}
+
 static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
+  if (env->agent != nullptr && env->agent->principal_env == env) {
+    std::vector<napi_env>& realms = env->agent->realm_envs;
+    while (!realms.empty()) {
+      napi_env realm = realms.back();
+      realms.pop_back();
+      DestroyRealmEnv(realm);
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr) {
@@ -1943,6 +1999,7 @@ napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
     v8::Local<v8::Context> principal_context = env->context();
     const bool use_principal_callback =
         current_context.IsEmpty() ||
+        NapiV8EnvForContext(current_context) != nullptr ||
         (!principal_context.IsEmpty() &&
          (current_context == principal_context ||
           NapiV8IsContextifyContext(env, current_context)));
@@ -2244,7 +2301,7 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
     }
   }
 #ifndef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
-  const bool has_hooks = HasPromiseHooks(env->promise_hooks);
+  const bool has_hooks = AgentHasPromiseHooks(env->agent);
 #endif
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
@@ -2321,13 +2378,9 @@ napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
     return napi_ok;
   }
 
-  // The reject callback is dispatched by the agent's principal env, as in
-  // PromiseRejectCallback.
-  napi_agent__* agent = env->agent;
-  napi_env reject_env = agent != nullptr ? agent->principal_env : nullptr;
-  if (reject_env == nullptr || reject_env->promise_reject_callback.IsEmpty()) {
-    return napi_ok;
-  }
+  // Same env as PromiseRejectCallback picks for this promise.
+  napi_env reject_env = PromiseRejectEnv(isolate, local_promise);
+  if (reject_env == nullptr) return napi_ok;
   v8::Local<v8::Function> callback = reject_env->promise_reject_callback.Get(isolate);
 
   v8::Local<v8::Value> args[3] = {

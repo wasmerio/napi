@@ -76,6 +76,26 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapi_bridge_unofficial_create_realm(
+        parent: SnapiEnv,
+        sandbox_id: u32,
+        name_id: u32,
+        origin_id: u32,
+        host_defined_option_id: u32,
+        allow_code_gen_strings: i32,
+        allow_code_gen_wasm: i32,
+        own_microtask_queue: i32,
+        realm_out: *mut SnapiEnv,
+        global_out_id: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_get_realm(
+        env: SnapiEnv,
+        value_id: u32,
+        realm_out: *mut SnapiEnv,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     /// Nonzero if releasing `env` from this thread now would be refused (see
     /// `RELEASE_REFUSED`).

@@ -170,6 +170,75 @@ namespace
         *result = env;
         return napi_ok;
     }
+
+    // The env a module operation acts through: the one whose module_wrap made
+    // the module, which may be another realm of the caller's agent.
+    napi_env ModuleOwner(napi_env env, unofficial_napi_module module)
+    {
+        napi_env owner = env->agent()->env_for_module(module);
+        return owner != nullptr ? owner : env;
+    }
+
+    // The realm a sandbox, global or other context argument selects; the
+    // caller's own realm when the argument is missing or selects none.
+    napi_env RealmForContextArgument(napi_env env, napi_value context)
+    {
+        if (context == nullptr)
+            return env;
+        JSValueConst raw = napi_quickjs_value_inner(env, context);
+        if (!JS_IsObject(raw))
+            return env;
+        napi_env realm = env->contextify().realm_for_value(raw);
+        if (realm == nullptr)
+            realm = env->agent()->env_for_object(env->context(), raw);
+        return realm != nullptr ? realm : env;
+    }
+}
+
+napi_status napi_quickjs_create_realm(napi_env parent,
+                                      JSValueConst sandbox_or_undefined,
+                                      JSValueConst host_defined_option_id,
+                                      napi_env *realm_out)
+{
+    if (!napi_util__::check_env(parent) || parent->is_closing() || realm_out == nullptr)
+        return napi_invalid_arg;
+    *realm_out = nullptr;
+
+    napi_agent__ *agent = parent->agent();
+    JSContext *ctx = JS_NewContext(agent->runtime());
+    if (ctx == nullptr)
+        return napi_generic_failure;
+    if (!EnsureNodeWellKnownSymbols(ctx))
+    {
+        napi_status status = napi_util__::return_pending_if_caught(parent, "Failed to set up realm");
+        JS_FreeContext(ctx);
+        return status == napi_ok ? napi_generic_failure : status;
+    }
+
+    std::unique_ptr<napi_env__> realm{
+        new (std::nothrow) napi_env__{agent, ctx, parent->module_api_version()}};
+    if (realm == nullptr)
+    {
+        JS_FreeContext(ctx);
+        return napi_generic_failure;
+    }
+    realm->set_parent(parent);
+    JS_SetContextOpaque(ctx, realm.get());
+
+    // On success the registry record owns the context.
+    napi_status status =
+        parent->contextify().register_realm(parent, realm.get(), sandbox_or_undefined, host_defined_option_id);
+    if (status != napi_ok)
+    {
+        realm.reset();
+        JS_SetContextOpaque(ctx, nullptr);
+        JS_FreeContext(ctx);
+        return status;
+    }
+
+    *realm_out = realm.get();
+    agent->add_realm_env(std::move(realm));
+    return napi_ok;
 }
 
 extern "C"
@@ -366,6 +435,84 @@ extern "C"
         return ReleaseEnvScope(owner);
     }
 
+    napi_status NAPI_CDECL unofficial_napi_create_realm(
+        napi_env parent,
+        const unofficial_napi_realm_options *options,
+        napi_env *realm_out,
+        napi_value *global_out)
+    {
+        if (!napi_util__::check_env(parent) || realm_out == nullptr)
+            return napi_invalid_arg;
+        if (options != nullptr &&
+            (options->size < sizeof(*options) ||
+             options->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION))
+            return napi_invalid_arg;
+        *realm_out = nullptr;
+
+        // QuickJS has no per-realm code-generation switch or microtask queue;
+        // name and origin only label the realm. Those options are accepted
+        // and have no effect, as with make_context.
+        JSValueConst sandbox = JS_UNDEFINED;
+        JSValueConst host_id = JS_UNDEFINED;
+        if (options != nullptr)
+        {
+            if (options->sandbox_or_null != nullptr)
+            {
+                JSValueConst raw = napi_quickjs_value_inner(parent, options->sandbox_or_null);
+                if (!JS_IsNull(raw) && !JS_IsUndefined(raw))
+                {
+                    if (!JS_IsObject(raw))
+                        return napi_invalid_arg;
+                    sandbox = raw;
+                }
+            }
+            if (options->host_defined_option_id != nullptr)
+                host_id = napi_quickjs_value_inner(parent, options->host_defined_option_id);
+        }
+        // A sandbox belongs to one realm.
+        if (JS_IsObject(sandbox) && parent->contextify().realm_for_value(sandbox) != nullptr)
+            return napi_invalid_arg;
+
+        napi_env realm = nullptr;
+        napi_status status = napi_quickjs_create_realm(parent, sandbox, host_id, &realm);
+        if (status != napi_ok)
+            return status;
+        if (JS_IsObject(sandbox))
+        {
+            status = parent->contextify().contextify_sandbox(sandbox);
+            if (status != napi_ok)
+                return status;
+        }
+
+        if (global_out != nullptr)
+        {
+            JSValue global = JS_IsObject(sandbox) ? JS_DupValue(parent->context(), sandbox)
+                                                  : JS_GetGlobalObject(realm->context());
+            *global_out = parent->wrap_value_in_current_scope(global, true);
+            if (*global_out == nullptr)
+                return napi_generic_failure;
+        }
+        *realm_out = realm;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_realm(
+        napi_env env,
+        napi_value value,
+        napi_env *realm_out)
+    {
+        if (!napi_util__::check_env(env) || value == nullptr || realm_out == nullptr)
+            return napi_invalid_arg;
+        JSValueConst raw = napi_quickjs_value_inner(env, value);
+        if (!JS_IsObject(raw))
+            return napi_object_expected;
+        napi_env realm = env->contextify().realm_for_value(raw);
+        if (realm == nullptr)
+            realm = env->agent()->env_for_object(env->context(), raw);
+        *realm_out = realm;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env)
     {
         if (!napi_util__::check_env(env))
@@ -400,9 +547,15 @@ extern "C"
         if (status != napi_ok)
             return status;
         if (state_out != nullptr)
-            *state_out = env->module_wrap().has_pending_provider_work()
+        {
+            // Dynamic imports pending in any realm of the agent count.
+            bool pending = false;
+            env->agent()->for_each_env([&](napi_env candidate)
+                                       { pending = candidate->module_wrap().has_pending_provider_work() || pending; });
+            *state_out = pending
                              ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
                              : unofficial_napi_event_loop_checkpoint_state_none;
+        }
         return napi_ok;
     }
 
@@ -501,7 +654,7 @@ extern "C"
         napi_status status = env->promises().set_reject_callback(callback);
         if (status != napi_ok)
             return status;
-        env->agent()->set_rejection_tracking(env->promises().has_reject_callback());
+        env->agent()->update_rejection_tracking();
         return napi_ok;
     }
 
@@ -1313,11 +1466,14 @@ extern "C"
             result_out == nullptr)
             return napi_invalid_arg;
         *result_out = {};
+        // A context argument selects its realm; the module lives in that
+        // realm's env.
+        napi_env target = RealmForContextArgument(env, options->context_or_undefined);
         napi_status status = napi_invalid_arg;
         switch (options->kind)
         {
         case unofficial_napi_module_source_text:
-            status = env->module_wrap().create_source_text(
+            status = target->module_wrap().create_source_text(
                 options->wrapper,
                 options->url,
                 options->context_or_undefined,
@@ -1328,7 +1484,7 @@ extern "C"
                 &result_out->module);
             break;
         case unofficial_napi_module_synthetic:
-            status = env->module_wrap().create_synthetic(
+            status = target->module_wrap().create_synthetic(
                 options->wrapper,
                 options->url,
                 options->context_or_undefined,
@@ -1341,13 +1497,13 @@ extern "C"
         }
         if (status != napi_ok)
             return status;
-        status = env->module_wrap().get_creation_metadata(
+        status = target->module_wrap().get_creation_metadata(
             result_out->module,
             &result_out->module_requests,
             &result_out->has_top_level_await);
         if (status != napi_ok)
         {
-            env->module_wrap().destroy(result_out->module);
+            target->module_wrap().destroy(result_out->module);
             *result_out = {};
         }
         return status;
@@ -1359,7 +1515,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
-        return env->module_wrap().destroy(module);
+        return ModuleOwner(env, module)->module_wrap().destroy(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
@@ -1370,7 +1526,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().link(module, count, linked_modules);
+        return ModuleOwner(env, module)->module_wrap().link(module, count, linked_modules);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
@@ -1379,7 +1535,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().instantiate(module);
+        return ModuleOwner(env, module)->module_wrap().instantiate(module);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
@@ -1393,7 +1549,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate(module, timeout, break_on_sigint, result_out);
+        return ModuleOwner(env, module)->module_wrap().evaluate(module, timeout, break_on_sigint, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
@@ -1407,7 +1563,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().evaluate_sync(module, filename, parent_filename, result_out);
+        return ModuleOwner(env, module)->module_wrap().evaluate_sync(module, filename, parent_filename, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
@@ -1419,7 +1575,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_namespace(module, result_out);
+        return ModuleOwner(env, module)->module_wrap().get_namespace(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_state(
@@ -1435,7 +1591,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_state(
+        return ModuleOwner(env, module)->module_wrap().get_state(
             module, status_out, error_out, has_async_graph_out);
     }
 
@@ -1447,7 +1603,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr || settled_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().check_unsettled_top_level_await(module,
+        return ModuleOwner(env, module)->module_wrap().check_unsettled_top_level_await(module,
                                                                   warnings,
                                                                   settled_out);
     }
@@ -1460,7 +1616,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_export(module, export_name, export_value);
+        return ModuleOwner(env, module)->module_wrap().set_export(module, export_name, export_value);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_module_source_object(
@@ -1470,7 +1626,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().set_module_source_object(module, source_object);
+        return ModuleOwner(env, module)->module_wrap().set_module_source_object(module, source_object);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_get_module_source_object(
@@ -1482,7 +1638,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().get_module_source_object(module, result_out);
+        return ModuleOwner(env, module)->module_wrap().get_module_source_object(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
@@ -1492,7 +1648,7 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || result_out == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_cached_data(module, result_out);
+        return ModuleOwner(env, module)->module_wrap().create_cached_data(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_module_wrap_set_hooks(
@@ -1513,7 +1669,7 @@ extern "C"
             return napi_invalid_arg;
         if (module == nullptr)
             return napi_invalid_arg;
-        return env->module_wrap().create_required_module_facade(module, result_out);
+        return ModuleOwner(env, module)->module_wrap().create_required_module_facade(module, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_destroy_env_instance_for_testing(napi_env env)

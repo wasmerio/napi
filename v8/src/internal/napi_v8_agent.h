@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <v8.h>
@@ -15,8 +16,8 @@ class CpuProfiler;
 }  // namespace v8
 
 // One engine instance: a V8 isolate and the state that belongs to it rather
-// than to a realm. Every env points at its agent. Today an agent has one env,
-// its principal env; envs for other realms of the isolate will share it.
+// than to a realm. Every env points at its agent: the principal env, made with
+// the isolate, and one env per realm made with unofficial_napi_create_realm.
 //
 // Only the isolate's own thread reads or writes these fields, except
 // `allocator` and `hash_seed`, which are fixed once the agent is set up.
@@ -36,12 +37,23 @@ struct napi_agent__ {
 
   v8::Isolate* const isolate;
   napi_env principal_env = nullptr;
+  // Envs of other realms of this isolate, in creation order. The agent owns
+  // them; they are torn down newest first, before the principal env.
+  std::vector<napi_env> realm_envs;
 
   // Backs the isolate's ArrayBuffers. Null when the isolate was not created
   // by unofficial_napi_create_env.
   std::shared_ptr<v8::ArrayBuffer::Allocator> allocator;
   // Provider-generated seed; zero means "ask the isolate".
   uint64_t hash_seed = 0;
+
+  // The exception pending for N-API calls on the isolate's thread. All envs
+  // of the agent share it, so an exception raised through one env reaches the
+  // callback that called it, whichever env that callback belongs to.
+  v8::Global<v8::Value> last_exception;
+  v8::Global<v8::Message> last_exception_message;
+  std::string last_exception_source_line;
+  std::string last_exception_thrown_at;
 
   // Isolate-wide keys for wraps, buffer records and type tags.
   v8::Global<v8::Private> wrap_private_key;

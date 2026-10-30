@@ -307,6 +307,93 @@ fn guest_unofficial_napi_release_env(
     status
 }
 
+/// Whether `len` bytes at `guest_ptr` lie inside guest memory, checked before
+/// an import has side effects it could not undo.
+fn guest_out_fits(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, len: u64) -> bool {
+    let (state, store) = env.data_and_store_mut();
+    let Some(memory) = state.memory.clone() else {
+        return false;
+    };
+    guest_ptr != 0 && u64::from(guest_ptr) + len <= memory.view(&store).data_size()
+}
+
+fn guest_unofficial_napi_create_realm(
+    mut env: FunctionEnvMut<NapiEnv>,
+    parent: u32,
+    options_ptr: u32,
+    realm_out_ptr: u32,
+    global_out_ptr: u32,
+) -> i32 {
+    let Some(options) = abi::read_realm_options(&mut env, options_ptr) else {
+        return 1;
+    };
+    if !guest_out_fits(&mut env, realm_out_ptr, 4)
+        || (global_out_ptr != 0 && !guest_out_fits(&mut env, global_out_ptr, 4))
+    {
+        return 1;
+    }
+    let parent_env = snapi_env(&env, parent);
+    if parent_env.is_null() {
+        return 1;
+    }
+    let mut realm: SnapiEnv = std::ptr::null_mut();
+    let mut global_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_create_realm(
+            parent_env,
+            options.sandbox_or_null,
+            options.name,
+            options.origin,
+            options.host_defined_option_id,
+            i32::from(options.allow_code_gen_strings),
+            i32::from(options.allow_code_gen_wasm),
+            i32::from(options.own_microtask_queue),
+            &mut realm,
+            &mut global_id,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    if realm.is_null() {
+        return 9;
+    }
+    let realm_id = env.data_mut().register_realm_env(parent, realm);
+    write_guest_u32(&mut env, realm_out_ptr, realm_id);
+    if global_out_ptr != 0 {
+        write_guest_u32(&mut env, global_out_ptr, global_id);
+    }
+    0
+}
+
+fn guest_unofficial_napi_get_realm(
+    mut env: FunctionEnvMut<NapiEnv>,
+    caller: u32,
+    value: u32,
+    realm_out_ptr: u32,
+) -> i32 {
+    if !guest_out_fits(&mut env, realm_out_ptr, 4) {
+        return 1;
+    }
+    let caller_env = snapi_env(&env, caller);
+    let mut realm: SnapiEnv = std::ptr::null_mut();
+    let status = unsafe { snapi_bridge_unofficial_get_realm(caller_env, value, &mut realm) };
+    if status != 0 {
+        return status;
+    }
+    let realm_id = if realm.is_null() {
+        0
+    } else {
+        // A realm env the provider made itself (make_context) is new here.
+        match env.data().guest_env_id(realm) {
+            Some(id) => id,
+            None => env.data_mut().register_realm_env(caller, realm),
+        }
+    };
+    write_guest_u32(&mut env, realm_out_ptr, realm_id);
+    0
+}
+
 fn guest_unofficial_napi_attach_env(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -4883,6 +4970,8 @@ pub fn register_napi_imports(
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
+        "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
+        "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),

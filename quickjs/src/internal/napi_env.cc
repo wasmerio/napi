@@ -120,6 +120,10 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
+  // Realm envs go first, while the principal env still accepts calls.
+  if (is_principal())
+    agent_->teardown_realm_envs();
+
   closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
   while (!env_cleanup_hooks_.empty())
@@ -157,8 +161,8 @@ void napi_env__::prepare_teardown()
   promises_.teardown();
   if (principal)
     agent_->clear_values();
-  // Detach before the runtime can be freed. The termination flag itself stays
-  // valid for the env's whole lifetime, since other threads may still set it.
+  // Detach before the runtime can be freed. The termination flag lives on the
+  // agent, which outlives this env, since other threads may still set it.
   if (context_ != nullptr)
     detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
   runtime_interrupts_ = nullptr;
@@ -206,6 +210,16 @@ void napi_env__::adopt_agent(std::unique_ptr<napi_agent__> agent)
 bool napi_env__::is_principal() const
 {
   return agent_->principal_env() == this;
+}
+
+napi_env napi_env__::parent() const
+{
+  return parent_;
+}
+
+void napi_env__::set_parent(napi_env parent)
+{
+  parent_ = parent;
 }
 
 JSContext *napi_env__::context() const
@@ -402,17 +416,17 @@ bool napi_env__::last_exception_is_uncatchable() const
 
 void napi_env__::request_termination()
 {
-  termination_requested_.store(true, std::memory_order_release);
+  agent_->request_termination();
 }
 
 void napi_env__::cancel_termination()
 {
-  termination_requested_.store(false, std::memory_order_release);
+  agent_->cancel_termination();
 }
 
 bool napi_env__::termination_requested() const
 {
-  return termination_requested_.load(std::memory_order_acquire);
+  return agent_->termination_requested();
 }
 
 void napi_env__::clear_last_exception()

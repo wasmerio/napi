@@ -45,6 +45,9 @@ struct napi_env__
   // Makes this env own its agent (an env made from an embedder's context).
   void adopt_agent(std::unique_ptr<napi_agent__> agent);
   bool is_principal() const;
+  // The env whose hooks this realm falls back to; null for the principal env.
+  napi_env parent() const;
+  void set_parent(napi_env parent);
   JSContext *context() const;
   int32_t module_api_version() const;
 
@@ -96,8 +99,9 @@ struct napi_env__
   void set_last_exception(JSValue exception);
   JSValue take_last_exception();
 
-  // unofficial_napi_terminate_execution state. Any thread may request
-  // termination; everything else runs on the env's engine thread.
+  // unofficial_napi_terminate_execution state, kept by the agent so that a
+  // termination stops every env of it. Any thread may request termination;
+  // everything else runs on the env's engine thread.
   void request_termination();
   void cancel_termination();
   bool termination_requested() const;
@@ -135,9 +139,10 @@ private:
   // Set only when this env owns its agent; destroyed last.
   std::unique_ptr<napi_agent__> owned_agent_;
 
-  // Agent, realm and API version.
+  // Agent, realm, parent realm and API version.
   napi_agent__ *agent_;
   JSContext *context_;
+  napi_env parent_ = nullptr;
   int32_t module_api_version_ = 8;
 
   // Last native error state.
@@ -145,7 +150,6 @@ private:
 
   // Termination. QuickJS polls one interrupt handler per runtime, so the
   // handler lives in a record shared by every env on this env's runtime.
-  std::atomic<bool> termination_requested_{false};
   napi_runtime_interrupts__ *runtime_interrupts_ = nullptr;
 
   // Instance data finalizer.

@@ -10,6 +10,14 @@
 #include <string>
 #include <vector>
 
+// Creates a realm on `parent`'s agent: a new JSContext and the env bound to
+// it. With a sandbox object the realm reads and writes the sandbox, as
+// vm.createContext does. Defined in unofficial_napi.cc.
+napi_status napi_quickjs_create_realm(napi_env parent,
+                                      JSValueConst sandbox_or_undefined,
+                                      JSValueConst host_defined_option_id,
+                                      napi_env *realm_out);
+
 namespace quickjs::detail
 {
     class napi_contextify__ final
@@ -86,6 +94,17 @@ namespace quickjs::detail
         napi_status bytecode_serialize(unofficial_napi_bytecode bytecode, napi_value *buffer_out);
         napi_status bytecode_release(unofficial_napi_bytecode bytecode);
 
+        // Realm records. Every realm of an agent has one, kept by the
+        // principal env's contextify; it owns the realm's JSContext.
+        napi_status register_realm(napi_env parent,
+                                   napi_env realm,
+                                   JSValueConst sandbox_or_undefined,
+                                   JSValueConst host_defined_option_id);
+        // Marks `sandbox` as contextified, as make_context does.
+        napi_status contextify_sandbox(JSValueConst sandbox);
+        // The env of the realm whose sandbox or global is `value`, or null.
+        napi_env realm_for_value(JSValueConst value) const;
+
     private:
         bool compile_trace_enabled() const;
         int32_t get_int32_property_or(JSValueConst object, const char *name, int32_t fallback) const;
@@ -111,10 +130,11 @@ namespace quickjs::detail
                                         const std::string &resource_name,
                                         int32_t line_offset,
                                         int32_t column_offset);
+        // The agent-wide registry: the principal env's contextify.
+        napi_contextify__ &registry() const;
         context_record *find_context_record(JSValueConst sandbox) const;
-        context_record *create_context_record(JSValueConst sandbox,
-                                              JSValueConst host_defined_option_id);
-        void destroy_context_record(context_record *record);
+        // The sandbox record of `realm`, if it was made with a sandbox.
+        context_record *find_sandbox_record_for_env(napi_env realm) const;
 
         // Owning environment and QuickJS context.
         napi_env env_;
