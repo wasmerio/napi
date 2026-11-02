@@ -114,29 +114,9 @@ fn call_guest_callback(
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(env, wasm_fn_ptr) else {
-                eprintln!("[callback trampoline] table entry missing for function {wasm_fn_ptr}");
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => {
-                    eprintln!("[callback trampoline] null function reference at {wasm_fn_ptr}");
-                    return 0;
-                }
-                other => {
-                    eprintln!(
-                        "[callback trampoline] non-function table value at {wasm_fn_ptr}: {other:?}"
-                    );
-                    return 0;
-                }
-            };
-            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
-            func
-        }
+    let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
+        eprintln!("[callback trampoline] table entry missing for function {wasm_fn_ptr}");
+        return 0;
     };
     let result = func.call(
         env,
@@ -163,16 +143,9 @@ fn call_guest_finalizer(
     data: u32,
     hint: u32,
 ) -> u32 {
-    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
-                eprintln!("[finalizer trampoline] table entry missing for function {wasm_fn_ptr}");
-                return 0;
-            };
-            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
-            func
-        }
+    let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
+        eprintln!("[finalizer trampoline] table entry missing for function {wasm_fn_ptr}");
+        return 0;
     };
     match func.call(
         env,

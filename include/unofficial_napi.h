@@ -218,6 +218,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // used when embedder code intentionally stops a worker but still needs the
 // current JS stack to unwind normally.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
+// Host-side callback transport uses this to preserve preexisting termination.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_execution_terminating(
+    napi_env env, bool* result);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 

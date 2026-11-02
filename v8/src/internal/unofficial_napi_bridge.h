@@ -15,4 +15,8 @@ void NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);
 
+// Bridge-created envs enter their isolate only during physical foreground calls.
+// Root handle/context scopes remain isolate-local and are released by their owner.
+napi_status NapiV8DetachBridgeIsolateScope(unofficial_napi_env_owner owner);
+
 #endif  // NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_

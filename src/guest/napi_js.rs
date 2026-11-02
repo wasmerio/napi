@@ -33,6 +33,9 @@ const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+    if !env.data().creation_enabled() {
+        return 0;
+    }
     let _ = unsafe { snapi_bridge_init() };
     let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
 
@@ -507,6 +510,9 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    if !env.data().creation_enabled() {
+        return 1;
+    }
     let (
         total_memory,
         constrained_memory,

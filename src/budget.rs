@@ -974,11 +974,8 @@ mod tests {
         assert_eq!(budget.memory_charged(), PAGE, "minimum charged up front");
 
         let mut pages = 1u32;
-        loop {
-            match memory.grow(&mut store, Pages(1)) {
-                Ok(_) => pages += 1,
-                Err(_) => break,
-            }
+        while memory.grow(&mut store, Pages(1)).is_ok() {
+            pages += 1;
             assert!(pages <= 100, "grow was never capped");
         }
 

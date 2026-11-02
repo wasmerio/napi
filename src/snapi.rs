@@ -82,14 +82,18 @@ unsafe extern "C" {
         has_runnable_work: i32,
         checkpoint_state: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_register_guest_buffer_finalizer(
         env: SnapiEnv,
         value_id: u32,
         guest_ptr: u32,
         recyclable: i32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_take_ready_guest_buffer_finalizer(
         env: SnapiEnv,
         force: i32,
@@ -102,6 +106,7 @@ unsafe extern "C" {
         callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_cancel_terminate_execution(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_is_execution_terminating(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_request_interrupt(
         env: SnapiEnv,
         guest_env: u32,
@@ -246,6 +251,7 @@ unsafe extern "C" {
         expose_numeric_values: i32,
         json_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_free_buffer(data: *mut c_void);
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
@@ -874,17 +880,13 @@ unsafe extern "C" {
         data_out: *mut u64,
         value_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
     -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_overwrite_value_bytes(
         env: SnapiEnv,
         id: u32,
-        data: *const core::ffi::c_void,
-        len: u32,
-    ) -> i32;
-    pub fn snapi_bridge_overwrite_reference_bytes(
-        env: SnapiEnv,
-        reference_id: u32,
         data: *const core::ffi::c_void,
         len: u32,
     ) -> i32;

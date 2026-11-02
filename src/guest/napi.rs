@@ -6,14 +6,13 @@
 
 use std::ffi::CString;
 
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
-use wasmer_wasix::WasiError;
+use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{take_pending_guest_exit, with_callback_state},
+        callback::with_callback_state,
     },
     snapi::*,
 };
@@ -21,6 +20,9 @@ use crate::{
 use super::{abi, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+    if !env.data().creation_enabled() {
+        return 0;
+    }
     let _ = unsafe { snapi_bridge_init() };
     // Legacy N-API modules without an embedder-owned runtime configuration use
     // the provider default. If Edge configured flags first, this conflicting
@@ -74,27 +76,14 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
         .unwrap_or(std::ptr::null())
 }
 
-/// Run a bridge call that may re-enter the guest via host V8 callbacks, then
-/// re-raise any guest instance exit that trapped out of one of those callbacks.
-///
-/// A guest `_exit`/`proc_exit` during a nested callback cannot unwind through the
-/// intervening host V8 (C++) frames, so the callback trampoline stashes it (see
-/// [`take_pending_guest_exit`]). This boundary — the enclosing N-API import — is
-/// the first Rust frame that can carry a trap, so it returns the exit as
-/// `Err(WasiError::Exit)`. wasmer re-raises it, and the same happens at each
-/// outer import layer until the runner handles it, terminating just this guest
-/// instance. Callers propagate with `?`.
+/// Run a bridge call and return the original error of any guest callback.
 fn with_cb_context<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: i32,
     f: impl FnOnce() -> R,
-) -> Result<R, WasiError> {
+) -> Result<R, RuntimeError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
-    let r = with_callback_state(env, snapi_env, f);
-    if let Some(code) = take_pending_guest_exit() {
-        return Err(WasiError::Exit(code));
-    }
-    Ok(r)
+    with_callback_state(env, snapi_env, f)
 }
 
 fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
@@ -214,6 +203,9 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
+    if !env.data().creation_enabled() {
+        return 1;
+    }
     let (
         total_memory,
         constrained_memory,
@@ -280,7 +272,7 @@ fn guest_unofficial_napi_release_env(
     mut env: FunctionEnvMut<NapiEnv>,
     scope_ptr: i32,
     loop_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
     let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
     else {
@@ -334,7 +326,7 @@ fn guest_unofficial_napi_event_loop_checkpoint(
     mode: i32,
     has_runnable_work: i32,
     checkpoint_state_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut checkpoint_state = 0;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -620,7 +612,7 @@ fn guest_unofficial_napi_request_interrupt(
     napi_env: i32,
     callback: i32,
     data: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
     let data_val = if data > 0 { data as u32 } else { 0 };
@@ -1199,7 +1191,7 @@ fn guest_unofficial_napi_contextify_run_script(
     break_on_first_line: i32,
     host_defined_option_id: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };
@@ -1458,7 +1450,7 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     timeout: i64,
     break_on_sigint: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -1483,7 +1475,7 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     filename: i32,
     parent_filename: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -1706,7 +1698,7 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     napi_env: i32,
     handle: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -2283,7 +2275,7 @@ fn guest_napi_set_property(
     o: i32,
     k: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_property(snapi, o as u32, k as u32, v as u32)
@@ -2296,7 +2288,7 @@ fn guest_napi_get_property(
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2314,7 +2306,7 @@ fn guest_napi_has_property(
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2332,7 +2324,7 @@ fn guest_napi_has_own_property(
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2350,7 +2342,7 @@ fn guest_napi_delete_property(
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2368,7 +2360,7 @@ fn guest_napi_set_named_property(
     o: i32,
     np: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2385,7 +2377,7 @@ fn guest_napi_get_named_property(
     o: i32,
     np: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2407,7 +2399,7 @@ fn guest_napi_has_named_property(
     o: i32,
     np: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2429,7 +2421,7 @@ fn guest_napi_set_element(
     o: i32,
     idx: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_element(snapi, o as u32, idx as u32, v as u32)
@@ -2442,7 +2434,7 @@ fn guest_napi_get_element(
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2460,7 +2452,7 @@ fn guest_napi_has_element(
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2478,7 +2470,7 @@ fn guest_napi_delete_element(
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2504,7 +2496,7 @@ fn guest_napi_get_property_names(
     e: i32,
     o: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
@@ -2525,7 +2517,7 @@ fn guest_napi_get_all_property_names(
     filter: i32,
     conversion: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
@@ -3198,9 +3190,7 @@ fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i3
     s
 }
 fn guest_napi_close_handle_scope(env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
-    let s = unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) };
-    if s == 0 {}
-    s
+    unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) }
 }
 
 fn guest_napi_open_escapable_handle_scope(
@@ -3290,7 +3280,7 @@ fn guest_napi_call_function(
     argc: i32,
     argv_ptr: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc as u32;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
@@ -3889,7 +3879,7 @@ fn guest_napi_run_script(
     e: i32,
     sh: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     let mut out: u32 = 0;
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -3916,10 +3906,7 @@ fn guest_napi_create_string_utf16(
     let char_count: usize = if wl == 0xFFFFFFFFu32 {
         // Auto-length: scan for null terminator (u16 == 0)
         let mut scan_len: usize = 0;
-        loop {
-            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else {
-                break;
-            };
+        while let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) {
             let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
             if ch == 0 {
                 break;
@@ -4302,6 +4289,7 @@ fn guest_napi_get_buffer_info(
     0
 }
 
+#[allow(clippy::too_many_arguments)] // The guest ABI fixes this import's signature.
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4688,7 +4676,7 @@ fn guest_napi_new_instance(
     argc: i32,
     argv_ptr: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc as u32;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {

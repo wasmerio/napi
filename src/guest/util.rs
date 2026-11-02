@@ -90,16 +90,6 @@ pub fn alloc_guest(
     heap.alloc_with_store(&mut store, len, zero)
 }
 
-pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> Option<u32> {
-    let heap = env.data().guest_heap.clone()?;
-    let guest_ptr = alloc_guest(env, &heap, data.len(), false)?;
-    if !write_guest_bytes(env, guest_ptr, data) {
-        heap.free_offset(guest_ptr);
-        return None;
-    }
-    Some(guest_ptr)
-}
-
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
     let memory = env.data().memory.clone()?;
     let (_, store_ref) = env.data_and_store_mut();
@@ -136,15 +126,13 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) ->
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
     let mut out = Vec::new();
-    let mut offset = guest_ptr as u64;
-    for _ in 0..super::MAX_GUEST_CSTRING_SCAN {
+    for offset in (guest_ptr as u64..).take(super::MAX_GUEST_CSTRING_SCAN) {
         let mut b = [0u8; 1];
         view.read(offset, &mut b).ok()?;
         if b[0] == 0 {
             return Some(out);
         }
         out.push(b[0]);
-        offset += 1;
     }
     None
 }

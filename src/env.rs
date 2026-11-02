@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasmer::TypedFunction;
-use wasmer::{Function, Memory, Table};
+use wasmer::{Memory, Table};
 
 use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
@@ -104,6 +104,8 @@ pub(crate) struct NapiEnv {
     /// only release what this env actually declared, never more, and so
     /// teardown releases the remainder.
     external_declared: u64,
+    pub(crate) configured: bool,
+    deactivated: bool,
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
@@ -119,15 +121,6 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
-    /// Cache of resolved guest callback functions, keyed by their
-    /// `__indirect_function_table` index. `Function::from_vm_funcref` (invoked
-    /// by `Table::get`) unconditionally appends a new entry to the store's
-    /// function arena on every call with no dedup, so re-resolving the same
-    /// `wasm_fn_ptr` on every guest→host→guest callback invocation leaks
-    /// memory unboundedly. `Function` clones are cheap (a store handle), so
-    /// caching by table index and cloning on repeat hits avoids the
-    /// unconditional store growth. See `guest::callback::call_guest_callback`.
-    pub(crate) func_cache: HashMap<u32, Function>,
     pub(crate) default_napi_env_id: Option<u32>,
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
@@ -178,6 +171,8 @@ impl NapiEnv {
             host_stopped,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
+            configured: false,
+            deactivated: false,
             callback_depth: 0,
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -185,7 +180,6 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             malloc_fn: None,
             table: None,
-            func_cache: HashMap::new(),
             default_napi_env_id: None,
             next_napi_env_id: 0,
             next_napi_scope_id: 0,
@@ -361,8 +355,17 @@ impl NapiEnv {
         self.budget.uncharge(Pool::V8External, release);
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn host_stop_flag(&self) -> Arc<AtomicBool> {
+        self.host_stopped.clone()
+    }
+
     pub(crate) fn host_stopped(&self) -> bool {
         self.host_stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn creation_enabled(&self) -> bool {
+        self.configured && !self.deactivated
     }
 
     /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
@@ -513,12 +516,30 @@ impl NapiEnv {
             .map(|env| *env as SnapiEnv)
             .unwrap_or(std::ptr::null_mut())
     }
-}
 
-impl Drop for NapiEnv {
-    fn drop(&mut self) {
-        let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
+    pub(crate) fn deactivate(&mut self) {
+        if self.deactivated {
+            return;
+        }
+        self.deactivated = true;
+        self.configured = false;
+        let mut scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
+        scope_ids.sort_unstable_by(|left, right| right.cmp(left));
         for scope_id in scope_ids {
+            if let Some(env) = self
+                .napi_scopes
+                .get(&scope_id)
+                .and_then(|env_id| self.napi_envs.get(env_id))
+            {
+                // Retirement is host-only: provider disposal must not reenter
+                // guest finalizers through a previously installed context.
+                unsafe {
+                    crate::snapi::snapi_bridge_swap_active_callback_ctx(
+                        *env as SnapiEnv,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
             if let Some(env) = self.unregister_napi_scope(scope_id) {
                 unsafe {
                     let _ = snapi_bridge_unofficial_release_env(env);
@@ -531,6 +552,35 @@ impl Drop for NapiEnv {
                 .uncharge(Pool::V8External, self.external_declared);
             self.external_declared = 0;
         }
+        self.default_napi_env_id = None;
+        self.memory = None;
+        self.table = None;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            self.native_buffer_leases.clear();
+            self.guest_heap = None;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        {
+            self.malloc_fn = None;
+            self.persistent_callback_contexts.clear();
+            self.guest_buffer_pool.clear();
+            self.guest_buffer_capacities.clear();
+            self.guest_buffer_allocated_bytes = 0;
+            self.guest_data_ptrs.clear();
+            self.guest_data_backing_stores.clear();
+            self.host_buffer_copies.clear();
+            self.host_buffer_copy_frames.clear();
+            self.host_buffer_handle_scopes.clear();
+            self.host_buffer_reference_holds.clear();
+            self.host_buffer_leases.clear();
+        }
+    }
+}
+
+impl Drop for NapiEnv {
+    fn drop(&mut self) {
+        self.deactivate();
     }
 }
 

@@ -17,11 +17,8 @@ js = [
   "wasmer/experimental-async",
   "wasmer/js-default",
 ]
-# Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
-# `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
-# trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
-# not activate the dependency.
-wasix = []
+# Implements the legacy WASIX runtime's instantiation hook.
+wasix = ["dep:wasmer-wasix"]
 cli = [
   "wasix",
   "dep:wasmer-cache",
@@ -42,9 +39,6 @@ wasmer = { version = "=7.5.0", path = "../api", default-features = false }
 wasmer-cache = { version = "=7.5.0", path = "../cache", optional = true }
 wasmer-c-api-imports = { version = "=7.5.0", path = "../c-api-imports", optional = true, default-features = false }
 wasmer-types = { version = "=7.5.0", path = "../types", optional = true }
-# Non-optional: the guest callback trampoline re-raises guest WASI process
-# exits (`WasiError::Exit`) through the N-API import layers, so `mod guest`
-# (always compiled) needs the WASIX error type in every build.
 virtual-fs = { version = "=0.705.0", path = "../virtual-fs", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
@@ -54,7 +48,7 @@ offset-allocator = "0.2.0"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { version = "=0.705.0", path = "../wasix", default-features = false, features = [
+wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", default-features = false, features = [
   "js",
 ] }
 
@@ -62,7 +56,7 @@ wasmer-wasix = { version = "=0.705.0", path = "../wasix", default-features = fal
 wasmer = { version = "=7.5.0", path = "../api", default-features = false, features = [
   "sys-default",
 ] }
-wasmer-wasix = { version = "=0.705.0", path = "../wasix", default-features = false, features = [
+wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", default-features = false, features = [
   "sys",
 ] }
 

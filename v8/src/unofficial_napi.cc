@@ -725,6 +725,18 @@ napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform == nullptr) return napi_invalid_arg;
+  // Threads which predate runtime initialization cannot inherit permissions for
+  // V8's newly allocated protection keys. Initialize normal provider entry once
+  // per thread with V8's own permission helper. An already-entered isolate may
+  // have a nested writable/sandbox scope whose permissions must remain intact.
+  // This runtime lives for the process lifetime, so the keys never change.
+  static thread_local bool thread_initialized = false;
+  if (!thread_initialized) {
+    if (v8::Isolate::TryGetCurrent() == nullptr) {
+      v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
+    }
+    thread_initialized = true;
+  }
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;
@@ -2002,10 +2014,17 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   return napi_ok;
 }
 
+
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
                             void* shutdown_pump_handle) {
   if (owner == nullptr) return napi_invalid_arg;
   auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
+  // Standalone provider users retain their original entered-scope contract.
+  // The Wasmer bridge detached only that entry; enter it during root teardown.
+  std::optional<v8::Isolate::Scope> detached_entry;
+  if (!scope->isolate_scope.has_value()) {
+    detached_entry.emplace(scope->isolate);
+  }
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
@@ -2016,6 +2035,7 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
   v8::Isolate* isolate = scope->isolate;
   std::shared_ptr<TrackingArrayBufferAllocator> allocator = scope->allocator;
   delete scope;
+  detached_entry.reset();
 
   if (isolate != nullptr) {
     EdgeV8Platform* platform = nullptr;
@@ -2205,6 +2225,15 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   env->isolate->CancelTerminateExecution();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_is_execution_terminating(napi_env env,
+                                                             bool* result) {
+  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result = env->isolate->IsExecutionTerminating();
   return napi_ok;
 }
 
@@ -3063,3 +3092,14 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
+
+napi_status NapiV8DetachBridgeIsolateScope(unofficial_napi_env_owner owner) {
+  if (owner == nullptr) return napi_invalid_arg;
+  auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
+  if (!scope->isolate_scope.has_value() ||
+      v8::Isolate::GetCurrent() != scope->isolate) {
+    return napi_generic_failure;
+  }
+  scope->isolate_scope.reset();
+  return napi_ok;
+}

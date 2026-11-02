@@ -14,11 +14,8 @@ js = [
   "wasmer/experimental-async",
   "wasmer/js-default",
 ]
-# Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
-# `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
-# trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
-# not activate the dependency.
-wasix = []
+# Implements the legacy WASIX runtime's instantiation hook.
+wasix = ["dep:wasmer-wasix"]
 cli = [
   "wasix",
   "dep:wasmer-cache",
@@ -40,8 +37,6 @@ wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051
 wasmer-cache = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
 wasmer-c-api-imports = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true, default-features = false }
 wasmer-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
-# Non-optional: `mod guest` (always compiled) re-raises guest WASI process
-# exits through the N-API import layers and needs the WASIX error type.
 virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
@@ -51,7 +46,7 @@ offset-allocator = "0.2.0"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
+wasmer-wasix = { optional = true, git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
   "js",
 ] }
 
@@ -59,7 +54,7 @@ wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d3
 wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
   "sys-default",
 ] }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
+wasmer-wasix = { optional = true, git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
   "sys",
 ] }
 

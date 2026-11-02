@@ -409,6 +409,14 @@ extern "C"
         return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_is_execution_terminating(napi_env env, bool *result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr)
+            return napi_invalid_arg;
+        *result = false;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         napi_env env,
         unofficial_napi_interrupt_callback callback,
