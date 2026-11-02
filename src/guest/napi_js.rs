@@ -162,6 +162,7 @@ fn write_guest_pod_slice<T>(
     write_guest_bytes(env, guest_ptr as u32, bytes)
 }
 
+#[allow(clippy::too_many_arguments)] // The complete ABI/buffer descriptor stays together.
 fn remember_guest_backing_store(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: u32,
@@ -170,7 +171,7 @@ fn remember_guest_backing_store(
     host_addr: u64,
     guest_ptr: u32,
     byte_len: usize,
-    covers_full_backing_store: bool,
+    _covers_full_backing_store: bool,
 ) {
     let state = env.data_mut();
     state
@@ -195,7 +196,6 @@ fn remember_guest_backing_store(
                         // the same Wasm memory. The guest memory access applies
                         // the final bounds check after resolving the offset.
                         byte_len: usize::MAX,
-                        covers_full_backing_store: true,
                     },
                 );
             }
@@ -206,7 +206,6 @@ fn remember_guest_backing_store(
                 host_addr,
                 guest_ptr,
                 byte_len,
-                covers_full_backing_store,
             },
         );
     }
@@ -214,6 +213,7 @@ fn remember_guest_backing_store(
 
 // TODO: Route Buffer/ArrayBuffer allocation through guest memory from the start
 // so host-owned buffers do not need snapshot-and-flush fallback synchronization.
+#[allow(clippy::too_many_arguments)] // The complete ABI/buffer descriptor stays together.
 fn remember_host_buffer_copy(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: u32,
@@ -225,7 +225,7 @@ fn remember_host_buffer_copy(
     guest_allocation_recyclable: bool,
     persistent: bool,
     needs_flush: bool,
-    covers_full_backing_store: bool,
+    _covers_full_backing_store: bool,
 ) -> bool {
     let mut host_reference_id = 0u32;
     if unsafe {
@@ -251,7 +251,6 @@ fn remember_host_buffer_copy(
                     host_addr,
                     guest_ptr,
                     byte_len,
-                    covers_full_backing_store,
                 },
             );
         }
@@ -639,34 +638,6 @@ fn guest_unofficial_napi_attach_env(
 fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
-}
-
-fn provider_event_loop_checkpoint_sync(
-    mut env: FunctionEnvMut<NapiEnv>,
-    napi_env: i32,
-    mode: i32,
-    has_runnable_work: i32,
-    checkpoint_state_ptr: i32,
-) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    let mut checkpoint_state = 0;
-    let status = with_cb_context(&mut env, napi_env, || unsafe {
-        let status = snapi_bridge_drain_pending_callbacks(env_handle);
-        if status != 0 {
-            return status;
-        }
-        snapi_bridge_unofficial_event_loop_checkpoint(
-            env_handle,
-            mode,
-            has_runnable_work,
-            &mut checkpoint_state,
-        )
-    });
-    drain_ready_guest_buffers(&mut env, napi_env as u32, env_handle, false);
-    if checkpoint_state_ptr > 0 {
-        write_guest_u32(&mut env, checkpoint_state_ptr as u32, checkpoint_state);
-    }
-    status
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -1663,7 +1634,7 @@ fn guest_unofficial_napi_contextify_run_script(
         return 1;
     };
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_contextify_run_script(
             env_handle,
             if sandbox_or_null > 0 {
@@ -1687,7 +1658,7 @@ fn guest_unofficial_napi_contextify_run_script(
             },
             &mut result_id,
         )
-    };
+    });
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
@@ -3206,7 +3177,7 @@ fn guest_napi_create_arraybuffer(
         if data_ptr > 0 {
             write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
         }
-        return 0;
+        0
     }
 
     #[cfg(not(feature = "js"))]
@@ -3336,7 +3307,7 @@ fn guest_napi_create_external_arraybuffer(
             return 1;
         }
         write_guest_u32(&mut env, rp as u32, out);
-        return 0;
+        0
     }
 
     #[cfg(not(feature = "js"))]
@@ -3432,7 +3403,7 @@ fn guest_napi_create_external_buffer(
             return 1;
         }
         write_guest_u32(&mut env, rp as u32, out);
-        return 0;
+        0
     }
 
     #[cfg(not(feature = "js"))]
@@ -4703,10 +4674,7 @@ fn guest_napi_create_string_utf16(
     let char_count: usize = if wl == 0xFFFFFFFFu32 {
         // Auto-length: scan for null terminator (u16 == 0)
         let mut scan_len: usize = 0;
-        loop {
-            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else {
-                break;
-            };
+        while let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) {
             let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
             if ch == 0 {
                 break;
@@ -4974,7 +4942,7 @@ fn guest_napi_create_buffer(
         if data_ptr > 0 {
             write_guest_u32(&mut env, data_ptr as u32, guest_ptr);
         }
-        return 0;
+        0
     }
 
     #[cfg(not(feature = "js"))]
@@ -5129,7 +5097,7 @@ fn guest_napi_create_buffer_copy(
         if result_data_ptr > 0 {
             write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr);
         }
-        return 0;
+        0
     }
 
     #[cfg(not(feature = "js"))]
@@ -5245,6 +5213,7 @@ fn guest_napi_get_buffer_info(
     0
 }
 
+#[allow(clippy::too_many_arguments)] // The complete ABI/buffer descriptor stays together.
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,

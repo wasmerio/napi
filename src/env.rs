@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -10,13 +13,15 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use wasmer::TypedFunction;
 use wasmer::{Memory, Table};
 
-use crate::budget::{
-    EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
-};
-use crate::snapi::{
-    SnapiEnv, snapi_bridge_unofficial_release_env,
-    snapi_bridge_unofficial_set_host_near_heap_limit_callback,
-    snapi_bridge_unofficial_set_value_limit,
+use crate::budget::{EnvHeapCharge, Pool, ResourceBudget};
+use crate::snapi::{SnapiEnv, snapi_bridge_unofficial_release_env};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::{
+    budget::{EnvRejected, HeapReservation, RequestedHeap},
+    snapi::{
+        snapi_bridge_unofficial_set_host_near_heap_limit_callback,
+        snapi_bridge_unofficial_set_value_limit,
+    },
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -51,7 +56,6 @@ pub(crate) struct GuestBackingStoreMapping {
     pub(crate) host_addr: u64,
     pub(crate) guest_ptr: u32,
     pub(crate) byte_len: usize,
-    pub(crate) covers_full_backing_store: bool,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -93,8 +97,10 @@ pub(crate) struct NapiEnv {
     /// `Arc` so the app-wide budget stays honest across stores.
     pub(crate) budget: Arc<ResourceBudget>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) max_envs: Option<usize>,
     env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     host_stopped: Arc<AtomicBool>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
@@ -109,6 +115,7 @@ pub(crate) struct NapiEnv {
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
     /// Host-side allocator over the guest's linear memory. `None` only before
@@ -122,6 +129,7 @@ pub(crate) struct NapiEnv {
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
     pub(crate) default_napi_env_id: Option<u32>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) next_napi_env_id: u32,
     pub(crate) next_napi_scope_id: u32,
     pub(crate) napi_envs: HashMap<u32, usize>,
@@ -160,19 +168,22 @@ pub(crate) struct NapiEnv {
 impl NapiEnv {
     pub(crate) fn new(
         budget: Arc<ResourceBudget>,
-        max_envs: Option<usize>,
+        _max_envs: Option<usize>,
         env_registry: Arc<std::sync::Mutex<HashSet<usize>>>,
-        host_stopped: Arc<AtomicBool>,
+        _host_stopped: Arc<AtomicBool>,
     ) -> Self {
         Self {
             budget,
-            max_envs,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            max_envs: _max_envs,
             env_registry,
-            host_stopped,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            host_stopped: _host_stopped,
             env_heap_charges: HashMap::new(),
             external_declared: 0,
             configured: false,
             deactivated: false,
+            #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
             callback_depth: 0,
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -181,6 +192,7 @@ impl NapiEnv {
             malloc_fn: None,
             table: None,
             default_napi_env_id: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             next_napi_env_id: 0,
             next_napi_scope_id: 0,
             napi_envs: HashMap::new(),
@@ -249,6 +261,7 @@ impl NapiEnv {
     ///
     /// [`commit_isolate`]: NapiEnv::commit_isolate
     /// [`abort_isolate`]: NapiEnv::abort_isolate
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn reserve_isolate(
         &self,
         requested: RequestedHeap,
@@ -260,6 +273,7 @@ impl NapiEnv {
     /// a limited budget — install the host-owned near-heap-limit callback so V8
     /// heap growth for this isolate is charged against the budget. Teardown
     /// releases both the initial ceiling and any granted growth.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn commit_isolate(
         &mut self,
         env: SnapiEnv,
@@ -332,12 +346,14 @@ impl NapiEnv {
     /// Release a reservation whose env creation failed after [`reserve_isolate`].
     ///
     /// [`reserve_isolate`]: NapiEnv::reserve_isolate
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn abort_isolate(&self, reservation: &HeapReservation) {
         self.budget.release_env(reservation.ceiling_bytes);
     }
 
     /// Charge a positive `napi_adjust_external_memory` delta against the budget.
     /// Returns `false` (guest sees a failure) when it would exceed the budget.
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
     pub(crate) fn charge_declared_external(&mut self, bytes: u64) -> bool {
         if self.budget.try_charge(Pool::V8External, bytes).is_err() {
             return false;
@@ -349,6 +365,7 @@ impl NapiEnv {
     /// Release a negative `napi_adjust_external_memory` delta, clamped to what
     /// this env actually declared so it can never underflow the pool or release
     /// the allocator's charges.
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
     pub(crate) fn uncharge_declared_external(&mut self, bytes: u64) {
         let release = bytes.min(self.external_declared);
         self.external_declared -= release;
@@ -360,6 +377,7 @@ impl NapiEnv {
         self.host_stopped.clone()
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn host_stopped(&self) -> bool {
         self.host_stopped.load(Ordering::Acquire)
     }
@@ -375,6 +393,7 @@ impl NapiEnv {
     ///
     /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
     /// [`leave_callback`]: NapiEnv::leave_callback
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
     pub(crate) fn enter_callback(&mut self) -> bool {
         if self.callback_depth >= crate::guest::MAX_CALLBACK_DEPTH {
             return false;
@@ -386,6 +405,7 @@ impl NapiEnv {
     /// Release one level claimed by a `true` [`enter_callback`].
     ///
     /// [`enter_callback`]: NapiEnv::enter_callback
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
     pub(crate) fn leave_callback(&mut self) {
         self.callback_depth = self.callback_depth.saturating_sub(1);
     }
@@ -520,6 +540,14 @@ impl NapiEnv {
     pub(crate) fn deactivate(&mut self) {
         if self.deactivated {
             return;
+        }
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        for env in self.napi_envs.values() {
+            assert_eq!(
+                unsafe { crate::snapi::snapi_bridge_unofficial_can_release_env(*env as SnapiEnv) },
+                1,
+                "cannot deactivate an N-API session with active provider frames"
+            );
         }
         self.deactivated = true;
         self.configured = false;

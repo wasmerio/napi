@@ -7,11 +7,10 @@ use wasmer::{AsStoreMut, FunctionEnvMut};
 use crate::NapiEnv;
 
 pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
-    let (state, store) = env.data_and_store_mut();
-    let Some(memory) = state.memory.clone() else {
+    let Some(memory) = env.data().memory.clone() else {
         return false;
     };
-    let view = memory.view(&store);
+    let view = memory.view(&*env);
     view.write(guest_ptr as u64, data).is_ok()
 }
 
@@ -47,9 +46,8 @@ pub fn read_guest_bytes(
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
+    let memory = env.data().memory.clone()?;
+    let view = memory.view(&*env);
     // A guest cannot legitimately reference more bytes than its own linear
     // memory holds, so reject a length that exceeds it before allocating. This
     // bounds the host copy to memory the guest was already charged for and
@@ -70,8 +68,7 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     let Some(memory) = env.data().memory.clone() else {
         return 0;
     };
-    let (_, store) = env.data_and_store_mut();
-    memory.view(&store).data_size()
+    memory.view(&*env).data_size()
 }
 
 /// Allocate `len` bytes of guest memory, passing the import's store directly so
@@ -92,8 +89,7 @@ pub fn alloc_guest(
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
     let memory = env.data().memory.clone()?;
-    let (_, store_ref) = env.data_and_store_mut();
-    let view = memory.view(&store_ref);
+    let view = memory.view(&*env);
     let host_base = view.data_ptr() as u64;
     let memory_len = view.data_size();
     if host_addr < host_base || host_addr >= host_base + memory_len {
@@ -122,9 +118,8 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) ->
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
+    let memory = env.data().memory.clone()?;
+    let view = memory.view(&*env);
     let mut out = Vec::new();
     for offset in (guest_ptr as u64..).take(super::MAX_GUEST_CSTRING_SCAN) {
         let mut b = [0u8; 1];

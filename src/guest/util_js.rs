@@ -158,7 +158,7 @@ pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) 
     #[cfg(feature = "js")]
     {
         let _ = (env, host_addr);
-        return None;
+        None
     }
 
     #[cfg(not(feature = "js"))]
@@ -235,7 +235,7 @@ pub fn resolve_or_copy_host_data_to_guest(
     backing_store_token: u64,
     host_addr: u64,
     byte_len: usize,
-    covers_full_backing_store: bool,
+    _covers_full_backing_store: bool,
 ) -> Option<u32> {
     if backing_store_token != 0
         && let Some(guest_data_ptr) = resolve_guest_backing_store_token(
@@ -285,7 +285,6 @@ pub fn resolve_or_copy_host_data_to_guest(
                 host_addr,
                 guest_ptr,
                 byte_len,
-                covers_full_backing_store,
             },
         );
     }
@@ -332,15 +331,13 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: i32) ->
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
     let mut out = Vec::new();
-    let mut offset = guest_ptr as u64;
-    for _ in 0..super::MAX_GUEST_CSTRING_SCAN {
+    for offset in (guest_ptr as u64..).take(super::MAX_GUEST_CSTRING_SCAN) {
         let mut b = [0u8; 1];
         view.read(offset, &mut b).ok()?;
         if b[0] == 0 {
             return Some(out);
         }
         out.push(b[0]);
-        offset += 1;
     }
     None
 }

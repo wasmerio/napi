@@ -401,13 +401,17 @@ impl NapiSession {
     /// continuations using this session must have finished or been retired.
     /// Call on the provider's owning thread.
     pub unsafe fn deactivate(&self, store: &mut StoreMut<'_>) {
-        let state = std::mem::replace(
-            &mut *self.inner.state.lock().expect("poisoned NapiSession mutex"),
-            SessionState::Deactivated,
-        );
-        if let SessionState::Attached(func_env) = state {
+        let attached = {
+            let state = self.inner.state.lock().expect("poisoned NapiSession mutex");
+            match &*state {
+                SessionState::Attached(func_env) => Some(func_env.clone()),
+                _ => None,
+            }
+        };
+        if let Some(func_env) = attached {
             func_env.as_mut(&mut *store).deactivate();
         }
+        *self.inner.state.lock().expect("poisoned NapiSession mutex") = SessionState::Deactivated;
     }
 
     /// Creates imports for exactly one store-local instance attachment.
@@ -537,7 +541,7 @@ impl NapiSession {
                 .find_map(|name| {
                     instance
                         .exports
-                        .get_typed_function::<i32, i32>(&mut *store, name)
+                        .get_typed_function::<i32, i32>(&*store, name)
                         .ok()
                 });
             func_env.as_mut(&mut *store).malloc_fn = malloc;

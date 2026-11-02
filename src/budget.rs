@@ -244,6 +244,7 @@ impl ResourceBudget {
     /// charged those bytes by the time we see them; charging again would
     /// count one allocation twice against the same total. With no accountant
     /// nothing else is counting, so the heap charges its own claims.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn wasm_is_externally_accounted(&self) -> bool {
         self.accountant.is_some()
     }

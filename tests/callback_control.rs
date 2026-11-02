@@ -26,18 +26,37 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_get_value_int32" (func $integer (param i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
         (func $contextify (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
-    (table (export "__indirect_function_table") 3 funcref)
-    (elem (i32.const 1) $first $second)
+    (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
+        (func $create_env (param i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
+        (func $release_env (param i32 i32) (result i32)))
+    (table (export "__indirect_function_table") 4 funcref)
+    (elem (i32.const 1) $first $second $release_callback)
     (data (i32.const 64) "callback\00")
     (global $env (mut i32) (i32.const 0))
+    (global $release_status (mut i32) (i32.const -1))
     (func $check (param i32) local.get 0 if unreachable end)
     (func $first (export "first") (param i32 i32) (result i32)
         i32.const 1 call $record i32.const 0)
     (func $second (export "second") (param i32 i32) (result i32)
         i32.const 2 call $record i32.const 0)
+    (func $release_callback (export "release_callback") (param i32 i32) (result i32)
+        i32.const 36 i32.load i32.const 0 call $release_env global.set $release_status
+        i32.const 0)
+    (func (export "release_status") (result i32) global.get $release_status)
+    (func (export "release_owned") (result i32)
+        i32.const 36 i32.load i32.const 0 call $release_env)
     (func (export "init")
         call $new_env global.set $env
         global.get $env i32.eqz if unreachable end
+        global.get $env i32.const 8 call $global call $check
+        global.get $env i32.const 64 i32.const 8 i32.const 1 i32.const 0 i32.const 12
+        call $function call $check
+        global.get $env i32.const 8 i32.load i32.const 64 i32.const 12 i32.load
+        call $set call $check)
+    (func (export "init_owned")
+        i32.const 8 i32.const 0 i32.const 32 i32.const 36 call $create_env call $check
+        i32.const 32 i32.load global.set $env
         global.get $env i32.const 8 call $global call $check
         global.get $env i32.const 64 i32.const 8 i32.const 1 i32.const 0 i32.const 12
         call $function call $check
@@ -249,6 +268,73 @@ fn explicit_deactivation_releases_provider_roots_before_store_drop() {
     assert_eq!(ctx.budget().snapshot().live_isolates, 0);
     drop(session);
     assert_eq!(ctx.active_sessions(), 0);
+}
+
+#[test]
+fn guest_release_rejects_a_provider_with_active_javascript_frames() {
+    if !run_in_subprocess(
+        "guest_release_rejects_a_provider_with_active_javascript_frames",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) = instance(&mut store, |_| Ok(()));
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    let target = instance
+        .exports
+        .get_function("release_callback")
+        .unwrap()
+        .clone();
+    instance
+        .exports
+        .get_table("__indirect_function_table")
+        .unwrap()
+        .set(&mut store, 1, Value::FuncRef(Some(target)))
+        .unwrap();
+    assert_eq!(ctx.budget().snapshot().live_isolates, 2);
+    assert_eq!(
+        eval(&mut store, &instance, &memory, "callback(); 42").unwrap(),
+        42
+    );
+    assert_ne!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_status")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    assert_eq!(ctx.budget().snapshot().live_isolates, 2);
+    assert_eq!(eval(&mut store, &instance, &memory, "40 + 2").unwrap(), 42);
+    let release = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "release_owned")
+        .unwrap();
+    assert_eq!(release.call(&mut store).unwrap(), 0);
+    assert_ne!(release.call(&mut store).unwrap(), 0);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    // Reuse the original default environment after the other env was released.
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    assert_eq!(eval(&mut store, &instance, &memory, "41 + 1").unwrap(), 42);
+    // Both environments have no active guest, callback or pending provider job.
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
 }
 
 #[test]

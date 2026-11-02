@@ -2516,19 +2516,32 @@ pub unsafe extern "C" fn snapi_bridge_new_instance(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_run_script(env: SnapiEnv, script: u32, out: *mut u32) -> i32 {
+    let (source, context, live_env_addr) = {
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        let Some(source) = state.get(script).and_then(JsValue::as_string) else {
+            return NAPI_STRING_EXPECTED;
+        };
+        (
+            source,
+            state.global_context.clone(),
+            state.live_env_addr.clone(),
+        )
+    };
+    // Scope synchronization and evaluation may recursively call this same bridge.
+    // Keep only owned JS values across that boundary, as the callback trampoline does.
+    // Evaluate in this environment's context so guest globals cannot replace the
+    // worker's scheduler or leak into another environment.
+    let global = wasmer_napi_global_context_scope(&context);
+    let result = wasmer_napi_context_eval(&global, &source);
+    if live_env_addr.get() != env as usize {
+        return NAPI_INVALID_ARG;
+    }
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let Some(source) = state.get(script).and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
-    };
-    // napi_run_script executes in the environment's context. Evaluating with
-    // js_sys::eval here would instead target the Wasmer worker's real global
-    // realm, allowing Node bootstrap code from one N-API environment to mutate
-    // the SDK scheduler and leak state into every other environment hosted by
-    // that worker.
-    let global = wasmer_napi_global_context_scope(&state.global_context);
-    match wasmer_napi_context_eval(&global, &source) {
+    match result {
         Ok(value) => {
             let id = state.insert(value);
             unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
@@ -4108,18 +4121,28 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_contextify_run_script(
         break_on_first_line,
         host_defined_option_id,
     );
+    let (source, sandbox, live_env_addr) = {
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 0) {
+            Ok(source) => source,
+            Err(status) => return status,
+        };
+        let sandbox = state
+            .get(sandbox_or_null_id)
+            .cloned()
+            .unwrap_or(JsValue::NULL);
+        (source, sandbox, state.live_env_addr.clone())
+    };
+    let result = wasmer_napi_context_eval(&sandbox, &source);
+    if live_env_addr.get() != env as usize {
+        return NAPI_INVALID_ARG;
+    }
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 0) {
-        Ok(source) => source,
-        Err(status) => return status,
-    };
-    let sandbox = state
-        .get(sandbox_or_null_id)
-        .cloned()
-        .unwrap_or(JsValue::NULL);
-    match wasmer_napi_context_eval(&sandbox, &source) {
+    match result {
         Ok(value) => {
             let id = state.insert(value);
             unsafe { write(result_out, id) }.map_or_else(|err| err, |()| NAPI_OK)
@@ -4349,6 +4372,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_bytecode_release(
         NAPI_INVALID_ARG
     }
 }
+#[allow(clippy::too_many_arguments)] // Matches the module creation ABI.
 unsafe fn host_js_create_source_text_module(
     env: SnapiEnv,
     wrapper_id: u32,
@@ -4451,6 +4475,7 @@ unsafe fn host_js_create_source_text_module(
     }
     NAPI_OK
 }
+#[allow(clippy::too_many_arguments)] // Matches the module creation ABI.
 unsafe fn host_js_create_synthetic_module(
     env: SnapiEnv,
     wrapper_id: u32,
@@ -4994,10 +5019,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
         };
         Some(status >= 2 && has_async_graph)
     };
-    if !status_out.is_null() {
-        if let Err(error) = unsafe { write(status_out, status) } {
-            return error;
-        }
+    if !status_out.is_null()
+        && let Err(error) = unsafe { write(status_out, status) }
+    {
+        return error;
     }
     if !error_out.is_null() {
         let error = state
@@ -5016,10 +5041,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
             return error;
         }
     }
-    if let Some(has_async_graph) = has_async_graph {
-        if let Err(error) = unsafe { write(has_async_graph_out, i32::from(has_async_graph)) } {
-            return error;
-        }
+    if let Some(has_async_graph) = has_async_graph
+        && let Err(error) = unsafe { write(has_async_graph_out, i32::from(has_async_graph)) }
+    {
+        return error;
     }
     NAPI_OK
 }
@@ -6007,10 +6032,8 @@ pub unsafe extern "C" fn snapi_bridge_wrap_finalized(
         }
         return NAPI_INVALID_ARG;
     }
-    if !ref_out.is_null() {
-        if unsafe { write(ref_out, reference_id) }.is_err() {
-            return NAPI_INVALID_ARG;
-        }
+    if !ref_out.is_null() && unsafe { write(ref_out, reference_id) }.is_err() {
+        return NAPI_INVALID_ARG;
     }
     NAPI_OK
 }
@@ -6049,10 +6072,8 @@ pub unsafe extern "C" fn snapi_bridge_add_finalizer_cb(
         }
         return NAPI_INVALID_ARG;
     }
-    if !ref_out.is_null() {
-        if unsafe { write(ref_out, reference_id) }.is_err() {
-            return NAPI_INVALID_ARG;
-        }
+    if !ref_out.is_null() && unsafe { write(ref_out, reference_id) }.is_err() {
+        return NAPI_INVALID_ARG;
     }
     NAPI_OK
 }
@@ -6400,7 +6421,4 @@ pub unsafe extern "C" fn snapi_bridge_define_properties(
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_dispose() {
-    let _ = ();
-    ()
-}
+pub unsafe extern "C" fn snapi_bridge_dispose() {}

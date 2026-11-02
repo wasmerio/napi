@@ -46,9 +46,9 @@ pub struct HostJsCapabilities {
 pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     {
-        return Some(HostJsCapabilities {
+        Some(HostJsCapabilities {
             jspi: snapi_js::has_jspi(),
-        });
+        })
     }
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     {

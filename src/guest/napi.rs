@@ -274,6 +274,15 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: i32,
 ) -> Result<i32, RuntimeError> {
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
+    let Some(guest_env) = env.data().napi_scopes.get(&scope_id).copied() else {
+        return Ok(1);
+    };
+    let target = env.data().resolve_napi_env(guest_env as i32);
+    // The check and unregister are synchronous on this provider's owning
+    // thread. Reject before changing ids, roots, leases or budget charges.
+    if unsafe { snapi_bridge_unofficial_can_release_env(target) } != 1 {
+        return Ok(1);
+    }
     let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
     else {
         return Ok(1);
@@ -2761,8 +2770,7 @@ fn guest_napi_create_external_arraybuffer(
     };
 
     let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
+        let view = memory.view(&env);
         let host_base = view.data_ptr() as u64;
         host_base + external_data as u32 as u64
     };
@@ -2820,8 +2828,7 @@ fn guest_napi_create_external_buffer(
     };
 
     let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
+        let view = memory.view(&env);
         let host_base = view.data_ptr() as u64;
         host_base + external_data as u32 as u64
     };
@@ -3371,8 +3378,7 @@ fn guest_napi_get_cb_info(
     // guest heap from this hot per-callback import so store-free allocations
     // (V8 backing stores) rarely find it empty. No-op for shared memories.
     if let Some(heap) = env.data().guest_heap.clone() {
-        let (_, mut store_ref) = env.data_and_store_mut();
-        heap.maybe_refill(&mut store_ref);
+        heap.maybe_refill(&mut env.as_store_mut());
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr > 0 {

@@ -43,4 +43,5 @@ pub const fn typedarray_element_size(typ: i32) -> Option<usize> {
 /// crossing piles host native stack frames (Rust bridge + C++ V8) that neither
 /// the wasm nor the V8 stack limit bounds, so unbounded reentrancy would SIGSEGV
 /// the process uncatchably. Far beyond any legitimate synchronous nesting.
+#[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
 pub const MAX_CALLBACK_DEPTH: u32 = 256;
