@@ -1,15 +1,21 @@
 #![cfg(all(target_arch = "wasm32", feature = "js"))]
 
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::{
-    AsStoreMut, Extern, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, MemoryType,
-    Module, Store, Value,
+    AsStoreAsync, AsStoreMut, Extern, Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
+    MemoryType, Module, Store, StoreAsync, Value,
 };
 use wasmer_napi::{NapiCtx, NapiSession};
+
+thread_local! {
+    static EXTERNAL_STORE_OWNER: std::cell::RefCell<Option<StoreAsync>> = const { std::cell::RefCell::new(None) };
+}
 
 const GUEST: &str = r#"(module
     (import "env" "memory" (memory 1))
     (import "proof" "assert_async" (func $assert_async))
+    (import "proof" "drop_external_owner" (func $drop_external_owner))
     (import "napi" "napi_wasm_init_env" (func $new_env (result i32)))
     (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
     (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
@@ -18,14 +24,30 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_run_script" (func $run (param i32 i32 i32) (result i32)))
     (import "napi" "napi_create_int32" (func $create_integer (param i32 i32 i32) (result i32)))
     (import "napi" "napi_get_value_int32" (func $integer (param i32 i32 i32) (result i32)))
+    (import "napi" "napi_get_named_property" (func $get (param i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_new_instance" (func $construct (param i32 i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_instanceof" (func $instanceof (param i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_get_and_clear_last_exception" (func $exception (param i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
         (func $contextify (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
-    (table (export "__indirect_function_table") 3 funcref)
-    (elem (i32.const 1) $first $second)
+    (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
+        (func $create_env (param i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
+        (func $release_env (param i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_event_loop_checkpoint"
+        (func $checkpoint (param i32 i32 i32 i32) (result i32)))
+    (table (export "__indirect_function_table") 4 funcref)
+    (elem (i32.const 1) $first $second $release_callback)
     (data (i32.const 64) "callback\00")
     (data (i32.const 256) "callback()")
+    (data (i32.const 384) "throw new Error('release-callback')")
+    (data (i32.const 448) "throws\00")
+    (data (i32.const 464) "captured_exception\00")
     (global $env (mut i32) (i32.const 0))
     (global $calls (mut i32) (i32.const 0))
+    (global $release_status (mut i32) (i32.const -1))
+    (global $throw_on_callback (mut i32) (i32.const 0))
+    (global $drop_owner (mut i32) (i32.const 0))
     (func $check (param i32) local.get 0 if unreachable end)
     (func $answer (result i32)
         global.get $env i32.const 42 i32.const 24 call $create_integer call $check
@@ -36,6 +58,43 @@ const GUEST: &str = r#"(module
         if (result i32) i32.const 256 i32.const 10 call $eval else call $answer end)
     (func $second (export "second") (param i32 i32) (result i32)
         global.get $calls i32.const 10 i32.add global.set $calls call $answer)
+    (func $release_callback (param i32 i32) (result i32)
+        global.get $drop_owner if call $drop_external_owner end
+        i32.const 36 i32.load i32.const 0 call $release_env global.set $release_status
+        global.get $throw_on_callback
+        if
+            global.get $env i32.const 384 i32.const 35 i32.const 40
+            call $string call $check
+            global.get $env i32.const 40 i32.load i32.const 44 call $run drop
+        end
+        call $answer)
+    (func (export "throwing_helper") (param i32) (result i32)
+        global.get $env i32.const 8 i32.load i32.const 448 i32.const 48 call $get call $check
+        local.get 0
+        if (result i32)
+            global.get $env i32.const 8 i32.load i32.const 48 i32.load i32.const 52 call $instanceof
+        else
+            global.get $env i32.const 48 i32.load i32.const 0 i32.const 0 i32.const 52 call $construct
+        end)
+    (func (export "publish_exception")
+        global.get $env i32.const 56 call $exception call $check
+        global.get $env i32.const 8 i32.load i32.const 464 i32.const 56 i32.load call $set call $check)
+    (func (export "release_status") (result i32) global.get $release_status)
+    (func (export "drop_owner_on_callback") (param i32) local.get 0 global.set $drop_owner)
+    (func (export "throw_on_callback") (param i32) local.get 0 global.set $throw_on_callback)
+    (func (export "release_owned") (result i32)
+        i32.const 36 i32.load i32.const 0 call $release_env)
+    (func (export "drain") (result i32)
+        global.get $env i32.const 0 i32.const 1 i32.const 60 call $checkpoint)
+    (func (export "init_owned")
+        i32.const 8 i32.const 0 i32.const 32 i32.const 36 call $create_env call $check
+        i32.const 32 i32.load global.set $env
+        i32.const -1 global.set $release_status
+        global.get $env i32.const 8 call $global call $check
+        global.get $env i32.const 64 i32.const 8 i32.const 3 i32.const 0 i32.const 12
+        call $function call $check
+        global.get $env i32.const 8 i32.load i32.const 64 i32.const 12 i32.load
+        call $set call $check)
     (func (export "init")
         call $assert_async
         call $new_env global.set $env
@@ -77,6 +136,13 @@ fn prepared_instance(jspi: bool) -> (NapiCtx, Store, Instance, Memory, NapiSessi
     let (mut imports, state) = hooks
         .additional_imports(&module, &mut store.as_store_mut())
         .unwrap();
+    imports.define(
+        "proof",
+        "drop_external_owner",
+        Function::new_typed(&mut store, || {
+            EXTERNAL_STORE_OWNER.with(|slot| drop(slot.borrow_mut().take()));
+        }),
+    );
     let expected = FunctionEnv::new(&mut store, jspi);
     imports.define(
         "proof",
@@ -239,4 +305,275 @@ fn callbacks_use_the_current_guest_table_target() {
     unsafe {
         session.deactivate(&mut store.as_store_mut());
     }
+}
+
+#[wasm_bindgen_test]
+fn active_provider_release_preserves_callbacks_and_exception_cleanup() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let init_owned = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap();
+    let release = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "release_owned")
+        .unwrap();
+    let release_status = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "release_status")
+        .unwrap();
+    let set_throw = instance
+        .exports
+        .get_typed_function::<i32, ()>(&store, "throw_on_callback")
+        .unwrap();
+    for throws in [false, true] {
+        init_owned.call(&mut store).unwrap();
+        set_throw.call(&mut store, i32::from(throws)).unwrap();
+        let script = if throws {
+            "try { callback(); 0 } catch (e) { e.message === 'release-callback' ? 42 : 0 }"
+        } else {
+            "callback(); 42"
+        };
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", script), 42);
+        assert_ne!(release_status.call(&mut store).unwrap(), 0);
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", "40 + 2"), 42);
+        assert_eq!(release.call(&mut store).unwrap(), 0);
+        assert_ne!(release.call(&mut store).unwrap(), 0);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn throwing_helpers_preserve_exception_identity_and_release_custody() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let init_owned = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap();
+    let throwing_helper = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "throwing_helper")
+        .unwrap();
+    let publish = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "publish_exception")
+        .unwrap();
+    let release = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "release_owned")
+        .unwrap();
+    for mode in [0, 1] {
+        init_owned.call(&mut store).unwrap();
+        let script = if mode == 0 {
+            "globalThis.expectedError = new Error('constructor'); globalThis.throws = function() { throw expectedError; }; 42"
+        } else {
+            "globalThis.expectedError = new Error('instanceof'); globalThis.throws = function() {}; Object.defineProperty(throws, Symbol.hasInstance, {value() { throw expectedError; }}); 42"
+        };
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", script), 42);
+        assert_eq!(throwing_helper.call(&mut store, mode).unwrap(), 10);
+        publish.call(&mut store).unwrap();
+        assert_eq!(
+            eval(
+                &mut store,
+                &instance,
+                &memory,
+                "eval",
+                "captured_exception === expectedError ? 42 : 0"
+            ),
+            42
+        );
+        assert_eq!(release.call(&mut store).unwrap(), 0);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+struct QueuedCallbackFixture {
+    ctx: NapiCtx,
+    store: StoreAsync,
+    instance: Instance,
+    session: NapiSession,
+    callback: js_sys::Function,
+    drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn queued_callback_fixture() -> QueuedCallbackFixture {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (ctx, mut store, instance, memory, session) = prepared_instance(true);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let _probe = FunctionEnv::new(&mut store, DropProbe(drops.clone()));
+    let init = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap();
+    let init_owned = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap();
+    let eval = instance
+        .exports
+        .get_typed_function::<(i32, i32), i32>(&store, "eval")
+        .unwrap();
+    let store = store.into_async();
+    init.call_async(&store).await.unwrap();
+    init_owned.call_async(&store).await.unwrap();
+    let script = "console.__wasmerNapiQueuedCallbackProof = callback; 42";
+    {
+        let locked = store.store().write();
+        memory.view(&locked).write(1024, script.as_bytes()).unwrap();
+    }
+    assert_eq!(
+        eval.call_async(&store, 1024, script.len() as i32)
+            .await
+            .unwrap(),
+        42
+    );
+    let console = js_sys::Reflect::get(&js_sys::global(), &"console".into()).unwrap();
+    let key = wasm_bindgen::JsValue::from_str("__wasmerNapiQueuedCallbackProof");
+    let callback = js_sys::Reflect::get(&console, &key).unwrap();
+    assert!(js_sys::Reflect::delete_property(&js_sys::Object::from(console), &key).unwrap());
+    QueuedCallbackFixture {
+        ctx,
+        store,
+        instance,
+        session,
+        callback: callback.unchecked_into(),
+        drops,
+    }
+}
+
+#[wasm_bindgen_test]
+async fn queued_callbacks_block_guest_release_until_they_are_dispatched() {
+    let QueuedCallbackFixture {
+        store,
+        instance,
+        session,
+        callback,
+        ..
+    } = queued_callback_fixture().await;
+    let release = {
+        let locked = store.read();
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&locked, "release_owned")
+            .unwrap()
+    };
+    let drain = {
+        let locked = store.read();
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&locked, "drain")
+            .unwrap()
+    };
+    let pending = {
+        let _locked = store.store().write();
+        let value = callback.call0(&wasm_bindgen::JsValue::UNDEFINED).unwrap();
+        wasm_bindgen_futures::JsFuture::from(
+            value
+                .dyn_into::<js_sys::Promise>()
+                .expect("locked Store defers the callback"),
+        )
+    };
+    assert_ne!(release.call_async(&store).await.unwrap(), 0);
+    assert_eq!(drain.call_async(&store).await.unwrap(), 0);
+    assert_eq!(pending.await.unwrap().as_f64(), Some(42.0));
+    assert_eq!(release.call_async(&store).await.unwrap(), 0);
+    let mut store = match store.into_store() {
+        Ok(store) => store,
+        Err(_) => panic!("settled callback retained Store"),
+    };
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+async fn dropping_the_last_store_retires_callbacks_before_guest_entry() {
+    use std::sync::atomic::Ordering;
+    let QueuedCallbackFixture {
+        ctx,
+        store,
+        instance: _instance,
+        session,
+        callback,
+        drops,
+    } = queued_callback_fixture().await;
+    let pending = {
+        let _locked = store.store().write();
+        let value = callback.call0(&wasm_bindgen::JsValue::UNDEFINED).unwrap();
+        wasm_bindgen_futures::JsFuture::from(
+            value
+                .dyn_into::<js_sys::Promise>()
+                .expect("locked Store defers the callback"),
+        )
+    };
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(session);
+    drop(store);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(ctx.active_sessions(), 0);
+    assert_eq!(
+        pending.await.unwrap_err().as_string().as_deref(),
+        Some("N-API environment released before callback entry")
+    );
+    assert!(
+        callback
+            .call0(&wasm_bindgen::JsValue::UNDEFINED)
+            .unwrap()
+            .is_undefined()
+    );
+}
+
+#[wasm_bindgen_test]
+async fn external_callbacks_pin_the_store_through_provider_result_cleanup() {
+    use std::sync::atomic::Ordering;
+    let QueuedCallbackFixture {
+        ctx,
+        store,
+        instance,
+        session,
+        callback,
+        drops,
+    } = queued_callback_fixture().await;
+    let set_drop = {
+        let locked = store.read();
+        instance
+            .exports
+            .get_typed_function::<i32, ()>(&locked, "drop_owner_on_callback")
+            .unwrap()
+    };
+    set_drop.call_async(&store, 1).await.unwrap();
+    drop(session);
+    EXTERNAL_STORE_OWNER.with(|slot| {
+        assert!(slot.borrow_mut().replace(store).is_none());
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        callback
+            .call0(&wasm_bindgen::JsValue::UNDEFINED)
+            .unwrap()
+            .as_f64(),
+        Some(42.0)
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(ctx.active_sessions(), 0);
+    EXTERNAL_STORE_OWNER.with(|slot| assert!(slot.borrow().is_none()));
+    assert!(
+        callback
+            .call0(&wasm_bindgen::JsValue::UNDEFINED)
+            .unwrap()
+            .is_undefined()
+    );
 }

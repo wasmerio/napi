@@ -596,6 +596,14 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: i32,
 ) -> i32 {
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
+    let Some(guest_env) = env.data().napi_scopes.get(&scope_id).copied() else {
+        return 1;
+    };
+    let target = env.data().resolve_napi_env(guest_env as i32);
+    // Check before finalizers or unregister can alter scope, context or leases.
+    if unsafe { snapi_bridge_unofficial_can_release_env(target) } != 1 {
+        return 1;
+    }
     let status = drain_env_guest_finalizers(&mut env, scope_id);
     if status != 0 {
         return status;

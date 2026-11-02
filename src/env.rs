@@ -541,16 +541,24 @@ impl NapiEnv {
         if self.deactivated {
             return;
         }
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         for env in self.napi_envs.values() {
-            assert_eq!(
-                unsafe { crate::snapi::snapi_bridge_unofficial_can_release_env(*env as SnapiEnv) },
-                1,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            let ready = unsafe { crate::snapi_js::can_deactivate(*env as SnapiEnv) };
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            let ready = unsafe {
+                crate::snapi::snapi_bridge_unofficial_can_release_env(*env as SnapiEnv) == 1
+            };
+            assert!(
+                ready,
                 "cannot deactivate an N-API session with active provider frames"
             );
         }
         self.deactivated = true;
         self.configured = false;
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        for env in self.napi_envs.values() {
+            unsafe { crate::snapi_js::retire_queued_callbacks(*env as SnapiEnv) };
+        }
         let mut scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
         scope_ids.sort_unstable_by(|left, right| right.cmp(left));
         for scope_id in scope_ids {

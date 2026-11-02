@@ -74,7 +74,6 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_can_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;

@@ -393,7 +393,9 @@ impl NapiRuntimeHooks {
 impl NapiSession {
     /// Clears this session's store-local provider and guest-memory resources.
     /// Repeated calls do nothing. The session limit remains charged until the
-    /// last clone of this session is dropped.
+    /// last clone of this session is dropped. Browser callbacks queued before
+    /// guest entry are rejected host-only; already-entered continuations must
+    /// have settled before calling this method.
     ///
     /// # Safety
     /// `store` must be the exact store used to create this session's imports.

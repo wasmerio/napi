@@ -71,12 +71,28 @@ fn with_current_env_mut<R>(
     .flatten()
 }
 
+/// Keep the exact async Store alive until the outer provider frame has finished
+/// its result/value-frame cleanup, beyond the inner trampoline's short upgrade.
+pub(crate) unsafe fn pin_callback_store(
+    callback_ctx: *mut c_void,
+) -> Option<AsyncFunctionEnvMut<NapiEnv>> {
+    if callback_ctx.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    match &ctx.env {
+        CallbackEnv::Sync(_) => None,
+        CallbackEnv::Async(env) => env.upgrade(),
+    }
+}
+
 struct CallbackStateGuard {
     _ctx: Box<CallbackInvocationCtx>,
     snapi_env: SnapiEnv,
     prev: *mut c_void,
     env: *mut RawFunctionEnvMut,
     owner_id: u64,
+    _operation: Option<crate::snapi_js::HostJsOperation>,
 }
 
 impl Drop for CallbackStateGuard {
@@ -104,6 +120,7 @@ fn install_callback_state(
         return None;
     }
 
+    let operation = unsafe { crate::snapi_js::HostJsOperation::enter(snapi_env) };
     let env_ptr = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>();
     let mut ctx = Box::new(CallbackInvocationCtx {
         env: CallbackEnv::Sync(env_ptr),
@@ -122,6 +139,7 @@ fn install_callback_state(
         snapi_env,
         prev,
         owner_id,
+        _operation: operation,
     })
 }
 
@@ -463,6 +481,7 @@ where
         return future.await;
     }
 
+    let _operation = unsafe { crate::snapi_js::HostJsOperation::enter(snapi_env) };
     let owner_id = {
         let mut locked = env.write().await;
         let owner_id = locked.data_mut().next_host_buffer_owner();
@@ -505,9 +524,12 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] no active callback scope available");
         return 0;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
-    match &mut ctx.env {
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    match &ctx.env {
         CallbackEnv::Sync(env) => {
+            // Copy the stored raw pointer; the shared reference is to its
+            // context slot, not to the FunctionEnvMut it designates.
+            let env = *env;
             if env.is_null() {
                 eprintln!("[callback trampoline] callback scope env cleared");
                 return 0;
@@ -571,7 +593,7 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     if callback_ctx.is_null() {
         return CALLBACK_DEFERRED;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
     let invoke = |env: &mut FunctionEnvMut<NapiEnv>| {
         let Some(table) = env.data().table.clone() else {
             return 0;
@@ -589,8 +611,11 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         }
         result
     };
-    match &mut ctx.env {
+    match &ctx.env {
         CallbackEnv::Sync(env) => {
+            // Copy the stored raw pointer; the shared reference is to its
+            // context slot, not to the FunctionEnvMut it designates.
+            let env = *env;
             if env.is_null() {
                 return CALLBACK_DEFERRED;
             }
