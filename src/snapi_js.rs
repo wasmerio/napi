@@ -1997,11 +1997,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i
     state.live_env_addr.set(0);
     wasmer_napi_release_global_context(&state.global_context);
     // JavaScript can retain callbacks through globals, event listeners, and
-    // pending tasks after the N-API environment is released. Keep only the
-    // wasm-bindgen trampoline alive; its shared liveness token makes retained
-    // callbacks inert without retaining or dereferencing the freed environment.
+    // pending tasks after the N-API environment is released. Transfer dispatch
+    // ownership to JS GC without retaining Rust's JsValue root. Its shared
+    // liveness token keeps externally retained callbacks inert.
     for closure in state.closures.drain(..) {
-        closure.forget();
+        drop(closure.into_js_value());
     }
     drop(state);
     NAPI_OK

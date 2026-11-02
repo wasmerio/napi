@@ -221,6 +221,32 @@ async fn persistent_callbacks_do_not_retain_their_async_store() {
     }
 }
 
+#[wasm_bindgen_test]
+fn released_callbacks_do_not_accumulate_owned_js_roots() {
+    fn cycle() {
+        {
+            let (_ctx, mut store, instance, memory, session) = instance();
+            assert_eq!(
+                eval(&mut store, &instance, &memory, "eval", "callback()"),
+                42
+            );
+            // The synchronous guest and provider frames have all returned.
+            unsafe {
+                session.deactivate(&mut store.as_store_mut());
+            }
+        }
+        // Drain the documented expired Module/Memory cache at this task boundary.
+        wasmer::js::collect_shared_objects();
+    }
+
+    cycle();
+    let baseline = wasm_bindgen::externref_heap_live_count();
+    for _ in 0..3 {
+        cycle();
+        assert_eq!(wasm_bindgen::externref_heap_live_count(), baseline);
+    }
+}
+
 fn eval(
     store: &mut Store,
     instance: &Instance,
