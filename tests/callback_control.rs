@@ -839,3 +839,70 @@ fn external_memory_pending_charge_rolls_back_after_environment_replacement() {
     let (_next_ctx, next, memory, _next_session) = self::instance(&mut store, |_| Ok(()));
     assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
 }
+
+#[test]
+fn external_memory_rejects_unbalanced_and_out_of_range_guest_deltas() {
+    if !run_in_subprocess(
+        "external_memory_rejects_unbalanced_and_out_of_range_guest_deltas",
+        Duration::from_secs(15),
+    ) {
+        return;
+    }
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) = self::instance(&mut store, |_| Ok(()));
+    let adjust = instance
+        .exports
+        .get_typed_function::<i64, i32>(&store, "adjust_external")
+        .unwrap();
+    // Exercise repeated ordinary increments/decrements before boundary checks.
+    for (delta, expected) in [(64, 64), (32, 96), (-32, 64)] {
+        assert_eq!(adjust.call(&mut store, delta).unwrap(), 0);
+        assert_eq!(ctx.budget().snapshot().v8_external, expected);
+    }
+    for delta in [-65, i64::MIN, i64::MAX, 1_i64 << 60, -(1_i64 << 60) - 1] {
+        assert_eq!(
+            adjust.call(&mut store, delta).unwrap(),
+            1,
+            "invalid delta {delta}"
+        );
+        assert_eq!(
+            ctx.budget().snapshot().v8_external,
+            64,
+            "rejection preserves the accepted declaration"
+        );
+    }
+    // A second provider may not debit the first provider's declaration.
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(adjust.call(&mut store, -1).unwrap(), 1);
+    assert_eq!(ctx.budget().snapshot().v8_external, 64);
+    assert_eq!(adjust.call(&mut store, 16).unwrap(), 0);
+    assert_eq!(adjust.call(&mut store, -16).unwrap(), 0);
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_owned")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(adjust.call(&mut store, -64).unwrap(), 0);
+    assert_eq!(adjust.call(&mut store, -1).unwrap(), 1);
+    assert_eq!(ctx.budget().snapshot().v8_external, 0);
+    assert_eq!(eval(&mut store, &instance, &memory, "40 + 2").unwrap(), 42);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+}

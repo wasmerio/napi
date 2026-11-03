@@ -136,6 +136,9 @@ struct SnapiEnvState {
   // Owner-thread physical provider frames, including reentrant guest callbacks.
   // A guest may release this env only after all such frames have returned.
   uint64_t foreground_depth = 0;
+  // Only explicit guest declarations may fund a negative adjustment. V8's
+  // other external allocations can be released independently by its sweeper.
+  int64_t declared_external_memory = 0;
   unofficial_napi_env_owner owner = nullptr;
 
   // Value slot table: maps generation-tagged u32 IDs to scope-bound raw
@@ -2380,10 +2383,40 @@ extern "C" int snapi_bridge_get_instance_data(SnapiEnvState* env_state, uint64_t
 extern "C" int snapi_bridge_adjust_external_memory(SnapiEnvState* env_state, int64_t change,
                                                    int64_t* adjusted) {
   auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return napi_invalid_arg;
+  if (bridge_state == nullptr || adjusted == nullptr) return napi_invalid_arg;
+  // Match the pinned V8 adjustment precondition, returning an N-API status
+  // before an untrusted Wasm integer can reach its fatal CHECK.
+  constexpr int64_t kMaximumDelta = int64_t{1} << 60;
+  if (change < -kMaximumDelta || change >= kMaximumDelta) {
+    return napi_invalid_arg;
+  }
+  const int64_t previous = bridge_state->declared_external_memory;
+  if ((change < 0 && previous < -change) ||
+      (change > 0 && previous > std::numeric_limits<int64_t>::max() - change)) {
+    return napi_invalid_arg;
+  }
   napi_env env = bridge_state->env;
   BridgeOperationScope isolate_scope(bridge_state);
-  return napi_adjust_external_memory(env, change, adjusted);
+  if (change > 0) {
+    int64_t actual = 0;
+    // Delta zero returns before V8's GC/interrupt path. Query the actual
+    // counter: HeapStatistics reports backing-store bytes instead. Positive
+    // updates are owner-thread operations; background sweeping only decreases it.
+    napi_status status = napi_adjust_external_memory(env, 0, &actual);
+    if (status != napi_ok) return status;
+    if (actual < 0 || actual > std::numeric_limits<int64_t>::max() - change) {
+      return napi_invalid_arg;
+    }
+  }
+  // V8 updates its counter before a positive adjustment may trigger GC and
+  // reentry. Publish our matching credit first; nested adjustments keep it.
+  bridge_state->declared_external_memory = previous + change;
+  napi_status status = napi_adjust_external_memory(env, change, adjusted);
+  if (status != napi_ok) {
+    // This provider returns failure only before changing its V8 counter.
+    bridge_state->declared_external_memory = previous;
+  }
+  return status;
 }
 
 // ============================================================
