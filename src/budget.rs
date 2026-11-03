@@ -95,7 +95,7 @@ pub enum Pool {
     /// live usage, so the guarantee never races V8's GC.
     V8HeapReserved,
     /// V8 external memory the guest has explicitly declared via
-    /// `napi_adjust_external_memory` (`NapiEnv::charge_declared_external`).
+    /// `napi_adjust_external_memory` (`NapiEnv::record_declared_external`).
     /// ArrayBuffer/Buffer backing stores are NOT charged here: GuestHeap is
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].

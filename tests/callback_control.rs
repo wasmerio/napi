@@ -18,6 +18,7 @@ const GUEST: &str = r#"(module
     (import "env" "memory" (memory 1 1024 shared))
     (import "test" "record" (func $record (param i32)))
     (import "napi" "napi_wasm_init_env" (func $new_env (result i32)))
+    (import "napi" "napi_adjust_external_memory" (func $adjust_external (param i32 i64 i32) (result i32)))
     (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
     (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
@@ -71,6 +72,10 @@ const GUEST: &str = r#"(module
         global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
         global.get $env i32.const 16 i32.load i32.const 20 call $run)
     (func (export "fresh") (result i32) i32.const 9)
+    (func (export "global_status") (result i32)
+        global.get $env i32.const 48 call $global)
+    (func (export "adjust_external") (param i64) (result i32)
+        global.get $env local.get 0 i32.const 40 call $adjust_external)
     (func (export "eval_contextify") (param i32 i32) (result i32)
         global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
         i32.const 128 i32.const 0 i32.store
@@ -94,8 +99,15 @@ fn instance_with_record(
     store: &mut Store,
     record: impl FnOnce(&mut Store, &NapiCtx) -> Function,
 ) -> (NapiCtx, Instance, Memory, NapiSession) {
+    instance_with_context(store, NapiCtx::default(), record)
+}
+
+fn instance_with_context(
+    store: &mut Store,
+    ctx: NapiCtx,
+    record: impl FnOnce(&mut Store, &NapiCtx) -> Function,
+) -> (NapiCtx, Instance, Memory, NapiSession) {
     let module = Module::new(&*store, wat::parse_str(GUEST).unwrap()).unwrap();
-    let ctx = NapiCtx::default();
     let hooks = ctx.runtime_hooks();
     let (mut imports, state) = hooks
         .additional_imports(&module, &mut store.as_store_mut())
@@ -671,6 +683,159 @@ fn callback_cleanup_uses_its_pinned_environment_after_slot_replacement() {
     );
     drop(session);
     assert_eq!(ctx.active_sessions(), 0);
+    let (_next_ctx, next, memory, _next_session) = self::instance(&mut store, |_| Ok(()));
+    assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
+}
+
+// Match budget::external_accountant_tests; only the owning thread's armed hook
+// may reenter the real Store, and taking it ends the TLS borrow before callout.
+thread_local! {
+    static EXTERNAL_ACCOUNTANT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct ReentrantAccountant(std::sync::atomic::AtomicU64);
+impl ReentrantAccountant {
+    fn call_hook() {
+        let hook = EXTERNAL_ACCOUNTANT_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+impl wasmer_napi::NapiMemoryAccountant for ReentrantAccountant {
+    fn memory_limit(&self) -> u64 {
+        u64::MAX
+    }
+    fn memory_charged(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn try_charge(&self, bytes: u64) -> bool {
+        Self::call_hook();
+        self.0.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+    fn uncharge(&self, bytes: u64) {
+        self.0.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        Self::call_hook();
+    }
+}
+
+#[test]
+fn external_memory_accountant_reenters_with_fresh_environment_borrows() {
+    if !run_in_subprocess(
+        "external_memory_accountant_reenters_with_fresh_environment_borrows",
+        Duration::from_secs(15),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let accountant = Arc::new(ReentrantAccountant(std::sync::atomic::AtomicU64::new(0)));
+    let ctx = NapiCtx::builder().memory_accountant(accountant).build();
+    let mut store = Store::default();
+    let (ctx, instance, _, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    let nested = instance
+        .exports
+        .get_function("global_status")
+        .unwrap()
+        .clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adjust = instance
+        .exports
+        .get_typed_function::<i64, i32>(&store, "adjust_external")
+        .unwrap();
+    for (delta, expected) in [(64, 64), (-64, 0)] {
+        let nested = nested.clone();
+        let calls = calls.clone();
+        EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let result = Store::with_current(|store| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        nested.call(store, &[])
+                    }))
+                });
+                assert_eq!(&*result.unwrap().unwrap().unwrap(), &[Value::I32(0)]);
+                calls.fetch_add(1, Ordering::SeqCst);
+            }))
+        });
+        assert_eq!(adjust.call(&mut store, delta).unwrap(), 0);
+        assert_eq!(ctx.budget().snapshot().v8_external, expected);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().v8_external, 0);
+}
+
+#[test]
+fn external_memory_pending_charge_rolls_back_after_environment_replacement() {
+    if !run_in_subprocess(
+        "external_memory_pending_charge_rolls_back_after_environment_replacement",
+        Duration::from_secs(15),
+    ) {
+        return;
+    }
+    use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+    let accountant = Arc::new(ReentrantAccountant(std::sync::atomic::AtomicU64::new(0)));
+    let ctx = NapiCtx::builder().memory_accountant(accountant).build();
+    let mut store = Store::default();
+    let before = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut()).len();
+    let mut target = None;
+    let (ctx, instance, _, session) = instance_with_context(&mut store, ctx, |store, _| {
+        let candidates: Vec<_> = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+            .iter()
+            .enumerate()
+            .skip(before)
+            .filter(|(_, owner)| !owner.as_ref().is::<()>())
+            .map(|(index, owner)| (index, owner.identity()))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        target = candidates.into_iter().next();
+        Function::new_typed(store, |_: i32| {})
+    });
+    let (index, identity) = target.unwrap();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            Store::with_current(|store| {
+                let owner =
+                    &mut VMFunctionEnvironment::list_mut(store.objects_mut().as_sys_mut())[index];
+                assert_eq!(owner.identity(), identity);
+                drop(std::mem::replace(owner, VMFunctionEnvironment::new(())));
+            })
+            .unwrap();
+        }))
+    });
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<i64, i32>(&store, "adjust_external")
+            .unwrap()
+            .call(&mut store, 64)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        ctx.budget().snapshot().v8_external,
+        0,
+        "unpublished charge rolled back"
+    );
+    assert_eq!(
+        ctx.budget().snapshot().live_isolates,
+        0,
+        "original pin owns provider until adjustment returns"
+    );
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "fresh")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        9
+    );
+    drop(session);
     let (_next_ctx, next, memory, _next_session) = self::instance(&mut store, |_| Ok(()));
     assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
 }

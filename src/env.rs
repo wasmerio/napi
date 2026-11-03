@@ -91,6 +91,44 @@ struct EnvHeapChargeHandle {
     tracker: usize,
 }
 
+/// An uncommitted declaration is charged without exposing it to nested releases.
+#[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
+pub(crate) struct DeclaredExternalCharge {
+    budget: Arc<ResourceBudget>,
+    bytes: u64,
+}
+
+#[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
+impl DeclaredExternalCharge {
+    pub(crate) fn reserve(budget: Arc<ResourceBudget>, bytes: u64) -> Option<Self> {
+        budget.try_charge(Pool::V8External, bytes).ok()?;
+        Some(Self { budget, bytes })
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+
+#[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
+impl Drop for DeclaredExternalCharge {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.budget.uncharge(Pool::V8External, bytes);
+        }));
+        if let Err(panic) = released {
+            if std::thread::panicking() {
+                // ResourceBudget removes its counters before calling the
+                // accountant. Preserve the already-unwinding first failure.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 pub(crate) struct NapiEnv {
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
@@ -351,25 +389,19 @@ impl NapiEnv {
         self.budget.release_env(reservation.ceiling_bytes);
     }
 
-    /// Charge a positive `napi_adjust_external_memory` delta against the budget.
-    /// Returns `false` (guest sees a failure) when it would exceed the budget.
+    /// Record a successful provider adjustment without invoking the accountant.
     #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
-    pub(crate) fn charge_declared_external(&mut self, bytes: u64) -> bool {
-        if self.budget.try_charge(Pool::V8External, bytes).is_err() {
-            return false;
-        }
+    pub(crate) fn record_declared_external(&mut self, bytes: u64) {
         self.external_declared = self.external_declared.saturating_add(bytes);
-        true
     }
 
-    /// Release a negative `napi_adjust_external_memory` delta, clamped to what
-    /// this env actually declared so it can never underflow the pool or release
-    /// the allocator's charges.
+    /// Take only committed declarations; the caller releases the charge after
+    /// ending this borrow. A pending positive adjustment cannot be consumed.
     #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
-    pub(crate) fn uncharge_declared_external(&mut self, bytes: u64) {
+    pub(crate) fn take_declared_external(&mut self, bytes: u64) -> u64 {
         let release = bytes.min(self.external_declared);
         self.external_declared -= release;
-        self.budget.uncharge(Pool::V8External, release);
+        release
     }
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -636,21 +668,25 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
 
-        assert!(env.charge_declared_external(6 * MIB));
+        let charge = DeclaredExternalCharge::reserve(budget.clone(), 6 * MIB).unwrap();
+        env.record_declared_external(6 * MIB);
+        charge.commit();
         assert_eq!(budget.snapshot().v8_external, 6 * MIB);
 
         // Over budget: denied, nothing charged.
-        assert!(!env.charge_declared_external(6 * MIB));
+        assert!(DeclaredExternalCharge::reserve(budget.clone(), 6 * MIB).is_none());
         assert_eq!(budget.snapshot().v8_external, 6 * MIB);
 
         // A negative delta larger than declared is clamped to what was declared,
         // so it can never underflow the pool.
-        env.uncharge_declared_external(100 * MIB);
+        let release = env.take_declared_external(100 * MIB);
+        budget.uncharge(Pool::V8External, release);
         assert_eq!(budget.snapshot().v8_external, 0);
         assert_eq!(env.external_declared, 0);
 
         // Further release is a no-op.
-        env.uncharge_declared_external(MIB);
+        let release = env.take_declared_external(MIB);
+        budget.uncharge(Pool::V8External, release);
         assert_eq!(budget.snapshot().v8_external, 0);
     }
 
@@ -664,7 +700,9 @@ mod tests {
                 Arc::new(std::sync::Mutex::new(HashSet::new())),
                 Arc::new(AtomicBool::new(false)),
             );
-            assert!(env.charge_declared_external(4 * MIB));
+            let charge = DeclaredExternalCharge::reserve(budget.clone(), 4 * MIB).unwrap();
+            env.record_declared_external(4 * MIB);
+            charge.commit();
             assert_eq!(budget.snapshot().v8_external, 4 * MIB);
         }
         assert_eq!(
@@ -672,6 +710,92 @@ mod tests {
             0,
             "drop releases declared external"
         );
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn external_rollback_preserves_the_first_failure_and_releases_once() {
+        use crate::budget::NapiMemoryAccountant;
+        use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+        struct PanickingAccountant(AtomicU64);
+        impl NapiMemoryAccountant for PanickingAccountant {
+            fn memory_limit(&self) -> u64 {
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+                panic_any("secondary accountant panic");
+            }
+        }
+        #[derive(Debug)]
+        struct Original(Arc<()>);
+        impl std::fmt::Display for Original {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original adjustment failure")
+            }
+        }
+        impl std::error::Error for Original {}
+        let accountant = Arc::new(PanickingAccountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let original = Arc::new(());
+        // Exercise the exact owned-result reconciliation used after CPP exit;
+        // this unit proof does not fabricate execution of a V8 callback.
+        let charge = DeclaredExternalCharge::reserve(budget.clone(), 64).unwrap();
+        let first = wasmer::RuntimeError::user(Box::new(Original(original.clone())));
+        let error = crate::guest::napi::settle_external_adjustment(
+            Some(charge),
+            &budget,
+            1,
+            0,
+            Ok(Err(first)),
+        )
+        .unwrap_err();
+        assert!(Arc::ptr_eq(
+            &error.downcast_ref::<Original>().unwrap().0,
+            &original
+        ));
+        assert_eq!(budget.snapshot().v8_external, 0);
+        assert_eq!(accountant.memory_charged(), 0);
+
+        let charge = DeclaredExternalCharge::reserve(budget.clone(), 64).unwrap();
+        let payload = original.clone();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            crate::guest::napi::settle_external_adjustment(
+                Some(charge),
+                &budget,
+                1,
+                0,
+                Err(Box::new(Original(payload))),
+            )
+            .unwrap();
+        }))
+        .unwrap_err();
+        assert!(Arc::ptr_eq(
+            &panic.downcast_ref::<Original>().unwrap().0,
+            &original
+        ));
+        assert_eq!(budget.snapshot().v8_external, 0);
+        assert_eq!(accountant.memory_charged(), 0);
+
+        let payload = original.clone();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _charge = DeclaredExternalCharge::reserve(budget.clone(), 64).unwrap();
+            panic_any(Original(payload));
+        }))
+        .unwrap_err();
+        assert!(Arc::ptr_eq(
+            &panic.downcast_ref::<Original>().unwrap().0,
+            &original
+        ));
+        assert_eq!(budget.snapshot().v8_external, 0);
+        assert_eq!(accountant.memory_charged(), 0);
     }
 
     #[test]

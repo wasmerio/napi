@@ -4115,29 +4115,127 @@ fn guest_napi_adjust_external_memory(
     e: i32,
     change: i64,
     rp: i32,
-) -> i32 {
-    // Charge a positive delta up front so an over-budget declaration fails
-    // before V8 is told about the memory.
-    if change > 0 && !env.data_mut().charge_declared_external(change as u64) {
-        return 1;
-    }
+) -> Result<i32, RuntimeError> {
+    use crate::env::DeclaredExternalCharge;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-    let mut adjusted: i64 = 0;
-    let s =
-        unsafe { snapi_bridge_adjust_external_memory(snapi_env(&env, e), change, &mut adjusted) };
-    if s != 0 {
-        if change > 0 {
-            env.data_mut().uncharge_declared_external(change as u64);
+    let target = snapi_env(&env, e);
+    if target.is_null() {
+        return Ok(1);
+    }
+    let Some(environment) = env.pin_frame() else {
+        return Ok(1);
+    };
+    let budget = env.data().budget.clone();
+    // Every accountant callback, including receipt rollback during unwind,
+    // runs while the original Store borrow is inaccessible.
+    let adjustment: Result<(i32, i64), RuntimeError> = env.as_store_mut().parked(|| {
+        let charge = if change > 0 {
+            let Some(charge) = DeclaredExternalCharge::reserve(budget.clone(), change as u64)
+            else {
+                return Ok((1, 0));
+            };
+            Some(charge)
+        } else {
+            None
+        };
+        let call = wasmer::Store::with_current(|store| {
+            // Restore the counted Store wrapper before replaying any panic.
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut current = environment.try_as_env_mut(store)?;
+                if !current.data().creation_enabled()
+                    || current.data().resolve_napi_env(e) != target
+                {
+                    return None;
+                }
+                let mut cpp_status = 1;
+                let mut adjusted = 0;
+                let callback = catch_unwind(AssertUnwindSafe(|| {
+                    with_cb_context(&mut current, e, || unsafe {
+                        cpp_status =
+                            snapi_bridge_adjust_external_memory(target, change, &mut adjusted);
+                        cpp_status
+                    })
+                }));
+                // The same temporary owns original-cell cleanup even when a
+                // callback replaces its slot. Follow actual CPP acceptance
+                // before replaying a callback failure reported after CPP exit.
+                let release = if cpp_status == 0 {
+                    if change > 0 {
+                        current.data_mut().record_declared_external(change as u64);
+                        0
+                    } else {
+                        current
+                            .data_mut()
+                            .take_declared_external(change.unsigned_abs())
+                    }
+                } else {
+                    0
+                };
+                Some((cpp_status, adjusted, release, callback))
+            }))
+        });
+        let Some(call) = call else {
+            return Ok((1, 0));
+        };
+        let Some((status, adjusted, release, callback)) = (match call {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        }) else {
+            return Ok((1, 0));
+        };
+        settle_external_adjustment(charge, &budget, status, release, callback)?;
+        // A negative adjustment's accountant can itself detach this cell.
+        // Reject further guest writes through a stale attachment.
+        let attached = wasmer::Store::with_current(|store| {
+            environment.try_as_env_mut(store).is_some_and(|current| {
+                current.data().creation_enabled() && current.data().resolve_napi_env(e) == target
+            })
+        })
+        .unwrap_or(false);
+        Ok((if attached { status } else { 1 }, adjusted))
+    });
+    let (status, adjusted) = adjustment?;
+    if status == 0 {
+        write_guest_i64(&mut env, rp as u32, adjusted);
+    }
+    Ok(status)
+}
+
+/// Reconcile owned charge cleanup before replaying the exact bridge outcome.
+/// Called only after original-cell bookkeeping and counted Store restoration.
+pub(crate) fn settle_external_adjustment(
+    charge: Option<crate::env::DeclaredExternalCharge>,
+    budget: &crate::ResourceBudget,
+    cpp_status: i32,
+    release: u64,
+    callback: std::thread::Result<Result<i32, RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    let cleanup = catch_unwind(AssertUnwindSafe(|| {
+        if cpp_status == 0 {
+            if let Some(charge) = charge {
+                charge.commit();
+            }
+            budget.uncharge(crate::Pool::V8External, release);
+        } else {
+            drop(charge);
         }
-        return s;
+    }));
+    match (callback, cleanup) {
+        (Ok(Ok(_)), Ok(())) => Ok(()),
+        (Ok(Ok(_)), Err(panic)) => resume_unwind(panic),
+        (first, cleanup) => {
+            if let Err(secondary) = cleanup {
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(secondary)));
+            }
+            match first {
+                Ok(Err(error)) => Err(error),
+                Err(panic) => resume_unwind(panic),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
     }
-
-    if change < 0 {
-        env.data_mut()
-            .uncharge_declared_external(change.unsigned_abs());
-    }
-    write_guest_i64(&mut env, rp as u32, adjusted);
-    s
 }
 
 // --- Node Buffers ---
