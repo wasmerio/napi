@@ -7,6 +7,8 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Native managed invocation profile; ordinary sys builds remain synchronous.
+experimental-async = ["wasmer/experimental-async"]
 # Uses the browser/Node JavaScript realm as the N-API value engine when this
 # crate is compiled as part of a wasm32-unknown-unknown wasm-bindgen module.
 # On native targets this feature is inert and the V8 backend remains active.

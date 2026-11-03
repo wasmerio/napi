@@ -706,32 +706,34 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
-        if delta == Pages(0) {
-            return self.inner.grow(delta);
-        }
-        let _mutation = self.charge.begin_mutation()?;
-        let delta_bytes = pages_to_bytes(delta);
-        // Reserve first: a denied charge must look exactly like hitting the
-        // memory's maximum, so the guest's `memory.grow` returns -1.
-        self.budget()
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .map_err(|_| MemoryError::CouldNotGrow {
-                current: self.inner.size(),
-                attempted_delta: delta,
-            })?;
+        wasmer::sys::with_memory_grow_callback(|| {
+            if delta == Pages(0) {
+                return self.inner.grow(delta);
+            }
+            let _mutation = self.charge.begin_mutation()?;
+            let delta_bytes = pages_to_bytes(delta);
+            // Reserve first: a denied charge must look exactly like hitting the
+            // memory's maximum, so the guest's `memory.grow` returns -1.
+            self.budget()
+                .try_charge(Pool::WasmLinear, delta_bytes)
+                .map_err(|_| MemoryError::CouldNotGrow {
+                    current: self.inner.size(),
+                    attempted_delta: delta,
+                })?;
 
-        match self.inner.grow(delta) {
-            Ok(previous) => {
-                self.charge.bytes.fetch_add(delta_bytes, Ordering::AcqRel);
-                Ok(previous)
+            match self.inner.grow(delta) {
+                Ok(previous) => {
+                    self.charge.bytes.fetch_add(delta_bytes, Ordering::AcqRel);
+                    Ok(previous)
+                }
+                Err(err) => {
+                    // The real grow failed (e.g. hit its own maximum); give the
+                    // reservation back so it does not leak against the budget.
+                    self.budget().uncharge(Pool::WasmLinear, delta_bytes);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                // The real grow failed (e.g. hit its own maximum); give the
-                // reservation back so it does not leak against the budget.
-                self.budget().uncharge(Pool::WasmLinear, delta_bytes);
-                Err(err)
-            }
-        }
+        })
     }
 
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
@@ -1711,5 +1713,373 @@ mod shared_memory_mutation_tests {
         drop(memory);
         assert_eq!(budget.snapshot().wasm_linear, 0);
         assert_eq!(accountant.memory_charged(), 0);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod memory_grow_callback_tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+        process::{Child, Command},
+        time::Instant,
+    };
+    use wasmer::sys::{Cranelift, EngineBuilder};
+    use wasmer::{AsStoreRef, Imports, Instance, Memory, Module, Store};
+
+    thread_local! {
+        static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    struct Accountant(AtomicU64);
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            8 * WASM_PAGE_SIZE as u64
+        }
+        fn memory_charged(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.0.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    // Production Phase1 wraps imported/host-created memory only. This sibling
+    // also wraps a defined memory to exercise the other VM libcall with the
+    // actual BudgetedMemory consumer, without changing production policy.
+    struct DefinedTunables {
+        host: BudgetedTunables<BaseTunables>,
+        budget: Arc<ResourceBudget>,
+    }
+    impl Tunables for DefinedTunables {
+        fn memory_style(&self, ty: &MemoryType) -> MemoryStyle {
+            self.host.memory_style(ty)
+        }
+        fn table_style(&self, ty: &TableType) -> TableStyle {
+            self.host.table_style(ty)
+        }
+        fn create_host_memory(
+            &self,
+            ty: &MemoryType,
+            style: &MemoryStyle,
+        ) -> Result<VMMemory, MemoryError> {
+            self.host.create_host_memory(ty, style)
+        }
+        unsafe fn create_vm_memory(
+            &self,
+            ty: &MemoryType,
+            style: &MemoryStyle,
+            location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
+        ) -> Result<VMMemory, MemoryError> {
+            // SAFETY: forward the exact initialization location and its owner.
+            let inner = unsafe { self.host.create_vm_memory(ty, style, location) }?;
+            Ok(VMMemory::from(
+                Box::new(BudgetedMemory::new(inner, self.budget.clone())?)
+                    as Box<dyn LinearMemory + Send + Sync>,
+            ))
+        }
+        fn create_host_table(&self, ty: &TableType, style: &TableStyle) -> Result<VMTable, String> {
+            self.host.create_host_table(ty, style)
+        }
+        unsafe fn create_vm_table(
+            &self,
+            ty: &TableType,
+            style: &TableStyle,
+            location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
+        ) -> Result<VMTable, String> {
+            // SAFETY: the caller's initialization contract is forwarded intact.
+            unsafe { self.host.create_vm_table(ty, style, location) }
+        }
+    }
+
+    fn setup(imported: bool) -> (Store, Instance, Arc<ResourceBudget>, Arc<Accountant>) {
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut engine = EngineBuilder::new(Cranelift::default()).engine();
+        engine.set_tunables(DefinedTunables {
+            host: budgeted_tunables(budget.clone()),
+            budget: budget.clone(),
+        });
+        let mut store = Store::new(engine);
+        let declaration = if imported {
+            "(import \"env\" \"memory\" (memory 1 3))"
+        } else {
+            "(memory 1 3)"
+        };
+        let module = Module::new(
+            &store,
+            format!(
+                r#"(module {declaration}
+                (export "memory" (memory 0))
+                (func (export "run") (result i32)
+                    i32.const 1 memory.grow drop
+                    i32.const 0 i32.const 1 i32.store
+                    i32.const 42)
+                (func (export "fresh") (result i32) i32.const 42))"#
+            ),
+        )
+        .unwrap();
+        let mut imports = Imports::new();
+        if imported {
+            let memory = Memory::new(&mut store, MemoryType::new(1, Some(3), false)).unwrap();
+            imports.define("env", "memory", memory);
+        }
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, WASM_PAGE_SIZE as u64);
+        (store, instance, budget, accountant)
+    }
+
+    fn continuation(instance: &Instance, store: &impl AsStoreRef) -> u32 {
+        let mut bytes = [0; 4];
+        instance
+            .exports
+            .get_memory("memory")
+            .unwrap()
+            .view(store)
+            .read(0, &mut bytes)
+            .unwrap();
+        u32::from_le_bytes(bytes)
+    }
+    fn ready_work() {
+        let mut other = Store::default();
+        let module = Module::new(
+            &other,
+            "(module (func (export \"run\") (result i32) i32.const 42))",
+        )
+        .unwrap();
+        let instance = Instance::new(&mut other, &module, &Imports::new()).unwrap();
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&other, "run")
+                .unwrap()
+                .call(&mut other)
+                .unwrap(),
+            42
+        );
+    }
+    fn subprocess(name: &str) -> bool {
+        const CHILD: &str = "NAPI_MEMORY_GROW_CALLBACK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "budgeted grow proof failed: {status}");
+                return false;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn builtin_budgeted_growth_allows_independent_ready_work() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::builtin_budgeted_growth_allows_independent_ready_work",
+        ) {
+            return;
+        }
+        for imported in [false, true] {
+            for typed in [false, true] {
+                let (mut store, instance, budget, accountant) = setup(imported);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                ON_CHARGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        ready_work();
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }))
+                });
+                let value = if typed {
+                    instance
+                        .exports
+                        .get_typed_function::<(), i32>(&store, "run")
+                        .unwrap()
+                        .call(&mut store)
+                        .unwrap()
+                } else {
+                    instance
+                        .exports
+                        .get_function("run")
+                        .unwrap()
+                        .call(&mut store, &[])
+                        .unwrap()[0]
+                        .i32()
+                        .unwrap()
+                };
+                assert_eq!(value, 42);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(continuation(&instance, &store), 1);
+                assert_eq!(budget.snapshot().wasm_linear, 2 * WASM_PAGE_SIZE as u64);
+                drop(instance);
+                drop(store);
+                assert_eq!(budget.snapshot().wasm_linear, 0);
+                assert_eq!(accountant.memory_charged(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_budgeted_growth_preserves_accountant_panic_and_charge() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::builtin_budgeted_growth_preserves_accountant_panic_and_charge",
+        ) {
+            return;
+        }
+        for imported in [false, true] {
+            for typed in [false, true] {
+                let (mut store, instance, budget, accountant) = setup(imported);
+                let original = Arc::new(());
+                let payload = original.clone();
+                ON_CHARGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        ready_work();
+                        panic_any(payload);
+                    }))
+                });
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    if typed {
+                        instance
+                            .exports
+                            .get_typed_function::<(), i32>(&store, "run")
+                            .unwrap()
+                            .call(&mut store)
+                            .unwrap();
+                    } else {
+                        instance
+                            .exports
+                            .get_function("run")
+                            .unwrap()
+                            .call(&mut store, &[])
+                            .unwrap();
+                    }
+                }));
+                let panic = outcome.unwrap_err();
+                assert!(Arc::ptr_eq(
+                    panic.downcast_ref::<Arc<()>>().unwrap(),
+                    &original
+                ));
+                assert_eq!(continuation(&instance, &store), 0);
+                assert_eq!(budget.snapshot().wasm_linear, WASM_PAGE_SIZE as u64);
+                // The mutation token must have been released during transport.
+                instance
+                    .exports
+                    .get_function("run")
+                    .unwrap()
+                    .call(&mut store, &[])
+                    .unwrap();
+                assert_eq!(continuation(&instance, &store), 1);
+                assert_eq!(budget.snapshot().wasm_linear, 2 * WASM_PAGE_SIZE as u64);
+                drop(instance);
+                drop(store);
+                assert_eq!(budget.snapshot().wasm_linear, 0);
+                assert_eq!(accountant.memory_charged(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[test]
+    fn retired_builtin_budgeted_growth_stops_before_guest_store() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::retired_builtin_budgeted_growth_stops_before_guest_store",
+        ) {
+            return;
+        }
+        use std::{
+            future::Future,
+            rc::Rc,
+            task::{Context, Poll, Waker},
+        };
+        use wasmer::{
+            AsStoreAsync, AsStoreMut,
+            sys::{NativeInvocationScope, WeakNativeInvocation},
+        };
+        for imported in [false, true] {
+            let (mut store, instance, budget, accountant) = setup(imported);
+            let scope = Rc::new(RefCell::new(
+                NativeInvocationScope::bind(&mut store).unwrap(),
+            ));
+            let root_scope = scope.clone();
+            let expected = Rc::new(RefCell::new(None));
+            let expected_abort = expected.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    ready_work();
+                    let root = WeakNativeInvocation::current().unwrap();
+                    root_scope.borrow().close();
+                    *expected_abort.borrow_mut() = root.retirement_error();
+                }))
+            });
+            let function = instance.exports.get_function("run").unwrap().clone();
+            let fresh = instance.exports.get_function("fresh").unwrap().clone();
+            let store = store.into_async();
+            let mut call = Box::pin(function.call_async(&store, vec![]));
+            let outcome = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            drop(call);
+            let Poll::Ready(Err(error)) = outcome else {
+                panic!("retired grow did not abort")
+            };
+            let expected = expected.borrow_mut().take().unwrap();
+            assert!(error.is_host_abort());
+            assert!(std::ptr::eq(
+                error.downcast_ref::<std::io::Error>().unwrap(),
+                expected.downcast_ref::<std::io::Error>().unwrap()
+            ));
+            let continued = {
+                let guard = store.store().write();
+                continuation(&instance, &guard)
+            };
+            let settled = {
+                let mut scope = scope.borrow_mut();
+                let mut wait = Box::pin(scope.close_and_wait());
+                wait.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            };
+            assert!(matches!(settled, Poll::Ready(Ok(()))));
+            let (next_scope, next_store) = {
+                let mut guard = store.store().write();
+                scope
+                    .borrow()
+                    .successor(&store, &mut guard.as_store_mut())
+                    .unwrap()
+            };
+            let mut next = Box::pin(fresh.call_async(&next_store, vec![]));
+            assert!(
+                matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(ref values)) if values[0].i32() == Some(42))
+            );
+            drop(next);
+            drop(next_scope);
+            drop(next_store);
+            drop(scope);
+            drop(instance);
+            drop(store);
+            assert_eq!(budget.snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(continued, 0, "guest continued after retired memory.grow");
+        }
     }
 }
