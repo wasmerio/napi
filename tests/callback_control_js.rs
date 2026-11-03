@@ -20,6 +20,10 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
     (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_has_named_property" (func $has_named (param i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_get_property_names" (func $keys (param i32 i32 i32) (result i32)))
+    (import "napi" "napi_coerce_to_number" (func $number (param i32 i32 i32) (result i32)))
+    (import "napi" "napi_coerce_to_string" (func $text (param i32 i32 i32) (result i32)))
     (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_run_script" (func $run (param i32 i32 i32) (result i32)))
     (import "napi" "napi_create_int32" (func $create_integer (param i32 i32 i32) (result i32)))
@@ -28,6 +32,8 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_new_instance" (func $construct (param i32 i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_instanceof" (func $instanceof (param i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_get_and_clear_last_exception" (func $exception (param i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_get_promise_details"
+        (func $promise_details (param i32 i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
         (func $contextify (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
@@ -43,6 +49,9 @@ const GUEST: &str = r#"(module
     (data (i32.const 384) "throw new Error('release-callback')")
     (data (i32.const 448) "throws\00")
     (data (i32.const 464) "captured_exception\00")
+    (data (i32.const 512) "target\00")
+    (data (i32.const 528) "answer\00")
+    (data (i32.const 544) "operation_result\00")
     (global $env (mut i32) (i32.const 0))
     (global $calls (mut i32) (i32.const 0))
     (global $release_status (mut i32) (i32.const -1))
@@ -76,6 +85,50 @@ const GUEST: &str = r#"(module
         else
             global.get $env i32.const 48 i32.load i32.const 0 i32.const 0 i32.const 52 call $construct
         end)
+    (func (export "property_helper") (param $mode i32) (result i32) (local $status i32)
+        global.get $env i32.const 8 i32.load i32.const 512 i32.const 80 call $get call $check
+        local.get $mode i32.const 7 i32.eq
+        if
+            global.get $env i32.const 80 i32.load i32.const 88 i32.const 84 i32.const 92
+            call $promise_details return
+        end
+        local.get $mode i32.const 1 i32.eq
+        if
+            global.get $env i32.const 80 i32.load i32.const 528 i32.const 12 i32.load
+            call $set return
+        end
+        local.get $mode i32.const 2 i32.eq
+        if
+            global.get $env i32.const 80 i32.load i32.const 528 i32.const 84
+            call $has_named local.tee $status if local.get $status return end
+            global.get $env i32.const 84 i32.load8_u i32.const 84 call $create_integer call $check
+        else
+            local.get $mode i32.const 3 i32.eq
+            if
+                global.get $env i32.const 80 i32.load i32.const 84 call $keys local.set $status
+            else
+                local.get $mode i32.const 4 i32.eq
+                if
+                    global.get $env i32.const 80 i32.load i32.const 84 call $number local.set $status
+                else
+                    local.get $mode i32.const 5 i32.eq
+                    if
+                        global.get $env i32.const 80 i32.load i32.const 84 call $text local.set $status
+                    else
+                        local.get $mode i32.const 6 i32.eq
+                        if
+                            global.get $env i32.const 80 i32.load i32.const 0 i32.const 0 i32.const 84
+                            call $construct local.set $status
+                        else
+                            global.get $env i32.const 80 i32.load i32.const 528 i32.const 84
+                            call $get local.set $status
+                        end
+                    end
+                end
+            end
+            local.get $status if local.get $status return end
+        end
+        global.get $env i32.const 8 i32.load i32.const 544 i32.const 84 i32.load call $set)
     (func (export "publish_exception")
         global.get $env i32.const 56 call $exception call $check
         global.get $env i32.const 8 i32.load i32.const 464 i32.const 56 i32.load call $set call $check)
@@ -412,6 +465,175 @@ fn throwing_helpers_preserve_exception_identity_and_release_custody() {
         );
         assert_eq!(release.call(&mut store).unwrap(), 0);
     }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn property_and_coercion_callouts_preserve_nested_callbacks() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let helper = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "property_helper")
+        .unwrap();
+    let reset = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "reset")
+        .unwrap();
+    let calls = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "calls")
+        .unwrap();
+    for (mode, setup, check) in [
+        (
+            0,
+            "globalThis.target = { get answer() { return callback(); } }; 42",
+            "operation_result === 42 ? 42 : 0",
+        ),
+        (
+            1,
+            "globalThis.target = { set answer(fn) { globalThis.setter_answer = fn(); } }; 42",
+            "setter_answer === 42 ? 42 : 0",
+        ),
+        (
+            2,
+            "globalThis.target = new Proxy({}, { has() { return callback() === 42; } }); 42",
+            "operation_result === 1 ? 42 : 0",
+        ),
+        (
+            3,
+            "globalThis.target = new Proxy({}, { ownKeys() { callback(); return ['answer']; }, getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; } }); 42",
+            "operation_result.length === 1 && operation_result[0] === 'answer' ? 42 : 0",
+        ),
+        (
+            4,
+            "globalThis.target = { valueOf() { return callback(); } }; 42",
+            "operation_result === 42 ? 42 : 0",
+        ),
+        (
+            5,
+            "globalThis.target = { toString() { return String(callback()); } }; 42",
+            "operation_result === '42' ? 42 : 0",
+        ),
+        (
+            6,
+            "globalThis.target = function() { this.answer = callback(); }; 42",
+            "operation_result.answer === 42 ? 42 : 0",
+        ),
+        (
+            7,
+            "globalThis.target = Promise.resolve(42); Object.defineProperty(target, 'constructor', { get() { callback(); return Promise; } }); 42",
+            "42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        reset.call(&mut store).unwrap();
+        assert_eq!(helper.call(&mut store, mode).unwrap(), 0);
+        assert_eq!(calls.call(&mut store).unwrap(), 2);
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", check), 42);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn property_callout_exceptions_preserve_the_exact_js_value() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let helper = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "property_helper")
+        .unwrap();
+    let publish = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "publish_exception")
+        .unwrap();
+    for (mode, setup) in [
+        (
+            0,
+            "globalThis.expectedError = {}; globalThis.target = { get answer() { callback(); throw expectedError; } }; 42",
+        ),
+        (
+            3,
+            "globalThis.expectedError = {}; globalThis.target = new Proxy({}, { ownKeys() { callback(); throw expectedError; } }); 42",
+        ),
+        (
+            4,
+            "globalThis.expectedError = {}; globalThis.target = { valueOf() { callback(); throw expectedError; } }; 42",
+        ),
+        (
+            5,
+            "globalThis.expectedError = {}; globalThis.target = { toString() { callback(); throw expectedError; } }; 42",
+        ),
+        (
+            7,
+            "globalThis.expectedError = {}; globalThis.target = Promise.resolve(42); Object.defineProperty(target, 'constructor', { get() { callback(); throw expectedError; } }); 42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        assert_eq!(helper.call(&mut store, mode).unwrap(), 10);
+        publish.call(&mut store).unwrap();
+        assert_eq!(
+            eval(
+                &mut store,
+                &instance,
+                &memory,
+                "eval",
+                "captured_exception === expectedError ? 42 : 0"
+            ),
+            42
+        );
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn private_metadata_ignores_guest_prototype_overrides() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let helper = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "property_helper")
+        .unwrap();
+    assert_eq!(
+        eval(
+            &mut store,
+            &instance,
+            &memory,
+            "eval",
+            r#"
+        globalThis.metadata_calls = 0;
+        globalThis.target = { answer: 42 };
+        globalThis.restore_metadata = (() => {
+            const get = WeakMap.prototype.get;
+            const set = WeakMap.prototype.set;
+            const same = Object.is;
+            const apply = Reflect.apply;
+            WeakMap.prototype.get = function(key) { metadata_calls++; return apply(get, this, [key]); };
+            WeakMap.prototype.set = function(key, value) { metadata_calls++; return apply(set, this, [key, value]); };
+            Object.is = function(a, b) { metadata_calls++; return same(a, b); };
+            return () => { WeakMap.prototype.get = get; WeakMap.prototype.set = set; Object.is = same; };
+        })();
+        42
+    "#
+        ),
+        42
+    );
+    // Restore primordials before asserting, including when an operation failed.
+    let first = helper.call(&mut store, 0);
+    let second = helper.call(&mut store, 0);
+    let count = eval(
+        &mut store,
+        &instance,
+        &memory,
+        "eval",
+        "restore_metadata(); metadata_calls",
+    );
+    assert_eq!(first.unwrap(), 0);
+    assert_eq!(second.unwrap(), 0);
+    assert_eq!(count, 0);
     unsafe {
         session.deactivate(&mut store.as_store_mut());
     }

@@ -772,7 +772,7 @@ fn guest_unofficial_napi_get_promise_details(
     let mut state = 0i32;
     let mut result_id = 0u32;
     let mut has_result = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_promise_details(
             env_handle,
             promise_id,
@@ -780,7 +780,7 @@ fn guest_unofficial_napi_get_promise_details(
             &mut result_id,
             &mut has_result,
         )
-    };
+    });
     if status != 0 {
         return status;
     }
@@ -2674,7 +2674,10 @@ fn guest_napi_instanceof(
     rp: i32,
 ) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_instanceof(snapi_env(&env, e), obj as u32, ctor as u32, &mut r) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_instanceof(snapi, obj as u32, ctor as u32, &mut r)
+    });
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
@@ -2687,7 +2690,10 @@ macro_rules! guest_coerce {
     ($name:ident, $bridge:ident) => {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
             let mut out: u32 = 0;
-            let s = unsafe { $bridge(snapi_env(&env, e), vh as u32, &mut out) };
+            let snapi = snapi_env(&env, e);
+            let s = with_cb_context(&mut env, e, || unsafe {
+                $bridge(snapi, vh as u32, &mut out)
+            });
             if s == 0 {
                 write_guest_u32(&mut env, rp as u32, out);
             }
@@ -2961,19 +2967,28 @@ fn guest_napi_get_all_property_names(
 
 fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_prototype(snapi_env(&env, e), o as u32, &mut out) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_prototype(snapi, o as u32, &mut out)
+    });
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
 
-fn guest_napi_object_freeze(env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
-    unsafe { snapi_bridge_object_freeze(snapi_env(&env, e), o as u32) }
+fn guest_napi_object_freeze(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_freeze(snapi, o as u32)
+    })
 }
 
-fn guest_napi_object_seal(env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
-    unsafe { snapi_bridge_object_seal(snapi_env(&env, e), o as u32) }
+fn guest_napi_object_seal(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_seal(snapi, o as u32)
+    })
 }
 
 // --- Comparison ---
