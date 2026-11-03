@@ -209,6 +209,17 @@ impl Default for NapiCtx {
 }
 
 impl NapiCtx {
+    /// Creates an empty native arena backed only by explicitly installed leases.
+    /// The arena shares this context's accounting policy and owns no Store.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn native_guest_arena(
+        &self,
+        store: &impl wasmer::AsStoreRef,
+        memory: &wasmer::Memory,
+    ) -> Option<crate::NativeGuestArena> {
+        crate::NativeGuestArena::new(store, memory, self.inner.budget.clone())
+    }
+
     pub fn builder() -> NapiCtxBuilder {
         NapiCtxBuilder::default()
     }

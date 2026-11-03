@@ -664,6 +664,13 @@ impl LinearMemory for BudgetedMemory {
         self.inner.style()
     }
 
+    fn begin_host_mapping_change(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<wasmer::sys::HostMemoryMappingChange, MemoryError> {
+        self.inner.begin_host_mapping_change(range)
+    }
+
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
         let delta_bytes = pages_to_bytes(delta);
         // Reserve first: a denied charge must look exactly like hitting the
@@ -918,6 +925,111 @@ mod tests {
         let tunables = budgeted_tunables(budget);
         engine.set_tunables(tunables);
         Store::new(engine)
+    }
+
+    #[test]
+    fn detached_shared_memory_preserves_growth_and_copy_accounting() {
+        let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+        let shared = {
+            let mut store = budgeted_store(budget.clone());
+            let memory = Memory::new(&mut store, MemoryType::new(2, Some(8), true)).unwrap();
+            let shared = memory.as_shared(&store).unwrap();
+            assert_eq!(budget.memory_charged(), 2 * PAGE);
+            shared
+        };
+        assert_eq!(
+            budget.memory_charged(),
+            2 * PAGE,
+            "detached bytes remain charged"
+        );
+        let sibling = shared.clone();
+        let mut store = Store::default();
+        let memory = shared.try_attach(&mut store).unwrap();
+        memory.grow(&mut store, Pages(2)).unwrap();
+        assert_eq!(
+            budget.memory_charged(),
+            4 * PAGE,
+            "reattachment keeps wrapped growth"
+        );
+        let copied = memory.copy(&store).unwrap();
+        assert_eq!(
+            budget.memory_charged(),
+            8 * PAGE,
+            "physical copies have their own charge"
+        );
+        assert!(memory.grow(&mut store, Pages(1)).is_err());
+        assert_eq!(budget.memory_charged(), 8 * PAGE);
+        drop(copied);
+        assert_eq!(budget.memory_charged(), 4 * PAGE);
+        memory.grow(&mut store, Pages(1)).unwrap();
+        assert_eq!(budget.memory_charged(), 5 * PAGE);
+        drop(store);
+        assert_eq!(
+            budget.memory_charged(),
+            5 * PAGE,
+            "the detached sibling owns the same allocation"
+        );
+        drop(sibling);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn a_native_pin_retains_its_memory_charge_after_store_and_shared_handles_drop() {
+        use std::sync::atomic::AtomicUsize;
+        struct ObserveStore(Arc<AtomicUsize>);
+        impl Drop for ObserveStore {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = ResourceBudget::with_memory_limit(4 * PAGE);
+        let stores = Arc::new(AtomicUsize::new(0));
+        let pin = {
+            let mut store = budgeted_store(budget.clone());
+            let _env = wasmer::FunctionEnv::new(&mut store, ObserveStore(stores.clone()));
+            let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+            let shared = memory.as_shared(&store).unwrap();
+            shared.pin_host_range(PAGE..2 * PAGE).unwrap()
+        };
+        assert_eq!(
+            stores.load(Ordering::SeqCst),
+            1,
+            "the pin must not retain its Store"
+        );
+        assert_eq!(
+            budget.memory_charged(),
+            2 * PAGE,
+            "physical bytes are still owned"
+        );
+        // SAFETY: the exact pin alone retains these anonymous writable bytes.
+        unsafe {
+            pin.as_ptr().write(42);
+            assert_eq!(pin.as_ptr().read(), 42);
+        }
+        drop(pin);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn budgeted_memory_forwards_mapping_change_exclusion() {
+        let budget = ResourceBudget::with_memory_limit(4 * PAGE);
+        let mut store = budgeted_store(budget.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+        let mapping = memory
+            .begin_host_mapping_change(&store, PAGE..2 * PAGE)
+            .unwrap();
+        assert!(mapping.was_private());
+        let shared = memory.as_shared(&store).unwrap();
+        assert!(shared.pin_host_range(PAGE..2 * PAGE).is_err());
+        drop(mapping);
+        assert!(
+            shared.pin_host_range(PAGE..2 * PAGE).is_err(),
+            "unfinished mapping stays unknown"
+        );
+        assert_eq!(budget.memory_charged(), 2 * PAGE);
+        drop(shared);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
     }
 
     #[test]

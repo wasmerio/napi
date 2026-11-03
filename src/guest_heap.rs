@@ -1,5 +1,12 @@
 //! Host-side allocator over guest linear memory.
 //!
+//! `NativeGuestArena` starts empty and accepts only externally owned protected
+//! chunks. WASIXv2 supplies typed kernel leases; growing linear memory does not
+//! establish logical ownership there. Allocator and finalizer contexts retain
+//! those chunks and their allocation until the last actual consumer releases them.
+//!
+//! The remaining growth description applies to the legacy standalone constructor.
+//!
 //! The N-API bridge frequently needs guest-addressable memory: buffer and
 //! arraybuffer backing stores, copies of host-only data, and (via the V8
 //! array-buffer allocator hooks) every backing store JS allocates. Historically
@@ -95,6 +102,7 @@ struct Chunk {
     /// Managed length in bytes.
     len: u32,
     alloc: OffsetAllocator<u32>,
+    _owner: Option<Box<dyn Send + Sync>>,
 }
 
 struct LiveAlloc {
@@ -133,11 +141,15 @@ pub(crate) struct GuestHeap {
     /// [`Pool::WasmLinear`]; uncharged on drop.
     charged: AtomicU64,
     inner: Mutex<HeapInner>,
+    leased: bool,
+    // Range owners drop before the allocation itself.
+    _memory_owner: Option<wasmer::SharedMemory>,
 }
 
-// SAFETY: `base` points into a mapping that outlives the heap: the instance's
-// store keeps it alive, and the heap is dropped with the env. All mutable
-// state is behind the mutex or atomics.
+// SAFETY: leased heaps retain the allocation independently and every chunk's
+// owner excludes replacement until the heap's last consumer drops. Legacy heaps
+// retain their existing instance-scoped lifetime. Mutable metadata is locked;
+// raw payload access still requires the caller's guest/host synchronization.
 unsafe impl Send for GuestHeap {}
 unsafe impl Sync for GuestHeap {}
 
@@ -200,6 +212,122 @@ fn shared_registry() -> &'static Mutex<HashMap<usize, Weak<GuestHeap>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A native allocator supplied with protected, owning reservations.
+/// It starts empty and never grows linear memory itself.
+#[derive(Clone)]
+pub struct NativeGuestArena {
+    heap: Arc<GuestHeap>,
+}
+
+impl NativeGuestArena {
+    pub(crate) fn new(
+        store: &impl AsStoreRef,
+        memory: &Memory,
+        budget: Arc<ResourceBudget>,
+    ) -> Option<Self> {
+        let owner = memory.as_shared(store)?;
+        let (base, _) = owner.host_data()?;
+        if base.is_null() {
+            return None;
+        }
+        let max_bytes = u64::from(memory.ty(store).maximum.map_or(65536, |p| p.0))
+            .checked_mul(u64::from(WASM_PAGE))?;
+        let mut registry = shared_registry()
+            .lock()
+            .expect("guest-heap registry poisoned");
+        registry.retain(|_, weak| weak.strong_count() != 0);
+        if let Some(heap) = registry.get(&(base as usize)).and_then(Weak::upgrade) {
+            if !heap.leased || !Arc::ptr_eq(&heap.budget, &budget) || heap.max_bytes != max_bytes {
+                drop(registry);
+                return None;
+            }
+            return Some(Self { heap });
+        }
+        let heap = Arc::new(GuestHeap {
+            base,
+            max_bytes,
+            budget,
+            charged: AtomicU64::new(0),
+            inner: Mutex::new(HeapInner {
+                memories: Vec::new(),
+                chunks: Vec::new(),
+                live: HashMap::new(),
+                free_bytes: 0,
+                pending_want: 0,
+            }),
+            leased: true,
+            _memory_owner: Some(owner),
+        });
+        registry.insert(base as usize, Arc::downgrade(&heap));
+        Some(Self { heap })
+    }
+
+    /// Installs a range and its owner without suspension or guest calls.
+    /// Rejection returns the original owner unchanged.
+    ///
+    /// # Safety
+    /// `owner` must retain this exact allocation's private, writable, stable
+    /// `address..address+len` bytes and exclude logical reuse and physical
+    /// replacement until drop. It must own no Store, provider or arena. The
+    /// caller must not retain another allocator over these bytes.
+    pub unsafe fn install_chunk(
+        &self,
+        address: u32,
+        len: u32,
+        pointer: *mut u8,
+        owner: Box<dyn Send + Sync>,
+    ) -> Result<(), Box<dyn Send + Sync>> {
+        let start = u64::from(address);
+        let end = start + u64::from(len);
+        if address == 0
+            || !address.is_multiple_of(UNIT)
+            || len == 0
+            || !len.is_multiple_of(UNIT)
+            || end > self.heap.max_bytes
+            || (self.heap.base as usize).checked_add(address as usize) != Some(pointer as usize)
+        {
+            return Err(owner);
+        }
+        let mut inner = self.heap.inner.lock().expect("guest-heap mutex poisoned");
+        if inner.chunks.iter().any(|chunk| {
+            u64::from(chunk.start) < end && start < u64::from(chunk.start) + u64::from(chunk.len)
+        }) {
+            drop(inner);
+            return Err(owner);
+        }
+        inner.chunks.push(Chunk {
+            start: address,
+            len,
+            alloc: OffsetAllocator::with_max_allocs(len / UNIT, chunk_max_allocs(len)),
+            _owner: Some(owner),
+        });
+        inner.free_bytes += u64::from(len);
+        inner.pending_want = 0;
+        Ok(())
+    }
+
+    /// Allocates from installed ranges, returning a guest offset.
+    pub fn alloc(&self, len: usize, zero: bool) -> Option<u32> {
+        self.heap.alloc(len, zero)
+    }
+
+    /// Releases a live allocation. Invalid offsets leave the arena unchanged.
+    pub fn free(&self, offset: u32) -> bool {
+        self.heap.free_offset(offset)
+    }
+
+    /// Desired next reservation size; callouts must happen after this returns.
+    pub fn refill_size(&self) -> Option<u32> {
+        let inner = self.heap.inner.lock().expect("guest-heap mutex poisoned");
+        if inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
+            return None;
+        }
+        chunk_size_for(inner.pending_want.max(PREFUND_BYTES))
+            .div_ceil(WASM_PAGE)
+            .checked_mul(WASM_PAGE)
+    }
+}
+
 impl GuestHeap {
     /// Get the shared heap for `memory`, building it on first use. All envs on
     /// the same shared linear memory receive the same `Arc<GuestHeap>`. Returns
@@ -224,6 +352,10 @@ impl GuestHeap {
             .lock()
             .expect("guest-heap registry poisoned");
         if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
+            if existing.leased || !Arc::ptr_eq(&existing.budget, &budget) {
+                drop(reg);
+                return None;
+            }
             // This store reaches the heap for the first time; its handle is
             // the only one that can grow the memory while it is the store
             // being lent.
@@ -295,6 +427,8 @@ impl GuestHeap {
                 free_bytes: 0,
                 pending_want: 0,
             }),
+            leased: false,
+            _memory_owner: None,
         });
 
         {
@@ -460,6 +594,9 @@ impl GuestHeap {
         store: &mut StoreMut<'_>,
         min_bytes: u32,
     ) -> bool {
+        if self.leased {
+            return false;
+        }
         let Some(memory) = inner
             .memories
             .iter()
@@ -538,6 +675,7 @@ impl GuestHeap {
             start,
             len,
             alloc: OffsetAllocator::with_max_allocs(len / UNIT, chunk_max_allocs(len)),
+            _owner: None,
         });
         inner.free_bytes += u64::from(len);
         Some(())
@@ -624,27 +762,45 @@ impl Drop for GuestHeap {
 // this Rust host — e.g. the native edgejs build — link the no-ops and never
 // install a context).
 //
-// The contexts hold a `Weak<GuestHeap>` plus copied integers, never an `Arc`:
-// process-lifetime V8 globals are deliberately leaked (see the exit-race fix),
-// and an `Arc` reachable from them would pin the instance's multi-GiB memory
-// reservation forever. Ownership decisions use only the integers so a
-// guest-heap pointer is never misrouted to the host allocator even after the
-// heap is gone.
+// Leased contexts strongly own the heap and its exact reservations. Actual V8
+// allocator/backing-store/finalizer owners release these contexts; the global
+// registry is weak. Legacy contexts retain their existing weak policy. Copied
+// bounds keep free provenance checks independent of Store/VM metadata.
 
 use std::ffi::c_void;
+
+enum HeapContextOwner {
+    Legacy(Weak<GuestHeap>),
+    Leased(Arc<GuestHeap>),
+}
+impl HeapContextOwner {
+    fn new(heap: &Arc<GuestHeap>) -> Self {
+        if heap.leased {
+            Self::Leased(heap.clone())
+        } else {
+            Self::Legacy(Arc::downgrade(heap))
+        }
+    }
+    fn upgrade(&self) -> Option<Arc<GuestHeap>> {
+        match self {
+            Self::Legacy(heap) => heap.upgrade(),
+            Self::Leased(heap) => Some(heap.clone()),
+        }
+    }
+}
 
 /// Context installed into a V8 array-buffer allocator
 /// (`unofficial_napi_env_create_options.guest_heap`).
 pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,
-    heap: Weak<GuestHeap>,
+    heap: HeapContextOwner,
 }
 
 /// Context handed to the buffer-finalizer trampoline for a single
 /// guest-heap-backed external buffer.
 pub(crate) struct GuestHeapFinalizeCtx {
-    heap: Weak<GuestHeap>,
+    heap: HeapContextOwner,
     offset: u32,
 }
 
@@ -656,7 +812,7 @@ impl GuestHeap {
         Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
-            heap: Arc::downgrade(self),
+            heap: HeapContextOwner::new(self),
         }))
         .cast()
     }
@@ -666,7 +822,7 @@ impl GuestHeap {
     /// reclaim with [`GuestHeap::reclaim_finalize_ctx`] on failure.
     pub(crate) fn make_finalize_ctx(self: &Arc<Self>, offset: u32) -> *mut c_void {
         Box::into_raw(Box::new(GuestHeapFinalizeCtx {
-            heap: Arc::downgrade(self),
+            heap: HeapContextOwner::new(self),
             offset,
         }))
         .cast()
@@ -1059,5 +1215,149 @@ mod tests {
         assert!(b.is_some(), "refill should cover the pending want");
         assert!(heap.free_offset(b.unwrap()));
         assert!(heap.free_offset(a));
+    }
+    fn leased_arena_store(ctx: &crate::NapiCtx) -> Store {
+        use wasmer::sys::{Cranelift, EngineBuilder};
+        let mut engine = EngineBuilder::new(Cranelift::default()).engine();
+        engine.set_tunables(crate::budgeted_tunables(ctx.budget()));
+        Store::new(engine)
+    }
+
+    struct ArenaPinOwner {
+        _pin: wasmer::sys::HostMemoryPin,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for ArenaPinOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn leased_arenas_start_empty_and_return_rejected_owners_without_growing() {
+        use std::sync::atomic::AtomicUsize;
+        let ctx = crate::NapiCtx::default();
+        let mut store = leased_arena_store(&ctx);
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(2048), true)).unwrap();
+        let arena = ctx.native_guest_arena(&store, &memory).unwrap();
+        assert!(arena.alloc(16, false).is_none());
+        assert!(arena.refill_size().is_some());
+        let wanted = PREFUND_BYTES + UNIT;
+        assert!(arena.alloc(wanted as usize, false).is_none());
+        let refill = arena.refill_size().unwrap();
+        assert!(
+            refill.is_multiple_of(WASM_PAGE),
+            "protected chunks require page-aligned reservations"
+        );
+        assert!(refill >= chunk_size_for(wanted));
+        assert!(
+            arena
+                .heap
+                .alloc_with_store(&mut store.as_store_mut(), 16, false)
+                .is_none()
+        );
+        assert_eq!(memory.size(&store), Pages(2));
+        let other_ctx = crate::NapiCtx::default();
+        assert!(other_ctx.native_guest_arena(&store, &memory).is_none());
+        assert!(
+            GuestHeap::get_or_create(
+                &mut store.as_store_mut(),
+                &memory,
+                arena.heap.budget.clone()
+            )
+            .is_none()
+        );
+        let shared = memory.as_shared(&store).unwrap();
+        let pin = shared.pin_host_range(65536..131072).unwrap();
+        let pointer = pin.as_ptr();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Box::new(ArenaPinOwner {
+            _pin: pin,
+            drops: drops.clone(),
+        });
+        // SAFETY: the owner really pins these bytes. The intentional pointer
+        // mismatch is rejected before the arena can publish or access a chunk.
+        let rejected =
+            unsafe { arena.install_chunk(65536, 65536, pointer.wrapping_add(16), owner) }
+                .expect_err("wrong allocation pointer must be rejected");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(arena.alloc(16, false).is_none());
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(shared.begin_host_mapping_change(65536..131072).is_ok());
+    }
+
+    #[test]
+    fn leased_allocator_and_finalizer_owners_keep_pins_after_store_drop() {
+        use std::sync::atomic::AtomicUsize;
+        struct ObserveStore(Arc<AtomicUsize>);
+        impl Drop for ObserveStore {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let ctx = crate::NapiCtx::default();
+        let budget = ctx.budget();
+        let mut store = leased_arena_store(&ctx);
+        let store_drops = Arc::new(AtomicUsize::new(0));
+        let _env = wasmer::FunctionEnv::new(&mut store, ObserveStore(store_drops.clone()));
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+        let arena = ctx.native_guest_arena(&store, &memory).unwrap();
+        let pin = memory
+            .as_shared(&store)
+            .unwrap()
+            .pin_host_range(65536..131072)
+            .unwrap();
+        let pointer = pin.as_ptr();
+        let pin_drops = Arc::new(AtomicUsize::new(0));
+        let owner = Box::new(ArenaPinOwner {
+            _pin: pin,
+            drops: pin_drops.clone(),
+        });
+        // SAFETY: the exact native pin owns these anonymous writable bytes,
+        // and no other allocator manages the range.
+        assert!(unsafe { arena.install_chunk(65536, 65536, pointer, owner) }.is_ok());
+        let first = arena.alloc(64, true).unwrap();
+        let second = arena.alloc(64, true).unwrap();
+        let allocator = arena.heap.make_alloc_ctx() as usize;
+        let finalizer = arena.heap.make_finalize_ctx(second) as usize;
+        let weak = Arc::downgrade(&arena.heap);
+        drop(arena);
+        drop(store);
+        assert_eq!(store_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.memory_charged(), 2 * u64::from(WASM_PAGE));
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+        // SAFETY: contexts still strongly own the exact protected chunk. No
+        // Store metadata is read to recover this cached base and live offset.
+        let heap = weak.upgrade().unwrap();
+        unsafe {
+            heap.offset_to_host(second).write(42);
+            assert_eq!(heap.offset_to_host(second).read(), 42);
+        }
+        let first_pointer = heap.offset_to_host(first) as usize;
+        drop(heap);
+        std::thread::spawn(move || {
+            assert_eq!(
+                napi_host_guest_heap_free(
+                    allocator as *const c_void,
+                    first_pointer as *mut c_void,
+                    64
+                ),
+                1
+            );
+            napi_host_guest_heap_release(allocator as *mut c_void);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+        assert!(weak.upgrade().is_some());
+        std::thread::spawn(move || {
+            napi_host_guest_heap_buffer_finalize(std::ptr::null_mut(), finalizer as *mut c_void);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.memory_charged(), 0);
+        assert!(weak.upgrade().is_none());
     }
 }
