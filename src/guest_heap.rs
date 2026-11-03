@@ -62,9 +62,9 @@
 //! ## Concurrency
 //!
 //! `alloc`/`free` take the internal mutex only. Frees need no store at all, so
-//! V8's GC threads can release backing stores off the JS thread. Lock order is
-//! the `inner` mutex → budget atomics → the memory's own grow lock; nothing
-//! else is acquired while the mutex is held.
+//! V8's GC threads can release backing stores off the JS thread. Growth marks
+//! one refill under the mutex, then releases it before accounting or memory
+//! callouts. Shared heap publication also ends before funding the arena.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -128,6 +128,8 @@ struct HeapInner {
     /// Bytes a recent allocation failed to find: the next refill claims at
     /// least this much.
     pending_want: u32,
+    /// One caller owns growth; existing chunks remain available during callouts.
+    refilling: bool,
 }
 
 pub(crate) struct GuestHeap {
@@ -254,6 +256,7 @@ impl NativeGuestArena {
                 live: HashMap::new(),
                 free_bytes: 0,
                 pending_want: 0,
+                refilling: false,
             }),
             leased: true,
             _memory_owner: Some(owner),
@@ -348,26 +351,43 @@ impl GuestHeap {
         if !memory.ty(store).shared {
             return Self::new(store, memory, budget);
         }
-        let mut reg = shared_registry()
-            .lock()
-            .expect("guest-heap registry poisoned");
-        if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
+        let existing = {
+            let registry = shared_registry()
+                .lock()
+                .expect("guest-heap registry poisoned");
+            registry.get(&base).and_then(Weak::upgrade)
+        };
+        if let Some(existing) = existing {
             if existing.leased || !Arc::ptr_eq(&existing.budget, &budget) {
-                drop(reg);
                 return None;
             }
-            // This store reaches the heap for the first time; its handle is
-            // the only one that can grow the memory while it is the store
-            // being lent.
             existing.register_memory(store, memory);
             return Some(existing);
         }
-        let heap = Self::new(store, memory, budget)?;
-        reg.insert(base, Arc::downgrade(&heap));
-        // Opportunistically drop dead entries so the map cannot grow unbounded
-        // across many short-lived instances that reuse addresses.
-        reg.retain(|_, w| w.strong_count() > 0);
-        Some(heap)
+        // Validate/build without the registry lock, but perform no growth yet.
+        // A racing or reentrant creator may publish the same shared heap first.
+        let candidate = Self::unfunded(store, memory, budget.clone())?;
+        let selected = {
+            let mut registry = shared_registry()
+                .lock()
+                .expect("guest-heap registry poisoned");
+            registry.retain(|_, weak| weak.strong_count() != 0);
+            if let Some(existing) = registry.get(&base).and_then(Weak::upgrade) {
+                existing
+            } else {
+                registry.insert(base, Arc::downgrade(&candidate));
+                candidate.clone()
+            }
+        };
+        // No last-owner destruction, heap mutex or memory callout under registry.
+        if selected.leased || !Arc::ptr_eq(&selected.budget, &budget) {
+            return None;
+        }
+        selected.register_memory(store, memory);
+        if Arc::ptr_eq(&selected, &candidate) {
+            selected.maybe_refill(store);
+        }
+        Some(selected)
     }
 
     /// Record the handle `store` uses for this heap's linear memory, if it has
@@ -390,6 +410,18 @@ impl GuestHeap {
     pub(crate) fn new(
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
+        budget: Arc<ResourceBudget>,
+    ) -> Option<Arc<Self>> {
+        let heap = Self::unfunded(store, memory, budget)?;
+        if !heap.refill_with_store(store, PREFUND_BYTES, false) {
+            integrity_warn("could not pre-claim the guest heap arena");
+        }
+        Some(heap)
+    }
+
+    fn unfunded(
+        store: &mut StoreMut<'_>,
+        memory: &Memory,
         budget: Arc<ResourceBudget>,
     ) -> Option<Arc<Self>> {
         let ty = memory.ty(store);
@@ -415,7 +447,7 @@ impl GuestHeap {
             }
         }
 
-        let heap = Arc::new(Self {
+        Some(Arc::new(Self {
             base,
             max_bytes,
             budget,
@@ -426,23 +458,11 @@ impl GuestHeap {
                 live: HashMap::new(),
                 free_bytes: 0,
                 pending_want: 0,
+                refilling: false,
             }),
             leased: false,
             _memory_owner: None,
-        });
-
-        {
-            // Claim a working arena while a store is unambiguously in hand.
-            // Best effort: an allocation that arrives with a store can
-            // still claim for itself, so an unfunded heap is slower, not
-            // broken. One that arrives without one has only this to draw on.
-            let mut inner = heap.inner.lock().expect("guest-heap mutex poisoned");
-            if !heap.refill_with_store_locked(&mut inner, store, PREFUND_BYTES) {
-                integrity_warn("could not pre-claim the guest heap arena");
-            }
-        }
-
-        Some(heap)
+        }))
     }
 
     /// Host address of guest offset 0.
@@ -515,24 +535,28 @@ impl GuestHeap {
         }
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        let offset = if let Some(offset) = Self::try_chunks(&mut inner, units) {
+        let needed_bytes = units.checked_mul(UNIT)?;
+        let available = {
+            let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+            let offset = Self::try_chunks(&mut inner, units);
+            if offset.is_none() {
+                inner.pending_want = inner.pending_want.max(needed_bytes);
+            }
+            offset
+        };
+        let offset = if let Some(offset) = available {
             offset
         } else {
-            let needed_bytes = units.checked_mul(UNIT)?;
-            if !self.refill_with_store_locked(&mut inner, store, needed_bytes) {
-                inner.pending_want = inner.pending_want.max(needed_bytes);
+            if !self.refill_with_store(store, needed_bytes, false) {
                 return None;
             }
-            match Self::try_chunks(&mut inner, units) {
-                Some(offset) => offset,
-                None => {
-                    inner.pending_want = inner.pending_want.max(needed_bytes);
-                    return None;
-                }
+            let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+            let offset = Self::try_chunks(&mut inner, units);
+            if offset.is_none() {
+                inner.pending_want = inner.pending_want.max(needed_bytes);
             }
+            offset?
         };
-        drop(inner);
 
         if zero {
             // SAFETY: `offset..offset+len` lies within a chunk this heap owns.
@@ -580,41 +604,53 @@ impl GuestHeap {
     /// without any parking, so the arena stays ahead of allocations that
     /// arrive without a store.
     pub(crate) fn maybe_refill(&self, store: &mut StoreMut<'_>) {
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        if inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
-            return;
-        }
-        let want = inner.pending_want.max(PREFUND_BYTES);
-        let _ = self.refill_with_store_locked(&mut inner, store, want);
+        let _ = self.refill_with_store(store, PREFUND_BYTES, true);
     }
 
-    fn refill_with_store_locked(
+    fn refill_with_store(
         &self,
-        inner: &mut HeapInner,
         store: &mut StoreMut<'_>,
         min_bytes: u32,
+        include_pending: bool,
     ) -> bool {
         if self.leased {
             return false;
         }
-        let Some(memory) = inner
-            .memories
-            .iter()
-            .find(|memory| memory.is_from_store(store))
-            .cloned()
-        else {
-            // This store has no handle on the heap's memory, so it is not the
-            // store that owns it.
-            return false;
+        let (memory, wanted, pending) = {
+            let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+            if inner.refilling {
+                return false;
+            }
+            if include_pending && inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
+                return true;
+            }
+            let Some(memory) = inner
+                .memories
+                .iter()
+                .find(|memory| memory.is_from_store(store))
+                .cloned()
+            else {
+                return false;
+            };
+            let pending = std::mem::take(&mut inner.pending_want);
+            // Background demand sizes advisory top-ups; it must not force a
+            // smaller foreground allocation to exceed the available budget.
+            let wanted = if include_pending {
+                min_bytes.max(pending)
+            } else {
+                min_bytes
+            };
+            inner.refilling = true;
+            (memory, wanted, pending)
         };
-        let want_bytes = chunk_size_for(min_bytes);
-        let delta_pages = want_bytes.div_ceil(WASM_PAGE);
-        // Only charge here when no embedder
-        // is already accounting for growth through its tunables.
+        let mut refill = HeapRefill {
+            heap: self,
+            charge: 0,
+            restore_want: Some(pending),
+        };
+        let delta_pages = chunk_size_for(wanted).div_ceil(WASM_PAGE);
         let delta_bytes = u64::from(delta_pages) * u64::from(WASM_PAGE);
-        let charge = if self.budget.wasm_is_externally_accounted() {
-            0
-        } else {
+        if !self.budget.wasm_is_externally_accounted() {
             if self
                 .budget
                 .try_charge(Pool::WasmLinear, delta_bytes)
@@ -622,20 +658,24 @@ impl GuestHeap {
             {
                 return false;
             }
-            delta_bytes
+            refill.charge = delta_bytes;
+        }
+        let previous = match memory.grow(&mut *store, Pages(delta_pages)) {
+            Ok(previous) => previous,
+            Err(_) => return false,
         };
-
-        let prev = match memory.grow(&mut *store, Pages(delta_pages)) {
-            Ok(prev) => prev,
-            Err(_) => {
-                self.budget.uncharge(Pool::WasmLinear, charge);
-                return false;
-            }
-        };
+        // A successful physical grow remains resident even if view/claim fails.
+        self.charged.fetch_add(refill.charge, Ordering::AcqRel);
+        refill.charge = 0;
         let base_now = memory.view(store).data_ptr();
-        inner.pending_want = 0;
-        self.finish_claim(inner, prev, delta_pages, base_now, charge)
-            .is_some()
+        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let claimed = self
+            .finish_claim(&mut inner, previous, delta_pages, base_now)
+            .is_some();
+        if claimed {
+            refill.restore_want = None;
+        }
+        claimed
     }
 
     fn finish_claim(
@@ -644,7 +684,6 @@ impl GuestHeap {
         prev: Pages,
         delta_pages: u32,
         base_now: *mut u8,
-        charged_bytes: u64,
     ) -> Option<()> {
         // The whole design (external backing stores, cached host pointers)
         // relies on the mapping never moving. A moved base means every live
@@ -660,9 +699,6 @@ impl GuestHeap {
 
         let start = u64::from(prev.0) * u64::from(WASM_PAGE);
         let len = u64::from(delta_pages) * u64::from(WASM_PAGE);
-        // Once the physical grow succeeds its bytes remain resident even if an
-        // integrity check prevents this allocator from using the new range.
-        self.charged.fetch_add(charged_bytes, Ordering::AcqRel);
         if start + len > self.max_bytes {
             // Cannot happen (grow enforces the maximum), but never hand out
             // ranges beyond the reservation.
@@ -741,6 +777,38 @@ impl GuestHeap {
     #[cfg(test)]
     fn live_count(&self) -> usize {
         self.inner.lock().unwrap().live.len()
+    }
+}
+
+struct HeapRefill<'a> {
+    heap: &'a GuestHeap,
+    charge: u64,
+    restore_want: Option<u32>,
+}
+impl Drop for HeapRefill<'_> {
+    fn drop(&mut self) {
+        {
+            let mut inner = self
+                .heap
+                .inner
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            inner.refilling = false;
+            if let Some(wanted) = self.restore_want.take() {
+                inner.pending_want = inner.pending_want.max(wanted);
+            }
+        }
+        let charge = std::mem::take(&mut self.charge);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.heap.budget.uncharge(Pool::WasmLinear, charge);
+        }));
+        if let Err(panic) = released {
+            if std::thread::panicking() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 }
 
@@ -931,6 +999,243 @@ mod tests {
         (memory, heap)
     }
 
+    thread_local! {
+        static REFILL_ACCOUNTANT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    struct RefillAccountant(AtomicU64);
+    impl crate::budget::NapiMemoryAccountant for RefillAccountant {
+        fn memory_limit(&self) -> u64 {
+            256 * 1024 * 1024
+        }
+        fn memory_charged(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let hook = REFILL_ACCOUNTANT_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.0.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+    fn refill_store(budget: Arc<ResourceBudget>) -> Store {
+        use wasmer::sys::{BaseTunables, NativeEngineExt};
+        let mut store = Store::default();
+        store
+            .engine_mut()
+            .set_tunables(crate::budget::BudgetedTunables::new(
+                BaseTunables::new(),
+                budget,
+            ));
+        store
+    }
+    // Match callback_control's owned child and API async_runtime's unit sibling.
+    // An isolated child also makes global registry try_lock observation exact.
+    fn refill_subprocess(name: &str) -> bool {
+        use std::{
+            process::{Child, Command},
+            time::{Duration, Instant},
+        };
+        const CHILD: &str = "NAPI_HEAP_REFILL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "heap refill proof failed: {status}");
+                return false;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "heap refill callback did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn refill_accountant_observes_unlocked_allocator_metadata() {
+        if !refill_subprocess(
+            "guest_heap::tests::refill_accountant_observes_unlocked_allocator_metadata",
+        ) {
+            return;
+        }
+        use std::sync::atomic::AtomicBool;
+        let accountant = Arc::new(RefillAccountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant);
+        let mut store = refill_store(budget.clone());
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages(64), Some(Pages(2048)), true),
+        )
+        .unwrap();
+        let registry_unlocked = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicBool::new(false));
+        let observed = registry_unlocked.clone();
+        let visible = published.clone();
+        let base = memory.view(&store).data_ptr() as usize;
+        REFILL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Metadata only: the old-source run never blocks or reenters.
+                if let Ok(registry) = shared_registry().try_lock() {
+                    observed.store(true, Ordering::SeqCst);
+                    visible.store(
+                        registry.get(&base).and_then(Weak::upgrade).is_some(),
+                        Ordering::SeqCst,
+                    );
+                }
+            }))
+        });
+        let heap =
+            GuestHeap::get_or_create(&mut store.as_store_mut(), &memory, budget.clone()).unwrap();
+        let heap_unlocked = Arc::new(AtomicBool::new(false));
+        let observed = heap_unlocked.clone();
+        let during = heap.clone();
+        REFILL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                observed.store(during.inner.try_lock().is_ok(), Ordering::SeqCst);
+            }))
+        });
+        let offset = heap
+            .alloc_with_store(
+                &mut store.as_store_mut(),
+                (PREFUND_BYTES * 2) as usize,
+                false,
+            )
+            .unwrap();
+        assert!(heap.free_offset(offset));
+        drop(heap);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
+        assert!(
+            registry_unlocked.load(Ordering::SeqCst),
+            "shared heap publication held registry during accounting"
+        );
+        assert!(
+            published.load(Ordering::SeqCst),
+            "shared heap was not published before its funding callout"
+        );
+        assert!(
+            heap_unlocked.load(Ordering::SeqCst),
+            "refill held allocator metadata during accounting"
+        );
+    }
+
+    #[test]
+    fn refill_allows_arena_work_and_preserves_requests_arriving_during_growth() {
+        if !refill_subprocess(
+            "guest_heap::tests::refill_allows_arena_work_and_preserves_requests_arriving_during_growth",
+        ) {
+            return;
+        }
+        let accountant = Arc::new(RefillAccountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant);
+        let mut store = refill_store(budget.clone());
+        let (_, heap) = shared_heap(&mut store, budget.clone());
+        const LATER_BYTES: u32 = PREFUND_BYTES * 2 - UNIT;
+        let during = heap.clone();
+        REFILL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // A callback can use existing chunks on this or a background thread.
+                let small = during.alloc(UNIT as usize, false).unwrap();
+                assert!(during.free_offset(small));
+                std::thread::spawn(move || {
+                    let small = during.alloc(UNIT as usize, false).unwrap();
+                    assert!(during.free_offset(small));
+                    assert!(during.alloc(LATER_BYTES as usize, false).is_none());
+                })
+                .join()
+                .unwrap();
+            }))
+        });
+        let offset = heap
+            .alloc_with_store(
+                &mut store.as_store_mut(),
+                (PREFUND_BYTES * 2) as usize,
+                false,
+            )
+            .unwrap();
+        let memory = heap.inner.lock().unwrap().memories[0].clone();
+        let before = memory.size(&store);
+        heap.maybe_refill(&mut store.as_store_mut());
+        let after = memory.size(&store);
+        assert!(
+            after.0 - before.0 >= LATER_BYTES.div_ceil(WASM_PAGE),
+            "later demand was lost by the earlier refill"
+        );
+        let later = heap.alloc(LATER_BYTES as usize, false).unwrap();
+        assert!(heap.free_offset(later));
+        assert!(heap.free_offset(offset));
+        drop(heap);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn refill_accountant_panic_releases_growth_without_poisoning_metadata() {
+        if !refill_subprocess(
+            "guest_heap::tests::refill_accountant_panic_releases_growth_without_poisoning_metadata",
+        ) {
+            return;
+        }
+        let accountant = Arc::new(RefillAccountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant);
+        let mut store = refill_store(budget.clone());
+        let (memory, heap) = shared_heap(&mut store, budget.clone());
+        let original = Arc::new(());
+        let payload = original.clone();
+        REFILL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || std::panic::panic_any(payload)))
+        });
+        let before = memory.size(&store);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            heap.alloc_with_store(
+                &mut store.as_store_mut(),
+                (PREFUND_BYTES * 2) as usize,
+                false,
+            )
+        }))
+        .unwrap_err();
+        assert!(Arc::ptr_eq(
+            failure.downcast_ref::<Arc<()>>().unwrap(),
+            &original
+        ));
+        assert_eq!(memory.size(&store), before);
+        assert!(!heap.inner.is_poisoned());
+        let small = heap.alloc(UNIT as usize, false).unwrap();
+        assert!(heap.free_offset(small));
+        let retry = heap
+            .alloc_with_store(
+                &mut store.as_store_mut(),
+                (PREFUND_BYTES * 2) as usize,
+                false,
+            )
+            .unwrap();
+        assert!(heap.free_offset(retry));
+        drop(heap);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
     #[test]
     fn chunk_node_budget_scales_with_chunk_size() {
         // What this pins: `OffsetAllocator::new` sizes every chunk for 128Ki
@@ -1077,6 +1382,26 @@ mod tests {
     }
 
     #[test]
+    fn refill_foreground_allocation_is_not_blocked_by_older_background_demand() {
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let mut store = Store::default();
+        let (_, heap) = shared_heap(&mut store, budget.clone());
+        assert!(heap.alloc(64 * 1024 * 1024, false).is_none());
+        let small = heap.alloc_with_store(&mut store.as_store_mut(), 1024, false);
+        let succeeded = small.is_some();
+        if let Some(offset) = small {
+            assert!(heap.free_offset(offset));
+        }
+        drop(heap);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
+        assert!(
+            succeeded,
+            "unfunded background demand blocked a small foreground allocation"
+        );
+    }
+
+    #[test]
     fn budget_charged_and_released_on_drop() {
         let mut store = Store::default();
         // Under the prefund, so the arena claims what the budget allows and no
@@ -1174,10 +1499,12 @@ mod tests {
         let charged = u64::from(WASM_PAGE);
         budget.try_charge(Pool::WasmLinear, charged).unwrap();
 
+        // Model the charge transfer after physical growth, before span validation.
+        heap.charged.fetch_add(charged, Ordering::AcqRel);
         {
             let mut inner = heap.inner.lock().unwrap();
             assert!(
-                heap.finish_claim(&mut inner, Pages(2048), 1, heap.base, charged)
+                heap.finish_claim(&mut inner, Pages(2048), 1, heap.base)
                     .is_none()
             );
         }
