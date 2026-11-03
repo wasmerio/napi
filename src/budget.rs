@@ -888,7 +888,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &MemoryType,
         style: &MemoryStyle,
-        vm_definition_location: std::ptr::NonNull<VMMemoryDefinition>,
+        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
     ) -> Result<VMMemory, MemoryError> {
         let adjusted = self.adjust_memory(ty);
         self.validate_memory(&adjusted)?;
@@ -908,7 +908,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &TableType,
         style: &TableStyle,
-        vm_definition_location: std::ptr::NonNull<VMTableDefinition>,
+        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
     ) -> Result<VMTable, String> {
         // SAFETY: contract forwarded to base.
         unsafe { self.base.create_vm_table(ty, style, vm_definition_location) }
