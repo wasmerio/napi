@@ -132,8 +132,45 @@ struct NapiSessionInner {
 
 enum SessionState {
     Unprepared,
+    Preparing,
     Attached(FunctionEnv<NapiEnv>),
     Deactivated,
+}
+
+// Session admission is metadata only; custom tunables and accounting must not
+// run under this mutex. Partial Store objects retain their existing Store owner.
+struct SessionPreparation<'a>(&'a Mutex<SessionState>);
+
+impl<'a> SessionPreparation<'a> {
+    fn begin(state: &'a Mutex<SessionState>) -> Result<Self> {
+        let mut current = state.lock().expect("poisoned NapiSession mutex");
+        if !matches!(*current, SessionState::Unprepared) {
+            bail!("N-API session imports have already been created or deactivated");
+        }
+        *current = SessionState::Preparing;
+        Ok(Self(state))
+    }
+
+    fn commit(self, env: FunctionEnv<NapiEnv>) -> std::result::Result<(), FunctionEnv<NapiEnv>> {
+        let mut pending = Some(env);
+        {
+            let mut current = self.0.lock().expect("poisoned NapiSession mutex");
+            if matches!(*current, SessionState::Preparing) {
+                *current = SessionState::Attached(pending.take().unwrap());
+            }
+        }
+        // Rejected provisional data is retired by the caller outside the lock.
+        pending.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SessionPreparation<'_> {
+    fn drop(&mut self) {
+        let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if matches!(*current, SessionState::Preparing) {
+            *current = SessionState::Unprepared;
+        }
+    }
 }
 
 impl std::fmt::Debug for NapiSession {
@@ -434,7 +471,7 @@ impl NapiSession {
     }
 
     /// Creates imports for exactly one store-local instance attachment.
-    /// Repeated calls, including after deactivation, return an error.
+    /// Once imports are created or the session is deactivated, later calls fail.
     pub fn create_imports(&self, store: &mut StoreMut<'_>) -> Result<Imports> {
         let mut import_object = Imports::new();
         self.add_imports(store, &mut import_object)?;
@@ -442,10 +479,7 @@ impl NapiSession {
     }
 
     fn add_imports(&self, store: &mut StoreMut<'_>, import_object: &mut Imports) -> Result<()> {
-        let mut state = self.inner.state.lock().expect("poisoned NapiSession mutex");
-        if !matches!(*state, SessionState::Unprepared) {
-            bail!("N-API session imports have already been created or deactivated");
-        }
+        let preparation = SessionPreparation::begin(&self.inner.state)?;
         let mut additions = Imports::new();
         let memory = if let Some(memory_type) = self.inner.imported_memory_type {
             let memory = if let Some(existing) = import_object.get_export("env", "memory") {
@@ -494,12 +528,26 @@ impl NapiSession {
         register_env_imports(store, &mut additions);
         register_napi_imports(store, &func_env, &mut additions);
 
+        let mut staged = import_object.clone();
         for (namespace, name, value) in additions.iter() {
-            if !import_object.exists(namespace, name) {
-                import_object.define(namespace, name, value.clone());
+            if !staged.exists(namespace, name) {
+                staged.define(namespace, name, value.clone());
             }
         }
-        *state = SessionState::Attached(func_env);
+        if let Err(func_env) = preparation.commit(func_env) {
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            {
+                let retirement = func_env.as_mut(&mut *store).take_native_deactivation();
+                store.parked(|| drop(retirement));
+            }
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            func_env.as_mut(&mut *store).deactivate();
+            bail!("N-API session was deactivated during import preparation");
+        }
+        // Move publication is callback-free; old import payloads drop after
+        // session commit has released its mutex.
+        let previous = std::mem::replace(import_object, staged);
+        drop(previous);
         Ok(())
     }
 
@@ -1001,5 +1049,187 @@ mod tests {
             !NapiWasmerExtensionVersion::Unknown
                 .is_compatible_with(NapiWasmerExtensionVersion::Unknown)
         );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    mod preparation {
+        use super::super::*;
+        use std::{
+            cell::RefCell,
+            panic::{AssertUnwindSafe, catch_unwind, panic_any},
+            sync::atomic::AtomicU64,
+        };
+        use wasmer::sys::{Cranelift, EngineBuilder};
+        use wasmer::{AsStoreMut, Global, Store};
+
+        thread_local! {
+            static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+        struct Accountant(AtomicU64);
+        impl NapiMemoryAccountant for Accountant {
+            fn memory_limit(&self) -> u64 {
+                8 * wasmer::WASM_PAGE_SIZE as u64
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        }
+        fn setup() -> (NapiCtx, NapiSession, Store, Arc<Accountant>) {
+            let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+            let ctx = NapiCtx::builder()
+                .memory_accountant(accountant.clone())
+                .build();
+            let mut engine = EngineBuilder::new(Cranelift::default()).engine();
+            engine.set_tunables(crate::budgeted_tunables(ctx.budget()));
+            let store = Store::new(engine);
+            let module = Module::new(
+                &store,
+                r#"(module
+                (import "env" "memory" (memory 1 8))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32))))"#,
+            )
+            .unwrap();
+            let session = ctx.prepare_module(&module).unwrap();
+            (ctx, session, store, accountant)
+        }
+
+        #[test]
+        fn preparation_releases_session_mutex_before_accounting() {
+            let (ctx, session, mut store, accountant) = setup();
+            let inner = session.inner.clone();
+            let unlocked = Arc::new(AtomicBool::new(false));
+            let observed = unlocked.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Old-source observation is nonblocking scalar metadata only:
+                    // never recursively enter the old held mutex or borrowed Store.
+                    observed.store(inner.state.try_lock().is_ok(), Ordering::SeqCst);
+                }))
+            });
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            drop(imports);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(
+                unlocked.load(Ordering::SeqCst),
+                "session preparation held its mutex during accounting"
+            );
+        }
+
+        #[test]
+        fn preparation_reentrant_create_fails_before_allocating_another_store() {
+            let (ctx, session, mut store, accountant) = setup();
+            let nested_session = session.clone();
+            let refused = Arc::new(AtomicBool::new(false));
+            let observed = refused.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let mut other = Store::default();
+                    observed.store(
+                        nested_session
+                            .create_imports(&mut other.as_store_mut())
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                }))
+            });
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            let charged = ctx.budget().snapshot().wasm_linear;
+            let attached = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Attached(_)
+            );
+            drop(imports);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(charged, wasmer::WASM_PAGE_SIZE as u64);
+            assert!(attached && refused.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn preparation_retries_after_error_or_panic_without_resurrecting_deactivation() {
+            let (ctx, session, mut store, accountant) = setup();
+            let mut wrong = Imports::new();
+            wrong.define("env", "memory", Global::new(&mut store, Value::I32(0)));
+            assert!(
+                session
+                    .add_imports(&mut store.as_store_mut(), &mut wrong)
+                    .is_err()
+            );
+            let reset_after_error = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Unprepared
+            );
+            let original = Arc::new(());
+            let payload = original.clone();
+            ON_CHARGE.with(|slot| *slot.borrow_mut() = Some(Box::new(move || panic_any(payload))));
+            let failure = catch_unwind(AssertUnwindSafe(|| {
+                let _ = session.create_imports(&mut store.as_store_mut());
+            }))
+            .unwrap_err();
+            let original_preserved =
+                Arc::ptr_eq(failure.downcast_ref::<Arc<()>>().unwrap(), &original);
+            let reset_after_panic = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Unprepared
+            );
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            drop(imports);
+            drop(wrong);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(reset_after_error && reset_after_panic && original_preserved);
+
+            let (ctx, session, mut store, accountant) = setup();
+            let inner = session.inner.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Model the private metadata transition only; do not invoke
+                    // unsafe deactivate with another or currently borrowed Store.
+                    *inner.state.lock().unwrap() = SessionState::Deactivated;
+                }))
+            });
+            let mut unpublished = Imports::new();
+            let rejected = session
+                .add_imports(&mut store.as_store_mut(), &mut unpublished)
+                .is_err();
+            let no_imports_published = unpublished.iter().next().is_none();
+            let late_envs_inert = {
+                use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+                let envs: Vec<_> = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+                    .iter()
+                    .filter_map(|owner| owner.as_ref().downcast_ref::<NapiEnv>())
+                    .collect();
+                envs.len() == 1
+                    && envs
+                        .iter()
+                        .all(|env| !env.configured && env.memory.is_none() && env.table.is_none())
+            };
+            let remained_closed = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Deactivated
+            );
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(rejected && remained_closed && no_imports_published && late_envs_inert);
+        }
     }
 }
