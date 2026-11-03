@@ -415,17 +415,27 @@ impl ResourceBudget {
         if !self.try_acquire_isolate(max_envs) {
             return Err(EnvRejected::TooManyEnvs);
         }
+        // Planning and charging may call the embedder. Retain the acquired
+        // slot until every fallible step has produced an owned reservation.
+        struct AcquiredSlot<'a>(Option<&'a ResourceBudget>);
+        impl Drop for AcquiredSlot<'_> {
+            fn drop(&mut self) {
+                if let Some(budget) = self.0.take() {
+                    budget.release_isolate();
+                }
+            }
+        }
+        let mut slot = AcquiredSlot(Some(self));
         let Some(reservation) = self.plan_heap_reservation(req) else {
-            self.release_isolate();
             return Err(EnvRejected::HeapDoesNotFit);
         };
         if self
             .try_charge(Pool::V8HeapReserved, reservation.ceiling_bytes)
             .is_err()
         {
-            self.release_isolate();
             return Err(EnvRejected::HeapDoesNotFit);
         }
+        slot.0 = None;
         Ok(reservation)
     }
 
@@ -1427,5 +1437,73 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8HeapReserved, 60);
         assert_eq!(accountant.memory_charged(), 40);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod isolate_slot_panic_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Match external_accountant_tests. Each mode panics before an admission
+    // side effect. Provider disposal ordering is a separate invariant.
+    struct PanickingAccountant {
+        operation: AtomicUsize,
+        charged: AtomicU64,
+    }
+    impl NapiMemoryAccountant for PanickingAccountant {
+        fn memory_limit(&self) -> u64 {
+            assert_ne!(
+                self.operation.load(Ordering::SeqCst),
+                1,
+                "memory limit panic"
+            );
+            512 * MIB
+        }
+        fn memory_charged(&self) -> u64 {
+            assert_ne!(
+                self.operation.load(Ordering::SeqCst),
+                2,
+                "memory charged panic"
+            );
+            self.charged.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            assert_ne!(self.operation.load(Ordering::SeqCst), 3, "charge panic");
+            self.charged.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.charged.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn accountant_panics_do_not_strand_isolate_slots() {
+        let accountant = Arc::new(PanickingAccountant {
+            operation: AtomicUsize::new(0),
+            charged: AtomicU64::new(0),
+        });
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        for operation in [1, 2, 3] {
+            accountant.operation.store(operation, Ordering::SeqCst);
+            assert!(
+                catch_unwind(AssertUnwindSafe(
+                    || budget.try_reserve_env(RequestedHeap::default(), Some(1))
+                ))
+                .is_err()
+            );
+            accountant.operation.store(0, Ordering::SeqCst);
+            assert_eq!(
+                budget.live_isolates(),
+                0,
+                "failed planning/charge releases its slot"
+            );
+            assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+            let next = budget
+                .try_reserve_env(RequestedHeap::default(), Some(1))
+                .unwrap();
+            budget.release_env(next.ceiling_bytes);
+        }
     }
 }
