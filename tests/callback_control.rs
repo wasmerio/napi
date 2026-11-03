@@ -67,6 +67,10 @@ const GUEST: &str = r#"(module
         global.get $env i32.const 16 i32.load i32.const 20 call $run call $check
         global.get $env i32.const 20 i32.load i32.const 24 call $integer call $check
         i32.const 24 i32.load)
+    (func (export "eval_status") (param i32 i32) (result i32)
+        global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
+        global.get $env i32.const 16 i32.load i32.const 20 call $run)
+    (func (export "fresh") (result i32) i32.const 9)
     (func (export "eval_contextify") (param i32 i32) (result i32)
         global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
         i32.const 128 i32.const 0 i32.store
@@ -83,6 +87,13 @@ fn instance(
     store: &mut Store,
     record: impl Fn(i32) -> Result<(), RuntimeError> + Send + Sync + 'static,
 ) -> (NapiCtx, Instance, Memory, NapiSession) {
+    instance_with_record(store, |store, _| Function::new_typed(store, record))
+}
+
+fn instance_with_record(
+    store: &mut Store,
+    record: impl FnOnce(&mut Store, &NapiCtx) -> Function,
+) -> (NapiCtx, Instance, Memory, NapiSession) {
     let module = Module::new(&*store, wat::parse_str(GUEST).unwrap()).unwrap();
     let ctx = NapiCtx::default();
     let hooks = ctx.runtime_hooks();
@@ -90,7 +101,7 @@ fn instance(
         .additional_imports(&module, &mut store.as_store_mut())
         .unwrap();
     let session = state.session().unwrap().clone();
-    imports.define("test", "record", Function::new_typed(store, record));
+    imports.define("test", "record", record(store, &ctx));
     let Some(Extern::Memory(memory)) = imports.get_export("env", "memory") else {
         panic!("NAPI did not create the imported memory");
     };
@@ -577,4 +588,89 @@ fn nested_bridge_isolate_restores_the_callers_current_isolate() {
     );
     assert_eq!(*entered.lock().unwrap(), 1);
     assert_eq!(eval(&mut store, &outer, &memory, "41 + 1").unwrap(), 42);
+}
+
+#[test]
+fn callback_cleanup_uses_its_pinned_environment_after_slot_replacement() {
+    if !run_in_subprocess(
+        "callback_cleanup_uses_its_pinned_environment_after_slot_replacement",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+    use wasmer::{FunctionEnv, FunctionEnvMut};
+
+    let mut store = Store::default();
+    let before = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut()).len();
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let observed = callbacks.clone();
+    let (ctx, instance, memory, session) = instance_with_record(&mut store, move |store, ctx| {
+        // The session appends its NapiEnv and the no-env imports append unit
+        // cells. Validate the exact sole non-unit cell while no frame is active,
+        // then retain only its opaque identity/index for the deliberate mutation.
+        let candidates: Vec<_> = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+            .iter()
+            .enumerate()
+            .skip(before)
+            .filter(|(_, owner)| !owner.as_ref().is::<()>())
+            .map(|(index, owner)| (index, owner.identity()))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        let (index, identity) = candidates.into_iter().next().unwrap();
+        let budget = ctx.budget();
+        let unit = FunctionEnv::new(store, ());
+        Function::new_typed_with_env(
+            store,
+            &unit,
+            move |mut current: FunctionEnvMut<()>, _: i32| -> Result<(), RuntimeError> {
+                let owner = VMFunctionEnvironment::list_mut(current.objects_mut().as_sys_mut())
+                    .get_mut(index)
+                    .unwrap();
+                assert_eq!(owner.identity(), identity);
+                drop(std::mem::replace(owner, VMFunctionEnvironment::new(())));
+                assert_eq!(
+                    budget.snapshot().live_isolates,
+                    1,
+                    "active CPP frame still owns the original NapiEnv"
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    });
+    let script = "callback(); callback(); 42";
+    memory.view(&store).write(1024, script.as_bytes()).unwrap();
+    let status = instance
+        .exports
+        .get_typed_function::<(i32, i32), i32>(&store, "eval_status")
+        .unwrap()
+        .call(&mut store, 1024, script.len() as i32)
+        .unwrap();
+    assert_eq!(
+        status, 0,
+        "paired callback cleanup must use the original cell"
+    );
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ctx.budget().snapshot().live_isolates,
+        0,
+        "original provider retires after its CPP call returns"
+    );
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "fresh")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        9
+    );
+    drop(session);
+    assert_eq!(ctx.active_sessions(), 0);
+    let (_next_ctx, next, memory, _next_session) = self::instance(&mut store, |_| Ok(()));
+    assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
 }

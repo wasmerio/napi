@@ -6,7 +6,8 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, Store, StoreMut, Value};
+use wasmer::sys::FunctionEnvFramePin;
+use wasmer::{AsStoreMut, FunctionEnvMut, RuntimeError, Store, StoreMut, Table, Value};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -18,7 +19,7 @@ enum CallbackFailure {
 /// One physical bridge call owns its callback result. Nested imports install
 /// their own context and return the original error through the guest stack.
 struct CallbackInvocationCtx {
-    func_env: FunctionEnv<NapiEnv>,
+    environment: FunctionEnvFramePin<NapiEnv>,
     failure: RefCell<Option<CallbackFailure>>,
     terminated: Cell<bool>,
     snapi_env: SnapiEnv,
@@ -40,11 +41,11 @@ impl CallbackInvocationCtx {
 
 fn call_guest_callback(
     store: &mut StoreMut<'_>,
-    func_env: &FunctionEnv<NapiEnv>,
+    table: Option<Table>,
     wasm_fn_ptr: u32,
     args: &[Value],
 ) -> Result<u32, RuntimeError> {
-    let Some(table) = func_env.as_ref(store).table.clone() else {
+    let Some(table) = table else {
         return Ok(0);
     };
     // A guest can replace a table entry without changing its signature.
@@ -70,8 +71,11 @@ pub fn with_callback_state<R>(
         return Ok(f());
     }
 
+    let environment = env
+        .pin_frame()
+        .ok_or_else(|| RuntimeError::new("native callbacks require the sys backend"))?;
     let mut ctx = CallbackInvocationCtx {
-        func_env: env.as_ref(),
+        environment,
         failure: RefCell::new(None),
         terminated: Cell::new(false),
         snapi_env,
@@ -148,20 +152,29 @@ fn invoke_inner(ctx: &CallbackInvocationCtx, wasm_fn_ptr: u32, args: &[Value]) -
         return 0;
     }
     let dispatched = Store::with_current(|store| {
-        let entered = Cell::new(false);
-        // Catch before Store::with_current drops its borrow wrapper: that wrapper
-        // cannot restore its borrow count while unwinding.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            if !ctx.func_env.as_mut(store).enter_callback() {
-                return Ok(0);
-            }
-            entered.set(true);
-            call_guest_callback(store, &ctx.func_env, wasm_fn_ptr, args)
-        }));
-        if entered.get() {
-            ctx.func_env.as_mut(store).leave_callback();
+        let Some(mut environment) = ctx.environment.try_as_env_mut(store) else {
+            return Ok(Ok(0));
+        };
+        if !environment.data_mut().enter_callback() {
+            return Ok(Ok(0));
         }
-        result
+        let table = environment.data().table.clone();
+        // End every T borrow before guest entry. The same temporary retains the
+        // exact original cell for leave_callback even if guest removes its slot.
+        // Catch before with_current releases its counted Store borrow wrapper.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            call_guest_callback(&mut environment.as_store_mut(), table, wasm_fn_ptr, args)
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| environment.data_mut().leave_callback()));
+        match (result, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(Ok(_)), Err(panic)) => Err(panic),
+            (result, Err(secondary)) => {
+                // Preserve the original callback failure after paired cleanup.
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(secondary)));
+                result
+            }
+        }
     });
     match dispatched {
         Some(Ok(Ok(value))) => value,
