@@ -81,6 +81,10 @@ struct napi_env__ {
   bool should_dump_lifetime_string_symbol_values(int64_t now_ms);
 #endif
 
+  // Bridge-only notification, after user finalizers and before env memory
+  // dies. Unset for ordinary native N-API embedders.
+  void (*before_destroy)(void*) = nullptr;
+  void* before_destroy_data = nullptr;
   v8::Isolate* isolate = nullptr;
   v8::Global<v8::Context> context_ref;
   napi::error_state__ error_state;

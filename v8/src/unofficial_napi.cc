@@ -1812,6 +1812,7 @@ static napi_status DestroyEnvInstance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   ProfilerState profiler_state;
   bool has_profiler_state = false;
+  bool remove_near_heap_callback = false;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr) {
@@ -1841,7 +1842,7 @@ static napi_status DestroyEnvInstance(napi_env env) {
     }
     unofficial_napi_internal::ResetErrorFormattingState(env);
     g_fatal_error_callbacks.erase(env->isolate);
-    g_near_heap_limit_callbacks.erase(env->isolate);
+    remove_near_heap_callback = g_near_heap_limit_callbacks.erase(env->isolate) != 0;
     auto profiler_it = g_profiler_states.find(env);
     if (profiler_it != g_profiler_states.end()) {
       profiler_state = std::move(profiler_it->second);
@@ -1850,6 +1851,9 @@ static napi_status DestroyEnvInstance(napi_env env) {
     }
   }
   if (env->isolate != nullptr) {
+    if (remove_near_heap_callback) {
+      env->isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, 0);
+    }
     if (has_profiler_state) {
       DisposeProfilerState(env, &profiler_state);
     }

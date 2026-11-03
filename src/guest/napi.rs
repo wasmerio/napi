@@ -278,22 +278,33 @@ fn guest_unofficial_napi_release_env(
         return Ok(1);
     };
     let target = env.data().resolve_napi_env(guest_env as i32);
-    // The check and unregister are synchronous on this provider's owning
-    // thread. Reject before changing ids, roots, leases or budget charges.
-    if unsafe { snapi_bridge_unofficial_can_release_env(target) } != 1 {
-        return Ok(1);
-    }
-    let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
-    else {
+    let Some(mut retirement) = env.data_mut().take_native_scope(scope_id) else {
         return Ok(1);
     };
-    let loop_id = if loop_ptr > 0 { loop_ptr as u32 } else { 0 };
-    let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
-        snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
-    });
+    let _ = loop_ptr; // the native provider currently has no separate loop owner
+    let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_cb_context(&mut env, guest_env as i32, || retirement.dispose())
+    }));
+    // Held temporary cleanup targets the original cell even after slot removal.
     env.data_mut()
-        .finish_unregister_napi_env(guest_env, snapi_env_state);
-    status
+        .finish_native_scope(guest_env, target, &mut retirement);
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.as_store_mut().parked(|| drop(retirement));
+    }));
+    match (callback, cleanup) {
+        (Ok(result), Ok(())) => result,
+        (Ok(Ok(_)), Err(panic)) => std::panic::resume_unwind(panic),
+        (first, cleanup) => {
+            if let Err(secondary) = cleanup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+            }
+            match first {
+                Ok(Err(error)) => Err(error),
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
 }
 
 fn guest_unofficial_napi_attach_env(
@@ -4148,6 +4159,15 @@ fn guest_napi_adjust_external_memory(
                 {
                     return None;
                 }
+                // Pending positive receipts are not committed declarations.
+                // A nested negative delta must not consume their CPP credit.
+                if change < 0
+                    && !current
+                        .data()
+                        .has_declared_external(e as u32, change.unsigned_abs())
+                {
+                    return None;
+                }
                 let mut cpp_status = 1;
                 let mut adjusted = 0;
                 let callback = catch_unwind(AssertUnwindSafe(|| {
@@ -4162,12 +4182,14 @@ fn guest_napi_adjust_external_memory(
                 // before replaying a callback failure reported after CPP exit.
                 let release = if cpp_status == 0 {
                     if change > 0 {
-                        current.data_mut().record_declared_external(change as u64);
+                        current
+                            .data_mut()
+                            .record_declared_external(e as u32, change as u64);
                         0
                     } else {
                         current
                             .data_mut()
-                            .take_declared_external(change.unsigned_abs())
+                            .take_declared_external(e as u32, change.unsigned_abs())
                     }
                 } else {
                     0

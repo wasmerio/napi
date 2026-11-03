@@ -421,10 +421,16 @@ impl NapiSession {
                 _ => None,
             }
         };
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let retirement =
+            attached.map(|func_env| func_env.as_mut(&mut *store).take_native_deactivation());
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
         if let Some(func_env) = attached {
             func_env.as_mut(&mut *store).deactivate();
         }
         *self.inner.state.lock().expect("poisoned NapiSession mutex") = SessionState::Deactivated;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        store.parked(|| drop(retirement));
     }
 
     /// Creates imports for exactly one store-local instance attachment.

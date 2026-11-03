@@ -14,7 +14,9 @@ use wasmer::TypedFunction;
 use wasmer::{Memory, Table};
 
 use crate::budget::{EnvHeapCharge, Pool, ResourceBudget};
-use crate::snapi::{SnapiEnv, snapi_bridge_unofficial_release_env};
+use crate::snapi::SnapiEnv;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use crate::snapi::snapi_bridge_unofficial_release_env;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use crate::{
     budget::{EnvRejected, HeapReservation, RequestedHeap},
@@ -129,6 +131,131 @@ impl Drop for DeclaredExternalCharge {
     }
 }
 
+// No Store/T reference crosses provider disposal or an accountant callback.
+// This plan is owner-thread-only, as are the physical native providers.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+struct NativeRetiredProvider {
+    state: Option<SnapiEnv>,
+    charge: Option<EnvHeapChargeHandle>,
+    external: u64,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct NativeRetirement {
+    providers: Vec<NativeRetiredProvider>,
+    registry: Arc<std::sync::Mutex<HashSet<usize>>>,
+    budget: Arc<ResourceBudget>,
+    leases: Vec<NativeBufferLease>,
+    heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    memory: Option<Memory>,
+    table: Option<Table>,
+    external: HashMap<u32, u64>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl NativeRetirement {
+    pub(crate) fn dispose(&mut self) -> i32 {
+        struct Notification<'a> {
+            registry: &'a std::sync::Mutex<HashSet<usize>>,
+            state: usize,
+        }
+        unsafe extern "C" fn before_destroy(data: *mut c_void) {
+            // Only scalar registry bookkeeping is allowed here. The CPP caller
+            // holds no g_mu, and nothing unwinds through its destructor.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let notification = unsafe { &*data.cast::<Notification<'_>>() };
+                notification
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&notification.state);
+            }));
+        }
+        let mut status = 0;
+        for provider in &mut self.providers {
+            if let Some(state) = provider.state.take() {
+                let mut notification = Notification {
+                    registry: &self.registry,
+                    state: state as usize,
+                };
+                let result = unsafe {
+                    crate::snapi::snapi_bridge_finish_retirement(
+                        state,
+                        before_destroy,
+                        (&mut notification as *mut Notification<'_>).cast(),
+                    )
+                };
+                if status == 0 {
+                    status = result;
+                }
+            }
+        }
+        status
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl Drop for NativeRetirement {
+    fn drop(&mut self) {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        let unwinding = std::thread::panicking();
+        let mut first = None;
+        let mut cleanup = |f: &mut dyn FnMut()| {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(f)) {
+                if first.is_none() {
+                    first = Some(panic);
+                } else {
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+                }
+            }
+        };
+        // Finish every provider before releasing any tracker or reservation.
+        cleanup(&mut || {
+            self.dispose();
+        });
+        for provider in &mut self.providers {
+            if let Some(handle) = provider.charge.take() {
+                let granted = if handle.tracker != 0 {
+                    let tracker = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
+                    tracker.granted.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                cleanup(&mut || self.budget.uncharge(Pool::V8HeapReserved, granted));
+                cleanup(&mut || self.budget.release_env(handle.ceiling));
+            }
+            let bytes = std::mem::take(&mut provider.external);
+            cleanup(&mut || self.budget.uncharge(Pool::V8External, bytes));
+        }
+        for (_, bytes) in self.external.drain() {
+            cleanup(&mut || self.budget.uncharge(Pool::V8External, bytes));
+        }
+        for lease in self.leases.drain(..) {
+            if lease.copied
+                && let Some(heap) = self.heap.as_ref()
+            {
+                cleanup(&mut || {
+                    heap.free_offset(lease.guest_ptr);
+                });
+            }
+        }
+        cleanup(&mut || drop(self.heap.take()));
+        cleanup(&mut || {
+            let _ = self.memory.take();
+        });
+        cleanup(&mut || {
+            let _ = self.table.take();
+        });
+        if let Some(panic) = first {
+            if unwinding {
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+            } else {
+                resume_unwind(panic);
+            }
+        }
+    }
+}
+
 pub(crate) struct NapiEnv {
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
@@ -147,7 +274,7 @@ pub(crate) struct NapiEnv {
     /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can
     /// only release what this env actually declared, never more, and so
     /// teardown releases the remainder.
-    external_declared: u64,
+    external_declared: HashMap<u32, u64>,
     pub(crate) configured: bool,
     deactivated: bool,
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
@@ -218,7 +345,7 @@ impl NapiEnv {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             host_stopped: _host_stopped,
             env_heap_charges: HashMap::new(),
-            external_declared: 0,
+            external_declared: HashMap::new(),
             configured: false,
             deactivated: false,
             #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
@@ -391,16 +518,30 @@ impl NapiEnv {
 
     /// Record a successful provider adjustment without invoking the accountant.
     #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
-    pub(crate) fn record_declared_external(&mut self, bytes: u64) {
-        self.external_declared = self.external_declared.saturating_add(bytes);
+    pub(crate) fn record_declared_external(&mut self, id: u32, bytes: u64) {
+        let committed = self.external_declared.entry(id).or_default();
+        *committed = committed
+            .checked_add(bytes)
+            .expect("accepted provider declaration fits its signed external counter");
+    }
+
+    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
+    pub(crate) fn has_declared_external(&self, id: u32, bytes: u64) -> bool {
+        bytes <= self.external_declared.get(&id).copied().unwrap_or(0)
     }
 
     /// Take only committed declarations; the caller releases the charge after
     /// ending this borrow. A pending positive adjustment cannot be consumed.
     #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
-    pub(crate) fn take_declared_external(&mut self, bytes: u64) -> u64 {
-        let release = bytes.min(self.external_declared);
-        self.external_declared -= release;
+    pub(crate) fn take_declared_external(&mut self, id: u32, bytes: u64) -> u64 {
+        let Some(committed) = self.external_declared.get_mut(&id) else {
+            return 0;
+        };
+        let release = bytes.min(*committed);
+        *committed -= release;
+        if *committed == 0 {
+            self.external_declared.remove(&id);
+        }
         release
     }
 
@@ -461,6 +602,7 @@ impl NapiEnv {
         (env_id, scope_id)
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     fn discard_buffer_leases_for_env(&mut self, env_id: u32) {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         {
@@ -481,28 +623,9 @@ impl NapiEnv {
                 }
             }
         }
-
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        {
-            let lease_ids: Vec<(u32, u32)> = self
-                .native_buffer_leases
-                .keys()
-                .filter(|(lease_env_id, _)| *lease_env_id == env_id)
-                .copied()
-                .collect();
-            for lease_id in lease_ids {
-                let Some(lease) = self.native_buffer_leases.remove(&lease_id) else {
-                    continue;
-                };
-                if lease.copied
-                    && let Some(heap) = self.guest_heap.as_ref()
-                {
-                    heap.free_offset(lease.guest_ptr);
-                }
-            }
-        }
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn begin_unregister_napi_scope(&mut self, scope_id: u32) -> Option<(u32, SnapiEnv)> {
         let env_id = self.napi_scopes.remove(&scope_id)?;
         if self.default_napi_env_id == Some(env_id) {
@@ -524,6 +647,7 @@ impl NapiEnv {
         Some((env_id, env as SnapiEnv))
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn finish_unregister_napi_env(&mut self, env_id: u32, env: SnapiEnv) {
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
@@ -551,6 +675,7 @@ impl NapiEnv {
         self.napi_state_to_guest_env.remove(&(env as usize));
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
         let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
         self.finish_unregister_napi_env(env_id, env);
@@ -569,6 +694,136 @@ impl NapiEnv {
             .unwrap_or(std::ptr::null_mut())
     }
 
+    /// Preallocate and atomically acquire every CPP token before changing ids.
+    /// Between the successful begin and publication only callback-free moves
+    /// into preallocated storage are permitted.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn take_native_retirement(&mut self, scope: Option<u32>) -> Option<NativeRetirement> {
+        let mut ids: Vec<u32> = match scope {
+            Some(scope) => vec![*self.napi_scopes.get(&scope)?],
+            None => self.napi_envs.keys().copied().collect(),
+        };
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let states: Vec<_> = ids
+            .iter()
+            .map(|id| self.napi_envs[id] as SnapiEnv)
+            .collect();
+        let lease_ids: Vec<_> = self
+            .native_buffer_leases
+            .keys()
+            .filter(|(id, _)| scope.is_none() && ids.contains(id))
+            .copied()
+            .collect();
+        let mut retirement = NativeRetirement {
+            providers: ids
+                .iter()
+                .map(|_| NativeRetiredProvider {
+                    state: None,
+                    charge: None,
+                    external: 0,
+                })
+                .collect(),
+            registry: self.env_registry.clone(),
+            budget: self.budget.clone(),
+            leases: Vec::with_capacity(lease_ids.len()),
+            heap: self.guest_heap.clone(),
+            memory: None,
+            table: None,
+            external: HashMap::new(),
+        };
+        if unsafe { crate::snapi::snapi_bridge_begin_retirement(states.as_ptr(), states.len()) }
+            != 0
+        {
+            return None;
+        }
+        // All allocations and validation preceded begin. There are no user
+        // destructors/callbacks/awaits between this point and the owned plan.
+        for ((id, state), provider) in ids.iter().zip(states).zip(&mut retirement.providers) {
+            provider.state = Some(state);
+            provider.charge = self.env_heap_charges.remove(id);
+            if scope.is_none() {
+                provider.external = self.external_declared.remove(id).unwrap_or(0);
+            }
+        }
+        for key in lease_ids {
+            if let Some(lease) = self.native_buffer_leases.remove(&key) {
+                retirement.leases.push(lease);
+            }
+        }
+        if let Some(scope) = scope {
+            let id = self.napi_scopes.remove(&scope);
+            if self.default_napi_env_id == id {
+                self.default_napi_env_id = None;
+            }
+            // Keep env mapping available to already-entered explicit finalizers.
+        } else {
+            self.configured = false;
+            self.deactivated = true;
+            self.default_napi_env_id = None;
+            self.napi_scopes.clear();
+            self.napi_envs.clear();
+            self.napi_state_to_guest_env.clear();
+            retirement.external = std::mem::take(&mut self.external_declared);
+            retirement.heap = self.guest_heap.take();
+            retirement.memory = self.memory.take();
+            retirement.table = self.table.take();
+            for provider in &retirement.providers {
+                if let Some(state) = provider.state {
+                    unsafe {
+                        crate::snapi::snapi_bridge_swap_active_callback_ctx(
+                            state,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                }
+            }
+        }
+        Some(retirement)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn take_native_scope(&mut self, scope: u32) -> Option<NativeRetirement> {
+        self.take_native_retirement(Some(scope))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn finish_native_scope(
+        &mut self,
+        id: u32,
+        state: SnapiEnv,
+        retirement: &mut NativeRetirement,
+    ) {
+        // Explicit finalizers may adjust declarations and acquire new leases.
+        // Extract the FINAL ownership from the same original cell after CPP,
+        // before invoking any accountant or guest-heap release callback.
+        retirement.providers[0].external = self.external_declared.remove(&id).unwrap_or(0);
+        let keys: Vec<_> = self
+            .native_buffer_leases
+            .keys()
+            .filter(|(env, _)| *env == id)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(lease) = self.native_buffer_leases.remove(&key) {
+                retirement.leases.push(lease);
+            }
+        }
+        self.napi_envs.remove(&id);
+        self.napi_state_to_guest_env.remove(&(state as usize));
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn take_native_deactivation(&mut self) -> Option<NativeRetirement> {
+        if self.deactivated {
+            return None;
+        }
+        Some(
+            self.take_native_retirement(None)
+                .expect("cannot deactivate an N-API session with active provider frames"),
+        )
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn deactivate(&mut self) {
         if self.deactivated {
             return;
@@ -615,10 +870,8 @@ impl NapiEnv {
             }
         }
         // Release any external memory the guest declared but did not take back.
-        if self.external_declared > 0 {
-            self.budget
-                .uncharge(Pool::V8External, self.external_declared);
-            self.external_declared = 0;
+        for (_, bytes) in self.external_declared.drain() {
+            self.budget.uncharge(Pool::V8External, bytes);
         }
         self.default_napi_env_id = None;
         self.memory = None;
@@ -648,7 +901,10 @@ impl NapiEnv {
 
 impl Drop for NapiEnv {
     fn drop(&mut self) {
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
         self.deactivate();
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        drop(self.take_native_deactivation());
     }
 }
 
@@ -669,7 +925,7 @@ mod tests {
         );
 
         let charge = DeclaredExternalCharge::reserve(budget.clone(), 6 * MIB).unwrap();
-        env.record_declared_external(6 * MIB);
+        env.record_declared_external(1, 6 * MIB);
         charge.commit();
         assert_eq!(budget.snapshot().v8_external, 6 * MIB);
 
@@ -679,13 +935,13 @@ mod tests {
 
         // A negative delta larger than declared is clamped to what was declared,
         // so it can never underflow the pool.
-        let release = env.take_declared_external(100 * MIB);
+        let release = env.take_declared_external(1, 100 * MIB);
         budget.uncharge(Pool::V8External, release);
         assert_eq!(budget.snapshot().v8_external, 0);
-        assert_eq!(env.external_declared, 0);
+        assert!(env.external_declared.is_empty());
 
         // Further release is a no-op.
-        let release = env.take_declared_external(MIB);
+        let release = env.take_declared_external(1, MIB);
         budget.uncharge(Pool::V8External, release);
         assert_eq!(budget.snapshot().v8_external, 0);
     }
@@ -701,7 +957,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             );
             let charge = DeclaredExternalCharge::reserve(budget.clone(), 4 * MIB).unwrap();
-            env.record_declared_external(4 * MIB);
+            env.record_declared_external(1, 4 * MIB);
             charge.commit();
             assert_eq!(budget.snapshot().v8_external, 4 * MIB);
         }

@@ -19,6 +19,9 @@ const GUEST: &str = r#"(module
     (import "test" "record" (func $record (param i32)))
     (import "napi" "napi_wasm_init_env" (func $new_env (result i32)))
     (import "napi" "napi_adjust_external_memory" (func $adjust_external (param i32 i64 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_acquire_buffer_lease"
+        (func $acquire_lease (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_add_finalizer" (func $add_finalizer (param i32 i32 i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
     (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
     (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
@@ -31,8 +34,8 @@ const GUEST: &str = r#"(module
         (func $create_env (param i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
         (func $release_env (param i32 i32) (result i32)))
-    (table (export "__indirect_function_table") 4 funcref)
-    (elem (i32.const 1) $first $second $release_callback)
+    (table (export "__indirect_function_table") 5 funcref)
+    (elem (i32.const 1) $first $second $release_callback $finalizer)
     (data (i32.const 64) "callback\00")
     (global $env (mut i32) (i32.const 0))
     (global $release_status (mut i32) (i32.const -1))
@@ -44,6 +47,27 @@ const GUEST: &str = r#"(module
     (func $release_callback (export "release_callback") (param i32 i32) (result i32)
         i32.const 36 i32.load i32.const 0 call $release_env global.set $release_status
         i32.const 0)
+    (global $finalizer_len (mut i32) (i32.const 0))
+    (global $finalizer_resources (mut i32) (i32.const 0))
+    (global $finalizer_status (mut i32) (i32.const -1))
+    (func (export "arm_finalizer") (param $len i32) (param $resources i32)
+        local.get $len global.set $finalizer_len
+        local.get $resources global.set $finalizer_resources
+        global.get $env i32.const 8 i32.load i32.const 0 i32.const 4 i32.const 0 i32.const 0
+        call $add_finalizer call $check)
+    (func $finalizer (param i32 i32 i32)
+        i32.const 3 call $record
+        global.get $finalizer_resources if
+            global.get $env i64.const -32 i32.const 40 call $adjust_external call $check
+            global.get $env i64.const 64 i32.const 40 call $adjust_external call $check
+        end
+        i32.const 1024 global.get $finalizer_len call $eval_status global.set $finalizer_status
+        global.get $finalizer_resources if
+            global.get $env i32.const 20 i32.load i32.const 0 i32.const 16 i32.const 1 i32.const 56 i32.const 60
+            call $acquire_lease call $check
+            i32.const 4 call $record
+        end)
+    (func (export "finalizer_status") (result i32) global.get $finalizer_status)
     (func (export "release_status") (result i32) global.get $release_status)
     (func (export "release_owned") (result i32)
         i32.const 36 i32.load i32.const 0 call $release_env)
@@ -68,7 +92,7 @@ const GUEST: &str = r#"(module
         global.get $env i32.const 16 i32.load i32.const 20 call $run call $check
         global.get $env i32.const 20 i32.load i32.const 24 call $integer call $check
         i32.const 24 i32.load)
-    (func (export "eval_status") (param i32 i32) (result i32)
+    (func $eval_status (export "eval_status") (param i32 i32) (result i32)
         global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
         global.get $env i32.const 16 i32.load i32.const 20 call $run)
     (func (export "fresh") (result i32) i32.const 9)
@@ -905,4 +929,364 @@ fn external_memory_rejects_unbalanced_and_out_of_range_guest_deltas() {
         session.deactivate(&mut store.as_store_mut());
     }
     assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+}
+
+// Scalar-only observation in the old-source regression: no Store/T/JS access
+// occurs from this accountant hook until the fixed-source sibling below.
+struct RetirementAccountant(std::sync::atomic::AtomicU64);
+impl wasmer_napi::NapiMemoryAccountant for RetirementAccountant {
+    fn memory_limit(&self) -> u64 {
+        512 * 1024 * 1024
+    }
+    fn memory_charged(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn try_charge(&self, bytes: u64) -> bool {
+        self.0.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+    fn uncharge(&self, bytes: u64) {
+        self.0.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        ReentrantAccountant::call_hook();
+    }
+}
+
+unsafe extern "C" {
+    fn snapi_bridge_unofficial_get_live_env_count() -> u64;
+    fn snapi_bridge_unofficial_get_live_buffer_lease_count() -> u64;
+}
+
+#[test]
+fn native_retirement_disposes_provider_before_releasing_its_charge() {
+    if !run_in_subprocess(
+        "native_retirement_disposes_provider_before_releasing_its_charge",
+        Duration::from_secs(15),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let accountant = Arc::new(RetirementAccountant(AtomicU64::new(0)));
+    let ctx = NapiCtx::builder().memory_accountant(accountant).build();
+    let mut store = Store::default();
+    let (ctx, instance, _, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 1);
+    let observed = Arc::new(AtomicU64::new(u64::MAX));
+    let during = observed.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            // Host registry diagnostic only: this deliberately does not access
+            // old NapiEnv/Store/JavaScript while testing the old release order.
+            during.store(
+                unsafe { snapi_bridge_unofficial_get_live_env_count() },
+                Ordering::SeqCst,
+            );
+        }));
+    });
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        0,
+        "provider membership must end before its reservation is released"
+    );
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "fresh")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        9
+    );
+    drop(session);
+    let (_next_ctx, next, memory, _session) = self::instance(&mut store, |_| Ok(()));
+    assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
+}
+
+#[test]
+fn native_retirement_accountant_reenters_only_an_inert_session() {
+    if !run_in_subprocess(
+        "native_retirement_accountant_reenters_only_an_inert_session",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let accountant = Arc::new(RetirementAccountant(std::sync::atomic::AtomicU64::new(0)));
+    let ctx = NapiCtx::builder().memory_accountant(accountant).build();
+    let mut store = Store::default();
+    let (ctx, instance, _, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    let global = instance
+        .exports
+        .get_function("global_status")
+        .unwrap()
+        .clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nested = calls.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+            let result = Store::with_current(|store| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| global.call(store, &[])))
+            });
+            assert_eq!(&*result.unwrap().unwrap().unwrap(), &[Value::I32(1)]);
+            nested.fetch_add(1, Ordering::SeqCst);
+        }));
+    });
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+}
+
+#[test]
+fn native_retirement_preserves_accountant_panic_after_disposing_every_provider() {
+    if !run_in_subprocess(
+        "native_retirement_preserves_accountant_panic_after_disposing_every_provider",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let accountant = Arc::new(RetirementAccountant(AtomicU64::new(0)));
+    let ctx = NapiCtx::builder().memory_accountant(accountant).build();
+    let mut store = Store::default();
+    let (ctx, instance, _, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 2);
+    let original = Arc::new(());
+    let payload = original.clone();
+    let observed = Arc::new(AtomicU64::new(u64::MAX));
+    let at_panic = observed.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            at_panic.store(
+                unsafe { snapi_bridge_unofficial_get_live_env_count() },
+                Ordering::SeqCst,
+            );
+            std::panic::panic_any(payload);
+        }));
+    });
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }))
+    .unwrap_err();
+    assert!(Arc::ptr_eq(
+        panic.downcast_ref::<Arc<()>>().unwrap(),
+        &original
+    ));
+    assert_eq!(observed.load(Ordering::SeqCst), 0);
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "fresh")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        9
+    );
+}
+
+#[test]
+fn native_retirement_releases_only_the_selected_providers_external_charge() {
+    if !run_in_subprocess(
+        "native_retirement_releases_only_the_selected_providers_external_charge",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    let mut store = Store::default();
+    let (ctx, instance, _, session) = instance(&mut store, |_| Ok(()));
+    let adjust = instance
+        .exports
+        .get_typed_function::<i64, i32>(&store, "adjust_external")
+        .unwrap();
+    assert_eq!(adjust.call(&mut store, 64).unwrap(), 0);
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(adjust.call(&mut store, 32).unwrap(), 0);
+    assert_eq!(ctx.budget().snapshot().v8_external, 96);
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_owned")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    assert_eq!(ctx.budget().snapshot().v8_external, 64);
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(adjust.call(&mut store, -65).unwrap(), 1);
+    assert_eq!(adjust.call(&mut store, -64).unwrap(), 0);
+    assert_eq!(ctx.budget().snapshot().v8_external, 0);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+fn run_explicit_release_finalizer(terminate: bool) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observations = seen.clone();
+    let acquired = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let lease_observation = acquired.clone();
+    let mut store = Store::default();
+    let ctx = NapiCtx::default();
+    let control = ctx.runtime_control();
+    let (notify, entered) = std::sync::mpsc::sync_channel(1);
+    let (ctx, instance, memory, session) =
+        instance_with_context(&mut store, ctx, move |store, _| {
+            Function::new_typed(store, move |code: i32| {
+                observations.lock().unwrap().push(code);
+                if code == 4 {
+                    lease_observation.store(
+                        unsafe { snapi_bridge_unofficial_get_live_buffer_lease_count() },
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                if terminate && code == 1 {
+                    notify.send(()).unwrap();
+                }
+            })
+        });
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    if !terminate {
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<i64, i32>(&store, "adjust_external")
+                .unwrap()
+                .call(&mut store, 64)
+                .unwrap(),
+            0
+        );
+    }
+    let script = if terminate {
+        "callback(); while (true) {}"
+    } else {
+        "callback(); new Uint8Array(16)"
+    };
+    memory.view(&store).write(1024, script.as_bytes()).unwrap();
+    instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "arm_finalizer")
+        .unwrap()
+        .call(&mut store, script.len() as i32, i32::from(!terminate))
+        .unwrap();
+    let worker = terminate.then(|| {
+        thread::spawn(move || {
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("entered explicit finalizer callback");
+            control.terminate_all();
+        })
+    });
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_owned")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    if let Some(worker) = worker {
+        worker.join().unwrap();
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        if terminate { vec![3, 1] } else { vec![3, 1, 4] }
+    );
+    if !terminate {
+        assert_eq!(
+            acquired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the finalizer actually published a persistent lease shell"
+        );
+    }
+    assert_eq!(
+        unsafe { snapi_bridge_unofficial_get_live_buffer_lease_count() },
+        0,
+        "post-finalizer resources are released before the reference factory dies"
+    );
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "finalizer_status")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        if terminate { 10 } else { 0 }
+    );
+    assert_eq!(
+        ctx.budget().snapshot().v8_external,
+        0,
+        "explicit release takes the final original-cell declaration ledger"
+    );
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+}
+
+#[test]
+fn native_retirement_preserves_explicit_release_finalizer_callbacks() {
+    if !run_in_subprocess(
+        "native_retirement_preserves_explicit_release_finalizer_callbacks",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    run_explicit_release_finalizer(false);
+}
+
+#[test]
+fn native_retirement_keeps_foreign_termination_live_through_finalizer_drain() {
+    if !run_in_subprocess(
+        "native_retirement_keeps_foreign_termination_live_through_finalizer_drain",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    run_explicit_release_finalizer(true);
 }

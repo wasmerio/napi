@@ -444,8 +444,10 @@ impl ResourceBudget {
     ///
     /// [`try_reserve_env`]: ResourceBudget::try_reserve_env
     pub fn release_env(&self, ceiling_bytes: u64) {
-        self.uncharge(Pool::V8HeapReserved, ceiling_bytes);
+        // Both counters are released even if the custom accountant panics.
+        // A successfully created provider must already have been disposed.
         self.release_isolate();
+        self.uncharge(Pool::V8HeapReserved, ceiling_bytes);
     }
 
     /// Atomically claim an isolate slot if under `max_envs` (always succeeds
@@ -1475,6 +1477,7 @@ mod isolate_slot_panic_tests {
         }
         fn uncharge(&self, bytes: u64) {
             self.charged.fetch_sub(bytes, Ordering::SeqCst);
+            assert_ne!(self.operation.load(Ordering::SeqCst), 4, "uncharge panic");
         }
     }
 
@@ -1505,5 +1508,24 @@ mod isolate_slot_panic_tests {
                 .unwrap();
             budget.release_env(next.ceiling_bytes);
         }
+        // This unit owns only a reservation, not a provider. Native lifecycle
+        // tests independently require CPP disposal before this release.
+        let reservation = budget
+            .try_reserve_env(RequestedHeap::default(), Some(1))
+            .unwrap();
+        accountant.operation.store(4, Ordering::SeqCst);
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || budget.release_env(reservation.ceiling_bytes)
+            ))
+            .is_err()
+        );
+        accountant.operation.store(0, Ordering::SeqCst);
+        assert_eq!(budget.live_isolates(), 0);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        let fresh = budget
+            .try_reserve_env(RequestedHeap::default(), Some(1))
+            .unwrap();
+        budget.release_env(fresh.ceiling_bytes);
     }
 }

@@ -136,6 +136,10 @@ struct SnapiEnvState {
   // Owner-thread physical provider frames, including reentrant guest callbacks.
   // A guest may release this env only after all such frames have returned.
   uint64_t foreground_depth = 0;
+  // A successful batch begin transfers disposal custody to its caller. Normal
+  // entry is sealed; already-entered explicit-release finalizers may finish.
+  bool retiring = false;
+  uint64_t finalizer_depth = 0;
   // Only explicit guest declarations may fund a negative adjustment. V8's
   // other external allocations can be released independently by its sweeper.
   int64_t declared_external_memory = 0;
@@ -455,22 +459,20 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
 
 SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
   auto* bridge_state = LookupEnvState(env_state);
-  if (bridge_state == nullptr || bridge_state->env == nullptr) {
+  if (bridge_state == nullptr || bridge_state->env == nullptr ||
+      (bridge_state->retiring && bridge_state->finalizer_depth == 0)) {
     return nullptr;
   }
   return bridge_state;
 }
 
-napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
-  if (state == nullptr) return napi_ok;
-  if (state->foreground_depth != 0) return napi_generic_failure;
+void DrainBridgeResources(SnapiEnvState* state) {
   {
     BridgeIsolateScope isolate_scope(state->env);
-    for (const auto& entry : state->buffer_lease_handles.handles) {
+    for (void* handle : state->buffer_lease_handles.TakeAll()) {
       (void)unofficial_napi_release_buffer_lease(
-          state->env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
+          state->env, static_cast<unofficial_napi_buffer_lease>(handle), false);
     }
-    state->buffer_lease_handles.Reset();
     // Slots hold raw Locals; they die with the env's scopes when release_env
     // tears everything down, so draining the frames is pure bookkeeping.
     while (!state->scope_frames.empty()) {
@@ -488,34 +490,58 @@ napi_status DisposeBridgeStateLocked(SnapiEnvState* state) {
     // Bytecode handles own engine resources outside any napi scope (V8
     // Globals / QuickJS JSValue refcounts), so they must be released
     // explicitly — env teardown does not reclaim them.
-    for (auto& entry : state->bytecode_handles.handles) {
-      if (entry.second != nullptr) {
+    for (void* handle : state->bytecode_handles.TakeAll()) {
+      if (handle != nullptr) {
         (void)unofficial_napi_bytecode_release(
-            state->env, reinterpret_cast<unofficial_napi_bytecode>(entry.second));
+            state->env, reinterpret_cast<unofficial_napi_bytecode>(handle));
       }
     }
-    state->bytecode_handles.Reset();
     state->profile_handles.Reset();
     state->callback_invocations.clear();
     state->next_callback_invocation_id = 1;
-    state->cb_registry.clear();
-    state->next_cb_reg_id = 1;
-    state->callback_bindings.clear();
+    // Registered functions can be called by a user finalizer. Keep both their
+    // binding allocations and registrations alive until provider disposal ends.
   }
-  if (state->owner != nullptr) {
-    napi_status s = unofficial_napi_release_env(state->owner, nullptr);
-    state->active_callback_ctx.store(nullptr, std::memory_order_release);
-    state->owner = nullptr;
-    state->env = nullptr;
-    g_envs.erase(state);
-    delete state;
-    return s;
+}
+
+struct RetirementNotification {
+  SnapiEnvState* state;
+  void (*before_destroy)(void*);
+  void* data;
+};
+
+void BeforeBridgeEnvDestroy(void* raw) noexcept {
+  auto* notification = static_cast<RetirementNotification*>(raw);
+  // Finalizers may have created new persistent handles after the initial
+  // drain. The env and factory are still live here. finalizer_depth is now
+  // zero, so allocator/accountant reentry cannot repopulate these tables.
+  DrainBridgeResources(notification->state);
+  // Rust catches inside its extern-C hook. Never hold g_mu while entering it:
+  // foreign termination uses the Rust registry -> g_mu lock order.
+  if (notification->before_destroy != nullptr) {
+    notification->before_destroy(notification->data);
   }
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  g_envs.erase(notification->state);
+}
+
+napi_status FinishBridgeRetirement(SnapiEnvState* state,
+                                  void (*before_destroy)(void*), void* data) {
+  if (state == nullptr) return napi_ok;
+  // Both bridge constructors publish a non-null owner. There is no nonowned
+  // fallback that could retain the stack notification beyond this call.
+  if (state->owner == nullptr || state->env == nullptr || !state->retiring) std::abort();
+  // The metadata-only begin already checked all members before marking any.
+  RetirementNotification notification{state, before_destroy, data};
+  state->env->before_destroy = BeforeBridgeEnvDestroy;
+  state->env->before_destroy_data = &notification;
+  DrainBridgeResources(state);
+  napi_status status = unofficial_napi_release_env(state->owner, nullptr);
   state->active_callback_ctx.store(nullptr, std::memory_order_release);
+  state->owner = nullptr;
   state->env = nullptr;
-  g_envs.erase(state);
   delete state;
-  return napi_ok;
+  return status;
 }
 
 }  // namespace
@@ -1601,6 +1627,14 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void* /*data*/,
           ? bridge_state->active_callback_ctx.load(std::memory_order_acquire)
           : nullptr;
   if (callback_ctx != nullptr) {
+    struct FinalizerEntry {
+      SnapiEnvState* state;
+      explicit FinalizerEntry(SnapiEnvState* value) : state(value) {
+        if (state->finalizer_depth == UINT64_MAX) std::abort();
+        ++state->finalizer_depth;
+      }
+      ~FinalizerEntry() { --state->finalizer_depth; }
+    } finalizer_entry(bridge_state);
     // Own any value ids the guest mints while running its finalizer; there is
     // no return value to escape, so a plain handle scope suffices (mirrors
     // WasmInterruptCallback).
@@ -3287,21 +3321,50 @@ extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState* env_state,
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
+// Private host protocol: preallocate the caller's token slots, then validate
+// the entire batch under one lock before marking any provider. Failure leaves
+// every provider open, including explicit release's logical scope.
+extern "C" int snapi_bridge_begin_retirement(SnapiEnvState* const* states,
+                                             size_t count) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return DisposeBridgeStateLocked(env_state);
+  for (size_t i = 0; i < count; ++i) {
+    auto* state = states[i];
+    if (g_envs.find(state) == g_envs.end() || state->retiring ||
+        state->env == nullptr || state->owner == nullptr || state->foreground_depth != 0) return napi_generic_failure;
+    for (size_t j = 0; j < i; ++j) {
+      if (states[j] == state) return napi_invalid_arg;
+    }
+  }
+  for (size_t i = 0; i < count; ++i) states[i]->retiring = true;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_finish_retirement(
+    SnapiEnvState* state, void (*before_destroy)(void*), void* data) {
+  return FinishBridgeRetirement(state, before_destroy, data);
+}
+
+extern "C" uint64_t snapi_bridge_unofficial_get_live_env_count() {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  return static_cast<uint64_t>(g_envs.size());
+}
+
+extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
+  int status = snapi_bridge_begin_retirement(&env_state, 1);
+  return status == napi_ok ? FinishBridgeRetirement(env_state, nullptr, nullptr)
+                           : status;
 }
 
 extern "C" int snapi_bridge_unofficial_can_release_env(SnapiEnvState* env_state) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   auto* state = LookupEnvState(env_state);
-  return state != nullptr && state->foreground_depth == 0 ? 1 : 0;
+  return state != nullptr && !state->retiring && state->foreground_depth == 0 ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_state,
                                                              uint32_t loop_id) {
   (void)loop_id;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  return DisposeBridgeStateLocked(env_state);
+  return snapi_bridge_unofficial_release_env(env_state);
 }
 
 extern "C" int snapi_bridge_unofficial_collect_garbage(
@@ -3515,27 +3578,27 @@ extern "C" int snapi_bridge_unofficial_attach_env(
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto* bridge_state = LookupEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_terminate_execution(env);
 }
 
 extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
     SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto* bridge_state = LookupEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_cancel_terminate_execution(env);
 }
 
 extern "C" int snapi_bridge_unofficial_is_execution_terminating(
     SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
-  if (bridge_state == nullptr) return -1;
   std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto* bridge_state = LookupEnvState(env_state);
+  if (bridge_state == nullptr) return -1;
   bool terminating = false;
   if (unofficial_napi_is_execution_terminating(bridge_state->env, &terminating) != napi_ok) {
     return -1;
@@ -4556,17 +4619,16 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade
 // ============================================================
 
 extern "C" void snapi_bridge_dispose() {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   std::vector<SnapiEnvState*> env_states;
-  env_states.reserve(g_envs.size());
-  for (auto* env_state : g_envs) {
-    env_states.push_back(env_state);
+  std::vector<void*> messages;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    env_states.reserve(g_envs.size());
+    for (auto* state : g_envs) env_states.push_back(state);
+    messages = g_message_handles.TakeAll();
   }
-  for (auto* env_state : env_states) {
-    (void)DisposeBridgeStateLocked(env_state);
-  }
-  for (void* handle : g_message_handles.TakeAll()) {
-    unofficial_napi_message_drop(
-        reinterpret_cast<unofficial_napi_message>(handle));
+  for (auto* state : env_states) (void)snapi_bridge_unofficial_release_env(state);
+  for (void* handle : messages) {
+    unofficial_napi_message_drop(reinterpret_cast<unofficial_napi_message>(handle));
   }
 }
