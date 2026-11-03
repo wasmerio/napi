@@ -19,61 +19,123 @@ use crate::{
 
 use super::{abi, util::*};
 
-fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
     if !env.data().creation_enabled() {
-        return 0;
+        return Ok(0);
     }
     let _ = unsafe { snapi_bridge_init() };
-    // Legacy N-API modules without an embedder-owned runtime configuration use
-    // the provider default. If Edge configured flags first, this conflicting
-    // empty request is rejected without changing the existing runtime.
+    // Preserve an embedder's prior explicit runtime configuration.
     let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
-
-    if let Some(env_id) = env.data().default_napi_env_id {
-        return env_id as i32;
+    if let Some(id) = env.data().default_napi_env_id {
+        return Ok(id as i32);
     }
-
-    let Ok(reservation) = env.data().reserve_isolate(RequestedHeap::default()) else {
-        return 0;
+    let options = NativeCreateOptions {
+        version: 8,
+        total: 0,
+        constrained: 0,
+        stack: 0,
+        requested: RequestedHeap::default(),
+        make_default: true,
+        outputs: None,
     };
-
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = if reservation.clamped {
-        unsafe {
-            snapi_bridge_unofficial_create_env_with_options(
-                8,
-                0,
-                0,
-                reservation.max_young,
-                reservation.max_old,
-                reservation.code_range,
-                0,
-                guest_heap_ctx,
-                &mut snapi_env_state,
-            )
-        }
-    } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
-    };
-    if status != 0 || snapi_env_state.is_null() {
-        env.data().abort_isolate(&reservation);
-        return 0;
-    }
-
-    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    env.data_mut().default_napi_env_id = Some(env_id);
-    env_id as i32
+    Ok(create_native_provider(&mut env, options).map_or(0, |ids| ids.env as i32))
 }
 
-/// Boxed guest-heap context for env creation, or null when no heap exists.
-/// The bridge takes ownership in all cases (success or failure).
-fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_void {
-    env.data()
-        .guest_heap
-        .as_ref()
-        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
-        .unwrap_or(std::ptr::null())
+struct NativeCreateOptions {
+    version: i32,
+    total: u64,
+    constrained: u64,
+    stack: u32,
+    requested: RequestedHeap,
+    make_default: bool,
+    outputs: Option<(i32, i32)>,
+}
+
+// Return only owned results, restoring the counted wrapper before replaying a
+// panic. No original FunctionEnvMut is reconstructed from a stored pointer.
+fn with_creation_env<R>(
+    frame: &wasmer::sys::FunctionEnvFramePin<NapiEnv>,
+    f: impl FnOnce(&mut FunctionEnvMut<NapiEnv>) -> R,
+) -> Option<R> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    let result = wasmer::Store::with_current(|store| {
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut current = frame.try_as_env_mut(store)?;
+            Some(f(&mut current))
+        }))
+    })?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => resume_unwind(panic),
+    }
+}
+
+fn create_native_provider(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    options: NativeCreateOptions,
+) -> Result<crate::env::NativeEnvIds, i32> {
+    let frame = env.pin_frame().ok_or(1)?;
+    let request = env.data_mut().prepare_native_creation().ok_or(1)?;
+    env.as_store_mut().parked(|| {
+        let mut creation = request.reserve(options.requested).map_err(|_| 1)?;
+        // A reservation accountant may detach this cell, stop the session or
+        // reenter default initialization. Recheck before provider creation.
+        let existing = with_creation_env(&frame, |current| {
+            if !creation.request.matches(current.data()) {
+                return Err(1);
+            }
+            Ok(if options.make_default {
+                current.data().default_napi_env_id
+            } else {
+                None
+            })
+        })
+        .ok_or(1)??;
+        if let Some(env) = existing {
+            return Ok(crate::env::NativeEnvIds { env, scope: 0 });
+        }
+        let status = creation.create(
+            options.version,
+            options.total,
+            options.constrained,
+            options.stack,
+        );
+        if status != 0 {
+            return Err(status);
+        }
+        let ids = with_creation_env(&frame, |current| {
+            if !creation.request.matches(current.data()) {
+                return Err(1);
+            }
+            if options.make_default
+                && let Some(env) = current.data().default_napi_env_id
+            {
+                return Ok(crate::env::NativeEnvIds { env, scope: 0 });
+            }
+            let ids = creation.ids();
+            if let Some((env_out, scope_out)) = options.outputs
+                && ((env_out > 0 && !write_guest_u32(current, env_out as u32, ids.env))
+                    || (scope_out > 0 && !write_guest_u32(current, scope_out as u32, ids.scope)))
+            {
+                return Err(1);
+            }
+            if current
+                .data_mut()
+                .commit_isolate(&mut creation, options.make_default)
+            {
+                Ok(ids)
+            } else {
+                Err(1)
+            }
+        })
+        .ok_or(1)??;
+        if ids.env == creation.ids().env {
+            // Every user callout and output write ended before this private,
+            // callback-free transition. Drop still owns every failure path.
+            creation.publish();
+        }
+        Ok(ids)
+    })
 }
 
 /// Run a bridge call and return the original error of any guest callback.
@@ -202,70 +264,30 @@ fn guest_unofficial_napi_create_env(
     options_ptr: i32,
     env_out_ptr: i32,
     scope_out_ptr: i32,
-) -> i32 {
-    if !env.data().creation_enabled() {
-        return 1;
-    }
-    let (
-        total_memory,
-        constrained_memory,
-        max_young_generation_size_in_bytes,
-        max_old_generation_size_in_bytes,
-        code_range_size_in_bytes,
-        stack_limit,
-    ) = if options_ptr > 0 {
-        let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
-            return 1;
+) -> Result<i32, RuntimeError> {
+    let mut options = NativeCreateOptions {
+        version: module_api_version,
+        total: 0,
+        constrained: 0,
+        stack: 0,
+        requested: RequestedHeap::default(),
+        make_default: false,
+        outputs: Some((env_out_ptr, scope_out_ptr)),
+    };
+    if options_ptr > 0 {
+        let Some(input) = abi::read_env_create(&mut env, options_ptr) else {
+            return Ok(1);
         };
-        (
-            options.total_memory,
-            options.constrained_memory,
-            options.max_young_generation_size_in_bytes,
-            options.max_old_generation_size_in_bytes,
-            options.code_range_size_in_bytes,
-            options.stack_limit,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0)
-    };
-
-    let requested = RequestedHeap {
-        max_young: max_young_generation_size_in_bytes,
-        max_old: max_old_generation_size_in_bytes,
-        code_range: code_range_size_in_bytes,
-    };
-    let reservation = match env.data().reserve_isolate(requested) {
-        Ok(reservation) => reservation,
-        Err(_) => return 1,
-    };
-
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe {
-        snapi_bridge_unofficial_create_env_with_options(
-            module_api_version,
-            total_memory,
-            constrained_memory,
-            reservation.max_young,
-            reservation.max_old,
-            reservation.code_range,
-            stack_limit,
-            guest_heap_ctx,
-            &mut snapi_env_state,
-        )
-    };
-    if status != 0 {
-        env.data().abort_isolate(&reservation);
-        return status;
+        options.total = input.total_memory;
+        options.constrained = input.constrained_memory;
+        options.stack = input.stack_limit;
+        options.requested = RequestedHeap {
+            max_young: input.max_young_generation_size_in_bytes,
+            max_old: input.max_old_generation_size_in_bytes,
+            code_range: input.code_range_size_in_bytes,
+        };
     }
-    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    if env_out_ptr > 0 {
-        write_guest_u32(&mut env, env_out_ptr as u32, env_id);
-    }
-    if scope_out_ptr > 0 {
-        write_guest_u32(&mut env, scope_out_ptr as u32, scope_id);
-    }
-    0
+    Ok(create_native_provider(&mut env, options).map_or_else(|status| status, |_| 0))
 }
 
 fn guest_unofficial_napi_release_env(

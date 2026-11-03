@@ -139,6 +139,8 @@ struct SnapiEnvState {
   // A successful batch begin transfers disposal custody to its caller. Normal
   // entry is sealed; already-entered explicit-release finalizers may finish.
   bool retiring = false;
+  // Private creation owner has not yet published logical ids and charges.
+  bool pending_publish = false;
   uint64_t finalizer_depth = 0;
   // Only explicit guest declarations may fund a negative adjustment. V8's
   // other external allocations can be released independently by its sweeper.
@@ -3182,6 +3184,8 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   }
   state->env = env;
   state->owner = owner;
+  state->retiring = true;
+  state->pending_publish = true;
   {
     // Provider creation may allocate through a guest arena. Publish only after
     // it completes; no process-global bridge lock may span that refill.
@@ -3254,6 +3258,8 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   }
   state->env = env;
   state->owner = owner;
+  state->retiring = true;
+  state->pending_publish = true;
   {
     // Provider creation may allocate through a guest arena. Publish only after
     // it completes; no process-global bridge lock may span that refill.
@@ -3293,6 +3299,34 @@ extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
       HostNearHeapLimitTrampoline,
       const_cast<void*>(data),
       0);
+}
+
+// Only the private pending owner may configure this closed provider. These
+// primitives do not invoke Rust/JS; the callback box remains owned by Rust.
+extern "C" int snapi_bridge_prepare_created_env(
+    SnapiEnvState* state, const void* tracker, uint64_t value_limit) {
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    if (g_envs.find(state) == g_envs.end() || !state->pending_publish ||
+        !state->retiring || state->env == nullptr || state->owner == nullptr ||
+        state->foreground_depth != 0) return napi_invalid_arg;
+    state->value_limit = static_cast<size_t>(value_limit);
+  }
+  if (tracker == nullptr) return napi_ok;
+  BridgeIsolateScope isolate_scope(state->env);
+  return unofficial_napi_configure_near_heap_limit_callback(
+      state->env, HostNearHeapLimitTrampoline, const_cast<void*>(tracker), 0);
+}
+
+extern "C" void snapi_bridge_publish_created_env(SnapiEnvState* state) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  // Impossible unless the private ownership protocol was violated.
+  if (g_envs.find(state) == g_envs.end() || !state->pending_publish ||
+      !state->retiring || state->owner == nullptr || state->foreground_depth != 0) {
+    std::abort();
+  }
+  state->pending_publish = false;
+  state->retiring = false;
 }
 
 // Debug/diagnostics: live count of slot-table entries (leak assertions).

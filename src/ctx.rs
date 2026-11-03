@@ -93,9 +93,9 @@ impl NapiRuntimeControl {
     /// when the instance was killed for an unrelated reason; N-API itself
     /// draws no distinction, since either way the app's JS must never run
     /// again. The stop is sticky: guest code cannot undo it with
-    /// `napi_cancel_terminate_execution`, and isolates created afterwards
-    /// stay terminated ([`NapiEnv::commit_isolate`] re-checks the flag under
-    /// the same registry lock this holds).
+    /// `napi_cancel_terminate_execution`. New native creation requests are
+    /// refused; a provider concurrently finishing publication stays terminated
+    /// ([`NapiEnv::commit_isolate`] checks the flag under this registry lock).
     ///
     /// [`NapiEnv::commit_isolate`]: crate::env::NapiEnv::commit_isolate
     pub fn terminate_all(&self) {

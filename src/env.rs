@@ -14,17 +14,11 @@ use wasmer::TypedFunction;
 use wasmer::{Memory, Table};
 
 use crate::budget::{EnvHeapCharge, Pool, ResourceBudget};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::budget::{EnvRejected, HeapReservation, RequestedHeap};
 use crate::snapi::SnapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use crate::snapi::snapi_bridge_unofficial_release_env;
-#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-use crate::{
-    budget::{EnvRejected, HeapReservation, RequestedHeap},
-    snapi::{
-        snapi_bridge_unofficial_set_host_near_heap_limit_callback,
-        snapi_bridge_unofficial_set_value_limit,
-    },
-};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_active_callback_ctx};
@@ -85,12 +79,11 @@ fn next_js_napi_env_id() -> u32 {
 }
 
 /// Bookkeeping for one live V8 env's heap charge: the initial ceiling plus a
-/// pointer (as `usize`, so [`NapiEnv`] stays `Send`) to the boxed
-/// [`EnvHeapCharge`] the near-heap-limit callback grows. `tracker == 0` means
-/// the env is unbudgeted (unlimited).
+/// owned [`EnvHeapCharge`] box the near-heap-limit callback grows. Moving the
+/// handle never moves its callback pointee; `None` is an unbudgeted provider.
 struct EnvHeapChargeHandle {
     ceiling: u64,
-    tracker: usize,
+    tracker: Option<Box<EnvHeapCharge>>,
 }
 
 /// An uncommitted declaration is charged without exposing it to nested releases.
@@ -215,12 +208,11 @@ impl Drop for NativeRetirement {
         });
         for provider in &mut self.providers {
             if let Some(handle) = provider.charge.take() {
-                let granted = if handle.tracker != 0 {
-                    let tracker = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
-                    tracker.granted.load(Ordering::Acquire)
-                } else {
-                    0
-                };
+                let granted = handle
+                    .tracker
+                    .as_ref()
+                    .map_or(0, |tracker| tracker.granted.load(Ordering::Acquire));
+                drop(handle.tracker);
                 cleanup(&mut || self.budget.uncharge(Pool::V8HeapReserved, granted));
                 cleanup(&mut || self.budget.release_env(handle.ceiling));
             }
@@ -251,6 +243,161 @@ impl Drop for NativeRetirement {
                 let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
             } else {
                 resume_unwind(panic);
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeEnvIds {
+    pub(crate) env: u32,
+    pub(crate) scope: u32,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct NativeCreationRequest {
+    ids: NativeEnvIds,
+    budget: Arc<ResourceBudget>,
+    max_envs: Option<usize>,
+    registry: Arc<std::sync::Mutex<HashSet<usize>>>,
+    stopped: Arc<AtomicBool>,
+    heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl NativeCreationRequest {
+    pub(crate) fn matches(&self, env: &NapiEnv) -> bool {
+        env.creation_enabled()
+            && Arc::ptr_eq(&self.budget, &env.budget)
+            && Arc::ptr_eq(&self.registry, &env.env_registry)
+            && !self.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reserve(self, requested: RequestedHeap) -> Result<NativeCreation, EnvRejected> {
+        let reservation = self.budget.try_reserve_env(requested, self.max_envs)?;
+        let retirement = NativeRetirement {
+            providers: vec![NativeRetiredProvider {
+                state: None,
+                charge: Some(EnvHeapChargeHandle {
+                    ceiling: reservation.ceiling_bytes,
+                    tracker: None,
+                }),
+                external: 0,
+            }],
+            registry: self.registry.clone(),
+            budget: self.budget.clone(),
+            leases: Vec::new(),
+            heap: self.heap.clone(),
+            memory: None,
+            table: None,
+            external: HashMap::new(),
+        };
+        let mut creation = NativeCreation {
+            request: self,
+            reservation,
+            retirement,
+            value_limit: None,
+        };
+        // The reservation already has an owned Drop path before this custom
+        // accountant query. No NapiEnv/Store reference is exposed to the callback.
+        if creation.reservation.clamped {
+            creation.value_limit = creation.request.budget.value_handle_limit();
+            creation.retirement.providers[0]
+                .charge
+                .as_mut()
+                .unwrap()
+                .tracker = Some(Box::new(EnvHeapCharge {
+                budget: creation.request.budget.clone(),
+                env: 0,
+                host_stopped: creation.request.stopped.clone(),
+                unwind_slack_available: AtomicBool::new(true),
+                granted: AtomicU64::new(0),
+            }));
+        }
+        Ok(creation)
+    }
+}
+
+/// Pending provider, reservation and callback box share the existing ordered
+/// retirement owner. No Store, original FunctionEnvMut or T pointer is stored.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct NativeCreation {
+    pub(crate) request: NativeCreationRequest,
+    reservation: HeapReservation,
+    retirement: NativeRetirement,
+    value_limit: Option<u64>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl NativeCreation {
+    pub(crate) fn ids(&self) -> NativeEnvIds {
+        self.request.ids
+    }
+    fn state(&self) -> SnapiEnv {
+        self.retirement.providers[0].state.unwrap()
+    }
+
+    /// The private bridge returns an already-closed owned token. Ordinary
+    /// provider entry cannot observe it before callback-free publication.
+    pub(crate) fn create(&mut self, version: i32, total: u64, constrained: u64, stack: u32) -> i32 {
+        let allocator = self
+            .request
+            .heap
+            .as_ref()
+            .map_or(std::ptr::null(), |heap| heap.make_alloc_ctx().cast_const());
+        let mut state = std::ptr::null_mut();
+        let status = unsafe {
+            crate::snapi::snapi_bridge_unofficial_create_env_with_options(
+                version,
+                total,
+                constrained,
+                self.reservation.max_young,
+                self.reservation.max_old,
+                self.reservation.code_range,
+                stack,
+                allocator,
+                &mut state,
+            )
+        };
+        if !state.is_null() {
+            self.retirement.providers[0].state = Some(state);
+        }
+        if status != 0 || state.is_null() {
+            return if status == 0 { 1 } else { status };
+        }
+        let tracker = self.retirement.providers[0]
+            .charge
+            .as_mut()
+            .unwrap()
+            .tracker
+            .as_mut()
+            .map_or(std::ptr::null(), |tracker| {
+                tracker.env = state as usize;
+                (&**tracker as *const EnvHeapCharge).cast::<c_void>()
+            });
+        unsafe {
+            crate::snapi::snapi_bridge_prepare_created_env(
+                state,
+                tracker,
+                self.value_limit.unwrap_or(0),
+            )
+        }
+    }
+
+    /// Called only after all fallible work, guest output writes and map moves
+    /// succeeded. This private primitive cannot invoke Rust/JS or fail.
+    pub(crate) fn publish(&mut self) {
+        let state = self.state();
+        unsafe {
+            crate::snapi::snapi_bridge_publish_created_env(state);
+        }
+        self.retirement.providers[0].state = None;
+        if self.request.stopped.load(Ordering::Acquire) {
+            // A stop concurrent with final map publication sees this row under
+            // the same registry lock; this idempotent check also covers it here.
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_terminate_execution(state);
             }
         }
     }
@@ -419,101 +566,74 @@ impl NapiEnv {
             .unwrap_or(0)
     }
 
-    /// Reserve budget for a new V8 env before creating it: acquire an isolate
-    /// slot against `max_envs` and charge its (clamped) heap ceiling. The
-    /// returned constraints must be forwarded to V8. Follow with exactly one of
-    /// [`commit_isolate`] (on success) or [`abort_isolate`] (on failure).
-    ///
-    /// [`commit_isolate`]: NapiEnv::commit_isolate
-    /// [`abort_isolate`]: NapiEnv::abort_isolate
+    /// Reserve nonreused positive guest ids before any accountant or provider
+    /// callout. Exhaustion leaves all ownership maps unchanged.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) fn reserve_isolate(
-        &self,
-        requested: RequestedHeap,
-    ) -> Result<HeapReservation, EnvRejected> {
-        self.budget.try_reserve_env(requested, self.max_envs)
+    pub(crate) fn prepare_native_creation(&mut self) -> Option<NativeCreationRequest> {
+        if !self.creation_enabled() || self.host_stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let env = self.next_napi_env_id.max(1);
+        let scope = self.next_napi_scope_id.max(1);
+        if env > i32::MAX as u32 || scope > i32::MAX as u32 {
+            return None;
+        }
+        self.next_napi_env_id = env + 1;
+        self.next_napi_scope_id = scope + 1;
+        Some(NativeCreationRequest {
+            ids: NativeEnvIds { env, scope },
+            budget: self.budget.clone(),
+            max_envs: self.max_envs,
+            registry: self.env_registry.clone(),
+            stopped: self.host_stopped.clone(),
+            heap: self.guest_heap.clone(),
+        })
     }
 
-    /// Register a successfully-created env, attach its heap charge, and — under
-    /// a limited budget — install the host-owned near-heap-limit callback so V8
-    /// heap growth for this isolate is charged against the budget. Teardown
-    /// releases both the initial ceiling and any granted growth.
+    /// Only primitive map moves occur after the final registry/stop check.
+    /// CPP remains privately closed until the caller ends this T borrow and
+    /// publishes the owned token; foreign terminate may already see this row.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn commit_isolate(
         &mut self,
-        env: SnapiEnv,
-        reservation: &HeapReservation,
-    ) -> (u32, u32) {
-        let (env_id, scope_id) = self.register_napi_env(env);
-        {
-            let mut registry = self
-                .env_registry
-                .lock()
-                .expect("poisoned N-API env registry");
-            registry.insert(env as usize);
-
-            // If the host already stopped this app's JS, an isolate created
-            // afterwards must not start running either. Checking under the
-            // registry lock closes the race against a concurrent
-            // `NapiRuntimeControl::terminate_all`, which sets the flag before
-            // taking this lock: either it sees this env in the registry, or
-            // we see its flag here.
-            if self.host_stopped.load(Ordering::Acquire) {
-                // SAFETY: `env` is the isolate just created and is still live.
-                unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
-                }
-            }
+        creation: &mut NativeCreation,
+        make_default: bool,
+    ) -> bool {
+        if !creation.request.matches(self) {
+            return false;
         }
-
-        let tracker = if reservation.clamped {
-            let boxed = Box::into_raw(Box::new(EnvHeapCharge {
-                budget: Arc::clone(&self.budget),
-                env: env as usize,
-                host_stopped: Arc::clone(&self.host_stopped),
-                unwind_slack_available: std::sync::atomic::AtomicBool::new(true),
-                granted: AtomicU64::new(0),
-            }));
-            // SAFETY: `env` is the isolate just created; `boxed` outlives the
-            // callback (freed only at this env's teardown, below).
-            unsafe {
-                snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-                    env,
-                    boxed as *const c_void,
-                );
-            }
-
-            // Cap per-value host handles / callback registrations so the C++
-            // bookkeeping (invisible to the byte pools) cannot grow host RSS
-            // without bound; derived from the budget.
-            if let Some(limit) = self.budget.value_handle_limit() {
-                // SAFETY: `env` is the isolate just created.
-                unsafe {
-                    snapi_bridge_unofficial_set_value_limit(env, limit);
-                }
-            }
-
-            boxed as usize
-        } else {
-            0
-        };
-
-        self.env_heap_charges.insert(
-            env_id,
-            EnvHeapChargeHandle {
-                ceiling: reservation.ceiling_bytes,
-                tracker,
-            },
+        if self.napi_envs.try_reserve(1).is_err()
+            || self.napi_state_to_guest_env.try_reserve(1).is_err()
+            || self.napi_scopes.try_reserve(1).is_err()
+            || self.env_heap_charges.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        let mut registry = self
+            .env_registry
+            .lock()
+            .expect("poisoned N-API env registry");
+        if registry.try_reserve(1).is_err() || self.host_stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = creation.state();
+        let ids = creation.request.ids;
+        // Checked nonreused ids cannot replace another provider's owners.
+        assert!(
+            !self.napi_envs.contains_key(&ids.env) && !self.napi_scopes.contains_key(&ids.scope)
         );
-        (env_id, scope_id)
-    }
-
-    /// Release a reservation whose env creation failed after [`reserve_isolate`].
-    ///
-    /// [`reserve_isolate`]: NapiEnv::reserve_isolate
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) fn abort_isolate(&self, reservation: &HeapReservation) {
-        self.budget.release_env(reservation.ceiling_bytes);
+        self.napi_envs.insert(ids.env, state as usize);
+        self.napi_state_to_guest_env.insert(state as usize, ids.env);
+        self.napi_scopes.insert(ids.scope, ids.env);
+        self.env_heap_charges.insert(
+            ids.env,
+            creation.retirement.providers[0].charge.take().unwrap(),
+        );
+        registry.insert(state as usize);
+        if make_default {
+            self.default_napi_env_id = Some(ids.env);
+        }
+        true
     }
 
     /// Record a successful provider adjustment without invoking the accountant.
@@ -583,14 +703,8 @@ impl NapiEnv {
         self.callback_depth = self.callback_depth.saturating_sub(1);
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        let env_id = {
-            let env_id = self.next_napi_env_id.max(1);
-            self.next_napi_env_id = env_id.saturating_add(1);
-            env_id
-        };
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
         let env_id = next_js_napi_env_id();
 
         let scope_id = self.next_napi_scope_id.max(1);
@@ -652,17 +766,11 @@ impl NapiEnv {
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
-            let granted = if handle.tracker != 0 {
-                // SAFETY: reclaim the box created in `commit_isolate`. The
-                // near-heap-limit callback holding this pointer only runs during
-                // JS execution, and no JS runs between here and the paired env
-                // release that removes the callback and disposes the isolate, so
-                // freeing it now is safe.
-                let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
-                boxed.granted.load(Ordering::Acquire)
-            } else {
-                0
-            };
+            let granted = handle
+                .tracker
+                .as_ref()
+                .map_or(0, |tracker| tracker.granted.load(Ordering::Acquire));
+            drop(handle.tracker);
             self.budget.uncharge(Pool::V8HeapReserved, granted);
             self.budget.release_env(handle.ceiling);
         }
@@ -913,6 +1021,37 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    fn native_creation_ids_exhaust_without_reusing_or_publishing() {
+        let budget = ResourceBudget::unlimited();
+        let mut env = NapiEnv::new(
+            budget.clone(),
+            None,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        env.configured = true;
+        env.next_napi_env_id = i32::MAX as u32;
+        env.next_napi_scope_id = i32::MAX as u32;
+        let request = env.prepare_native_creation().unwrap();
+        assert_eq!(request.ids.env, i32::MAX as u32);
+        assert_eq!(request.ids.scope, i32::MAX as u32);
+        assert!(env.prepare_native_creation().is_none());
+        assert_eq!(env.next_napi_env_id, i32::MAX as u32 + 1);
+        assert_eq!(env.next_napi_scope_id, i32::MAX as u32 + 1);
+        env.next_napi_env_id = 1;
+        assert!(
+            env.prepare_native_creation().is_none(),
+            "scope exhaustion is independent"
+        );
+        assert!(env.napi_envs.is_empty());
+        assert!(env.napi_scopes.is_empty());
+        assert!(env.env_heap_charges.is_empty());
+        assert_eq!(budget.snapshot().live_isolates, 0);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
 
     #[test]
     fn declared_external_charges_denies_and_clamps() {

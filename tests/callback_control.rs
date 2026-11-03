@@ -30,6 +30,8 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_get_value_int32" (func $integer (param i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
         (func $contextify (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_configure_runtime"
+        (func $configure_runtime (param i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
         (func $create_env (param i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
@@ -71,6 +73,10 @@ const GUEST: &str = r#"(module
     (func (export "release_status") (result i32) global.get $release_status)
     (func (export "release_owned") (result i32)
         i32.const 36 i32.load i32.const 0 call $release_env)
+    (func (export "configure_runtime") (result i32) i32.const 0 call $configure_runtime)
+    (func (export "init_id") (result i32) call $new_env)
+    (func (export "create_status") (param i32 i32) (result i32)
+        i32.const 8 i32.const 0 local.get 0 local.get 1 call $create_env)
     (func (export "init")
         call $new_env global.set $env
         global.get $env i32.eqz if unreachable end
@@ -131,6 +137,22 @@ fn instance_with_context(
     ctx: NapiCtx,
     record: impl FnOnce(&mut Store, &NapiCtx) -> Function,
 ) -> (NapiCtx, Instance, Memory, NapiSession) {
+    let result = configured_instance_with_context(store, ctx, record);
+    result
+        .1
+        .exports
+        .get_typed_function::<(), ()>(store, "init")
+        .unwrap()
+        .call(store)
+        .unwrap();
+    result
+}
+
+fn configured_instance_with_context(
+    store: &mut Store,
+    ctx: NapiCtx,
+    record: impl FnOnce(&mut Store, &NapiCtx) -> Function,
+) -> (NapiCtx, Instance, Memory, NapiSession) {
     let module = Module::new(&*store, wat::parse_str(GUEST).unwrap()).unwrap();
     let hooks = ctx.runtime_hooks();
     let (mut imports, state) = hooks
@@ -150,12 +172,6 @@ fn instance_with_context(
             Some(&memory),
             state,
         )
-        .unwrap();
-    instance
-        .exports
-        .get_typed_function::<(), ()>(store, "init")
-        .unwrap()
-        .call(store)
         .unwrap();
     (ctx, instance, memory, session)
 }
@@ -1289,4 +1305,371 @@ fn native_retirement_keeps_foreign_termination_live_through_finalizer_drain() {
         return;
     }
     run_explicit_release_finalizer(true);
+}
+
+// Match the existing accountant siblings. The old-source panic probe uses
+// only this scalar hook; Store reentry is exercised on the repaired source.
+struct CreationAccountant {
+    charged: std::sync::atomic::AtomicU64,
+    panic_after_charge: std::sync::atomic::AtomicBool,
+    pending_query: std::sync::atomic::AtomicBool,
+    providers_at_query: std::sync::atomic::AtomicU64,
+}
+impl CreationAccountant {
+    fn new() -> Self {
+        Self {
+            charged: std::sync::atomic::AtomicU64::new(0),
+            panic_after_charge: std::sync::atomic::AtomicBool::new(false),
+            pending_query: std::sync::atomic::AtomicBool::new(false),
+            providers_at_query: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+}
+impl wasmer_napi::NapiMemoryAccountant for CreationAccountant {
+    fn memory_limit(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        if self.pending_query.swap(false, Ordering::SeqCst) {
+            self.providers_at_query.store(
+                unsafe { snapi_bridge_unofficial_get_live_env_count() },
+                Ordering::SeqCst,
+            );
+            std::panic::panic_any("creation limit query");
+        }
+        512 * 1024 * 1024
+    }
+    fn memory_charged(&self) -> u64 {
+        self.charged.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn try_charge(&self, bytes: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        // A throwing hook has not charged anything yet.
+        ReentrantAccountant::call_hook();
+        self.charged.fetch_add(bytes, Ordering::SeqCst);
+        if self.panic_after_charge.swap(false, Ordering::SeqCst) {
+            self.pending_query.store(true, Ordering::SeqCst);
+        }
+        true
+    }
+    fn uncharge(&self, bytes: u64) {
+        self.charged
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn native_creation_owns_reservation_before_the_value_limit_query() {
+    if !run_in_subprocess(
+        "native_creation_owns_reservation_before_the_value_limit_query",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let accountant = Arc::new(CreationAccountant::new());
+    let ctx = NapiCtx::builder()
+        .memory_accountant(accountant.clone())
+        .max_envs(1)
+        .build();
+    let mut store = Store::default();
+    let (ctx, instance, _, session) =
+        configured_instance_with_context(&mut store, ctx, |store, _| {
+            Function::new_typed(store, |_: i32| {})
+        });
+    accountant.panic_after_charge.store(true, Ordering::SeqCst);
+    let init = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "init_id")
+        .unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init.call(&mut store)))
+        .unwrap_err();
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"creation limit query"));
+    // Dispose all logical providers before checking scalar ownership. The old
+    // path publishes a provider but strands its reservation before charge-map insertion.
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+    assert_eq!(
+        ctx.budget().snapshot().live_isolates,
+        0,
+        "failed creation must release its reservation"
+    );
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(accountant.providers_at_query.load(Ordering::SeqCst), 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+    assert_eq!(
+        wasmer_napi::NapiMemoryAccountant::memory_charged(&*accountant),
+        0
+    );
+    let (_next_ctx, next, memory, _session) = self::instance(&mut store, |_| Ok(()));
+    assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
+}
+
+#[test]
+fn native_creation_rechecks_default_after_accountant_reentry() {
+    if !run_in_subprocess(
+        "native_creation_rechecks_default_after_accountant_reentry",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicI32, Ordering};
+    let accountant = Arc::new(CreationAccountant::new());
+    let ctx = NapiCtx::builder()
+        .memory_accountant(accountant)
+        .max_envs(2)
+        .build();
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) =
+        configured_instance_with_context(&mut store, ctx, |store, _| {
+            Function::new_typed(store, |_: i32| {})
+        });
+    let init = instance.exports.get_function("init_id").unwrap().clone();
+    let nested_id = Arc::new(AtomicI32::new(0));
+    let observed = nested_id.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let result = Store::with_current(|store| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init.call(store, &[])))
+            });
+            let values = result.unwrap().unwrap().unwrap();
+            observed.store(values[0].i32().unwrap(), Ordering::SeqCst);
+        }))
+    });
+    let outer = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "init_id")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert!(outer > 0);
+    assert_eq!(outer, nested_id.load(Ordering::SeqCst));
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 1);
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(eval(&mut store, &instance, &memory, "40 + 2").unwrap(), 42);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+}
+
+#[test]
+fn native_creation_revalidates_attachment_and_stop_before_publication() {
+    if !run_in_subprocess(
+        "native_creation_revalidates_attachment_and_stop_before_publication",
+        Duration::from_secs(25),
+    ) {
+        return;
+    }
+    use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+    for detach in [true, false] {
+        let accountant = Arc::new(CreationAccountant::new());
+        let ctx = NapiCtx::builder()
+            .memory_accountant(accountant)
+            .max_envs(1)
+            .build();
+        let control = ctx.runtime_control();
+        let mut store = Store::default();
+        let before = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut()).len();
+        let mut target = None;
+        let (ctx, instance, _, session) =
+            configured_instance_with_context(&mut store, ctx, |store, _| {
+                let candidates: Vec<_> =
+                    VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+                        .iter()
+                        .enumerate()
+                        .skip(before)
+                        .filter(|(_, owner)| !owner.as_ref().is::<()>())
+                        .map(|(index, owner)| (index, owner.identity()))
+                        .collect();
+                assert_eq!(candidates.len(), 1);
+                target = candidates.into_iter().next();
+                Function::new_typed(store, |_: i32| {})
+            });
+        let (index, identity) = target.unwrap();
+        EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                if detach {
+                    Store::with_current(|store| {
+                        let owner =
+                            &mut VMFunctionEnvironment::list_mut(store.objects_mut().as_sys_mut())
+                                [index];
+                        assert_eq!(owner.identity(), identity);
+                        drop(std::mem::replace(owner, VMFunctionEnvironment::new(())));
+                    })
+                    .unwrap();
+                } else {
+                    control.terminate_all();
+                }
+            }))
+        });
+        let id = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "init_id")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+        assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&store, "fresh")
+                .unwrap()
+                .call(&mut store)
+                .unwrap(),
+            9
+        );
+        if !detach {
+            unsafe {
+                session.deactivate(&mut store.as_store_mut());
+            }
+        }
+        drop(session);
+        let (_next_ctx, next, memory, _session) = self::instance(&mut store, |_| Ok(()));
+        assert_eq!(eval(&mut store, &next, &memory, "40 + 2").unwrap(), 42);
+    }
+}
+
+#[test]
+fn native_creation_rolls_back_provider_when_guest_output_is_invalid() {
+    if !run_in_subprocess(
+        "native_creation_rolls_back_provider_when_guest_output_is_invalid",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    let accountant = Arc::new(CreationAccountant::new());
+    let ctx = NapiCtx::builder()
+        .memory_accountant(accountant)
+        .max_envs(1)
+        .build();
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) =
+        configured_instance_with_context(&mut store, ctx, |store, _| {
+            Function::new_typed(store, |_: i32| {})
+        });
+    // Explicit provider creation requires the runtime's prior configuration.
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "configure_runtime")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    let create = instance
+        .exports
+        .get_typed_function::<(i32, i32), i32>(&store, "create_status")
+        .unwrap();
+    // The env id write succeeds, the scope write does not. Neither id may
+    // become a logical owner, and the already-created provider must be retired.
+    assert_eq!(create.call(&mut store, 32, i32::MAX).unwrap(), 1);
+    let mut bytes = [0; 4];
+    memory.view(&store).read(32, &mut bytes).unwrap();
+    let rejected_id = u32::from_le_bytes(bytes);
+    assert!(rejected_id > 0);
+    assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+    assert_eq!(create.call(&mut store, 32, 36).unwrap(), 0);
+    memory.view(&store).read(32, &mut bytes).unwrap();
+    assert!(
+        u32::from_le_bytes(bytes) > rejected_id,
+        "failed ids are never reused"
+    );
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_owned")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(eval(&mut store, &instance, &memory, "40 + 2").unwrap(), 42);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+}
+
+#[test]
+fn native_creation_accountant_reenters_an_existing_provider_with_fresh_borrows() {
+    if !run_in_subprocess(
+        "native_creation_accountant_reenters_an_existing_provider_with_fresh_borrows",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let accountant = Arc::new(CreationAccountant::new());
+    let ctx = NapiCtx::builder()
+        .memory_accountant(accountant)
+        .max_envs(2)
+        .build();
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    let nested = instance
+        .exports
+        .get_function("global_status")
+        .unwrap()
+        .clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let result = Store::with_current(|store| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| nested.call(store, &[])))
+            });
+            assert_eq!(&*result.unwrap().unwrap().unwrap(), &[Value::I32(0)]);
+            observed.fetch_add(1, Ordering::SeqCst);
+        }))
+    });
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(i32, i32), i32>(&store, "create_status")
+            .unwrap()
+            .call(&mut store, 32, 36)
+            .unwrap(),
+        0
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 2);
+    assert_eq!(
+        instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "release_owned")
+            .unwrap()
+            .call(&mut store)
+            .unwrap(),
+        0
+    );
+    assert_eq!(eval(&mut store, &instance, &memory, "40 + 2").unwrap(), 42);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
 }

@@ -57,6 +57,7 @@ unsafe extern "C" {
         engine_flags: *const i8,
         engine_flags_length: u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
@@ -73,6 +74,14 @@ unsafe extern "C" {
         guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_prepare_created_env(
+        state: SnapiEnv,
+        tracker: *const core::ffi::c_void,
+        value_limit: u64,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_publish_created_env(state: SnapiEnv);
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_begin_retirement(states: *const SnapiEnv, count: usize) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -133,19 +142,6 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    /// Register a host-owned near-heap-limit callback that charges V8 heap
-    /// growth against the resource budget. `data` is an
-    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
