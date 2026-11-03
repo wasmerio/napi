@@ -34,6 +34,22 @@ const GUEST: &str = r#"(module
     (import "napi" "napi_get_and_clear_last_exception" (func $exception (param i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_get_promise_details"
         (func $promise_details (param i32 i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create_required_module_facade"
+        (func $module_facade (param i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create"
+        (func $module_create (param i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_link"
+        (func $module_link (param i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_instantiate"
+        (func $module_instantiate (param i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_evaluate_sync"
+        (func $module_sync (param i32 i32 i32 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_evaluate"
+        (func $module_async (param i32 i32 i64 i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_destroy"
+        (func $module_destroy (param i32 i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_get_state"
+        (func $module_state (param i32 i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
         (func $contextify (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
@@ -52,17 +68,37 @@ const GUEST: &str = r#"(module
     (data (i32.const 512) "target\00")
     (data (i32.const 528) "answer\00")
     (data (i32.const 544) "operation_result\00")
+    (data (i32.const 576) "source\00")
+    (data (i32.const 592) "evaluate\00")
+    (data (i32.const 608) "exports\00")
+    (data (i32.const 624) "module://proof")
     (global $env (mut i32) (i32.const 0))
     (global $calls (mut i32) (i32.const 0))
     (global $release_status (mut i32) (i32.const -1))
     (global $throw_on_callback (mut i32) (i32.const 0))
     (global $drop_owner (mut i32) (i32.const 0))
+    (global $reenter_module (mut i32) (i32.const 0))
+    (global $reenter_module_status (mut i32) (i32.const -1))
+    (global $destroy_module (mut i32) (i32.const 0))
+    (global $destroy_module_status (mut i32) (i32.const -1))
     (func $check (param i32) local.get 0 if unreachable end)
     (func $answer (result i32)
         global.get $env i32.const 42 i32.const 24 call $create_integer call $check
         i32.const 24 i32.load)
     (func $first (param i32 i32) (result i32)
         global.get $calls i32.const 1 i32.add global.set $calls
+        global.get $reenter_module
+        if
+            i32.const 0 global.set $reenter_module
+            global.get $env i32.const 808 i32.load i32.const 100 i32.load i32.const 100 i32.load
+            i32.const 128 call $module_sync global.set $reenter_module_status
+            global.get $env i32.const 132 call $exception call $check
+        end
+        global.get $destroy_module
+        if
+            i32.const 0 global.set $destroy_module
+            global.get $env i32.const 808 i32.load call $module_destroy global.set $destroy_module_status
+        end
         global.get $calls i32.const 1 i32.eq
         if (result i32) i32.const 256 i32.const 10 call $eval else call $answer end)
     (func $second (export "second") (param i32 i32) (result i32)
@@ -129,6 +165,58 @@ const GUEST: &str = r#"(module
             local.get $status if local.get $status return end
         end
         global.get $env i32.const 8 i32.load i32.const 544 i32.const 84 i32.load call $set)
+    (func (export "module_create") (param $kind i32) (result i32) (local $status i32)
+        global.get $env i32.const 8 i32.load i32.const 512 i32.const 80 call $get call $check
+        global.get $env i32.const 624 i32.const 14 i32.const 100 call $string call $check
+        i32.const 768 i32.const 40 i32.store
+        i32.const 772 i32.const 1 i32.store
+        i32.const 776 local.get $kind i32.store
+        i32.const 780 i32.const 8 i32.load i32.store
+        i32.const 784 i32.const 100 i32.load i32.store
+        i32.const 788 i32.const 0 i32.store
+        i32.const 792 i32.const 0 i32.store
+        i32.const 796 i32.const 0 i32.store
+        i32.const 800 i32.const 0 i32.store
+        i32.const 804 i32.const 0 i32.store
+        local.get $kind i32.const 1 i32.eq
+        if
+            global.get $env i32.const 80 i32.load i32.const 576 i32.const 104 call $get call $check
+            i32.const 832 i32.const 0 i32.store
+            i32.const 836 i32.const 104 i32.load i32.store
+            i32.const 840 i32.const 0 i32.store
+            i32.const 792 i32.const 832 i32.store
+        else
+            global.get $env i32.const 80 i32.load i32.const 608 i32.const 104 call $get call $check
+            global.get $env i32.const 80 i32.load i32.const 592 i32.const 108 call $get call $check
+            i32.const 792 i32.const 104 i32.load i32.store
+            i32.const 796 i32.const 108 i32.load i32.store
+        end
+        global.get $env i32.const 768 i32.const 808 call $module_create
+        local.tee $status if local.get $status return end
+        global.get $env i32.const 808 i32.load i32.const 0 i32.const 0 call $module_link call $check
+        global.get $env i32.const 808 i32.load call $module_instantiate)
+    (func (export "module_run") (param $async i32) (result i32) (local $status i32)
+        local.get $async
+        if (result i32)
+            global.get $env i32.const 808 i32.load i64.const -1 i32.const 0 i32.const 112 call $module_async
+        else
+            global.get $env i32.const 808 i32.load i32.const 100 i32.load i32.const 100 i32.load
+            i32.const 112 call $module_sync
+        end
+        local.tee $status if local.get $status return end
+        global.get $env i32.const 8 i32.load i32.const 544 i32.const 112 i32.load call $set)
+    (func (export "reenter_module_on_callback") i32.const 1 global.set $reenter_module)
+    (func (export "reenter_module_status") (result i32) global.get $reenter_module_status)
+    (func (export "destroy_module_on_callback") (param i32) local.get 0 global.set $destroy_module)
+    (func (export "destroy_module_status") (result i32) global.get $destroy_module_status)
+    (func (export "module_facade") (result i32)
+        global.get $env i32.const 808 i32.load i32.const 112 call $module_facade call $check
+        global.get $env i32.const 8 i32.load i32.const 544 i32.const 112 i32.load call $set)
+    (func (export "module_destroy") (result i32)
+        global.get $env i32.const 808 i32.load call $module_destroy)
+    (func (export "module_state") (result i32)
+        global.get $env i32.const 808 i32.load i32.const 116 i32.const 120 i32.const 124 call $module_state call $check
+        i32.const 116 i32.load)
     (func (export "publish_exception")
         global.get $env i32.const 56 call $exception call $check
         global.get $env i32.const 8 i32.load i32.const 464 i32.const 56 i32.load call $set call $check)
@@ -634,6 +722,524 @@ fn private_metadata_ignores_guest_prototype_overrides() {
     assert_eq!(first.unwrap(), 0);
     assert_eq!(second.unwrap(), 0);
     assert_eq!(count, 0);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn module_sync_evaluation_runs_once_and_preserves_nested_callbacks() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    let state = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_state")
+        .unwrap();
+    let destroy = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_destroy")
+        .unwrap();
+    for (kind, setup) in [
+        (
+            1,
+            "globalThis.module_runs = 0; globalThis.target = { source: 'globalThis.module_runs++; export const answer = callback();' }; 42",
+        ),
+        (
+            2,
+            "globalThis.module_runs = 0; globalThis.target = { exports: [], evaluate() { globalThis.module_runs++; callback(); } }; 42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        assert_eq!(create.call(&mut store, kind).unwrap(), 0);
+        assert_eq!(run.call(&mut store, 0).unwrap(), 0);
+        assert_eq!(run.call(&mut store, 0).unwrap(), 0);
+        assert_eq!(state.call(&mut store).unwrap(), 4);
+        assert_eq!(
+            eval(
+                &mut store,
+                &instance,
+                &memory,
+                "eval",
+                "module_runs === 1 ? 42 : 0"
+            ),
+            42
+        );
+        assert_eq!(destroy.call(&mut store).unwrap(), 0);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn source_module_repeated_evaluation_does_not_repeat_side_effects() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    assert_eq!(
+        eval(
+            &mut store,
+            &instance,
+            &memory,
+            "eval",
+            "globalThis.module_runs = 0; globalThis.target = { source: 'globalThis.module_runs++; export const answer = 42;' }; 42"
+        ),
+        42
+    );
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    assert_eq!(create.call(&mut store, 1).unwrap(), 0);
+    assert_eq!(run.call(&mut store, 0).unwrap(), 0);
+    assert_eq!(run.call(&mut store, 0).unwrap(), 0);
+    assert_eq!(
+        eval(&mut store, &instance, &memory, "eval", "module_runs"),
+        1
+    );
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn module_evaluator_exceptions_are_cached_without_reexecution() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    let publish = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "publish_exception")
+        .unwrap();
+    let destroy = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_destroy")
+        .unwrap();
+    for (kind, setup) in [
+        (
+            1,
+            "globalThis.module_runs = 0; globalThis.expectedError = {}; globalThis.target = { source: 'globalThis.module_runs++; callback(); throw expectedError;' }; 42",
+        ),
+        (
+            2,
+            "globalThis.module_runs = 0; globalThis.expectedError = {}; globalThis.target = { exports: [], evaluate() { globalThis.module_runs++; callback(); throw expectedError; } }; 42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        assert_eq!(create.call(&mut store, kind).unwrap(), 0);
+        for _ in 0..2 {
+            assert_eq!(run.call(&mut store, 0).unwrap(), 10);
+            publish.call(&mut store).unwrap();
+            assert_eq!(
+                eval(
+                    &mut store,
+                    &instance,
+                    &memory,
+                    "eval",
+                    "captured_exception === expectedError ? 42 : 0"
+                ),
+                42
+            );
+        }
+        assert_eq!(
+            eval(&mut store, &instance, &memory, "eval", "module_runs"),
+            1
+        );
+        assert_eq!(destroy.call(&mut store).unwrap(), 0);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+async fn module_eval_async(
+    store: &StoreAsync,
+    instance: &Instance,
+    memory: &Memory,
+    script: &str,
+) -> i32 {
+    {
+        let write = store.store().write();
+        memory.view(&write).write(1024, script.as_bytes()).unwrap();
+    }
+    let eval = {
+        let read = store.store().read();
+        instance
+            .exports
+            .get_typed_function::<(i32, i32), i32>(&read, "eval")
+            .unwrap()
+    };
+    eval.call_async(store, 1024, script.len() as i32)
+        .await
+        .unwrap()
+}
+
+fn take_module_console_value(name: &str) -> wasm_bindgen::JsValue {
+    let console = js_sys::Reflect::get(&js_sys::global(), &"console".into()).unwrap();
+    let key = wasm_bindgen::JsValue::from_str(name);
+    let value = js_sys::Reflect::get(&console, &key).unwrap();
+    assert!(js_sys::Reflect::delete_property(&js_sys::Object::from(console), &key).unwrap());
+    value
+}
+
+#[wasm_bindgen_test]
+async fn module_async_evaluation_preserves_one_promise_and_nested_callbacks() {
+    for (kind, pending, setup) in [
+        (
+            1,
+            false,
+            "globalThis.module_runs = 0; globalThis.target = { source: 'globalThis.module_runs++; export const answer = callback();' }; 42",
+        ),
+        (
+            1,
+            true,
+            "globalThis.module_runs = 0; globalThis.target = { source: 'await new Promise(resolve => globalThis.release_module = resolve); globalThis.module_runs++; export const answer = callback();' }; 42",
+        ),
+        (
+            2,
+            false,
+            "globalThis.module_runs = 0; globalThis.target = { exports: [], evaluate() { globalThis.module_runs++; callback(); } }; 42",
+        ),
+    ] {
+        let (_ctx, store, instance, memory, session) = prepared_instance(true);
+        let init = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "init")
+            .unwrap();
+        let create = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "module_create")
+            .unwrap();
+        let run = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "module_run")
+            .unwrap();
+        let state = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "module_state")
+            .unwrap();
+        let store = store.into_async();
+        init.call_async(&store).await.unwrap();
+        assert_eq!(
+            module_eval_async(&store, &instance, &memory, setup).await,
+            42
+        );
+        assert_eq!(create.call_async(&store, kind).await.unwrap(), 0);
+        assert_eq!(run.call_async(&store, 1).await.unwrap(), 0);
+        assert_eq!(
+            module_eval_async(
+                &store,
+                &instance,
+                &memory,
+                "console.__napi_module_promise = operation_result; 42"
+            )
+            .await,
+            42
+        );
+        let first = take_module_console_value("__napi_module_promise");
+        assert_eq!(
+            state.call_async(&store).await.unwrap(),
+            if pending { 3 } else { 4 }
+        );
+        assert_eq!(run.call_async(&store, 1).await.unwrap(), 0);
+        assert_eq!(
+            module_eval_async(
+                &store,
+                &instance,
+                &memory,
+                "console.__napi_module_promise = operation_result; 42"
+            )
+            .await,
+            42
+        );
+        let second = take_module_console_value("__napi_module_promise");
+        assert!(js_sys::Object::is(&first, &second));
+        let settled =
+            wasm_bindgen_futures::JsFuture::from(first.unchecked_into::<js_sys::Promise>());
+        if pending {
+            assert_eq!(
+                module_eval_async(&store, &instance, &memory, "release_module(); 42").await,
+                42
+            );
+        }
+        assert!(settled.await.unwrap().is_undefined());
+        assert_eq!(state.call_async(&store).await.unwrap(), 4);
+        assert_eq!(
+            module_eval_async(&store, &instance, &memory, "module_runs").await,
+            1
+        );
+        let mut store = store
+            .into_store()
+            .unwrap_or_else(|_| panic!("settled module retained Store ownership"));
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+async fn asynchronous_source_module_rejects_with_the_original_value() {
+    let (_ctx, store, instance, memory, session) = prepared_instance(true);
+    let init = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init")
+        .unwrap();
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    let state = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_state")
+        .unwrap();
+    let store = store.into_async();
+    init.call_async(&store).await.unwrap();
+    assert_eq!(module_eval_async(&store, &instance, &memory, "globalThis.expectedError = {}; globalThis.module_runs = 0; globalThis.target = { source: 'await new Promise(resolve => globalThis.release_module = resolve); globalThis.module_runs++; callback(); throw expectedError;' }; console.__napi_module_error = expectedError; 42").await, 42);
+    let expected = take_module_console_value("__napi_module_error");
+    assert_eq!(create.call_async(&store, 1).await.unwrap(), 0);
+    assert_eq!(run.call_async(&store, 1).await.unwrap(), 0);
+    assert_eq!(
+        module_eval_async(
+            &store,
+            &instance,
+            &memory,
+            "console.__napi_module_promise = operation_result; 42"
+        )
+        .await,
+        42
+    );
+    let promise = take_module_console_value("__napi_module_promise");
+    // Attach rejection observation before releasing the actual top-level await.
+    let settled = wasm_bindgen_futures::JsFuture::from(promise.unchecked_into::<js_sys::Promise>());
+    assert_eq!(
+        module_eval_async(&store, &instance, &memory, "release_module(); 42").await,
+        42
+    );
+    let error = settled.await.unwrap_err();
+    assert!(js_sys::Object::is(&error, &expected));
+    assert_eq!(state.call_async(&store).await.unwrap(), 5);
+    assert_eq!(
+        module_eval_async(&store, &instance, &memory, "module_runs").await,
+        1
+    );
+    let mut store = store
+        .into_store()
+        .unwrap_or_else(|_| panic!("rejected module retained Store ownership"));
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn destroying_a_module_during_its_evaluator_preserves_the_environment() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    let arm = instance
+        .exports
+        .get_typed_function::<i32, ()>(&store, "destroy_module_on_callback")
+        .unwrap();
+    let destroyed = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "destroy_module_status")
+        .unwrap();
+    let publish = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "publish_exception")
+        .unwrap();
+    for (kind, async_entry, throws, setup) in [
+        (
+            1,
+            0,
+            false,
+            "globalThis.target = { source: 'export const answer = callback();' }; 42",
+        ),
+        (
+            2,
+            0,
+            false,
+            "globalThis.target = { exports: [], evaluate() { callback(); } }; 42",
+        ),
+        (
+            2,
+            1,
+            true,
+            "globalThis.expectedError = {}; globalThis.target = { exports: [], evaluate() { callback(); throw expectedError; } }; 42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        assert_eq!(create.call(&mut store, kind).unwrap(), 0);
+        instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "reset")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
+        arm.call(&mut store, 1).unwrap();
+        assert_eq!(run.call(&mut store, async_entry).unwrap(), 10);
+        assert_eq!(destroyed.call(&mut store).unwrap(), 0);
+        publish.call(&mut store).unwrap();
+        if throws {
+            assert_eq!(
+                eval(
+                    &mut store,
+                    &instance,
+                    &memory,
+                    "eval",
+                    "captured_exception === expectedError ? 42 : 0"
+                ),
+                42
+            );
+        }
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", "42"), 42);
+    }
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn synthetic_module_creation_owns_accessor_backed_export_names() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    assert_eq!(
+        eval(
+            &mut store,
+            &instance,
+            &memory,
+            "eval",
+            "globalThis.target = { exports: new Proxy(['answer'], { get(value, key, receiver) { if (key === '0') callback(); return Reflect.get(value, key, receiver); } }), evaluate() {} }; 42"
+        ),
+        42
+    );
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    assert_eq!(create.call(&mut store, 2).unwrap(), 0);
+    let calls = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "calls")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    assert_eq!(calls, 2);
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn required_module_facade_evaluates_and_forwards_the_original_exports() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    assert_eq!(
+        eval(
+            &mut store,
+            &instance,
+            &memory,
+            "eval",
+            "globalThis.module_runs = 0; globalThis.target = { source: 'globalThis.module_runs++; export default callback(); export const named = 43;' }; 42"
+        ),
+        42
+    );
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let facade = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_facade")
+        .unwrap();
+    assert_eq!(create.call(&mut store, 1).unwrap(), 0);
+    assert_eq!(facade.call(&mut store).unwrap(), 0);
+    assert_eq!(
+        eval(
+            &mut store,
+            &instance,
+            &memory,
+            "eval",
+            "operation_result.default === 42 && operation_result.named === 43 && operation_result.__esModule === true && module_runs === 1 ? 42 : 0"
+        ),
+        42
+    );
+    assert_eq!(facade.call(&mut store).unwrap(), 0);
+    assert_eq!(
+        eval(&mut store, &instance, &memory, "eval", "module_runs"),
+        1
+    );
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+}
+
+#[wasm_bindgen_test]
+fn recursive_module_evaluation_keeps_the_outer_evaluator_live() {
+    let (_ctx, mut store, instance, memory, session) = instance();
+    let create = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_create")
+        .unwrap();
+    let run = instance
+        .exports
+        .get_typed_function::<i32, i32>(&store, "module_run")
+        .unwrap();
+    let reenter = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "reenter_module_on_callback")
+        .unwrap();
+    let status = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "reenter_module_status")
+        .unwrap();
+    let destroy = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "module_destroy")
+        .unwrap();
+    for (kind, setup) in [
+        (
+            1,
+            "globalThis.module_runs = 0; globalThis.target = { source: 'globalThis.module_runs++; export const answer = callback();' }; 42",
+        ),
+        (
+            2,
+            "globalThis.module_runs = 0; globalThis.target = { exports: [], evaluate() { globalThis.module_runs++; callback(); } }; 42",
+        ),
+    ] {
+        assert_eq!(eval(&mut store, &instance, &memory, "eval", setup), 42);
+        assert_eq!(create.call(&mut store, kind).unwrap(), 0);
+        reenter.call(&mut store).unwrap();
+        assert_eq!(run.call(&mut store, 0).unwrap(), 0);
+        assert_eq!(status.call(&mut store).unwrap(), 10);
+        assert_eq!(
+            eval(&mut store, &instance, &memory, "eval", "module_runs"),
+            1
+        );
+        assert_eq!(destroy.call(&mut store).unwrap(), 0);
+    }
     unsafe {
         session.deactivate(&mut store.as_store_mut());
     }

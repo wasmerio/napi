@@ -98,6 +98,7 @@ export function wasmer_napi_console_error(message) {
   console.error(message);
 }
 const wasmerNapiReflectApply = Reflect.apply;
+const wasmerNapiReflectDefineProperty = Reflect.defineProperty;
 const wasmerNapiWeakMap = WeakMap;
 const wasmerNapiWeakMapGet = WeakMap.prototype.get;
 const wasmerNapiWeakMapSet = WeakMap.prototype.set;
@@ -136,6 +137,9 @@ const wasmerNapiHostSetTimeout = globalThis.setTimeout.bind(globalThis);
 const wasmerNapiHostQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const wasmerNapiHostPromise = globalThis.Promise;
 const wasmerNapiHostPromiseThen = globalThis.Promise.prototype.then;
+const wasmerNapiHostPromiseResolve = globalThis.Promise.resolve;
+const wasmerNapiHostPromiseReject = globalThis.Promise.reject;
+const wasmerNapiHostPromiseAll = globalThis.Promise.all;
 let wasmerNapiPendingProviderWork = 0;
 let wasmerNapiSettledProviderWork = false;
 function wasmerNapiTrackHostPromise(value) {
@@ -672,6 +676,35 @@ export function wasmer_napi_compile_module(scope, source, filename) {
     `with(scope){${constructorBody}}`)(scope, wasmerNapiTrackHostPromise);
   return { requests, exportNames, hasTopLevelAwait, execute };
 }
+export function wasmer_napi_prepare_source_module(compiled) {
+  const requests = compiled.requests;
+  const names = compiled.exportNames;
+  const execute = compiled.execute;
+  if (!Array.isArray(requests) || !Array.isArray(names)) return [9];
+  if (typeof execute !== 'function') return [5];
+  const namespace = {};
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    if (typeof name !== 'string') return [3];
+    wasmerNapiReflectDefineProperty(namespace, name,
+      { value: undefined, writable: true, enumerable: true, configurable: true });
+  }
+  return [0, requests, requests.length, execute, namespace, Boolean(compiled.hasTopLevelAwait)];
+}
+export function wasmer_napi_prepare_synthetic_module(exportNames) {
+  if (!Array.isArray(exportNames)) return [1];
+  const names = [];
+  const namespace = {};
+  for (let index = 0; index < exportNames.length; index++) {
+    const name = exportNames[index];
+    if (typeof name !== 'string') return [3];
+    wasmerNapiReflectDefineProperty(names, names.length,
+      { value: name, writable: true, enumerable: true, configurable: true });
+    wasmerNapiReflectDefineProperty(namespace, name,
+      { value: undefined, writable: true, enumerable: true, configurable: true });
+  }
+  return [0, names, namespace, []];
+}
 export function wasmer_napi_create_module_evaluation() {
   let resolve;
   let reject;
@@ -679,13 +712,73 @@ export function wasmer_napi_create_module_evaluation() {
     resolve = resolveValue;
     reject = rejectValue;
   });
-  return { promise, resolve, reject };
+  const details = { state: 0, result: undefined, hasResult: false };
+  wasmer_napi_metadata_set(wasmerNapiPromiseDetails, promise, details);
+  return {
+    promise,
+    resolve() {
+      details.state = 1;
+      details.result = undefined;
+      details.hasResult = true;
+      resolve(undefined);
+    },
+    reject(error) {
+      details.state = 2;
+      details.result = error;
+      details.hasResult = true;
+      reject(error);
+    },
+  };
+}
+export function wasmer_napi_module_evaluation_promise(evaluation) { return evaluation.promise; }
+export function wasmer_napi_resolved_module_evaluation() {
+  const promise = wasmerNapiReflectApply(wasmerNapiHostPromiseResolve, wasmerNapiHostPromise, [undefined]);
+  wasmer_napi_metadata_set(wasmerNapiPromiseDetails, promise,
+    { state: 1, result: undefined, hasResult: true });
+  return promise;
+}
+export function wasmer_napi_rejected_module_evaluation(error) {
+  const promise = wasmerNapiReflectApply(wasmerNapiHostPromiseReject, wasmerNapiHostPromise, [error]);
+  wasmer_napi_metadata_set(wasmerNapiPromiseDetails, promise,
+    { state: 2, result: error, hasResult: true });
+  return promise;
+}
+export function wasmer_napi_module_type_error(message) { return new TypeError(message); }
+export function wasmer_napi_module_facade(namespace) {
+  const facade = {};
+  for (const key of Reflect.ownKeys(namespace)) {
+    if (key === '__esModule') continue;
+    wasmerNapiReflectDefineProperty(facade, key, {
+      get() { return namespace[key]; }, enumerable: true, configurable: false,
+    });
+  }
+  wasmerNapiReflectDefineProperty(facade, '__esModule', { value: true, enumerable: true });
+  return facade;
+}
+export function wasmer_napi_execute_module(execute, imports, namespace, url) {
+  return wasmerNapiReflectApply(execute, undefined, [imports, namespace, {url}]);
 }
 export function wasmer_napi_finish_module_evaluation(
-  evaluation, dependencies, execute, imports, namespace, importMeta) {
-  wasmerNapiHostPromise.all(dependencies)
-    .then(() => execute(imports, namespace, importMeta))
-    .then(() => evaluation.resolve(undefined), evaluation.reject);
+    evaluation, dependencies, execute, imports, namespace, url, hasTopLevelAwait) {
+  // Non-async module evaluation settles synchronously when every dependency
+  // already completed. Only private capability metadata is trusted here.
+  if (!hasTopLevelAwait && dependencies.every(promise =>
+      wasmer_napi_metadata_get(wasmerNapiPromiseDetails, promise)?.state === 1)) {
+    try {
+      wasmer_napi_execute_module(execute, imports, namespace, url);
+      evaluation.resolve();
+    } catch (error) {
+      evaluation.reject(error);
+    }
+    return;
+  }
+  const all = wasmerNapiReflectApply(wasmerNapiHostPromiseAll, wasmerNapiHostPromise, [dependencies]);
+  const execution = wasmerNapiReflectApply(wasmerNapiHostPromiseThen, all, [
+    () => wasmer_napi_execute_module(execute, imports, namespace, url),
+  ]);
+  wasmerNapiReflectApply(wasmerNapiHostPromiseThen, execution, [
+    () => evaluation.resolve(undefined), evaluation.reject,
+  ]);
 }
 export function wasmer_napi_reject_module_evaluation(evaluation, error) {
   evaluation.reject(error);
@@ -970,7 +1063,6 @@ extern "C" {
         has_runnable_work: bool,
     ) -> Promise;
     fn wasmer_napi_has_pending_provider_work() -> bool;
-    fn wasmer_napi_get_promise_details(promise: &JsValue) -> Array;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_checked_promise_details(promise: &JsValue) -> Result<Option<Array>, JsValue>;
     fn wasmer_napi_has_jspi() -> bool;
@@ -1013,16 +1105,43 @@ extern "C" {
     ) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_validate_script(source: &str, filename: &str) -> Result<(), JsValue>;
-    fn wasmer_napi_create_module_evaluation() -> Object;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_prepare_source_module(compiled: &JsValue) -> Result<Array, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_prepare_synthetic_module(export_names: &JsValue) -> Result<Array, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_create_module_evaluation() -> Result<Object, JsValue>;
+    fn wasmer_napi_module_evaluation_promise(evaluation: &Object) -> JsValue;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_resolved_module_evaluation() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_rejected_module_evaluation(error: &JsValue) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_module_type_error(message: &str) -> Result<Object, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_module_facade(namespace: &Object) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_execute_module(
+        execute: &Function,
+        imports: &[JsValue],
+        namespace: &Object,
+        url: &str,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
     fn wasmer_napi_finish_module_evaluation(
         evaluation: &Object,
-        dependencies: &Array,
+        dependencies: &[JsValue],
         execute: &Function,
-        imports: &Array,
+        imports: &[JsValue],
         namespace: &Object,
-        import_meta: &Object,
-    );
-    fn wasmer_napi_reject_module_evaluation(evaluation: &Object, error: &JsValue);
+        url: &str,
+        has_top_level_await: bool,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_reject_module_evaluation(
+        evaluation: &Object,
+        error: &JsValue,
+    ) -> Result<(), JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_typed_array(
         kind: i32,
@@ -1143,7 +1262,7 @@ struct SyntheticModule {
 
 struct SourceTextModule {
     url: String,
-    requests: Array,
+    request_count: u32,
     linked_handles: Vec<u32>,
     execute: Function,
     namespace: Object,
@@ -2403,6 +2522,28 @@ type_test!(snapi_bridge_is_buffer, |v: &JsValue| {
 
 // Preparation and commit may access the environment; invocation owns all inputs.
 // In particular, no reference into HostJsEnv survives a getter/Proxy/coercion call.
+struct LiveEnv {
+    env: SnapiEnv,
+    token: Rc<Cell<usize>>,
+}
+
+impl LiveEnv {
+    fn with<R>(&self, access: impl FnOnce(&mut HostJsEnv) -> R) -> Result<R, JsValue> {
+        if self.token.get() != self.env as usize {
+            return Err(JsValue::from_str(
+                "N-API environment retired during module execution",
+            ));
+        }
+        let state = unsafe { env_mut(self.env) }
+            .map_err(|_| JsValue::from_str("N-API environment unavailable"))?;
+        Ok(access(state))
+    }
+}
+
+fn missing_module() -> JsValue {
+    JsValue::from_str("Module retired during execution")
+}
+
 unsafe fn with_js_call<T, R>(
     env: SnapiEnv,
     prepare: impl FnOnce(&HostJsEnv) -> Result<T, i32>,
@@ -4803,94 +4944,74 @@ unsafe fn host_js_create_source_text_module(
     requests_out: *mut u32,
     has_top_level_await_out: *mut u8,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
     let _ = (line_offset, column_offset, host_defined_option_id);
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    if state.get(wrapper_id).is_none() {
-        return NAPI_INVALID_ARG;
+    unsafe {
+        with_js_call(
+            env,
+            |state| {
+                if state.get(wrapper_id).is_none() {
+                    return Err(NAPI_INVALID_ARG);
+                }
+                let url = state
+                    .get(url_id)
+                    .and_then(JsValue::as_string)
+                    .ok_or(NAPI_STRING_EXPECTED)?;
+                let source =
+                    host_js_source_for_shape(state, source_text_id, source_bytecode_id, 2)?;
+                let scope = evaluation_scope(state, context_id)?;
+                Ok((scope, source, url))
+            },
+            |(scope, source, url)| {
+                let compiled = wasmer_napi_compile_module(&scope, &source, &url)?;
+                let prepared = wasmer_napi_prepare_source_module(&compiled)?;
+                Ok((url, prepared))
+            },
+            |state, (url, prepared)| {
+                let status = prepared
+                    .get(0)
+                    .as_f64()
+                    .unwrap_or(NAPI_GENERIC_FAILURE as f64) as i32;
+                if status != NAPI_OK {
+                    return status;
+                }
+                let requests = prepared.get(1);
+                let request_count = prepared.get(2).as_f64().unwrap_or(0.0) as u32;
+                let execute = prepared.get(3).unchecked_into::<Function>();
+                let namespace = prepared.get(4).unchecked_into::<Object>();
+                let has_top_level_await = prepared.get(5).as_bool().unwrap_or(false);
+                let handle = state.next_module;
+                if handle == 0 {
+                    return NAPI_GENERIC_FAILURE;
+                }
+                state.next_module = handle.checked_add(1).unwrap_or(0);
+                let requests_id = state.insert(requests);
+                state.source_text_modules.insert(
+                    handle,
+                    SourceTextModule {
+                        url,
+                        request_count,
+                        linked_handles: Vec::new(),
+                        execute,
+                        namespace,
+                        has_top_level_await,
+                        status: 0,
+                        error: None,
+                        evaluation: None,
+                    },
+                );
+                for result in [
+                    write(handle_out, handle),
+                    write(requests_out, requests_id),
+                    write(has_top_level_await_out, u8::from(has_top_level_await)),
+                ] {
+                    if let Err(status) = result {
+                        return status;
+                    }
+                }
+                NAPI_OK
+            },
+        )
     }
-    let Some(url) = state.get(url_id).and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
-    };
-    let source = match host_js_source_for_shape(state, source_text_id, source_bytecode_id, 2) {
-        Ok(source) => source,
-        Err(status) => return status,
-    };
-
-    let scope = match evaluation_scope(state, context_id) {
-        Ok(scope) => scope,
-        Err(status) => return status,
-    };
-    let compiled = match wasmer_napi_compile_module(&scope, &source, &url) {
-        Ok(value) => value,
-        Err(error) => {
-            state.last_exception = Some(error);
-            return NAPI_PENDING_EXCEPTION;
-        }
-    };
-    let Ok(requests_value) = Reflect::get(&compiled, &JsValue::from_str("requests")) else {
-        return NAPI_GENERIC_FAILURE;
-    };
-    if !Array::is_array(&requests_value) {
-        return NAPI_GENERIC_FAILURE;
-    }
-    let requests = Array::from(&requests_value);
-    let Ok(export_names_value) = Reflect::get(&compiled, &JsValue::from_str("exportNames")) else {
-        return NAPI_GENERIC_FAILURE;
-    };
-    if !Array::is_array(&export_names_value) {
-        return NAPI_GENERIC_FAILURE;
-    }
-    let Ok(execute_value) = Reflect::get(&compiled, &JsValue::from_str("execute")) else {
-        return NAPI_GENERIC_FAILURE;
-    };
-    let Some(execute) = execute_value.dyn_ref::<Function>().cloned() else {
-        return NAPI_FUNCTION_EXPECTED;
-    };
-    let has_top_level_await = Reflect::get(&compiled, &JsValue::from_str("hasTopLevelAwait"))
-        .ok()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-
-    let namespace = Object::new();
-    for name_value in Array::from(&export_names_value).iter() {
-        let Some(name) = name_value.as_string() else {
-            return NAPI_STRING_EXPECTED;
-        };
-        if Reflect::set(&namespace, &JsValue::from_str(&name), &JsValue::UNDEFINED).is_err() {
-            return NAPI_GENERIC_FAILURE;
-        }
-    }
-
-    let handle = state.next_module;
-    state.next_module = state.next_module.wrapping_add(1).max(1);
-    let requests_id = state.insert(requests.clone().into());
-    state.source_text_modules.insert(
-        handle,
-        SourceTextModule {
-            url,
-            requests,
-            linked_handles: Vec::new(),
-            execute,
-            namespace,
-            has_top_level_await,
-            status: 0,
-            error: None,
-            evaluation: None,
-        },
-    );
-    for result in [
-        unsafe { write(handle_out, handle) },
-        unsafe { write(requests_out, requests_id) },
-        unsafe { write(has_top_level_await_out, u8::from(has_top_level_await)) },
-    ] {
-        if let Err(error) = result {
-            return error;
-        }
-    }
-    NAPI_OK
 }
 #[allow(clippy::too_many_arguments)] // Matches the module creation ABI.
 unsafe fn host_js_create_synthetic_module(
@@ -4904,67 +5025,80 @@ unsafe fn host_js_create_synthetic_module(
     requests_out: *mut u32,
     has_top_level_await_out: *mut u8,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
     let _ = (url_id, context_id);
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(wrapper) = state.get(wrapper_id).cloned() else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(export_names_value) = state
-        .get(export_names_id)
-        .filter(|value| Array::is_array(value))
-        .cloned()
-    else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(evaluate) = state
-        .get(synthetic_eval_steps_id)
-        .and_then(|value| value.dyn_ref::<Function>())
-        .cloned()
-    else {
-        return NAPI_FUNCTION_EXPECTED;
-    };
-
-    let export_names_array = Array::from(&export_names_value);
-    let mut export_names = Vec::with_capacity(export_names_array.length() as usize);
-    let namespace = Object::new();
-    for value in export_names_array.iter() {
-        let Some(name) = value.as_string() else {
-            return NAPI_STRING_EXPECTED;
-        };
-        if Reflect::set(&namespace, &JsValue::from_str(&name), &JsValue::UNDEFINED).is_err() {
-            return NAPI_GENERIC_FAILURE;
-        }
-        export_names.push(name);
+    unsafe {
+        with_js_call(
+            env,
+            |state| {
+                let wrapper = state.get(wrapper_id).cloned().ok_or(NAPI_INVALID_ARG)?;
+                let names = state
+                    .get(export_names_id)
+                    .cloned()
+                    .ok_or(NAPI_INVALID_ARG)?;
+                let evaluate = state
+                    .get(synthetic_eval_steps_id)
+                    .filter(|v| v.is_function())
+                    .cloned()
+                    .ok_or(NAPI_FUNCTION_EXPECTED)?
+                    .unchecked_into::<Function>();
+                Ok((wrapper, names, evaluate))
+            },
+            |(wrapper, names, evaluate)| {
+                let prepared = wasmer_napi_prepare_synthetic_module(&names)?;
+                // Read only fresh literal own slots, then move Rust-owned strings.
+                let status = prepared
+                    .get(0)
+                    .as_f64()
+                    .unwrap_or(NAPI_GENERIC_FAILURE as f64) as i32;
+                let names = if status == 0 {
+                    prepared
+                        .get(1)
+                        .unchecked_into::<Array>()
+                        .iter()
+                        .map(|v| v.as_string().expect("validated own string element"))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok((status, wrapper, evaluate, names, prepared))
+            },
+            |state, (status, wrapper, evaluate, export_names, prepared)| {
+                if status != NAPI_OK {
+                    return status;
+                }
+                let namespace = prepared.get(2).unchecked_into::<Object>();
+                let requests = prepared.get(3);
+                let handle = state.next_module;
+                if handle == 0 {
+                    return NAPI_GENERIC_FAILURE;
+                }
+                state.next_module = handle.checked_add(1).unwrap_or(0);
+                state.synthetic_modules.insert(
+                    handle,
+                    SyntheticModule {
+                        wrapper,
+                        export_names,
+                        evaluate,
+                        namespace,
+                        status: 0,
+                        error: None,
+                        evaluation: None,
+                    },
+                );
+                let requests_id = state.insert(requests);
+                for result in [
+                    write(handle_out, handle),
+                    write(requests_out, requests_id),
+                    write(has_top_level_await_out, 0),
+                ] {
+                    if let Err(status) = result {
+                        return status;
+                    }
+                }
+                NAPI_OK
+            },
+        )
     }
-
-    let handle = state.next_module;
-    state.next_module = state.next_module.wrapping_add(1).max(1);
-    state.synthetic_modules.insert(
-        handle,
-        SyntheticModule {
-            wrapper,
-            export_names,
-            evaluate,
-            namespace,
-            status: 0,
-            error: None,
-            evaluation: None,
-        },
-    );
-    let requests_id = state.insert(Array::new().into());
-    for result in [
-        unsafe { write(handle_out, handle) },
-        unsafe { write(requests_out, requests_id) },
-        unsafe { write(has_top_level_await_out, 0) },
-    ] {
-        if let Err(error) = result {
-            return error;
-        }
-    }
-    NAPI_OK
 }
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -5053,7 +5187,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_link(
     let Some(module) = state.source_text_modules.get(&handle_id) else {
         return NAPI_INVALID_ARG;
     };
-    if count != module.requests.length() || (count != 0 && linked_handle_ids.is_null()) {
+    if count != module.request_count || (count != 0 && linked_handle_ids.is_null()) {
         return NAPI_INVALID_ARG;
     }
     let linked = if count == 0 {
@@ -5092,7 +5226,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_instantiate(
     let Some(module) = state.source_text_modules.get_mut(&handle_id) else {
         return NAPI_INVALID_ARG;
     };
-    if module.linked_handles.len() != module.requests.length() as usize {
+    if module.linked_handles.len() != module.request_count as usize {
         return NAPI_INVALID_ARG;
     }
     if module.status < 2 {
@@ -5127,200 +5261,334 @@ fn module_evaluation(state: &HostJsEnv, handle_id: u32) -> Option<JsValue> {
         })
 }
 
-fn start_module_evaluation(state: &mut HostJsEnv, handle_id: u32) -> Result<JsValue, JsValue> {
-    if let Some(evaluation) = module_evaluation(state, handle_id) {
-        return Ok(evaluation);
-    }
-
-    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-        module.status = 3;
-        let evaluate = module.evaluate.clone();
-        let wrapper = module.wrapper.clone();
-        match evaluate.apply(&wrapper, &Array::new()) {
-            Ok(_) => {
-                let promise: JsValue = Promise::resolve(&JsValue::UNDEFINED).into();
-                let module = state
-                    .synthetic_modules
-                    .get_mut(&handle_id)
-                    .expect("synthetic module disappeared during evaluation");
-                module.status = 4;
-                module.evaluation = Some(promise.clone());
-                return Ok(promise);
-            }
-            Err(error) => {
-                let module = state
-                    .synthetic_modules
-                    .get_mut(&handle_id)
-                    .expect("synthetic module disappeared during evaluation");
-                module.status = 5;
-                module.error = Some(error.clone());
-                return Err(error);
-            }
-        }
-    }
-
-    let evaluation = wasmer_napi_create_module_evaluation();
-    let promise = Reflect::get(&evaluation, &JsValue::from_str("promise"))?;
-
-    let (linked_handles, execute, namespace, url) = {
-        let Some(module) = state.source_text_modules.get_mut(&handle_id) else {
-            return Err(TypeError::new("Unknown module handle").into());
-        };
-        if module.linked_handles.len() != module.requests.length() as usize {
-            return Err(TypeError::new("Module must be linked before evaluation").into());
-        }
-        module.status = 3;
-        module.evaluation = Some(promise.clone());
-        (
-            module.linked_handles.clone(),
-            module.execute.clone(),
-            module.namespace.clone(),
-            module.url.clone(),
-        )
-    };
-
-    let dependencies = Array::new();
-    let imports = Array::new();
-    for (index, linked_handle) in linked_handles.into_iter().enumerate() {
-        let dependency = match start_module_evaluation(state, linked_handle) {
-            Ok(value) => value,
-            Err(error) => {
-                wasmer_napi_reject_module_evaluation(&evaluation, &error);
-                return Ok(promise);
-            }
-        };
-        dependencies.set(index as u32, dependency);
-        let Some(namespace) = module_namespace(state, linked_handle) else {
-            let error: JsValue = TypeError::new("Linked module disappeared").into();
-            wasmer_napi_reject_module_evaluation(&evaluation, &error);
-            return Ok(promise);
-        };
-        imports.set(index as u32, namespace.into());
-    }
-    let import_meta = Object::new();
-    Reflect::set(
-        &import_meta,
-        &JsValue::from_str("url"),
-        &JsValue::from_str(&url),
-    )?;
-    wasmer_napi_finish_module_evaluation(
-        &evaluation,
-        &dependencies,
-        &execute,
-        &imports,
-        &namespace,
-        &import_meta,
-    );
-    Ok(promise)
+enum ModuleStart {
+    Cached(JsValue),
+    Failed {
+        error: JsValue,
+        cache: bool,
+    },
+    Synthetic {
+        evaluate: Function,
+        wrapper: JsValue,
+    },
+    Source {
+        linked: Vec<u32>,
+        execute: Function,
+        namespace: Object,
+        url: String,
+        has_top_level_await: bool,
+    },
 }
 
-fn refresh_module_status(state: &mut HostJsEnv, handle_id: u32) -> Result<i32, i32> {
-    let Some(evaluation) = module_evaluation(state, handle_id) else {
-        return state
-            .synthetic_modules
-            .get(&handle_id)
-            .map(|module| module.status)
-            .or_else(|| {
-                state
-                    .source_text_modules
-                    .get(&handle_id)
-                    .map(|module| module.status)
-            })
-            .ok_or(NAPI_INVALID_ARG);
-    };
-    let details = wasmer_napi_get_promise_details(&evaluation);
-    let promise_state = details.get(0).as_f64().unwrap_or(0.0) as i32;
-    let result = details.get(1);
-    let (status, error) = match promise_state {
-        1 => (4, None),
-        2 => (5, Some(result)),
-        _ => (3, None),
-    };
-    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-        module.status = status;
-        if error.is_some() {
-            module.error = error;
+fn update_module(
+    access: &LiveEnv,
+    handle: u32,
+    update: impl FnOnce(&mut i32, &mut Option<JsValue>, &mut Option<JsValue>),
+) -> Result<(), JsValue> {
+    access.with(|state| {
+        if let Some(module) = state.synthetic_modules.get_mut(&handle) {
+            update(
+                &mut module.status,
+                &mut module.error,
+                &mut module.evaluation,
+            );
+        } else if let Some(module) = state.source_text_modules.get_mut(&handle) {
+            update(
+                &mut module.status,
+                &mut module.error,
+                &mut module.evaluation,
+            );
+        } else {
+            return Err(missing_module());
         }
-    } else if let Some(module) = state.source_text_modules.get_mut(&handle_id) {
-        module.status = status;
-        if error.is_some() {
-            module.error = error;
+        Ok(())
+    })?
+}
+
+fn start_module_evaluation(access: &LiveEnv, handle: u32) -> Result<JsValue, JsValue> {
+    let input = access.with(|state| {
+        if let Some(evaluation) = module_evaluation(state, handle) {
+            return Ok(ModuleStart::Cached(evaluation));
         }
-    } else {
-        return Err(NAPI_INVALID_ARG);
+        if let Some(module) = state.synthetic_modules.get_mut(&handle) {
+            if let Some(error) = &module.error {
+                return Ok(ModuleStart::Failed {
+                    error: error.clone(),
+                    cache: false,
+                });
+            }
+            if module.status == 3 {
+                return Err(JsValue::from_str("Synthetic module is already evaluating"));
+            }
+            module.status = 3;
+            return Ok(ModuleStart::Synthetic {
+                evaluate: module.evaluate.clone(),
+                wrapper: module.wrapper.clone(),
+            });
+        }
+        let module = state
+            .source_text_modules
+            .get(&handle)
+            .ok_or_else(missing_module)?;
+        if let Some(error) = &module.error {
+            return Ok(ModuleStart::Failed {
+                error: error.clone(),
+                cache: true,
+            });
+        }
+        if module.status == 3 {
+            return Err(JsValue::from_str("Module is already evaluating"));
+        }
+        if module.linked_handles.len() != module.request_count as usize {
+            return Err(JsValue::from_str("Module must be linked before evaluation"));
+        }
+        Ok(ModuleStart::Source {
+            linked: module.linked_handles.clone(),
+            execute: module.execute.clone(),
+            namespace: module.namespace.clone(),
+            url: module.url.clone(),
+            has_top_level_await: module.has_top_level_await,
+        })
+    })??;
+    match input {
+        ModuleStart::Cached(promise) => Ok(promise),
+        ModuleStart::Failed { error, cache } => {
+            let promise = wasmer_napi_rejected_module_evaluation(&error)?;
+            if cache {
+                update_module(access, handle, |_, _, saved| *saved = Some(promise.clone()))?;
+            }
+            Ok(promise)
+        }
+        ModuleStart::Synthetic { evaluate, wrapper } => {
+            match wasmer_napi_apply(&evaluate, &wrapper, &[]) {
+                Ok(_) => {
+                    let promise = wasmer_napi_resolved_module_evaluation()?;
+                    update_module(access, handle, |status, _, evaluation| {
+                        *status = 4;
+                        *evaluation = Some(promise.clone());
+                    })?;
+                    Ok(promise)
+                }
+                Err(error) => {
+                    // The native synthetic evaluator also reports its first throw directly.
+                    let _ = update_module(access, handle, |status, saved, _| {
+                        *status = 5;
+                        *saved = Some(error.clone());
+                    });
+                    Err(error)
+                }
+            }
+        }
+        ModuleStart::Source {
+            linked,
+            execute,
+            namespace,
+            url,
+            has_top_level_await,
+        } => {
+            let evaluation = wasmer_napi_create_module_evaluation()?;
+            let promise = wasmer_napi_module_evaluation_promise(&evaluation);
+            update_module(access, handle, |status, _, saved| {
+                *status = 3;
+                *saved = Some(promise.clone());
+            })?;
+            let mut dependencies = Vec::with_capacity(linked.len());
+            let mut imports = Vec::with_capacity(linked.len());
+            for dependency in linked {
+                match start_module_evaluation(access, dependency) {
+                    Ok(promise) => dependencies.push(promise),
+                    Err(error) => {
+                        wasmer_napi_reject_module_evaluation(&evaluation, &error)?;
+                        return Ok(promise);
+                    }
+                }
+                let dependency_namespace = match access
+                    .with(|state| module_namespace(state, dependency))
+                    .and_then(|namespace| namespace.ok_or_else(missing_module))
+                {
+                    Ok(namespace) => namespace,
+                    Err(error) => {
+                        wasmer_napi_reject_module_evaluation(&evaluation, &error)?;
+                        return Ok(promise);
+                    }
+                };
+                imports.push(dependency_namespace.into());
+            }
+            if let Err(error) = wasmer_napi_finish_module_evaluation(
+                &evaluation,
+                &dependencies,
+                &execute,
+                &imports,
+                &namespace,
+                &url,
+                has_top_level_await,
+            ) {
+                wasmer_napi_reject_module_evaluation(&evaluation, &error)?;
+            }
+            // A user callback may have removed the record while setting up evaluation.
+            access
+                .with(|state| module_namespace(state, handle))?
+                .ok_or_else(missing_module)?;
+            Ok(promise)
+        }
     }
+}
+
+fn refresh_module_status(access: &LiveEnv, handle: u32) -> Result<i32, JsValue> {
+    let (status, evaluation) = access.with(|state| {
+        let status = state
+            .synthetic_modules
+            .get(&handle)
+            .map(|m| m.status)
+            .or_else(|| state.source_text_modules.get(&handle).map(|m| m.status))
+            .ok_or_else(missing_module)?;
+        Ok::<_, JsValue>((status, module_evaluation(state, handle)))
+    })??;
+    if status == 4 || status == 5 || evaluation.is_none() {
+        return Ok(status);
+    }
+    let details = wasmer_napi_checked_promise_details(evaluation.as_ref().unwrap())?
+        .ok_or_else(missing_module)?;
+    let promise_state = details.get(0).as_f64().unwrap_or(0.0) as i32;
+    let error = (promise_state == 2).then(|| details.get(1));
+    let status = match promise_state {
+        1 => 4,
+        2 => 5,
+        _ => 3,
+    };
+    update_module(access, handle, |saved_status, saved_error, _| {
+        *saved_status = status;
+        if error.is_some() {
+            *saved_error = error;
+        }
+    })?;
     Ok(status)
 }
 
+enum ModuleSync {
+    Done(Object),
+    TopLevelAwait,
+    Synthetic {
+        evaluate: Function,
+        wrapper: JsValue,
+        namespace: Object,
+    },
+    Source {
+        linked: Vec<u32>,
+        execute: Function,
+        namespace: Object,
+        url: String,
+    },
+}
+
 fn evaluate_module_sync(
-    state: &mut HostJsEnv,
-    handle_id: u32,
+    access: &LiveEnv,
+    handle: u32,
     visiting: &mut Vec<u32>,
 ) -> Result<Object, JsValue> {
-    if visiting.contains(&handle_id) {
-        return module_namespace(state, handle_id)
-            .ok_or_else(|| TypeError::new("Unknown module handle").into());
-    }
-    if let Some(module) = state.synthetic_modules.get(&handle_id) {
-        if module.status == 4 {
-            return Ok(module.namespace.clone());
+    refresh_module_status(access, handle)?;
+    let input = access.with(|state| {
+        let has_async_graph = module_graph_has_top_level_await(state, handle, &mut Vec::new())
+            .ok_or_else(missing_module)?;
+        if visiting.contains(&handle) {
+            return module_namespace(state, handle)
+                .map(ModuleSync::Done)
+                .ok_or_else(missing_module);
         }
-        let evaluate = module.evaluate.clone();
-        let wrapper = module.wrapper.clone();
-        let namespace = module.namespace.clone();
-        state.synthetic_modules.get_mut(&handle_id).unwrap().status = 3;
-        evaluate.apply(&wrapper, &Array::new())?;
-        state.synthetic_modules.get_mut(&handle_id).unwrap().status = 4;
-        return Ok(namespace);
-    }
-
-    let (linked_handles, execute, namespace, url, has_top_level_await) = {
-        let Some(module) = state.source_text_modules.get(&handle_id) else {
-            return Err(TypeError::new("Unknown module handle").into());
-        };
-        (
-            module.linked_handles.clone(),
-            module.execute.clone(),
-            module.namespace.clone(),
-            module.url.clone(),
-            module.has_top_level_await,
-        )
+        if let Some(module) = state.synthetic_modules.get_mut(&handle) {
+            if module.status == 4 {
+                return Ok(ModuleSync::Done(module.namespace.clone()));
+            }
+            if let Some(error) = &module.error {
+                return Err(error.clone());
+            }
+            if module.status == 3 {
+                return Err(JsValue::from_str("Synthetic module is already evaluating"));
+            }
+            module.status = 3;
+            return Ok(ModuleSync::Synthetic {
+                evaluate: module.evaluate.clone(),
+                wrapper: module.wrapper.clone(),
+                namespace: module.namespace.clone(),
+            });
+        }
+        let module = state
+            .source_text_modules
+            .get_mut(&handle)
+            .ok_or_else(missing_module)?;
+        if let Some(error) = &module.error {
+            return Err(error.clone());
+        }
+        if has_async_graph {
+            return Ok(ModuleSync::TopLevelAwait);
+        }
+        if module.status == 4 {
+            return Ok(ModuleSync::Done(module.namespace.clone()));
+        }
+        if module.status == 3 {
+            return Err(JsValue::from_str("Module is already evaluating"));
+        }
+        module.status = 3;
+        Ok(ModuleSync::Source {
+            linked: module.linked_handles.clone(),
+            execute: module.execute.clone(),
+            namespace: module.namespace.clone(),
+            url: module.url.clone(),
+        })
+    })??;
+    let input = match input {
+        ModuleSync::Done(namespace) => return Ok(namespace),
+        ModuleSync::TopLevelAwait => {
+            return Err(wasmer_napi_module_type_error(
+                "Cannot synchronously evaluate a module graph with top-level await",
+            )?
+            .into());
+        }
+        input => input,
     };
-    if has_top_level_await {
-        return Err(TypeError::new(
-            "Cannot synchronously evaluate a module graph with top-level await",
-        )
-        .into());
+    let result: Result<Object, JsValue> = (|| match input {
+        ModuleSync::Done(_) | ModuleSync::TopLevelAwait => unreachable!(),
+        ModuleSync::Synthetic {
+            evaluate,
+            wrapper,
+            namespace,
+        } => {
+            wasmer_napi_apply(&evaluate, &wrapper, &[])?;
+            let promise = wasmer_napi_resolved_module_evaluation()?;
+            update_module(access, handle, |status, _, saved| {
+                *status = 4;
+                *saved = Some(promise);
+            })?;
+            Ok(namespace)
+        }
+        ModuleSync::Source {
+            linked,
+            execute,
+            namespace,
+            url,
+        } => {
+            visiting.push(handle);
+            let mut imports = Vec::with_capacity(linked.len());
+            for dependency in linked {
+                imports.push(evaluate_module_sync(access, dependency, visiting)?.into());
+            }
+            visiting.pop();
+            wasmer_napi_execute_module(&execute, &imports, &namespace, &url)?;
+            let promise = wasmer_napi_resolved_module_evaluation()?;
+            update_module(access, handle, |status, _, saved| {
+                *status = 4;
+                *saved = Some(promise);
+            })?;
+            Ok(namespace)
+        }
+    })();
+    if let Err(error) = &result {
+        let _ = update_module(access, handle, |status, saved, _| {
+            *status = 5;
+            *saved = Some(error.clone());
+        });
     }
-    state
-        .source_text_modules
-        .get_mut(&handle_id)
-        .unwrap()
-        .status = 3;
-    visiting.push(handle_id);
-    let imports = Array::new();
-    for (index, linked_handle) in linked_handles.into_iter().enumerate() {
-        let dependency_namespace = evaluate_module_sync(state, linked_handle, visiting)?;
-        imports.set(index as u32, dependency_namespace.into());
-    }
-    visiting.pop();
-    let import_meta = Object::new();
-    Reflect::set(
-        &import_meta,
-        &JsValue::from_str("url"),
-        &JsValue::from_str(&url),
-    )?;
-    let args = Array::new();
-    args.push(&imports);
-    args.push(&namespace);
-    args.push(&import_meta);
-    execute.apply(&JsValue::UNDEFINED, &args)?;
-    state
-        .source_text_modules
-        .get_mut(&handle_id)
-        .unwrap()
-        .status = 4;
-    Ok(namespace)
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -5331,20 +5599,19 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate(
     break_on_sigint: i32,
     result_out: *mut u32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
     let _ = (timeout, break_on_sigint);
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    match start_module_evaluation(state, handle_id) {
-        Ok(promise) => {
-            let id = state.insert(promise);
-            unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
-        }
-        Err(error) => {
-            state.last_exception = Some(error);
-            NAPI_PENDING_EXCEPTION
-        }
+    unsafe {
+        reflect_op(
+            env,
+            result_out,
+            |state| {
+                Ok(LiveEnv {
+                    env,
+                    token: state.live_env_addr.clone(),
+                })
+            },
+            |access| start_module_evaluation(&access, handle_id),
+        )
     }
 }
 #[unsafe(no_mangle)]
@@ -5355,27 +5622,19 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_evaluate_sync(
     parent_filename_id: u32,
     result_out: *mut u32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
     let _ = (filename_id, parent_filename_id);
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    match evaluate_module_sync(state, handle_id, &mut Vec::new()) {
-        Ok(namespace) => {
-            let id = state.insert(namespace.into());
-            unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
-        }
-        Err(error) => {
-            if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-                module.status = 5;
-                module.error = Some(error.clone());
-            } else if let Some(module) = state.source_text_modules.get_mut(&handle_id) {
-                module.status = 5;
-                module.error = Some(error.clone());
-            }
-            state.last_exception = Some(error);
-            NAPI_PENDING_EXCEPTION
-        }
+    unsafe {
+        reflect_op(
+            env,
+            result_out,
+            |state| {
+                Ok(LiveEnv {
+                    env,
+                    token: state.live_env_addr.clone(),
+                })
+            },
+            |access| evaluate_module_sync(&access, handle_id, &mut Vec::new()).map(Into::into),
+        )
     }
 }
 #[unsafe(no_mangle)]
@@ -5424,55 +5683,64 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_get_state(
     error_out: *mut u32,
     has_async_graph_out: *mut i32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
     if status_out.is_null() && error_out.is_null() && has_async_graph_out.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let status = match refresh_module_status(state, handle_id) {
-        Ok(status) => status,
-        Err(error) => return error,
-    };
-    let has_async_graph = if has_async_graph_out.is_null() {
-        None
-    } else {
-        let Some(has_async_graph) =
-            module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
-        else {
-            return NAPI_INVALID_ARG;
-        };
-        Some(status >= 2 && has_async_graph)
-    };
-    if !status_out.is_null()
-        && let Err(error) = unsafe { write(status_out, status) }
-    {
-        return error;
+    unsafe {
+        with_js_call(
+            env,
+            |state| {
+                if !state.synthetic_modules.contains_key(&handle_id)
+                    && !state.source_text_modules.contains_key(&handle_id)
+                {
+                    return Err(NAPI_INVALID_ARG);
+                }
+                Ok(LiveEnv {
+                    env,
+                    token: state.live_env_addr.clone(),
+                })
+            },
+            |access| refresh_module_status(&access, handle_id),
+            |state, status| {
+                let graph = if has_async_graph_out.is_null() {
+                    None
+                } else {
+                    let Some(graph) =
+                        module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+                    else {
+                        return NAPI_INVALID_ARG;
+                    };
+                    Some(status >= 2 && graph)
+                };
+                if !status_out.is_null() && write(status_out, status).is_err() {
+                    return NAPI_INVALID_ARG;
+                }
+                if !error_out.is_null() {
+                    let error = state
+                        .synthetic_modules
+                        .get(&handle_id)
+                        .and_then(|m| m.error.clone())
+                        .or_else(|| {
+                            state
+                                .source_text_modules
+                                .get(&handle_id)
+                                .and_then(|m| m.error.clone())
+                        })
+                        .unwrap_or(JsValue::UNDEFINED);
+                    let id = state.insert(error);
+                    if write(error_out, id).is_err() {
+                        return NAPI_INVALID_ARG;
+                    }
+                }
+                if let Some(graph) = graph
+                    && write(has_async_graph_out, i32::from(graph)).is_err()
+                {
+                    return NAPI_INVALID_ARG;
+                }
+                NAPI_OK
+            },
+        )
     }
-    if !error_out.is_null() {
-        let error = state
-            .synthetic_modules
-            .get(&handle_id)
-            .and_then(|module| module.error.clone())
-            .or_else(|| {
-                state
-                    .source_text_modules
-                    .get(&handle_id)
-                    .and_then(|module| module.error.clone())
-            })
-            .unwrap_or(JsValue::UNDEFINED);
-        let error_id = state.insert(error);
-        if let Err(error) = unsafe { write(error_out, error_id) } {
-            return error;
-        }
-    }
-    if let Some(has_async_graph) = has_async_graph
-        && let Err(error) = unsafe { write(has_async_graph_out, i32::from(has_async_graph)) }
-    {
-        return error;
-    }
-    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
@@ -5481,21 +5749,32 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_check_unsettled_top
     warnings: i32,
     settled_out: *mut i32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
     let _ = warnings;
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let settled = if state.source_text_modules.contains_key(&handle_id) {
-        let is_async =
-            module_graph_has_top_level_await(state, handle_id, &mut Vec::new()).unwrap_or(false);
-        !is_async || refresh_module_status(state, handle_id).unwrap_or(4) != 3
-    } else if state.synthetic_modules.contains_key(&handle_id) {
-        true
-    } else {
-        return NAPI_INVALID_ARG;
-    };
-    unsafe { write(settled_out, i32::from(settled)) }.map_or_else(|error| error, |()| NAPI_OK)
+    unsafe {
+        with_js_call(
+            env,
+            |state| {
+                let graph = module_graph_has_top_level_await(state, handle_id, &mut Vec::new())
+                    .ok_or(NAPI_INVALID_ARG)?;
+                Ok((
+                    LiveEnv {
+                        env,
+                        token: state.live_env_addr.clone(),
+                    },
+                    graph,
+                ))
+            },
+            |(access, graph)| {
+                if !graph {
+                    return Ok(true);
+                }
+                refresh_module_status(&access, handle_id).map(|status| status != 3)
+            },
+            |_, settled| {
+                write(settled_out, i32::from(settled)).map_or_else(|status| status, |()| NAPI_OK)
+            },
+        )
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_export(
@@ -5504,35 +5783,45 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_set_export(
     export_name_id: u32,
     export_value_id: u32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(name) = state.get(export_name_id).and_then(JsValue::as_string) else {
-        return NAPI_STRING_EXPECTED;
-    };
-    let Some(value) = state.get(export_value_id).cloned() else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(module) = state.synthetic_modules.get_mut(&handle_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    if !module
-        .export_names
-        .iter()
-        .any(|candidate| candidate == &name)
-    {
-        state.last_exception =
-            Some(TypeError::new("Synthetic module export is not defined").into());
-        return NAPI_PENDING_EXCEPTION;
-    }
-    match Reflect::set(&module.namespace, &JsValue::from_str(&name), &value) {
-        Ok(true) => NAPI_OK,
-        Ok(false) => NAPI_GENERIC_FAILURE,
-        Err(error) => {
-            state.last_exception = Some(error);
-            NAPI_PENDING_EXCEPTION
-        }
+    unsafe {
+        with_js_call(
+            env,
+            |state| {
+                let name = state
+                    .get(export_name_id)
+                    .and_then(JsValue::as_string)
+                    .ok_or(NAPI_STRING_EXPECTED)?;
+                let value = state
+                    .get(export_value_id)
+                    .cloned()
+                    .ok_or(NAPI_INVALID_ARG)?;
+                let module = state
+                    .synthetic_modules
+                    .get(&handle_id)
+                    .ok_or(NAPI_INVALID_ARG)?;
+                let declared = module
+                    .export_names
+                    .iter()
+                    .any(|candidate| candidate == &name);
+                Ok((module.namespace.clone(), name, value, declared))
+            },
+            |(namespace, name, value, declared)| {
+                if !declared {
+                    return Err(wasmer_napi_module_type_error(
+                        "Synthetic module export is not defined",
+                    )?
+                    .into());
+                }
+                Reflect::set(&namespace, &JsValue::from_str(&name), &value)
+            },
+            |_, stored| {
+                if stored {
+                    NAPI_OK
+                } else {
+                    NAPI_GENERIC_FAILURE
+                }
+            },
+        )
     }
 }
 #[unsafe(no_mangle)]
@@ -5581,15 +5870,22 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_required_mod
     handle_id: u32,
     result_out: *mut u32,
 ) -> i32 {
-    let _operation = unsafe { HostJsOperation::enter(env) };
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Some(namespace) = module_namespace(state, handle_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    let id = state.insert(namespace.into());
-    unsafe { write(result_out, id) }.map_or_else(|error| error, |()| NAPI_OK)
+    unsafe {
+        reflect_op(
+            env,
+            result_out,
+            |state| {
+                Ok(LiveEnv {
+                    env,
+                    token: state.live_env_addr.clone(),
+                })
+            },
+            |access| {
+                let namespace = evaluate_module_sync(&access, handle_id, &mut Vec::new())?;
+                wasmer_napi_module_facade(&namespace)
+            },
+        )
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_instanceof(

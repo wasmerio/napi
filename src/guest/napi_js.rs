@@ -1816,7 +1816,7 @@ fn guest_unofficial_napi_module_wrap_create(
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1834,7 +1834,7 @@ fn guest_unofficial_napi_module_wrap_create(
             &mut requests_id,
             &mut has_top_level_await,
         )
-    };
+    });
     if status == 0 {
         write_guest_u32(&mut env, result_ptr as u32, handle_id);
         write_guest_u32(&mut env, result_ptr as u32 + 4, requests_id);
@@ -1971,7 +1971,7 @@ fn guest_unofficial_napi_module_wrap_get_state(
     let mut status_val = 0i32;
     let mut error_id = 0u32;
     let mut has_async_graph = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_get_state(
             env_handle,
             handle as u32,
@@ -1991,7 +1991,7 @@ fn guest_unofficial_napi_module_wrap_get_state(
                 std::ptr::null_mut()
             },
         )
-    };
+    });
     if status == 0 {
         if status_ptr > 0 {
             write_guest_i32(&mut env, status_ptr as u32, status_val);
@@ -2020,14 +2020,14 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     let env_handle = snapi_env(&env, napi_env);
     let handle_id = if handle > 0 { handle as u32 } else { 0 };
     let mut settled = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
             warnings,
             &mut settled,
         )
-    };
+    });
     if status == 0 && settled_ptr > 0 {
         write_guest_u8(&mut env, settled_ptr as u32, (settled != 0) as u8);
     }
@@ -2035,14 +2035,14 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
 }
 
 fn guest_unofficial_napi_module_wrap_set_export(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
     export_name: i32,
     export_value: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe {
+    with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_set_export(
             env_handle,
             handle as u32,
@@ -2053,7 +2053,7 @@ fn guest_unofficial_napi_module_wrap_set_export(
                 0
             },
         )
-    }
+    })
 }
 
 fn guest_unofficial_napi_module_wrap_set_module_source_object(
@@ -2146,13 +2146,13 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
             env_handle,
             handle as u32,
             &mut result_id,
         )
-    };
+    });
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
