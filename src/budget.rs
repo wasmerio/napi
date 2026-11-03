@@ -603,6 +603,18 @@ struct MemoryCharge {
     budget: Arc<ResourceBudget>,
     /// Bytes currently charged for this allocation.
     bytes: AtomicU64,
+    // One real allocation mutation at a time, shared across wrapped clones.
+    mutating: AtomicBool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MemoryMutation<'a>(&'a AtomicBool);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for MemoryMutation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -612,7 +624,17 @@ impl MemoryCharge {
         Ok(Arc::new(Self {
             budget,
             bytes: AtomicU64::new(bytes),
+            mutating: AtomicBool::new(false),
         }))
+    }
+
+    fn begin_mutation(&self) -> Result<MemoryMutation<'_>, MemoryError> {
+        self.mutating
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                MemoryError::Generic("a shared memory mutation is already active".into())
+            })?;
+        Ok(MemoryMutation(&self.mutating))
     }
 }
 
@@ -684,6 +706,10 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
+        if delta == Pages(0) {
+            return self.inner.grow(delta);
+        }
+        let _mutation = self.charge.begin_mutation()?;
         let delta_bytes = pages_to_bytes(delta);
         // Reserve first: a denied charge must look exactly like hitting the
         // memory's maximum, so the guest's `memory.grow` returns -1.
@@ -709,10 +735,13 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
+        // Reject a competing mutation before any backend size/mapping lock.
+        let _mutation = self.charge.begin_mutation()?;
         let before = pages_to_bytes(self.inner.size());
         if min_size <= before {
-            // Already big enough; the inner call is a no-op that cannot grow.
-            return self.inner.grow_at_least(min_size);
+            // Linearize this no-op at the observed size. Delegating after a
+            // competing reset could otherwise perform uncharged actual growth.
+            return Ok(());
         }
 
         // Reserve an upper bound (page-rounded target minus current) up front,
@@ -743,6 +772,7 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn reset(&mut self) -> Result<(), MemoryError> {
+        let _mutation = self.charge.begin_mutation()?;
         self.inner.reset()?;
         // reset only ever shrinks; release the freed bytes.
         let after = pages_to_bytes(self.inner.size());
@@ -1527,5 +1557,159 @@ mod isolate_slot_panic_tests {
             .try_reserve_env(RequestedHeap::default(), Some(1))
             .unwrap();
         budget.release_env(fresh.ceiling_bytes);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod shared_memory_mutation_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Match external_accountant_tests: take the callback out of TLS before
+    // invoking it; the accountant itself remains Send + Sync and scalar-only.
+    thread_local! {
+        static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    struct Accountant(AtomicU64);
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            8 * WASM_PAGE_SIZE as u64
+        }
+        fn memory_charged(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.0.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    fn shared_memory(budget: Arc<ResourceBudget>) -> BudgetedMemory {
+        let base = BaseTunables::new();
+        let ty = MemoryType::new(1, Some(8), true);
+        let inner = base
+            .create_host_memory(&ty, &base.memory_style(&ty))
+            .unwrap();
+        BudgetedMemory::new(inner, budget).unwrap()
+    }
+
+    #[test]
+    fn reentrant_shared_mutation_preserves_exact_physical_charge() {
+        let page = WASM_PAGE_SIZE as u64;
+        for reset in [false, true] {
+            let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+            let budget = ResourceBudget::with_accountant(accountant.clone());
+            let mut memory = shared_memory(budget.clone());
+            let sibling = Rc::new(RefCell::new(memory.try_clone().unwrap()));
+            let nested = sibling.clone();
+            let denied = Arc::new(AtomicBool::new(false));
+            let observed = denied.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let result = if reset {
+                        nested.borrow_mut().reset()
+                    } else {
+                        nested.borrow_mut().grow_at_least(3 * page)
+                    };
+                    observed.store(result.is_err(), Ordering::SeqCst);
+                }));
+            });
+            memory.grow_at_least(2 * page).unwrap();
+            let physical = pages_to_bytes(memory.size());
+            let recorded = memory.charge.bytes.load(Ordering::SeqCst);
+            let pool = budget.snapshot().wasm_linear;
+            // Dispose every real memory owner BEFORE the discriminators. The
+            // old code over-records after nested grow (underflow on last Drop),
+            // or undercharges physical pages after nested reset.
+            drop(sibling);
+            drop(memory);
+            assert_eq!(
+                budget.snapshot().wasm_linear,
+                0,
+                "last physical owner must release exactly the pool's charge"
+            );
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(
+                pool, physical,
+                "the pool must match physical resident pages"
+            );
+            assert_eq!(
+                recorded, physical,
+                "last-owner charge must match physical pages"
+            );
+            assert!(denied.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn shared_mutation_token_is_released_after_accountant_panic() {
+        let page = WASM_PAGE_SIZE as u64;
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut memory = shared_memory(budget.clone());
+        let marker = Arc::new(());
+        let payload = marker.clone();
+        ON_CHARGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || std::panic::panic_any(payload)))
+        });
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| memory.grow(Pages(1))))
+                .unwrap_err();
+        assert!(Arc::ptr_eq(
+            panic.downcast_ref::<Arc<()>>().unwrap(),
+            &marker
+        ));
+        assert_eq!(memory.grow(Pages(0)).unwrap(), Pages(1));
+        assert_eq!(memory.grow(Pages(1)).unwrap(), Pages(1));
+        memory.grow_at_least(2 * page).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, 2 * page);
+        memory.reset().unwrap();
+        assert_eq!(memory.size(), Pages(0));
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        memory.grow_at_least(page).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, page);
+        drop(memory);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        assert_eq!(accountant.memory_charged(), 0);
+    }
+
+    #[test]
+    fn shared_worker_mutations_wait_for_no_callback_or_mapping_lock() {
+        let page = WASM_PAGE_SIZE as u64;
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut memory = shared_memory(budget.clone());
+        let mut sibling = memory.try_clone().unwrap();
+        let charge = memory.charge.clone();
+        let held = charge.begin_mutation().unwrap();
+        let worker = std::thread::spawn(move || {
+            let grow = sibling.grow(Pages(1)).is_err();
+            let at_least = sibling.grow_at_least(page).is_err();
+            let reset = sibling.reset().is_err();
+            let zero = sibling.grow(Pages(0)).unwrap();
+            (sibling, grow, at_least, reset, zero)
+        });
+        let (mut sibling, grow, at_least, reset, zero) = worker.join().unwrap();
+        assert!(grow && at_least && reset);
+        assert_eq!(zero, Pages(1));
+        drop(held);
+        drop(charge);
+        memory.grow(Pages(1)).unwrap();
+        sibling.grow_at_least(3 * page).unwrap();
+        assert_eq!(pages_to_bytes(memory.size()), 3 * page);
+        assert_eq!(budget.snapshot().wasm_linear, 3 * page);
+        drop(sibling);
+        drop(memory);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        assert_eq!(accountant.memory_charged(), 0);
     }
 }

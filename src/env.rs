@@ -525,7 +525,7 @@ impl NapiEnv {
             .expect("accepted provider declaration fits its signed external counter");
     }
 
-    #[cfg(any(test, not(all(target_arch = "wasm32", feature = "js"))))]
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn has_declared_external(&self, id: u32, bytes: u64) -> bool {
         bytes <= self.external_declared.get(&id).copied().unwrap_or(0)
     }
