@@ -144,14 +144,17 @@ pub(crate) struct GuestHeap {
     charged: AtomicU64,
     inner: Mutex<HeapInner>,
     leased: bool,
-    // Range owners drop before the allocation itself.
+    // Legacy heaps retain only the mapping/accounting, not a Store or VM metadata.
+    allocation_owner: Option<wasmer::sys::HostMemoryAllocation>,
+    // Leased range owners drop before their detached memory wrapper.
     _memory_owner: Option<wasmer::SharedMemory>,
 }
 
 // SAFETY: leased heaps retain the allocation independently and every chunk's
 // owner excludes replacement until the heap's last consumer drops. Legacy heaps
-// retain their existing instance-scoped lifetime. Mutable metadata is locked;
-// raw payload access still requires the caller's guest/host synchronization.
+// independently retain their static allocation and pin each allocator chunk.
+// Mutable metadata is locked; raw payload access still requires the caller's
+// guest/host synchronization.
 unsafe impl Send for GuestHeap {}
 unsafe impl Sync for GuestHeap {}
 
@@ -259,6 +262,7 @@ impl NativeGuestArena {
                 refilling: false,
             }),
             leased: true,
+            allocation_owner: None,
             _memory_owner: Some(owner),
         });
         registry.insert(base as usize, Arc::downgrade(&heap));
@@ -424,9 +428,15 @@ impl GuestHeap {
         memory: &Memory,
         budget: Arc<ResourceBudget>,
     ) -> Option<Arc<Self>> {
+        // This owned capability does not fund or grow the heap. It is needed
+        // even when advisory prefunding fails: external buffers may refer to
+        // guest-owned bytes outside every allocator chunk.
+        let allocation_owner = memory.retain_host_allocation(store).ok()?;
         let ty = memory.ty(store);
-        let view = memory.view(store);
-        let base = view.data_ptr();
+        let base = {
+            let view = memory.view(store);
+            view.data_ptr()
+        };
         if base.is_null() {
             integrity_warn("memory has no base mapping; guest heap disabled");
             return None;
@@ -461,6 +471,7 @@ impl GuestHeap {
                 refilling: false,
             }),
             leased: false,
+            allocation_owner: Some(allocation_owner),
             _memory_owner: None,
         }))
     }
@@ -667,11 +678,21 @@ impl GuestHeap {
         // A successful physical grow remains resident even if view/claim fails.
         self.charged.fetch_add(refill.charge, Ordering::AcqRel);
         refill.charge = 0;
+        let start = u64::from(previous.0) * u64::from(WASM_PAGE);
+        let end = start + delta_bytes;
+        // Exact range admission happens outside the heap mutex and before any
+        // V8 pointer can be allocated from this new chunk.
+        let Ok(pin) = memory.pin_host_range(&*store, start..end) else {
+            return false;
+        };
+        let mut owner: Option<Box<dyn Send + Sync>> = Some(Box::new(pin));
         let base_now = memory.view(store).data_ptr();
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
         let claimed = self
-            .finish_claim(&mut inner, previous, delta_pages, base_now)
+            .finish_claim(&mut inner, previous, delta_pages, base_now, &mut owner)
             .is_some();
+        drop(inner);
+        drop(owner);
         if claimed {
             refill.restore_want = None;
         }
@@ -684,6 +705,7 @@ impl GuestHeap {
         prev: Pages,
         delta_pages: u32,
         base_now: *mut u8,
+        owner: &mut Option<Box<dyn Send + Sync>>,
     ) -> Option<()> {
         // The whole design (external backing stores, cached host pointers)
         // relies on the mapping never moving. A moved base means every live
@@ -711,7 +733,11 @@ impl GuestHeap {
             start,
             len,
             alloc: OffsetAllocator::with_max_allocs(len / UNIT, chunk_max_allocs(len)),
-            _owner: None,
+            _owner: Some(
+                owner
+                    .take()
+                    .expect("new chunk has exact allocation custody"),
+            ),
         });
         inner.free_bytes += u64::from(len);
         Some(())
@@ -814,9 +840,41 @@ impl Drop for HeapRefill<'_> {
 
 impl Drop for GuestHeap {
     fn drop(&mut self) {
-        let charged = self.charged.load(Ordering::Acquire);
-        if charged > 0 {
-            self.budget.uncharge(Pool::WasmLinear, charged);
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        let unwinding = std::thread::panicking();
+        let mut first = None;
+        let mut cleanup = |f: &mut dyn FnMut()| {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(f)) {
+                if first.is_none() {
+                    first = Some(panic);
+                } else {
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+                }
+            }
+        };
+        // At last-owner Drop there is no concurrent heap borrower. Take every
+        // range owner before callbacks, then release each outside the mutex.
+        let chunks = std::mem::take(
+            &mut self
+                .inner
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .chunks,
+        );
+        for chunk in chunks {
+            let mut chunk = Some(chunk);
+            cleanup(&mut || drop(chunk.take()));
+        }
+        cleanup(&mut || drop(self._memory_owner.take()));
+        cleanup(&mut || drop(self.allocation_owner.take()));
+        let charged = self.charged.swap(0, Ordering::AcqRel);
+        cleanup(&mut || self.budget.uncharge(Pool::WasmLinear, charged));
+        if let Some(panic) = first {
+            if unwinding {
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+            } else {
+                resume_unwind(panic);
+            }
         }
     }
 }
@@ -1402,6 +1460,72 @@ mod tests {
     }
 
     #[test]
+    fn legacy_allocation_receipt_outlives_store_without_funded_chunks() {
+        let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
+        let mut store = refill_store(budget.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(64, Some(2048), false)).unwrap();
+        let heap = GuestHeap::new(&mut store.as_store_mut(), &memory, budget.clone()).unwrap();
+        assert_eq!(
+            heap.free_bytes(),
+            0,
+            "advisory prefund must really be denied"
+        );
+        // Fail safely before Store/metadata disposal if allocation custody is omitted.
+        assert!(
+            heap.allocation_owner
+                .as_ref()
+                .unwrap()
+                .allocation_owner_count()
+                > 1,
+            "an unfunded heap must retain its physical mapping"
+        );
+        let charged = budget.memory_charged();
+        assert!(charged > 0);
+        // Model ordinary guest-owned external-buffer data outside allocator chunks.
+        memory.view(&store).write(0, &[42]).unwrap();
+        drop(store);
+        let held_charge = budget.memory_charged();
+        // SAFETY: the receipt retains the static mapping; no Store or guest remains.
+        let value = unsafe { heap.base.read() };
+        drop(heap);
+        assert_eq!(value, 42);
+        assert_eq!(
+            held_charge, charged,
+            "allocation accounting outlives its Store"
+        );
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn legacy_chunk_pins_remain_usable_after_store_drop() {
+        let budget = ResourceBudget::with_memory_limit(256 * 1024 * 1024);
+        let mut store = refill_store(budget.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(2048), false)).unwrap();
+        let heap = GuestHeap::new(&mut store.as_store_mut(), &memory, budget.clone()).unwrap();
+        let offset = heap.alloc(16, true).unwrap();
+        let reset_rejected = memory.reset(&mut store).is_err();
+        drop(store);
+        let worker = heap.clone();
+        std::thread::spawn(move || {
+            // SAFETY: the exact owned chunk is still live, with no guest access.
+            let value = unsafe {
+                let pointer = worker.offset_to_host(offset);
+                pointer.write(42);
+                pointer.read()
+            };
+            assert_eq!(value, 42);
+            assert!(worker.free_offset(offset));
+        })
+        .join()
+        .unwrap();
+        let held_charge = budget.memory_charged();
+        drop(heap);
+        assert!(reset_rejected);
+        assert!(held_charge > 0);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
     fn budget_charged_and_released_on_drop() {
         let mut store = Store::default();
         // Under the prefund, so the arena claims what the budget allows and no
@@ -1504,8 +1628,14 @@ mod tests {
         {
             let mut inner = heap.inner.lock().unwrap();
             assert!(
-                heap.finish_claim(&mut inner, Pages(2048), 1, heap.base)
-                    .is_none()
+                heap.finish_claim(
+                    &mut inner,
+                    Pages(2048),
+                    1,
+                    heap.base,
+                    &mut Some(Box::new(())),
+                )
+                .is_none()
             );
         }
         assert_eq!(budget.memory_charged(), charged);

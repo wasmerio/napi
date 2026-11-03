@@ -686,6 +686,29 @@ fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LinearMemory for BudgetedMemory {
+    fn retain_host_allocation(&self) -> Result<wasmer::sys::HostMemoryAllocation, MemoryError> {
+        let mut allocation = self.inner.retain_host_allocation()?;
+        if allocation.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "allocation already has an accounting owner".into(),
+            ));
+        }
+        Ok(allocation)
+    }
+
+    fn pin_host_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<wasmer::sys::HostMemoryPin, MemoryError> {
+        let mut pin = self.inner.pin_host_range(range)?;
+        if pin.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "host range already has an accounting owner".into(),
+            ));
+        }
+        Ok(pin)
+    }
+
     fn ty(&self) -> MemoryType {
         self.inner.ty()
     }
