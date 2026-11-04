@@ -129,6 +129,9 @@ impl Drop for DeclaredExternalCharge {
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 struct NativeRetiredProvider {
     state: Option<SnapiEnv>,
+    // V8 is gone and bridge membership is erased, but its allocation cannot
+    // be reused until the original held cell has removed its guest-id rows.
+    retired_state: Option<SnapiEnv>,
     charge: Option<EnvHeapChargeHandle>,
     external: u64,
 }
@@ -148,6 +151,20 @@ pub(crate) struct NativeRetirement {
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl NativeRetirement {
     pub(crate) fn dispose(&mut self) -> i32 {
+        // Explicit release removes original-cell resolution rows after this
+        // call and before dropping the plan's now-inert state allocation.
+        self.dispose_with_mode(false)
+    }
+    #[cfg(test)]
+    pub(crate) fn forget_retired_states_for_probe(&mut self) {
+        // Only the allocation-count sensitivity uses this if its mutant has
+        // already freed the shell. Never destroy a pointer disproved by it.
+        for provider in &mut self.providers {
+            provider.retired_state = None;
+        }
+    }
+
+    fn dispose_with_mode(&mut self, cleanup: bool) -> i32 {
         struct Notification<'a> {
             registry: &'a std::sync::Mutex<HashSet<usize>>,
             state: usize,
@@ -174,10 +191,15 @@ impl NativeRetirement {
                 let result = unsafe {
                     crate::snapi::snapi_bridge_finish_retirement(
                         state,
+                        i32::from(cleanup),
                         before_destroy,
                         (&mut notification as *mut Notification<'_>).cast(),
                     )
                 };
+                // The private CPP protocol always consumes the provider,
+                // including managed-admission fallback. Its inert shell stays
+                // uniquely owned here across SDK wake/reentry until plan Drop.
+                provider.retired_state = Some(state);
                 if status == 0 {
                     status = result;
                 }
@@ -188,8 +210,8 @@ impl NativeRetirement {
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-impl Drop for NativeRetirement {
-    fn drop(&mut self) {
+impl NativeRetirement {
+    fn finish(&mut self) {
         use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
         let unwinding = std::thread::panicking();
         let mut first = None;
@@ -204,9 +226,16 @@ impl Drop for NativeRetirement {
         };
         // Finish every provider before releasing any tracker or reservation.
         cleanup(&mut || {
-            self.dispose();
+            self.dispose_with_mode(true);
         });
         for provider in &mut self.providers {
+            if let Some(state) = provider.retired_state.take() {
+                // Host plans cleared rows before disposal; explicit release's
+                // held original temporary did so before this final plan Drop.
+                unsafe {
+                    crate::snapi::snapi_bridge_destroy_retired_state(state);
+                }
+            }
             if let Some(handle) = provider.charge.take() {
                 let granted = handle
                     .tracker
@@ -249,6 +278,45 @@ impl Drop for NativeRetirement {
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl Drop for NativeRetirement {
+    fn drop(&mut self) {
+        if unsafe { crate::snapi::snapi_v8_allocator_active() } != 0
+            && self
+                .providers
+                .iter()
+                .any(|provider| provider.state.is_some())
+        {
+            // All logical rows were sealed/taken before constructing the plan.
+            // Move only owned resources; the empty shell cannot run a callback.
+            let plan = Self {
+                providers: std::mem::take(&mut self.providers),
+                registry: self.registry.clone(),
+                budget: self.budget.clone(),
+                leases: std::mem::take(&mut self.leases),
+                heap: self.heap.take(),
+                memory: self.memory.take(),
+                table: self.table.take(),
+                external: std::mem::take(&mut self.external),
+            };
+            match crate::native_frame::defer_retirement(plan) {
+                None => return,
+                Some(_plan) => {
+                    // The private default V8 worker pool can first enter Rust
+                    // only through the covered depth-vetoed FFIs. It cannot
+                    // acquire a provider-bearing Store there. Every supported
+                    // foreground path owns its physical retirement holder.
+                    // Destructive raw Store collection transfer is outside this
+                    // profile. A violated internal custody protocol must never
+                    // dispose V8 in an allocator or free its retained mapping.
+                    std::process::abort();
+                }
+            }
+        }
+        crate::native_frame::host_cleanup(|| self.finish());
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeEnvIds {
     pub(crate) env: u32,
@@ -279,6 +347,7 @@ impl NativeCreationRequest {
         let retirement = NativeRetirement {
             providers: vec![NativeRetiredProvider {
                 state: None,
+                retired_state: None,
                 charge: Some(EnvHeapChargeHandle {
                     ceiling: reservation.ceiling_bytes,
                     tracker: None,
@@ -827,6 +896,7 @@ impl NapiEnv {
                 .iter()
                 .map(|_| NativeRetiredProvider {
                     state: None,
+                    retired_state: None,
                     charge: None,
                     external: 0,
                 })
@@ -875,16 +945,6 @@ impl NapiEnv {
             retirement.heap = self.guest_heap.take();
             retirement.memory = self.memory.take();
             retirement.table = self.table.take();
-            for provider in &retirement.providers {
-                if let Some(state) = provider.state {
-                    unsafe {
-                        crate::snapi::snapi_bridge_swap_active_callback_ctx(
-                            state,
-                            std::ptr::null_mut(),
-                        );
-                    }
-                }
-            }
         }
         Some(retirement)
     }

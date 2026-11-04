@@ -1,20 +1,16 @@
+use crate::{
+    NapiEnv,
+    native_frame::{CallbackFailure, FrameHolder, ImportScope},
+    snapi::SnapiEnv,
+};
+#[cfg(test)]
+use std::sync::{Arc, atomic::Ordering};
 use std::{
-    any::Any,
-    cell::{Cell, RefCell},
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    sync::{Arc, atomic::Ordering},
 };
 
-use wasmer::sys::FunctionEnvFramePin;
 use wasmer::{AsStoreMut, FunctionEnvMut, RuntimeError, Store, StoreMut, Table, Value};
-
-use crate::{NapiEnv, snapi::SnapiEnv};
-
-enum CallbackFailure {
-    Guest(RuntimeError),
-    Panic(Box<dyn Any + Send>),
-}
 
 // Native typed handlers expose the same primitive Wasm ABI while returning
 // callback failures only after original-cell cleanup has completed.
@@ -46,12 +42,9 @@ pub(super) fn with_native_import<O: NativeImportOutput>(
     env: FunctionEnvMut<NapiEnv>,
     body: impl FnOnce(FunctionEnvMut<NapiEnv>) -> O,
 ) -> Result<O::Value, RuntimeError> {
-    // Sys imports retain their exact original allocation even after its Store
-    // slot is removed. Other backends retain their existing import behavior;
-    // native physical callback admission remains sys-only.
-    let frame = env.pin_frame();
+    let mut scope = ImportScope::enter(env.pin_frame(), Some(env.data().host_stop_flag()));
     let mut value = None;
-    let mut failure = match catch_unwind(AssertUnwindSafe(|| body(env).into_native_result())) {
+    let failure = match catch_unwind(AssertUnwindSafe(|| body(env).into_native_result())) {
         Ok(Ok(result)) => {
             value = Some(result);
             None
@@ -59,43 +52,25 @@ pub(super) fn with_native_import<O: NativeImportOutput>(
         Ok(Err(error)) => Some(CallbackFailure::Guest(error)),
         Err(panic) => Some(CallbackFailure::Panic(panic)),
     };
-    // The original FunctionEnvMut has already ended, including on panic. Its
-    // retained cell can now run its last destructor outside that body unwind.
-    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(frame))) {
-        if failure.is_none() {
-            failure = Some(CallbackFailure::Panic(panic));
-        } else {
-            let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
-        }
-    }
-    match failure {
+    scope.failure.body_finished(failure);
+    scope.finish();
+    match scope.failure.take() {
         Some(CallbackFailure::Guest(error)) => Err(error),
         Some(CallbackFailure::Panic(panic)) => resume_unwind(panic),
         None => Ok(value.unwrap()),
     }
 }
 
-/// One physical bridge call owns its callback result. Nested imports install
-/// their own context and return the original error through the guest stack.
-struct CallbackInvocationCtx {
-    environment: FunctionEnvFramePin<NapiEnv>,
-    failure: RefCell<Option<CallbackFailure>>,
-    terminated: Cell<bool>,
-    snapi_env: SnapiEnv,
-}
-
-impl CallbackInvocationCtx {
-    fn fail(&self, failure: CallbackFailure) {
-        let mut slot = self.failure.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(failure);
-            // Returning a null value alone lets JS catch and continue forever.
-            self.terminated.set(true);
-            unsafe {
-                crate::snapi::snapi_bridge_unofficial_terminate_execution(self.snapi_env);
-            }
-        }
-    }
+/// All native CPP calls now obtain their exact context from the physical
+/// header. The import row is already installed by with_native_import.
+pub fn with_callback_state<R: Copy>(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    _snapi_env: SnapiEnv,
+    body: impl FnOnce() -> R,
+) -> Result<R, RuntimeError> {
+    let result = env.as_store_mut().parked(body);
+    crate::native_frame::replay_current()?;
+    Ok(result)
 }
 
 fn call_guest_callback(
@@ -119,84 +94,12 @@ fn call_guest_callback(
     })
 }
 
-/// Lend the store only while the bridge may synchronously call the guest.
-/// Errors and panics cannot cross C++ frames; restore those frames first.
-pub fn with_callback_state<R>(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    snapi_env: SnapiEnv,
-    f: impl FnOnce() -> R,
-) -> Result<R, RuntimeError> {
-    if snapi_env.is_null() {
-        return Ok(f());
-    }
-
-    let environment = env
-        .pin_frame()
-        .ok_or_else(|| RuntimeError::new("native callbacks require the sys backend"))?;
-    let mut ctx = CallbackInvocationCtx {
-        environment,
-        failure: RefCell::new(None),
-        terminated: Cell::new(false),
-        snapi_env,
-    };
-    let host_stopped = env.data().host_stop_flag();
-    let already_terminating =
-        unsafe { crate::snapi::snapi_bridge_unofficial_is_execution_terminating(snapi_env) != 0 };
-    let prev = unsafe {
-        crate::snapi::snapi_bridge_swap_active_callback_ctx(
-            snapi_env,
-            (&mut ctx as *mut CallbackInvocationCtx).cast::<c_void>(),
-        )
-    };
-    struct CallbackStateGuard<'a> {
-        snapi_env: SnapiEnv,
-        prev: *mut c_void,
-        terminated: &'a Cell<bool>,
-        already_terminating: bool,
-        host_stopped: Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl Drop for CallbackStateGuard<'_> {
-        fn drop(&mut self) {
-            unsafe {
-                crate::snapi::snapi_bridge_swap_active_callback_ctx(self.snapi_env, self.prev);
-                if self.terminated.get()
-                    && !self.already_terminating
-                    && !self.host_stopped.load(Ordering::Acquire)
-                {
-                    crate::snapi::snapi_bridge_unofficial_cancel_terminate_execution(
-                        self.snapi_env,
-                    );
-                    // terminate_all sets its flag before entering the registry.
-                    if self.host_stopped.load(Ordering::Acquire) {
-                        crate::snapi::snapi_bridge_unofficial_terminate_execution(self.snapi_env);
-                    }
-                }
-            }
-        }
-    }
-    let result = {
-        let _guard = CallbackStateGuard {
-            snapi_env,
-            prev,
-            terminated: &ctx.terminated,
-            already_terminating,
-            host_stopped,
-        };
-        env.as_store_mut().parked(f)
-    };
-    match ctx.failure.into_inner() {
-        Some(CallbackFailure::Guest(error)) => Err(error),
-        Some(CallbackFailure::Panic(panic)) => resume_unwind(panic),
-        None => Ok(result),
-    }
-}
-
 fn invoke(callback_ctx: *mut c_void, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
     if callback_ctx.is_null() {
         return 0;
     }
     // The invocation's stack context outlives the bridge and its callbacks.
-    let ctx = unsafe { &*callback_ctx.cast::<CallbackInvocationCtx>() };
+    let ctx = unsafe { &*callback_ctx.cast::<FrameHolder>() };
     match catch_unwind(AssertUnwindSafe(|| invoke_inner(ctx, wasm_fn_ptr, args))) {
         Ok(value) => value,
         Err(panic) => {
@@ -206,12 +109,16 @@ fn invoke(callback_ctx: *mut c_void, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
     }
 }
 
-fn invoke_inner(ctx: &CallbackInvocationCtx, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
-    if ctx.failure.borrow().is_some() {
+fn invoke_inner(ctx: &FrameHolder, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
+    if ctx.failed() {
         return 0;
     }
     let dispatched = Store::with_current(|store| {
-        let Some(mut environment) = ctx.environment.try_as_env_mut(store) else {
+        let Some(mut environment) = ctx
+            .environment
+            .as_ref()
+            .and_then(|pin| pin.try_as_env_mut(store))
+        else {
             return Ok(Ok(0));
         };
         if !environment.data_mut().enter_callback() {
@@ -265,7 +172,6 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         ],
     )
 }
-
 #[unsafe(no_mangle)]
 pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     callback_ctx: *mut c_void,

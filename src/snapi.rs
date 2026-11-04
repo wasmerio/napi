@@ -51,6 +51,16 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 }
 
 unsafe extern "C" {
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_v8_allocator_active() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_heap_refill_allowed() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_current_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_retirement_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_fail_current();
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
@@ -87,9 +97,12 @@ unsafe extern "C" {
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_finish_retirement(
         state: SnapiEnv,
+        cleanup: i32,
         before_destroy: unsafe extern "C" fn(*mut core::ffi::c_void),
         data: *mut core::ffi::c_void,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_destroy_retired_state(state: SnapiEnv);
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -127,8 +140,6 @@ unsafe extern "C" {
         callback_id: u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_cancel_terminate_execution(env: SnapiEnv) -> i32;
-    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub fn snapi_bridge_unofficial_is_execution_terminating(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_request_interrupt(
         env: SnapiEnv,
         guest_env: u32,
@@ -971,6 +982,7 @@ unsafe extern "C" {
         reg_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_swap_active_callback_ctx(
         env: SnapiEnv,
         callback_ctx: *mut c_void,

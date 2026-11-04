@@ -4799,6 +4799,7 @@ dependencies = [
  "offset-allocator",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tar",
  "tokio",
  "ureq",

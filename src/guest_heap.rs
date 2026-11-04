@@ -890,28 +890,20 @@ impl Drop for GuestHeap {
 //
 // Leased contexts strongly own the heap and its exact reservations. Actual V8
 // allocator/backing-store/finalizer owners release these contexts; the global
-// registry is weak. Legacy contexts retain their existing weak policy. Copied
+// registry is weak. Legacy contexts retain the same physical custody. Copied
 // bounds keep free provenance checks independent of Store/VM metadata.
 
 use std::ffi::c_void;
 
-enum HeapContextOwner {
-    Legacy(Weak<GuestHeap>),
-    Leased(Arc<GuestHeap>),
-}
+// A BackingStore/message may outlive its source provider and Store. The heap
+// contains drop-only physical pins/accounting and no provider or Store owner.
+struct HeapContextOwner(Arc<GuestHeap>);
 impl HeapContextOwner {
     fn new(heap: &Arc<GuestHeap>) -> Self {
-        if heap.leased {
-            Self::Leased(heap.clone())
-        } else {
-            Self::Legacy(Arc::downgrade(heap))
-        }
+        Self(heap.clone())
     }
     fn upgrade(&self) -> Option<Arc<GuestHeap>> {
-        match self {
-            Self::Legacy(heap) => heap.upgrade(),
-            Self::Leased(heap) => Some(heap.clone()),
-        }
+        Some(self.0.clone())
     }
 }
 
@@ -971,20 +963,52 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     length: usize,
     zero: i32,
 ) -> *mut c_void {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
-    let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
-    let Some(heap) = ctx.heap.upgrade() else {
-        return std::ptr::null_mut();
-    };
-    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
-        .unwrap_or_else(|| heap.alloc(length, zero != 0));
-    match offset {
-        Some(offset) => heap.offset_to_host(offset).cast(),
-        None => std::ptr::null_mut(),
-    }
+    crate::native_frame::synchronous(|guard| {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
+        let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
+        let Some(heap) = ctx.heap.upgrade() else {
+            return std::ptr::null_mut();
+        };
+        // Before Isolate::Initialize completes, growth/accountant callouts
+        // cannot be followed by a legal termination of that target. Inert or
+        // callerless engine work is likewise arena-only. A direct Rust call
+        // with no V8 allocator active retains its explicitly lent Store path.
+        let refill = unsafe { crate::snapi::snapi_v8_allocator_active() } == 0
+            || unsafe { crate::snapi::snapi_bridge_native_heap_refill_allowed() } != 0;
+        let offset = if refill {
+            // Catch before the counted wrapper drops: replaying outside the
+            // closure lets it restore its borrow while not already unwinding.
+            let outcome = Store::with_current(|store| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    heap.alloc_with_store(store, length, zero != 0)
+                }))
+            });
+            match outcome {
+                Some(Ok(offset)) => offset,
+                Some(Err(panic)) => std::panic::resume_unwind(panic),
+                None => heap.alloc(length, zero != 0),
+            }
+        } else {
+            heap.alloc(length, zero != 0)
+        };
+        match offset {
+            Some(offset) => {
+                if crate::native_frame::current_physical_failed()
+                    || (!std::thread::panicking() && guard.retirement_error().is_some())
+                {
+                    heap.free_offset(offset);
+                    std::ptr::null_mut()
+                } else {
+                    heap.offset_to_host(offset).cast()
+                }
+            }
+            None => std::ptr::null_mut(),
+        }
+    })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// Free a backing store if it belongs to the guest heap. Returns 1 when the
@@ -999,44 +1023,56 @@ pub extern "C" fn napi_host_guest_heap_free(
     data: *mut c_void,
     length: usize,
 ) -> i32 {
-    if ctx.is_null() || data.is_null() {
-        return 0;
-    }
-    // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
-    let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
-    let addr = data as usize;
-    if addr < ctx.base || (addr - ctx.base) as u64 >= ctx.len {
-        return 0;
-    }
-    if let Some(heap) = ctx.heap.upgrade() {
-        heap.free_host_ptr(data.cast(), length);
-    }
-    1
+    crate::native_frame::synchronous(|_| {
+        if ctx.is_null() || data.is_null() {
+            return 0;
+        }
+        // SAFETY: `ctx` is a live GuestHeapCtx owned by the calling allocator.
+        let ctx = unsafe { &*ctx.cast::<GuestHeapCtx>() };
+        let addr = data as usize;
+        if addr < ctx.base || (addr - ctx.base) as u64 >= ctx.len {
+            return 0;
+        }
+        if let Some(heap) = ctx.heap.upgrade() {
+            heap.free_host_ptr(data.cast(), length);
+        }
+        1
+    })
+    .unwrap_or(1)
 }
 
 /// Release an allocator context (called from the allocator's destructor, or
 /// from env-creation failure paths).
 #[unsafe(no_mangle)]
 pub extern "C" fn napi_host_guest_heap_release(ctx: *mut c_void) {
-    if !ctx.is_null() {
-        // SAFETY: `ctx` came from `make_alloc_ctx` and is released exactly once.
-        drop(unsafe { Box::from_raw(ctx.cast::<GuestHeapCtx>()) });
-    }
+    crate::native_frame::synchronous(|_| {
+        if !ctx.is_null() {
+            // SAFETY: `ctx` came from `make_alloc_ctx` and is released exactly once.
+            drop(unsafe { Box::from_raw(ctx.cast::<GuestHeapCtx>()) });
+        }
+    })
+    .unwrap_or(())
 }
 
 /// Finalizer for guest-heap-backed external buffers: frees the allocation and
 /// drops the boxed context. Runs when V8 collects the buffer (any thread).
 #[unsafe(no_mangle)]
 pub extern "C" fn napi_host_guest_heap_buffer_finalize(_data: *mut c_void, hint: *mut c_void) {
-    if hint.is_null() {
-        return;
-    }
-    // SAFETY: `hint` came from `make_finalize_ctx`; the bridge calls this
-    // exactly once per successfully created buffer.
-    let ctx = unsafe { Box::from_raw(hint.cast::<GuestHeapFinalizeCtx>()) };
-    if let Some(heap) = ctx.heap.upgrade() {
-        heap.free_offset(ctx.offset);
-    }
+    crate::native_frame::synchronous(|_| {
+        if hint.is_null() {
+            return;
+        }
+        // SAFETY: `hint` came from `make_finalize_ctx`; the bridge calls this
+        // exactly once per successfully created buffer.
+        let ctx = unsafe { Box::from_raw(hint.cast::<GuestHeapFinalizeCtx>()) };
+        crate::native_frame::cleanup_phase(|| {
+            if let Some(heap) = ctx.heap.upgrade() {
+                heap.free_offset(ctx.offset);
+            }
+        });
+        crate::native_frame::cleanup_phase(|| drop(ctx));
+    })
+    .unwrap_or(())
 }
 
 #[cfg(test)]
@@ -1816,5 +1852,380 @@ mod tests {
         assert_eq!(pin_drops.load(Ordering::SeqCst), 1);
         assert_eq!(budget.memory_charged(), 0);
         assert!(weak.upgrade().is_none());
+    }
+    const MESSAGE_GUEST: &str = r#"(module
+        (import "env" "memory" (memory 1 1024 shared))
+        (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+        (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+        (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+        (import "napi" "napi_run_script" (func $run (param i32 i32 i32) (result i32)))
+        (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+        (import "napi" "napi_get_value_int32" (func $int (param i32 i32 i32) (result i32)))
+        (import "napi_extension_wasmer_v0" "unofficial_napi_message_create" (func $create (param i32 i32 i32) (result i32)))
+        (import "napi_extension_wasmer_v0" "unofficial_napi_message_take" (func $take (param i32 i32 i32) (result i32)))
+        (table (export "__indirect_function_table") 1 funcref)
+        (global $env (mut i32) (i32.const 0))
+        (data (i32.const 64) "__shared\00")
+        (func $check (param i32) local.get 0 if unreachable end)
+        (func (export "init") call $init global.set $env global.get $env i32.eqz if unreachable end)
+        (func $eval (param i32 i32)
+            global.get $env local.get 0 local.get 1 i32.const 8 call $string call $check
+            global.get $env i32.const 8 i32.load i32.const 12 call $run call $check)
+        (func (export "message") (param i32 i32) (result i32)
+            local.get 0 local.get 1 call $eval
+            global.get $env i32.const 12 i32.load i32.const 16 call $create call $check
+            i32.const 16 i32.load)
+        (func (export "take") (param i32)
+            global.get $env local.get 0 i32.const 12 call $take call $check
+            global.get $env i32.const 20 call $global call $check
+            global.get $env i32.const 20 i32.load i32.const 64 i32.const 12 i32.load call $set call $check)
+        (func (export "eval") (param i32 i32) (result i32)
+            local.get 0 local.get 1 call $eval
+            global.get $env i32.const 12 i32.load i32.const 24 call $int call $check
+            i32.const 24 i32.load))"#;
+
+    fn message_instance() -> (
+        Store,
+        crate::NapiCtx,
+        wasmer::Instance,
+        Memory,
+        crate::NapiSession,
+    ) {
+        message_instance_configured(crate::NapiCtx::default(), false, true)
+    }
+    fn message_instance_configured(
+        ctx: crate::NapiCtx,
+        metered: bool,
+        initialize: bool,
+    ) -> (
+        Store,
+        crate::NapiCtx,
+        wasmer::Instance,
+        Memory,
+        crate::NapiSession,
+    ) {
+        use wasmer::{Extern, Instance, Module};
+        let mut store = Store::default();
+        if metered {
+            store
+                .engine_mut()
+                .set_tunables(crate::budget::budgeted_tunables(ctx.budget()));
+        }
+        let module = Module::new(&store, MESSAGE_GUEST).unwrap();
+        let hooks = ctx.runtime_hooks();
+        let (imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session().unwrap().clone();
+        let Some(Extern::Memory(memory)) = imports.get_export("env", "memory") else {
+            panic!("memory");
+        };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &module,
+                &mut store.as_store_mut(),
+                &instance,
+                Some(&memory),
+                state,
+            )
+            .unwrap();
+        if initialize {
+            instance
+                .exports
+                .get_typed_function::<(), ()>(&store, "init")
+                .unwrap()
+                .call(&mut store)
+                .unwrap();
+        }
+        (store, ctx, instance, memory, session)
+    }
+
+    #[test]
+    fn legacy_shared_message_keeps_source_backing_after_provider_and_store_drop() {
+        if !refill_subprocess(
+            "guest_heap::tests::legacy_shared_message_keeps_source_backing_after_provider_and_store_drop",
+        ) {
+            return;
+        }
+        use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+        let (mut source, source_ctx, source_instance, source_memory, source_session) =
+            message_instance();
+        let script = "globalThis.__shared = new SharedArrayBuffer(64); new Uint8Array(__shared)[0] = 42; __shared";
+        source_memory
+            .view(&source)
+            .write(1024, script.as_bytes())
+            .unwrap();
+        let payload = source_instance
+            .exports
+            .get_typed_function::<(i32, i32), i32>(&source, "message")
+            .unwrap()
+            .call(&mut source, 1024, script.len() as i32)
+            .unwrap();
+        // Observe actual provider allocator custody while its Env/Store still
+        // exist. A missing strong context fails HERE, before any old mapping
+        // could be freed or a target could read a stale backing-store pointer.
+        let (owners, heap) = VMFunctionEnvironment::list(source.objects_mut().as_sys_mut())
+            .iter()
+            .find_map(|owner| {
+                let env = owner.as_ref().downcast_ref::<crate::NapiEnv>()?;
+                let heap = env.guest_heap.as_ref()?;
+                Some((Arc::strong_count(heap), Arc::downgrade(heap)))
+            })
+            .unwrap();
+        assert!(
+            owners > 1,
+            "real provider allocator must retain the legacy heap"
+        );
+        unsafe {
+            source_session.deactivate(&mut source.as_store_mut());
+        }
+        drop(source_instance);
+        drop(source_session);
+        drop(source);
+        assert_eq!(source_ctx.budget().snapshot().live_isolates, 0);
+        assert!(source_ctx.budget().snapshot().wasm_linear > 0);
+        assert!(heap.upgrade().is_some());
+        // The payload owns V8's real shared BackingStore/allocator, rather than
+        // a copied byte vector or a modeled pin. A new provider reads it.
+        let (value, target_usage) = std::thread::spawn(move || {
+            let (mut target, target_ctx, target_instance, target_memory, target_session) =
+                message_instance();
+            target_instance
+                .exports
+                .get_typed_function::<i32, ()>(&target, "take")
+                .unwrap()
+                .call(&mut target, payload)
+                .unwrap();
+            let read = "new Uint8Array(__shared)[0]";
+            target_memory
+                .view(&target)
+                .write(1024, read.as_bytes())
+                .unwrap();
+            let value = target_instance
+                .exports
+                .get_typed_function::<(i32, i32), i32>(&target, "eval")
+                .unwrap()
+                .call(&mut target, 1024, read.len() as i32)
+                .unwrap();
+            unsafe {
+                target_session.deactivate(&mut target.as_store_mut());
+            }
+            drop(target_instance);
+            drop(target_session);
+            drop(target);
+            (value, target_ctx.budget().snapshot())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(value, 42);
+        assert!(heap.upgrade().is_none());
+        assert_eq!(source_ctx.budget().snapshot().wasm_linear, 0);
+        assert_eq!(target_usage.wasm_linear, 0);
+        assert_eq!(target_usage.live_isolates, 0);
+    }
+
+    #[test]
+    fn native_retired_state_keeps_its_address_until_original_ids_are_removed() {
+        if !refill_subprocess(
+            "guest_heap::tests::native_retired_state_keeps_its_address_until_original_ids_are_removed",
+        ) {
+            return;
+        }
+        use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+        unsafe extern "C" {
+            fn snapi_bridge_unofficial_get_live_env_count() -> u64;
+            fn snapi_bridge_unofficial_get_live_state_allocation_count() -> u64;
+            fn snapi_bridge_unofficial_set_value_limit(
+                env: crate::snapi::SnapiEnv,
+                limit: u64,
+            ) -> i32;
+        }
+        fn with_env<R>(store: &mut Store, f: impl FnOnce(&mut crate::NapiEnv) -> R) -> R {
+            for owner in VMFunctionEnvironment::list_mut(store.objects_mut().as_sys_mut()) {
+                if let Some(env) = owner.as_mut().downcast_mut::<crate::NapiEnv>() {
+                    return f(env);
+                }
+            }
+            panic!("configured environment");
+        }
+        let (mut store, ctx, instance, memory, session) = message_instance();
+        let (id, state, mut retirement) = with_env(&mut store, |env| {
+            let id = env.default_napi_env_id.unwrap();
+            let state = env.resolve_napi_env(id as i32);
+            let scope = *env
+                .napi_scopes
+                .iter()
+                .find(|(_, value)| **value == id)
+                .unwrap()
+                .0;
+            (id, state, env.take_native_scope(scope).unwrap())
+        });
+        let status = store.as_store_mut().parked(|| retirement.dispose());
+        let members_after_disposal = unsafe { snapi_bridge_unofficial_get_live_env_count() };
+        let retained = unsafe { snapi_bridge_unofficial_get_live_state_allocation_count() } == 1;
+        let mut rejected = false;
+        let mut distinct = false;
+        let mut both_allocations = false;
+        let mut fresh = None;
+        if retained {
+            // This branch runs only while the scalar proves the old shell is
+            // still owned. Membership rejection precedes any state dereference.
+            rejected = unsafe {
+                let registration = crate::snapi::snapi_bridge_alloc_cb_reg_id(state);
+                crate::snapi::snapi_bridge_register_callback(state, 1, id, 1, 0);
+                crate::snapi::snapi_bridge_register_callback_pair(state, 1, id, 1, 1, 0);
+                registration == 0 && snapi_bridge_unofficial_set_value_limit(state, 8) != 0
+            };
+            instance
+                .exports
+                .get_typed_function::<(), ()>(&store, "init")
+                .unwrap()
+                .call(&mut store)
+                .unwrap();
+            fresh = Some(with_env(&mut store, |env| {
+                let id = env.default_napi_env_id.unwrap();
+                (id, env.resolve_napi_env(id as i32))
+            }));
+            distinct = fresh.unwrap().1 != state;
+            both_allocations =
+                unsafe { snapi_bridge_unofficial_get_live_state_allocation_count() } == 2;
+        } else {
+            // A controlled eager-delete mutant must fail without destroying or
+            // dereferencing its stale token. Remove only Rust metadata first.
+            retirement.forget_retired_states_for_probe();
+        }
+        with_env(&mut store, |env| {
+            env.finish_native_scope(id, state, &mut retirement)
+        });
+        store.as_store_mut().parked(|| drop(retirement));
+        let one_allocation =
+            unsafe { snapi_bridge_unofficial_get_live_state_allocation_count() } == 1;
+        let fresh_mapping = fresh.is_some_and(|(id, state)| {
+            with_env(&mut store, |env| {
+                env.napi_state_to_guest_env.get(&(state as usize)) == Some(&id)
+            })
+        });
+        let mut value = None;
+        if retained {
+            memory.view(&store).write(1024, b"42").unwrap();
+            value = Some(
+                instance
+                    .exports
+                    .get_typed_function::<(i32, i32), i32>(&store, "eval")
+                    .unwrap()
+                    .call(&mut store, 1024, 2)
+                    .unwrap(),
+            );
+        }
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+        drop(instance);
+        drop(session);
+        drop(store);
+        assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+        assert_eq!(
+            unsafe { snapi_bridge_unofficial_get_live_state_allocation_count() },
+            0
+        );
+        assert_eq!(ctx.budget().memory_charged(), 0);
+        assert!(
+            retained,
+            "retirement freed its state before original id removal"
+        );
+        assert_eq!(status, 0);
+        assert_eq!(members_after_disposal, 0);
+        assert!(rejected, "retired metadata entry was accepted");
+        assert!(
+            distinct && both_allocations,
+            "new provider reused the retired token"
+        );
+        assert!(one_allocation && fresh_mapping);
+        assert_eq!(value, Some(42));
+    }
+
+    #[test]
+    fn native_default_snapshot_bootstraps_without_advisory_funding_or_early_growth() {
+        if !refill_subprocess(
+            "guest_heap::tests::native_default_snapshot_bootstraps_without_advisory_funding_or_early_growth",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+        struct BootstrapAccountant {
+            charged: AtomicU64,
+            armed: AtomicBool,
+            premature: AtomicUsize,
+        }
+        impl crate::budget::NapiMemoryAccountant for BootstrapAccountant {
+            fn memory_limit(&self) -> u64 {
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.charged.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                if self.armed.load(Ordering::SeqCst)
+                    && unsafe { crate::snapi::snapi_v8_allocator_active() } != 0
+                    && unsafe { crate::snapi::snapi_bridge_native_heap_refill_allowed() } == 0
+                {
+                    self.premature.fetch_add(1, Ordering::SeqCst);
+                }
+                if bytes >= u64::from(PREFUND_BYTES) {
+                    return false;
+                }
+                self.charged.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.charged.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        }
+        let accountant = Arc::new(BootstrapAccountant {
+            charged: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+            premature: AtomicUsize::new(0),
+        });
+        let ctx = crate::NapiCtx::builder()
+            .memory_accountant(accountant.clone())
+            .build();
+        let (mut store, ctx, instance, _memory, session) =
+            message_instance_configured(ctx, true, false);
+        let unfunded = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+            .iter()
+            .find_map(|owner| {
+                let env = owner.as_ref().downcast_ref::<crate::NapiEnv>()?;
+                let heap = env.guest_heap.as_ref()?;
+                Some(heap.inner.lock().unwrap().chunks.is_empty())
+            })
+            .unwrap();
+        assert!(
+            unfunded,
+            "the actual advisory prefund must have been denied"
+        );
+        accountant.armed.store(true, Ordering::SeqCst);
+        instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "init")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
+        let providers = ctx.budget().snapshot().live_isolates;
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+        drop(instance);
+        drop(session);
+        drop(store);
+        assert_eq!(providers, 1);
+        assert_eq!(
+            accountant.premature.load(Ordering::SeqCst),
+            0,
+            "uninitialized V8 invoked a growth/accountant callback"
+        );
+        assert_eq!(accountant.charged.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
     }
 }

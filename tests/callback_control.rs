@@ -36,6 +36,8 @@ const GUEST: &str = r#"(module
         (func $create_env (param i32 i32 i32 i32) (result i32)))
     (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
         (func $release_env (param i32 i32) (result i32)))
+    (import "napi" "napi_create_external_arraybuffer" (func $external_array (param i32 i32 i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_create_external_buffer" (func $external_buffer (param i32 i32 i32 i32 i32 i32) (result i32)))
     (table (export "__indirect_function_table") 5 funcref)
     (elem (i32.const 1) $first $second $release_callback $finalizer)
     (data (i32.const 64) "callback\00")
@@ -74,6 +76,7 @@ const GUEST: &str = r#"(module
     (func (export "release_owned") (result i32)
         i32.const 36 i32.load i32.const 0 call $release_env)
     (func (export "configure_runtime") (result i32) i32.const 0 call $configure_runtime)
+    (func (export "configure_runtime_options") (param i32) (result i32) local.get 0 call $configure_runtime)
     (func (export "init_id") (result i32) call $new_env)
     (func (export "create_status") (param i32 i32) (result i32)
         i32.const 8 i32.const 0 local.get 0 local.get 1 call $create_env)
@@ -101,6 +104,10 @@ const GUEST: &str = r#"(module
     (func $eval_status (export "eval_status") (param i32 i32) (result i32)
         global.get $env local.get 0 local.get 1 i32.const 16 call $string call $check
         global.get $env i32.const 16 i32.load i32.const 20 call $run)
+    (func (export "external_array") (param i32 i32) (result i32)
+        global.get $env local.get 0 local.get 1 i32.const 0 i32.const 0 i32.const 48 call $external_array)
+    (func (export "external_buffer") (param i32 i32) (result i32)
+        global.get $env local.get 1 local.get 0 i32.const 0 i32.const 0 i32.const 48 call $external_buffer)
     (func (export "fresh") (result i32) i32.const 9)
     (func (export "global_status") (result i32)
         global.get $env i32.const 48 call $global)
@@ -177,7 +184,7 @@ fn configured_instance_with_context(
 }
 
 fn eval(
-    store: &mut Store,
+    store: &mut impl AsStoreMut,
     instance: &Instance,
     memory: &Memory,
     script: &str,
@@ -1672,4 +1679,1586 @@ fn native_creation_accountant_reenters_an_existing_provider_with_fresh_borrows()
     }
     assert_eq!(ctx.budget().snapshot().live_isolates, 0);
     assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
+}
+
+#[cfg(feature = "experimental-async")]
+mod native_frame_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll, Waker},
+    };
+    use wasmer::{AsStoreAsync, sys::NativeInvocationScope};
+
+    struct CallbackBody {
+        ready: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        panic: Option<Arc<()>>,
+    }
+    impl Future for CallbackBody {
+        type Output = Result<(), RuntimeError>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if let Some(panic) = &self.panic {
+                std::panic::panic_any(panic.clone());
+            }
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for CallbackBody {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Completion {
+        Ready,
+        Cancel,
+        Panic,
+    }
+
+    // Existing callback_control owned-child fixture, with the real typed async
+    // record import reached by JS -> cached CPP context -> Wasm table callback.
+    fn pending_proof(completion: Completion) {
+        let mut store = Store::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original = Arc::new(());
+        let pending_ready = ready.clone();
+        let pending_polls = polls.clone();
+        let pending_drops = drops.clone();
+        let panic = matches!(completion, Completion::Panic).then(|| original.clone());
+        let (ctx, instance, memory, session) = instance_with_record(&mut store, move |store, _| {
+            Function::new_typed_async(store, move |_tag: i32| CallbackBody {
+                ready: pending_ready.clone(),
+                polls: pending_polls.clone(),
+                drops: pending_drops.clone(),
+                panic: panic.clone(),
+            })
+        });
+        // Like callback_error_stops_js_and_preserves_original_payload, test
+        // V8 termination at a backedge; it promises no zero-bytecode boundary.
+        let script = match completion {
+            Completion::Ready => "callback(); globalThis.nativeAfter = 1; 42",
+            Completion::Cancel | Completion::Panic => {
+                "try { callback(); } catch (_) {} while (true) {} globalThis.nativeAfter = 1; 42"
+            }
+        };
+        memory.view(&store).write(1024, script.as_bytes()).unwrap();
+        let eval = instance.exports.get_function("eval").unwrap().clone();
+        let fresh = instance.exports.get_function("fresh").unwrap().clone();
+        let mut scope = NativeInvocationScope::bind(&mut store).unwrap();
+        let store = store.into_async();
+        let mut call = Box::pin(eval.call_async(
+            &store,
+            vec![Value::I32(1024), Value::I32(script.len() as i32)],
+        ));
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        let first_pending = matches!(&first, Ok(Poll::Pending));
+        let mut original_panic = None;
+        let mut result = None;
+        match completion {
+            Completion::Ready => {
+                if first_pending {
+                    ready.store(true, Ordering::SeqCst);
+                    result = Some(call.as_mut().poll(&mut Context::from_waker(Waker::noop())));
+                }
+            }
+            Completion::Cancel => {
+                scope.close();
+            }
+            Completion::Panic => {
+                original_panic = first.err();
+            }
+        }
+        // The original CPP call was parked through a same-Store borrowed Sync
+        // suffix; cancellation must use the graceful driver and exit CPP before
+        // the generation reports physical completion. No forced-unwind model.
+        drop(call);
+        let settled = {
+            let mut wait = Box::pin(scope.close_and_wait());
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        let (next_scope, next_store) = {
+            let mut guard = store.store().write();
+            scope.successor(&store, &mut guard.as_store_mut()).unwrap()
+        };
+        let mut next = Box::pin(fresh.call_async(&next_store, vec![]));
+        let fresh_result = next.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        drop(next);
+        let after = {
+            let mut guard = next_store.store().write();
+            // Inspect real JS state after all prior CPP frames have exited.
+            super::eval(
+                &mut guard,
+                &instance,
+                &memory,
+                "typeof nativeAfter === 'undefined' ? 0 : nativeAfter",
+            )
+            .unwrap()
+        };
+        {
+            let mut guard = next_store.store().write();
+            unsafe {
+                session.deactivate(&mut guard.as_store_mut());
+            }
+        }
+        drop(next_scope);
+        drop(next_store);
+        drop(scope);
+        drop(session);
+        drop(instance);
+        drop(store);
+        assert!(
+            matches!(settled, Poll::Ready(Ok(()))),
+            "CPP frame remained physically active after cancellation"
+        );
+        assert!(matches!(fresh_result, Poll::Ready(Ok(ref values)) if values[0].i32() == Some(9)));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(polls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+        match completion {
+            Completion::Ready => {
+                assert!(first_pending, "real native callback did not suspend");
+                assert!(
+                    matches!(result, Some(Poll::Ready(Ok(ref values))) if values[0].i32() == Some(42))
+                );
+                assert_eq!(after, 1);
+            }
+            Completion::Cancel => {
+                assert!(first_pending, "real native callback did not suspend");
+                assert_eq!(
+                    after, 0,
+                    "JS continued after its guest callback was cancelled"
+                );
+            }
+            Completion::Panic => {
+                assert!(Arc::ptr_eq(
+                    original_panic.unwrap().downcast_ref::<Arc<()>>().unwrap(),
+                    &original
+                ));
+                assert_eq!(after, 0, "JS continued after the original callback panic");
+            }
+        }
+    }
+
+    #[test]
+    fn native_cpp_callback_pending_completes_after_ready() {
+        if run_in_subprocess(
+            "native_frame_tests::native_cpp_callback_pending_completes_after_ready",
+            Duration::from_secs(30),
+        ) {
+            pending_proof(Completion::Ready);
+        }
+    }
+    #[test]
+    fn native_cpp_callback_pending_cancels_before_physical_completion() {
+        if run_in_subprocess(
+            "native_frame_tests::native_cpp_callback_pending_cancels_before_physical_completion",
+            Duration::from_secs(30),
+        ) {
+            pending_proof(Completion::Cancel);
+        }
+    }
+    #[test]
+    fn native_cpp_callback_preserves_original_async_panic() {
+        if run_in_subprocess(
+            "native_frame_tests::native_cpp_callback_preserves_original_async_panic",
+            Duration::from_secs(30),
+        ) {
+            pending_proof(Completion::Panic);
+        }
+    }
+    #[test]
+    fn native_cpp_without_coroutine_allows_ready_and_refuses_pending() {
+        if !run_in_subprocess(
+            "native_frame_tests::native_cpp_without_coroutine_allows_ready_and_refuses_pending",
+            Duration::from_secs(30),
+        ) {
+            return;
+        }
+        for ready_now in [true, false] {
+            let mut store = Store::default();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let outside_coroutine = Arc::new(AtomicBool::new(false));
+            let record_polls = polls.clone();
+            let record_drops = drops.clone();
+            let record_outside = outside_coroutine.clone();
+            let (ctx, instance, memory, session) =
+                instance_with_record(&mut store, move |store, _| {
+                    Function::new_async(
+                        store,
+                        wasmer::FunctionType::new([wasmer::Type::I32], []),
+                        move |_args| {
+                            record_outside.store(
+                                wasmer::sys::NativeEngineInvocation::current().is_none(),
+                                Ordering::SeqCst,
+                            );
+                            let body = CallbackBody {
+                                ready: Arc::new(AtomicBool::new(ready_now)),
+                                polls: record_polls.clone(),
+                                drops: record_drops.clone(),
+                                panic: None,
+                            };
+                            async move {
+                                body.await?;
+                                Ok(Vec::new())
+                            }
+                        },
+                    )
+                });
+            let outcome = super::eval(
+                &mut store,
+                &instance,
+                &memory,
+                if ready_now {
+                    "callback(); globalThis.nativeAfter = 1; 42"
+                } else {
+                    // A later callback is also refused by the same first slot;
+                    // the first body's poll/drop counters must remain one.
+                    "try { callback(); } catch (_) {} callback(); while (true) {} globalThis.nativeAfter = 1; 42"
+                },
+            );
+            let after = super::eval(
+                &mut store,
+                &instance,
+                &memory,
+                "typeof nativeAfter === 'undefined' ? 0 : nativeAfter",
+            )
+            .unwrap();
+            let fresh = super::eval(&mut store, &instance, &memory, "40 + 2").unwrap();
+            unsafe {
+                session.deactivate(&mut store.as_store_mut());
+            }
+            drop(instance);
+            drop(session);
+            drop(store);
+            assert!(outside_coroutine.load(Ordering::SeqCst));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(fresh, 42);
+            assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            if ready_now {
+                assert_eq!(outcome.unwrap(), 42);
+                assert_eq!(after, 1);
+            } else {
+                assert!(outcome.is_err());
+                assert_eq!(after, 0);
+            }
+        }
+    }
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn native_cpp_relocates_and_restores_the_configured_stack_limit() {
+        if !run_in_subprocess(
+            "native_frame_tests::native_cpp_relocates_and_restores_the_configured_stack_limit",
+            Duration::from_secs(30),
+        ) {
+            return;
+        }
+        unsafe extern "C" {
+            fn snapi_bridge_native_current_stack_info(
+                saved: *mut usize,
+                budget: *mut usize,
+                applied: *mut usize,
+            ) -> i32;
+        }
+        // Match the existing owned async fixtures; all bodies here are Ready.
+        fn complete<F: Future>(future: F) -> F::Output {
+            let mut future = Box::pin(future);
+            for _ in 0..8 {
+                if let Poll::Ready(result) = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    return result;
+                }
+            }
+            panic!("a Ready stack-limit fixture remained pending");
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let recorded = observations.clone();
+        let mut store = Store::default();
+        let (ctx, instance, memory, session) =
+            configured_instance_with_context(&mut store, NapiCtx::default(), move |store, _| {
+                Function::new_async(
+                    store,
+                    wasmer::FunctionType::new([wasmer::Type::I32], []),
+                    move |_| {
+                        let mut saved = 0;
+                        let mut budget = 0;
+                        let mut applied = 0;
+                        let present = unsafe {
+                            snapi_bridge_native_current_stack_info(
+                                &mut saved,
+                                &mut budget,
+                                &mut applied,
+                            )
+                        };
+                        let bounds = wasmer::sys::NativeEngineStackBounds::current()
+                            .map(|bounds| (bounds.usable_low, bounds.base));
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((present, saved, budget, applied, bounds));
+                        async { Ok(Vec::new()) }
+                    },
+                )
+            });
+        let flags = b"--stack-size=512";
+        let options: Vec<_> = [16_u32, 1, 256, flags.len() as u32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        memory.view(&store).write(128, &options).unwrap();
+        memory.view(&store).write(256, flags).unwrap();
+        let configured = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "configure_runtime_options")
+            .unwrap()
+            .call(&mut store, 128)
+            .unwrap();
+        let init = instance.exports.get_function("init").unwrap().clone();
+        let run = instance.exports.get_function("eval").unwrap().clone();
+        let scope = NativeInvocationScope::bind(&mut store).unwrap();
+        let store = store.into_async();
+        // Initialization itself occurs on the real API coroutine stack, before
+        // the provider's first Context::New and ordinary getter frames.
+        let initialized = complete(init.call_async(&store, vec![]));
+        let script = "callback(); 42";
+        {
+            let guard = store.store().write();
+            memory.view(&guard).write(1024, script.as_bytes()).unwrap();
+        }
+        let rooted = complete(run.call_async(
+            &store,
+            vec![Value::I32(1024), Value::I32(script.len() as i32)],
+        ));
+        let synchronous = {
+            let mut guard = store.store().write();
+            super::eval(&mut guard, &instance, &memory, script)
+        };
+        {
+            let mut guard = store.store().write();
+            unsafe {
+                session.deactivate(&mut guard.as_store_mut());
+            }
+        }
+        drop(scope);
+        drop(instance);
+        drop(session);
+        drop(store);
+        let observations = observations.lock().unwrap();
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+        assert_eq!(configured, 0);
+        initialized.unwrap();
+        assert_eq!(rooted.unwrap()[0].i32(), Some(42));
+        assert_eq!(synchronous.unwrap(), 42);
+        assert_eq!(observations.len(), 2);
+        let (present, saved, budget, applied, bounds) = observations[0];
+        assert_eq!(present, 1);
+        assert_eq!(budget, 512 * 1024);
+        let (low, base) = bounds.expect("root callback must expose actual numeric stack bounds");
+        assert_eq!(applied, (low + 64 * 1024).max(base - budget));
+        assert_ne!(applied, saved, "the coroutine reused the OS stack limit");
+        let (present, later_saved, budget, applied, bounds) = observations[1];
+        assert_eq!(present, 1);
+        assert!(bounds.is_none());
+        assert_eq!(budget, 512 * 1024);
+        assert_eq!(
+            later_saved, saved,
+            "root exit did not restore the exact prior OS limit"
+        );
+        assert_eq!(applied, saved);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn native_cpp_zero_stack_budget_retires_failed_creation() {
+        if !run_in_subprocess(
+            "native_frame_tests::native_cpp_zero_stack_budget_retires_failed_creation",
+            Duration::from_secs(30),
+        ) {
+            return;
+        }
+        let mut store = Store::default();
+        let (ctx, instance, memory, session) =
+            configured_instance_with_context(&mut store, NapiCtx::default(), |store, _| {
+                Function::new_typed(store, |_: i32| {})
+            });
+        let flags = b"--stack-size=0";
+        let options: Vec<_> = [16_u32, 1, 256, flags.len() as u32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        memory.view(&store).write(128, &options).unwrap();
+        memory.view(&store).write(256, flags).unwrap();
+        let configured = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "configure_runtime_options")
+            .unwrap()
+            .call(&mut store, 128);
+        // Reading the configured limit succeeds, but ordinary managed entry
+        // must fail. Inert recovery still has to dispose the initialized isolate.
+        let initialized = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, "init_id")
+            .unwrap()
+            .call(&mut store);
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+        drop(instance);
+        drop(session);
+        drop(store);
+        // V8 flags are process-wide and are deliberately not reset. This fresh
+        // independent Wasm Store checks recovery without creating another V8 env.
+        let mut successor = Store::default();
+        let module = Module::new(
+            &successor,
+            r#"(module (func (export "fresh") (result i32) i32.const 42))"#,
+        )
+        .unwrap();
+        let instance = Instance::new(&mut successor, &module, &wasmer::imports! {}).unwrap();
+        let fresh = instance
+            .exports
+            .get_typed_function::<(), i32>(&successor, "fresh")
+            .unwrap()
+            .call(&mut successor);
+        drop(instance);
+        drop(module);
+        drop(successor);
+        assert_eq!(configured.unwrap(), 0);
+        assert!(
+            initialized.is_err(),
+            "zero JS budget admitted a native provider"
+        );
+        assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
+        let usage = ctx.budget().snapshot();
+        assert_eq!(usage.live_isolates, 0);
+        assert_eq!(usage.v8_heap_reserved, 0);
+        assert_eq!(usage.wasm_linear, 0);
+        assert_eq!(fresh.unwrap(), 42);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn native_cpp_preserves_same_stack_nested_js_roots_and_exceptions() {
+        if run_in_subprocess(
+            "native_frame_tests::native_cpp_preserves_same_stack_nested_js_roots_and_exceptions",
+            Duration::from_secs(30),
+        ) {
+            nested_stack_proof(false);
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn native_cpp_refuses_same_isolate_host_body_reentry_across_stacks() {
+        if run_in_subprocess(
+            "native_frame_tests::native_cpp_refuses_same_isolate_host_body_reentry_across_stacks",
+            Duration::from_secs(30),
+        ) {
+            nested_stack_proof(true);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn nested_stack_proof(cross_stack: bool) {
+        use wasmer::FunctionEnv;
+        unsafe extern "C" {
+            fn snapi_bridge_native_current_stack_info(
+                saved: *mut usize,
+                budget: *mut usize,
+                applied: *mut usize,
+            ) -> i32;
+        }
+        fn stack_info() -> (i32, usize, usize, usize, Option<(usize, usize)>) {
+            let (mut saved, mut budget, mut applied) = (0, 0, 0);
+            let present = unsafe {
+                snapi_bridge_native_current_stack_info(&mut saved, &mut budget, &mut applied)
+            };
+            let bounds = wasmer::sys::NativeEngineStackBounds::current()
+                .map(|bounds| (bounds.usable_low, bounds.base));
+            (present, saved, budget, applied, bounds)
+        }
+        #[derive(Default)]
+        struct Nested {
+            handles: Option<(Memory, Function, Function)>,
+        }
+        struct BodyDrop(Arc<AtomicUsize>);
+        impl Drop for BodyDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // The same-stack sibling runs GC with both JS entries live. Across
+        // stacks, admission must refuse before this inner script or GC runs.
+        let guest = GUEST
+            .replace(
+                "    (table (export \"__indirect_function_table\") 5 funcref)",
+                r#"    (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
+        (func $gc (param i32) (result i32)))
+    (import "napi" "napi_get_and_clear_last_exception"
+        (func $clear (param i32 i32) (result i32)))
+    (table (export "__indirect_function_table") 6 funcref)"#,
+            )
+            .replace(
+                "$release_callback $finalizer)",
+                "$release_callback $finalizer $nested)",
+            )
+            .replace(
+                r#"    (data (i32.const 64) "callback\00")"#,
+                r#"    (data (i32.const 64) "callback\00")
+    (data (i32.const 80) "nested\00")"#,
+            )
+            .replace(
+                "    (func (export \"init_owned\")",
+                r#"    (func $nested (param i32 i32) (result i32)
+        global.get $env call $gc call $check
+        i32.const 2 call $record i32.const 0)
+    (func (export "install_nested")
+        global.get $env i32.const 80 i32.const 6 i32.const 5 i32.const 0 i32.const 12
+        call $function call $check
+        global.get $env i32.const 8 i32.load i32.const 80 i32.const 12 i32.load
+        call $set call $check)
+    (func (export "clear_nested_exception") (result i32)
+        global.get $env i32.const 56 call $clear)
+    (func (export "init_owned")"#,
+            );
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let statuses = Arc::new(Mutex::new(None));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut store = Store::default();
+        let environment = FunctionEnv::new(&mut store, Nested::default());
+        let recorded = observations.clone();
+        let body_status = statuses.clone();
+        let calls = entries.clone();
+        let body_polls = polls.clone();
+        let body_drops = drops.clone();
+        let record = if cross_stack {
+            Function::new_with_env_async(
+                &mut store,
+                &environment,
+                wasmer::FunctionType::new([wasmer::Type::I32], []),
+                move |env, _| -> Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>>>> {
+                    let entry = calls.fetch_add(1, Ordering::SeqCst);
+                    recorded.lock().unwrap().push(stack_info());
+                    if entry != 0 {
+                        return Box::pin(async { Ok(Vec::new()) });
+                    }
+                    let recorded = recorded.clone();
+                    let status = body_status.clone();
+                    let polls = body_polls.clone();
+                    let body_drop = BodyDrop(body_drops.clone());
+                    Box::pin(async move {
+                        let _drop = body_drop;
+                        let mut yielded = false;
+                        std::future::poll_fn(|_| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            if std::mem::replace(&mut yielded, true) {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        // This is an actual host-future body, outside the import
+                        // factory. The existing explicit same-Store loan reacquires
+                        // a fresh guard; no ambient Store lookup or new root poll.
+                        let mut guard = env.write().await;
+                        let (memory, run, clear) =
+                            guard.data_mut().handles.as_ref().unwrap().clone();
+                        let script = "globalThis.nestedEntered = 1; nested(); throw new Error('nested-stack')";
+                        memory.view(&guard).write(4096, script.as_bytes()).unwrap();
+                        let inner = run.call(
+                            &mut guard,
+                            &[Value::I32(4096), Value::I32(script.len() as i32)],
+                        );
+                        // Even refused entry must preserve the parked parent's
+                        // limit. Record only owned metadata before replaying it.
+                        recorded.lock().unwrap().push(stack_info());
+                        let inner = inner?;
+                        let cleared = clear.call(&mut guard, &[])?;
+                        *status.lock().unwrap() = Some((inner[0].i32(), cleared[0].i32()));
+                        Ok(Vec::new())
+                    })
+                },
+            )
+        } else {
+            Function::new_typed_with_env(
+                &mut store,
+                &environment,
+                move |mut env: wasmer::FunctionEnvMut<Nested>,
+                      _: i32|
+                      -> Result<(), RuntimeError> {
+                    let entry = calls.fetch_add(1, Ordering::SeqCst);
+                    recorded.lock().unwrap().push(stack_info());
+                    if entry != 0 {
+                        return Ok(());
+                    }
+                    let (memory, run, clear) = env.data().handles.as_ref().unwrap().clone();
+                    let script =
+                        "globalThis.nestedEntered = 1; nested(); throw new Error('nested-stack')";
+                    memory.view(&env).write(4096, script.as_bytes()).unwrap();
+                    let inner = run.call(
+                        &mut env,
+                        &[Value::I32(4096), Value::I32(script.len() as i32)],
+                    )?;
+                    let cleared = clear.call(&mut env, &[])?;
+                    *body_status.lock().unwrap() = Some((inner[0].i32(), cleared[0].i32()));
+                    recorded.lock().unwrap().push(stack_info());
+                    Ok(())
+                },
+            )
+        };
+        // Match configured_instance_with_context's module/import/configuration
+        // order, using this sibling's two extra NAPI imports and callback.
+        let ctx = NapiCtx::default();
+        let module = Module::new(&store, wat::parse_str(&guest).unwrap()).unwrap();
+        let hooks = ctx.runtime_hooks();
+        let (mut imports, state) = hooks
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session().unwrap().clone();
+        imports.define("test", "record", record);
+        let Some(Extern::Memory(memory)) = imports.get_export("env", "memory") else {
+            panic!("NAPI did not create the imported memory");
+        };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        hooks
+            .configure_instance(
+                &module,
+                &mut store.as_store_mut(),
+                &instance,
+                Some(&memory),
+                state,
+            )
+            .unwrap();
+        environment.as_mut(&mut store).handles = Some((
+            memory.clone(),
+            instance
+                .exports
+                .get_function("eval_status")
+                .unwrap()
+                .clone(),
+            instance
+                .exports
+                .get_function("clear_nested_exception")
+                .unwrap()
+                .clone(),
+        ));
+        let flags = b"--stack-size=512";
+        let options: Vec<_> = [16_u32, 1, 256, flags.len() as u32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        memory.view(&store).write(128, &options).unwrap();
+        memory.view(&store).write(256, flags).unwrap();
+        let configured = instance
+            .exports
+            .get_typed_function::<i32, i32>(&store, "configure_runtime_options")
+            .unwrap()
+            .call(&mut store, 128);
+        instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "init")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
+        instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "install_nested")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
+        let script = "(() => { const live = { answer: 35, bytes: new Uint8Array([7,8,9]) }; try { callback(); throw live; } catch (error) { return error === live ? error.answer + error.bytes[0] : -1; } })()";
+        memory.view(&store).write(1024, script.as_bytes()).unwrap();
+        let run = instance.exports.get_function("eval").unwrap().clone();
+        let scope = NativeInvocationScope::bind(&mut store).unwrap();
+        let store = store.into_async();
+        let mut call = Box::pin(run.call_async(
+            &store,
+            vec![Value::I32(1024), Value::I32(script.len() as i32)],
+        ));
+        let first = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let first_pending = first.is_pending();
+        let mut result = first;
+        for _ in 0..8 {
+            if result.is_ready() {
+                break;
+            }
+            result = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        }
+        drop(call);
+        let (entered, fresh) = {
+            let mut guard = store.store().write();
+            let entered = super::eval(
+                &mut guard,
+                &instance,
+                &memory,
+                "typeof nestedEntered === 'undefined' ? 0 : nestedEntered",
+            );
+            let fresh = super::eval(&mut guard, &instance, &memory, "40 + 2");
+            (entered, fresh)
+        };
+        {
+            let mut guard = store.store().write();
+            unsafe { session.deactivate(&mut guard.as_store_mut()) };
+        }
+        drop(scope);
+        drop(instance);
+        drop(imports);
+        drop(module);
+        drop(session);
+        drop(store);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+        assert_eq!(configured.unwrap(), 0);
+        assert_eq!(first_pending, cross_stack);
+        let Poll::Ready(result) = result else {
+            panic!("the nested callback did not settle");
+        };
+        assert_eq!(fresh.unwrap(), 42);
+        assert_eq!(entered.unwrap(), i32::from(!cross_stack));
+        if cross_stack {
+            let error = result.expect_err("same-isolate entry crossed physical stacks");
+            assert!(error.to_string().contains("native engine stack bounds"));
+            assert_eq!(
+                entries.load(Ordering::SeqCst),
+                1,
+                "refused JS entered its callback"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(statuses.lock().unwrap().is_none());
+        } else {
+            assert_eq!(result.unwrap()[0].i32(), Some(42));
+            assert_eq!(entries.load(Ordering::SeqCst), 2);
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(*statuses.lock().unwrap(), Some((Some(10), Some(0))));
+        }
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), if cross_stack { 2 } else { 3 });
+        let (present, saved, budget, parent, bounds) = observations[0];
+        assert_eq!(present, 1);
+        assert_eq!(budget, 512 * 1024);
+        let (low, base) = bounds.expect("outer callback must be on its actual root stack");
+        assert_eq!(parent, (low + 64 * 1024).max(base - budget));
+        if !cross_stack {
+            let (present, inner_saved, inner_budget, inner_applied, inner_bounds) = observations[1];
+            assert_eq!(present, 1);
+            assert_eq!(inner_bounds, bounds);
+            assert_eq!(inner_budget, budget);
+            assert_eq!(inner_saved, parent);
+            assert_eq!(inner_applied, parent);
+        }
+        let (present, restored_saved, restored_budget, restored, restored_bounds) =
+            *observations.last().unwrap();
+        assert_eq!(present, 1);
+        assert_eq!(restored_bounds, if cross_stack { None } else { bounds });
+        assert_eq!(restored_saved, saved);
+        assert_eq!(restored_budget, budget);
+        assert_eq!(
+            restored, parent,
+            "nested entry lost the parent's exact limit"
+        );
+    }
+
+    #[cfg(all(
+        feature = "native-stack-diagnostics",
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    mod scanner_proofs {
+        use super::*;
+        use std::{
+            any::Any,
+            panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        };
+
+        unsafe extern "C" {
+            fn snapi_bridge_native_probe_begin() -> i32;
+            fn snapi_bridge_native_probe_end(out: *mut u64);
+            fn snapi_bridge_native_probe_with_register(
+                operation: unsafe extern "C" fn(*mut std::ffi::c_void),
+                context: *mut std::ffi::c_void,
+                ancestor: i32,
+            );
+        }
+
+        // The actual patterns are encoded only in the CPP assembly. Rust owns
+        // expected bits and ordinary outcomes, so a stack copy cannot stand in
+        // for the external assembly register roots under test.
+        fn with_register<R, F: FnOnce() -> R>(ancestor: bool, operation: F) -> R {
+            struct Call<F, R> {
+                operation: Option<F>,
+                result: Option<Result<R, Box<dyn Any + Send>>>,
+            }
+            unsafe extern "C" fn invoke<F: FnOnce() -> R, R>(raw: *mut std::ffi::c_void) {
+                let call = unsafe { &mut *raw.cast::<Call<F, R>>() };
+                let operation = call.operation.take().unwrap();
+                call.result = Some(catch_unwind(AssertUnwindSafe(operation)));
+            }
+            let mut call = Call {
+                operation: Some(operation),
+                result: None,
+            };
+            unsafe {
+                snapi_bridge_native_probe_with_register(
+                    invoke::<F, R>,
+                    (&mut call as *mut Call<F, R>).cast(),
+                    i32::from(ancestor),
+                );
+            }
+            match call.result.unwrap() {
+                Ok(value) => value,
+                Err(panic) => resume_unwind(panic),
+            }
+        }
+
+        struct ScanProbe;
+        impl ScanProbe {
+            fn begin() -> Self {
+                assert_eq!(unsafe { snapi_bridge_native_probe_begin() }, 1);
+                Self
+            }
+            fn finish(self) -> [u64; 5] {
+                let mut counters = [0; 5];
+                unsafe { snapi_bridge_native_probe_end(counters.as_mut_ptr()) };
+                std::mem::forget(self);
+                counters
+            }
+        }
+        impl Drop for ScanProbe {
+            fn drop(&mut self) {
+                let mut ignored = [0; 5];
+                unsafe { snapi_bridge_native_probe_end(ignored.as_mut_ptr()) };
+            }
+        }
+
+        fn guest() -> String {
+            GUEST
+                .replace(
+                    "    (table (export \"__indirect_function_table\") 5 funcref)",
+                    r#"    (import "test" "wait" (func $wait))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
+        (func $gc (param i32) (result i32)))
+    (table (export "__indirect_function_table") 5 funcref)"#,
+                )
+                .replace(
+                    "    (func (export \"fresh\")",
+                    r#"    (func (export "collect") global.get $env call $gc call $check)
+    (func (export "wait") call $wait)
+    (func (export "fresh")"#,
+                )
+        }
+
+        // Same construction/configuration order as the existing GUEST sibling.
+        fn configured(
+            store: &mut Store,
+            record: Function,
+            wait: Function,
+        ) -> (NapiCtx, Instance, Memory, NapiSession) {
+            let ctx = NapiCtx::default();
+            let module = Module::new(&*store, wat::parse_str(guest()).unwrap()).unwrap();
+            let hooks = ctx.runtime_hooks();
+            let (mut imports, state) = hooks
+                .additional_imports(&module, &mut store.as_store_mut())
+                .unwrap();
+            let session = state.session().unwrap().clone();
+            imports.define("test", "record", record);
+            imports.define("test", "wait", wait);
+            let Some(Extern::Memory(memory)) = imports.get_export("env", "memory") else {
+                panic!("NAPI did not create its imported memory");
+            };
+            let instance = Instance::new(store, &module, &imports).unwrap();
+            hooks
+                .configure_instance(
+                    &module,
+                    &mut store.as_store_mut(),
+                    &instance,
+                    Some(&memory),
+                    state,
+                )
+                .unwrap();
+            (ctx, instance, memory, session)
+        }
+
+        fn poll_ready<F: Future>(future: F) -> F::Output {
+            let mut future = Box::pin(future);
+            for _ in 0..8 {
+                if let Poll::Ready(result) = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    return result;
+                }
+            }
+            panic!("a native GC proof remained pending");
+        }
+
+        fn dispose(store: &mut Store, session: &NapiSession) {
+            unsafe { session.deactivate(&mut store.as_store_mut()) };
+        }
+
+        #[test]
+        fn allocation_gc_preserves_current_register_os_and_live_js_roots() {
+            if !run_in_subprocess(
+                "native_frame_tests::scanner_proofs::allocation_gc_preserves_current_register_os_and_live_js_roots",
+                Duration::from_secs(45),
+            ) {
+                return;
+            }
+            let mut store = Store::default();
+            let record = Function::new_typed(&mut store, |_: i32| {});
+            let wait = Function::new_typed(&mut store, || {});
+            let (ctx, instance, memory, session) = configured(&mut store, record, wait);
+            let flags = b"--max-old-space-size=32";
+            let options: Vec<_> = [16_u32, 1, 256, flags.len() as u32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            memory.view(&store).write(128, &options).unwrap();
+            memory.view(&store).write(256, flags).unwrap();
+            let configured = instance
+                .exports
+                .get_typed_function::<i32, i32>(&store, "configure_runtime_options")
+                .unwrap()
+                .call(&mut store, 128);
+            let init = instance.exports.get_function("init").unwrap().clone();
+            let run = instance.exports.get_function("eval").unwrap().clone();
+            let scope = NativeInvocationScope::bind(&mut store).unwrap();
+            let store = store.into_async();
+            let initialized = with_register(false, || poll_ready(init.call_async(&store, vec![])));
+            // No explicit GC call: bounded live sets repeatedly allocate far
+            // beyond the configured old-space limit and must trigger real GC.
+            let script = "(() => { const live = { answer: 35, bytes: new Uint8Array([7,8,9]) }; for (let i=0; i<96; i++) { const junk = []; for (let j=0; j<16; j++) junk.push(new Array(32768).fill(i)); } try { throw live; } catch (error) { return error === live ? error.answer + error.bytes[0] : -1; } })()";
+            {
+                let guard = store.store().write();
+                memory.view(&guard).write(1024, script.as_bytes()).unwrap();
+            }
+            let probe = ScanProbe::begin();
+            let result = with_register(false, || {
+                poll_ready(run.call_async(
+                    &store,
+                    vec![Value::I32(1024), Value::I32(script.len() as i32)],
+                ))
+            });
+            let counters = probe.finish();
+            let fresh = {
+                let mut guard = store.store().write();
+                let result = super::super::eval(&mut guard, &instance, &memory, "40 + 2");
+                unsafe { session.deactivate(&mut guard.as_store_mut()) };
+                result
+            };
+            drop(scope);
+            drop(instance);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(configured.unwrap(), 0);
+            initialized.unwrap();
+            assert_eq!(result.unwrap()[0].i32(), Some(42));
+            assert_eq!(fresh.unwrap(), 42);
+            assert_eq!(
+                counters[0] & 5,
+                5,
+                "original visitor missed current-register or OS roots"
+            );
+            assert!(
+                counters[1] > 0 && counters[3] > 0,
+                "allocation did not run the actual native GC scanner"
+            );
+            assert_eq!(counters[4], 0);
+        }
+
+        #[test]
+        fn independent_gc_scans_the_retained_native_ancestor() {
+            if !run_in_subprocess(
+                "native_frame_tests::scanner_proofs::independent_gc_scans_the_retained_native_ancestor",
+                Duration::from_secs(45),
+            ) {
+                return;
+            }
+            let mut store = Store::default();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = calls.clone();
+            let inner = Arc::new(Mutex::new(None));
+            let observed_inner = inner.clone();
+            let wait =
+                Function::new_async(&mut store, wasmer::FunctionType::new([], []), move |_| {
+                    let observed_calls = observed_calls.clone();
+                    let observed_inner = observed_inner.clone();
+                    async move {
+                        let mut yielded = false;
+                        std::future::poll_fn(|_| {
+                            observed_calls.fetch_add(1, Ordering::SeqCst);
+                            if std::mem::replace(&mut yielded, true) {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        // A is genuinely parked. B owns a different Store/isolate,
+                        // enters on OS, collects while A's CPP/JS frames stay live,
+                        // and retires fully before A resumes.
+                        let mut other = Store::default();
+                        let record = Function::new_typed(&mut other, |_: i32| {});
+                        let wait = Function::new_typed(&mut other, || {});
+                        let (ctx, instance, memory, session) = configured(&mut other, record, wait);
+                        instance
+                            .exports
+                            .get_typed_function::<(), ()>(&other, "init")
+                            .unwrap()
+                            .call(&mut other)
+                            .unwrap();
+                        let before = super::super::eval(
+                            &mut other,
+                            &instance,
+                            &memory,
+                            "globalThis.live = new Uint8Array([42]); 42",
+                        );
+                        let collected = instance
+                            .exports
+                            .get_typed_function::<(), ()>(&other, "collect")
+                            .unwrap()
+                            .call(&mut other);
+                        let after = super::super::eval(&mut other, &instance, &memory, "live[0]");
+                        dispose(&mut other, &session);
+                        drop(instance);
+                        drop(session);
+                        drop(other);
+                        *observed_inner.lock().unwrap() =
+                            Some((before, collected, after, ctx.budget().snapshot()));
+                        Ok(Vec::new())
+                    }
+                });
+            let environment = wasmer::FunctionEnv::new(&mut store, None::<Function>);
+            let record = Function::new_typed_with_env(
+                &mut store,
+                &environment,
+                |mut env: wasmer::FunctionEnvMut<Option<Function>>,
+                 _: i32|
+                 -> Result<(), RuntimeError> {
+                    let wait = env.data().as_ref().unwrap().clone();
+                    with_register(true, || wait.call(&mut env, &[])).map(|_| ())
+                },
+            );
+            let (ctx, instance, memory, session) = configured(&mut store, record, wait);
+            environment
+                .as_mut(&mut store)
+                .replace(instance.exports.get_function("wait").unwrap().clone());
+            instance
+                .exports
+                .get_typed_function::<(), ()>(&store, "init")
+                .unwrap()
+                .call(&mut store)
+                .unwrap();
+            let script = "(() => { const live = { answer: 35, bytes: new Uint8Array([7,8,9]) }; callback(); try { throw live; } catch (error) { return error === live ? error.answer + error.bytes[0] : -1; } })()";
+            memory.view(&store).write(1024, script.as_bytes()).unwrap();
+            let run = instance.exports.get_function("eval").unwrap().clone();
+            let scope = NativeInvocationScope::bind(&mut store).unwrap();
+            let store = store.into_async();
+            let mut call = Box::pin(run.call_async(
+                &store,
+                vec![Value::I32(1024), Value::I32(script.len() as i32)],
+            ));
+            let probe = ScanProbe::begin();
+            let first = with_register(false, || {
+                call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            });
+            let pending = first.is_pending();
+            let mut result = first;
+            for _ in 0..8 {
+                if result.is_ready() {
+                    break;
+                }
+                result = with_register(false, || {
+                    call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                });
+            }
+            drop(call);
+            let counters = probe.finish();
+            let fresh = {
+                let mut guard = store.store().write();
+                let value = super::super::eval(&mut guard, &instance, &memory, "40 + 2");
+                unsafe { session.deactivate(&mut guard.as_store_mut()) };
+                value
+            };
+            drop(scope);
+            drop(instance);
+            drop(session);
+            drop(store);
+            let inner = inner.lock().unwrap().take();
+            assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert!(pending, "ancestor never parked");
+            let Poll::Ready(result) = result else {
+                panic!("ancestor did not settle");
+            };
+            assert_eq!(result.unwrap()[0].i32(), Some(42));
+            assert_eq!(fresh.unwrap(), 42);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let (before, collected, after, usage) =
+                inner.expect("independent provider never collected");
+            assert_eq!(before.unwrap(), 42);
+            collected.unwrap();
+            assert_eq!(after.unwrap(), 42);
+            assert_eq!(usage.live_isolates, 0);
+            assert_eq!(usage.wasm_linear, 0);
+            assert_eq!(
+                counters[0] & 3,
+                3,
+                "original visitor missed current-register or retained ancestor roots"
+            );
+            assert!(counters[1] > 0 && counters[2] > 0);
+            assert_eq!(counters[4], 0);
+        }
+    }
+
+    thread_local! {
+        static LOGICAL_DROP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    fn deferred_causal_cleanup_proof() {
+        use std::sync::atomic::AtomicU64;
+        use wasmer::sys::NativeEngineExt;
+        struct CleanupAccountant {
+            charged: AtomicU64,
+            armed: AtomicBool,
+            panics: Arc<AtomicUsize>,
+            payload: Arc<()>,
+        }
+        impl wasmer_napi::NapiMemoryAccountant for CleanupAccountant {
+            fn memory_limit(&self) -> u64 {
+                512 * 1024 * 1024
+            }
+            fn memory_charged(&self) -> u64 {
+                self.charged.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.charged.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.charged.fetch_sub(bytes, Ordering::SeqCst);
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    self.panics.fetch_add(1, Ordering::SeqCst);
+                    std::panic::panic_any(self.payload.clone());
+                }
+            }
+        }
+        let panics = Arc::new(AtomicUsize::new(0));
+        let original = Arc::new(());
+        let other_accountant = Arc::new(CleanupAccountant {
+            charged: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+            panics: panics.clone(),
+            payload: original.clone(),
+        });
+        let other_ctx = NapiCtx::builder()
+            .memory_accountant(other_accountant.clone())
+            .build();
+        let mut other = Store::default();
+        let (other_ctx, other_instance, _other_memory, other_session) =
+            instance_with_context(&mut other, other_ctx, |store, _| {
+                Function::new_typed(store, |_: i32| {})
+            });
+        LOGICAL_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                drop(other_instance);
+                drop(other_session);
+                drop(other);
+            }))
+        });
+        let accountant = Arc::new(ReentrantAccountant(AtomicU64::new(0)));
+        let ctx = NapiCtx::builder()
+            .memory_accountant(accountant.clone())
+            .build();
+        let mut store = Store::default();
+        store
+            .engine_mut()
+            .set_tunables(wasmer_napi::budgeted_tunables(ctx.budget()));
+        let (ctx, instance, memory, session) =
+            instance_with_context(&mut store, ctx, |store, _| {
+                Function::new_typed(store, |_: i32| {})
+            });
+        let child_done = Arc::new(AtomicBool::new(false));
+        let observed = child_done.clone();
+        other_accountant.armed.store(true, Ordering::SeqCst);
+        EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let cleanup = LOGICAL_DROP.with(|slot| slot.borrow_mut().take()).unwrap();
+                cleanup();
+                observed.store(true, Ordering::SeqCst);
+            }))
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::eval(
+                &mut store,
+                &instance,
+                &memory,
+                "globalThis.bytes = new Uint8Array(32 * 1024 * 1024); 42",
+            )
+        }));
+        // Even a failed setup must release its independent Store here, rather
+        // than leave a panicking owner for thread-local process teardown.
+        let leftover = LOGICAL_DROP.with(|slot| slot.borrow_mut().take());
+        let leftover_present = leftover.is_some();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(leftover)));
+        let fresh = super::eval(&mut store, &instance, &memory, "40 + 2").unwrap();
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+        drop(instance);
+        drop(session);
+        drop(store);
+        assert!(!leftover_present, "allocator cleanup hook did not run");
+        assert!(child_done.load(Ordering::SeqCst));
+        assert_eq!(panics.load(Ordering::SeqCst), 1);
+        assert_eq!(other_ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(other_accountant.charged.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+        assert_eq!(fresh, 42);
+        assert!(Arc::ptr_eq(
+            outcome
+                .expect_err("causal deferred cleanup failure was lost")
+                .downcast_ref::<Arc<()>>()
+                .unwrap(),
+            &original
+        ));
+    }
+    #[test]
+    fn deferred_causal_cleanup_preserves_the_initiating_import_failure() {
+        if run_in_subprocess(
+            "native_frame_tests::deferred_causal_cleanup_preserves_the_initiating_import_failure",
+            Duration::from_secs(30),
+        ) {
+            deferred_causal_cleanup_proof();
+        }
+    }
+}
+
+#[test]
+fn native_allocator_defers_independent_store_retirement_until_cpp_exit() {
+    if !run_in_subprocess(
+        "native_allocator_defers_independent_store_retirement_until_cpp_exit",
+        Duration::from_secs(30),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wasmer::sys::NativeEngineExt;
+    let mut other = Store::default();
+    let (other_ctx, other_instance, _other_memory, other_session) =
+        instance(&mut other, |_| Ok(()));
+    other_instance
+        .exports
+        .get_typed_function::<(), ()>(&other, "init_owned")
+        .unwrap()
+        .call(&mut other)
+        .unwrap();
+    assert_eq!(other_ctx.budget().snapshot().live_isolates, 2);
+    let accountant = Arc::new(ReentrantAccountant(AtomicU64::new(0)));
+    let ctx = NapiCtx::builder()
+        .memory_accountant(accountant.clone())
+        .build();
+    let mut store = Store::default();
+    store
+        .engine_mut()
+        .set_tunables(wasmer_napi::budgeted_tunables(ctx.budget()));
+    let (ctx, instance, memory, session) = instance_with_context(&mut store, ctx, |store, _| {
+        Function::new_typed(store, |_: i32| {})
+    });
+    let operation = Arc::new(AtomicU64::new(u64::MAX));
+    let release = Arc::new(AtomicU64::new(u64::MAX));
+    let retained = Arc::new(AtomicU64::new(u64::MAX));
+    let observed_operation = operation.clone();
+    let observed_release = release.clone();
+    let observed_retained = retained.clone();
+    let other_budget = other_ctx.budget();
+    let during_budget = other_budget.clone();
+    EXTERNAL_ACCOUNTANT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            // Pure Wasm ready work remains supported in an allocator callback.
+            assert_eq!(
+                other_instance
+                    .exports
+                    .get_typed_function::<(), i32>(&other, "fresh")
+                    .unwrap()
+                    .call(&mut other)
+                    .unwrap(),
+                9
+            );
+            // V8 entry and explicit release must reject before provider/logical
+            // state changes. These are real ordinary public session imports.
+            observed_operation.store(
+                other_instance
+                    .exports
+                    .get_typed_function::<(), i32>(&other, "global_status")
+                    .unwrap()
+                    .call(&mut other)
+                    .unwrap() as u64,
+                Ordering::SeqCst,
+            );
+            observed_release.store(
+                other_instance
+                    .exports
+                    .get_typed_function::<(), i32>(&other, "release_owned")
+                    .unwrap()
+                    .call(&mut other)
+                    .unwrap() as u64,
+                Ordering::SeqCst,
+            );
+            drop(other_instance);
+            drop(other_session);
+            drop(other);
+            observed_retained.store(
+                during_budget.snapshot().live_isolates as u64,
+                Ordering::SeqCst,
+            );
+        }));
+    });
+    let value = eval(
+        &mut store,
+        &instance,
+        &memory,
+        "globalThis.bytes = new Uint8Array(32 * 1024 * 1024); 42",
+    )
+    .unwrap();
+    let after = other_budget.snapshot();
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    drop(instance);
+    drop(session);
+    drop(store);
+    assert_eq!(value, 42);
+    assert_eq!(
+        operation.load(Ordering::SeqCst),
+        1,
+        "allocator reentered V8"
+    );
+    assert_eq!(
+        release.load(Ordering::SeqCst),
+        1,
+        "allocator consumed explicit release"
+    );
+    assert_eq!(
+        retained.load(Ordering::SeqCst),
+        2,
+        "provider was disposed inside allocator"
+    );
+    assert_eq!(
+        after.live_isolates, 0,
+        "physical CPP exit did not drain the owned plan"
+    );
+    assert_eq!(after.wasm_linear, 0);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+    assert_eq!(
+        wasmer_napi::NapiMemoryAccountant::memory_charged(&*accountant),
+        0
+    );
+}
+
+#[test]
+fn native_allocator_panic_preserves_first_payload_and_stops_caught_js() {
+    if !run_in_subprocess(
+        "native_allocator_panic_preserves_first_payload_and_stops_caught_js",
+        Duration::from_secs(30),
+    ) {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wasmer::sys::NativeEngineExt;
+    for typed in [false, true] {
+        let accountant = Arc::new(ReentrantAccountant(AtomicU64::new(0)));
+        let ctx = NapiCtx::builder()
+            .memory_accountant(accountant.clone())
+            .build();
+        let mut store = Store::default();
+        store
+            .engine_mut()
+            .set_tunables(wasmer_napi::budgeted_tunables(ctx.budget()));
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let observed_callbacks = callbacks.clone();
+        let (ctx, instance, memory, session) =
+            instance_with_context(&mut store, ctx, move |store, _| {
+                Function::new_typed(store, move |_: i32| {
+                    observed_callbacks.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+        let original = Arc::new(());
+        let panic = original.clone();
+        EXTERNAL_ACCOUNTANT_HOOK
+            .with(|slot| *slot.borrow_mut() = Some(Box::new(move || std::panic::panic_any(panic))));
+        let script = "try { new Uint8Array(32 * 1024 * 1024); } catch (_) {} callback(); while (true) {} globalThis.nativeAfter = 1; 42";
+        memory.view(&store).write(1024, script.as_bytes()).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if typed {
+                instance
+                    .exports
+                    .get_typed_function::<(i32, i32), i32>(&store, "eval")
+                    .unwrap()
+                    .call(&mut store, 1024, script.len() as i32)
+                    .map(|value| vec![Value::I32(value)])
+            } else {
+                instance
+                    .exports
+                    .get_function("eval")
+                    .unwrap()
+                    .call(
+                        &mut store,
+                        &[Value::I32(1024), Value::I32(script.len() as i32)],
+                    )
+                    .map(|values| values.to_vec())
+            }
+        }));
+        let after = eval(
+            &mut store,
+            &instance,
+            &memory,
+            "typeof nativeAfter === 'undefined' ? 0 : nativeAfter",
+        )
+        .unwrap();
+        let fresh = eval(&mut store, &instance, &memory, "40 + 2").unwrap();
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+        }
+        drop(instance);
+        drop(session);
+        drop(store);
+        assert_eq!(fresh, 42);
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+        assert_eq!(
+            wasmer_napi::NapiMemoryAccountant::memory_charged(&*accountant),
+            0
+        );
+        assert!(Arc::ptr_eq(
+            outcome.unwrap_err().downcast_ref::<Arc<()>>().unwrap(),
+            &original
+        ));
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            0,
+            "failed frame admitted another native callback"
+        );
+        assert_eq!(after, 0, "JS escaped the termination backedge");
+    }
+}
+
+#[test]
+fn native_external_buffers_reject_nonresident_guest_spans() {
+    if !run_in_subprocess(
+        "native_external_buffers_reject_nonresident_guest_spans",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    let mut store = Store::default();
+    let (ctx, instance, memory, session) = instance(&mut store, |_| Ok(()));
+    let size = memory.view(&store).data_size();
+    for export in ["external_array", "external_buffer"] {
+        let create = instance
+            .exports
+            .get_typed_function::<(i32, i32), i32>(&store, export)
+            .unwrap();
+        for (offset, length) in [(size as i32 - 8, 16), (-1, 16), (64, -1)] {
+            assert_eq!(create.call(&mut store, offset, length).unwrap(), 1);
+        }
+        // Real provider admission still accepts the ordinary valid prefix.
+        assert_eq!(create.call(&mut store, 64, 8).unwrap(), 0);
+    }
+    let fresh = eval(&mut store, &instance, &memory, "40 + 2").unwrap();
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    drop(instance);
+    drop(session);
+    drop(store);
+    assert_eq!(fresh, 42);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+}
+
+#[test]
+fn native_retirement_does_not_resurrect_js_stopped_before_finalizer_entry() {
+    if !run_in_subprocess(
+        "native_retirement_does_not_resurrect_js_stopped_before_finalizer_entry",
+        Duration::from_secs(20),
+    ) {
+        return;
+    }
+    let mut store = Store::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let (ctx, instance, memory, session) = instance(&mut store, move |code| {
+        observed.lock().unwrap().push(code);
+        Ok(())
+    });
+    instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "init_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    let script = "callback(); 42";
+    memory.view(&store).write(1024, script.as_bytes()).unwrap();
+    instance
+        .exports
+        .get_typed_function::<(i32, i32), ()>(&store, "arm_finalizer")
+        .unwrap()
+        .call(&mut store, script.len() as i32, 0)
+        .unwrap();
+    ctx.runtime_control().terminate_all();
+    let release = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "release_owned")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    let status = instance
+        .exports
+        .get_typed_function::<(), i32>(&store, "finalizer_status")
+        .unwrap()
+        .call(&mut store)
+        .unwrap();
+    unsafe {
+        session.deactivate(&mut store.as_store_mut());
+    }
+    drop(instance);
+    drop(session);
+    drop(store);
+    assert_eq!(release, 0);
+    // The explicit Wasm finalizer still runs. Its nested JS cannot execute a
+    // newly entered callback after vendor teardown clears termination flags.
+    assert_eq!(*seen.lock().unwrap(), vec![3]);
+    assert_eq!(status, 10);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
 }

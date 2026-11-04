@@ -31,6 +31,27 @@
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
+namespace {
+thread_local uint64_t g_native_allocator_depth = 0;
+}
+extern "C" int snapi_v8_allocator_active() noexcept {
+  return g_native_allocator_depth != 0;
+}
+extern "C" uint64_t snapi_v8_allocator_enter() noexcept {
+  if (g_native_allocator_depth == UINT64_MAX) std::abort();
+  return g_native_allocator_depth++;
+}
+extern "C" void snapi_v8_allocator_leave(uint64_t previous) noexcept {
+  if (g_native_allocator_depth != previous + 1) std::abort();
+  g_native_allocator_depth = previous;
+}
+
+// Standalone native provider builds have no Wasmer physical header.
+extern "C" __attribute__((weak)) int snapi_bridge_native_bind_isolate(
+    void*, int) noexcept { return 1; }
+extern "C" __attribute__((weak)) void snapi_bridge_native_clear_isolate(
+    void*) noexcept {}
+
 struct unofficial_napi_profile__ {
   unofficial_napi_profile_kind kind = unofficial_napi_profile_cpu;
   uint32_t provider_id = 0;
@@ -463,12 +484,18 @@ extern "C" __attribute__((weak)) int napi_host_guest_heap_free(
 extern "C" __attribute__((weak)) void napi_host_guest_heap_release(
     void* /*ctx*/) {}
 
+void ReleaseGuestHeapContext(unofficial_napi_guest_heap guest_heap) {
+  NapiV8AllocatorCallbackScope callback;
+  napi_host_guest_heap_release(guest_heap);
+}
+
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
   TrackingArrayBufferAllocator()
       : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 
   ~TrackingArrayBufferAllocator() override {
+    NapiV8AllocatorCallbackScope callback;
     unofficial_napi_guest_heap guest_heap =
         guest_heap_.load(std::memory_order_acquire);
     if (guest_heap != nullptr) {
@@ -484,6 +511,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   }
 
   void Free(void* data, size_t length) override {
+    NapiV8AllocatorCallbackScope callback;
     unofficial_napi_guest_heap guest_heap =
         guest_heap_.load(std::memory_order_acquire);
     if (guest_heap != nullptr && data != nullptr &&
@@ -530,6 +558,7 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
 
  private:
   void* AllocateImpl(size_t length, bool zeroed) {
+    NapiV8AllocatorCallbackScope callback;
     unofficial_napi_guest_heap guest_heap =
         guest_heap_.load(std::memory_order_acquire);
     if (guest_heap != nullptr) {
@@ -585,15 +614,24 @@ v8::IsolateGroup GetOrCreateIsolateGroup() {
   return v8::IsolateGroup::GetDefault();
 }
 
+void DisposeIsolateAndWait(EdgeV8Platform* platform, v8::Isolate* isolate,
+                           void* shutdown_pump_handle);
+
 v8::Isolate* CreateIsolateForEnv(EdgeV8Platform* platform,
                                  const v8::Isolate::CreateParams& params) {
   v8::Isolate* isolate = v8::Isolate::Allocate(GetOrCreateIsolateGroup());
   if (isolate == nullptr) return nullptr;
+  snapi_bridge_native_bind_isolate(isolate, 0);
   if (platform != nullptr && !platform->RegisterIsolate(isolate)) {
+    snapi_bridge_native_clear_isolate(isolate);
     isolate->Dispose();
     return nullptr;
   }
   v8::Isolate::Initialize(isolate, params);
+  if (snapi_bridge_native_bind_isolate(isolate, 1) == 0) {
+    DisposeIsolateAndWait(platform, isolate, nullptr);
+    return nullptr;
+  }
   return isolate;
 }
 
@@ -627,6 +665,7 @@ void DisposeIsolateAndWait(EdgeV8Platform* platform,
                            void* shutdown_pump_handle = nullptr) {
   if (isolate == nullptr) return;
 
+  snapi_bridge_native_clear_isolate(isolate);
   PlatformShutdownWaiter waiter;
   if (platform != nullptr) {
     platform->AddIsolateFinishedCallback(
@@ -1931,20 +1970,24 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // function owns it from here on and must release it exactly once.
   unofficial_napi_guest_heap guest_heap =
       options != nullptr ? options->guest_heap : nullptr;
+  if (snapi_v8_allocator_active() != 0) {
+    if (guest_heap != nullptr) ReleaseGuestHeapContext(guest_heap);
+    return napi_invalid_arg;
+  }
   if (env_out == nullptr || owner_out == nullptr) {
-    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    if (guest_heap != nullptr) ReleaseGuestHeapContext(guest_heap);
     return napi_invalid_arg;
   }
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
-    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    if (guest_heap != nullptr) ReleaseGuestHeapContext(guest_heap);
     return status != napi_ok ? status : napi_generic_failure;
   }
 
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
-    if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+    if (guest_heap != nullptr) ReleaseGuestHeapContext(guest_heap);
     ReleaseRuntime();
     return napi_generic_failure;
   }
@@ -1992,6 +2035,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     DisposeIsolateAndWait(platform, isolate);
     {
       std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_hash_seeds.erase(isolate);
       g_tracking_allocators.erase(allocator.get());
     }
     ReleaseRuntime();
@@ -1999,6 +2043,19 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
+  if (context.IsEmpty()) {
+    // Captured allocator/accountant failure may terminate this initialized
+    // isolate. Preserve owned cleanup before constructing any context scope.
+    delete scope;
+    DisposeIsolateAndWait(platform, isolate);
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_hash_seeds.erase(isolate);
+      g_tracking_allocators.erase(allocator.get());
+    }
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
@@ -2007,6 +2064,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     DisposeIsolateAndWait(platform, isolate);
     {
       std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_hash_seeds.erase(isolate);
       g_tracking_allocators.erase(allocator.get());
     }
     ReleaseRuntime();
@@ -2021,7 +2079,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
 
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
                             void* shutdown_pump_handle) {
-  if (owner == nullptr) return napi_invalid_arg;
+  if (owner == nullptr || snapi_v8_allocator_active() != 0) return napi_invalid_arg;
   auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
   // Standalone provider users retain their original entered-scope contract.
   // The Wasmer bridge detached only that entry; enter it during root teardown.

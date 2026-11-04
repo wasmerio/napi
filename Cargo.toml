@@ -7,6 +7,8 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Host-only native stack validation instrumentation; never enabled by default.
+native-stack-diagnostics = []
 # Native managed invocation profile; ordinary sys builds remain synchronous.
 experimental-async = ["wasmer/experimental-async"]
 # Uses the browser/Node JavaScript realm as the N-API value engine when this
@@ -64,6 +66,7 @@ wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", defau
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.11"
 tar = "0.4"
 ureq = "2"
 xz = "0.1"

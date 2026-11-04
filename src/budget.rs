@@ -189,6 +189,32 @@ pub enum EnvRejected {
     HeapDoesNotFit,
 }
 
+// The final accountant destructor is another user callback. It can run
+// while an earlier uncharge/query panic is unwinding through the last budget.
+// Suppress only that secondary failure; an ordinary first Drop panic remains
+// visible to the enclosing Rust/FFI outcome fence.
+struct AccountantOwner(Option<Arc<dyn NapiMemoryAccountant>>);
+impl std::ops::Deref for AccountantOwner {
+    type Target = Option<Arc<dyn NapiMemoryAccountant>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for AccountantOwner {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.0.take())));
+        if let Err(panic) = outcome {
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 /// One shared accountant per app, `Arc`-shared into every pool that allocates.
 ///
 /// Charging is **reserve-based**: bytes are charged before (or exactly at) the
@@ -200,7 +226,7 @@ pub struct ResourceBudget {
     mem_total: u64,
     /// Sum of all currently-charged bytes across every pool.
     mem_charged: AtomicU64,
-    accountant: Option<Arc<dyn NapiMemoryAccountant>>,
+    accountant: AccountantOwner,
     /// Per-pool charge, for observability and reconciliation.
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
@@ -250,10 +276,13 @@ impl ResourceBudget {
     }
 
     pub fn with_accountant(accountant: Arc<dyn NapiMemoryAccountant>) -> Arc<Self> {
+        // Install cleanup custody BEFORE the first custom limit query.
+        let accountant = AccountantOwner(Some(accountant));
+        let mem_total = accountant.as_ref().unwrap().memory_limit();
         Arc::new(Self {
-            mem_total: accountant.memory_limit(),
+            mem_total,
             mem_charged: AtomicU64::new(0),
-            accountant: Some(accountant),
+            accountant,
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
@@ -265,7 +294,7 @@ impl ResourceBudget {
         Self {
             mem_total,
             mem_charged: AtomicU64::new(0),
-            accountant: None,
+            accountant: AccountantOwner(None),
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
@@ -308,7 +337,7 @@ impl ResourceBudget {
             return Ok(());
         }
 
-        if let Some(accountant) = &self.accountant {
+        if let Some(accountant) = self.accountant.as_ref() {
             if !accountant.try_charge(bytes) {
                 return Err(OverBudget {
                     pool,
@@ -359,7 +388,7 @@ impl ResourceBudget {
         }
         self.pool_counter(pool).fetch_sub(bytes, Ordering::AcqRel);
         self.mem_charged.fetch_sub(bytes, Ordering::AcqRel);
-        if let Some(accountant) = &self.accountant {
+        if let Some(accountant) = self.accountant.as_ref() {
             accountant.uncharge(bytes);
         }
     }
@@ -557,6 +586,54 @@ pub(crate) struct EnvHeapCharge {
 /// call. The tracker is freed only at env teardown — after the callback is
 /// removed from the isolate and while no JS runs — so a non-null pointer is
 /// valid for every real invocation.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_near_heap_limit_grant(
+    data: *const c_void,
+    current_limit: usize,
+    _initial_limit: usize,
+) -> usize {
+    if data.is_null() {
+        return current_limit;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let grant = crate::native_frame::synchronous(|_| {
+        let step = DEFAULT_HEAP_GROW_STEP;
+        match tracker.budget.try_charge(Pool::V8HeapReserved, step) {
+            Ok(()) => {
+                // Publish the owned grant before any later callback/metadata
+                // query. Provider retirement releases this exact amount.
+                tracker.granted.fetch_add(step, Ordering::AcqRel);
+                current_limit.saturating_add(step as usize)
+            }
+            Err(_) => {
+                tracker.host_stopped.store(true, Ordering::Release);
+                unsafe {
+                    crate::snapi::snapi_bridge_native_fail_current();
+                }
+                unwind_heap_slack(tracker, current_limit)
+            }
+        }
+    });
+    grant.unwrap_or_else(|| {
+        tracker.host_stopped.store(true, Ordering::Release);
+        // A panic/retirement failure was already recorded and requested the
+        // narrow physical termination leaf inside the synchronous wrapper.
+        unwind_heap_slack(tracker, current_limit)
+    })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+fn unwind_heap_slack(tracker: &EnvHeapCharge, current_limit: usize) -> usize {
+    if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
+        current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
+    } else {
+        current_limit
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn napi_host_near_heap_limit_grant(
     data: *const c_void,
@@ -2103,6 +2180,82 @@ mod memory_grow_callback_tests {
             assert_eq!(budget.snapshot().wasm_linear, 0);
             assert_eq!(accountant.memory_charged(), 0);
             assert_eq!(continued, 0, "guest continued after retired memory.grow");
+        }
+    }
+
+    #[test]
+    fn last_accountant_drop_preserves_prior_uncharge_or_query_panic() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::last_accountant_drop_preserves_prior_uncharge_or_query_panic",
+        ) {
+            return;
+        }
+        struct LastAccountant {
+            charged: Arc<AtomicU64>,
+            drops: Arc<AtomicUsize>,
+            first: Arc<()>,
+            second: Arc<()>,
+            mode: u8,
+        }
+        impl NapiMemoryAccountant for LastAccountant {
+            fn memory_limit(&self) -> u64 {
+                if self.mode == 1 {
+                    panic_any(self.first.clone());
+                }
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.charged.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.charged.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.charged.fetch_sub(bytes, Ordering::SeqCst);
+                if self.mode == 0 {
+                    panic_any(self.first.clone());
+                }
+            }
+        }
+        impl Drop for LastAccountant {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                panic_any(self.second.clone());
+            }
+        }
+        for mode in 0..3 {
+            let first = Arc::new(());
+            let second = Arc::new(());
+            let charged = Arc::new(AtomicU64::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let accountant = Arc::new(LastAccountant {
+                charged: charged.clone(),
+                drops: drops.clone(),
+                first: first.clone(),
+                second: second.clone(),
+                mode,
+            });
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Move the SOLE accountant Arc into its actual budget owner.
+                let budget = ResourceBudget::with_accountant(accountant);
+                let base = BaseTunables::new();
+                let ty = MemoryType::new(1, Some(2), true);
+                let inner = base
+                    .create_host_memory(&ty, &base.memory_style(&ty))
+                    .unwrap();
+                // The real physical memory/last MemoryCharge owns the budget;
+                // all bytes/counters settle before we inspect either payload.
+                let memory = BudgetedMemory::new(inner, budget).unwrap();
+                drop(memory);
+            }));
+            let expected = if mode == 2 { &second } else { &first };
+            assert_eq!(charged.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(Arc::ptr_eq(
+                outcome.unwrap_err().downcast_ref::<Arc<()>>().unwrap(),
+                expected
+            ));
         }
     }
 }

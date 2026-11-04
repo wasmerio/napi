@@ -51,6 +51,8 @@ fn main() {
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=lib/src");
     println!("cargo:rerun-if-changed=v8/src");
+    println!("cargo:rerun-if-env-changed=OBJCOPY");
+    println!("cargo:rerun-if-env-changed=NM");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -71,7 +73,7 @@ fn main() {
     let napi_include = manifest_dir.join("include");
     let napi_lib_src = manifest_dir.join("lib/src");
     let napi_v8_src = manifest_dir.join("v8/src");
-    let v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
+    let mut v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
     assert!(
         v8.include_dir.join("v8.h").exists(),
         "V8 headers not found in {}",
@@ -87,6 +89,23 @@ fn main() {
         .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
 
     let mut build = cc::Build::new();
+    // This private layout/stack-start contract is audited only for the pinned
+    // Linux-amd64 prebuilt. Explicit/local builds keep ordinary native entry
+    // and decline coroutine entry rather than assuming their GC/build flags.
+    if v8.origin == V8Origin::Prebuilt
+        && target_arch == "x86_64"
+        && env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+        && PREBUILT_V8_VERSION == "11.9.7"
+    {
+        v8.library_path = adapt_pinned_v8_archive(&v8.library_path, &build)
+            .unwrap_or_else(|error| panic!("{error}"));
+        build.define("SNAPI_PINNED_V8_STACK_LIMIT", Some("1"));
+        if env::var_os("CARGO_FEATURE_NATIVE_STACK_DIAGNOSTICS").is_some() {
+            build.define("SNAPI_NATIVE_STACK_DIAGNOSTICS", Some("1"));
+        }
+    }
     build
         .cpp(true)
         .flag_if_supported("-std=c++20")
@@ -220,6 +239,165 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=pthread");
         println!("cargo:rustc-link-lib=dylib=rt");
     }
+}
+
+const PINNED_V8_ARCHIVE_SHA256: &str =
+    "c58981886d0aabc93eae4da63ea6f8ce253603f95efe26d604aaaf185ab8109a";
+const PINNED_STACK_OBJECT_SHA256: &str =
+    "f48ebc83f7693073b85889b843649cca1d5c6192ec0c2cb5731b6c9eb28ecacc";
+const STACK_SCANNER_SYMBOL: &str =
+    "_ZNK4heap4base5Stack26IteratePointersUntilMarkerEPNS0_12StackVisitorE";
+const ORIGINAL_STACK_SCANNER_SYMBOL: &str = "snapi_original_v8_stack_iterate_pointers_until_marker";
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut hex, "{byte:02x}").expect("formatting into a String cannot fail");
+    }
+    hex
+}
+
+// The pinned archive uses GNU ar. Preserve every data member byte-for-byte;
+// only its symbol index and the one audited stack.o member may change.
+fn archive_members(bytes: &[u8]) -> Result<Vec<(&str, &[u8])>, String> {
+    if !bytes.starts_with(b"!<arch>\n") {
+        return Err("pinned V8 must be an ordinary GNU archive".into());
+    }
+    let mut position = 8usize;
+    let mut members = Vec::new();
+    while position < bytes.len() {
+        let header = bytes
+            .get(position..position + 60)
+            .ok_or("truncated V8 archive member")?;
+        if &header[58..60] != b"`\n" {
+            return Err("invalid V8 archive member header".into());
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .map_err(|_| "invalid archive member name")?
+            .trim_end();
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .map_err(|_| "invalid archive member length")?
+            .trim()
+            .parse()
+            .map_err(|_| "invalid archive member length")?;
+        let start = position.checked_add(60).ok_or("archive offset overflow")?;
+        let end = start.checked_add(size).ok_or("archive member overflow")?;
+        let data = bytes
+            .get(start..end)
+            .ok_or("truncated archive member data")?;
+        if name != "/" && name != "/SYM64/" {
+            members.push((name, data));
+        }
+        position = end
+            .checked_add(size % 2)
+            .ok_or("archive padding overflow")?;
+    }
+    if position != bytes.len() {
+        return Err("invalid V8 archive padding".into());
+    }
+    Ok(members)
+}
+
+fn tool_output(command: &mut std::process::Command) -> Result<Vec<u8>, String> {
+    let result = command
+        .output()
+        .map_err(|error| format!("could not run {command:?}: {error}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "{command:?} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(result.stdout)
+}
+
+fn adapt_pinned_v8_archive(source: &Path, build: &cc::Build) -> Result<PathBuf, String> {
+    let source_bytes = std::fs::read(source).map_err(|error| error.to_string())?;
+    if sha256(&source_bytes) != PINNED_V8_ARCHIVE_SHA256 {
+        return Err("V8 coroutine stack support requires re-audit of this archive".into());
+    }
+    let before = archive_members(&source_bytes)?;
+    let stack_members: Vec<_> = before
+        .iter()
+        .filter(|(name, _)| *name == "stack.o/")
+        .collect();
+    if stack_members.len() != 1 || sha256(stack_members[0].1) != PINNED_STACK_OBJECT_SHA256 {
+        return Err("audited V8 stack.o member is missing or changed".into());
+    }
+    let directory =
+        PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?).join("v8-native-stack");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let original_object = directory.join("stack-original.o");
+    let adapted_object = directory.join("stack.o");
+    let destination = directory.join("libv8_snapi_stack.a");
+    std::fs::write(&original_object, stack_members[0].1).map_err(|error| error.to_string())?;
+    std::fs::copy(source, &destination).map_err(|error| error.to_string())?;
+
+    let objcopy = env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
+    tool_output(
+        std::process::Command::new(objcopy)
+            .arg("--redefine-sym")
+            .arg(format!(
+                "{STACK_SCANNER_SYMBOL}={ORIGINAL_STACK_SCANNER_SYMBOL}"
+            ))
+            .arg(&original_object)
+            .arg(&adapted_object),
+    )?;
+    // stack.o contains no relocation to its scanner symbol (including its
+    // inlined testing-only loop); all production references are other members.
+    let nm = env::var_os("NM").unwrap_or_else(|| "nm".into());
+    let original_symbols = tool_output(std::process::Command::new(&nm).arg(&original_object))?;
+    let adapted_symbols = tool_output(std::process::Command::new(&nm).arg(&adapted_object))?;
+    let original_symbols =
+        String::from_utf8(original_symbols).map_err(|error| error.to_string())?;
+    let adapted_symbols = String::from_utf8(adapted_symbols).map_err(|error| error.to_string())?;
+    if original_symbols.matches(STACK_SCANNER_SYMBOL).count() != 1 {
+        return Err("unexpected scanner definition/reference in audited stack.o".into());
+    }
+    // nm sorts by symbol name; compare sorted lines after the one exact rename.
+    let expected = original_symbols.replace(STACK_SCANNER_SYMBOL, ORIGINAL_STACK_SCANNER_SYMBOL);
+    let mut expected: Vec<_> = expected.lines().collect();
+    let mut actual: Vec<_> = adapted_symbols.lines().collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected != actual {
+        return Err("V8 scanner transformation changed unrelated symbols".into());
+    }
+
+    let mut replace = build.get_archiver();
+    replace.arg("r").arg(&destination).arg(&adapted_object);
+    tool_output(&mut replace)?;
+    let mut index = build.get_archiver();
+    index.arg("s").arg(&destination);
+    tool_output(&mut index)?;
+    let output_bytes = std::fs::read(&destination).map_err(|error| error.to_string())?;
+    let after = archive_members(&output_bytes)?;
+    if before.len() != after.len() {
+        return Err("V8 scanner transformation changed archive membership".into());
+    }
+    let adapted_bytes = std::fs::read(&adapted_object).map_err(|error| error.to_string())?;
+    for ((old_name, old), (new_name, new)) in before.iter().zip(&after) {
+        if old_name != new_name
+            || if *old_name == "stack.o/" {
+                *new != adapted_bytes
+            } else {
+                old != new
+            }
+        {
+            return Err(format!(
+                "V8 scanner transformation changed unrelated member {old_name}"
+            ));
+        }
+    }
+    if sha256(&std::fs::read(source).map_err(|error| error.to_string())?)
+        != PINNED_V8_ARCHIVE_SHA256
+    {
+        return Err("source V8 archive changed during private adaptation".into());
+    }
+    Ok(destination)
 }
 
 fn resolve_v8_config() -> Result<V8Config, String> {
