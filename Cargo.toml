@@ -50,7 +50,7 @@ offset-allocator = "0.2.0"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", default-features = false, features = [
+wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix-legacy", default-features = false, features = [
   "js",
 ] }
 
@@ -58,7 +58,7 @@ wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", defau
 wasmer = { version = "=7.5.0", path = "../api", default-features = false, features = [
   "sys-default",
 ] }
-wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix", default-features = false, features = [
+wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix-legacy", default-features = false, features = [
   "sys",
 ] }
 
