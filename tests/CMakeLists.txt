@@ -336,6 +336,9 @@ add_fixture_test(${_napi_test_prefix}_test_69_unofficial_realm_entry
 add_fixture_test(${_napi_test_prefix}_test_70_realm_entry_attack
   runners/test_70_realm_entry_attack.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_71_contextify_compat
+  runners/test_71_contextify_compat.cc
+)
 if(_napi_test_engine STREQUAL "v8")
   # Only the V8 provider posts engine tasks through the enqueue hook.
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
