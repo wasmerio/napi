@@ -1013,3 +1013,44 @@ TEST_F(Test69UnofficialRealmEntry, DynamicImportHookRunsInTheEnvsRealm) {
   ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
 }
 #endif
+// napi_run_script in an entered sandbox realm.
+
+namespace {
+
+int32_t Int32Property(napi_env env, napi_value object, const char* name) {
+  napi_value value = nullptr;
+  int32_t out = -1;
+  if (napi_get_named_property(env, object, name, &value) != napi_ok ||
+      napi_get_value_int32(env, value, &out) != napi_ok) {
+    return -1;
+  }
+  return out;
+}
+
+}  // namespace
+
+// A sandbox realm's global is its sandbox, so napi_run_script there reads the
+// sandbox, and its global writes reach the sandbox.
+TEST_F(Test69UnofficialRealmEntry, NapiRunScriptInAnEnteredSandboxRealmUsesTheSandbox) {
+  EnvScope s(runtime_.get());
+  napi_value sandbox = nullptr;
+  napi_value x = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_create_int32(s.env, 42, &x), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "x", x), napi_ok);
+  unofficial_napi_realm realm = CreateRealm(s.env, nullptr, sandbox);
+  ASSERT_NE(realm, nullptr);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_TRUE(StrictEquals(s.env, Global(s.env), sandbox));
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "fromNative", Str(s.env, "native")),
+            napi_ok);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "`${typeof x} ${x} ${fromNative}`")), "number 42 native");
+  EXPECT_NE(Eval(s.env, "globalThis.written = 7; var declared = 8; x = 43"), nullptr);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(Int32Property(s.env, sandbox, "written"), 7);
+  EXPECT_EQ(Int32Property(s.env, sandbox, "declared"), 8);
+  EXPECT_EQ(Int32Property(s.env, sandbox, "x"), 43);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof written")), "undefined");
+}

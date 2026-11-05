@@ -3220,6 +3220,16 @@ extern "C"
     if (str == nullptr)
       return napi_util__::return_pending_if_caught(env, "Failed to convert script to string");
 
+    // A sandbox realm's global is its sandbox (napi_get_global), so the
+    // sandbox is copied into the realm's real global and back, as
+    // unofficial_napi_run_script does.
+    napi_status sync_status = env->contextify().sync_sandbox_in(env->context());
+    if (sync_status != napi_ok)
+    {
+      JS_FreeCString(env->context(), str);
+      return sync_status;
+    }
+
     JSValue out = JS_Eval(env->context(), str, len, "<napi_run_script>", JS_EVAL_TYPE_GLOBAL);
 
     if (JS_IsException(out))
@@ -3241,6 +3251,13 @@ extern "C"
     }
 
     JS_FreeCString(env->context(), str);
+
+    sync_status = env->contextify().sync_sandbox_out(env->context());
+    if (sync_status != napi_ok)
+    {
+      JS_FreeValue(env->context(), out);
+      return sync_status;
+    }
 
     *result = env->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;

@@ -131,7 +131,7 @@ and interrupt callbacks push the env's realm.
 | Provider | A realm is | `get_realm` | Collection |
 |---|---|---|---|
 | V8 | a record with a weak `v8::Global<v8::Context>` and its own microtask queue, owned by the env | creation context of the global, then context embedder-data slot 33 | The context is weak. The next `create_realm` frees records whose context is gone, and only then their microtask queues (from #109). |
-| QuickJS | a record with a `JSContext` on the env's runtime; a sandbox realm copies the sandbox's properties in and out around each call | a map from global or sandbox to record | The key (the sandbox, or the realm's global) holds a function of the realm under a private symbol, and a sandbox realm's global holds the sandbox, so the collector frees the cycle with its key. The record holds the key weakly, and the next `create_realm` frees collected records (from #110). |
+| QuickJS | a record with a `JSContext` on the env's runtime; a sandbox realm copies the sandbox's properties in and out around each script | a map from global or sandbox to record | The key (the sandbox, or the realm's global) holds a function of the realm under a private symbol, and a sandbox realm's global holds the sandbox, so the collector frees the cycle with its key. The record holds the key weakly, and the next `create_realm` frees collected records (from #110). |
 | host-JS | a virtual global context (a `with`/Proxy scope over one host realm) | a per-env `WeakMap` from global or sandbox to context | Nothing holds a realm strongly; the host GC collects it with its key. |
 
 - **host-JS with a native Worker realm (#125).** The env's realm is the
@@ -172,7 +172,13 @@ and interrupt callbacks push the env's realm.
 - **Sandboxes work differently per engine.**
   - V8 turns the sandbox itself into the realm's global, which goes against
     V8's API contract and breaks `vm.createContext(globalThis)`.
-  - QuickJS copies sandbox properties in and out around scripts.
+  - QuickJS copies the sandbox's properties into the realm's global before
+    each script and back after a script that completes:
+    `unofficial_napi_run_script`, and `napi_run_script` while the realm is
+    current. `compile_function` only copies them in. In between, the two can
+    differ. Native code that runs during a script sees the sandbox as of the
+    last copy, and a script it starts in the realm copies the sandbox in
+    again, over the running script's global writes to the same names.
   - host-JS evaluates against the sandbox with `with`.
 
 ## History

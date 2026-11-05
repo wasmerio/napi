@@ -50,6 +50,11 @@ namespace quickjs::detail
         // The context code for `realm` runs in: the realm's, or the env's
         // for NULL.
         JSContext *realm_context(unofficial_napi_realm realm) const;
+        // For napi_run_script in a sandbox realm: copy the sandbox into the
+        // realm's global before the script and back after it, as run_script
+        // does. No-ops for a context without a sandbox.
+        napi_status sync_sandbox_in(JSContext *ctx) const;
+        napi_status sync_sandbox_out(JSContext *ctx) const;
 
         napi_status run_script(unofficial_napi_realm realm,
                                const unofficial_napi_js_source *source,
@@ -125,6 +130,7 @@ namespace quickjs::detail
                                         int32_t line_offset,
                                         int32_t column_offset);
         context_record *find_live_record(JSValueConst global_or_sandbox) const;
+        context_record *sandbox_record_for(JSContext *ctx) const;
         context_record *create_context_record(JSValueConst sandbox_or_undefined,
                                               JSValueConst host_defined_option_id,
                                               napi_value *key_out);

@@ -921,6 +921,29 @@ namespace quickjs::detail
         return record->live() ? record->ctx : nullptr;
     }
 
+    // The live sandbox realm whose context is `ctx`, or null.
+    napi_contextify__::context_record *napi_contextify__::sandbox_record_for(JSContext *ctx) const
+    {
+        if (ctx == nullptr || ctx == ctx_)
+            return nullptr;
+        JSValue global = JS_GetGlobalObject(ctx);
+        context_record *record = find_live_record(global);
+        JS_FreeValue(ctx, global);
+        return record != nullptr && record->ctx == ctx && record->has_sandbox() ? record : nullptr;
+    }
+
+    napi_status napi_contextify__::sync_sandbox_in(JSContext *ctx) const
+    {
+        context_record *record = sandbox_record_for(ctx);
+        return record != nullptr ? sync_sandbox_to_context(record) : napi_ok;
+    }
+
+    napi_status napi_contextify__::sync_sandbox_out(JSContext *ctx) const
+    {
+        context_record *record = sandbox_record_for(ctx);
+        return record != nullptr ? sync_context_to_sandbox(record) : napi_ok;
+    }
+
     napi_status napi_contextify__::run_script(unofficial_napi_realm realm,
                                               const unofficial_napi_js_source *source,
                                               napi_value filename,

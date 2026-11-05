@@ -159,7 +159,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
 //   realm's intrinsics: objects, arrays, functions, classes, errors (also the
 //   ones napi_throw_* makes), promises, dates, typed arrays and buffers.
 //   napi_get_global returns the current realm's global (a sandbox realm's
-//   sandbox), and napi_run_script runs there.
+//   sandbox), and napi_run_script runs there. (QuickJS copies a sandbox in
+//   and out around each script; see docs/realms.md.)
 // - A native function belongs to the realm that was current when it was made,
 //   as an ECMAScript built-in function has a [[Realm]]. That covers
 //   napi_create_function, and the constructors, methods and accessors of
