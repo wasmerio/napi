@@ -941,3 +941,65 @@ TEST_F(Test69UnofficialRealmEntry, BuffersNeverReadTheRealmsBuffer) {
             "true");
   EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm, "String(pageCalls)")), "0");
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+struct ImportHookRealms {
+  napi_ref env_global = nullptr;
+  int calls = 0;
+  int this_is_env_global = 0;
+  int global_is_env_global = 0;
+};
+
+napi_value RecordImportHookRealm(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, &self, &data) != napi_ok) return nullptr;
+  auto* record = static_cast<ImportHookRealms*>(data);
+  napi_value env_global = nullptr;
+  if (napi_get_reference_value(env, record->env_global, &env_global) != napi_ok) return nullptr;
+  ++record->calls;
+  if (StrictEquals(env, self, env_global)) ++record->this_is_env_global;
+  if (StrictEquals(env, Global(env), env_global)) ++record->global_is_env_global;
+  napi_value result = nullptr;
+  napi_create_object(env, &result);
+  return result;
+}
+
+}  // namespace
+
+// Env hooks run in the env's realm: the dynamic-import hook's receiver and
+// current realm are the env's, whichever realm imports and is current.
+TEST_F(Test69UnofficialRealmEntry, DynamicImportHookRunsInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  unofficial_napi_realm b = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  ImportHookRealms record;
+  ASSERT_EQ(napi_create_reference(s.env, Global(s.env), 1, &record.env_global), napi_ok);
+  napi_value hook = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "importHook", NAPI_AUTO_LENGTH, RecordImportHookRealm,
+                                 &record, &hook),
+            napi_ok);
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks), UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION, hook, nullptr};
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  // import() in A: with nothing entered, with A entered, and with B entered.
+  ASSERT_NE(RunIn(s.env, a, "import('one'); 0"), nullptr);
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_NE(Eval(s.env, "import('two'); 0"), nullptr);
+  Leave(s.env, scope);
+  scope = Enter(s.env, b);
+  ASSERT_NE(RunIn(s.env, a, "import('three'); 0"), nullptr);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(record.calls, 3);
+  EXPECT_EQ(record.this_is_env_global, 3);
+  EXPECT_EQ(record.global_is_env_global, 3);
+  ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
+}
+#endif

@@ -939,6 +939,10 @@ napi_value GetVmDynamicImportDefaultInternalSymbol(napi_env env) {
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name) {
   if (env == nullptr || property_name == nullptr) return nullptr;
+  // The bindings are the env's: look them up in its realm, whichever is
+  // current.
+  v8::Context::Scope context_scope(env->main_context());
+  napi_realm_frame_scope__ realm_frame(env, nullptr);
   napi_value global = nullptr;
   napi_get_global(env, &global);
   if (global == nullptr) return nullptr;
@@ -1190,30 +1194,37 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     }
   }
 
-  napi_value phase_value = nullptr;
-  napi_create_int32(env, phase == v8::ModuleImportPhase::kSource ? 1 : 2, &phase_value);
-  napi_value argv[5] = {
-      napi_v8_wrap_value(env, id),
-      napi_v8_wrap_value(env, specifier),
-      phase_value,
-      napi_v8_wrap_value(env, CreateDynamicImportAttributesObject(env, import_attributes)),
-      napi_v8_wrap_value(env, resource_name),
-  };
-
-  napi_value global = nullptr;
-  napi_get_global(env, &global);
   napi_value result = nullptr;
-  if (napi_call_function(env, global, callback, 5, argv, &result) != napi_ok) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-      napi_value error = nullptr;
-      if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
-        isolate->ThrowException(napi_v8_unwrap_value(error));
+  {
+    // Env hooks run in the env's realm, whichever realm imports; the
+    // arguments still name the importing script.
+    v8::Context::Scope env_context_scope(env->main_context());
+    napi_realm_frame_scope__ realm_frame(env, nullptr);
+    napi_value phase_value = nullptr;
+    napi_create_int32(env, phase == v8::ModuleImportPhase::kSource ? 1 : 2, &phase_value);
+    napi_value argv[5] = {
+        napi_v8_wrap_value(env, id),
+        napi_v8_wrap_value(env, specifier),
+        phase_value,
+        napi_v8_wrap_value(env, CreateDynamicImportAttributesObject(env, import_attributes)),
+        napi_v8_wrap_value(env, resource_name),
+    };
+
+    napi_value global = nullptr;
+    napi_get_global(env, &global);
+    if (napi_call_function(env, global, callback, 5, argv, &result) != napi_ok) {
+      bool pending = false;
+      if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+        napi_value error = nullptr;
+        if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
+          isolate->ThrowException(napi_v8_unwrap_value(error));
+        }
       }
+      return v8::MaybeLocal<v8::Promise>();
     }
-    return v8::MaybeLocal<v8::Promise>();
   }
 
+  // The promise is the importing realm's.
   v8::Local<v8::Promise::Resolver> resolver;
   if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
     return v8::MaybeLocal<v8::Promise>();
@@ -1256,6 +1267,9 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
   napi_value id_value = GetRefValue(env, record->host_defined_option_ref);
   if (callback == nullptr || wrapper == nullptr || id_value == nullptr) return;
 
+  // Env hooks run in the env's realm, whichever realm the module is in.
+  v8::Context::Scope env_context_scope(env->main_context());
+  napi_realm_frame_scope__ realm_frame(env, nullptr);
   napi_value meta_value = napi_v8_wrap_value(env, meta);
   napi_value argv[3] = {id_value, meta_value, wrapper};
   napi_value ignored = nullptr;
