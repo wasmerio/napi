@@ -9,7 +9,10 @@
 - **N-API acts in one realm at a time, the current realm**, as an ECMAScript
   engine runs code in the realm of its running execution context:
   - what N-API creates comes from the current realm, with its intrinsics, and
-    `napi_get_global` returns its global;
+    `napi_get_global` returns its global. Errors, typed arrays and DataViews
+    never come from the realm's global, which its scripts control. A buffer
+    is the current realm's `Uint8Array` with the env realm's
+    `Buffer.prototype`, since `Buffer` belongs to the env;
   - a native function belongs to the realm current when it was made (its
     `[[Realm]]`, as for an ECMAScript built-in function) and its callback
     runs in that realm, whichever realm calls it;

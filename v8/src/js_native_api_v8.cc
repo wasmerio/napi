@@ -13,7 +13,6 @@
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_setter_callback_info.h"
 #include "internal/unofficial_napi_bridge.h"
-#include "napi_typedarray_metadata.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -437,8 +436,30 @@ inline v8::PropertyAttribute ToV8PropertyAttributes(napi_property_attributes att
   return static_cast<v8::PropertyAttribute>(v8_attrs);
 }
 
-inline const char* TypedArrayConstructorName(napi_typedarray_type type) {
-  return napi::typedarray_constructor_name(type);
+// Makes a typed array of the current realm's own intrinsic, after the checks
+// Node makes, since v8::TypedArray::New aborts on an out-of-range view.
+template <typename T>
+napi_status CreateTypedArray(napi_env env,
+                             v8::Local<v8::ArrayBuffer> buffer,
+                             size_t element_size,
+                             const char* type_name,
+                             size_t byte_offset,
+                             size_t length,
+                             v8::Local<v8::Value>* result) {
+  if (byte_offset % element_size != 0) {
+    std::string message = std::string("start offset of ") + type_name +
+                          " should be a multiple of " + std::to_string(element_size);
+    napi_throw_range_error(env, "ERR_NAPI_INVALID_TYPEDARRAY_ALIGNMENT", message.c_str());
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid TypedArray alignment");
+  }
+  const size_t buffer_length = buffer->ByteLength();
+  if (byte_offset > buffer_length || length > T::kMaxLength ||
+      length * element_size > buffer_length - byte_offset) {
+    napi_throw_range_error(env, "ERR_NAPI_INVALID_TYPEDARRAY_LENGTH", "Invalid typed array length");
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid TypedArray length");
+  }
+  *result = T::New(buffer, byte_offset, length);
+  return napi_ok;
 }
 
 inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* out_type) {
@@ -1000,29 +1021,61 @@ napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(arraybuffer);
   if (!local->IsArrayBuffer()) return napi_arraybuffer_expected;
+  v8::Local<v8::ArrayBuffer> buffer = local.As<v8::ArrayBuffer>();
 
-  const char* ctor_name = TypedArrayConstructorName(type);
-  if (ctor_name == nullptr) return InvalidArg(env);
-
-  v8::TryCatch tc(env->isolate);
-  v8::Local<v8::String> key;
-  if (!v8::String::NewFromUtf8(env->isolate, ctor_name, v8::NewStringType::kNormal).ToLocal(&key)) {
-    return napi_generic_failure;
+  // The current realm's own constructors, never its global's: scripts can
+  // replace those.
+  v8::Context::Scope context_scope(env->context());
+  v8::Local<v8::Value> view;
+  napi_status status = napi_ok;
+  switch (type) {
+    case napi_int8_array:
+      status = CreateTypedArray<v8::Int8Array>(env, buffer, 1, "Int8Array", byte_offset, length, &view);
+      break;
+    case napi_uint8_array:
+      status = CreateTypedArray<v8::Uint8Array>(env, buffer, 1, "Uint8Array", byte_offset, length, &view);
+      break;
+    case napi_uint8_clamped_array:
+      status = CreateTypedArray<v8::Uint8ClampedArray>(
+          env, buffer, 1, "Uint8ClampedArray", byte_offset, length, &view);
+      break;
+    case napi_int16_array:
+      status = CreateTypedArray<v8::Int16Array>(env, buffer, 2, "Int16Array", byte_offset, length, &view);
+      break;
+    case napi_uint16_array:
+      status = CreateTypedArray<v8::Uint16Array>(env, buffer, 2, "Uint16Array", byte_offset, length, &view);
+      break;
+    case napi_int32_array:
+      status = CreateTypedArray<v8::Int32Array>(env, buffer, 4, "Int32Array", byte_offset, length, &view);
+      break;
+    case napi_uint32_array:
+      status = CreateTypedArray<v8::Uint32Array>(env, buffer, 4, "Uint32Array", byte_offset, length, &view);
+      break;
+    case napi_float16_array:
+      // The provider refuses --no-js-float16array, so Float16Array exists.
+      status = CreateTypedArray<v8::Float16Array>(
+          env, buffer, 2, "Float16Array", byte_offset, length, &view);
+      break;
+    case napi_float32_array:
+      status = CreateTypedArray<v8::Float32Array>(
+          env, buffer, 4, "Float32Array", byte_offset, length, &view);
+      break;
+    case napi_float64_array:
+      status = CreateTypedArray<v8::Float64Array>(
+          env, buffer, 8, "Float64Array", byte_offset, length, &view);
+      break;
+    case napi_bigint64_array:
+      status = CreateTypedArray<v8::BigInt64Array>(
+          env, buffer, 8, "BigInt64Array", byte_offset, length, &view);
+      break;
+    case napi_biguint64_array:
+      status = CreateTypedArray<v8::BigUint64Array>(
+          env, buffer, 8, "BigUint64Array", byte_offset, length, &view);
+      break;
+    default:
+      return InvalidArg(env);
   }
-  v8::Local<v8::Value> ctor_value;
-  if (!env->context()->Global()->Get(env->context(), key).ToLocal(&ctor_value) ||
-      !ctor_value->IsFunction()) {
-    return napi_generic_failure;
-  }
-  v8::Local<v8::Value> args[3] = {
-      local,
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
-  };
-  v8::Local<v8::Object> view;
-  if (!ctor_value.As<v8::Function>()->NewInstance(env->context(), 3, args).ToLocal(&view)) {
-    return ReturnPendingIfCaught(env, tc, "Failed to create TypedArray");
-  }
+  if (status != napi_ok) return status;
   *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }

@@ -1075,3 +1075,50 @@ TEST_F(Test69UnofficialRealmEntry, EnteredRealmKeepsItsStringCodeGenerationSwitc
   EXPECT_EQ(Utf8(s.env, Eval(s.env, probe)), "2");
 }
 #endif
+
+// Typed arrays in an entered realm come from the realm's own constructors,
+// and ranges that don't fit throw that realm's RangeError.
+TEST_F(Test69UnofficialRealmEntry, TypedArraysComeFromTheRealmsIntrinsics) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm,
+                  "globalThis.saved = { Uint8Array, Int32Array, RangeError };"
+                  "globalThis.pageCalls = 0;"
+                  "for (const name of ['Uint8Array', 'Int32Array'])"
+                  "  Object.defineProperty(globalThis, name, { configurable: true,"
+                  "    get() { pageCalls++; return function () { pageCalls++; return {}; }; } });"
+                  "0"),
+            nullptr);
+
+  napi_value buffer = nullptr;
+  napi_value made[4] = {};
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 16, nullptr, &buffer), napi_ok);
+  ASSERT_EQ(napi_create_typedarray(s.env, napi_uint8_array, 4, buffer, 1, &made[0]), napi_ok);
+  ASSERT_EQ(napi_create_typedarray(s.env, napi_int32_array, 2, buffer, 8, &made[1]), napi_ok);
+  // Misaligned, then past the end of the buffer.
+  EXPECT_EQ(napi_create_typedarray(s.env, napi_int32_array, 1, buffer, 2, &made[2]),
+            napi_pending_exception);
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &made[2]), napi_ok);
+  EXPECT_EQ(napi_create_typedarray(s.env, napi_int32_array, 4, buffer, 4, &made[3]),
+            napi_pending_exception);
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &made[3]), napi_ok);
+  napi_value array = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 4, &array), napi_ok);
+  for (uint32_t i = 0; i < 4; ++i) ASSERT_EQ(napi_set_element(s.env, array, i, made[i]), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "made", array), napi_ok);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm,
+                              "(() => {"
+                              "  const [bytes, ints, misaligned, tooLong] = made;"
+                              "  const proto = Object.getPrototypeOf;"
+                              "  return ["
+                              "    proto(bytes) === saved.Uint8Array.prototype, bytes.byteOffset,"
+                              "    bytes.length, proto(ints) === saved.Int32Array.prototype,"
+                              "    ints.length, misaligned instanceof saved.RangeError,"
+                              "    tooLong instanceof saved.RangeError, pageCalls].join();"
+                              "})()")),
+            "true,1,4,true,2,true,true,0");
+}
