@@ -154,6 +154,7 @@ export function wasmer_napi_instanceof(value, ctor) {
 }
 // Intrinsics captured at load, so page code replacing them changes nothing.
 const wasmerNapiGetPrototypeOf = Object.getPrototypeOf;
+const wasmerNapiSetPrototypeOf = Reflect.setPrototypeOf;
 const wasmerNapiFreeze = Object.freeze;
 const wasmerNapiSeal = Object.seal;
 const wasmerNapiKeys = Object.keys;
@@ -161,6 +162,27 @@ const wasmerNapiIsArray = Array.isArray;
 const wasmerNapiConstruct = Reflect.construct;
 export function wasmer_napi_get_prototype(value) {
   return wasmerNapiGetPrototypeOf(value);
+}
+// As V8's Object::SetPrototype, which Node's node_api_set_prototype calls: a
+// refused change (a non-extensible object, a prototype cycle) is a failure,
+// not an exception, and so is a Proxy trap's exception, which V8 doesn't let
+// propagate. A prototype that is neither an object nor null is ignored, and
+// a primitive's object wrapper would be temporary. Returns false on failure.
+// JavaScript can't tell a Proxy apart, so for one this approximates V8's
+// Proxy branch: there a trap returning false succeeds and a primitive
+// prototype fails.
+function wasmerNapiIsObject(value) {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+export function wasmer_napi_set_prototype(value, prototype) {
+  if (!wasmerNapiIsObject(value) || (prototype !== null && !wasmerNapiIsObject(prototype))) {
+    return true;
+  }
+  try {
+    return wasmerNapiSetPrototypeOf(value, prototype);
+  } catch {
+    return false;
+  }
 }
 export function wasmer_napi_object_freeze(value) {
   wasmerNapiFreeze(value);
@@ -171,8 +193,9 @@ export function wasmer_napi_object_seal(value) {
 export function wasmer_napi_own_keys(value) {
   return wasmerNapiKeys(value);
 }
-// A type test that never throws, like V8's IsArray: Array.isArray throws on a
-// revoked Proxy.
+// A type test that never throws: Array.isArray throws on a revoked Proxy.
+// V8's IsArray, which Node uses, is false for every Proxy. JavaScript can't
+// detect one, so here a live Proxy of an array still counts as an array.
 export function wasmer_napi_is_array(value) {
   try {
     return wasmerNapiIsArray(value);
@@ -180,7 +203,8 @@ export function wasmer_napi_is_array(value) {
     return false;
   }
 }
-// An array's length, or -1 for anything else. A Proxy's get trap can throw.
+// An array's length, or -1 for anything else. For a Proxy of an array (no
+// array in Node, see above) this runs its get trap, which can throw.
 export function wasmer_napi_array_length(value) {
   return wasmer_napi_is_array(value) ? value.length >>> 0 : -1;
 }
@@ -1390,6 +1414,8 @@ extern "C" {
     fn wasmer_napi_instanceof(value: &JsValue, ctor: &JsValue) -> Result<bool, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_get_prototype(value: &JsValue) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_set_prototype(value: &JsValue, prototype: &JsValue) -> Result<bool, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_object_freeze(value: &JsValue) -> Result<(), JsValue>;
     #[wasm_bindgen(catch)]
@@ -6320,6 +6346,11 @@ pub unsafe extern "C" fn snapi_bridge_get_prototype(
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
+    // As in Node, null and undefined have no prototype; a Proxy's
+    // getPrototypeOf trap can throw.
+    if object.is_null() || object.is_undefined() {
+        return NAPI_OBJECT_EXPECTED;
+    }
     match wasmer_napi_get_prototype(object) {
         Ok(proto) => {
             let id = state.insert(proto);
@@ -6339,6 +6370,11 @@ pub unsafe extern "C" fn snapi_bridge_object_freeze(env: SnapiEnv, obj_id: u32) 
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
+    // As in Node, null and undefined can't be frozen (Object.freeze would
+    // return them unchanged).
+    if object.is_null() || object.is_undefined() {
+        return NAPI_OBJECT_EXPECTED;
+    }
     match wasmer_napi_object_freeze(object) {
         Ok(()) => NAPI_OK,
         Err(error) => {
@@ -6355,6 +6391,9 @@ pub unsafe extern "C" fn snapi_bridge_object_seal(env: SnapiEnv, obj_id: u32) ->
     let Some(object) = state.get(obj_id) else {
         return NAPI_INVALID_ARG;
     };
+    if object.is_null() || object.is_undefined() {
+        return NAPI_OBJECT_EXPECTED;
+    }
     match wasmer_napi_object_seal(object) {
         Ok(()) => NAPI_OK,
         Err(error) => {
@@ -6617,9 +6656,19 @@ pub unsafe extern "C" fn snapi_bridge_node_api_set_prototype(
     let (Some(object), Some(prototype)) = (state.get(object_id), state.get(prototype_id)) else {
         return NAPI_INVALID_ARG;
     };
-    let prototype = Object::from(prototype.clone());
-    Object::set_prototype_of(&Object::from(object.clone()), &prototype);
-    NAPI_OK
+    if object.is_null() || object.is_undefined() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    // As in Node and the V8 backend, a refused change is a generic failure
+    // with no exception pending (see wasmer_napi_set_prototype).
+    match wasmer_napi_set_prototype(object, prototype) {
+        Ok(true) => NAPI_OK,
+        Ok(false) => NAPI_GENERIC_FAILURE,
+        Err(error) => {
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_create_typedarray(
@@ -7464,11 +7513,16 @@ mod tests {
             let proxy = state.insert(make(
                 "new Proxy([], { get() { throw new Error('get'); }, \
                  getPrototypeOf() { throw new Error('getPrototypeOf'); }, \
+                 setPrototypeOf() { throw new Error('setPrototypeOf'); }, \
                  preventExtensions() { throw new Error('preventExtensions'); }, \
                  ownKeys() { throw new Error('ownKeys'); } })",
             ));
             let typed_array = state.insert(make("new Uint8Array(4)"));
             let object = state.insert(make("({})"));
+            let frozen = state.insert(make("Object.freeze({})"));
+            let number = state.insert(JsValue::from_f64(5.0));
+            let parent = state.insert(make("({})"));
+            let child = state.insert(make("({})"));
             let ctor = state.insert(make(
                 "(() => { const f = function () {}; \
                  Object.defineProperty(f, Symbol.hasInstance, { value() { throw new Error('hasInstance'); } }); \
@@ -7514,6 +7568,31 @@ mod tests {
                     "ownKeys",
                     snapi_bridge_get_property_names(env, proxy, &mut out),
                 );
+                // As V8 under Node: a refused prototype change, or a throwing
+                // setPrototypeOf trap, fails with no exception pending, and a
+                // prototype that is neither an object nor null is ignored.
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, proxy, object),
+                    NAPI_GENERIC_FAILURE
+                );
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, frozen, object),
+                    NAPI_GENERIC_FAILURE
+                );
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, child, parent),
+                    NAPI_OK
+                );
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, parent, child),
+                    NAPI_GENERIC_FAILURE,
+                    "a prototype cycle is refused"
+                );
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, object, number),
+                    NAPI_OK
+                );
+                assert!(env_mut(env).unwrap().last_exception.is_none());
                 // Type checks don't throw, even on a revoked Proxy, and
                 // report a status rather than an exception.
                 flag = 1;
@@ -7530,6 +7609,23 @@ mod tests {
                 assert_eq!(
                     snapi_bridge_get_property_names(env, null, &mut out),
                     NAPI_OBJECT_EXPECTED
+                );
+                // As in Node, null has no prototype and can't be frozen,
+                // sealed or given a prototype.
+                assert_eq!(
+                    snapi_bridge_get_prototype(env, null, &mut out),
+                    NAPI_OBJECT_EXPECTED
+                );
+                assert_eq!(snapi_bridge_object_freeze(env, null), NAPI_OBJECT_EXPECTED);
+                assert_eq!(snapi_bridge_object_seal(env, null), NAPI_OBJECT_EXPECTED);
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, null, object),
+                    NAPI_OBJECT_EXPECTED
+                );
+                // A prototype that is an object or null is accepted.
+                assert_eq!(
+                    snapi_bridge_node_api_set_prototype(env, object, null),
+                    NAPI_OK
                 );
             }
             assert!(unsafe { env_mut(env) }.unwrap().last_exception.is_none());
