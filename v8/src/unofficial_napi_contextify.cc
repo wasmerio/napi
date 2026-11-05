@@ -703,7 +703,9 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   *out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
-  v8::Local<v8::Context> context = env->context();
+  // Buffer is the env's: read and call it in the env's realm, never in the
+  // current one, whose global its scripts control.
+  v8::Local<v8::Context> context = env->main_context();
 
   std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(isolate, size);
   if (!store) return false;

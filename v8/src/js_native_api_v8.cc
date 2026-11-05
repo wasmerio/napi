@@ -320,7 +320,9 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
                                          size_t offset,
                                          size_t length) {
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
-  v8::Local<v8::Context> context = env->context();
+  // Buffer is the env's: read it from the env's realm, never from the current
+  // one, whose global its scripts control.
+  v8::Local<v8::Context> context = env->main_context();
   v8::Local<v8::Object> global = context->Global();
 
   // Node's napi_create_buffer* APIs produce Buffer instances, not plain

@@ -887,3 +887,57 @@ TEST_F(Test69UnofficialRealmEntry, ThrowFromARealmsFunctionIsCaughtAsItsError) {
   ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
   EXPECT_FALSE(pending);
 }
+
+// Buffer is the env's, as in Node: a buffer made in a realm takes the env
+// realm's Buffer.prototype, and nothing reads the realm's Buffer.
+TEST_F(Test69UnofficialRealmEntry, BuffersNeverReadTheRealmsBuffer) {
+  EnvScope s(runtime_.get());
+  ASSERT_NE(RunIn(s.env, nullptr,
+                  "globalThis.Buffer = class Buffer extends Uint8Array {"
+                  "  static from(view) { return new Buffer(view); } };"
+                  "0"),
+            nullptr);
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm,
+                  "globalThis.pageCalls = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { get() {"
+                  "  pageCalls++;"
+                  "  return { prototype: {}, from() { pageCalls++; return {}; } }; } });"
+                  "0"),
+            nullptr);
+
+  unofficial_napi_bytecode_open_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  options.source_text = Str(s.env, "1 + 1");
+  options.filename = Str(s.env, "script.js");
+  options.shape = unofficial_napi_bytecode_shape_script;
+  options.params_or_undefined = Undefined(s.env);
+  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "hdo"), &options.host_defined_option_id),
+            napi_ok);
+  unofficial_napi_bytecode_open_result opened{};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &options, &opened), napi_ok);
+  ASSERT_NE(opened.bytecode, nullptr);
+
+  napi_value buffer = nullptr;
+  napi_value serialized = nullptr;
+  void* data = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  EXPECT_EQ(napi_create_buffer(s.env, 4, &data, &buffer), napi_ok);
+  EXPECT_EQ(unofficial_napi_bytecode_serialize(s.env, opened.bytecode, &serialized), napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(unofficial_napi_bytecode_release(s.env, opened.bytecode), napi_ok);
+  ASSERT_NE(buffer, nullptr);
+  ASSERT_NE(serialized, nullptr);
+  bool is_typedarray = false;
+  ASSERT_EQ(napi_is_typedarray(s.env, serialized, &is_typedarray), napi_ok);
+  EXPECT_TRUE(is_typedarray);
+
+  // The buffer is a Buffer of the env's realm, and the realm's getter never
+  // ran.
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "made", buffer), napi_ok);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "String(Object.getPrototypeOf(made) === Buffer.prototype)")),
+            "true");
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm, "String(pageCalls)")), "0");
+}
