@@ -65,6 +65,9 @@ struct napi_env__
   JSContext *context() const;
   // The env's own realm.
   JSContext *main_context() const;
+  // The env realm's DataView constructor, read when the env was made, before
+  // any script could replace it; undefined if there was none.
+  JSValueConst data_view_constructor() const;
   // A function of the current realm that keeps it alive; undefined for the
   // env's own realm.
   JSValueConst current_realm_anchor() const;
@@ -174,6 +177,7 @@ private:
   napi_agent__ *agent_;
   JSContext *context_;
   int32_t module_api_version_ = 8;
+  JSValue data_view_constructor_ = JS_UNDEFINED;
 
   // The realms N-API acts in, innermost last. Empty means the env's own.
   std::vector<napi_realm_frame__> realm_frames_;

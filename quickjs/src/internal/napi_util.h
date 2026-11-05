@@ -76,11 +76,9 @@ public:
                                         napi_key_conversion key_conversion,
                                         napi_value *result);
 
+  // Errors from the realm's intrinsics. On failure the error is JS_EXCEPTION
+  // and the exception is pending.
   static JSValue create_plain_error(JSContext *ctx, const char *msg);
-  static napi_status create_plain_error_common(napi_env env,
-                                               napi_value code,
-                                               napi_value msg,
-                                               napi_value *result);
   static JSValue create_error_object(JSContext *ctx,
                                      JSValue (*factory)(JSContext *, const char *, ...),
                                      const char *code,

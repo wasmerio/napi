@@ -104,7 +104,18 @@ napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_a
   if (agent_->principal_env() == nullptr)
     agent_->set_principal_env(this);
   if (context_ != nullptr)
+  {
     agent_->open_root_scope(this);
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue data_view = JS_GetPropertyStr(context_, global, "DataView");
+    JS_FreeValue(context_, global);
+    if (JS_IsConstructor(context_, data_view))
+      data_view_constructor_ = data_view;
+    else if (JS_IsException(data_view))
+      JS_FreeValue(context_, JS_GetException(context_));
+    else
+      JS_FreeValue(context_, data_view);
+  }
   clear_last_error();
   runtime_interrupts_ = attach_runtime_interrupts(JS_GetRuntime(context), this);
 }
@@ -161,6 +172,9 @@ void napi_env__::prepare_teardown()
   module_wrap_.teardown();
   contextify_.teardown();
   buffers_.teardown();
+  if (context_ != nullptr)
+    JS_FreeValue(context_, data_view_constructor_);
+  data_view_constructor_ = JS_UNDEFINED;
   if (principal)
     agent_->clear_promise_hooks();
   promises_.teardown();
@@ -237,6 +251,11 @@ JSContext *napi_env__::context() const
 JSContext *napi_env__::main_context() const
 {
   return context_;
+}
+
+JSValueConst napi_env__::data_view_constructor() const
+{
+  return data_view_constructor_;
 }
 
 JSValueConst napi_env__::current_realm_anchor() const

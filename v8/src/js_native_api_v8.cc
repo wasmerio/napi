@@ -1541,28 +1541,24 @@ napi_status NAPI_CDECL napi_create_dataview(napi_env env,
     return napi_v8_set_last_error(env, napi_arraybuffer_expected, "ArrayBuffer expected");
   }
 
-  v8::TryCatch tc(env->isolate);
-  auto context = env->context();
-  v8::Local<v8::String> ctor_name = v8::String::NewFromUtf8Literal(env->isolate, "DataView");
-  v8::Local<v8::Value> ctor_val;
-  if (!context->Global()->Get(context, ctor_name).ToLocal(&ctor_val) || !ctor_val->IsFunction()) {
-    return napi_generic_failure;
+  const size_t buffer_length = ab->IsArrayBuffer() ? ab.As<v8::ArrayBuffer>()->ByteLength()
+                                                   : ab.As<v8::SharedArrayBuffer>()->ByteLength();
+  if (byte_offset > buffer_length || length > buffer_length - byte_offset) {
+    napi_throw_range_error(env,
+                           "ERR_NAPI_INVALID_DATAVIEW_ARGS",
+                           "byte_offset + byte_length should be less than or equal to the size in "
+                           "bytes of the array passed in");
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid DataView range");
   }
-  v8::Local<v8::Function> ctor = ctor_val.As<v8::Function>();
-  v8::Local<v8::Value> args[3] = {
-      ab,
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
-  };
-  v8::Local<v8::Object> out;
-  if (!ctor->NewInstance(context, 3, args).ToLocal(&out)) {
-    if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
-      return napi_v8_set_last_error(env, napi_pending_exception, "DataView construction threw");
-    }
-    return napi_generic_failure;
-  }
-  *result = napi_v8_wrap_value(env, out);
+
+  // The current realm's own DataView, never its global's (scripts can
+  // replace that).
+  v8::Context::Scope context_scope(env->context());
+  v8::Local<v8::DataView> view =
+      ab->IsArrayBuffer()
+          ? v8::DataView::New(ab.As<v8::ArrayBuffer>(), byte_offset, length)
+          : v8::DataView::New(ab.As<v8::SharedArrayBuffer>(), byte_offset, length);
+  *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 

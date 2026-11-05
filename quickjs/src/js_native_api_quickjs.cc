@@ -1373,27 +1373,46 @@ extern "C"
     if (!napi_util__::check_value(env, arraybuffer) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
+    JSContext *ctx = env->context();
+    JSValueConst buffer = napi_quickjs_value_inner(env, arraybuffer);
     size_t ab_len = 0;
-    uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, napi_quickjs_value_inner(env, arraybuffer));
-    if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->context()))
+    uint8_t *ab_data = JS_GetArrayBuffer(ctx, &ab_len, buffer);
+    if (ab_data == nullptr && ab_len == 0 && JS_HasException(ctx))
       return napi_util__::return_pending_if_caught(env, "ArrayBuffer expected");
+    if (byte_offset > ab_len || length > ab_len - byte_offset)
+    {
+      napi_throw_range_error(env, "ERR_NAPI_INVALID_DATAVIEW_ARGS",
+                             "byte_offset + byte_length should be less than or equal to the size in "
+                             "bytes of the array passed in");
+      return napi_quickjs_set_last_error(env, napi_pending_exception, "Invalid DataView range");
+    }
 
-    JSValue global = JS_GetGlobalObject(env->context());
-    JSValue ctor = JS_GetPropertyStr(env->context(), global, "DataView");
-    JS_FreeValue(env->context(), global);
-    if (JS_IsException(ctor))
-      return napi_util__::return_pending_if_caught(env, "Failed to get DataView constructor");
-
+    // The env realm's DataView, read before any script ran, makes the view;
+    // a view for another realm then takes that realm's own DataView.prototype.
+    // Neither step reads the realm's global, which its scripts control.
+    JSValueConst ctor = env->data_view_constructor();
+    if (!JS_IsConstructor(ctx, ctor))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "No DataView constructor");
     JSValue args[] = {
-        napi_quickjs_value_inner(env, arraybuffer),
-        JS_NewInt64(env->context(), static_cast<int64_t>(byte_offset)),
-        JS_NewInt64(env->context(), static_cast<int64_t>(length))};
-    JSValue view = JS_CallConstructor(env->context(), ctor, 3, args);
-    JS_FreeValue(env->context(), args[1]);
-    JS_FreeValue(env->context(), args[2]);
-    JS_FreeValue(env->context(), ctor);
+        JS_DupValue(ctx, buffer),
+        JS_NewInt64(ctx, static_cast<int64_t>(byte_offset)),
+        JS_NewInt64(ctx, static_cast<int64_t>(length))};
+    JSValue view = JS_CallConstructor(ctx, ctor, 3, args);
+    for (JSValue arg : args)
+      JS_FreeValue(ctx, arg);
     if (JS_IsException(view))
       return napi_util__::return_pending_if_caught(env, "DataView construction threw");
+    if (ctx != env->main_context())
+    {
+      JSValue proto = JS_GetClassProto(ctx, JS_GetClassID(view));
+      const int set = JS_SetPrototype(ctx, view, proto);
+      JS_FreeValue(ctx, proto);
+      if (set < 0)
+      {
+        JS_FreeValue(ctx, view);
+        return napi_util__::return_pending_if_caught(env, "Failed to create DataView");
+      }
+    }
 
     *result = env->wrap_value_in_current_scope(view, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
@@ -3033,13 +3052,9 @@ extern "C"
       return napi_invalid_arg;
     }
 
-    JSValue error = napi_util__::create_plain_error(env->context(), msg);
-    if (code != nullptr)
-    {
-      JS_SetPropertyStr(env->context(), error, "code",
-                        JS_NewString(env->context(), code));
-    }
-
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewPlainError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
     napi_util__::set_last_exception(env, error);
 
     return napi_ok;
@@ -3074,7 +3089,10 @@ extern "C"
     NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewTypeError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewTypeError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
@@ -3083,7 +3101,10 @@ extern "C"
     NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewRangeError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewRangeError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
@@ -3092,7 +3113,10 @@ extern "C"
     NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewSyntaxError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewSyntaxError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
@@ -3107,7 +3131,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_create_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
   {
-    return napi_util__::create_plain_error_common(env, code, msg, result);
+    return napi_util__::create_error_common(env, JS_NewPlainError, code, msg, result);
   }
 
   napi_status NAPI_CDECL napi_create_type_error(napi_env env, napi_value code, napi_value msg, napi_value *result)

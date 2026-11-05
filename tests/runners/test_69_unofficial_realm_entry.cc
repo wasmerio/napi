@@ -773,3 +773,117 @@ TEST_F(Test69UnofficialRealmEntry, ReplacedInstanceDataIsFinalizedInTheEnvsRealm
   }
   EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
 }
+// Intrinsics in an entered realm: what N-API makes there comes from the
+// realm's own intrinsics, never from whatever its global now holds, which its
+// scripts control.
+
+namespace {
+
+// Saves the realm's Error, RangeError and DataView, then hides Error and
+// DataView behind getters that count every read: Error reads as 1, and
+// DataView as a fake constructor that counts its calls too.
+constexpr char kReplaceErrorAndDataView[] =
+    "globalThis.saved = { Error, RangeError, DataView };"
+    "globalThis.pageCalls = 0;"
+    "Object.defineProperty(globalThis, 'Error', {"
+    "  configurable: true, get() { pageCalls++; return 1; } });"
+    "Object.defineProperty(globalThis, 'DataView', {"
+    "  configurable: true,"
+    "  get() { pageCalls++; return function DataView() { pageCalls++; return {}; }; } });"
+    "0";
+
+// In `realm` (the env's own when null): makes an error, one with a message
+// longer than 256 bytes, a DataView and an out-of-range DataView, and reports
+// how they relate to the intrinsics the realm saved.
+std::string MadeFromSavedIntrinsics(napi_env env, unofficial_napi_realm realm) {
+  const std::string long_message(300, 'm');
+  napi_value made[4] = {};
+  napi_value buffer = nullptr;
+  napi_status range_status = napi_ok;
+  bool pending = false;
+  unofficial_napi_realm_scope scope = Enter(env, realm);
+  const bool ok =
+      napi_create_error(env, nullptr, Str(env, "made"), &made[0]) == napi_ok &&
+      napi_create_error(env, nullptr, Str(env, long_message.c_str()), &made[1]) == napi_ok &&
+      napi_create_arraybuffer(env, 8, nullptr, &buffer) == napi_ok &&
+      napi_create_dataview(env, 4, buffer, 2, &made[2]) == napi_ok &&
+      napi_is_exception_pending(env, &pending) == napi_ok && !pending &&
+      (range_status = napi_create_dataview(env, 200, buffer, 10, &made[3])) ==
+          napi_pending_exception &&
+      napi_get_and_clear_last_exception(env, &made[3]) == napi_ok;
+  napi_value array = nullptr;
+  const bool stored = ok && napi_create_array_with_length(env, 4, &array) == napi_ok &&
+                      napi_set_element(env, array, 0, made[0]) == napi_ok &&
+                      napi_set_element(env, array, 1, made[1]) == napi_ok &&
+                      napi_set_element(env, array, 2, made[2]) == napi_ok &&
+                      napi_set_element(env, array, 3, made[3]) == napi_ok &&
+                      napi_set_named_property(env, Global(env), "made", array) == napi_ok;
+  Leave(env, scope);
+  if (!stored) {
+    return "<not made: pending " + std::to_string(pending) + ", range status " +
+           std::to_string(range_status) + ">";
+  }
+  return Utf8(env, RunIn(env, realm,
+                         "(() => {"
+                         "  const [e, long, view, range] = made;"
+                         "  const proto = Object.getPrototypeOf;"
+                         "  return ["
+                         "    proto(e) === saved.Error.prototype, e instanceof saved.Error,"
+                         "    e.message, long.message.length,"
+                         "    proto(view) === saved.DataView.prototype, view.byteOffset,"
+                         "    view.byteLength,"
+                         "    proto(range) === saved.RangeError.prototype, range.code,"
+                         "    pageCalls].join();"
+                         "})()"));
+}
+
+napi_value ThrowBindingFailed(napi_env env, napi_callback_info) {
+  const napi_status status = napi_throw_error(env, nullptr, "binding failed");
+  if (status != napi_ok && status != napi_pending_exception) return Str(env, "not thrown");
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ErrorsAndDataViewsComeFromTheRealmsIntrinsics) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm, kReplaceErrorAndDataView), nullptr);
+  const std::string expected =
+      "true,true,made,300,true,2,4,true,ERR_NAPI_INVALID_DATAVIEW_ARGS,0";
+  EXPECT_EQ(MadeFromSavedIntrinsics(s.env, realm), expected);
+
+  // The env's own realm, too.
+  ASSERT_NE(RunIn(s.env, nullptr, kReplaceErrorAndDataView), nullptr);
+  EXPECT_EQ(MadeFromSavedIntrinsics(s.env, nullptr), expected);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ThrowFromARealmsFunctionIsCaughtAsItsError) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  unofficial_napi_realm realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm, kReplaceErrorAndDataView), nullptr);
+
+  napi_value fail = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_EQ(napi_create_function(s.env, "fail", NAPI_AUTO_LENGTH, ThrowBindingFailed, nullptr,
+                                 &fail),
+            napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(napi_set_named_property(s.env, realm_global, "fail", fail), napi_ok);
+
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm,
+                              "(() => {"
+                              "  try { return String(fail()); } catch (e) {"
+                              "    return [e instanceof saved.Error,"
+                              "      Object.getPrototypeOf(e) === saved.Error.prototype,"
+                              "      e.message, pageCalls].join();"
+                              "  }"
+                              "})()")),
+            "true,true,binding failed,0");
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+}

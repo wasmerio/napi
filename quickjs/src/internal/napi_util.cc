@@ -751,41 +751,8 @@ napi_status napi_util__::get_property_names(napi_env env,
 
 JSValue napi_util__::create_plain_error(JSContext *ctx, const char *msg)
 {
-  JSValue global = JS_GetGlobalObject(ctx);
-  JSValue error_ctor = JS_GetPropertyStr(ctx, global, "Error");
-  JSValue msg_str = JS_NewString(ctx, msg ? msg : "");
-  JSValue error = JS_CallConstructor(ctx, error_ctor, 1, &msg_str);
-  JS_FreeValue(ctx, msg_str);
-  JS_FreeValue(ctx, error_ctor);
-  JS_FreeValue(ctx, global);
-  return error;
-}
-
-napi_status napi_util__::create_plain_error_common(napi_env env,
-                                                   napi_value code,
-                                                   napi_value msg,
-                                                   napi_value *result)
-{
-  if (!check_env(env) || msg == nullptr || result == nullptr)
-    return napi_invalid_arg;
-
-  JSValue msg_val = napi_quickjs_value_inner(env, msg);
-  if (!JS_IsString(msg_val))
-    return napi_string_expected;
-
-  const char *msg_str = JS_ToCString(env->context(), msg_val);
-  JSValue error = create_plain_error(env->context(), msg_str);
-  JS_FreeCString(env->context(), msg_str);
-
-  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
-  {
-    const char *code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
-    JS_SetPropertyStr(env->context(), error, "code", JS_NewString(env->context(), code_str));
-    JS_FreeCString(env->context(), code_str);
-  }
-
-  *result = env->wrap_value_in_current_scope(error, true);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  // The realm's own Error, not whatever its global now calls Error.
+  return create_error_object(ctx, JS_NewPlainError, nullptr, msg);
 }
 
 JSValue napi_util__::create_error_object(JSContext *ctx,
@@ -794,6 +761,9 @@ JSValue napi_util__::create_error_object(JSContext *ctx,
                                          const char *msg)
 {
   JSValue error = factory(ctx, "%s", msg ? msg : "");
+  if (JS_IsException(error))
+    return error;
+  // The factory cuts the formatted message at 256 bytes; keep all of it.
   JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, msg ? msg : ""));
   if (code != nullptr)
     JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, code));
@@ -823,6 +793,8 @@ napi_status napi_util__::create_error_common(napi_env env,
   JS_FreeCString(env->context(), msg_str);
   if (code_str != nullptr)
     JS_FreeCString(env->context(), code_str);
+  if (JS_IsException(error))
+    return return_pending_if_caught(env, "Failed to create error");
 
   *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
