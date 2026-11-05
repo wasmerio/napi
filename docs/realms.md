@@ -68,6 +68,15 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
 | QuickJS | a record with a `JSContext` on the env's runtime; a sandbox realm copies the sandbox's properties in and out around each call | a map from global or sandbox to record | The key (the sandbox, or the realm's global) holds a function of the realm under a private symbol, and a sandbox realm's global holds the sandbox, so the collector frees the cycle with its key. The record holds the key weakly, and the next `create_realm` frees collected records (from #110). |
 | host-JS | a virtual global context (a `with`/Proxy scope over one host realm) | a per-env `WeakMap` from global or sandbox to context | Nothing holds a realm strongly; the host GC collects it with its key. |
 
+- **host-JS with a native Worker realm (#125).** The env's realm is the
+  Worker's own global, and it serves that one env. `create_realm` fails with
+  a pending TypeError, so `get_realm` finds nothing and NULL is the only realm
+  to run code in. `unofficial_napi_run_script` goes to the bridge's
+  `evaluate()`, which keeps the filename and offsets, and `napi_run_script` to
+  its `binding()`.
+- **Threads.** A realm call touches only its env's state and runs on the
+  thread that owns the env (#107). The bridge takes no global lock for it.
+
 ## How EdgeJS uses it
 
 - `vm.createContext` → `create_realm`.

@@ -5,6 +5,8 @@ pub mod callback;
 #[path = "callback_js.rs"]
 pub mod callback;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) mod callback_cache;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub mod napi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[path = "napi_js.rs"]
