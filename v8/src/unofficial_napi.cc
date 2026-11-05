@@ -1693,8 +1693,12 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   napi_agent__* agent = env->agent;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
-  agent->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
-  agent->enqueue_foreground_task_target = hooks->data;
+  {
+    // Backing-store deleters read the hook on other threads.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    agent->enqueue_foreground_task_callback = hooks->enqueue_foreground_task_callback;
+    agent->enqueue_foreground_task_target = hooks->data;
+  }
   agent->embedder_hooks_attached = true;
 
   env->isolate->SetFatalErrorHandler(

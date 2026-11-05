@@ -28,6 +28,26 @@
 #include <string>
 #include <vector>
 
+// Guards `napi_env__::external_backing_store_hints`, the `hint->env` back
+// pointer, and the env's queue of external finalizers.
+//
+// V8 destroys backing stores from its ArrayBufferSweeper, which runs on
+// background threads, so `ExternalBackingStoreDeleter` executes concurrently
+// with the main thread creating new hints. The set was being mutated from both
+// without synchronization, which corrupts the host heap — glibc aborts with
+// "malloc_consolidate(): unaligned fastbin chunk detected" a few hundred
+// requests into a payload-heavy workload. (`GuestHeap` already takes its own
+// mutex for exactly this reason; this container was missed.)
+//
+// Process-global rather than a member because a deleter has to read
+// `hint->env` before it can know which env to lock, and that read races
+// teardown. Never destroyed, matching the other process-lifetime globals here
+// (see the runtime-globals comment in unofficial_napi.cc).
+std::mutex& NapiV8ExternalHintsMutex() {
+  static std::mutex& mutex = *new std::mutex();
+  return mutex;
+}
+
 namespace {
 
 void DrainFinalizerQueueForegroundTask(napi_env env, void* data) {
@@ -211,91 +231,129 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   }
 }
 
-// Guards `napi_env__::external_backing_store_hints` and the `hint->env` back
-// pointer.
-//
-// V8 destroys backing stores from its ArrayBufferSweeper, which runs on
-// background threads, so `ExternalBackingStoreDeleter` executes concurrently
-// with the main thread creating new hints. The set was being mutated from both
-// without synchronization, which corrupts the host heap — glibc aborts with
-// "malloc_consolidate(): unaligned fastbin chunk detected" a few hundred
-// requests into a payload-heavy workload. (`GuestHeap` already takes its own
-// mutex for exactly this reason; this container was missed.)
-//
-// Process-global rather than a member because a deleter has to read
-// `hint->env` before it can know which env to lock, and that read races
-// teardown. Never destroyed, matching the other process-lifetime globals here
-// (see the runtime-globals comment in unofficial_napi.cc).
-std::mutex& ExternalHintsMutex() {
-  static std::mutex& mutex = *new std::mutex();
-  return mutex;
+// Queues an external backing store's finalizer for the env's thread. Returns
+// true when the caller must then post a drain for it, with
+// PostExternalFinalizerDrain. The caller holds NapiV8ExternalHintsMutex(),
+// which keeps `env` alive: its teardown takes the lock before it lets go of a
+// hint.
+bool QueueExternalFinalizer(napi_env env, const napi_external_finalizer__& finalizer) {
+  env->external_finalizers.push_back(finalizer);
+  env->has_external_finalizers.store(true, std::memory_order_release);
+  // Without a hook, the env's next checkpoint drains the queue; once the env
+  // is being torn down, the teardown does.
+  napi_agent__* agent = env->agent;
+  if (env->external_finalizer_drain_posted || env->releasing || agent == nullptr ||
+      agent->enqueue_foreground_task_callback == nullptr) {
+    return false;
+  }
+  env->external_finalizer_drain_posted = true;
+  ++env->external_drain_posts_in_flight;
+  return true;
 }
 
+// Posts a drain of the env's external finalizers. Called without the lock:
+// the hook may hand the drain to the env's thread and wait for it to run, and
+// the drain takes the lock. The env's teardown waits for the post to finish.
+void PostExternalFinalizerDrain(napi_env env,
+                                unofficial_napi_enqueue_foreground_task_callback enqueue,
+                                void* target) {
+  const bool posted =
+      enqueue(target, DrainFinalizerQueueForegroundTask, env, nullptr, 0) == napi_ok;
+  std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+  // Refused: another deleter may post, or the next checkpoint drains.
+  if (!posted) env->external_finalizer_drain_posted = false;
+  // Notified under the lock: the env may be gone once its teardown sees no
+  // post in flight.
+  if (--env->external_drain_posts_in_flight == 0) {
+    env->external_drain_posts_done.notify_all();
+  }
+}
 
+// Takes the external finalizers deleters queued for `env`. Env thread only.
+std::vector<napi_external_finalizer__> TakeExternalFinalizers(napi_env env) {
+  std::vector<napi_external_finalizer__> taken;
+  if (!env->has_external_finalizers.load(std::memory_order_acquire)) return taken;
+  std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+  taken.swap(env->external_finalizers);
+  env->has_external_finalizers.store(false, std::memory_order_relaxed);
+  env->external_finalizer_drain_posted = false;
+  return taken;
+}
+
+// V8 calls this wherever the last reference to the backing store drops: on
+// one of its own threads, during a GC, or inside a detach or transfer while
+// another realm is entered. None of those may run the finalizer, so, as Node
+// does, this only claims it and hands it to the env's thread.
 void ExternalBackingStoreDeleter(void* data,
                                  size_t /*length*/,
                                  void* deleter_data) {
   auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
   if (hint == nullptr) return;
-  // Read the env and unlink in one critical section: the pointer is cleared by
-  // FinalizeExternalBackingStoreHints under the same lock, so reading it
-  // outside would race teardown.
-  napi_env env = nullptr;
-  napi_finalize finalize_cb = nullptr;
+  napi_env post_to = nullptr;
+  unofficial_napi_enqueue_foreground_task_callback enqueue = nullptr;
+  void* target = nullptr;
   {
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    env = hint->env;
+    // Reads the env and unlinks in one critical section: the env's teardown
+    // clears the pointer under the same lock. A cleared pointer means the
+    // teardown has claimed the finalizer, and maybe run it, already.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    napi_env env = hint->env;
     if (env != nullptr) {
       v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
           record_release(env, hint);
       env->external_backing_store_hints.erase(hint);
       hint->env = nullptr;
+      if (hint->finalize_cb != nullptr &&
+          QueueExternalFinalizer(
+              env, {hint->finalize_cb,
+                    hint->external_data != nullptr ? hint->external_data : data,
+                    hint->finalize_hint})) {
+        post_to = env;
+        enqueue = env->agent->enqueue_foreground_task_callback;
+        target = env->agent->enqueue_foreground_task_target;
+      }
     }
-    // Claim the callback under the lock so a concurrent teardown sweep cannot
-    // also run it.
-    finalize_cb = hint->finalize_cb;
-    hint->finalize_cb = nullptr;
-  }
-  // Outside the lock: a finalizer may re-enter N-API and create or destroy
-  // further hints.
-  if (finalize_cb != nullptr) {
-    finalize_cb(env, hint->external_data != nullptr ? hint->external_data : data,
-                hint->finalize_hint);
   }
   delete hint;
+  if (post_to != nullptr) PostExternalFinalizerDrain(post_to, enqueue, target);
 }
 
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  // Detach the whole set under the lock, then run the finalizers outside it.
-  // A backing store can still outlive the env, so each hint is unlinked from
-  // the dying env rather than deleted here — its deleter frees it later and,
-  // seeing a null env, skips the env-side bookkeeping.
-  // Each entry is the callback claimed from one hint, plus its arguments. The
-  // hints themselves are not touched after the lock is dropped: a concurrent
-  // deleter may already be freeing them.
-  std::vector<std::tuple<napi_finalize, void*, void*>> pending;
-  {
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    std::unordered_set<napi_external_backing_store_hint__*> hints;
-    hints.swap(env->external_backing_store_hints);
-    pending.reserve(hints.size());
-    for (auto* hint : hints) {
-      if (hint == nullptr) continue;
-      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-          record_release(env, hint);
-      hint->env = nullptr;
-      if (hint->finalize_cb != nullptr) {
-        pending.emplace_back(hint->finalize_cb, hint->external_data,
-                             hint->finalize_hint);
-        hint->finalize_cb = nullptr;
+  // Claims, under the lock, the finalizers deleters queued and those of the
+  // backing stores still alive, then runs them outside it. A backing store
+  // can outlive the env, so each live hint is unlinked from the dying env
+  // rather than deleted here — its deleter frees it later and, seeing a null
+  // env, skips the env-side bookkeeping. The hints are not touched after the
+  // lock is dropped: a concurrent deleter may already be freeing them.
+  // Repeats while finalizers make more external buffers.
+  for (;;) {
+    std::vector<napi_external_finalizer__> pending;
+    {
+      std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+      pending.swap(env->external_finalizers);
+      env->has_external_finalizers.store(false, std::memory_order_relaxed);
+      env->external_finalizer_drain_posted = false;
+      std::unordered_set<napi_external_backing_store_hint__*> hints;
+      hints.swap(env->external_backing_store_hints);
+      if (pending.empty() && hints.empty()) return;
+      pending.reserve(pending.size() + hints.size());
+      for (auto* hint : hints) {
+        if (hint == nullptr) continue;
+        v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+            record_release(env, hint);
+        hint->env = nullptr;
+        if (hint->finalize_cb != nullptr) {
+          pending.push_back({hint->finalize_cb, hint->external_data, hint->finalize_hint});
+          hint->finalize_cb = nullptr;
+        }
       }
     }
-  }
 
-  for (auto& [finalize_cb, external_data, finalize_hint] : pending) {
-    env->CallFinalizer(finalize_cb, external_data, finalize_hint);
+    for (const auto& finalizer : pending) {
+      env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+    }
   }
 }
 
@@ -609,11 +667,15 @@ void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
 
 void napi_env__::DrainFinalizerQueue() {
   finalization_scheduled = false;
-  if (pending_finalizers.empty() && pending_buffer_finalizers.empty()) return;
+  std::vector<napi_external_finalizer__> external = TakeExternalFinalizers(this);
+  if (pending_finalizers.empty() && pending_buffer_finalizers.empty() && external.empty()) {
+    return;
+  }
   v8::HandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(main_context());
   napi_realm_frame_scope__ realm_frame(this, nullptr);
-  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty()) {
+  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty() ||
+         !external.empty()) {
     while (!pending_finalizers.empty()) {
       napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
       pending_finalizers.erase(ref_tracker);
@@ -626,6 +688,13 @@ void napi_env__::DrainFinalizerQueue() {
       FinalizeBufferRecord(record);
       release(record);
     }
+
+    for (const auto& finalizer : external) {
+      CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+    }
+    // Releasing a buffer record above can free its backing store, which
+    // queues the store's finalizer.
+    external = TakeExternalFinalizers(this);
   }
 }
 
@@ -685,6 +754,12 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 
 napi_env__::~napi_env__() {
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
+  {
+    // A drain posted now could run after the env is gone. Deleters queue
+    // without posting; FinalizeExternalBackingStoreHints runs what they queue.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    releasing = true;
+  }
   // Every scope closes. Cleanup hooks and finalizers each run in the env's
   // realm, and a scope one leaves open closes when it returns.
   PopRealmFrames(0);
@@ -697,11 +772,22 @@ napi_env__::~napi_env__() {
   FinalizeExternalBackingStoreHints(this);
   napi_v8_finalize_buffer_records(this);
   CallFinalizer(instance_data_finalize_cb, instance_data, instance_data_finalize_hint);
+  // External buffers the finalizers above made: their finalizers run too, and
+  // no hint is left pointing at the env.
+  FinalizeExternalBackingStoreHints(this);
   // Backstop: nothing above should leave a scope open, and a context still
   // entered here would abort V8 at the embedder's next Context::Exit.
   PopRealmFrames(0);
   if (agent != nullptr && agent->principal_env == this) {
     agent->principal_env = nullptr;
+  }
+  {
+    // A deleter still in the hook, posting a drain, touches the env when the
+    // hook returns. A hook that waits for the env's thread must let go of
+    // the task once the release begins; the release already needs that for
+    // the engine's own tasks.
+    std::unique_lock<std::mutex> lock(NapiV8ExternalHintsMutex());
+    external_drain_posts_done.wait(lock, [this] { return external_drain_posts_in_flight == 0; });
   }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
@@ -995,8 +1081,8 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
         record_create(env, hint.get());
     {
-      // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
-      std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+      // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
+      std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
       env->external_backing_store_hints.insert(hint.release());
     }
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
@@ -3243,8 +3329,8 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
       record_create(env, hint.get());
   {
-    // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
+    // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
     env->external_backing_store_hints.insert(hint.release());
   }
 

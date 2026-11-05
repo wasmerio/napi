@@ -19,7 +19,9 @@ class CpuProfiler;
 // its principal env; envs for other realms of the isolate will share it.
 //
 // Only the isolate's own thread reads or writes these fields, except
-// `allocator` and `hash_seed`, which are fixed once the agent is set up.
+// `allocator` and `hash_seed`, which are fixed once the agent is set up, and
+// the enqueue hook, which backing-store deleters read on any thread under
+// NapiV8ExternalHintsMutex().
 struct napi_agent__ {
   explicit napi_agent__(v8::Isolate* isolate);
   ~napi_agent__();

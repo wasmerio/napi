@@ -7,9 +7,12 @@
 
 #include "unofficial_napi.h"
 
+#include <atomic>
 #include <cstdio>
+#include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 // The current realm: what N-API creates while a realm is entered or one of
@@ -783,6 +786,197 @@ TEST_F(Test69UnofficialRealmEntry, ReplacedInstanceDataIsFinalizedInTheEnvsRealm
   }
   EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
 }
+
+// External ArrayBuffer finalizers. An engine may free a backing store
+// wherever its last reference drops: on a collector thread, or inside a
+// detach while another realm is entered. Its finalizer still runs on the
+// env's thread, in the env's realm, as in Node.
+
+namespace {
+
+constexpr char kEnvMarker[] = "__envMarker";
+
+// Marks the env's global, which no other realm's global has.
+void MarkEnvGlobal(napi_env env) {
+  napi_value marker = nullptr;
+  ASSERT_EQ(napi_get_boolean(env, true, &marker), napi_ok);
+  ASSERT_EQ(napi_set_named_property(env, Global(env), kEnvMarker, marker), napi_ok);
+}
+
+// Made on the test's thread, which is the env's.
+struct ExternalFinalizerRecord {
+  std::thread::id env_thread = std::this_thread::get_id();
+  uint8_t bytes[8] = {};
+  std::atomic<int> calls{0};
+  std::atomic<bool> on_env_thread{false};
+  std::atomic<bool> saw_env_global{false};
+};
+
+void RecordExternalFinalizer(node_api_basic_env basic_env, void*, void* hint) {
+  auto* record = static_cast<ExternalFinalizerRecord*>(hint);
+  const bool on_env_thread = std::this_thread::get_id() == record->env_thread;
+  record->on_env_thread = on_env_thread;
+  // N-API is only usable on the env's thread.
+  if (on_env_thread) {
+    auto env = const_cast<napi_env>(basic_env);
+    bool has_marker = false;
+    record->saw_env_global =
+        napi_has_named_property(env, Global(env), kEnvMarker, &has_marker) == napi_ok &&
+        has_marker;
+  }
+  record->calls.fetch_add(1);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, DetachedExternalArrayBufferIsFinalizedLaterInTheEnvsRealm) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                             RecordExternalFinalizer, &record, &buffer),
+            napi_ok);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  // V8 frees the backing store inside the detach, and the finalizer waits
+  // for the env to drain its finalizers. QuickJS runs it in the detach, in
+  // the env's realm.
+  EXPECT_EQ(record.calls.load(), 0);
+#endif
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+
+// A finalizer still waiting when the env is released runs then, once.
+TEST_F(Test69UnofficialRealmEntry, DetachedExternalArrayBufferIsFinalizedByTheEnvsRelease) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                             RecordExternalFinalizer, &record, &buffer),
+            napi_ok);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+  Leave(s.env, scope);
+  Release(s);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+void DetachExternalBufferFromInstanceDataFinalizer(napi_env env, void* data, void*) {
+  auto* record = static_cast<ExternalFinalizerRecord*>(data);
+  napi_value buffer = nullptr;
+  if (napi_create_external_arraybuffer(env, record->bytes, sizeof(record->bytes),
+                                       RecordExternalFinalizer, record, &buffer) == napi_ok) {
+    (void)napi_detach_arraybuffer(env, buffer);
+  }
+}
+
+}  // namespace
+
+// The instance-data finalizer runs last in the release. An external buffer it
+// makes and detaches is still finalized, once. V8 only: the QuickJS provider
+// frees its context before it runs that finalizer, which then cannot make
+// values.
+TEST_F(Test69UnofficialRealmEntry, ExternalArrayBufferTheInstanceDataFinalizerDetachesIsFinalized) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, DetachExternalBufferFromInstanceDataFinalizer,
+                                   nullptr),
+            napi_ok);
+  Release(s);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+#endif
+
+TEST_F(Test69UnofficialRealmEntry, CollectedExternalArrayBuffersAreFinalizedOnTheEnvsThread) {
+  constexpr int kBatches = 16;
+  constexpr int kBuffers = kBatches * 64;
+  auto records = std::make_unique<ExternalFinalizerRecord[]>(kBuffers);
+  auto finalized = [&records] {
+    int calls = 0;
+    for (int i = 0; i < kBuffers; ++i) calls += records[i].calls.load();
+    return calls;
+  };
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+
+  // The buffers become unreachable, and are collected and finalized, with A
+  // entered. Allocation between batches lets V8 collect, and sweep on its own
+  // threads, as it goes.
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  for (int batch = 0; batch < kBatches; ++batch) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    for (int i = batch * (kBuffers / kBatches); i < (batch + 1) * (kBuffers / kBatches); ++i) {
+      ExternalFinalizerRecord& record = records[i];
+      napi_value buffer = nullptr;
+      ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                                 RecordExternalFinalizer, &record, &buffer),
+                napi_ok);
+    }
+    ASSERT_NE(Eval(s.env, "{ let a = []; for (let i = 0; i < 20000; i++) a.push({ i }); 0 }"),
+              nullptr);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  // The collector only hands them to the env. QuickJS runs them as it
+  // collects, on this thread and in the env's realm.
+  EXPECT_EQ(finalized(), 0);
+#endif
+  for (int round = 0; round < 10 && finalized() < kBuffers; ++round) {
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+              napi_ok);
+    if (finalized() < kBuffers) ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  }
+  Leave(s.env, scope);
+
+  int not_once = 0;
+  int off_thread = 0;
+  int in_another_realm = 0;
+  for (int i = 0; i < kBuffers; ++i) {
+    const ExternalFinalizerRecord& record = records[i];
+    if (record.calls.load() != 1) ++not_once;
+    if (record.calls.load() == 0) continue;
+    if (!record.on_env_thread.load()) {
+      ++off_thread;
+    } else if (!record.saw_env_global.load()) {
+      ++in_another_realm;
+    }
+  }
+  EXPECT_EQ(not_once, 0);
+  EXPECT_EQ(off_thread, 0);
+  EXPECT_EQ(in_another_realm, 0);
+}
+
 // Intrinsics in an entered realm: what N-API makes there comes from the
 // realm's own intrinsics, never from whatever its global now holds, which its
 // scripts control.

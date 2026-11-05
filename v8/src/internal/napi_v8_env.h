@@ -2,9 +2,12 @@
 #define NAPI_V8_ENV_H_
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -47,6 +50,14 @@ inline v8::Local<v8::Value> V8LocalValueFromJsValue(napi_value value) {
   std::memcpy(static_cast<void*>(&local), &value, sizeof(value));
   return local;
 }
+
+// An external backing store's finalizer, claimed by the store's deleter and
+// waiting to run on the env's thread.
+struct napi_external_finalizer__ {
+  node_api_basic_finalize cb = nullptr;
+  void* data = nullptr;
+  void* hint = nullptr;
+};
 
 struct napi_callback_info__ {
   virtual ~napi_callback_info__() = default;
@@ -150,6 +161,21 @@ struct napi_env__ {
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
+  // External backing-store finalizers their deleters queued for the env's
+  // thread. Deleters run on any thread, so the fields below are guarded by
+  // NapiV8ExternalHintsMutex(); `has_external_finalizers` is also read
+  // without it, so a drain skips the lock when nothing is queued.
+  std::vector<napi_external_finalizer__> external_finalizers;
+  std::atomic<bool> has_external_finalizers{false};
+  // A deleter posted a drain for them.
+  bool external_finalizer_drain_posted = false;
+  // Deleters in the embedder's hook, posting a drain. The env's teardown
+  // waits for them.
+  int external_drain_posts_in_flight = 0;
+  std::condition_variable external_drain_posts_done;
+  // The env is being torn down: deleters queue without posting, and the
+  // teardown runs what they queue.
+  bool releasing = false;
   // Realm hooks: unofficial_napi_set_promise_reject_callback and
   // unofficial_napi_set_promise_hooks (init, before, after, resolve).
   v8::Global<v8::Function> promise_reject_callback;
@@ -180,6 +206,11 @@ class napi_realm_frame_scope__ {
   napi_env env_;
   size_t depth_;
 };
+
+// Guards what backing-store deleters share with the env's thread: the
+// external hints, the hints' env pointers, the envs' queued external
+// finalizers, and the enqueue hook a deleter posts their drain with.
+std::mutex& NapiV8ExternalHintsMutex();
 
 napi_status napi_v8_set_last_error(napi_env env,
                                    napi_status status,

@@ -15,15 +15,21 @@
 // leaks its pending-task count, which makes unofficial_napi_release_env wait
 // forever; the watchdog below turns that into a failure.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <v8.h>
 
 #include "test_env.h"
 
@@ -54,11 +60,24 @@ struct HookState {
 
   const HookMode mode;
   napi_env env = nullptr;
+  // Made on the test's thread, which is the env's.
+  const std::thread::id env_thread = std::this_thread::get_id();
+  // In kQueue mode, while set, a task posted from another thread also waits
+  // until the env's thread has run or released it. A hook may not wait like
+  // that in general, since it is called during GCs; tests do it while nothing
+  // collects, to show the provider holds no lock the task needs while it
+  // calls the hook.
+  std::atomic<bool> hand_off{false};
 
   std::mutex mutex;
   std::condition_variable cv;
   bool closed = false;
   std::deque<HookedTask> queue;
+  // Tasks queued, and tasks run or released since, in queue order.
+  uint64_t queued = 0;
+  uint64_t done = 0;
+  // Threads that waited in the hook because of `hand_off`.
+  std::vector<std::thread::id> waited;
 
   std::atomic<int> enqueued{0};
   std::atomic<int> released{0};
@@ -99,10 +118,17 @@ napi_status EnqueueHook(void* target,
       return napi_ok;
     case HookMode::kQueue: {
       {
-        std::lock_guard<std::mutex> lock(state->mutex);
+        std::unique_lock<std::mutex> lock(state->mutex);
         if (!state->closed) {
           state->queue.push_back(task);
+          const uint64_t ticket = ++state->queued;
+          const bool wait =
+              state->hand_off.load() && std::this_thread::get_id() != state->env_thread;
+          if (wait) state->waited.push_back(std::this_thread::get_id());
           state->cv.notify_all();
+          if (wait) {
+            state->cv.wait(lock, [state, ticket] { return state->done >= ticket; });
+          }
           return napi_ok;
         }
       }
@@ -122,6 +148,11 @@ size_t RunQueuedTasks(HookState* state) {
     batch.swap(state->queue);
   }
   for (const HookedTask& task : batch) RunTask(state, task);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->done += batch.size();
+  }
+  state->cv.notify_all();
   return batch.size();
 }
 
@@ -135,6 +166,11 @@ void CloseQueue(HookState* state) {
     batch.swap(state->queue);
   }
   for (const HookedTask& task : batch) ReleaseTask(state, task);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->done += batch.size();
+  }
+  state->cv.notify_all();
 }
 
 // Aborts the process if it is not destroyed within `limit`. A provider that
@@ -370,6 +406,211 @@ TEST_F(Test66ForegroundTaskHandoff, QueuedTasksRunOnTheEnvThread) {
     CloseQueue(&hook);
     env.Release();
   }
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+struct ExternalFinalizerCounts {
+  std::thread::id env_thread = std::this_thread::get_id();
+  std::atomic<int> calls{0};
+  std::atomic<int> off_thread{0};
+};
+
+void CountExternalFinalizer(node_api_basic_env /*env*/, void* data, void* hint) {
+  auto* counts = static_cast<ExternalFinalizerCounts*>(hint);
+  if (std::this_thread::get_id() != counts->env_thread) counts->off_thread.fetch_add(1);
+  delete[] static_cast<uint8_t*>(data);
+  counts->calls.fetch_add(1);
+}
+
+// V8 sweeps dead ArrayBuffers on its own threads too, and frees their backing
+// stores there. An external ArrayBuffer's finalizer never runs there, nor
+// inside the collector: the provider posts a drain through the hook, which
+// runs it on the env's thread.
+TEST_F(Test66ForegroundTaskHandoff, ExternalArrayBufferFinalizersRunFromAQueuedTask) {
+  constexpr int kBatches = 100;
+  constexpr int kBuffers = kBatches * 64;
+  ExternalFinalizerCounts counts;
+  HookState hook(HookMode::kQueue);
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    ASSERT_TRUE(env.attached());
+
+    // Allocation pressure on the small heap, rather than a forced collection,
+    // makes V8 sweep concurrently.
+    for (int batch = 0; batch < kBatches; ++batch) {
+      napi_handle_scope handles = nullptr;
+      ASSERT_EQ(napi_open_handle_scope(env.env(), &handles), napi_ok);
+      for (int i = 0; i < kBuffers / kBatches; ++i) {
+        auto* bytes = new uint8_t[1024]();
+        napi_value buffer = nullptr;
+        ASSERT_EQ(napi_create_external_arraybuffer(env.env(), bytes, 1024,
+                                                   CountExternalFinalizer, &counts,
+                                                   &buffer),
+                  napi_ok);
+      }
+      ASSERT_TRUE(RunJs(env.env(),
+                        "{ let a = []; for (let i = 0; i < 20000; i++) a.push({ i }); }"));
+      ASSERT_EQ(napi_close_handle_scope(env.env(), handles), napi_ok);
+    }
+    ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+    EXPECT_EQ(counts.calls.load(), 0) << "finalizers ran inside the collector";
+
+    // Only the hook's queue runs; nothing drains finalizers at a checkpoint.
+    const auto deadline = steady_clock::now() + seconds(20);
+    while (counts.calls.load() < kBuffers) {
+      ASSERT_LT(steady_clock::now(), deadline)
+          << "only " << counts.calls.load() << " of " << kBuffers
+          << " external finalizers ran";
+      if (RunQueuedTasks(&hook) == 0) {
+        // Collects any buffer the first collection missed.
+        ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+        std::unique_lock<std::mutex> lock(hook.mutex);
+        hook.cv.wait_for(lock, milliseconds(10),
+                         [&hook] { return !hook.queue.empty(); });
+      }
+    }
+    EXPECT_EQ(counts.off_thread.load(), 0);
+
+    CloseQueue(&hook);
+    env.Release();
+  }
+  EXPECT_EQ(counts.calls.load(), kBuffers);
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+// Makes an external ArrayBuffer and detaches it. Only `store` keeps its
+// backing store alive.
+void MakeDetachedExternalBuffer(napi_env env,
+                                ExternalFinalizerCounts* counts,
+                                std::shared_ptr<v8::BackingStore>* store) {
+  napi_handle_scope handles = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &handles), napi_ok);
+  auto* bytes = new uint8_t[1024]();
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(env, bytes, 1024, CountExternalFinalizer, counts,
+                                             &buffer),
+            napi_ok);
+  // This provider's napi_value is a v8::Local.
+  v8::Local<v8::Value> value;
+  std::memcpy(static_cast<void*>(&value), &buffer, sizeof(buffer));
+  *store = value.As<v8::ArrayBuffer>()->GetBackingStore();
+  ASSERT_EQ(napi_detach_arraybuffer(env, buffer), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(env, handles), napi_ok);
+  ASSERT_EQ(counts->calls.load(), 0);
+}
+
+// The last reference to a backing store drops on another thread, so its
+// deleter runs there and posts the drain. The hook hands the drain to the
+// env's thread and waits until it has run, which deadlocks if the provider
+// posts while holding a lock the drain takes.
+TEST_F(Test66ForegroundTaskHandoff,
+       ExternalArrayBufferFreedOnAnotherThreadIsFinalizedByThePostedDrain) {
+  ExternalFinalizerCounts counts;
+  HookState hook(HookMode::kQueue);
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    ASSERT_TRUE(env.attached());
+    std::shared_ptr<v8::BackingStore> store;
+    ASSERT_NO_FATAL_FAILURE(MakeDetachedExternalBuffer(env.env(), &counts, &store));
+
+    {
+      Watchdog watchdog("the drain posted from another thread", seconds(30));
+      hook.hand_off = true;
+      std::thread dropper([&store] { store.reset(); });
+      // Only the hook's queue runs.
+      const auto deadline = steady_clock::now() + seconds(20);
+      while (counts.calls.load() == 0 && steady_clock::now() < deadline) {
+        if (RunQueuedTasks(&hook) == 0) {
+          std::unique_lock<std::mutex> lock(hook.mutex);
+          hook.cv.wait_for(lock, milliseconds(10),
+                           [&hook] { return !hook.queue.empty(); });
+        }
+      }
+      // Releases what the hook still holds, so the dropper returns.
+      CloseQueue(&hook);
+      dropper.join();
+      hook.hand_off = false;
+    }
+    EXPECT_EQ(counts.calls.load(), 1);
+    EXPECT_EQ(counts.off_thread.load(), 0);
+    env.Release();
+  }
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+struct InstanceDataSignal {
+  ExternalFinalizerCounts* counts = nullptr;
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool finalized = false;
+  int calls_before = -1;
+};
+
+void SignalInstanceDataFinalized(napi_env /*env*/, void* data, void* /*hint*/) {
+  auto* signal = static_cast<InstanceDataSignal*>(data);
+  std::lock_guard<std::mutex> lock(signal->mutex);
+  signal->calls_before = signal->counts->calls.load();
+  signal->finalized = true;
+  signal->cv.notify_all();
+}
+
+// The env is released while a deleter on another thread is still in the
+// hook, posting a drain. The release runs the queued finalizer itself, and
+// the env outlives the post: the release waits for the hook to return, which
+// here is only once the embedder lets go of the task.
+TEST_F(Test66ForegroundTaskHandoff, ReleaseOutlastsADrainBeingPostedFromAnotherThread) {
+  ExternalFinalizerCounts counts;
+  InstanceDataSignal signal;
+  signal.counts = &counts;
+  HookState hook(HookMode::kQueue);
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    ASSERT_TRUE(env.attached());
+    std::shared_ptr<v8::BackingStore> store;
+    ASSERT_NO_FATAL_FAILURE(MakeDetachedExternalBuffer(env.env(), &counts, &store));
+    // Runs last in the release, just before it waits for posts.
+    ASSERT_EQ(napi_set_instance_data(env.env(), &signal, SignalInstanceDataFinalized, nullptr),
+              napi_ok);
+
+    Watchdog watchdog("the release while a drain was being posted", seconds(30));
+    hook.hand_off = true;
+    std::thread dropper([&store] { store.reset(); });
+    const std::thread::id dropper_id = dropper.get_id();
+    bool posted = false;
+    {
+      // The dropper has posted its drain and waits in the hook.
+      std::unique_lock<std::mutex> lock(hook.mutex);
+      posted = hook.cv.wait_for(lock, seconds(10), [&] {
+        return std::find(hook.waited.begin(), hook.waited.end(), dropper_id) !=
+               hook.waited.end();
+      });
+    }
+    if (!posted) {
+      dropper.join();
+      hook.hand_off = false;
+      FAIL() << "the deleter posted no drain from the dropper's thread";
+    }
+    std::thread closer([&] {
+      {
+        std::unique_lock<std::mutex> lock(signal.mutex);
+        signal.cv.wait(lock, [&] { return signal.finalized; });
+      }
+      // By now the release waits for the post, or is about to.
+      std::this_thread::sleep_for(milliseconds(100));
+      CloseQueue(&hook);
+    });
+    env.Release();
+    closer.join();
+    dropper.join();
+    hook.hand_off = false;
+  }
+  // The release ran the queued finalizer before the instance-data finalizer.
+  EXPECT_EQ(signal.calls_before, 1);
+  EXPECT_EQ(counts.calls.load(), 1);
+  EXPECT_EQ(counts.off_thread.load(), 0);
   EXPECT_EQ(hook.released.load(), hook.enqueued.load());
 }
 
