@@ -79,12 +79,13 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
 /// publish and rediscover it through runtime TLS.
 pub fn alloc_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
-    heap: &crate::guest_heap::GuestHeap,
+    heap: &std::sync::Arc<crate::guest_heap::GuestHeap>,
     len: usize,
     zero: bool,
 ) -> Option<u32> {
+    let refill = env.data().native_guest_refill.clone();
     let mut store = env.as_store_mut();
-    heap.alloc_with_store(&mut store, len, zero)
+    heap.alloc_with_refill(&mut store, refill.as_deref(), len, zero)
 }
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {

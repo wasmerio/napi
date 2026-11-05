@@ -217,11 +217,55 @@ fn shared_registry() -> &'static Mutex<HashMap<usize, Weak<GuestHeap>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// One protected native reservation. The owner retains the exact private bytes.
+pub struct NativeGuestChunk {
+    address: u32,
+    len: u32,
+    pointer: *mut u8,
+    owner: Box<dyn Send + Sync>,
+}
+
+impl NativeGuestChunk {
+    /// Wraps an independently owned reservation for a leased arena.
+    ///
+    /// # Safety
+    /// The owner must satisfy [`NativeGuestArena::install_chunk`]'s contract,
+    /// including stable private writable storage and no Store/provider ownership.
+    pub unsafe fn new(
+        address: u32,
+        len: u32,
+        pointer: *mut u8,
+        owner: Box<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            address,
+            len,
+            pointer,
+            owner,
+        }
+    }
+}
+
+/// Store-local reservation authority, never retained by a backing store.
+///
+/// # Safety
+/// Implementations must own no Store or StoreAsync, directly or indirectly.
+/// `reserve` must use only the supplied exact Store, perform no guest or V8
+/// calls, and return private owning storage satisfying NativeGuestChunk's
+/// contract. All arena metadata locks are released before this call.
+pub unsafe trait NativeGuestRefill: Send + Sync {
+    fn reserve(
+        &self,
+        store: &mut StoreMut<'_>,
+        min_bytes: u32,
+    ) -> Result<Option<NativeGuestChunk>, wasmer::RuntimeError>;
+}
+
 /// A native allocator supplied with protected, owning reservations.
 /// It starts empty and never grows linear memory itself.
 #[derive(Clone)]
 pub struct NativeGuestArena {
-    heap: Arc<GuestHeap>,
+    pub(crate) heap: Arc<GuestHeap>,
 }
 
 impl NativeGuestArena {
@@ -309,8 +353,20 @@ impl NativeGuestArena {
             _owner: Some(owner),
         });
         inner.free_bytes += u64::from(len);
-        inner.pending_want = 0;
         Ok(())
+    }
+
+    pub(crate) fn matches(
+        &self,
+        store: &impl AsStoreRef,
+        memory: &Memory,
+        budget: &Arc<ResourceBudget>,
+    ) -> bool {
+        memory
+            .as_shared(store)
+            .and_then(|memory| memory.host_data())
+            .is_some_and(|(base, _)| base == self.heap.base)
+            && Arc::ptr_eq(&self.heap.budget, budget)
     }
 
     /// Allocates from installed ranges, returning a guest offset.
@@ -574,6 +630,76 @@ impl GuestHeap {
             unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len) };
         }
         Some(offset)
+    }
+
+    pub(crate) fn alloc_with_refill(
+        self: &Arc<Self>,
+        store: &mut StoreMut<'_>,
+        refill: Option<&dyn NativeGuestRefill>,
+        len: usize,
+        zero: bool,
+    ) -> Option<u32> {
+        if !self.leased {
+            return self.alloc_with_store(store, len, zero);
+        }
+        if let Some(offset) = self.alloc(len, zero) {
+            return Some(offset);
+        }
+        let needed = u32::try_from(len.max(1)).ok()?;
+        self.refill_leased(store, refill?, needed, false)?;
+        self.alloc(len, zero)
+    }
+
+    pub(crate) fn refill_leased(
+        self: &Arc<Self>,
+        store: &mut StoreMut<'_>,
+        refill: &dyn NativeGuestRefill,
+        min_bytes: u32,
+        advisory: bool,
+    ) -> Option<()> {
+        if !self.leased {
+            return None;
+        }
+        let (wanted, pending) = {
+            let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+            if advisory && inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
+                return Some(());
+            }
+            if inner.refilling {
+                return None;
+            }
+            let pending = std::mem::take(&mut inner.pending_want);
+            let wanted = if advisory {
+                min_bytes.max(PREFUND_BYTES).max(pending)
+            } else {
+                min_bytes
+            };
+            inner.refilling = true;
+            (wanted, pending)
+        };
+        // charge stays zero: the kernel's physical reservation owns accounting.
+        let mut claim = HeapRefill {
+            heap: self,
+            charge: 0,
+            restore_want: Some(pending),
+        };
+        let wanted = chunk_size_for(wanted)
+            .div_ceil(WASM_PAGE)
+            .checked_mul(WASM_PAGE)?;
+        let chunk = match refill.reserve(store, wanted) {
+            Ok(chunk) => chunk?,
+            Err(error) => {
+                crate::native_frame::record_current_error(error);
+                return None;
+            }
+        };
+        let arena = NativeGuestArena { heap: self.clone() };
+        // SAFETY: the typed refiller returns an owning private reservation. The
+        // arena checks its exact base, limits, alignment and overlap again.
+        unsafe { arena.install_chunk(chunk.address, chunk.len, chunk.pointer, chunk.owner) }
+            .ok()?;
+        claim.restore_want = None;
+        Some(())
     }
 
     fn try_chunks(inner: &mut HeapInner, units: u32) -> Option<u32> {
@@ -913,6 +1039,7 @@ pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,
     heap: HeapContextOwner,
+    refill: Option<Weak<dyn NativeGuestRefill>>,
 }
 
 /// Context handed to the buffer-finalizer trampoline for a single
@@ -926,11 +1053,15 @@ impl GuestHeap {
     /// Box an allocator context for [`unofficial_napi_env_create_options`].
     /// The receiver takes ownership (released via
     /// [`napi_host_guest_heap_release`]).
-    pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
+    pub(crate) fn make_alloc_ctx(
+        self: &Arc<Self>,
+        refill: Option<Weak<dyn NativeGuestRefill>>,
+    ) -> *mut c_void {
         Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
             heap: HeapContextOwner::new(self),
+            refill,
         }))
         .cast()
     }
@@ -983,7 +1114,8 @@ pub extern "C" fn napi_host_guest_heap_alloc(
             // closure lets it restore its borrow while not already unwinding.
             let outcome = Store::with_current(|store| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    heap.alloc_with_store(store, length, zero != 0)
+                    let refill = ctx.refill.as_ref().and_then(Weak::upgrade);
+                    heap.alloc_with_refill(store, refill.as_deref(), length, zero != 0)
                 }))
             });
             match outcome {
@@ -1620,7 +1752,7 @@ mod tests {
     fn allocator_hook_grows_only_with_a_lent_store() {
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
-        let ctx = heap.make_alloc_ctx();
+        let ctx = heap.make_alloc_ctx(None);
         let past_arena = (PREFUND_BYTES as usize) * 2;
 
         let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
@@ -1812,7 +1944,7 @@ mod tests {
         assert!(unsafe { arena.install_chunk(65536, 65536, pointer, owner) }.is_ok());
         let first = arena.alloc(64, true).unwrap();
         let second = arena.alloc(64, true).unwrap();
-        let allocator = arena.heap.make_alloc_ctx() as usize;
+        let allocator = arena.heap.make_alloc_ctx(None) as usize;
         let finalizer = arena.heap.make_finalize_ctx(second) as usize;
         let weak = Arc::downgrade(&arena.heap);
         drop(arena);

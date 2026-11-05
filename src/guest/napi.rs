@@ -119,6 +119,11 @@ fn create_native_provider(
     if unsafe { snapi_v8_allocator_active() } != 0 {
         return Err(1);
     }
+    let refill = env.data().native_guest_refill.clone();
+    if let (Some(heap), Some(refill)) = (env.data().guest_heap.clone(), refill) {
+        heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true)
+            .ok_or(1)?;
+    }
     let frame = env.pin_frame().ok_or(1)?;
     let request = env.data_mut().prepare_native_creation().ok_or(1)?;
     env.as_store_mut().parked(|| {
@@ -3775,7 +3780,12 @@ fn guest_napi_get_cb_info(
     // guest heap from this hot per-callback import so store-free allocations
     // (V8 backing stores) rarely find it empty. No-op for shared memories.
     if let Some(heap) = env.data().guest_heap.clone() {
-        heap.maybe_refill(&mut env.as_store_mut());
+        let refill = env.data().native_guest_refill.clone();
+        if let Some(refill) = refill {
+            let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
+        } else {
+            heap.maybe_refill(&mut env.as_store_mut());
+        }
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr > 0 {
@@ -5400,6 +5410,92 @@ pub(crate) fn is_known_napi_import(name: &str) -> bool {
             | "napi_get_version"
             | "napi_add_env_cleanup_hook"
             | "napi_remove_env_cleanup_hook"
+    )
+}
+
+pub(crate) fn is_known_extension_import(name: &str) -> bool {
+    matches!(
+        name,
+        "unofficial_napi_configure_runtime"
+            | "unofficial_napi_create_env"
+            | "unofficial_napi_attach_env"
+            | "unofficial_napi_release_env"
+            | "unofficial_napi_collect_garbage"
+            | "unofficial_napi_event_loop_checkpoint"
+            | "unofficial_napi_create_uninitialized_arraybuffer"
+            | "unofficial_napi_acquire_buffer_lease"
+            | "unofficial_napi_release_buffer_lease"
+            | "unofficial_napi_create_guest_backed_typedarray"
+            | "unofficial_napi_set_prepare_stack_trace_callback"
+            | "unofficial_napi_get_promise_details"
+            | "unofficial_napi_get_proxy_details"
+            | "unofficial_napi_preview_entries"
+            | "unofficial_napi_get_call_sites"
+            | "unofficial_napi_arraybuffer_view_has_buffer"
+            | "unofficial_napi_get_constructor_name"
+            | "unofficial_napi_create_private_symbol"
+            | "unofficial_napi_get_continuation_preserved_embedder_data"
+            | "unofficial_napi_set_continuation_preserved_embedder_data"
+            | "unofficial_napi_notify_datetime_configuration_change"
+            | "unofficial_napi_terminate_execution"
+            | "unofficial_napi_cancel_terminate_execution"
+            | "unofficial_napi_request_interrupt"
+            | "unofficial_napi_structured_clone"
+            | "unofficial_napi_message_create"
+            | "unofficial_napi_message_take"
+            | "unofficial_napi_message_drop"
+            | "unofficial_napi_enqueue_microtask"
+            | "unofficial_napi_set_promise_reject_callback"
+            | "unofficial_napi_get_own_non_index_properties"
+            | "unofficial_napi_set_promise_hooks"
+            | "unofficial_napi_get_hash_seed"
+            | "unofficial_napi_get_error_metadata"
+            | "unofficial_napi_configure_source_maps"
+            | "unofficial_napi_preserve_error_source_message"
+            | "unofficial_napi_mark_promise_as_handled"
+            | "unofficial_napi_get_heap_statistics"
+            | "unofficial_napi_get_heap_space_statistics"
+            | "unofficial_napi_get_heap_code_statistics"
+            | "unofficial_napi_configure_near_heap_limit_callback"
+            | "unofficial_napi_profile_start"
+            | "unofficial_napi_profile_stop"
+            | "unofficial_napi_take_heap_snapshot"
+            | "unofficial_napi_create_serdes_binding"
+            | "unofficial_napi_contextify_contains_module_syntax"
+            | "unofficial_napi_contextify_make_context"
+            | "unofficial_napi_contextify_run_script"
+            | "unofficial_napi_contextify_compile_function"
+            | "unofficial_napi_bytecode_open"
+            | "unofficial_napi_bytecode_serialize"
+            | "unofficial_napi_bytecode_release"
+            | "unofficial_napi_module_wrap_create"
+            | "unofficial_napi_module_wrap_destroy"
+            | "unofficial_napi_module_wrap_link"
+            | "unofficial_napi_module_wrap_instantiate"
+            | "unofficial_napi_module_wrap_evaluate"
+            | "unofficial_napi_module_wrap_evaluate_sync"
+            | "unofficial_napi_module_wrap_get_namespace"
+            | "unofficial_napi_module_wrap_get_state"
+            | "unofficial_napi_module_wrap_check_unsettled_top_level_await"
+            | "unofficial_napi_module_wrap_set_export"
+            | "unofficial_napi_module_wrap_set_module_source_object"
+            | "unofficial_napi_module_wrap_get_module_source_object"
+            | "unofficial_napi_module_wrap_create_cached_data"
+            | "unofficial_napi_module_wrap_set_hooks"
+            | "unofficial_napi_module_wrap_create_required_module_facade"
+    )
+}
+
+pub(crate) fn is_known_env_import(name: &str) -> bool {
+    matches!(
+        name,
+        "uv_cpu_info"
+            | "uv_interface_addresses"
+            | "uv_free_interface_addresses"
+            | "uv_resident_set_memory"
+            | "uv_get_free_memory"
+            | "uv_get_total_memory"
+            | "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty"
     )
 }
 

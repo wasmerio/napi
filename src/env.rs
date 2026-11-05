@@ -143,6 +143,7 @@ pub(crate) struct NativeRetirement {
     budget: Arc<ResourceBudget>,
     leases: Vec<NativeBufferLease>,
     heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    refill: Option<Arc<dyn crate::NativeGuestRefill>>,
     memory: Option<Memory>,
     table: Option<Table>,
     external: HashMap<u32, u64>,
@@ -260,6 +261,7 @@ impl NativeRetirement {
                 });
             }
         }
+        cleanup(&mut || drop(self.refill.take()));
         cleanup(&mut || drop(self.heap.take()));
         cleanup(&mut || {
             let _ = self.memory.take();
@@ -294,6 +296,7 @@ impl Drop for NativeRetirement {
                 budget: self.budget.clone(),
                 leases: std::mem::take(&mut self.leases),
                 heap: self.heap.take(),
+                refill: self.refill.take(),
                 memory: self.memory.take(),
                 table: self.table.take(),
                 external: std::mem::take(&mut self.external),
@@ -331,6 +334,7 @@ pub(crate) struct NativeCreationRequest {
     registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     stopped: Arc<AtomicBool>,
     heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    refill: Option<Arc<dyn crate::NativeGuestRefill>>,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -358,6 +362,7 @@ impl NativeCreationRequest {
             budget: self.budget.clone(),
             leases: Vec::new(),
             heap: self.heap.clone(),
+            refill: None,
             memory: None,
             table: None,
             external: HashMap::new(),
@@ -410,11 +415,10 @@ impl NativeCreation {
     /// The private bridge returns an already-closed owned token. Ordinary
     /// provider entry cannot observe it before callback-free publication.
     pub(crate) fn create(&mut self, version: i32, total: u64, constrained: u64, stack: u32) -> i32 {
-        let allocator = self
-            .request
-            .heap
-            .as_ref()
-            .map_or(std::ptr::null(), |heap| heap.make_alloc_ctx().cast_const());
+        let allocator = self.request.heap.as_ref().map_or(std::ptr::null(), |heap| {
+            heap.make_alloc_ctx(self.request.refill.as_ref().map(Arc::downgrade))
+                .cast_const()
+        });
         let mut state = std::ptr::null_mut();
         let status = unsafe {
             crate::snapi::snapi_bridge_unofficial_create_env_with_options(
@@ -506,6 +510,8 @@ pub(crate) struct NapiEnv {
     /// for guest-visible V8 memory, never a best-effort fallback.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) native_guest_refill: Option<Arc<dyn crate::NativeGuestRefill>>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -569,6 +575,8 @@ impl NapiEnv {
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             guest_heap: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            native_guest_refill: None,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             malloc_fn: None,
             table: None,
@@ -656,6 +664,7 @@ impl NapiEnv {
             registry: self.env_registry.clone(),
             stopped: self.host_stopped.clone(),
             heap: self.guest_heap.clone(),
+            refill: self.native_guest_refill.clone(),
         })
     }
 
@@ -905,6 +914,7 @@ impl NapiEnv {
             budget: self.budget.clone(),
             leases: Vec::with_capacity(lease_ids.len()),
             heap: self.guest_heap.clone(),
+            refill: None,
             memory: None,
             table: None,
             external: HashMap::new(),
@@ -943,6 +953,7 @@ impl NapiEnv {
             self.napi_state_to_guest_env.clear();
             retirement.external = std::mem::take(&mut self.external_declared);
             retirement.heap = self.guest_heap.take();
+            retirement.refill = self.native_guest_refill.take();
             retirement.memory = self.memory.take();
             retirement.table = self.table.take();
         }

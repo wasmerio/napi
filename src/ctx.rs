@@ -12,7 +12,10 @@ use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
-    guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
+    guest::napi::{
+        is_known_env_import, is_known_extension_import, is_known_napi_import, register_env_imports,
+        register_napi_imports,
+    },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -280,6 +283,16 @@ impl NapiCtx {
         self.new_session(module)
     }
 
+    /// Pure declaration matching the imports this binding can provide.
+    pub fn provides_import(namespace: &str, name: &str) -> bool {
+        match namespace {
+            NAPI_MODULE_NAME => is_known_napi_import(name),
+            NAPI_EXTENSION_WASMER_MODULE_NAME => is_known_extension_import(name),
+            "env" => is_known_env_import(name),
+            _ => false,
+        }
+    }
+
     pub fn module_needs_napi(
         module: &Module,
     ) -> (Option<NapiVersion>, Option<NapiWasmerExtensionVersion>) {
@@ -389,6 +402,18 @@ impl NapiRuntimeHooks {
     ) -> Result<NapiInstantiationState> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
+            if module
+                .imports()
+                .any(|import| import.module() == "env" && is_known_env_import(import.name()))
+            {
+                let mut additions = Imports::new();
+                register_env_imports(store, &mut additions);
+                for (namespace, name, value) in additions.iter() {
+                    if !imports.exists(namespace, name) {
+                        imports.define(namespace, name, value.clone());
+                    }
+                }
+            }
             return Ok(NapiInstantiationState { session: None });
         }
 
@@ -557,6 +582,38 @@ impl NapiSession {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
     ) -> Result<()> {
+        self.configure_instance_inner(
+            store,
+            instance,
+            imported_memory,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            None,
+        )
+    }
+
+    /// Binds only protected native leases; never initializes the legacy grow heap.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn configure_leased_instance(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        memory: &wasmer::Memory,
+        arena: crate::NativeGuestArena,
+        refill: Arc<dyn crate::NativeGuestRefill>,
+    ) -> Result<()> {
+        self.configure_instance_inner(store, instance, Some(memory), Some((arena, refill)))
+    }
+
+    fn configure_instance_inner(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] leased: Option<(
+            crate::NativeGuestArena,
+            Arc<dyn crate::NativeGuestRefill>,
+        )>,
+    ) -> Result<()> {
         let func_env = {
             let guard = self.inner.state.lock().expect("poisoned NapiSession mutex");
             let SessionState::Attached(func_env) = &*guard else {
@@ -591,11 +648,25 @@ impl NapiSession {
                 .clone()
                 .context("N-API imports require the guest to have linear memory")?;
             let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget)
+            let (heap, refill) = if let Some((arena, refill)) = leased {
+                if !arena.matches(&*store, &memory, &budget) {
+                    bail!("leased N-API arena does not match this memory and context");
+                }
+                (arena.heap, Some(refill))
+            } else {
+                let heap = crate::guest_heap::GuestHeap::get_or_create(
+                    &mut *store,
+                    &memory,
+                    budget,
+                )
                 .context(
                     "failed to initialize the guest-heap allocator over the guest's linear memory",
                 )?;
-            func_env.as_mut(&mut *store).guest_heap = Some(heap);
+                (heap, None)
+            };
+            let env = func_env.as_mut(&mut *store);
+            env.guest_heap = Some(heap);
+            env.native_guest_refill = refill;
         }
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
@@ -646,6 +717,70 @@ mod tests {
     use wat::parse_str;
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[test]
+    fn leased_configuration_rejects_wrong_arena_without_legacy_growth() {
+        struct NoRefill;
+        // SAFETY: this fixture never reserves or owns a Store.
+        unsafe impl crate::NativeGuestRefill for NoRefill {
+            fn reserve(
+                &self,
+                _: &mut wasmer::StoreMut<'_>,
+                _: u32,
+            ) -> Result<Option<crate::NativeGuestChunk>, wasmer::RuntimeError> {
+                panic!("configuration must not reserve through an inactive Store")
+            }
+        }
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "env" "memory" (memory 1 4 shared))
+            (import "napi" "napi_wasm_init_env" (func (result i32))))"#,
+        )
+        .unwrap();
+        let context = NapiCtx::default();
+        let (imports, state) = context
+            .runtime_hooks()
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session().unwrap().clone();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let Some(wasmer::Extern::Memory(memory)) = imports.get_export("env", "memory") else {
+            panic!("missing prepared memory");
+        };
+        let other =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(4), true)).unwrap();
+        let wrong = context.native_guest_arena(&store, &other).unwrap();
+        assert!(
+            session
+                .configure_leased_instance(
+                    &mut store.as_store_mut(),
+                    &instance,
+                    &memory,
+                    wrong,
+                    std::sync::Arc::new(NoRefill)
+                )
+                .is_err()
+        );
+        let arena = context.native_guest_arena(&store, &memory).unwrap();
+        session
+            .configure_leased_instance(
+                &mut store.as_store_mut(),
+                &instance,
+                &memory,
+                arena,
+                std::sync::Arc::new(NoRefill),
+            )
+            .unwrap();
+        assert_eq!(memory.size(&store).0, 1);
+        // No provider was entered; the paired Store is still on its owner.
+        unsafe { session.deactivate(&mut store.as_store_mut()) };
+        drop(state);
+        drop(session);
+        assert_eq!(context.active_sessions(), 0);
+    }
 
     #[test]
     fn runtime_stop_is_sticky_without_live_envs() {

@@ -7,7 +7,7 @@ mod guest;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod guest_heap;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-pub use guest_heap::NativeGuestArena;
+pub use guest_heap::{NativeGuestArena, NativeGuestChunk, NativeGuestRefill};
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod native_frame;
 mod snapi;

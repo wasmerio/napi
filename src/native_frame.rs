@@ -185,6 +185,15 @@ pub(crate) fn replay_current() -> Result<(), RuntimeError> {
         None => Ok(()),
     }
 }
+pub(crate) fn record_current_error(error: RuntimeError) {
+    let raw = unsafe { crate::snapi::snapi_bridge_native_current_holder() };
+    if !raw.is_null() {
+        unsafe { &*raw.cast::<FrameHolder>() }.fail(CallbackFailure::Guest(error));
+    } else if let Some(selected) = select() {
+        selected.failure.record(CallbackFailure::Guest(error));
+    }
+}
+
 pub(crate) fn current_failed() -> bool {
     select().is_some_and(|selected| selected.failure.failed())
 }
