@@ -1013,7 +1013,8 @@ TEST_F(Test69UnofficialRealmEntry, DynamicImportHookRunsInTheEnvsRealm) {
   ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
 }
 #endif
-// napi_run_script in an entered sandbox realm.
+// napi_run_script in an entered sandbox realm, and the realm options each
+// provider honors.
 
 namespace {
 
@@ -1054,3 +1055,23 @@ TEST_F(Test69UnofficialRealmEntry, NapiRunScriptInAnEnteredSandboxRealmUsesTheSa
   EXPECT_EQ(Int32Property(s.env, sandbox, "x"), 43);
   EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof written")), "undefined");
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// Only V8 honors allow_code_gen_strings. The switch belongs to the realm, so
+// it holds for napi_run_script while the realm is entered.
+TEST_F(Test69UnofficialRealmEntry, EnteredRealmKeepsItsStringCodeGenerationSwitch) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.allow_code_gen_strings = false;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+
+  const char* probe =
+      "(() => { try { return String(eval('1 + 1')); } catch (e) { return e.name; } })()";
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, probe)), "EvalError");
+  Leave(s.env, scope);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, probe)), "2");
+}
+#endif

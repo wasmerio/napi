@@ -1697,6 +1697,9 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   if (context.IsEmpty()) return napi_pending_exception;
 
   context->SetSecurityToken(current->GetSecurityToken());
+  // allow_code_gen_wasm is ignored: honoring it per realm needs an isolate
+  // AllowWasmCodeGenerationCallback, which this provider does not install.
+  // name and origin are ignored too.
   context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
   context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
   NapiV8ApplyPromiseHooksToContext(env, context);

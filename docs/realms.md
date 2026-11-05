@@ -66,8 +66,22 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
     sandbox, as with `vm.createContext(sandbox)`.
   - A sandbox belongs to at most one realm. The env's own global may still be
     one.
-  - Options: sandbox, name, origin, host-defined option id, the
-    code-generation flags and an own microtask queue (V8 only).
+  - Options: sandbox, name, origin, host-defined option id, the two
+    code-generation flags and an own microtask queue. Each provider honors
+    only some of them, and accepts and ignores the rest:
+
+    | Option | V8 | QuickJS | host-JS |
+    |---|---|---|---|
+    | `sandbox_or_null` | yes | yes | yes |
+    | `host_defined_option_id` | yes | yes | no |
+    | `allow_code_gen_strings` | yes | no | no |
+    | `own_microtask_queue` | yes | no | no |
+    | `allow_code_gen_wasm` | no | no | no |
+    | `name`, `origin` | no | no | no |
+
+    With `allow_code_gen_strings` false, V8 makes `eval` and the `Function`
+    constructors throw an `EvalError` in the realm. WebAssembly code
+    generation stays allowed on V8 (QuickJS has no WebAssembly).
 - **`get_realm`** returns NULL for any object that isn't a realm's global or
   sandbox, the env's own global included.
 - **`enter_realm` / `leave_realm`:**
@@ -180,6 +194,12 @@ and interrupt callbacks push the env's realm.
     last copy, and a script it starts in the realm copies the sandbox in
     again, over the running script's global writes to the same names.
   - host-JS evaluates against the sandbox with `with`.
+- **Code generation per realm.** No provider enforces
+  `allow_code_gen_wasm`. V8 would need an isolate-wide
+  `AllowWasmCodeGenerationCallback` that reads a per-realm flag, as Node
+  does. There is also no call to change a realm's code-generation policy
+  after it is created, which a browser needs because CSP arrives with the
+  response.
 
 ## History
 

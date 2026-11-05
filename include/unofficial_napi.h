@@ -205,6 +205,16 @@ enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
 // writes the sandbox, as with vm.createContext(sandbox). Otherwise the realm
 // gets a fresh global. `name`, `origin` and `host_defined_option_id` may be
 // NULL. The descriptor is observed only for the duration of the call.
+//
+// Each provider honors only some fields. It accepts the rest, ignores them
+// and still returns napi_ok:
+// - `sandbox_or_null`: every provider.
+// - `host_defined_option_id`: V8 and QuickJS.
+// - `allow_code_gen_strings`: V8 only. When false, eval and the Function
+//   constructors throw an EvalError in the realm.
+// - `own_microtask_queue`: V8 only.
+// - `allow_code_gen_wasm`, `name` and `origin`: no provider. WebAssembly code
+//   generation stays allowed wherever the engine has WebAssembly.
 typedef struct {
   uint32_t size;
   uint32_t version;

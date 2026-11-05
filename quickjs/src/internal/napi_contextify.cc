@@ -836,7 +836,8 @@ namespace quickjs::detail
                                                 napi_value *global_out)
     {
         // QuickJS has no per-realm code-generation switches or microtask
-        // queues; name and origin only label V8 inspector contexts.
+        // queues, so those options are ignored. No provider uses name or
+        // origin either.
         if (!napi_util__::check_env(env_) || realm_out == nullptr)
             return napi_invalid_arg;
         JSValueConst sandbox = JS_UNDEFINED;
