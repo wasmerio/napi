@@ -1564,6 +1564,124 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
     status
 }
 
+/// Deprecated (use create_realm), kept for older guests. Makes a realm over
+/// the sandbox, or with a fresh global for a symbol, and writes its global,
+/// which is also its realm id. A native Worker realm refuses it as it
+/// refuses create_realm.
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_contextify_make_context(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    sandbox_or_symbol: u32,
+    name: u32,
+    origin_or_undefined: u32,
+    allow_code_gen_strings: i32,
+    allow_code_gen_wasm: i32,
+    own_microtask_queue: i32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    match compat::make_context(
+        env_handle,
+        sandbox_or_symbol,
+        name,
+        origin_or_undefined,
+        allow_code_gen_strings,
+        allow_code_gen_wasm,
+        own_microtask_queue,
+        host_defined_option_id,
+    ) {
+        Ok(global) => {
+            if result_ptr != 0 {
+                write_guest_u32(&mut env, result_ptr, global);
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Deprecated (use unofficial_napi_run_script), kept for older guests. The
+/// sandbox names the realm; 0, undefined or null is the current realm, so in
+/// a native Worker realm the script goes to its evaluate().
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_contextify_run_script(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    sandbox_or_null: u32,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    timeout: i64,
+    display_errors: i32,
+    break_on_sigint: i32,
+    break_on_first_line: i32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let realm = match compat::realm_from_context(snapi_env(&env, napi_env), sandbox_or_null, true) {
+        Ok(realm) => realm,
+        Err(status) => return status,
+    };
+    guest_unofficial_napi_run_script(
+        env,
+        napi_env,
+        realm,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        timeout,
+        display_errors,
+        break_on_sigint,
+        break_on_first_line,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
+/// Deprecated (use unofficial_napi_compile_function), kept for older
+/// guests. The parsing context names the realm; 0, undefined or null is the
+/// current realm.
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_contextify_compile_function(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source_ptr: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    parsing_context_or_undefined: u32,
+    context_extensions_or_undefined: u32,
+    params_or_undefined: u32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let realm = match compat::realm_from_context(
+        snapi_env(&env, napi_env),
+        parsing_context_or_undefined,
+        true,
+    ) {
+        Ok(realm) => realm,
+        Err(status) => return status,
+    };
+    guest_unofficial_napi_compile_function(
+        env,
+        napi_env,
+        realm,
+        source_ptr,
+        filename,
+        line_offset,
+        column_offset,
+        context_extensions_or_undefined,
+        params_or_undefined,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
 // A guest realm id is the value id of the realm's global (its sandbox, when it
 // has one); 0 means the env's own realm.
 
@@ -5774,6 +5892,9 @@ pub fn register_napi_imports(
         "unofficial_napi_take_heap_snapshot" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_heap_snapshot),
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
+        "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
+        "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
+        "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
         "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
         "unofficial_napi_enter_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enter_realm),

@@ -36,6 +36,10 @@ const WAT: &str = r#"(module
   (import "napi_extension_wasmer_v0" "unofficial_napi_run_script"
     (func $realm_run_script
       (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
+  ;; Deprecated, kept for guests built against older headers.
+  (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
+    (func $contextify_run_script
+      (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_event_loop_checkpoint"
     (func $checkpoint (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
@@ -148,6 +152,15 @@ const WAT: &str = r#"(module
     (i32.store (i32.const 24) (i32.const 0))
     (i32.store (i32.const 56) (call $string (i32.const 116) (i32.const 7)))
     (call $realm_run_script (global.get $env) (i32.const 0) (i32.const 16)
+      (i32.load (i32.const 56)) (i32.const 0) (i32.const 0) (i64.const -1)
+      (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 32)))
+  ;; The deprecated import with no sandbox: the current realm.
+  (func (export "eval_contextify") (param $ptr i32) (param $len i32) (result i32)
+    (i32.store (i32.const 16) (i32.const 0))
+    (i32.store (i32.const 20) (call $string (local.get $ptr) (local.get $len)))
+    (i32.store (i32.const 24) (i32.const 0))
+    (i32.store (i32.const 56) (call $string (i32.const 116) (i32.const 7)))
+    (call $contextify_run_script (global.get $env) (i32.const 0) (i32.const 16)
       (i32.load (i32.const 56)) (i32.const 0) (i32.const 0) (i64.const -1)
       (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 32)))
   ;; Creates, links, instantiates, evaluates and destroys a source text
@@ -372,6 +385,12 @@ impl Guest {
     /// `unofficial_napi_run_script` in the env's realm; returns its status.
     pub fn run_script_in_realm(&mut self, source: &str) -> i32 {
         self.call_with_source("run_script_in_realm", source)
+    }
+
+    /// The deprecated `unofficial_napi_contextify_run_script` with no
+    /// sandbox, which is the current realm; returns its status.
+    pub fn eval_contextify(&mut self, source: &str) -> i32 {
+        self.call_with_source("eval_contextify", source)
     }
 
     /// Creates, links, instantiates, evaluates and destroys a source text

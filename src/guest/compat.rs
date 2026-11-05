@@ -1,7 +1,8 @@
-//! The deprecated guest API (version 1 of the option structs) on the bridge's
-//! realm calls, for both guest backends, as lib/src/napi_compat.cc does for
-//! native code. Ids are guest value ids, 0 is NULL, and a realm id is the
-//! value id of the realm's global or sandbox, 0 for the env's own realm.
+//! The deprecated guest API (the contextify imports and version 1 of the
+//! option structs) on the bridge's realm calls, for both guest backends, as
+//! lib/src/napi_compat.cc does for native code. Ids are guest value ids, 0 is
+//! NULL, and a realm id is the value id of the realm's global or sandbox, 0
+//! for the env's own realm.
 
 use crate::snapi::*;
 
@@ -11,6 +12,7 @@ const NAPI_INVALID_ARG: i32 = 1;
 // napi_valuetype.
 const NAPI_UNDEFINED: i32 = 0;
 const NAPI_NULL: i32 = 1;
+const NAPI_SYMBOL: i32 = 5;
 const NAPI_OBJECT: i32 = 6;
 const NAPI_FUNCTION: i32 = 7;
 
@@ -132,4 +134,44 @@ pub(crate) fn module_create_realm(
         return Ok(realm_or_null);
     }
     realm_from_context(env, context_or_undefined, version == 1)
+}
+
+/// unofficial_napi_contextify_make_context: an object or function sandbox
+/// becomes the realm's sandbox, a symbol makes a fresh global. Returns the
+/// realm's global: the sandbox, or the fresh global.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_context(
+    env: SnapiEnv,
+    sandbox_or_symbol: u32,
+    name: u32,
+    origin_or_undefined: u32,
+    allow_code_gen_strings: i32,
+    allow_code_gen_wasm: i32,
+    own_microtask_queue: i32,
+    host_defined_option_id: u32,
+) -> Result<u32, i32> {
+    if name == 0 {
+        return Err(NAPI_INVALID_ARG);
+    }
+    let sandbox = match type_of(env, sandbox_or_symbol) {
+        Some(NAPI_SYMBOL) => 0,
+        Some(NAPI_OBJECT | NAPI_FUNCTION) => sandbox_or_symbol,
+        _ => return Err(NAPI_INVALID_ARG),
+    };
+    let (mut realm, mut global) = (0u32, 0u32);
+    check(unsafe {
+        snapi_bridge_unofficial_create_realm(
+            env,
+            sandbox,
+            name,
+            origin_or_undefined,
+            host_defined_option_id,
+            i32::from(allow_code_gen_strings != 0),
+            i32::from(allow_code_gen_wasm != 0),
+            i32::from(own_microtask_queue != 0),
+            &mut realm,
+            &mut global,
+        )
+    })?;
+    Ok(global)
 }

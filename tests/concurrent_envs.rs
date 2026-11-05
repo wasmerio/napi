@@ -36,6 +36,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug)]
 enum Entry {
     RunScriptInRealm,
+    ContextifyRunScript,
     ModuleEvaluate,
     MicrotaskCheckpoint,
     SerializerGetter,
@@ -64,6 +65,7 @@ fn wait_in_one_env_and_notify_from_another(engine: &Engine, module: &Module, ent
             assert_eq!(guest.install(), 0);
             match entry {
                 Entry::RunScriptInRealm => assert_eq!(guest.run_script_in_realm(WAIT_SCRIPT), 0),
+                Entry::ContextifyRunScript => assert_eq!(guest.eval_contextify(WAIT_SCRIPT), 0),
                 Entry::ModuleEvaluate => assert_eq!(guest.eval_module(WAIT_SCRIPT), 0),
                 Entry::MicrotaskCheckpoint => {
                     let queued = format!("Promise.resolve().then(() => {{ {WAIT_SCRIPT} }})");
@@ -120,6 +122,12 @@ fn wait_in_one_env_and_notify_from_another(engine: &Engine, module: &Module, ent
 fn a_realm_script_does_not_block_other_envs() {
     let (engine, module) = compile();
     wait_in_one_env_and_notify_from_another(&engine, &module, Entry::RunScriptInRealm);
+}
+
+#[test]
+fn a_contextified_script_does_not_block_other_envs() {
+    let (engine, module) = compile();
+    wait_in_one_env_and_notify_from_another(&engine, &module, Entry::ContextifyRunScript);
 }
 
 #[test]

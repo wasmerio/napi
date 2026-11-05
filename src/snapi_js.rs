@@ -231,7 +231,7 @@ export function wasmer_napi_console_error(message) {
 // module captures it and deletes the global, so author code can't reach it.
 // No untrusted code may run in that global before then. The bridge has:
 //   evaluate(source, filename, lineOffset, columnOffset): runs a classic script
-//     (unofficial_napi_contextify_run_script); its return value is the result.
+//     (unofficial_napi_run_script); its return value is the result.
 //   binding(source): runs source text in the global scope and returns its
 //     completion value (napi_run_script).
 //   enterCallback() / leaveCallback(): bracket all guest code the environment
@@ -8981,5 +8981,170 @@ mod tests {
             assert!(unsafe { env_mut(env) }.unwrap().realm_stack.is_empty());
         }
         assert_eq!(current_realm(env), 0);
+    }
+
+    /// A guest built against older headers: the deprecated contextify imports
+    /// take a realm's global or sandbox as a context, and 0 for the current
+    /// realm.
+    const CONTEXTIFY_GUEST: &str = r#"
+        (module
+          (import "env" "memory" (memory 1))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_make_context"
+            (func $make_context (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
+            (func $run_script
+              (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_compile_function"
+            (func $compile_function
+              (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+          ;; (env, sandbox_or_symbol, name, result_ptr)
+          (func (export "make_context") (param i32 i32 i32 i32) (result i32)
+            (call $make_context (local.get 0) (local.get 1) (local.get 2) (i32.const 0)
+              (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0) (local.get 3)))
+          ;; (env, sandbox_or_null, source_ptr, filename, result_ptr)
+          (func (export "run_script") (param i32 i32 i32 i32 i32) (result i32)
+            (call $run_script (local.get 0) (local.get 1) (local.get 2) (local.get 3)
+              (i32.const 0) (i32.const 0) (i64.const -1) (i32.const 1) (i32.const 0)
+              (i32.const 0) (i32.const 0) (local.get 4)))
+          ;; (env, source_ptr, filename, parsing_context, result_ptr)
+          (func (export "compile_function") (param i32 i32 i32 i32 i32) (result i32)
+            (call $compile_function (local.get 0) (local.get 1) (local.get 2) (i32.const 0)
+              (i32.const 0) (local.get 3) (i32.const 0) (i32.const 0) (i32.const 0)
+              (local.get 4))))
+    "#;
+
+    #[wasm_bindgen_test]
+    fn guest_contextify_imports_resolve_contexts_to_realms() {
+        use wasmer::{FunctionEnv, Imports, Instance, Memory, MemoryType, Module, Store};
+
+        const SOURCE: u32 = 16;
+        const RESULT: u32 = 32;
+        let mut store = Store::default();
+        let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
+        let env = new_env();
+        let mut napi_env = crate::env::NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        napi_env.memory = Some(memory.clone());
+        // Dropping the store releases the env.
+        let (guest_env, _) = napi_env.register_napi_env(env);
+        let function_env = FunctionEnv::new(&mut store, napi_env);
+        let mut imports = Imports::new();
+        crate::guest::napi::register_napi_imports(&mut store, &function_env, &mut imports);
+        imports.define("env", "memory", memory.clone());
+        let module = Module::new(&store, wat::parse_str(CONTEXTIFY_GUEST).unwrap()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let make_context = instance
+            .exports
+            .get_typed_function::<(u32, u32, u32, u32), i32>(&store, "make_context")
+            .unwrap();
+        let run_script = instance
+            .exports
+            .get_typed_function::<(u32, u32, u32, u32, u32), i32>(&store, "run_script")
+            .unwrap();
+        let compile_function = instance
+            .exports
+            .get_typed_function::<(u32, u32, u32, u32, u32), i32>(&store, "compile_function")
+            .unwrap();
+        let read_u32 = |store: &Store| {
+            let mut bytes = [0; 4];
+            memory.view(store).read(RESULT.into(), &mut bytes).unwrap();
+            u32::from_le_bytes(bytes)
+        };
+        // A text unofficial_napi_js_source at SOURCE.
+        let set_source = |store: &Store, text: u32| {
+            let mut bytes = [0; 12];
+            bytes[4..8].copy_from_slice(&text.to_le_bytes());
+            memory.view(store).write(SOURCE.into(), &bytes).unwrap();
+        };
+        let state = unsafe { env_mut(env) }.unwrap();
+        let name = state.agent.insert_primitive("compat".into());
+        let filename = state.agent.insert_primitive("compat.js".into());
+        let script = state
+            .agent
+            .insert_primitive("typeof marker === 'number' ? marker : 0".into());
+        let body = state
+            .agent
+            .insert_primitive("return typeof marker === 'number' ? marker : 0;".into());
+        let sandbox_object = Object::new();
+        Reflect::set(&sandbox_object, &"marker".into(), &73.into()).unwrap();
+        let sandbox = state.agent.insert(sandbox_object.into());
+        let plain = state.agent.insert(Object::new().into());
+        let symbol = state.agent.insert(js_sys::Symbol::for_("compat").into());
+        let number = state.agent.insert_primitive(1.into());
+        set_source(&store, script);
+        let run = |store: &mut Store, context: u32| -> Result<JsValue, i32> {
+            match run_script
+                .call(store, guest_env, context, SOURCE, filename, RESULT)
+                .unwrap()
+            {
+                NAPI_OK => Ok(value(env, read_u32(store))),
+                status => Err(status),
+            }
+        };
+
+        // make_context makes the sandbox a realm's global, and its id names
+        // that realm.
+        assert_eq!(
+            make_context
+                .call(&mut store, guest_env, sandbox, name, RESULT)
+                .unwrap(),
+            NAPI_OK
+        );
+        let context = read_u32(&store);
+        assert!(Object::is(&value(env, context), &value(env, sandbox)));
+        assert_eq!(realm_of(env, context), Ok(context));
+        assert_eq!(run(&mut store, context), Ok(73.into()));
+
+        // 0 is the current realm, the env's unless a realm is entered. The
+        // env's own global names the env's realm; other objects nothing.
+        assert_eq!(run(&mut store, 0), Ok(0.into()));
+        let scope = enter(env, context).unwrap();
+        assert_eq!(run(&mut store, 0), Ok(73.into()));
+        set_source(&store, body);
+        assert_eq!(
+            compile_function
+                .call(&mut store, guest_env, SOURCE, filename, 0, RESULT)
+                .unwrap(),
+            NAPI_OK
+        );
+        let compiled = value(env, read_u32(&store));
+        let function: js_sys::Function = Reflect::get(&compiled, &"function".into())
+            .unwrap()
+            .unchecked_into();
+        assert_eq!(function.call0(&JsValue::UNDEFINED), Ok(73.into()));
+        set_source(&store, script);
+        let env_global = {
+            let inner = enter(env, 0).unwrap();
+            let global = global_id(env);
+            assert_eq!(leave(env, inner), NAPI_OK);
+            global
+        };
+        assert_eq!(run(&mut store, env_global), Ok(0.into()));
+        assert_eq!(leave(env, scope), NAPI_OK);
+        assert_eq!(run(&mut store, plain), Err(NAPI_INVALID_ARG));
+
+        // A symbol makes a fresh global; other values and a missing name are
+        // refused.
+        assert_eq!(
+            make_context
+                .call(&mut store, guest_env, symbol, name, RESULT)
+                .unwrap(),
+            NAPI_OK
+        );
+        let fresh = read_u32(&store);
+        assert_ne!(realm_of(env, fresh), Ok(0));
+        assert_eq!(run(&mut store, fresh), Ok(0.into()));
+        for (sandbox, name) in [(number, name), (0, name), (symbol, 0)] {
+            assert_eq!(
+                make_context
+                    .call(&mut store, guest_env, sandbox, name, RESULT)
+                    .unwrap(),
+                NAPI_INVALID_ARG
+            );
+        }
     }
 }
