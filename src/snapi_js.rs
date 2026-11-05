@@ -239,6 +239,12 @@ let wasmerNapiActiveGlobalContext;
 //     runs: JavaScript calls into guest functions, deferred callbacks and
 //     finalizers. They must not throw; around deferred callbacks and
 //     finalizers, a throw is logged and the guest code still runs.
+//   invokeCallback(dispatch, receiver, args, newTarget) (optional): makes a
+//     JavaScript call into a guest function, inside that bracket, by calling
+//     dispatch(receiver, args, newTarget) and returning its result. The
+//     embedder may change the receiver, the arguments or the result, for
+//     example to map a virtualized global to the real one. Without it,
+//     dispatch is called directly.
 //   release() (optional): the environment was released.
 //   checkpoint(allowHostTasks, hasRunnableWork) (optional): runs an event loop
 //     turn; returns a Promise. Without it, the default checkpoint runs. A
@@ -264,6 +270,7 @@ const wasmerNapiNativeRealm = (() => {
     binding: bridge.binding.bind(bridge),
     enterCallback: bridge.enterCallback.bind(bridge),
     leaveCallback: bridge.leaveCallback.bind(bridge),
+    invokeCallback: typeof bridge.invokeCallback === 'function' ? bridge.invokeCallback.bind(bridge) : undefined,
     release: typeof bridge.release === 'function' ? bridge.release.bind(bridge) : undefined,
     checkpoint: typeof bridge.checkpoint === 'function' ? bridge.checkpoint.bind(bridge) : undefined,
   };
@@ -664,9 +671,12 @@ export function wasmer_napi_make_callback(context, dispatch) {
     const dispatch = callbacks.dispatches?.[index];
     // new.target lets napi_get_new_target tell construction from a call.
     if (!nativeRealm || dispatch === undefined) return dispatch?.(this, args, new.target);
+    const invoke = wasmerNapiNativeRealm.invokeCallback;
     wasmerNapiNativeRealm.enterCallback();
     try {
-      return dispatch(this, args, new.target);
+      return invoke === undefined
+        ? dispatch(this, args, new.target)
+        : invoke(dispatch, this, args, new.target);
     } finally {
       wasmerNapiNativeRealm.leaveCallback();
     }

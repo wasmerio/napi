@@ -96,6 +96,33 @@ test('a native realm brackets callbacks, routes checkpoints and is never recycle
   assert.equal(api.wasmer_napi_can_create_global_context(), false, 'a released realm is not recycled');
 });
 
+test('an invokeCallback hook makes calls into the guest, inside the bracket', () => {
+  const standIn = { name: 'stand-in' };
+  const real = { name: 'real' };
+  const hooked = [];
+  const { api, calls } = load(true, {
+    // As an embedder virtualizing globals would: map the receiver to the real
+    // one, and change the result on the way back.
+    invokeCallback(dispatch, receiver, args, newTarget) {
+      hooked.push([calls.depth, newTarget]);
+      return dispatch(receiver === standIn ? real : receiver, args, newTarget) * 10;
+    },
+  });
+  const root = api.wasmer_napi_create_global_context();
+  const callback = api.wasmer_napi_make_callback(root, (receiver, args) => {
+    assert.equal(receiver, real);
+    return args[0] + 1;
+  });
+  assert.equal(callback.call(standIn, 4), 50);
+  assert.deepEqual(hooked, [[1, undefined]]);
+  assert.deepEqual([calls.depth, calls.enters, calls.leaves], [0, 1, 1]);
+  // A throwing hook still leaves the bracket.
+  const throwing = load(true, { invokeCallback() { throw new Error('invoke test'); } });
+  const throwingRoot = throwing.api.wasmer_napi_create_global_context();
+  assert.throws(() => throwing.api.wasmer_napi_make_callback(throwingRoot, () => 1)(), /invoke test/);
+  assert.deepEqual([throwing.calls.depth, throwing.calls.enters, throwing.calls.leaves], [0, 1, 1]);
+});
+
 test('without the bridge, contexts stay isolated from the global and each other', () => {
   const { api, context } = load(false);
   assert.equal(api.wasmer_napi_has_native_realm(), false);

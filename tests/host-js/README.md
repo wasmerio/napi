@@ -29,7 +29,8 @@ realm, with and without a fake `__wasmerNapiNativeRealm` bridge. With it,
 scripts run in the realm's global with their filename and offsets, global
 lexical declarations persist, the realm serves one environment and refuses
 secondary contexts, context extensions and modules, callbacks and drained guest
-code are bracketed, checkpoints, release and the bracketing hooks go to the
+code are bracketed, an `invokeCallback` hook makes JavaScript calls into guest
+functions, checkpoints, release and the bracketing hooks go to the
 bridge without letting its errors escape, and the bridge global is removed once
 captured; a bridge that can't be removed is refused. Without it, contexts stay
 isolated.
