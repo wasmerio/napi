@@ -1,1 +1,0 @@
-void throw_exception_proxy();

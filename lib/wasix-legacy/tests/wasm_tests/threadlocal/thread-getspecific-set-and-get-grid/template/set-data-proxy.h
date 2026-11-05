@@ -1,1 +1,0 @@
-void set_data_proxy();

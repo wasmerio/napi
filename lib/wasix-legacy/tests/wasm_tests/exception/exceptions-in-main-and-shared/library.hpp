@@ -1,1 +1,0 @@
-int try_catch_in_lib();

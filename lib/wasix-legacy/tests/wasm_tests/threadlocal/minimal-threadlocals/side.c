@@ -1,1 +1,0 @@
-int _Thread_local toast = 20;
