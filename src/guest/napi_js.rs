@@ -1076,9 +1076,10 @@ fn guest_unofficial_napi_structured_clone(
     let value_id = value;
     let transfer_list_id = transfer_list;
     let mut out = 0u32;
-    let status = unsafe {
+    // Serializing an object reads its properties, running any getters.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
-    };
+    });
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
     }
@@ -1096,7 +1097,10 @@ fn guest_unofficial_napi_message_create(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut payload = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut payload) };
+    // Sharing serializes the value, as structured_clone does.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_message_create(env_handle, value, &mut payload)
+    });
     if status == 0 && payload_out_ptr != 0 {
         write_guest_u32(&mut env, payload_out_ptr, payload);
     }
@@ -1209,14 +1213,16 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe {
+    // A Proxy's ownKeys and getOwnPropertyDescriptor traps can call guest
+    // functions.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
             filter_bits,
             &mut out,
         )
-    };
+    });
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, out);
     }
@@ -3024,9 +3030,12 @@ fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: u32, dp: u32, 
 }
 
 fn guest_napi_resolve_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
+    // Resolving reads the value's `then` at once, which can run a getter or
+    // a Proxy trap. with_cb_context publishes pending host buffer copies.
     let snapi = snapi_env(&env, e);
-    publish_pending_host_buffer_copies(&mut env, snapi);
-    unsafe { snapi_bridge_resolve_deferred(snapi, d, v) }
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_resolve_deferred(snapi, d, v)
+    })
 }
 
 fn guest_napi_reject_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
@@ -3487,16 +3496,18 @@ fn guest_node_api_create_sharedarraybuffer(
 }
 
 fn guest_node_api_set_prototype(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     object: u32,
     prototype: u32,
 ) -> i32 {
     let object_id = object;
     let prototype_id = prototype;
-    unsafe {
-        snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id)
-    }
+    // A Proxy's setPrototypeOf trap can call guest functions.
+    let snapi = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
+    })
 }
 
 // --- TypedArray ---
