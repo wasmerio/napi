@@ -3,8 +3,8 @@
 Run the context tests directly, without compiling Wasmer or installing npm dependencies:
 
 ```sh
-node --expose-gc --test tests/host-js/global-context.test.mjs
-bun test tests/host-js/global-context.test.mjs
+node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
+bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
 ```
 
 The tests extract the context implementation from the JavaScript embedded in
@@ -16,6 +16,25 @@ become inert on release and allow collection of their contexts and dispatch
 captures. A callback wrapper passes the realm it was made in to its dispatch,
 and is all that keeps that realm alive. The shared-object registry and
 module loader are outside this isolated test.
+
+`finalizer-queue.test.mjs` extracts the finalizer queue the same way. It
+checks that a drain takes only objects the host collected, oldest first, with
+20,000 live ones registered; that queues are independent; that a retried id is
+queued once; that removing an id cancels a queued or later collection; that
+author code replacing `Map` or `FinalizationRegistry` methods afterwards
+changes nothing; and, with the host's own GC, that a collected object is
+reported and a live one is not.
+
+`native-realm.test.mjs` loads the whole embedded JavaScript into a `vm`
+realm, with and without a fake `__wasmerNapiNativeRealm` bridge. With it,
+scripts run in the realm's global with their filename and offsets, global
+lexical declarations persist, the realm serves one environment and refuses
+secondary contexts, context extensions and modules, callbacks and drained guest
+code are bracketed, an `invokeCallback` hook makes JavaScript calls into guest
+functions, checkpoints, release and the bracketing hooks go to the
+bridge without letting its errors escape, and the bridge global is removed once
+captured; a bridge that can't be removed is refused. Without it, contexts stay
+isolated.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
 hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip
@@ -30,7 +49,10 @@ releases their environment, checks that no unowned externref roots remain, and
 verifies the Rust closure captures are freed immediately without GC. It invokes
 a saved callback after release, which must return `undefined` through its empty
 dispatch slot instead of entering the freed environment or throwing a
-dropped-closure error. With a matching `wasm-bindgen-test-runner`, `rust-src`
+dropped-closure error. The finalizer tests check that finalizers and
+buffer finalizers are taken only once their object is reported collected, that
+`napi_remove_wrap` cancels its finalizer even after that report, and that the
+bookkeeping stays consistent. With a matching `wasm-bindgen-test-runner`, `rust-src`
 and Acorn available to the runner, execute it with:
 
 ```sh

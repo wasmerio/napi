@@ -4769,6 +4769,7 @@ dependencies = [
  "offset-allocator",
  "serde",
  "serde_json",
+ "smallvec",
  "tar",
  "tokio",
  "ureq",

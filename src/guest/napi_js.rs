@@ -18,7 +18,7 @@ use crate::{
     guest::{
         MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{
-            flush_host_buffer_copies_for_owner, install_persistent_callback_state,
+            flush_host_buffer_copies_for_owner, install_async_owner,
             publish_pending_host_buffer_copies, refresh_host_buffer_copies, with_callback_state,
             with_callback_state_async,
         },
@@ -55,9 +55,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let async_env = env.as_async_mut();
     let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    if let Some(async_env) = async_env {
-        install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
-    }
+    install_async_owner(&mut env, env_id, snapi_env_state, async_env);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -547,9 +545,7 @@ fn guest_unofficial_napi_create_env(
     let async_env = env.as_async_mut();
     let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    if let Some(async_env) = async_env {
-        install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
-    }
+    install_async_owner(&mut env, env_id, snapi_env_state, async_env);
     if env_out_ptr != 0 {
         write_guest_u32(&mut env, env_out_ptr, env_id);
     }
@@ -587,6 +583,13 @@ fn guest_unofficial_napi_release_env(
     loop_ptr: u32,
 ) -> i32 {
     let scope_id = scope_ptr;
+    // Refuse before touching any of the env's bookkeeping, so the env stays
+    // usable and releasable afterwards.
+    if let Some(snapi_env_state) = env.data().napi_scope_env(scope_id)
+        && unsafe { snapi_bridge_unofficial_env_release_refused(snapi_env_state) } != 0
+    {
+        return crate::env::RELEASE_REFUSED;
+    }
     let status = drain_env_guest_finalizers(&mut env, scope_id);
     if status != 0 {
         return status;
@@ -1034,9 +1037,10 @@ fn guest_unofficial_napi_structured_clone(
     let value_id = value;
     let transfer_list_id = transfer_list;
     let mut out = 0u32;
-    let status = unsafe {
+    // Serializing an object reads its properties, running any getters.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
-    };
+    });
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
     }
@@ -1054,7 +1058,10 @@ fn guest_unofficial_napi_message_create(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut payload = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut payload) };
+    // Sharing serializes the value, as structured_clone does.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_message_create(env_handle, value, &mut payload)
+    });
     if status == 0 && payload_out_ptr != 0 {
         write_guest_u32(&mut env, payload_out_ptr, payload);
     }
@@ -1167,14 +1174,16 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe {
+    // A Proxy's ownKeys and getOwnPropertyDescriptor traps can call guest
+    // functions.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
             filter_bits,
             &mut out,
         )
-    };
+    });
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, out);
     }
@@ -1666,7 +1675,7 @@ fn guest_unofficial_napi_run_script(
         return 1;
     };
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_run_script(
             env_handle,
             realm,
@@ -1682,7 +1691,7 @@ fn guest_unofficial_napi_run_script(
             host_defined_option_id,
             &mut result_id,
         )
-    };
+    });
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, result_id);
     }
@@ -2572,7 +2581,10 @@ fn guest_napi_instanceof(
     rp: u32,
 ) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_instanceof(snapi_env(&env, e), obj, ctor, &mut r) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
+    });
     if s == 0 {
         write_guest_u8(&mut env, rp, r as u8);
     }
@@ -2582,7 +2594,21 @@ fn guest_napi_instanceof(
 // --- Coercion ---
 
 macro_rules! guest_coerce {
+    // ToNumber and ToString can run author code (valueOf, toString,
+    // Symbol.toPrimitive), which can call guest functions.
     ($name:ident, $bridge:ident) => {
+        fn $name(mut env: FunctionEnvMut<NapiEnv>, e: u32, vh: u32, rp: u32) -> i32 {
+            let mut out: u32 = 0;
+            let snapi = snapi_env(&env, e);
+            let s = with_cb_context(&mut env, e, || unsafe { $bridge(snapi, vh, &mut out) });
+            if s == 0 {
+                write_guest_u32(&mut env, rp, out);
+            }
+            s
+        }
+    };
+    // ToBoolean and ToObject never run JavaScript.
+    (no_js $name:ident, $bridge:ident) => {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: u32, vh: u32, rp: u32) -> i32 {
             let mut out: u32 = 0;
             let s = unsafe { $bridge(snapi_env(&env, e), vh, &mut out) };
@@ -2594,10 +2620,10 @@ macro_rules! guest_coerce {
     };
 }
 
-guest_coerce!(guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
+guest_coerce!(no_js guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
 guest_coerce!(guest_napi_coerce_to_number, snapi_bridge_coerce_to_number);
 guest_coerce!(guest_napi_coerce_to_string, snapi_bridge_coerce_to_string);
-guest_coerce!(guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
+guest_coerce!(no_js guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 
 // --- Object operations ---
 
@@ -2816,7 +2842,10 @@ fn guest_napi_delete_element(
 
 fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: u32, ah: u32, rp: u32) -> i32 {
     let mut r: u32 = 0;
-    let s = unsafe { snapi_bridge_get_array_length(snapi_env(&env, e), ah, &mut r) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_array_length(snapi, ah, &mut r)
+    });
     if s == 0 {
         write_guest_u32(&mut env, rp, r);
     }
@@ -2859,19 +2888,28 @@ fn guest_napi_get_all_property_names(
 
 fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32, rp: u32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_prototype(snapi_env(&env, e), o, &mut out) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_prototype(snapi, o, &mut out)
+    });
     if s == 0 {
         write_guest_u32(&mut env, rp, out);
     }
     s
 }
 
-fn guest_napi_object_freeze(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_freeze(snapi_env(&env, e), o) }
+fn guest_napi_object_freeze(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_freeze(snapi, o)
+    })
 }
 
-fn guest_napi_object_seal(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_seal(snapi_env(&env, e), o) }
+fn guest_napi_object_seal(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_seal(snapi, o)
+    })
 }
 
 // --- Comparison ---
@@ -3010,9 +3048,12 @@ fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: u32, dp: u32, 
 }
 
 fn guest_napi_resolve_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
+    // Resolving reads the value's `then` at once, which can run a getter or
+    // a Proxy trap. with_cb_context publishes pending host buffer copies.
     let snapi = snapi_env(&env, e);
-    publish_pending_host_buffer_copies(&mut env, snapi);
-    unsafe { snapi_bridge_resolve_deferred(snapi, d, v) }
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_resolve_deferred(snapi, d, v)
+    })
 }
 
 fn guest_napi_reject_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
@@ -3473,16 +3514,18 @@ fn guest_node_api_create_sharedarraybuffer(
 }
 
 fn guest_node_api_set_prototype(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     object: u32,
     prototype: u32,
 ) -> i32 {
     let object_id = object;
     let prototype_id = prototype;
-    unsafe {
-        snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id)
-    }
+    // A Proxy's setPrototypeOf trap can call guest functions.
+    let snapi = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
+    })
 }
 
 // --- TypedArray ---
@@ -4017,7 +4060,8 @@ fn guest_napi_get_cb_info(
             snapi_env(&env, e),
             _cbinfo,
             &mut actual_argc,
-            if wanted > 0 {
+            // Only mint ids for arguments if the guest asked.
+            if wanted > 0 && argv_ptr != 0 {
                 argv_ids.as_mut_ptr()
             } else {
                 std::ptr::null_mut()
@@ -4036,16 +4080,14 @@ fn guest_napi_get_cb_info(
         write_guest_u32(&mut env, argc_ptr, actual_argc);
     }
 
-    // Write argv (array of handle IDs) - only write up to min(wanted, actual)
+    // Write all `wanted` argv entries: those past the actual count are
+    // undefined.
     if argv_ptr != 0 {
-        let to_write = std::cmp::min(wanted, actual_argc);
         // The argv entries written must lie below 4 GiB.
-        if u64::from(argv_ptr) + u64::from(to_write) * 4 > 1u64 << 32 {
+        if u64::from(argv_ptr) + u64::from(wanted) * 4 > 1u64 << 32 {
             return 1;
         }
-        for i in 0..to_write {
-            write_guest_u32(&mut env, argv_ptr + i * 4, argv_ids[i as usize]);
-        }
+        write_guest_pod_slice(&mut env, argv_ptr, &argv_ids);
     }
 
     // Write this_arg
@@ -4126,9 +4168,9 @@ fn guest_napi_define_class(
     if pc == 0 {
         // No properties — simple case
         let mut out: u32 = 0;
-        let s = unsafe {
+        let s = with_cb_context(&mut env, e, || unsafe {
             snapi_bridge_define_class(
-                snapi_env(&env, e),
+                snapi,
                 c_name.as_ptr(),
                 actual_name_len,
                 ctor_reg_id,
@@ -4143,7 +4185,7 @@ fn guest_napi_define_class(
                 std::ptr::null(),
                 &mut out,
             )
-        };
+        });
         if s != 0 {
             return s;
         }
@@ -4289,9 +4331,9 @@ fn guest_napi_define_class(
     }
 
     let mut out: u32 = 0;
-    let s = unsafe {
+    let s = with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_define_class(
-            snapi_env(&env, e),
+            snapi,
             c_name.as_ptr(),
             actual_name_len,
             ctor_reg_id,
@@ -4306,7 +4348,7 @@ fn guest_napi_define_class(
             prop_attributes.as_ptr(),
             &mut out,
         )
-    };
+    });
     if s != 0 {
         return s;
     }
@@ -4324,7 +4366,7 @@ fn guest_napi_define_properties(
     let snapi = snapi_env(&env, e);
     let pc = prop_count;
     if pc == 0 {
-        return unsafe {
+        return with_cb_context(&mut env, e, || unsafe {
             snapi_bridge_define_properties(
                 snapi,
                 obj,
@@ -4338,7 +4380,7 @@ fn guest_napi_define_properties(
                 std::ptr::null(),
                 std::ptr::null(),
             )
-        };
+        });
     }
 
     // usize is 32 bits on this host, so a guest-supplied count can overflow.
@@ -4469,7 +4511,7 @@ fn guest_napi_define_properties(
         prop_names_ptrs.push(cn.as_ptr());
     }
 
-    unsafe {
+    with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_define_properties(
             snapi,
             obj,
@@ -4483,7 +4525,7 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.as_ptr(),
             prop_attributes.as_ptr(),
         )
-    }
+    })
 }
 
 // --- Script execution ---
