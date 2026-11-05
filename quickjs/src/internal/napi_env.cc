@@ -135,26 +135,27 @@ void napi_env__::prepare_teardown()
   // Every scope closes. Cleanup hooks and finalizers each run in the env's
   // realm, and a scope one leaves open closes when it returns.
   pop_realm_frames(0);
-  while (!env_cleanup_hooks_.empty())
+  // The cleanup hooks run, then the finalizers of the values still alive; a
+  // hook or value one of them adds runs too (Node also runs hooks added during
+  // cleanup), until neither is left. They run while the context and runtime
+  // are alive and the root scope is open, so they can use N-API; what they
+  // make is freed below.
+  run_cleanup_hooks();
+  while (napi_external_backing_store_hint__::first_pending(pending_finalizers_) != nullptr)
   {
-    auto *entry = env_cleanup_hooks_.back();
-    env_cleanup_hooks_.pop_back();
-    if (entry != nullptr)
-    {
-      {
-        napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
-        entry->run();
-      }
-      napi_env_cleanup_hook__::destroy(entry);
-    }
+    finalize_pending_values();
+    run_cleanup_hooks();
   }
-  // As in Node, the finalizers of values still alive run next, then the
-  // instance data's. They run while the context and runtime are alive and
-  // the root scope is open, so they can use N-API; what they make is freed
-  // below.
-  finalize_external_values();
+  // The instance data's finalizer runs last. Nothing is finalized after it,
+  // but hooks it adds still run.
   finalize_instance_data();
+  drop_finalizer_exception();
+  run_cleanup_hooks();
+  // A value still pending is never finalized: the runtime frees it after the
+  // context is gone.
   finalizers_done_ = true;
+  while (auto *hint = napi_external_backing_store_hint__::first_pending(pending_finalizers_))
+    hint->abandon_finalizer();
   cleanup_hooks_.close();
   deferreds_.close();
 
@@ -206,28 +207,43 @@ void napi_env__::clear_refs_for_teardown()
   clearing_refs_for_teardown_ = false;
 }
 
-void napi_env__::finalize_external_values()
+void napi_env__::run_cleanup_hooks()
 {
-  // Externals, wraps, napi_add_finalizer and external buffers each hold a
-  // hint. A finalizer may make or free values, which changes the hints, so
-  // look again from the start after one did.
-  bool changed = true;
-  while (changed)
+  while (!env_cleanup_hooks_.empty())
   {
-    changed = false;
-    for (napi_external_backing_store_hint__ &hint : external_backing_stores_)
+    auto *entry = env_cleanup_hooks_.back();
+    env_cleanup_hooks_.pop_back();
+    if (entry != nullptr)
     {
-      if (!hint.finalizer_pending())
-        continue;
-      const uint64_t changes = external_backing_store_changes_;
-      hint.invoke_finalizer();
-      if (changes != external_backing_store_changes_)
       {
-        changed = true;
-        break;
+        napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+        entry->run();
       }
+      napi_env_cleanup_hook__::destroy(entry);
     }
   }
+}
+
+void napi_env__::finalize_pending_values()
+{
+  // Externals, wraps, napi_add_finalizer and external buffers each hold a
+  // hint. The ones whose finalizers have yet to run are listed most recent
+  // first, the order Node finalizes in. A value a finalizer makes joins the
+  // list, and one it frees leaves it.
+  while (auto *hint = napi_external_backing_store_hint__::first_pending(pending_finalizers_))
+  {
+    hint->finalize_at_teardown();
+    drop_finalizer_exception();
+  }
+}
+
+void napi_env__::drop_finalizer_exception()
+{
+  // Nothing can catch what a finalizer threw at release. Node also clears it
+  // after each finalizer.
+  clear_last_exception();
+  if (context_ != nullptr && JS_HasException(context_))
+    JS_FreeValue(context_, JS_GetException(context_));
 }
 
 void napi_env__::finalize_instance_data()
@@ -645,14 +661,13 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
     return nullptr;
   napi_external_backing_store_hint__ *hint =
       external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
-  if (hint != nullptr)
-    ++external_backing_store_changes_;
+  if (hint != nullptr && finalize_cb != nullptr && !finalizers_done_)
+    hint->link_pending(pending_finalizers_);
   return hint;
 }
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
 {
-  ++external_backing_store_changes_;
   external_backing_stores_.destroy(hint);
 }
 

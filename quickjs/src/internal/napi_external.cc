@@ -127,8 +127,7 @@ void *napi_external__::realloc_external_array_buffer_data(JSRuntime *rt, void *o
   auto *hint = reinterpret_cast<napi_external_backing_store_hint__ *>(opaque);
   if (hint == nullptr)
     return nullptr;
-  hint->invoke_finalizer();
-  napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
+  hint->release_array_buffer(rt);
   return nullptr;
 }
 

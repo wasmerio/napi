@@ -17,6 +17,9 @@ napi_external_backing_store_hint__::napi_external_backing_store_hint__(
 
 napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
 {
+  if (pending_link_.linked())
+    pending_link_.unlink();
+  forget_array_buffer();
   env_ = nullptr;
   rt_ = nullptr;
   external_data_ = nullptr;
@@ -63,6 +66,9 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   if (finalize_invoked_)
     return;
   finalize_invoked_ = true;
+  if (pending_link_.linked())
+    pending_link_.unlink();
+  forget_array_buffer();
   if (finalize_cb_ == nullptr)
     return;
   if (env_ == nullptr)
@@ -80,9 +86,88 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   finalize_cb_(env_, external_data_, finalize_hint_);
 }
 
-bool napi_external_backing_store_hint__::finalizer_pending() const
+void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)
 {
-  return !finalize_invoked_ && finalize_cb_ != nullptr;
+  invoke_finalizer();
+  if (!detaching_)
+    destroy_with_runtime(rt, this);
+}
+
+void napi_external_backing_store_hint__::track_array_buffer(JSContext *ctx,
+                                                            JSValueConst array_buffer)
+{
+  // Only a finalizer frees the memory, so only then must teardown detach the
+  // buffer first.
+  if (finalize_cb_ == nullptr || finalize_invoked_)
+    return;
+  if (JS_AddNativeWeakRefLink(ctx, array_buffer, &array_buffer_link_, array_buffer_freed, this) < 0)
+  {
+    // Out of memory: teardown can still run the finalizer, just not detach.
+    if (JS_HasException(ctx))
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    return;
+  }
+  array_buffer_ = array_buffer;
+}
+
+void napi_external_backing_store_hint__::link_pending(napi_intrinsic_link__ &pending)
+{
+  pending.link(pending_link_);
+}
+
+napi_external_backing_store_hint__ *napi_external_backing_store_hint__::first_pending(
+    napi_intrinsic_link__ &pending)
+{
+  napi_intrinsic_link__ *link = pending.first();
+  return link == nullptr
+             ? nullptr
+             : link->unsafe_get<&napi_external_backing_store_hint__::pending_link_>();
+}
+
+void napi_external_backing_store_hint__::finalize_at_teardown()
+{
+  if (JS_GetNativeWeakRefFromLink(&array_buffer_link_) != nullptr)
+  {
+    // As Node does, detach the buffer first, so nothing can reach the memory
+    // the finalizer frees. Detaching runs the finalizer, unless
+    // ArrayBuffer.prototype.transfer already moved the memory to a buffer this
+    // hint cannot reach (Node cannot either). The reference keeps the buffer
+    // alive in case the finalizer drops the last other one.
+    JSContext *ctx = env_->main_context();
+    JSValue array_buffer = JS_DupValue(ctx, array_buffer_);
+    detaching_ = true;
+    JS_DetachArrayBuffer(ctx, array_buffer);
+    detaching_ = false;
+    JS_FreeValue(ctx, array_buffer);
+    if (finalize_invoked_)
+    {
+      // The buffer no longer refers to the hint.
+      destroy(this);
+      return;
+    }
+  }
+  invoke_finalizer();
+}
+
+void napi_external_backing_store_hint__::abandon_finalizer()
+{
+  if (pending_link_.linked())
+    pending_link_.unlink();
+  forget_array_buffer();
+}
+
+void napi_external_backing_store_hint__::array_buffer_freed(JSRuntime *rt, void *opaque)
+{
+  (void)rt;
+  // QuickJS has already cleared the link.
+  static_cast<napi_external_backing_store_hint__ *>(opaque)->array_buffer_ = JS_UNDEFINED;
+}
+
+void napi_external_backing_store_hint__::forget_array_buffer()
+{
+  if (JS_GetNativeWeakRefFromLink(&array_buffer_link_) != nullptr)
+    JS_DeleteNativeWeakRefLink(rt_, &array_buffer_link_);
+  array_buffer_ = JS_UNDEFINED;
 }
 
 napi_env napi_external_backing_store_hint__::env() const

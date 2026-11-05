@@ -51,9 +51,9 @@ struct napi_env__
   napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version);
   ~napi_env__();
 
-  // Runs the cleanup hooks, then every pending finalizer and the
-  // instance-data finalizer last, while the context is alive, and lets go of
-  // the context. N-API calls on the env fail from then on.
+  // Runs the cleanup hooks and every pending finalizer, the instance data's
+  // last, while the context is alive, and lets go of the context. N-API calls
+  // on the env fail from then on.
   void prepare_teardown();
   // Native callbacks are refused once teardown has started.
   bool is_closing() const;
@@ -173,7 +173,9 @@ struct napi_env__
 
 private:
   void clear_refs_for_teardown();
-  void finalize_external_values();
+  void run_cleanup_hooks();
+  void finalize_pending_values();
+  void drop_finalizer_exception();
   void finalize_instance_data();
   void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);
 
@@ -207,13 +209,15 @@ private:
   // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
 
+  // Hints whose finalizers have yet to run, the most recent first. Declared
+  // before the hints' allocator, so it is destroyed after every hint.
+  napi_intrinsic_link__ pending_finalizers_{};
+
   // Env-owned slot allocators.
   napi_allocator__<napi_ref__, napi_env__> refs_;
   napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
   napi_allocator__<napi_deferred__, napi_env__> deferreds_;
   napi_allocator__<napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
-  // Counts hints made and destroyed, so teardown sees a finalizer change them.
-  uint64_t external_backing_store_changes_ = 0;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.

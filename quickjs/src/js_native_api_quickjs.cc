@@ -450,6 +450,7 @@ extern "C"
         napi_external_backing_store_hint__::destroy(hint);
         return napi_util__::return_pending_if_caught(env, "Failed to create external array");
       }
+      hint->track_array_buffer(env->context(), out);
     }
 
     *result = env->wrap_value_in_current_scope(out, true);
