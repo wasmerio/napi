@@ -870,10 +870,17 @@ napi_env__::~napi_env__() {
   finalization_scheduled = false;
   FinalizeExternalBackingStoreHints(this);
   napi_v8_finalize_buffer_records(this);
-  CallFinalizer(instance_data_finalize_cb, instance_data, instance_data_finalize_hint);
-  // External buffers the finalizers above made: their finalizers run too, and
-  // no hint is left pointing at the env.
-  FinalizeExternalBackingStoreHints(this);
+  // External buffers the finalizers above made are finalized too, then the
+  // instance data, then what its finalizer made, so no hint is left pointing
+  // at the env. Instance data a finalizer sets is finalized in turn, as Node
+  // finalizes refs made while it finalizes.
+  for (;;) {
+    FinalizeExternalBackingStoreHints(this);
+    if (instance_data_finalize_cb == nullptr) break;
+    napi_finalize finalize_cb = instance_data_finalize_cb;
+    instance_data_finalize_cb = nullptr;
+    CallFinalizer(finalize_cb, instance_data, instance_data_finalize_hint);
+  }
   // Backstop: nothing above should leave a scope open, and a context still
   // entered here would abort V8 at the embedder's next Context::Exit.
   PopRealmFrames(0);

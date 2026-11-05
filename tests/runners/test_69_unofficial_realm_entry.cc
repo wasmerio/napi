@@ -911,6 +911,56 @@ TEST_F(Test69UnofficialRealmEntry, ExternalArrayBufferTheInstanceDataFinalizerDe
   EXPECT_TRUE(record.on_env_thread.load());
   EXPECT_TRUE(record.saw_env_global.load());
 }
+
+namespace {
+
+struct LateInstanceData {
+  ExternalFinalizerRecord buffer;
+  std::atomic<int> late_finalized{0};
+  std::atomic<bool> late_saw_env_global{false};
+};
+
+void FinalizeLateInstanceData(napi_env env, void* data, void*) {
+  auto* late = static_cast<LateInstanceData*>(data);
+  bool has_marker = false;
+  late->late_saw_env_global =
+      napi_has_named_property(env, Global(env), kEnvMarker, &has_marker) == napi_ok &&
+      has_marker;
+  late->late_finalized.fetch_add(1);
+}
+
+// The buffer's finalizer runs late in the release, and sets instance data.
+void SetInstanceDataFromExternalFinalizer(node_api_basic_env basic_env, void* data, void* hint) {
+  auto* late = static_cast<LateInstanceData*>(hint);
+  RecordExternalFinalizer(basic_env, data, &late->buffer);
+  (void)napi_set_instance_data(basic_env, late, FinalizeLateInstanceData, nullptr);
+}
+
+void DetachLateExternalBuffer(napi_env env, void* data, void*) {
+  auto* late = static_cast<LateInstanceData*>(data);
+  napi_value buffer = nullptr;
+  if (napi_create_external_arraybuffer(env, late->buffer.bytes, sizeof(late->buffer.bytes),
+                                       SetInstanceDataFromExternalFinalizer, late,
+                                       &buffer) == napi_ok) {
+    (void)napi_detach_arraybuffer(env, buffer);
+  }
+}
+
+}  // namespace
+
+// Instance data a finalizer sets during the release is finalized too, once,
+// as Node finalizes references made while it finalizes the others.
+TEST_F(Test69UnofficialRealmEntry, InstanceDataSetByALateFinalizerIsFinalized) {
+  LateInstanceData late;
+  EnvScope s(runtime_.get());
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_set_instance_data(s.env, &late, DetachLateExternalBuffer, nullptr), napi_ok);
+  Release(s);
+
+  EXPECT_EQ(late.buffer.calls.load(), 1);
+  EXPECT_EQ(late.late_finalized.load(), 1);
+  EXPECT_TRUE(late.late_saw_env_global.load());
+}
 #endif
 
 TEST_F(Test69UnofficialRealmEntry, CollectedExternalArrayBuffersAreFinalizedOnTheEnvsThread) {
