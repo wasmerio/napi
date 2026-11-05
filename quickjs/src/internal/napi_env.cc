@@ -122,7 +122,8 @@ void napi_env__::prepare_teardown()
 
   closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  // Every scope closes; cleanup hooks and finalizers run in the env's realm.
+  // Every scope closes. Cleanup hooks and finalizers each run in the env's
+  // realm, and a scope one leaves open closes when it returns.
   pop_realm_frames(0);
   while (!env_cleanup_hooks_.empty())
   {
@@ -130,7 +131,10 @@ void napi_env__::prepare_teardown()
     env_cleanup_hooks_.pop_back();
     if (entry != nullptr)
     {
-      entry->run();
+      {
+        napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+        entry->run();
+      }
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
@@ -151,6 +155,9 @@ void napi_env__::prepare_teardown()
     agent_->close_scopes();
     agent_->clear_module_hooks();
   }
+  // Backstop: nothing above should leave a scope open, and a scope's anchor
+  // must be freed while the runtime lives.
+  pop_realm_frames(0);
   module_wrap_.teardown();
   contextify_.teardown();
   buffers_.teardown();
@@ -186,8 +193,20 @@ void napi_env__::finalize_instance_data()
   instance_data_finalize_cb_ = nullptr;
   instance_data_finalize_hint_ = nullptr;
 
-  if (data != nullptr && finalize_cb != nullptr)
-    finalize_cb(this, data, finalize_hint);
+  call_instance_data_finalizer(data, finalize_cb, finalize_hint);
+}
+
+void napi_env__::call_instance_data_finalizer(void *data,
+                                              napi_finalize finalize_cb,
+                                              void *finalize_hint)
+{
+  if (data == nullptr || finalize_cb == nullptr)
+    return;
+  // In the env's realm, as any finalizer. At release this runs after the
+  // runtime is freed; the realms are gone by then, so no scope it opens holds
+  // an anchor and popping the frame touches nothing.
+  napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+  finalize_cb(this, data, finalize_hint);
 }
 
 bool napi_env__::is_closing() const
@@ -252,7 +271,9 @@ void napi_env__::pop_realm_frames(size_t depth)
   {
     napi_realm_frame__ frame = realm_frames_.back();
     realm_frames_.pop_back();
-    if (frame.scope != 0)
+    // A scope of the env's own realm holds no anchor, and may close after
+    // the runtime is freed (in the instance-data finalizer).
+    if (frame.scope != 0 && JS_VALUE_HAS_REF_COUNT(frame.anchor))
       JS_FreeValue(context_, frame.anchor);
   }
 }
@@ -505,8 +526,7 @@ void napi_env__::set_instance_data(void *data, napi_finalize finalize_cb, void *
   instance_data_finalize_cb_ = nullptr;
   instance_data_finalize_hint_ = nullptr;
 
-  if (old_data != nullptr && old_finalize_cb != nullptr)
-    old_finalize_cb(this, old_data, old_finalize_hint);
+  call_instance_data_finalizer(old_data, old_finalize_cb, old_finalize_hint);
 
   instance_data_ = data;
   instance_data_finalize_cb_ = finalize_cb;

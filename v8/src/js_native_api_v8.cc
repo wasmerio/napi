@@ -156,7 +156,14 @@ void RunEnvCleanupHooks(napi_env env) {
         continue;
       }
 
-      snapshot.hook(snapshot.arg);
+      {
+        // Each hook runs in the env's realm, and a scope it leaves open
+        // closes when it returns.
+        v8::HandleScope handle_scope(env->isolate);
+        v8::Context::Scope context_scope(env->main_context());
+        napi_realm_frame_scope__ realm_frame(env, nullptr);
+        snapshot.hook(snapshot.arg);
+      }
 
       it = find_hook(env->env_cleanup_hooks, snapshot);
       if (it != env->env_cleanup_hooks.end()) {
@@ -182,7 +189,10 @@ napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
 void FinalizeBufferRecord(napi_buffer_record* record) {
   if (record == nullptr || record->finalized) return;
   record->finalized = true;
-  if (record->finalize_cb != nullptr) {
+  if (record->finalize_cb == nullptr) return;
+  if (CheckEnv(record->env)) {
+    record->env->CallFinalizer(record->finalize_cb, record->external_data, record->finalize_hint);
+  } else {
     record->finalize_cb(record->env, record->external_data, record->finalize_hint);
   }
 }
@@ -286,7 +296,7 @@ void FinalizeExternalBackingStoreHints(napi_env env) {
   }
 
   for (auto& [finalize_cb, external_data, finalize_hint] : pending) {
-    finalize_cb(env, external_data, finalize_hint);
+    env->CallFinalizer(finalize_cb, external_data, finalize_hint);
   }
 }
 
@@ -652,7 +662,8 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 
 napi_env__::~napi_env__() {
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  // Every scope closes; cleanup hooks and finalizers run in the env's realm.
+  // Every scope closes. Cleanup hooks and finalizers each run in the env's
+  // realm, and a scope one leaves open closes when it returns.
   PopRealmFrames(0);
   RunEnvCleanupHooks(this);
   napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
@@ -662,10 +673,10 @@ napi_env__::~napi_env__() {
   finalization_scheduled = false;
   FinalizeExternalBackingStoreHints(this);
   napi_v8_finalize_buffer_records(this);
-
-  if (instance_data_finalize_cb != nullptr) {
-    instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
-  }
+  CallFinalizer(instance_data_finalize_cb, instance_data, instance_data_finalize_hint);
+  // Backstop: nothing above should leave a scope open, and a context still
+  // entered here would abort V8 at the embedder's next Context::Exit.
+  PopRealmFrames(0);
   if (agent != nullptr && agent->principal_env == this) {
     agent->principal_env = nullptr;
   }

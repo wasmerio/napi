@@ -653,3 +653,123 @@ TEST_F(Test69UnofficialRealmEntry, FinalizersRunInTheEnvsRealm) {
   EXPECT_TRUE(record.saw_env_global);
   ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
 }
+
+// Scopes opened while the env is released.
+
+namespace {
+
+// Releases the env before the test ends.
+void Release(EnvScope& s) {
+  ASSERT_EQ(unofficial_napi_release_env(s.scope, nullptr), napi_ok);
+  s.scope = nullptr;
+  s.env = nullptr;
+}
+
+struct ReleaseRecord {
+  napi_env env = nullptr;
+  napi_ref env_global = nullptr;
+  napi_ref realm_global = nullptr;
+  unofficial_napi_realm realm = nullptr;
+  napi_status enter_status = napi_generic_failure;
+  napi_status enter_env_realm_status = napi_generic_failure;
+  bool checked = false;
+  bool saw_env_global = false;
+};
+
+// A cleanup hook that enters a realm, makes an object there and returns
+// without leaving it.
+void EnterRealmFromCleanupHook(void* arg) {
+  auto* record = static_cast<ReleaseRecord*>(arg);
+  napi_value global = nullptr;
+  unofficial_napi_realm realm = nullptr;
+  if (napi_get_reference_value(record->env, record->realm_global, &global) != napi_ok ||
+      unofficial_napi_get_realm(record->env, global, &realm) != napi_ok) {
+    return;
+  }
+  unofficial_napi_realm_scope scope = 0;
+  record->enter_status = unofficial_napi_enter_realm(record->env, realm, &scope);
+  napi_value object = nullptr;
+  (void)napi_create_object(record->env, &object);
+}
+
+// A cleanup hook that records whether it acts in the env's realm.
+void CheckEnvRealmFromCleanupHook(void* arg) {
+  auto* record = static_cast<ReleaseRecord*>(arg);
+  record->checked = true;
+  napi_value env_global = nullptr;
+  if (napi_get_reference_value(record->env, record->env_global, &env_global) == napi_ok) {
+    record->saw_env_global = StrictEquals(record->env, Global(record->env), env_global);
+  }
+  (void)napi_delete_reference(record->env, record->env_global);
+  (void)napi_delete_reference(record->env, record->realm_global);
+}
+
+// An instance-data finalizer that enters a realm, then the env's own, and
+// returns without leaving either.
+void EnterRealmFromInstanceDataFinalizer(napi_env env, void* data, void*) {
+  auto* record = static_cast<ReleaseRecord*>(data);
+  record->checked = true;
+  unofficial_napi_realm_scope scope = 0;
+  record->enter_status = unofficial_napi_enter_realm(env, record->realm, &scope);
+  unofficial_napi_realm_scope env_scope = 0;
+  record->enter_env_realm_status = unofficial_napi_enter_realm(env, nullptr, &env_scope);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ScopeACleanupHookLeavesOpenClosesWhenItReturns) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  ASSERT_NE(CreateRealm(s.env, &realm_global), nullptr);
+  ReleaseRecord record;
+  record.env = s.env;
+  ASSERT_EQ(napi_create_reference(s.env, Global(s.env), 1, &record.env_global), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, realm_global, 1, &record.realm_global), napi_ok);
+  // Hooks run in reverse order of registration: the one that enters runs
+  // first.
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, CheckEnvRealmFromCleanupHook, &record), napi_ok);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, EnterRealmFromCleanupHook, &record), napi_ok);
+
+  Release(s);
+  EXPECT_EQ(record.enter_status, napi_ok);
+  EXPECT_TRUE(record.checked);
+  EXPECT_TRUE(record.saw_env_global);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ScopeTheInstanceDataFinalizerLeavesOpenCloses) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  ReleaseRecord record;
+  record.realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(record.realm, nullptr);
+  // The env's global keeps the realm alive until the env is released.
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "realm", realm_global), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, EnterRealmFromInstanceDataFinalizer, nullptr),
+            napi_ok);
+
+  Release(s);
+  EXPECT_TRUE(record.checked);
+  // The finalizer runs last, and a provider may have let go of its realms by
+  // then.
+  EXPECT_TRUE(record.enter_status == napi_ok || record.enter_status == napi_invalid_arg)
+      << record.enter_status;
+  EXPECT_EQ(record.enter_env_realm_status, napi_ok);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ReplacedInstanceDataIsFinalizedInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  ReleaseRecord record;
+  record.realm = CreateRealm(s.env);
+  ASSERT_NE(record.realm, nullptr);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, EnterRealmFromInstanceDataFinalizer, nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, nullptr, nullptr, nullptr), napi_ok);
+  // A provider that finalizes replaced data does it in the env's realm, and
+  // closes the scope the finalizer left open.
+  if (record.checked) {
+    EXPECT_EQ(record.enter_status, napi_ok);
+    EXPECT_EQ(record.enter_env_realm_status, napi_ok);
+  }
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+}

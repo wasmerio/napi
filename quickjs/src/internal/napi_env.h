@@ -165,6 +165,7 @@ struct napi_env__
 
 private:
   void clear_refs_for_teardown();
+  void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);
 
   // Set only when this env owns its agent; destroyed last.
   std::unique_ptr<napi_agent__> owned_agent_;
