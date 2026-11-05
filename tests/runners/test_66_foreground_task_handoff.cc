@@ -30,8 +30,24 @@
 #include <vector>
 
 #include <v8.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "test_env.h"
+
+// The V8 provider's own entry points for memory that only needs freeing
+// (v8/src/internal/napi_v8_env.h). The WASIX bridge makes guest-heap buffers
+// with them.
+typedef void (*napi_v8_external_free_callback)(void* data, void* hint);
+napi_status napi_v8_create_external_arraybuffer_with_free(
+    napi_env env, void* data, size_t byte_length, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result);
+napi_status napi_v8_create_external_buffer_with_free(
+    napi_env env, size_t length, void* data, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result);
 
 namespace {
 
@@ -612,6 +628,168 @@ TEST_F(Test66ForegroundTaskHandoff, ReleaseOutlastsADrainBeingPostedFromAnotherT
   EXPECT_EQ(counts.calls.load(), 1);
   EXPECT_EQ(counts.off_thread.load(), 0);
   EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+// Memory that only needs freeing comes back where V8 frees its backing store,
+// unlike a user finalizer, which waits for the env's thread. Otherwise a
+// synchronous stretch that makes and drops buffers keeps all of them until
+// the next drain; a WASIX guest's heap then grows, and wasm memory never
+// shrinks.
+
+struct FreeCounts {
+  std::atomic<int> freed{0};
+};
+
+void CountFree(void* data, void* hint) {
+  delete[] static_cast<uint8_t*>(data);
+  static_cast<FreeCounts*>(hint)->freed.fetch_add(1);
+}
+
+TEST_F(Test66ForegroundTaskHandoff, MemoryFreedInTheDeleterComesBackWithoutADrain) {
+  constexpr int kBatches = 16;
+  constexpr int kBuffers = kBatches * 64;
+  FreeCounts counts;
+  HookState hook(HookMode::kQueue);
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    ASSERT_TRUE(env.attached());
+
+    for (int batch = 0; batch < kBatches; ++batch) {
+      napi_handle_scope handles = nullptr;
+      ASSERT_EQ(napi_open_handle_scope(env.env(), &handles), napi_ok);
+      for (int i = 0; i < kBuffers / kBatches; ++i) {
+        auto* bytes = new uint8_t[1024]();
+        napi_value buffer = nullptr;
+        // Half ArrayBuffers, half Buffers.
+        if (i % 2 == 0) {
+          ASSERT_EQ(napi_v8_create_external_arraybuffer_with_free(env.env(), bytes, 1024,
+                                                                  CountFree, &counts, &buffer),
+                    napi_ok);
+        } else {
+          ASSERT_EQ(napi_v8_create_external_buffer_with_free(env.env(), 1024, bytes, CountFree,
+                                                             &counts, &buffer),
+                    napi_ok);
+        }
+      }
+      ASSERT_TRUE(RunJs(env.env(),
+                        "{ let a = []; for (let i = 0; i < 20000; i++) a.push({ i }); }"));
+      ASSERT_EQ(napi_close_handle_scope(env.env(), handles), napi_ok);
+    }
+    // Neither the hook's queue nor a checkpoint runs; only the collector.
+    for (int round = 0; round < 20 && counts.freed.load() < kBuffers; ++round) {
+      ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+      if (counts.freed.load() < kBuffers) std::this_thread::sleep_for(milliseconds(10));
+    }
+    EXPECT_EQ(counts.freed.load(), kBuffers) << "freed only after a drain";
+
+    CloseQueue(&hook);
+    env.Release();
+  }
+  EXPECT_EQ(counts.freed.load(), kBuffers);
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+// What is still alive at the release is freed then, once, as before: the
+// guest may reuse the memory after that. A backing store that outlives the
+// env is not freed again when V8 drops it.
+TEST_F(Test66ForegroundTaskHandoff, MemoryFreedInTheDeleterIsFreedOnceAtRelease) {
+  FreeCounts counts;
+  HookState hook(HookMode::kRefuse);
+  std::shared_ptr<v8::BackingStore> outliving;
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env.env(), &handles), napi_ok);
+    napi_value array_buffer = nullptr;
+    ASSERT_EQ(napi_v8_create_external_arraybuffer_with_free(env.env(), new uint8_t[16](), 16,
+                                                            CountFree, &counts, &array_buffer),
+              napi_ok);
+    napi_value buffer = nullptr;
+    ASSERT_EQ(napi_v8_create_external_buffer_with_free(env.env(), 16, new uint8_t[16](),
+                                                       CountFree, &counts, &buffer),
+              napi_ok);
+    napi_value detached = nullptr;
+    ASSERT_EQ(napi_v8_create_external_arraybuffer_with_free(env.env(), new uint8_t[16](), 16,
+                                                            CountFree, &counts, &detached),
+              napi_ok);
+    // This provider's napi_value is a v8::Local.
+    v8::Local<v8::Value> value;
+    std::memcpy(static_cast<void*>(&value), &detached, sizeof(detached));
+    outliving = value.As<v8::ArrayBuffer>()->GetBackingStore();
+    ASSERT_EQ(napi_detach_arraybuffer(env.env(), detached), napi_ok);
+    // Keeps the other two alive until the release.
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_global(env.env(), &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(env.env(), global, "liveArrayBuffer", array_buffer),
+              napi_ok);
+    ASSERT_EQ(napi_set_named_property(env.env(), global, "liveBuffer", buffer), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env.env(), handles), napi_ok);
+    ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+    EXPECT_EQ(counts.freed.load(), 0);
+    env.Release();
+  }
+  EXPECT_EQ(counts.freed.load(), 3);
+  outliving.reset();
+  EXPECT_EQ(counts.freed.load(), 3);
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NAPI_TEST_ADDRESS_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define NAPI_TEST_ADDRESS_SANITIZER 1
+#endif
+
+// Bytes malloc has handed out and not had back, or 0 where unknown.
+size_t MallocBytesInUse() {
+#if defined(__APPLE__)
+  malloc_statistics_t stats{};
+  malloc_zone_statistics(nullptr, &stats);
+  return stats.size_in_use;
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  const struct mallinfo2 info = mallinfo2();
+  return info.uordblks + info.hblkhd;
+#else
+  return 0;
+#endif
+}
+
+// unofficial_napi_create_uninitialized_arraybuffer mallocs its memory, so a
+// dropped buffer's memory comes back as V8 collects it.
+TEST_F(Test66ForegroundTaskHandoff, UninitializedArrayBuffersAreFreedWithoutACheckpoint) {
+#if defined(NAPI_TEST_ADDRESS_SANITIZER)
+  GTEST_SKIP() << "ASan holds freed memory in quarantine";
+#endif
+  if (MallocBytesInUse() == 0) GTEST_SKIP() << "no malloc statistics here";
+  constexpr size_t kBufferSize = size_t{1} << 20;
+  constexpr int kBuffers = 256;
+  HookState hook(HookMode::kRefuse);
+  HookedEnv env(&hook);
+  ASSERT_NE(env.env(), nullptr);
+  RunMicrotasks(env.env());
+  const size_t base = MallocBytesInUse();
+  for (int i = 0; i < kBuffers; ++i) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env.env(), &handles), napi_ok);
+    napi_value buffer = nullptr;
+    ASSERT_EQ(unofficial_napi_create_uninitialized_arraybuffer(env.env(), kBufferSize, false,
+                                                               &buffer),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env.env(), handles), napi_ok);
+    if (i % 64 == 63) ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+  const size_t in_use = MallocBytesInUse();
+  const size_t grown = in_use > base ? in_use - base : 0;
+  EXPECT_LT(grown, 32 * kBufferSize)
+      << (grown >> 20) << " MiB of " << ((kBuffers * kBufferSize) >> 20)
+      << " MiB of dropped buffers still held before a checkpoint";
+  env.Release();
 }
 
 }  // namespace

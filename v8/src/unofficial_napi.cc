@@ -119,6 +119,26 @@ class StringOutputStream final : public v8::OutputStream {
   std::string output_;
 };
 
+// An ArrayBuffer over memory the provider owns. V8's deleter frees it as V8
+// collects the buffer: it needs no env, so it does not wait for the env's
+// thread like a user finalizer, nor run at the env's release while the
+// buffer may still be in use. Frees `data` itself on failure.
+napi_status CreateOwnedArrayBuffer(napi_env env,
+                                   void* data,
+                                   size_t length,
+                                   v8::BackingStore::DeleterCallback deleter,
+                                   void* deleter_data,
+                                   napi_value* result) {
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(data, length, deleter, deleter_data);
+  if (!backing) {
+    deleter(data, length, deleter_data);
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, v8::ArrayBuffer::New(env->isolate, std::move(backing)));
+  return *result == nullptr ? napi_generic_failure : napi_ok;
+}
+
 napi_status CreateExternalUtf8Bytes(napi_env env,
                                     std::string&& bytes,
                                     napi_value* result) {
@@ -133,22 +153,20 @@ napi_status CreateExternalUtf8Bytes(napi_env env,
     return napi_create_typedarray(
         env, napi_uint8_array, 0, arraybuffer, 0, result);
   }
+  const size_t size = owner->size();
   napi_value arraybuffer = nullptr;
-  napi_status status = napi_create_external_arraybuffer(
+  napi_status status = CreateOwnedArrayBuffer(
       env,
       owner->data(),
-      owner->size(),
-      [](napi_env, void*, void* hint) {
-        delete static_cast<std::string*>(hint);
+      size,
+      [](void*, size_t, void* deleter_data) {
+        delete static_cast<std::string*>(deleter_data);
       },
       owner,
       &arraybuffer);
-  if (status != napi_ok) {
-    delete owner;
-    return status;
-  }
+  if (status != napi_ok) return status;
   return napi_create_typedarray(
-      env, napi_uint8_array, owner->size(), arraybuffer, 0, result);
+      env, napi_uint8_array, size, arraybuffer, 0, result);
 }
 
 void DisposeProfilers(napi_agent__* agent) {
@@ -2068,15 +2086,8 @@ napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
 
   void* data = zero_fill ? std::calloc(length, 1) : std::malloc(length);
   if (data == nullptr) return napi_generic_failure;
-  napi_status status = napi_create_external_arraybuffer(
-      env,
-      data,
-      length,
-      [](napi_env, void* bytes, void*) { std::free(bytes); },
-      nullptr,
-      result);
-  if (status != napi_ok) std::free(data);
-  return status;
+  return CreateOwnedArrayBuffer(
+      env, data, length, [](void* bytes, size_t, void*) { std::free(bytes); }, nullptr, result);
 }
 
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {

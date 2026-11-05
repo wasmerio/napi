@@ -51,12 +51,18 @@ inline v8::Local<v8::Value> V8LocalValueFromJsValue(napi_value value) {
   return local;
 }
 
+// Frees an external backing store's memory. Runs in V8's deleter, on any
+// thread, so it must not use V8 or an env.
+typedef void (*napi_v8_external_free_callback)(void* data, void* hint);
+
 // An external backing store's finalizer, claimed by the store's deleter and
-// waiting to run on the env's thread.
+// waiting to run on the env's thread. The teardown also claims stores' free
+// callbacks: `free_cb` is set instead of `cb` for those.
 struct napi_external_finalizer__ {
   node_api_basic_finalize cb = nullptr;
   void* data = nullptr;
   void* hint = nullptr;
+  napi_v8_external_free_callback free_cb = nullptr;
 };
 
 struct napi_callback_info__ {
@@ -226,5 +232,18 @@ void napi_v8_set_last_exception(
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_finalize_buffer_records(napi_env env);
+
+// napi_create_external_arraybuffer and napi_create_external_buffer for memory
+// that only needs freeing. `free_cb` runs in the backing store's deleter,
+// wherever V8 frees it, so the memory comes back as V8 collects; a user
+// finalizer instead waits for the env's thread. A store still alive at the
+// env's release is freed then, and not again. Ownership of `free_hint`
+// passes only on success.
+napi_status napi_v8_create_external_arraybuffer_with_free(
+    napi_env env, void* data, size_t byte_length, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result);
+napi_status napi_v8_create_external_buffer_with_free(
+    napi_env env, size_t length, void* data, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result);
 
 #endif  // NAPI_V8_ENV_H_

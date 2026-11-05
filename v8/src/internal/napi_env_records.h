@@ -65,6 +65,9 @@ struct napi_external_backing_store_hint__ {
   void* external_data = nullptr;
   node_api_basic_finalize finalize_cb = nullptr;
   void* finalize_hint = nullptr;
+  // Set instead of `finalize_cb` for memory that only needs freeing
+  // (napi_v8_external_free_callback); it gets `finalize_hint`.
+  void (*free_cb)(void* data, void* hint) = nullptr;
 };
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 

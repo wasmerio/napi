@@ -224,6 +224,10 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
     napi_buffer_record* owned_record = TakeBufferRecord(env, record);
     if (owned_record == nullptr) return;
     owned_record->holder.Reset();
+    // Nothing reads the store once the Buffer is gone, and holding it until
+    // the drain would keep its memory until then. Freeing it here, if this
+    // is the last reference, uses no V8, so it is safe in a GC callback.
+    owned_record->backing_store.reset();
     env->EnqueueBufferFinalizer(owned_record);
   } else {
     record->holder.Reset();
@@ -283,19 +287,22 @@ std::vector<napi_external_finalizer__> TakeExternalFinalizers(napi_env env) {
 // V8 calls this wherever the last reference to the backing store drops: on
 // one of its own threads, during a GC, or inside a detach or transfer while
 // another realm is entered. None of those may run the finalizer, so, as Node
-// does, this only claims it and hands it to the env's thread.
+// does, this only claims it and hands it to the env's thread. A free
+// callback needs no env, so it runs here and the memory comes back now.
 void ExternalBackingStoreDeleter(void* data,
                                  size_t /*length*/,
                                  void* deleter_data) {
   auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
   if (hint == nullptr) return;
+  if (hint->external_data != nullptr) data = hint->external_data;
+  napi_v8_external_free_callback free_cb = nullptr;
   napi_env post_to = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue = nullptr;
   void* target = nullptr;
   {
     // Reads the env and unlinks in one critical section: the env's teardown
     // clears the pointer under the same lock. A cleared pointer means the
-    // teardown has claimed the finalizer, and maybe run it, already.
+    // teardown has claimed the callback, and maybe run it, already.
     std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
     napi_env env = hint->env;
     if (env != nullptr) {
@@ -303,17 +310,16 @@ void ExternalBackingStoreDeleter(void* data,
           record_release(env, hint);
       env->external_backing_store_hints.erase(hint);
       hint->env = nullptr;
+      free_cb = hint->free_cb;
       if (hint->finalize_cb != nullptr &&
-          QueueExternalFinalizer(
-              env, {hint->finalize_cb,
-                    hint->external_data != nullptr ? hint->external_data : data,
-                    hint->finalize_hint})) {
+          QueueExternalFinalizer(env, {hint->finalize_cb, data, hint->finalize_hint})) {
         post_to = env;
         enqueue = env->agent->enqueue_foreground_task_callback;
         target = env->agent->enqueue_foreground_task_target;
       }
     }
   }
+  if (free_cb != nullptr) free_cb(data, hint->finalize_hint);
   delete hint;
   if (post_to != nullptr) PostExternalFinalizerDrain(post_to, enqueue, target);
 }
@@ -321,8 +327,9 @@ void ExternalBackingStoreDeleter(void* data,
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  // Claims, under the lock, the finalizers deleters queued and those of the
-  // backing stores still alive, then runs them outside it. A backing store
+  // Claims, under the lock, the finalizers deleters queued and the finalizers
+  // and free callbacks of the backing stores still alive, then runs them
+  // outside it. A backing store
   // can outlive the env, so each live hint is unlinked from the dying env
   // rather than deleted here — its deleter frees it later and, seeing a null
   // env, skips the env-side bookkeeping. The hints are not touched after the
@@ -344,15 +351,21 @@ void FinalizeExternalBackingStoreHints(napi_env env) {
         v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
             record_release(env, hint);
         hint->env = nullptr;
-        if (hint->finalize_cb != nullptr) {
-          pending.push_back({hint->finalize_cb, hint->external_data, hint->finalize_hint});
+        if (hint->finalize_cb != nullptr || hint->free_cb != nullptr) {
+          pending.push_back({hint->finalize_cb, hint->external_data, hint->finalize_hint,
+                             hint->free_cb});
           hint->finalize_cb = nullptr;
+          hint->free_cb = nullptr;
         }
       }
     }
 
     for (const auto& finalizer : pending) {
-      env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+      if (finalizer.free_cb != nullptr) {
+        finalizer.free_cb(finalizer.data, finalizer.hint);
+      } else {
+        env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+      }
     }
   }
 }
@@ -622,6 +635,92 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   (void)HandleCallbackException(env);
 }
 
+// A backing store over external memory. Its deleter hands `finalize_cb` to
+// the env's thread, or runs `free_cb` itself; at most one is set.
+std::unique_ptr<v8::BackingStore> NewExternalBackingStore(napi_env env,
+                                                          void* data,
+                                                          size_t length,
+                                                          node_api_basic_finalize finalize_cb,
+                                                          napi_v8_external_free_callback free_cb,
+                                                          void* finalize_hint) {
+  auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
+  hint->external_data = data;
+  hint->finalize_cb = finalize_cb;
+  hint->finalize_hint = finalize_hint;
+  hint->free_cb = free_cb;
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter, hint.get());
+  if (!backing) return nullptr;
+  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+      record_create(env, hint.get());
+  {
+    // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    env->external_backing_store_hints.insert(hint.release());
+  }
+  return backing;
+}
+
+napi_status CreateExternalArrayBuffer(napi_env env,
+                                      void* external_data,
+                                      size_t byte_length,
+                                      node_api_basic_finalize finalize_cb,
+                                      napi_v8_external_free_callback free_cb,
+                                      void* finalize_hint,
+                                      napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+
+  v8::Local<v8::ArrayBuffer> out;
+  if (external_data == nullptr && byte_length == 0) {
+    out = v8::ArrayBuffer::New(env->isolate, 0);
+    out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
+  } else {
+    if (external_data == nullptr) return napi_invalid_arg;
+    std::unique_ptr<v8::BackingStore> backing = NewExternalBackingStore(
+        env, external_data, byte_length, finalize_cb, free_cb, finalize_hint);
+    if (!backing) return napi_generic_failure;
+    out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
+  }
+
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status CreateExternalBuffer(napi_env env,
+                                 size_t length,
+                                 void* data,
+                                 node_api_basic_finalize finalize_cb,
+                                 napi_v8_external_free_callback free_cb,
+                                 void* finalize_hint,
+                                 napi_value* result) {
+  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  // Before the backing store: a failure after it would run the callback,
+  // whose data the caller still owns then.
+  auto* record = env->allocate<napi_buffer_record__>(env);
+  if (record == nullptr) return napi_generic_failure;
+  record->backing_store =
+      NewExternalBackingStore(env, data, length, finalize_cb, free_cb, finalize_hint);
+  if (!record->backing_store) {
+    env->release(record);
+    return napi_generic_failure;
+  }
+
+  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
+  record->holder.Reset(env->isolate, buffer_obj);
+  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
+  buffer_obj
+      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
+      .FromJust();
+  env->buffer_records.push_back(record);
+
+  *result = napi_v8_wrap_value(env, buffer_obj);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
 }  // namespace
 
 void napi_v8_set_last_exception(napi_env env,
@@ -692,8 +791,8 @@ void napi_env__::DrainFinalizerQueue() {
     for (const auto& finalizer : external) {
       CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
     }
-    // Releasing a buffer record above can free its backing store, which
-    // queues the store's finalizer.
+    // A finalizer above can free a backing store, which queues the store's
+    // finalizer.
     external = TakeExternalFinalizers(this);
   }
 }
@@ -852,6 +951,20 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
 
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value) {
   return V8LocalValueFromJsValue(value);
+}
+
+napi_status napi_v8_create_external_arraybuffer_with_free(
+    napi_env env, void* data, size_t byte_length, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result) {
+  if (free_cb == nullptr) return napi_invalid_arg;
+  return CreateExternalArrayBuffer(env, data, byte_length, nullptr, free_cb, free_hint, result);
+}
+
+napi_status napi_v8_create_external_buffer_with_free(
+    napi_env env, size_t length, void* data, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result) {
+  if (free_cb == nullptr) return napi_invalid_arg;
+  return CreateExternalBuffer(env, length, data, nullptr, free_cb, free_hint, result);
 }
 
 void napi_v8_finalize_buffer_records(napi_env env) {
@@ -1060,36 +1173,8 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     node_api_basic_finalize finalize_cb,
     void* finalize_hint,
     napi_value* result) {
-  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-
-  v8::Local<v8::ArrayBuffer> out;
-  if (external_data == nullptr && byte_length == 0) {
-    out = v8::ArrayBuffer::New(env->isolate, 0);
-    out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
-  } else {
-    if (external_data == nullptr) return napi_invalid_arg;
-    auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
-    hint->external_data = external_data;
-    hint->finalize_cb = finalize_cb;
-    hint->finalize_hint = finalize_hint;
-    auto* hint_ptr = hint.get();
-    std::unique_ptr<v8::BackingStore> backing = v8::ArrayBuffer::NewBackingStore(
-        external_data, byte_length, ExternalBackingStoreDeleter, hint_ptr);
-    if (!backing) {
-      return napi_generic_failure;
-    }
-    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-        record_create(env, hint.get());
-    {
-      // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
-      std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
-      env->external_backing_store_hints.insert(hint.release());
-    }
-    out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
-  }
-
-  *result = napi_v8_wrap_value(env, out);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return CreateExternalArrayBuffer(
+      env, external_data, byte_length, finalize_cb, nullptr, finalize_hint, result);
 }
 
 napi_status NAPI_CDECL napi_is_typedarray(napi_env env, napi_value value, bool* result) {
@@ -3310,45 +3395,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
                                                    node_api_basic_finalize finalize_cb,
                                                    void* finalize_hint,
                                                    napi_value* result) {
-  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Context> context = env->context();
-  v8::Context::Scope context_scope(context);
-
-  auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
-  hint->external_data = data;
-  hint->finalize_cb = finalize_cb;
-  hint->finalize_hint = finalize_hint;
-  auto* hint_ptr = hint.get();
-
-  std::unique_ptr<v8::BackingStore> backing =
-      v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter,
-                                       hint_ptr);
-  if (!backing) {
-    return napi_generic_failure;
-  }
-  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-      record_create(env, hint.get());
-  {
-    // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
-    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
-    env->external_backing_store_hints.insert(hint.release());
-  }
-
-  auto* record = env->allocate<napi_buffer_record__>(env);
-  if (record == nullptr) return napi_generic_failure;
-  record->backing_store = std::move(backing);
-
-  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
-  record->holder.Reset(env->isolate, buffer_obj);
-  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
-  buffer_obj
-      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
-      .FromJust();
-  env->buffer_records.push_back(record);
-
-  *result = napi_v8_wrap_value(env, buffer_obj);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return CreateExternalBuffer(env, length, data, finalize_cb, nullptr, finalize_hint, result);
 }
 
 napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {

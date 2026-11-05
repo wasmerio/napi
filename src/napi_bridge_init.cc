@@ -1705,6 +1705,13 @@ extern "C" __attribute__((weak)) void napi_host_guest_heap_buffer_finalize(
     void* /*data*/, void* /*hint*/) {}
 
 namespace {
+// Runs in V8's backing-store deleter, on whatever thread frees the store, so
+// the guest heap gets the memory back as V8 collects; GuestHeap takes its
+// own lock.
+void GuestHeapBufferFree(void* data, void* hint) {
+  napi_host_guest_heap_buffer_finalize(data, hint);
+}
+
 void GuestHeapBufferFinalizeTrampoline(node_api_basic_env /*env*/, void* data,
                                        void* hint) {
   napi_host_guest_heap_buffer_finalize(data, hint);
@@ -1726,10 +1733,9 @@ namespace {
 // which fire on the *deferred* finalizer drain: their RefBase weak callbacks
 // enqueue into pending_finalizers, drained from the guest's
 // process-microtasks import call where an active callback ctx lets us re-enter
-// the guest. (External array buffers/buffers deliberately do NOT use V8's
-// backing-store deleter for the guest finalizer — those run synchronously in
-// GC, with no way back into the guest — they attach via napi_add_finalizer
-// instead.) Allocated on registration, freed exactly once when it fires.
+// the guest. (External array buffers/buffers attach the guest finalizer the
+// same way, with napi_add_finalizer, rather than as the backing store's own
+// finalizer.) Allocated on registration, freed exactly once when it fires.
 struct GuestFinalizerRecord {
   SnapiEnvState* state;
   uint32_t guest_env;
@@ -1865,9 +1871,8 @@ extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
   napi_value result;
-  napi_status s = napi_create_external_arraybuffer(
-      env, data, (size_t)byte_length, GuestHeapBufferFinalizeTrampoline,
-      finalize_hint, &result);
+  napi_status s = napi_v8_create_external_arraybuffer_with_free(
+      env, data, (size_t)byte_length, GuestHeapBufferFree, finalize_hint, &result);
   if (s != napi_ok) return s;
   if (backing_store_token_out) {
     *backing_store_token_out = napi_v8_get_arraybuffer_backing_store_token(env, result);
@@ -1885,9 +1890,8 @@ extern "C" int snapi_bridge_create_external_buffer_finalized(
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
   napi_value result;
-  napi_status s = napi_create_external_buffer(
-      env, (size_t)byte_length, data, GuestHeapBufferFinalizeTrampoline,
-      finalize_hint, &result);
+  napi_status s = napi_v8_create_external_buffer_with_free(
+      env, (size_t)byte_length, data, GuestHeapBufferFree, finalize_hint, &result);
   if (s != napi_ok) return s;
   if (backing_store_token_out) {
     *backing_store_token_out = napi_v8_get_arraybuffer_view_backing_store_token(env, result);
