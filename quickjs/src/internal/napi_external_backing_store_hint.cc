@@ -70,10 +70,19 @@ void napi_external_backing_store_hint__::invoke_finalizer()
     finalize_cb_(env_, external_data_, finalize_hint_);
     return;
   }
+  // Teardown has run every finalizer it could, and the context may be gone
+  // (the runtime frees what is still alive): no user code runs now.
+  if (env_->finalizers_done())
+    return;
   // Finalizers run in the env's own realm, also when the collector runs
   // inside another realm.
   napi_realm_frame_scope__ realm_frame{env_, nullptr, JS_UNDEFINED};
   finalize_cb_(env_, external_data_, finalize_hint_);
+}
+
+bool napi_external_backing_store_hint__::finalizer_pending() const
+{
+  return !finalize_invoked_ && finalize_cb_ != nullptr;
 }
 
 napi_env napi_external_backing_store_hint__::env() const

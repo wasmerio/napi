@@ -123,7 +123,6 @@ napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_a
 napi_env__::~napi_env__()
 {
   prepare_teardown();
-  finalize_instance_data();
 }
 
 void napi_env__::prepare_teardown()
@@ -149,6 +148,13 @@ void napi_env__::prepare_teardown()
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
+  // As in Node, the finalizers of values still alive run next, then the
+  // instance data's. They run while the context and runtime are alive and
+  // the root scope is open, so they can use N-API; what they make is freed
+  // below.
+  finalize_external_values();
+  finalize_instance_data();
+  finalizers_done_ = true;
   cleanup_hooks_.close();
   deferreds_.close();
 
@@ -186,6 +192,9 @@ void napi_env__::prepare_teardown()
     detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
   runtime_interrupts_ = nullptr;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
+  // The context is freed after this. Without it every N-API call on the env
+  // fails with napi_invalid_arg instead of touching freed memory.
+  context_ = nullptr;
   torn_down_ = true;
 }
 
@@ -195,6 +204,30 @@ void napi_env__::clear_refs_for_teardown()
   for (napi_ref__ &ref : refs_)
     ref.clear_for_teardown();
   clearing_refs_for_teardown_ = false;
+}
+
+void napi_env__::finalize_external_values()
+{
+  // Externals, wraps, napi_add_finalizer and external buffers each hold a
+  // hint. A finalizer may make or free values, which changes the hints, so
+  // look again from the start after one did.
+  bool changed = true;
+  while (changed)
+  {
+    changed = false;
+    for (napi_external_backing_store_hint__ &hint : external_backing_stores_)
+    {
+      if (!hint.finalizer_pending())
+        continue;
+      const uint64_t changes = external_backing_store_changes_;
+      hint.invoke_finalizer();
+      if (changes != external_backing_store_changes_)
+      {
+        changed = true;
+        break;
+      }
+    }
+  }
 }
 
 void napi_env__::finalize_instance_data()
@@ -216,9 +249,7 @@ void napi_env__::call_instance_data_finalizer(void *data,
 {
   if (data == nullptr || finalize_cb == nullptr)
     return;
-  // In the env's realm, as any finalizer. At release this runs after the
-  // runtime is freed; the realms are gone by then, so no scope it opens holds
-  // an anchor and popping the frame touches nothing.
+  // In the env's realm, as any finalizer.
   napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
   finalize_cb(this, data, finalize_hint);
 }
@@ -226,6 +257,11 @@ void napi_env__::call_instance_data_finalizer(void *data,
 bool napi_env__::is_closing() const
 {
   return closing_;
+}
+
+bool napi_env__::finalizers_done() const
+{
+  return finalizers_done_;
 }
 
 napi_agent__ *napi_env__::agent() const
@@ -290,8 +326,7 @@ void napi_env__::pop_realm_frames(size_t depth)
   {
     napi_realm_frame__ frame = realm_frames_.back();
     realm_frames_.pop_back();
-    // A scope of the env's own realm holds no anchor, and may close after
-    // the runtime is freed (in the instance-data finalizer).
+    // A scope of the env's own realm holds no anchor.
     if (frame.scope != 0 && JS_VALUE_HAS_REF_COUNT(frame.anchor))
       JS_FreeValue(context_, frame.anchor);
   }
@@ -608,11 +643,16 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
 {
   if (context_ == nullptr)
     return nullptr;
-  return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+  napi_external_backing_store_hint__ *hint =
+      external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+  if (hint != nullptr)
+    ++external_backing_store_changes_;
+  return hint;
 }
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
 {
+  ++external_backing_store_changes_;
   external_backing_stores_.destroy(hint);
 }
 

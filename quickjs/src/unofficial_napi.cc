@@ -67,6 +67,8 @@ namespace
         napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)
         {
+            // Runs every finalizer, the instance data's last, while the
+            // context and runtime are alive.
             env_to_delete = scope->env;
             status = DestroyEnvInstance(scope->env);
             scope->env = nullptr;
@@ -81,10 +83,8 @@ namespace
             JS_FreeRuntime(scope->rt);
             scope->rt = nullptr;
         }
-        if (env_to_delete != nullptr)
-        {
-            env_to_delete->finalize_instance_data();
-        }
+        // Deleted last: freeing the runtime returns the hints of the values
+        // still alive to the env.
         delete env_to_delete;
         delete scope;
         return status;

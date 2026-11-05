@@ -28,6 +28,8 @@ struct napi_external_backing_store_hint__
   napi_external_backing_store_hint__ &operator=(napi_external_backing_store_hint__ &&other) = delete;
 
   void invoke_finalizer();
+  // Whether invoke_finalizer would still call a finalizer.
+  bool finalizer_pending() const;
   napi_env env() const;
   JSRuntime *runtime() const;
   void *external_data() const;

@@ -51,10 +51,15 @@ struct napi_env__
   napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version);
   ~napi_env__();
 
+  // Runs the cleanup hooks, then every pending finalizer and the
+  // instance-data finalizer last, while the context is alive, and lets go of
+  // the context. N-API calls on the env fail from then on.
   void prepare_teardown();
-  void finalize_instance_data();
   // Native callbacks are refused once teardown has started.
   bool is_closing() const;
+  // True once teardown has run the finalizers. A finalizer that would run
+  // later, as the runtime frees what was still alive, is dropped.
+  bool finalizers_done() const;
 
   napi_agent__ *agent() const;
   // Makes this env own its agent (an env made from an embedder's context).
@@ -168,6 +173,8 @@ struct napi_env__
 
 private:
   void clear_refs_for_teardown();
+  void finalize_external_values();
+  void finalize_instance_data();
   void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);
 
   // Set only when this env owns its agent; destroyed last.
@@ -205,6 +212,8 @@ private:
   napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
   napi_allocator__<napi_deferred__, napi_env__> deferreds_;
   napi_allocator__<napi_external_backing_store_hint__, napi_env__> external_backing_stores_;
+  // Counts hints made and destroyed, so teardown sees a finalizer change them.
+  uint64_t external_backing_store_changes_ = 0;
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
   // Periodic lifetime dump scheduling.
@@ -220,6 +229,7 @@ private:
 
   // Env teardown state.
   bool closing_ = false;
+  bool finalizers_done_ = false;
   bool torn_down_ = false;
   bool clearing_refs_for_teardown_ = false;
 };
