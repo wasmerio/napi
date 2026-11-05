@@ -112,21 +112,76 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
   run their callbacks in the realm that made them, the embedder keeps a
   reference to the global `napi_get_global` returns when they are made, and
   enters `get_realm` of that global around each callback.
-- **Changed from `main`:**
-  - `unofficial_napi_contextify_make_context` is replaced by `create_realm`.
-  - `unofficial_napi_contextify_run_script` and
-    `unofficial_napi_contextify_compile_function` become `run_script` and
-    `compile_function`. They take a realm instead of a sandbox or parsing
-    context.
-  - The module options' `context_or_undefined` becomes `realm_or_null`.
-  - The context-token hooks are gone (env hooks are version 2).
+- **Changed from `main`:** the realm API replaces the contextify calls, the
+  module options' `context_or_undefined` and the context-token hooks. They
+  still work, deprecated, on top of realms: see
+  [Deprecated compatibility API](#deprecated-compatibility-api).
 - **Guest ABI:** a realm id is the value id of the realm's global or sandbox,
   and 0 is the env's realm. The bridge keeps no realm table: it resolves the
   id again with `get_realm` on each call, so the id lives exactly as long as
-  its value id. Version 1 structs are rejected and the old imports are gone.
-  The scope imports are `unofficial_napi_enter_realm(env, realm_id,
-  scope_out_ptr) -> status` and `unofficial_napi_leave_realm(env, scope: i64)
-  -> status`; the token is the provider's, passed through as a u64.
+  its value id. The scope imports are `unofficial_napi_enter_realm(env,
+  realm_id, scope_out_ptr) -> status` and `unofficial_napi_leave_realm(env,
+  scope: i64) -> status`; the token is the provider's, passed through as a
+  u64.
+
+## Deprecated compatibility API
+
+Code written against `main`, EdgeJS's included, builds and runs unchanged,
+from source or as a binary. The API it uses is marked deprecated in
+`unofficial_napi.h` (`UNOFFICIAL_NAPI_DEPRECATED`; define
+`UNOFFICIAL_NAPI_NO_DEPRECATION_WARNINGS` to silence it) and is removed in a
+future major release. It is a thin layer over realms, the same for V8 and
+QuickJS (`lib/src/napi_compat.cc`), so contextified objects and realms mix:
+`get_realm` finds the realm of a contextified object, and the deprecated
+calls take a realm's global or sandbox.
+
+| Deprecated | Use instead | How it maps |
+|---|---|---|
+| `unofficial_napi_contextify_make_context` | `create_realm` | An object or function sandbox becomes `sandbox_or_null`; a symbol (`vm.constants.DONT_CONTEXTIFY`) makes a fresh global. The other arguments become the realm options of the same names. Returns the realm's global: the sandbox, or the fresh global. |
+| `unofficial_napi_contextify_run_script` | `run_script` | The sandbox names the realm, as below. |
+| `unofficial_napi_contextify_compile_function` | `compile_function` | The parsing context names the realm, as below. |
+| Bytecode-open options version 1 | Version 2, `realm_or_null` | Compiles for the current realm. |
+| Module-create options version 1, and `context_or_undefined` in version 2 | Version 2, `realm_or_null` | The context names the realm, as below. |
+| The env hooks' `context_token_assign_callback` and `context_token_unassign_callback` | Per-realm state keyed by the realm's global | Tokens on realms, as below. |
+
+- **A context argument** (sandbox, parsing context, `context_or_undefined`)
+  is a contextified object, naming its realm, the env's own global, naming
+  the env's realm, or nothing. Anything else fails with `napi_invalid_arg`.
+- **Nothing** (NULL, `undefined` or `null`) means what the env's context
+  meant on `main`: the current realm. That is the env's own realm unless the
+  embedder enters a realm or a native function of another realm is running.
+  Version 2 of the module options is the exception: there nothing means the
+  env's realm, as a NULL `realm_or_null` does. The realm API's NULL is
+  always the env's realm.
+- **Structs grow at the end.** Version 1 of the bytecode-open and
+  module-create options keeps `main`'s layout, and version 2 appends
+  `realm_or_null`. A provider reads a version 1 struct only up to
+  `UNOFFICIAL_NAPI_*_V1_SIZE`. A version 2 module struct sets
+  `realm_or_null` or the deprecated `context_or_undefined`, not both
+  (`napi_invalid_arg`). The env hooks are version 1 again, `main`'s layout.
+- **Context tokens.** V8 accepts the token callbacks, as on `main`. A realm's
+  token is its record, which outlives the assignment. V8 assigns it when
+  `create_realm` (and so `make_context`) makes the realm, and unassigns it
+  once: when it frees the record of the collected realm (in the next
+  `create_realm` or in `collect_garbage`), or, for a realm still alive, at
+  env release before the cleanup hooks run (and after them for realms they
+  made). Realms made before the hooks were attached get no token. Both
+  hooks run in the env's realm. On `main` a context lived until release, so
+  tokens were only unassigned then. QuickJS does not accept the hooks and
+  never calls them, as on `main`.
+- **Statuses are `main`'s V8 ones.** `main`'s QuickJS differed: it took a
+  NULL `name`, refused a symbol sandbox, returned an already contextified
+  sandbox again, compiled in the env's context for a parsing context that
+  was not contextified, and ignored `context_or_undefined`. It now behaves
+  as V8 does.
+- **Guest ABI.** The wasm32 layouts of version 1 are `main`'s, and version 2
+  appends a u32 realm id. The guest imports
+  `unofficial_napi_contextify_make_context`, `…_run_script` and
+  `…_compile_function` keep `main`'s names and signatures, on the bridge's
+  realm calls. A sandbox id is the value id of a realm's global or sandbox,
+  as on `main`, and 0 is the current realm. With a host-JS native Worker
+  realm (#125), `make_context` fails as `create_realm` does, and
+  `run_script` with id 0 goes to `evaluate()`.
 
 ## How the current realm works
 
@@ -222,3 +277,6 @@ and interrupt callbacks push the env's realm.
   one realm per document, and its bindings must create objects in the
   document's realm and run there. Native code now acts in a current realm,
   with ECMAScript's rules.
+- **The deprecated API** came back on top of realms, with its structs grown
+  at the end instead of changed in place, so that code built against `main`
+  keeps working until a major release removes it.
