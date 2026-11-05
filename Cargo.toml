@@ -20,16 +20,21 @@ js = [
   "dep:wasm-bindgen-futures",
   "wasmer/experimental-async",
   "wasmer/js-default",
+  "wasixv2-exec?/js",
 ]
-# Implements the legacy WASIX runtime's instantiation hook.
-wasix = ["dep:wasmer-wasix"]
+# Implements the WASIX v2 runtime's per-instance hook.
+wasix = ["experimental-async", "dep:wasixv2-exec", "dep:wasixv2-host", "dep:wasixv2-syscalls"]
 cli = [
   "wasix",
   "dep:wasmer-cache",
   "dep:wasmer-c-api-imports",
-  "wasmer-c-api-imports/wasi",
+  "wasmer-c-api-imports/wasixv2",
   "dep:tokio",
-  "dep:virtual-fs",
+  "tokio/signal",
+  "dep:wasixv2",
+  "wasixv2/terminal",
+  "dep:wasixv2-dylink",
+  "wasixv2-host/tokio",
   "dep:wasmer-types",
 ]
 
@@ -43,8 +48,12 @@ wasmer = { version = "=7.5.0", path = "../api", default-features = false }
 wasmer-cache = { version = "=7.5.0", path = "../cache", optional = true }
 wasmer-c-api-imports = { version = "=7.5.0", path = "../c-api-imports", optional = true, default-features = false }
 wasmer-types = { version = "=7.5.0", path = "../types", optional = true }
-virtual-fs = { version = "=0.705.0", path = "../virtual-fs", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+wasixv2 = { path = "../wasix/api", optional = true }
+wasixv2-dylink = { path = "../wasix/dylink", default-features = false, features = ["sys"], optional = true }
+wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true }
+wasixv2-host = { workspace = true, optional = true }
+wasixv2-syscalls = { workspace = true, optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
 
@@ -52,16 +61,11 @@ offset-allocator = "0.2.0"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix-legacy", default-features = false, features = [
-  "js",
-] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true, features = ["sys"] }
 wasmer = { version = "=7.5.0", path = "../api", default-features = false, features = [
   "sys-default",
-] }
-wasmer-wasix = { optional = true, version = "=0.705.0", path = "../wasix-legacy", default-features = false, features = [
-  "sys",
 ] }
 
 [build-dependencies]
@@ -76,7 +80,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wat = "1"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wasixv2 = { path = "../wasix/api" }
+wasixv2-host = { workspace = true, features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasixv2 = { path = "../wasix/api", default-features = false, features = ["js", "web", "wasix1"] }
+wasixv2-host = { workspace = true, features = ["web"] }
 wasm-bindgen-test = "0.3.70"
 
 [package.metadata.docs.rs]

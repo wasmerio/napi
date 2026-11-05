@@ -248,6 +248,10 @@ const PINNED_STACK_OBJECT_SHA256: &str =
 const STACK_SCANNER_SYMBOL: &str =
     "_ZNK4heap4base5Stack26IteratePointersUntilMarkerEPNS0_12StackVisitorE";
 const ORIGINAL_STACK_SCANNER_SYMBOL: &str = "snapi_original_v8_stack_iterate_pointers_until_marker";
+const PINNED_PLATFORM_OBJECT_SHA256: &str =
+    "20fe10400d298b3b2dd5953a59a1523f8e3f3ff26d57512cc572ba225275242e";
+const PINNED_STACK_GUARD_OBJECT_SHA256: &str =
+    "808afcaaf805b5f71cf7f6b259ac414ac60622296efa2f65251ae6d27180ac1f";
 
 fn sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -260,45 +264,99 @@ fn sha256(bytes: &[u8]) -> String {
     hex
 }
 
-// The pinned archive uses GNU ar. Preserve every data member byte-for-byte;
-// only its symbol index and the one audited stack.o member may change.
-fn archive_members(bytes: &[u8]) -> Result<Vec<(&str, &[u8])>, String> {
+// GNU ar permits duplicate names. Ordinals include the long-name table but
+// exclude only the rebuilt symbol index; preserve every other raw record.
+struct ArchiveMember<'a> {
+    name: &'a str,
+    header: &'a [u8],
+    data: &'a [u8],
+    record: &'a [u8],
+}
+
+fn archive_members(bytes: &[u8]) -> Result<Vec<ArchiveMember<'_>>, String> {
     if !bytes.starts_with(b"!<arch>\n") {
         return Err("pinned V8 must be an ordinary GNU archive".into());
     }
     let mut position = 8usize;
     let mut members = Vec::new();
+    let mut indexes = 0usize;
     while position < bytes.len() {
+        let start = position.checked_add(60).ok_or("archive offset overflow")?;
         let header = bytes
-            .get(position..position + 60)
+            .get(position..start)
             .ok_or("truncated V8 archive member")?;
         if &header[58..60] != b"`\n" {
             return Err("invalid V8 archive member header".into());
         }
         let name = std::str::from_utf8(&header[..16])
             .map_err(|_| "invalid archive member name")?
-            .trim_end();
-        let size: usize = std::str::from_utf8(&header[48..58])
+            .trim_end_matches(' ');
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err("invalid GNU archive member name".into());
+        }
+        let symbol_index = name == "/" || name == "/SYM64/";
+        let long_name = name.strip_prefix('/').is_some_and(|offset| {
+            !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        if !symbol_index
+            && name != "//"
+            && !long_name
+            && (name.starts_with('/') || name.starts_with("#1/") || !name.ends_with('/'))
+        {
+            return Err("unsupported GNU archive member name".into());
+        }
+        let size = std::str::from_utf8(&header[48..58])
             .map_err(|_| "invalid archive member length")?
-            .trim()
-            .parse()
-            .map_err(|_| "invalid archive member length")?;
-        let start = position.checked_add(60).ok_or("archive offset overflow")?;
+            .trim_matches(' ');
+        if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid archive member length".into());
+        }
+        let size: usize = size.parse().map_err(|_| "invalid archive member length")?;
         let end = start.checked_add(size).ok_or("archive member overflow")?;
+        let padded_end = end
+            .checked_add(size % 2)
+            .ok_or("archive padding overflow")?;
         let data = bytes
             .get(start..end)
             .ok_or("truncated archive member data")?;
-        if name != "/" && name != "/SYM64/" {
-            members.push((name, data));
+        let record = bytes
+            .get(position..padded_end)
+            .ok_or("truncated archive member padding")?;
+        if symbol_index {
+            indexes += 1;
+            if indexes != 1 || position != 8 {
+                return Err("unsupported GNU archive symbol index shape".into());
+            }
+        } else {
+            members.push(ArchiveMember {
+                name,
+                header,
+                data,
+                record,
+            });
         }
-        position = end
-            .checked_add(size % 2)
-            .ok_or("archive padding overflow")?;
+        position = padded_end;
     }
-    if position != bytes.len() {
-        return Err("invalid V8 archive padding".into());
+    if indexes != 1 {
+        return Err("indexed GNU archive required".into());
     }
     Ok(members)
+}
+
+fn replace_archive_record(member: &ArchiveMember<'_>, data: &[u8]) -> Result<Vec<u8>, String> {
+    let size = data.len().to_string();
+    if size.len() > 10 {
+        return Err("adapted archive member exceeds ten-column size field".into());
+    }
+    let mut header = member.header.to_vec();
+    header[48..58].fill(b' ');
+    header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+    let mut record = header;
+    record.extend_from_slice(data);
+    if data.len() % 2 != 0 {
+        record.push(b'\n');
+    }
+    Ok(record)
 }
 
 fn tool_output(command: &mut std::process::Command) -> Result<Vec<u8>, String> {
@@ -320,75 +378,126 @@ fn adapt_pinned_v8_archive(source: &Path, build: &cc::Build) -> Result<PathBuf, 
         return Err("V8 coroutine stack support requires re-audit of this archive".into());
     }
     let before = archive_members(&source_bytes)?;
-    let stack_members: Vec<_> = before
-        .iter()
-        .filter(|(name, _)| *name == "stack.o/")
-        .collect();
-    if stack_members.len() != 1 || sha256(stack_members[0].1) != PINNED_STACK_OBJECT_SHA256 {
-        return Err("audited V8 stack.o member is missing or changed".into());
-    }
+    // Each original machine-code object contains exactly one definition and
+    // no local relocation to the symbol being renamed. Other members retain
+    // their upstream references, which resolve to the physical-context adapter.
+    let adaptations: &[(usize, &str, &str, &[(&str, &str)])] = &[
+        (
+            803,
+            "stack.o/",
+            PINNED_STACK_OBJECT_SHA256,
+            &[(STACK_SCANNER_SYMBOL, ORIGINAL_STACK_SCANNER_SYMBOL)],
+        ),
+        (
+            26,
+            "platform.o/",
+            PINNED_PLATFORM_OBJECT_SHA256,
+            &[
+                (
+                    "_ZN2v84base5Stack13GetStackStartEv",
+                    "snapi_original_v8_get_stack_start",
+                ),
+                (
+                    "_ZN2v84base5Stack22GetStackStartUncheckedEv",
+                    "snapi_original_v8_get_stack_start_unchecked",
+                ),
+            ],
+        ),
+        (
+            184,
+            "stack-guard.o/",
+            PINNED_STACK_GUARD_OBJECT_SHA256,
+            &[(
+                "_ZN2v88internal10StackGuard10InitThreadERKNS0_15ExecutionAccessE",
+                "snapi_original_v8_stack_guard_init_thread",
+            )],
+        ),
+    ];
     let directory =
         PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?).join("v8-native-stack");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let original_object = directory.join("stack-original.o");
-    let adapted_object = directory.join("stack.o");
     let destination = directory.join("libv8_snapi_stack.a");
-    std::fs::write(&original_object, stack_members[0].1).map_err(|error| error.to_string())?;
-    std::fs::copy(source, &destination).map_err(|error| error.to_string())?;
-
     let objcopy = env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
-    tool_output(
-        std::process::Command::new(objcopy)
-            .arg("--redefine-sym")
-            .arg(format!(
-                "{STACK_SCANNER_SYMBOL}={ORIGINAL_STACK_SCANNER_SYMBOL}"
-            ))
-            .arg(&original_object)
-            .arg(&adapted_object),
-    )?;
-    // stack.o contains no relocation to its scanner symbol (including its
-    // inlined testing-only loop); all production references are other members.
     let nm = env::var_os("NM").unwrap_or_else(|| "nm".into());
-    let original_symbols = tool_output(std::process::Command::new(&nm).arg(&original_object))?;
-    let adapted_symbols = tool_output(std::process::Command::new(&nm).arg(&adapted_object))?;
-    let original_symbols =
-        String::from_utf8(original_symbols).map_err(|error| error.to_string())?;
-    let adapted_symbols = String::from_utf8(adapted_symbols).map_err(|error| error.to_string())?;
-    if original_symbols.matches(STACK_SCANNER_SYMBOL).count() != 1 {
-        return Err("unexpected scanner definition/reference in audited stack.o".into());
+    let mut adapted_members = Vec::new();
+    for &(ordinal, name, expected_hash, renames) in adaptations {
+        let member = before
+            .get(ordinal)
+            .ok_or("audited V8 member ordinal missing")?;
+        if member.name != name || sha256(member.data) != expected_hash {
+            return Err(format!(
+                "audited V8 member {ordinal} ({name}) is missing or changed"
+            ));
+        }
+        let filename = name
+            .strip_suffix('/')
+            .ok_or("invalid audited member name")?;
+        let original_object = directory.join(format!("original-{filename}"));
+        let adapted_object = directory.join(filename);
+        std::fs::write(&original_object, member.data).map_err(|error| error.to_string())?;
+        let mut transform = std::process::Command::new(&objcopy);
+        for &(original, adapted) in renames {
+            transform
+                .arg("--redefine-sym")
+                .arg(format!("{original}={adapted}"));
+        }
+        tool_output(transform.arg(&original_object).arg(&adapted_object))?;
+        let original_symbols = tool_output(std::process::Command::new(&nm).arg(&original_object))?;
+        let adapted_symbols = tool_output(std::process::Command::new(&nm).arg(&adapted_object))?;
+        let mut expected =
+            String::from_utf8(original_symbols).map_err(|error| error.to_string())?;
+        for &(original, adapted) in renames {
+            if expected.matches(original).count() != 1 {
+                return Err(format!(
+                    "unexpected definition/reference of {original} in {name}"
+                ));
+            }
+            expected = expected.replace(original, adapted);
+        }
+        let actual = String::from_utf8(adapted_symbols).map_err(|error| error.to_string())?;
+        // nm sorts by symbol name; compare after only the exact renames.
+        let mut expected: Vec<_> = expected.lines().collect();
+        let mut actual: Vec<_> = actual.lines().collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if expected != actual {
+            return Err(format!(
+                "V8 {name} transformation changed unrelated symbols"
+            ));
+        }
+        let bytes = std::fs::read(&adapted_object).map_err(|error| error.to_string())?;
+        adapted_members.push((ordinal, replace_archive_record(member, &bytes)?));
     }
-    // nm sorts by symbol name; compare sorted lines after the one exact rename.
-    let expected = original_symbols.replace(STACK_SCANNER_SYMBOL, ORIGINAL_STACK_SCANNER_SYMBOL);
-    let mut expected: Vec<_> = expected.lines().collect();
-    let mut actual: Vec<_> = adapted_symbols.lines().collect();
-    expected.sort_unstable();
-    actual.sort_unstable();
-    if expected != actual {
-        return Err("V8 scanner transformation changed unrelated symbols".into());
+    // Rebuild by ordered record, never ar r/name: another platform.o at
+    // ordinal 650 is unrelated and must remain byte-for-byte unchanged.
+    // Dropping only the old symbol index lets ar s calculate new offsets.
+    let mut output = b"!<arch>\n".to_vec();
+    for (ordinal, member) in before.iter().enumerate() {
+        let record = adapted_members
+            .iter()
+            .find(|(selected, _)| *selected == ordinal)
+            .map_or(member.record, |(_, record)| record.as_slice());
+        output.extend_from_slice(record);
     }
-
-    let mut replace = build.get_archiver();
-    replace.arg("r").arg(&destination).arg(&adapted_object);
-    tool_output(&mut replace)?;
+    std::fs::write(&destination, &output).map_err(|error| error.to_string())?;
+    drop(output);
     let mut index = build.get_archiver();
     index.arg("s").arg(&destination);
     tool_output(&mut index)?;
     let output_bytes = std::fs::read(&destination).map_err(|error| error.to_string())?;
     let after = archive_members(&output_bytes)?;
     if before.len() != after.len() {
-        return Err("V8 scanner transformation changed archive membership".into());
+        return Err("V8 physical-context transformation changed archive membership".into());
     }
-    let adapted_bytes = std::fs::read(&adapted_object).map_err(|error| error.to_string())?;
-    for ((old_name, old), (new_name, new)) in before.iter().zip(&after) {
-        if old_name != new_name
-            || if *old_name == "stack.o/" {
-                *new != adapted_bytes
-            } else {
-                old != new
-            }
-        {
+    for (ordinal, (old, new)) in before.iter().zip(&after).enumerate() {
+        let expected = adapted_members
+            .iter()
+            .find(|(selected, _)| *selected == ordinal)
+            .map_or(old.record, |(_, record)| record.as_slice());
+        if new.record != expected {
             return Err(format!(
-                "V8 scanner transformation changed unrelated member {old_name}"
+                "V8 transformation changed archive record {ordinal} ({})",
+                old.name
             ));
         }
     }

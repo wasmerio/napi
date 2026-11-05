@@ -69,11 +69,17 @@ extern "C" void snapi_host_native_frame_reject_operation(void*) noexcept;
 extern "C" int snapi_host_native_frame_failed(void*) noexcept;
 extern "C" int snapi_host_native_frame_host_stopped(void*) noexcept;
 extern "C" int snapi_host_native_stack_bounds(uintptr_t*, uintptr_t*) noexcept;
+extern "C" int snapi_host_native_frame_invocation_is_current(void*) noexcept;
 extern "C" int snapi_host_native_paused_stack_top(uintptr_t, uintptr_t, uintptr_t*) noexcept;
 extern "C" void snapi_host_native_frame_reject_stack(void*) noexcept;
 extern "C" void napi_host_guest_heap_release(void*);
 
 namespace {
+struct NativeStackPolicy {
+  uintptr_t configured_budget = 0;
+  bool captured = false;
+};
+
 struct PhysicalNativeFrame {
   PhysicalNativeFrame* previous = nullptr;
   void* holder = nullptr;
@@ -86,6 +92,10 @@ struct PhysicalNativeFrame {
   bool already_terminating = false;
   uintptr_t saved_stack_limit = 0;
   uintptr_t configured_stack_budget = 0;
+  uintptr_t saved_stack_size = 0;
+  uintptr_t active_stack_size = 0;
+  NativeStackPolicy stack_policy;
+  bool physical_origin_ready = false;
   uintptr_t physical_stack_low = 0;
   uintptr_t physical_stack_base = 0;
   bool stack_limit_installed = false;
@@ -105,6 +115,17 @@ static_assert(v8::internal::Internals::kIsolateStackGuardOffset % sizeof(uintptr
 #if defined(USE_SIMULATOR) || defined(V8_USE_ADDRESS_SANITIZER) || defined(V8_USE_SAFE_STACK)
 #error "native stack ABI requires the audited nonsimulator, nonsanitized V8 profile"
 #endif
+// Exact SysV64 member-call ABI from the audited archive. Use V8's own
+// temporary stack-switch operation: public Isolate::SetStackLimit also updates
+// configured stack_size by subtracting from the unrelated OS stack start.
+extern "C" void SnapiSetStackLimitForStackSwitching(void*, uintptr_t) noexcept
+    asm("_ZN2v88internal10StackGuard30SetStackLimitForStackSwitchingEm");
+extern "C" uintptr_t SnapiOriginalGetStackStart() noexcept
+    asm("snapi_original_v8_get_stack_start");
+extern "C" uintptr_t SnapiOriginalGetStackStartUnchecked() noexcept
+    asm("snapi_original_v8_get_stack_start_unchecked");
+extern "C" void SnapiOriginalStackGuardInitThread(void*, const void*) noexcept
+    asm("snapi_original_v8_stack_guard_init_thread");
 #endif
 
 bool ReadNativeRealStackLimit(v8::Isolate* target, uintptr_t* limit) noexcept {
@@ -116,6 +137,23 @@ bool ReadNativeRealStackLimit(v8::Isolate* target, uintptr_t* limit) noexcept {
   if (owner != reinterpret_cast<uintptr_t>(target)) return false;
   std::memcpy(limit, guard + sizeof(uintptr_t), sizeof(*limit));
   return *limit != 0;
+#else
+  (void)target;
+  (void)limit;
+  return false;
+#endif
+}
+
+bool SetNativeRealStackLimit(v8::Isolate* target, uintptr_t limit) noexcept {
+#if defined(SNAPI_PINNED_V8_STACK_LIMIT)
+  auto* guard = reinterpret_cast<unsigned char*>(target) +
+      v8::internal::Internals::kIsolateStackGuardOffset;
+  uintptr_t owner = 0;
+  std::memcpy(&owner, guard, sizeof(owner));
+  if (owner != reinterpret_cast<uintptr_t>(target)) return false;
+  // Preserves an interrupt sentinel without changing configured stack_size.
+  SnapiSetStackLimitForStackSwitching(guard, limit);
+  return true;
 #else
   (void)target;
   (void)limit;
@@ -393,75 +431,180 @@ extern "C" void SnapiStackScanner(void* stack, void* visitor) {
 }
 #endif
 
-// The JS conservative visitor is disabled in the audited archive. Its cppgc
-// native scanner is separately adapted above; SetStackLimit alone is insufficient.
-// Keep 64KiB inside actual usable memory for overflow reporting/native unwind
-// (pinned Isolate::StackOverflow permits up to 64KiB in sanitizer builds).
-bool ConfigurePhysicalStack(PhysicalNativeFrame* frame, bool cleanup) noexcept {
+#if defined(SNAPI_PINNED_V8_STACK_LIMIT)
+constexpr uintptr_t kNativeStackRecoveryBytes = 64 * 1024;
+
+// Inputs are the checked actual allocation, never an OS-relative relocation.
+constexpr uintptr_t SelectNativePhysicalStackLimit(
+    NativeStackRange physical, uintptr_t point, uintptr_t budget) {
+  const uintptr_t recovery = physical.low + kNativeStackRecoveryBytes;
+  const uintptr_t budget_limit = budget >= physical.base - physical.low
+      ? physical.low : physical.base - budget;
+  const uintptr_t selected = std::max(recovery, budget_limit);
+  return selected < point ? selected : 0;
+}
+// The actual failed worker layout: its coroutine lies ABOVE the OS stack base
+// 0x7ffff6bfa000. Its valid 984KiB budget must still select the physical guard.
+static_assert(SelectNativePhysicalStackLimit(
+    {0x7ffff7ae8000, 0x7ffff7be8000}, 0x7ffff7be4910, 984 * 1024)
+    == 0x7ffff7af8000);
+static_assert(SelectNativePhysicalStackLimit(
+    {0x7ffff7ae8000, 0x7ffff7be8000}, 0x7ffff7be4910, 1024 * 1024)
+    == 0x7ffff7af8000);  // Cleanup keeps the same 64KiB physical recovery margin.
+static_assert(SelectNativePhysicalStackLimit(
+    {0x7ffff7ae8000, 0x7ffff7be8000}, 0x7ffff7af8000, 1024 * 1024) == 0);
+// Selection is equally valid below that OS stack, and zero JS budget fails.
+static_assert(SelectNativePhysicalStackLimit(
+    {0x7ffff5ae8000, 0x7ffff5be8000}, 0x7ffff5be4910, 512 * 1024)
+    == 0x7ffff5b68000);
+static_assert(SelectNativePhysicalStackLimit(
+    {0x7ffff7ae8000, 0x7ffff7be8000}, 0x7ffff7be4910, 0) == 0);
+#endif
+
+// Origins describe an admitted physical call independently of its isolate's
+// liveness and logical metadata. In particular Dispose still needs the origin
+// after clear_isolate, and force-unwind cleanup can have no logical invocation.
+bool ConfigurePhysicalOrigin(PhysicalNativeFrame* frame) noexcept {
   NativeStackRange physical;
   const bool coroutine = snapi_host_native_stack_bounds(&physical.low, &physical.base) != 0;
 #if !defined(SNAPI_PINNED_V8_STACK_LIMIT)
-  // Only the selected pinned prebuilt was audited. Preserve ordinary native
-  // calls for explicit/local/other builds; reject coroutine admission.
   return !coroutine;
 #else
-  NativeStackRange thread;
-  if (!NativeThreadStackRange(&thread)) return false;
+  if (!coroutine && !NativeThreadStackRange(&physical)) return false;
   const uintptr_t point = NativeStackPosition();
-  if (!coroutine) physical = thread;
   if (physical.low == 0 || physical.low >= physical.base ||
-      point < physical.low || point >= physical.base) return false;
-  constexpr uintptr_t kRecoveryBytes = 64 * 1024;
-  if (physical.base - physical.low <= kRecoveryBytes) return false;
-  // Header-only creation must reject an unsupported/exhausted physical stack
-  // before Allocate/Initialize. Its real V8 limit is available at initialized bind.
-  if (frame->target == nullptr) {
-    frame->physical_stack_low = physical.low;
-    frame->physical_stack_base = physical.base;
-    return point > physical.low + kRecoveryBytes;
-  }
-  if (!cleanup) {
-    // V8's exception-handler ordering compares stack addresses. Even though
-    // precise frame walking follows saved C-entry pointers, a nested entry on
-    // another allocation can bypass its physically current TryCatch. Refuse
-    // that same-isolate switch before any limit change or operation body.
-    for (auto* previous = frame->previous; previous != nullptr; previous = previous->previous) {
-      if (previous->target == frame->target && previous->initialized && !previous->disposing) {
-        if (previous->physical_stack_low != physical.low ||
-            previous->physical_stack_base != physical.base) return false;
-        break;
-      }
-    }
-  }
-  uintptr_t saved = 0;
-  if (!ReadNativeRealStackLimit(frame->target, &saved)) return false;
-  uintptr_t budget = 0;
-  const uintptr_t recovery_limit = physical.low + kRecoveryBytes;
-  uintptr_t selected = recovery_limit;
-  // Recovery owns an initialized provider independently of its configured JS
-  // budget. In particular --stack-size=0 must still dispose before Context::New.
-  if (!cleanup) {
-    if (saved >= thread.base) return false;
-    for (auto* previous = frame->previous; previous != nullptr; previous = previous->previous) {
-      if (previous->target == frame->target && previous->initialized &&
-          !previous->disposing && previous->configured_stack_budget != 0) {
-        budget = previous->configured_stack_budget;
-        break;
-      }
-    }
-    if (budget == 0) budget = thread.base - saved;
-    const uintptr_t budget_limit = budget >= physical.base - physical.low
-        ? physical.low : physical.base - budget;
-    selected = std::max(recovery_limit, budget_limit);
-  }
-  if (selected >= point || selected >= thread.base) return false;
-  // Public SetStackLimit preserves an interrupt sentinel and also calculates
-  // stack_size as V8 OS-stack-start minus limit; checked subtraction above.
-  frame->saved_stack_limit = saved;
-  frame->configured_stack_budget = budget;
+      point < physical.low || point >= physical.base ||
+      physical.base - physical.low <= kNativeStackRecoveryBytes ||
+      point <= physical.low + kNativeStackRecoveryBytes) return false;
   frame->physical_stack_low = physical.low;
   frame->physical_stack_base = physical.base;
+  frame->physical_origin_ready = true;
+  return true;
+#endif
+}
+
+bool SameIsolatePhysicalStackAllowed(const PhysicalNativeFrame* frame) noexcept {
+  // V8's TryCatch ordering cannot represent live same-isolate frames on
+  // different allocations. Reject BEFORE Isolate::Enter changes heap start.
+  for (auto* previous = frame->previous; previous != nullptr; previous = previous->previous) {
+    if (previous->target == frame->target && previous->initialized && !previous->disposing) {
+      return previous->physical_stack_low == frame->physical_stack_low &&
+          previous->physical_stack_base == frame->physical_stack_base;
+    }
+  }
+  return true;
+}
+
+#if defined(SNAPI_PINNED_V8_STACK_LIMIT)
+bool CurrentPhysicalOrigin(uintptr_t* origin) noexcept {
+  auto* frame = current_native_frame;
+  // Allocator metadata headers carry no independent origin or V8 authority.
+  while (frame != nullptr && !frame->physical_origin_ready) frame = frame->previous;
+  if (frame == nullptr) return false;
+  NativeStackRange actual;
+  const uintptr_t point = NativeStackPosition();
+  if (snapi_host_native_stack_bounds(&actual.low, &actual.base) != 0 &&
+      actual.low == frame->physical_stack_low && actual.base == frame->physical_stack_base &&
+      actual.low <= point && point < actual.base) {
+    *origin = actual.base;
+    return true;
+  }
+  // A V8-owned secondary stack is not an SDK allocation. Only the exact
+  // executing invocation and entered isolate extend its central origin; a
+  // paused TLS header cannot authorize an unrelated coroutine/OS callback.
+  if (frame->target != nullptr && frame->initialized && !frame->disposing &&
+      v8::Isolate::TryGetCurrent() == frame->target &&
+      snapi_host_native_frame_invocation_is_current(frame->holder) != 0) {
+    *origin = frame->physical_stack_base;
+    return true;
+  }
+  return false;
+}
+
+extern "C" uintptr_t SnapiGetStackStart() noexcept
+    asm("_ZN2v84base5Stack13GetStackStartEv");
+extern "C" uintptr_t SnapiGetStackStart() noexcept {
+  uintptr_t origin = 0;
+  return CurrentPhysicalOrigin(&origin) ? origin : SnapiOriginalGetStackStart();
+}
+extern "C" uintptr_t SnapiGetStackStartUnchecked() noexcept
+    asm("_ZN2v84base5Stack22GetStackStartUncheckedEv");
+extern "C" uintptr_t SnapiGetStackStartUnchecked() noexcept {
+  uintptr_t origin = 0;
+  return CurrentPhysicalOrigin(&origin) ? origin : SnapiOriginalGetStackStartUnchecked();
+}
+
+// Initialize's real guard contains V8's actual flags-derived budget. Capture
+// it once on a fresh provider; its per-isolate thread entry has stored_limit=0.
+// The caller holds recursive ExecutionAccess, as does upstream's own optional
+// stored-limit SetStackLimit call. Clamp before further isolate bootstrap.
+extern "C" void SnapiStackGuardInitThread(void*, const void*) noexcept
+    asm("_ZN2v88internal10StackGuard10InitThreadERKNS0_15ExecutionAccessE");
+extern "C" void SnapiStackGuardInitThread(void* guard, const void* access) noexcept {
+  SnapiOriginalStackGuardInitThread(guard, access);
+  auto* frame = current_native_frame;
+  if (frame == nullptr || frame->target == nullptr || frame->initialized ||
+      frame->disposing || !frame->physical_origin_ready || frame->stack_policy.captured) return;
+  const auto* expected = reinterpret_cast<unsigned char*>(frame->target) +
+      v8::internal::Internals::kIsolateStackGuardOffset;
+  if (guard != expected) return;
+  const uintptr_t origin = SnapiGetStackStart();
+  uintptr_t saved = 0;
+  if (!ReadNativeRealStackLimit(frame->target, &saved)) std::abort();
+  // An invalid/negative V8 stack flag can place its initial guard above the
+  // origin. Preserve ordinary rejection while still owning bootstrap cleanup.
+  frame->stack_policy = NativeStackPolicy{saved <= origin ? origin - saved : 0, true};
+  frame->configured_stack_budget = frame->stack_policy.configured_budget;
+  frame->saved_stack_limit = saved;
+  frame->saved_stack_size = frame->stack_policy.configured_budget;
+  const NativeStackRange physical{frame->physical_stack_low, frame->physical_stack_base};
+  const uintptr_t point = NativeStackPosition();
+  const uintptr_t selected = SelectNativePhysicalStackLimit(
+      physical, point, frame->configured_stack_budget == 0
+          ? physical.base - physical.low : frame->configured_stack_budget);
+  if (selected == 0) std::abort();
   frame->target->SetStackLimit(selected);
+  frame->active_stack_size = origin - selected;
+  frame->stack_limit_installed = true;
+}
+#endif
+
+// The JS conservative visitor is disabled in the audited archive. Its cppgc
+// native scanner remains separately adapted to all retained physical segments.
+// Public SetStackLimit now uses the truthful physical origin and also bounds
+// central-stack classification (including V8's 40KiB release safety margin).
+bool ConfigurePhysicalStack(PhysicalNativeFrame* frame, bool cleanup) noexcept {
+#if !defined(SNAPI_PINNED_V8_STACK_LIMIT)
+  (void)frame;
+  (void)cleanup;
+  return true;  // ConfigurePhysicalOrigin already refused coroutine entry.
+#else
+  if (!frame->physical_origin_ready) return false;
+  if (frame->target == nullptr) return true;
+  const NativeStackRange physical{frame->physical_stack_low, frame->physical_stack_base};
+  const uintptr_t point = NativeStackPosition();
+  if (point < physical.low || point >= physical.base) return false;
+  if (!frame->stack_policy.captured) return false;
+  const uintptr_t budget = frame->stack_policy.configured_budget;
+  const uintptr_t selected = SelectNativePhysicalStackLimit(
+      physical, point, cleanup ? physical.base - physical.low : budget);
+  if (selected == 0) return false;
+  // InitThread already owns the original initialization restoration pair.
+  // Post-Initialize bind must not replace it with the temporary clamped pair.
+  if (!frame->stack_limit_installed) {
+    if (!ReadNativeRealStackLimit(frame->target, &frame->saved_stack_limit)) return false;
+    frame->saved_stack_size = budget;
+    for (auto* previous = frame->previous; previous != nullptr; previous = previous->previous) {
+      if (previous->target == frame->target && previous->initialized &&
+          !previous->disposing && previous->stack_limit_installed) {
+        frame->saved_stack_size = previous->active_stack_size;
+        break;
+      }
+    }
+  }
+  frame->target->SetStackLimit(selected);
+  frame->configured_stack_budget = budget;
+  frame->active_stack_size = physical.base - selected;
   frame->stack_limit_installed = true;
   return true;
 #endif
@@ -488,6 +631,31 @@ extern "C" int snapi_bridge_native_current_stack_info(
   return 1;
 }
 
+// Host-only numeric receipt for tests. Sizes are the adapter's saved/applied
+// metadata after its public setter calls, NOT private V8 field reads; the
+// separate stack_info diagnostic reads the actual real guard independently.
+extern "C" int snapi_bridge_native_current_stack_context(
+    uintptr_t* low, uintptr_t* base, uintptr_t* saved_size,
+    uintptr_t* applied_size, uintptr_t* origin) noexcept {
+  if (low == nullptr || base == nullptr || saved_size == nullptr ||
+      applied_size == nullptr || origin == nullptr) return 0;
+  *low = *base = *saved_size = *applied_size = *origin = 0;
+#if defined(SNAPI_PINNED_V8_STACK_LIMIT)
+  const auto* frame = current_native_frame;
+  if (snapi_v8_allocator_active() != 0 || frame == nullptr ||
+      frame->target == nullptr || !frame->initialized || frame->disposing ||
+      !frame->stack_limit_installed || !frame->physical_origin_ready) return 0;
+  *low = frame->physical_stack_low;
+  *base = frame->physical_stack_base;
+  *saved_size = frame->saved_stack_size;
+  *applied_size = frame->active_stack_size;
+  *origin = SnapiGetStackStart();
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 extern "C" void* snapi_bridge_native_current_holder() noexcept {
   return current_native_frame == nullptr ? nullptr : current_native_frame->holder;
 }
@@ -511,7 +679,8 @@ extern "C" void snapi_bridge_native_fail_current() noexcept {
 class PhysicalBridgeScope {
  public:
   PhysicalBridgeScope(v8::Isolate* target, uint64_t* foreground,
-                      int mode, bool enter_isolate)
+                      int mode, bool enter_isolate,
+                      NativeStackPolicy policy = {})
       : foreground_(foreground) {
     if (foreground_ != nullptr) {
       if (*foreground_ == UINT64_MAX) std::abort();
@@ -533,6 +702,7 @@ class PhysicalBridgeScope {
       return;
     }
     frame_.previous = previous;
+    frame_.stack_policy = policy;
     frame_.holder = holder;
     frame_.retirement_holder = allocator
         ? (previous == nullptr ? nullptr : previous->retirement_holder)
@@ -542,6 +712,13 @@ class PhysicalBridgeScope {
     frame_.callback_enabled = !allocator && mode == 0 && callbacks_ != 0;
     current_native_frame = &frame_;
     entered_ = true;
+    if (!allocator && (!ConfigurePhysicalOrigin(&frame_) ||
+        (mode == 0 && target != nullptr && !SameIsolatePhysicalStackAllowed(&frame_)))) {
+      blocked_ = true;
+      frame_.callback_enabled = false;
+      snapi_host_native_frame_reject_stack(holder);
+      return;
+    }
     if (!allocator && enter_isolate && target != nullptr) {
       isolate_.emplace(target);
     }
@@ -566,6 +743,7 @@ class PhysicalBridgeScope {
   PhysicalBridgeScope& operator=(const PhysicalBridgeScope&) = delete;
   explicit operator bool() const { return entered_ && !blocked_; }
   bool owns_header() const { return entered_; }
+  NativeStackPolicy stack_policy() const { return frame_.stack_policy; }
 
   // Void guest operations have no status channel for an allocator veto.
   void RejectOperation() {
@@ -591,11 +769,18 @@ class PhysicalBridgeScope {
     }
     if (frame_.stack_limit_installed && frame_.target != nullptr &&
         frame_.initialized && !frame_.disposing) {
-      frame_.target->SetStackLimit(frame_.saved_stack_limit);
+#if defined(SNAPI_PINNED_V8_STACK_LIMIT)
+      const uintptr_t origin = SnapiGetStackStart();
+      if (frame_.saved_stack_size >= origin) std::abort();
+      // Public setter restores the exact configured size; its transient guard
+      // is never executed. Then restore the independent exact real guard.
+      frame_.target->SetStackLimit(origin - frame_.saved_stack_size);
+      if (!SetNativeRealStackLimit(frame_.target, frame_.saved_stack_limit)) std::abort();
+#endif
       frame_.stack_limit_installed = false;
     }
-    current_native_frame = frame_.previous;
     isolate_.reset();
+    current_native_frame = frame_.previous;
     ReleaseForeground();
     void* holder = frame_.holder;
     frame_.holder = nullptr;
@@ -765,6 +950,7 @@ struct ScopeFrame {
 
 struct SnapiEnvState {
   napi_env env = nullptr;
+  NativeStackPolicy stack_policy;
   // Owner-thread physical provider frames, including reentrant guest callbacks.
   // A guest may release this env only after all such frames have returned.
   uint64_t foreground_depth = 0;
@@ -833,7 +1019,7 @@ struct SnapiEnvState {
 class BridgeOperationScope {
  public:
   explicit BridgeOperationScope(SnapiEnvState* state)
-      : frame_(state->env->isolate, &state->foreground_depth, 0, true) {}
+      : frame_(state->env->isolate, &state->foreground_depth, 0, true, state->stack_policy) {}
   explicit operator bool() const { return static_cast<bool>(frame_); }
  private:
   PhysicalBridgeScope frame_;
@@ -1160,10 +1346,10 @@ napi_status FinishBridgeRetirement(SnapiEnvState* state,
   // This exact already-sealed token owns the provider until disposal completes.
   // A managed error suppresses finalizers but cannot abandon owned cleanup.
   std::optional<PhysicalBridgeScope> entry;
-  entry.emplace(state->env->isolate, nullptr, cleanup ? 1 : 0, false);
+  entry.emplace(state->env->isolate, nullptr, cleanup ? 1 : 0, false, state->stack_policy);
   if (!static_cast<bool>(*entry) && !cleanup) {
     entry.reset();
-    entry.emplace(state->env->isolate, nullptr, 1, false);
+    entry.emplace(state->env->isolate, nullptr, 1, false, state->stack_policy);
   }
   if (!static_cast<bool>(*entry)) std::abort();
   // The metadata-only begin already checked all members before marking any.
@@ -3972,6 +4158,7 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   g_live_state_allocations.fetch_add(1, std::memory_order_relaxed);
   state->env = env;
   state->owner = owner;
+  state->stack_policy = entry.stack_policy();
   state->retiring = true;
   state->pending_publish = true;
   {
@@ -4054,6 +4241,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   g_live_state_allocations.fetch_add(1, std::memory_order_relaxed);
   state->env = env;
   state->owner = owner;
+  state->stack_policy = entry.stack_policy();
   state->retiring = true;
   state->pending_publish = true;
   {
@@ -4110,7 +4298,7 @@ extern "C" int snapi_bridge_prepare_created_env(
         state->foreground_depth != 0) return napi_invalid_arg;
     state->value_limit = static_cast<size_t>(value_limit);
   }
-  PhysicalBridgeScope entry(state->env->isolate, &state->foreground_depth, 0, true);
+  PhysicalBridgeScope entry(state->env->isolate, &state->foreground_depth, 0, true, state->stack_policy);
   if (!entry) return napi_invalid_arg;
   if (tracker == nullptr) return napi_ok;
   return unofficial_napi_configure_near_heap_limit_callback(

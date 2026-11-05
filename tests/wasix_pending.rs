@@ -68,6 +68,11 @@ struct RefillCounts {
     large_resumed: AtomicUsize,
     large_dropped_after_one_poll: AtomicUsize,
     task_releases: AtomicUsize,
+    permanent_pending_polls: AtomicUsize,
+    permanent_pending_drops: AtomicUsize,
+    permanent_pending_first_poll: tokio::sync::Notify,
+    permanent_pending_dropped: tokio::sync::Notify,
+    task_released: tokio::sync::Notify,
 }
 
 struct DropCount {
@@ -127,10 +132,43 @@ impl Future for PendingThenNoMemory {
     }
 }
 
+struct PendingForever {
+    counts: Arc<RefillCounts>,
+    polls: usize,
+}
+
+impl Future for PendingForever {
+    type Output = SysResult<Box<dyn wasixv2_syscalls::HostMemoryLease>>;
+
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls += 1;
+        self.counts
+            .permanent_pending_polls
+            .fetch_add(1, Ordering::SeqCst);
+        if self.polls == 1 {
+            self.counts.permanent_pending_first_poll.notify_one();
+        }
+        // Deliberately never wake itself. Only caller cancellation can retire it.
+        Poll::Pending
+    }
+}
+
+impl Drop for PendingForever {
+    fn drop(&mut self) {
+        if self.polls > 0 {
+            self.counts
+                .permanent_pending_drops
+                .fetch_add(1, Ordering::SeqCst);
+            self.counts.permanent_pending_dropped.notify_one();
+        }
+    }
+}
+
 #[derive(Default)]
 struct TestSyscalls {
     actions: Mutex<VecDeque<(TaskId, GuestAction)>>,
     refill: Arc<RefillCounts>,
+    permanent_pending: bool,
 }
 
 impl Syscalls for TestSyscalls {
@@ -155,6 +193,12 @@ impl LoaderControl for TestSyscalls {
         _: u32,
     ) -> LocalFuture<'a, SysResult<Box<dyn wasixv2_syscalls::HostMemoryLease>>> {
         self.refill.calls.fetch_add(1, Ordering::SeqCst);
+        if self.permanent_pending {
+            return Box::pin(PendingForever {
+                counts: self.refill.clone(),
+                polls: 0,
+            });
+        }
         let large = bytes > 32 * MIB;
         let drop_count = DropCount {
             counts: self.refill.clone(),
@@ -229,11 +273,38 @@ impl Control for TestSyscalls {
 
     fn release(&self, _: TaskId) {
         self.refill.task_releases.fetch_add(1, Ordering::SeqCst);
+        self.refill.task_released.notify_one();
     }
 }
 
 #[tokio::test]
 async fn napi_hook_suspends_advisory_refill_and_drops_allocator_pending_in_no_yield() {
+    const CHILD: &str = "WASIXV2_NAPI_PENDING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "napi_hook_suspends_advisory_refill_and_drops_allocator_pending_in_no_yield",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "pending refill child failed: {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pending refill child did not finish");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     tokio::task::LocalSet::new()
         .run_until(async {
             let context = NapiCtx::builder().max_sessions(1).max_envs(1).build();
@@ -298,6 +369,124 @@ async fn napi_hook_suspends_advisory_refill_and_drops_allocator_pending_in_no_yi
             assert_eq!(budget.v8_external, 0);
             assert_eq!(budget.wasm_linear, 0);
             assert_eq!(syscalls.refill.task_releases.load(Ordering::SeqCst), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn dropping_the_caller_cancels_a_permanently_pending_napi_refill() {
+    const CHILD: &str = "WASIXV2_NAPI_PENDING_CANCEL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dropping_the_caller_cancels_a_permanently_pending_napi_refill",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "pending cancellation child failed: {status}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pending cancellation child did not finish");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let context = NapiCtx::builder().max_sessions(1).max_envs(1).build();
+            let mut features = Features::default();
+            features.exceptions(true);
+            let mut engine = EngineBuilder::new(Cranelift::default())
+                .set_features(Some(features))
+                .engine();
+            engine.set_tunables(wasmer_napi::budgeted_tunables(context.budget()));
+            let store = Store::new(engine.clone());
+            let module = Module::new(&store, wat::parse_str(GUEST).unwrap()).unwrap();
+            drop(store);
+
+            let syscalls = Arc::new(TestSyscalls {
+                permanent_pending: true,
+                ..TestSyscalls::default()
+            });
+            let mut abis = Abis::<TestSyscalls>::wasixv2();
+            abis.push_instantiation_hook(Arc::new(NapiHook::new(context.clone())));
+            let mut run = Box::pin(run_on_owning_thread(
+                engine,
+                &module,
+                syscalls.clone(),
+                TaskId(2),
+                Arc::new(TokioHost::default()),
+                Arc::new(abis),
+            ));
+
+            let first_poll = syscalls.refill.permanent_pending_first_poll.notified();
+            tokio::pin!(first_poll);
+            let reached_pending = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut first_poll => (),
+                    result = &mut run => panic!("guest completed before refill became pending: {result:?}"),
+                }
+            })
+            .await;
+            assert!(reached_pending.is_ok(), "the N-API advisory refill did not become pending");
+            assert!(
+                syscalls
+                    .refill
+                    .permanent_pending_polls
+                    .load(Ordering::SeqCst)
+                    >= 1,
+                "the cancellation probe must reach a real pending loader reservation"
+            );
+            assert_eq!(context.active_sessions(), 1);
+
+            let refill_dropped = syscalls.refill.permanent_pending_dropped.notified();
+            let task_released = syscalls.refill.task_released.notified();
+            tokio::pin!(refill_dropped);
+            tokio::pin!(task_released);
+            drop(run);
+
+            let retired = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(&mut refill_dropped, &mut task_released);
+            })
+            .await;
+            assert!(
+                retired.is_ok(),
+                "dropping the caller must drop the pending refill and release its task; observed refill_drops={}, task_releases={}, active_sessions={}",
+                syscalls
+                    .refill
+                    .permanent_pending_drops
+                    .load(Ordering::SeqCst),
+                syscalls.refill.task_releases.load(Ordering::SeqCst),
+                context.active_sessions(),
+            );
+            assert_eq!(
+                syscalls
+                    .refill
+                    .permanent_pending_drops
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(syscalls.refill.task_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(context.active_sessions(), 0);
+            let budget = context.budget().snapshot();
+            assert_eq!(budget.live_isolates, 0);
+            assert_eq!(budget.v8_heap_reserved, 0);
+            assert_eq!(budget.v8_external, 0);
+            assert_eq!(budget.wasm_linear, 0);
+            assert_eq!(budget.mem_charged, 0);
         })
         .await;
 }

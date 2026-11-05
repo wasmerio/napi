@@ -119,6 +119,16 @@ fn create_native_provider(
     if unsafe { snapi_v8_allocator_active() } != 0 {
         return Err(1);
     }
+    let refill = env.data().native_guest_refill.clone();
+    if let (Some(heap), Some(refill)) = (env.data().guest_heap.clone(), refill) {
+        // Prefunding is advisory: creating an isolate does not require a
+        // guest-visible backing buffer. Preserve the original failure if the
+        // refiller raised one rather than merely refusing this allocation.
+        let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
+        if crate::native_frame::current_failed() {
+            return Err(1);
+        }
+    }
     let frame = env.pin_frame().ok_or(1)?;
     let request = env.data_mut().prepare_native_creation().ok_or(1)?;
     env.as_store_mut().parked(|| {
@@ -3775,7 +3785,12 @@ fn guest_napi_get_cb_info(
     // guest heap from this hot per-callback import so store-free allocations
     // (V8 backing stores) rarely find it empty. No-op for shared memories.
     if let Some(heap) = env.data().guest_heap.clone() {
-        heap.maybe_refill(&mut env.as_store_mut());
+        let refill = env.data().native_guest_refill.clone();
+        if let Some(refill) = refill {
+            let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
+        } else {
+            heap.maybe_refill(&mut env.as_store_mut());
+        }
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr > 0 {

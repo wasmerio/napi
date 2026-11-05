@@ -1976,6 +1976,13 @@ mod native_frame_tests {
                 budget: *mut usize,
                 applied: *mut usize,
             ) -> i32;
+            fn snapi_bridge_native_current_stack_context(
+                low: *mut usize,
+                base: *mut usize,
+                saved_size: *mut usize,
+                applied_size: *mut usize,
+                origin: *mut usize,
+            ) -> i32;
         }
         // Match the existing owned async fixtures; all bodies here are Ready.
         fn complete<F: Future>(future: F) -> F::Output {
@@ -2002,6 +2009,11 @@ mod native_frame_tests {
                         let mut saved = 0;
                         let mut budget = 0;
                         let mut applied = 0;
+                        let mut low = 0;
+                        let mut base = 0;
+                        let mut saved_size = 0;
+                        let mut applied_size = 0;
+                        let mut origin = 0;
                         let present = unsafe {
                             snapi_bridge_native_current_stack_info(
                                 &mut saved,
@@ -2009,12 +2021,30 @@ mod native_frame_tests {
                                 &mut applied,
                             )
                         };
+                        let context_present = unsafe {
+                            snapi_bridge_native_current_stack_context(
+                                &mut low,
+                                &mut base,
+                                &mut saved_size,
+                                &mut applied_size,
+                                &mut origin,
+                            )
+                        };
                         let bounds = wasmer::sys::NativeEngineStackBounds::current()
                             .map(|bounds| (bounds.usable_low, bounds.base));
-                        recorded
-                            .lock()
-                            .unwrap()
-                            .push((present, saved, budget, applied, bounds));
+                        recorded.lock().unwrap().push((
+                            present,
+                            saved,
+                            budget,
+                            applied,
+                            bounds,
+                            context_present,
+                            low,
+                            base,
+                            saved_size,
+                            applied_size,
+                            origin,
+                        ));
                         async { Ok(Vec::new()) }
                     },
                 )
@@ -2070,21 +2100,59 @@ mod native_frame_tests {
         assert_eq!(rooted.unwrap()[0].i32(), Some(42));
         assert_eq!(synchronous.unwrap(), 42);
         assert_eq!(observations.len(), 2);
-        let (present, saved, budget, applied, bounds) = observations[0];
+        let (
+            present,
+            saved,
+            budget,
+            applied,
+            bounds,
+            context_present,
+            low,
+            base,
+            saved_size,
+            applied_size,
+            origin,
+        ) = observations[0];
         assert_eq!(present, 1);
+        assert_eq!(context_present, 1);
         assert_eq!(budget, 512 * 1024);
-        let (low, base) = bounds.expect("root callback must expose actual numeric stack bounds");
-        assert_eq!(applied, (low + 64 * 1024).max(base - budget));
-        assert_ne!(applied, saved, "the coroutine reused the OS stack limit");
-        let (present, later_saved, budget, applied, bounds) = observations[1];
+        assert!(low < origin && origin <= base);
+        assert_eq!(origin, base);
+        assert_eq!(
+            bounds,
+            Some((low, base)),
+            "root callback must expose its actual physical stack bounds"
+        );
+        assert_eq!(saved_size, budget);
+        let selected = (low + 64 * 1024).max(base - budget);
+        assert_eq!(applied, selected);
+        assert_eq!(applied_size, base - selected);
+        let (
+            present,
+            later_saved,
+            budget,
+            applied,
+            bounds,
+            context_present,
+            low,
+            base,
+            saved_size,
+            applied_size,
+            origin,
+        ) = observations[1];
         assert_eq!(present, 1);
         assert!(bounds.is_none());
+        assert_eq!(context_present, 1);
         assert_eq!(budget, 512 * 1024);
+        assert!(low < origin && origin <= base);
+        assert_eq!(origin, base);
+        assert_eq!(saved_size, budget);
+        assert_eq!(applied, origin - budget);
+        assert_eq!(applied_size, budget);
         assert_eq!(
             later_saved, saved,
             "root exit did not restore the exact prior OS limit"
         );
-        assert_eq!(applied, saved);
     }
 
     #[test]

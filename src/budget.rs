@@ -275,6 +275,17 @@ impl ResourceBudget {
         self.accountant.is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn accounting_identity(self: &Arc<Self>) -> std::sync::Weak<dyn Send + Sync> {
+        // MemoryCharge retains this budget and its protected AccountantOwner.
+        // Weak identity must not become an independent last accountant owner.
+        let source: Arc<dyn Send + Sync> = match self.accountant.as_ref() {
+            Some(accountant) => accountant.clone(),
+            None => self.clone(),
+        };
+        Arc::downgrade(&source)
+    }
+
     pub fn with_accountant(accountant: Arc<dyn NapiMemoryAccountant>) -> Arc<Self> {
         // Install cleanup custody BEFORE the first custom limit query.
         let accountant = AccountantOwner(Some(accountant));
@@ -763,6 +774,24 @@ fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LinearMemory for BudgetedMemory {
+    fn host_memory_access(&self) -> Result<wasmer::sys::HostMemoryAccess, MemoryError> {
+        let mut access = self.inner.host_memory_access()?;
+        if access.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "native access already has an accounting owner".into(),
+            ));
+        }
+        if access
+            .set_accounting_identity(self.budget().accounting_identity())
+            .is_err()
+        {
+            return Err(MemoryError::Generic(
+                "native access already identifies a funding source".into(),
+            ));
+        }
+        Ok(access)
+    }
+
     fn retain_host_allocation(&self) -> Result<wasmer::sys::HostMemoryAllocation, MemoryError> {
         let mut allocation = self.inner.retain_host_allocation()?;
         if allocation.retain_owner(self.charge.clone()).is_err() {
@@ -1115,6 +1144,119 @@ mod tests {
         );
         drop(sibling);
         assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn native_access_identifies_the_actual_shared_funding_source() {
+        struct Accountant(AtomicU64);
+        impl NapiMemoryAccountant for Accountant {
+            fn memory_limit(&self) -> u64 {
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        }
+        let standalone = ResourceBudget::unlimited();
+        let other = ResourceBudget::unlimited();
+        let mut store = budgeted_store(standalone.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), false)).unwrap();
+        let access = memory.host_memory_access(&store).unwrap();
+        assert!(access.is_accounted_by(&standalone.accounting_identity()));
+        assert!(!access.is_accounted_by(&other.accounting_identity()));
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let a = ResourceBudget::with_accountant(accountant.clone());
+        let b = ResourceBudget::with_accountant(accountant.clone());
+        let unrelated = ResourceBudget::with_accountant(Arc::new(Accountant(AtomicU64::new(0))));
+        let mut store = budgeted_store(a.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+        let access = memory.host_memory_access(&store).unwrap();
+        assert!(access.is_accounted_by(&a.accounting_identity()));
+        assert!(access.is_accounted_by(&b.accounting_identity()));
+        assert!(!access.is_accounted_by(&unrelated.accounting_identity()));
+        assert!(!access.is_accounted_by(&standalone.accounting_identity()));
+        let mut unmetered = Store::default();
+        let memory = Memory::new(&mut unmetered, MemoryType::new(2, Some(4), false)).unwrap();
+        assert!(
+            !memory
+                .host_memory_access(&unmetered)
+                .unwrap()
+                .is_accounted_by(&a.accounting_identity())
+        );
+    }
+
+    #[test]
+    fn detached_native_access_and_derived_pins_retain_exact_allocation_charges() {
+        use std::sync::atomic::AtomicUsize;
+        struct ObserveStore(Arc<AtomicUsize>);
+        impl Drop for ObserveStore {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for shared in [false, true] {
+            let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let access = {
+                let mut store = budgeted_store(budget.clone());
+                let _env = wasmer::FunctionEnv::new(&mut store, ObserveStore(dropped.clone()));
+                let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), shared)).unwrap();
+                let access = memory.host_memory_access(&store).unwrap();
+                memory.grow(&mut store, 1).unwrap();
+                assert_eq!(access.host_data().unwrap().1, 3 * PAGE);
+                assert!(memory.reset(&mut store).is_err());
+                assert_eq!(budget.memory_charged(), 3 * PAGE);
+                access
+            };
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            let pin = access.pin_host_range(PAGE..2 * PAGE).unwrap();
+            drop(access);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            // SAFETY: the originating Store is gone; the pin owns the exact bytes.
+            unsafe {
+                pin.as_ptr().write(42);
+                assert_eq!(pin.as_ptr().read(), 42);
+            }
+            drop(pin);
+            assert_eq!(budget.memory_charged(), 0);
+        }
+    }
+
+    #[test]
+    fn detached_native_copy_charges_and_reset_are_independent() {
+        for shared in [false, true] {
+            let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+            let raw =
+                VMMemory::new(&MemoryType::new(2, Some(4), shared), &MemoryStyle::Static).unwrap();
+            let mut memory = BudgetedMemory::new(raw, budget.clone()).unwrap();
+            let access = memory.host_memory_access().unwrap();
+            let mut copy = memory.copy().unwrap();
+            let copied = copy.host_memory_access().unwrap();
+            assert_ne!(access.host_data().unwrap().0, copied.host_data().unwrap().0);
+            assert_eq!(budget.memory_charged(), 4 * PAGE);
+            copy.grow(Pages(1)).unwrap();
+            assert_eq!(budget.memory_charged(), 5 * PAGE);
+            assert_eq!(access.host_data().unwrap().1, 2 * PAGE);
+            assert_eq!(copied.host_data().unwrap().1, 3 * PAGE);
+            assert!(copy.reset().is_err());
+            assert_eq!(budget.memory_charged(), 5 * PAGE);
+            drop(access);
+            memory.reset().unwrap();
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            drop(memory);
+            drop(copy);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            drop(copied);
+            assert_eq!(budget.memory_charged(), 0);
+        }
     }
 
     #[test]

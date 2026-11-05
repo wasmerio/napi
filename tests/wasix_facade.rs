@@ -1,7 +1,10 @@
 //! Native bindings run through the real facade and protected kernel allocator.
 #![cfg(all(feature = "wasix", not(target_arch = "wasm32")))]
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use wasixv2::{Machine, Stdio};
 use wasmer_napi::{NapiCtx, NapiHook, NapiMemoryAccountant, NativeGuestChunk, NativeGuestRefill};
 
@@ -316,6 +319,7 @@ fn leased_heap_bootstraps_when_refill_is_unavailable() {
         }
     }
 
+    use wasmer::sys::NativeEngineExt;
     use wasmer::{AsStoreMut, Imports, Instance, Memory, MemoryType, Module, Store};
     for (source, shared) in [
         (EMPTY_REFILL_GUEST.to_owned(), true),
@@ -505,7 +509,7 @@ const EXEC_CHILD_GUEST: &str = r#"(module
         global.get $env i32.const 8 i32.load i32.const 12 call $script call $check
         global.get $env i32.const 12 i32.load i32.const 16 call $integer call $check
         i32.const 16 i32.load i32.const 42 i32.ne if unreachable end
-        i32.const 0 call $exit unreachable))"#;
+        i32.const 3 call $exit unreachable))"#;
 
 struct ExecPrograms(PathBuf);
 
@@ -694,6 +698,8 @@ const DSO_MAIN: &str = r#"(module
     (import "env" "__stack_pointer" (global (mut i32)))
     (import "env" "__memory_base" (global $base i32))
     (import "env" "__table_base" (global i32))
+    (import "wasix_32v1" "fd_write"
+        (func $write (param i32 i32 i32 i32) (result i32)))
     (import "wasix_32v1" "dlopen"
         (func $open (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
     (import "wasix_32v1" "dlsym"
@@ -702,16 +708,31 @@ const DSO_MAIN: &str = r#"(module
         (func $invoke (param i32 i32 i32 i32 i32 i32) (result i32)))
     (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
     (export "__indirect_function_table" (table 0))
-    (data (global.get $base) "/prog/side.so\00run_napi\00")
+    (data (global.get $base) "{request}")
     (func $at (param i32) (result i32)
         global.get $base local.get 0 i32.add)
     (func $check (param i32 i32 i32)
         local.get 0 local.get 1 i32.ne if local.get 2 call $exit end)
-    (func $load (result i32)
-        i32.const 0 call $at i32.const 13 i32.const -1
-        i32.const 256 call $at i32.const 64 i32.const 53 call $at
-        i32.const 5 i32.const 192 call $at call $open
-        i32.const 0 i32.const 1 call $check
+    (func $write_dlopen_error (local $length i32)
+        i32.const 0 local.set $length
+        (block $done
+            (loop $scan
+                local.get $length i32.const 64 i32.ge_u br_if $done
+                i32.const 256 call $at local.get $length i32.add i32.load8_u
+                i32.eqz br_if $done
+                local.get $length i32.const 1 i32.add local.set $length
+                br $scan))
+        i32.const 320 call $at i32.const 256 call $at i32.store
+        i32.const 320 call $at i32.const 4 i32.add
+        local.get $length i32.store
+        i32.const 2 i32.const 320 call $at i32.const 1
+        i32.const 328 call $at call $write drop)
+    (func $load (result i32) (local $status i32)
+        i32.const 0 call $at i32.const {request_len} i32.const -1
+        i32.const 256 call $at i32.const 64 i32.const 23 call $at
+        i32.const 5 i32.const 192 call $at call $open local.tee $status
+        i32.eqz if else call $write_dlopen_error end
+        local.get $status i32.const 0 i32.const 1 call $check
         i32.const 192 call $at i32.load)
     (func $lookup (param $handle i32) (result i32)
         local.get $handle i32.const 14 call $at i32.const 8
@@ -771,15 +792,29 @@ impl Drop for DsoPrograms {
 
 #[tokio::test]
 async fn facade_native_dso_import_gets_its_own_napi_session() {
-    const CHILD: &str = "WASIXV2_NAPI_DSO_CHILD";
-    if std::env::var_os(CHILD).is_none() {
+    run_dso_fixture(
+        "facade_native_dso_import_gets_its_own_napi_session",
+        "WASIXV2_NAPI_DSO_CHILD",
+        &["side.so"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn facade_native_late_dso_import_gets_its_own_napi_session() {
+    run_dso_fixture(
+        "facade_native_late_dso_import_gets_its_own_napi_session",
+        "WASIXV2_NAPI_LATE_DSO_CHILD",
+        &[],
+    )
+    .await;
+}
+
+async fn run_dso_fixture(test_name: &str, child_key: &str, needed: &[&str]) {
+    if std::env::var_os(child_key).is_none() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "facade_native_dso_import_gets_its_own_napi_session",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_key, "1")
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
@@ -799,12 +834,17 @@ async fn facade_native_dso_import_gets_its_own_napi_session() {
 
     tokio::task::LocalSet::new()
         .run_until(async {
-            let main = pic(DSO_MAIN, &["side.so"]);
+            // Exercise both a declared startup dependency and a genuinely late
+            // dlopen. Both must retire the binding before run_process returns.
+            let main_wat = dso_main_wat(!needed.is_empty());
+            let main = pic(&main_wat, needed);
             let programs = DsoPrograms::new(&main, &pic(DSO_SIDE, &[]));
             let context = NapiCtx::builder().max_sessions(1).max_envs(1).build();
             let machine = Machine::builder()
                 .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
                 .build();
+            let stderr = Arc::new(Mutex::new(Vec::new()));
+            let captured_stderr = stderr.clone();
             machine
                 .mount_host_dir("/prog", &programs.0, false)
                 .await
@@ -815,12 +855,18 @@ async fn facade_native_dso_import_gets_its_own_napi_session() {
                     wasixv2::ProcessConfig {
                         args: vec!["napi-dso".into()],
                         env: vec!["LD_LIBRARY_PATH=/prog".into()],
-                        stdio: Stdio::from_fns(|_| {}, |_| {}),
+                        stdio: Stdio::from_fns(
+                            |_| {},
+                            move |bytes| {
+                                captured_stderr.lock().unwrap().extend_from_slice(bytes);
+                            },
+                        ),
                     },
                 )
                 .await
                 .unwrap();
-            assert_eq!(status, 0);
+            let stderr = String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
+            assert_eq!(status, 0, "guest stderr: {stderr}");
             assert_eq!(context.active_sessions(), 0);
             let budget = context.budget().snapshot();
             assert_eq!(budget.live_isolates, 0);
@@ -830,4 +876,18 @@ async fn facade_native_dso_import_gets_its_own_napi_session() {
             machine.shutdown().await;
         })
         .await;
+}
+
+fn dso_main_wat(startup_dependency: bool) -> String {
+    // WASIX1 reuses startup dependencies by their exact guest request. Match
+    // the startup profile's dlopen request while keeping run_napi at offset 14
+    // and /prog at offset 23 for the shared WAT body.
+    let (request, request_len) = if startup_dependency {
+        (r"side.so\00\00\00\00\00\00\00run_napi\00/prog\00", "7")
+    } else {
+        (r"/prog/side.so\00run_napi\00/prog\00", "13")
+    };
+    DSO_MAIN
+        .replace("{request}", request)
+        .replace("{request_len}", request_len)
 }

@@ -185,6 +185,15 @@ pub(crate) fn replay_current() -> Result<(), RuntimeError> {
         None => Ok(()),
     }
 }
+pub(crate) fn record_current_error(error: RuntimeError) {
+    let raw = unsafe { crate::snapi::snapi_bridge_native_current_holder() };
+    if !raw.is_null() {
+        unsafe { &*raw.cast::<FrameHolder>() }.fail(CallbackFailure::Guest(error));
+    } else if let Some(selected) = select() {
+        selected.failure.record(CallbackFailure::Guest(error));
+    }
+}
+
 pub(crate) fn current_failed() -> bool {
     select().is_some_and(|selected| selected.failure.failed())
 }
@@ -548,6 +557,33 @@ pub unsafe extern "C" fn snapi_host_native_stack_bounds(low: *mut usize, base: *
         Ok(None) => 0,
         Err(panic) => {
             discard(panic);
+            0
+        }
+    }
+}
+
+// This weak execution identity extends an admitted central origin across
+// V8-owned secondary stacks. Actual SDK-stack cleanup uses physical bounds
+// instead, since force-unwind may deliberately hide the logical invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_host_native_frame_invocation_is_current(raw: *mut c_void) -> i32 {
+    if raw.is_null() {
+        return 0;
+    }
+    let holder = unsafe { &*raw.cast::<FrameHolder>() };
+    match catch_unwind(AssertUnwindSafe(|| {
+        holder
+            .invocation
+            .as_ref()
+            .is_some_and(NativeEngineInvocation::is_current)
+    })) {
+        Ok(current) => i32::from(current),
+        Err(panic) => {
+            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| {
+                holder.failure.record(CallbackFailure::Panic(panic));
+            })) {
+                discard(secondary);
+            }
             0
         }
     }

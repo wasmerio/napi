@@ -3,9 +3,11 @@
 
 use std::path::{Path, PathBuf};
 use wasmer_napi::{
-    NapiCtx,
+    NapiCtx, NapiMemoryAccountant,
     cli::{GuestMount, run_wasix_main_capture_stdio_with_ctx},
 };
+
+const MIB: u64 = 1024 * 1024;
 
 const ROOT_LAYER_GUEST: &str = r#"(module
     (import "env" "memory" (memory 2 2048 shared))
@@ -139,6 +141,31 @@ fn assert_released(context: &NapiCtx) {
     assert_eq!(budget.wasm_linear, 0);
 }
 
+fn run_in_watched_child(test_name: &str, child_key: &str) -> bool {
+    if std::env::var_os(child_key).is_some() {
+        return false;
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_key, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "CLI facade child failed: {status}");
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLI facade child did not finish: {test_name}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 const REFILL_GUEST: &str = r#"(module
     (import "env" "memory" (memory 2 2048 shared))
     (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
@@ -168,25 +195,97 @@ const REFILL_GUEST: &str = r#"(module
 
 #[test]
 fn public_cli_runner_charges_a_refilled_arraybuffer_once() {
-    const MIB: u64 = 1024 * 1024;
+    if run_in_watched_child(
+        "public_cli_runner_charges_a_refilled_arraybuffer_once",
+        "WASIXV2_NAPI_CLI_REFILL_CHILD",
+    ) {
+        return;
+    }
+
+    struct Accountant {
+        current: std::sync::atomic::AtomicU64,
+        peak: std::sync::atomic::AtomicU64,
+    }
+
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            192 * MIB
+        }
+
+        fn memory_charged(&self) -> u64 {
+            self.current.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn try_charge(&self, bytes: u64) -> bool {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            let mut current = self.current.load(SeqCst);
+            loop {
+                let Some(next) = current.checked_add(bytes) else {
+                    return false;
+                };
+                if next > self.memory_limit() {
+                    return false;
+                }
+                match self
+                    .current
+                    .compare_exchange_weak(current, next, SeqCst, SeqCst)
+                {
+                    Ok(_) => {
+                        self.peak.fetch_max(next, SeqCst);
+                        return true;
+                    }
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        fn uncharge(&self, bytes: u64) {
+            self.current
+                .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     let temp = TempDir::new("budgeted-refill");
     let guest = temp.guest("refill.wasm", REFILL_GUEST);
-    // V8's initial reservation plus one 32 MiB guest backing fits; charging
-    // that same memory growth a second time would exceed this cap.
+    // The imported linear-memory mapping includes its 1/8 address-space gap,
+    // so the actual combined reservation is about 158 MiB. Charging the
+    // leased backing a second time would push it above this 192 MiB cap.
+    let accountant = std::sync::Arc::new(Accountant {
+        current: std::sync::atomic::AtomicU64::new(0),
+        peak: std::sync::atomic::AtomicU64::new(0),
+    });
     let context = NapiCtx::builder()
         .max_sessions(1)
         .max_envs(1)
-        .total_memory_bytes(128 * MIB)
+        .memory_accountant(accountant.clone())
         .build();
     let (status, stdout, stderr) =
         run_wasix_main_capture_stdio_with_ctx(&context, &guest, &[], &[]).unwrap();
     assert_eq!(status, 0, "refill guest failed: {stderr}");
     assert!(stdout.is_empty());
+    let peak = accountant.peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak > 128 * MIB,
+        "unexpectedly low observed peak: {peak} bytes"
+    );
+    assert!(
+        peak <= 192 * MIB,
+        "unexpectedly high observed peak: {peak} bytes"
+    );
+    assert_eq!(accountant.memory_charged(), 0);
     assert_released(&context);
 }
 
 #[test]
 fn public_runner_preserves_root_layer_precedence_cow_and_writable_mounts() {
+    if run_in_watched_child(
+        "public_runner_preserves_root_layer_precedence_cow_and_writable_mounts",
+        "WASIXV2_NAPI_CLI_MOUNTS_CHILD",
+    ) {
+        return;
+    }
+
     let temp = TempDir::new("mounts");
     let first_root = temp.0.join("first-root");
     let second_root = temp.0.join("second-root");
