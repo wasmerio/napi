@@ -191,7 +191,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
 // made in it is reachable, and is then collected. A realm handle, like a
 // napi_value, is valid only while the handle scope it was obtained in is open,
 // and two handles for one realm may differ; unofficial_napi_get_realm finds
-// the realm again from its global.
+// the realm again from its global. Using a handle after its handle scope has
+// closed is undefined behavior that the provider may not detect: once the
+// realm is collected, a newer realm can get the same handle. To use a realm
+// later, keep its global (in a napi_ref, say) and call
+// unofficial_napi_get_realm on it each time.
 typedef struct unofficial_napi_realm__* unofficial_napi_realm;
 
 enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
@@ -256,8 +260,10 @@ typedef uint64_t unofficial_napi_realm_scope;
 // every scope closes when the env is released.
 //
 // No JavaScript runs, so entering also succeeds while execution is
-// terminating. Fails with napi_invalid_arg for a realm of another env or one
-// that was collected.
+// terminating. Fails with napi_invalid_arg for a realm of another env. A
+// handle used after its handle scope has closed is undefined behavior (see
+// unofficial_napi_realm): it may fail, or enter a newer realm that got the
+// same handle.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enter_realm(
     napi_env env,
     unofficial_napi_realm realm_or_null,

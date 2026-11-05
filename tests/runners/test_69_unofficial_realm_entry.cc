@@ -509,7 +509,7 @@ TEST_F(Test69UnofficialRealmEntry, PendingExceptionSurvivesLeavingARealm) {
             "true");
 }
 
-TEST_F(Test69UnofficialRealmEntry, EnteringAnUnknownOrCollectedRealmFails) {
+TEST_F(Test69UnofficialRealmEntry, EnteringAnUnknownRealmFails) {
   EnvScope s(runtime_.get());
   unofficial_napi_realm_scope scope = 0;
 
@@ -520,23 +520,33 @@ TEST_F(Test69UnofficialRealmEntry, EnteringAnUnknownOrCollectedRealmFails) {
             napi_invalid_arg);
   EXPECT_EQ(scope, 0u);
 
-  // A handle that outlived its handle scope, once the realm is collected.
-  unofficial_napi_realm stale = nullptr;
-  napi_ref weak_global = nullptr;
+  // A handle that outlived its handle scope is not tried: using it is
+  // undefined behavior, and a newer realm may have the same handle. A realm
+  // used later is kept by its global and found again from it.
+  napi_ref kept_global = nullptr;
   {
     napi_handle_scope handles = nullptr;
     ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
     napi_value global = nullptr;
-    stale = CreateRealm(s.env, &global);
-    ASSERT_NE(stale, nullptr);
-    ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak_global), napi_ok);
+    ASSERT_NE(CreateRealm(s.env, &global), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, global, 1, &kept_global), napi_ok);
     ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
   }
   ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
-  ASSERT_TRUE(IsCollected(s.env, weak_global));
-  EXPECT_EQ(unofficial_napi_enter_realm(s.env, stale, &scope), napi_invalid_arg);
-  EXPECT_EQ(scope, 0u);
-  ASSERT_EQ(napi_delete_reference(s.env, weak_global), napi_ok);
+  {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, kept_global, &global), napi_ok);
+    unofficial_napi_realm found = nullptr;
+    ASSERT_EQ(unofficial_napi_get_realm(s.env, global, &found), napi_ok);
+    ASSERT_NE(found, nullptr);
+    scope = Enter(s.env, found);
+    EXPECT_TRUE(StrictEquals(s.env, Global(s.env), global));
+    Leave(s.env, scope);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(napi_delete_reference(s.env, kept_global), napi_ok);
 
   // No JavaScript runs on entering or leaving, so both work while
   // terminating.

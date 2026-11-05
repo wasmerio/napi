@@ -32,6 +32,11 @@
   only while the handle scope it was obtained in is open, like a
   `napi_value`, and two handles for one realm may differ;
   `unofficial_napi_get_realm` finds the realm again from its global.
+- **Don't keep realm handles.** Using one after its handle scope has closed
+  is undefined behavior that the provider may not detect: once the realm is
+  collected, a newer realm can get the same handle. An embedder that uses a
+  realm later (a browser, per document) keeps its global in a `napi_ref` and
+  calls `get_realm` on it each time.
 
 ## API
 
@@ -73,7 +78,12 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
     leave a scope its caller opened, and scopes it leaves open close when it
     returns. Releasing the env closes every scope.
   - A scope keeps its realm alive until it is left. Entering a realm of
-    another env, or a collected one, fails with `napi_invalid_arg`.
+    another env fails with `napi_invalid_arg`.
+  - A handle used after its handle scope has closed is undefined behavior.
+    V8 and QuickJS only check that the handle is one of the env's realm
+    records before reading it, so entering it does not crash. But the next
+    `create_realm` frees the records of collected realms and can reuse one,
+    and the stale handle then enters that newer realm.
   - No JavaScript runs, so both work while execution is terminating. A
     pending exception stays pending.
   - NULL enters the env's own realm, for example to reach its global from
