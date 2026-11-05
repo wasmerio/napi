@@ -8861,4 +8861,125 @@ mod tests {
         drop(retained);
         assert_eq!(wasm_bindgen::externref_heap_live_count(), before);
     }
+
+    /// A guest that uses the realm imports as a C guest does: the scope token
+    /// comes back through its memory as a u64 and goes out again as an i64.
+    const REALM_GUEST: &str = r#"
+        (module
+          (import "env" "memory" (memory 1))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_enter_realm"
+            (func $enter (param i32 i32 i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_leave_realm"
+            (func $leave (param i32 i64) (result i32)))
+          (import "napi" "napi_get_global" (func $get_global (param i32 i32) (result i32)))
+          (func (export "enter") (param i32 i32 i32) (result i32)
+            (call $enter (local.get 0) (local.get 1) (local.get 2)))
+          ;; Leaves the scope whose token is stored at the pointer.
+          (func (export "leave") (param i32 i32) (result i32)
+            (call $leave (local.get 0) (i64.load (local.get 1))))
+          (func (export "get_global") (param i32 i32) (result i32)
+            (call $get_global (local.get 0) (local.get 1))))
+    "#;
+
+    #[wasm_bindgen_test]
+    fn guest_imports_enter_and_leave_realms() {
+        use wasmer::{FunctionEnv, Imports, Instance, Memory, MemoryType, Module, Store};
+
+        const TOKEN: u32 = 64;
+        const OTHER_TOKEN: u32 = 72;
+        const GLOBAL: u32 = 80;
+        let mut store = Store::default();
+        let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
+        let env = new_env();
+        let mut napi_env = crate::env::NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        napi_env.memory = Some(memory.clone());
+        // Dropping the store releases the env.
+        let (guest_env, _) = napi_env.register_napi_env(env);
+        let function_env = FunctionEnv::new(&mut store, napi_env);
+        let mut imports = Imports::new();
+        crate::guest::napi::register_napi_imports(&mut store, &function_env, &mut imports);
+        imports.define("env", "memory", memory.clone());
+        let module = Module::new(&store, wat::parse_str(REALM_GUEST).unwrap()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let enter = instance
+            .exports
+            .get_typed_function::<(u32, u32, u32), i32>(&store, "enter")
+            .unwrap();
+        let leave = instance
+            .exports
+            .get_typed_function::<(u32, u32), i32>(&store, "leave")
+            .unwrap();
+        let get_global = instance
+            .exports
+            .get_typed_function::<(u32, u32), i32>(&store, "get_global")
+            .unwrap();
+        let read = |store: &Store, ptr: u32, bytes: &mut [u8]| {
+            memory.view(store).read(ptr.into(), bytes).unwrap();
+        };
+        let read_u64 = |store: &Store, ptr| {
+            let mut bytes = [0; 8];
+            read(store, ptr, &mut bytes);
+            u64::from_le_bytes(bytes)
+        };
+        let read_u32 = |store: &Store, ptr| {
+            let mut bytes = [0; 4];
+            read(store, ptr, &mut bytes);
+            u32::from_le_bytes(bytes)
+        };
+        let realm = new_realm(env, 0).unwrap();
+
+        // Entered by its id, the realm's global is napi_get_global's.
+        assert_eq!(
+            enter.call(&mut store, guest_env, realm, TOKEN).unwrap(),
+            NAPI_OK
+        );
+        assert_ne!(read_u64(&store, TOKEN), 0);
+        assert_eq!(current_realm(env), realm);
+        assert_eq!(
+            get_global.call(&mut store, guest_env, GLOBAL).unwrap(),
+            NAPI_OK
+        );
+        assert!(Object::is(
+            &value(env, read_u32(&store, GLOBAL)),
+            &value(env, realm)
+        ));
+        assert_eq!(leave.call(&mut store, guest_env, TOKEN).unwrap(), NAPI_OK);
+        assert_eq!(current_realm(env), 0);
+
+        // A token above 2^63 reaches the guest whole and is a negative i64 on
+        // the way back. One that differs only in the sign bit closes nothing.
+        let large = 0xfedc_ba98_7654_3210_u64;
+        unsafe { env_mut(env) }.unwrap().next_realm_scope = large;
+        assert_eq!(
+            enter.call(&mut store, guest_env, realm, TOKEN).unwrap(),
+            NAPI_OK
+        );
+        assert_eq!(read_u64(&store, TOKEN), large);
+        memory
+            .view(&store)
+            .write(OTHER_TOKEN.into(), &(large & !(1 << 63)).to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            leave.call(&mut store, guest_env, OTHER_TOKEN).unwrap(),
+            NAPI_INVALID_ARG
+        );
+        assert_eq!(current_realm(env), realm);
+        assert_eq!(leave.call(&mut store, guest_env, TOKEN).unwrap(), NAPI_OK);
+        assert_eq!(current_realm(env), 0);
+
+        // With no room for the token, or no pointer, nothing stays entered.
+        for ptr in [65536 - 4, 0] {
+            assert_eq!(
+                enter.call(&mut store, guest_env, realm, ptr).unwrap(),
+                NAPI_INVALID_ARG
+            );
+            assert!(unsafe { env_mut(env) }.unwrap().realm_stack.is_empty());
+        }
+        assert_eq!(current_realm(env), 0);
+    }
 }
