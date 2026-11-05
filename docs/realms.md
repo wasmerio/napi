@@ -182,6 +182,20 @@ calls take a realm's global or sandbox.
   as on `main`, and 0 is the current realm. With a host-JS native Worker
   realm (#125), `make_context` fails as `create_realm` does, and
   `run_script` with id 0 goes to `evaluate()`.
+  - One layer (`src/guest/compat.rs`) maps a context id to a realm id for
+    both guest backends, as `lib/src/napi_compat.cc` does natively. The
+    current realm takes the id of `napi_get_global` and maps it with
+    `get_realm`, so a call with no context can add up to two value ids to
+    the current handle scope.
+  - Guest env hooks are version 1, `main`'s 32 bytes. As on `main`, the
+    bridge gives the provider none of them, so a guest's token callbacks
+    are reported as not accepted and never called.
+  - `tests/programs/run_script_compat_test.c` is `main`'s
+    `run_script_test.c`, run natively and as a WASIX guest, with version 1
+    module and bytecode options and checks of the current realm. The WAT
+    guest of the concurrency tests calls `…_contextify_run_script` and
+    sends version 1 module options, and a host-JS test drives the three
+    imports from a guest.
 
 ## How the current realm works
 
