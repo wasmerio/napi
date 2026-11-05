@@ -1,9 +1,29 @@
 # WASIX compatibility TODO
 
-Stopped-work checkpoint: 2026-11-05. Integration branch: `feat/wasixv2`.
-Subagents were stopped at the user's request. **Full supported v1 parity is not complete.**
+Active delivery: 2026-11-05. Integration target: private
+[`wasmerio/wasmer-next`, `main`](https://github.com/wasmerio/wasmer-next/tree/main).
+The previous stopped-work snapshot is preserved below. **Full supported v1 parity is not complete.**
 This tree was renamed from `lib/wasixv2` to `lib/wasix`; crate names remain unchanged.
 The old runtime remains in `lib/wasix-legacy` until its consumers have working replacements.
+
+## Active unification work
+
+All new source is published only to private `wasmerio/wasmer-next` and
+`wasmerio/wlk`. The CLI and embedding consumers must use v2 before legacy
+runtime/support crates are removed. Keep `wasixv2-wasix1`, the v1 guest adapter
+on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
+
+| Stream | Required result |
+| --- | --- |
+| Contexts and closures | Native and JSPI execution, exact values/errors, cancellation and physical-frame cleanup; actual supported v1 consumers. |
+| CLI and legacy consumers | V2 package/acquisition/cache/HTTP/network paths, C API/Swift/examples ports, then legacy crate removal. |
+| NAPI and custom bindings | Trait-based v2 facade, managed refill/leases, callbacks/finalizers and supported lifecycle proofs. |
+| Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
+| Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
+
+Managers use native Sol 6.1 high implementors/reviewers and Luna max validators.
+Large designs require independent review. Validation runs serially against the
+integrated source tuple; a compile or placeholder is not a completed parity item.
 
 ## Scope and snapshot
 
