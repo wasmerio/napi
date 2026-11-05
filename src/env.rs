@@ -186,6 +186,11 @@ pub(crate) struct NapiEnv {
     pub(crate) host_buffer_leases: HashMap<(u32, u32), HostBufferLease>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) persistent_callback_contexts: HashMap<u32, Box<CallbackInvocationCtx>>,
+    /// Envs created from a synchronous store, which had no JSPI owner for a
+    /// persistent callback context yet. Usually empty; checked before every
+    /// callback state is installed.
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub(crate) envs_awaiting_async_owner: Vec<u32>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) native_buffer_leases: HashMap<(u32, u32), NativeBufferLease>,
 }
@@ -244,6 +249,8 @@ impl NapiEnv {
             host_buffer_leases: HashMap::new(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             persistent_callback_contexts: HashMap::new(),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            envs_awaiting_async_owner: Vec::new(),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_buffer_leases: HashMap::new(),
         }
@@ -587,6 +594,7 @@ impl NapiEnv {
         unsafe {
             snapi_bridge_swap_active_callback_ctx(env, std::ptr::null_mut());
             self.persistent_callback_contexts.remove(&env_id);
+            self.envs_awaiting_async_owner.retain(|&id| id != env_id);
         }
         self.napi_state_to_guest_env.remove(&(env as usize));
     }

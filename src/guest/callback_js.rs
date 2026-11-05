@@ -45,11 +45,53 @@ pub(crate) fn install_persistent_callback_state(
         env: CallbackEnv::Async(async_env),
     });
     let ctx_ptr = (&mut *ctx as *mut CallbackInvocationCtx).cast::<c_void>();
-    env.data_mut()
-        .persistent_callback_contexts
-        .insert(env_id, ctx);
+    let data = env.data_mut();
+    data.envs_awaiting_async_owner.retain(|&id| id != env_id);
+    data.persistent_callback_contexts.insert(env_id, ctx);
     unsafe {
         crate::snapi::snapi_bridge_swap_active_callback_ctx(snapi_env, ctx_ptr);
+    }
+}
+
+/// Gives a new env its persistent callback context, owned by the store's JSPI
+/// `AsyncFunctionEnvMut`. A synchronous store has no such owner yet; some
+/// embedders promote it to an async store later. Until then the env waits:
+/// the next callback state installed once the store is async, synchronous or
+/// async (a checkpoint, a message wait), installs the context.
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) fn install_async_owner(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    env_id: u32,
+    snapi_env: SnapiEnv,
+    async_env: Option<AsyncFunctionEnvMut<NapiEnv>>,
+) {
+    match async_env {
+        Some(async_env) => install_persistent_callback_state(env, env_id, snapi_env, async_env),
+        None => env.data_mut().envs_awaiting_async_owner.push(env_id),
+    }
+}
+
+/// Installs the persistent callback context of an env created from a
+/// synchronous store, once that store has become async. An async import
+/// passes the owner it holds; otherwise it is looked up.
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn install_awaited_async_owner(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    snapi_env: SnapiEnv,
+    owner: Option<AsyncFunctionEnvMut<NapiEnv>>,
+) {
+    let Some(&env_id) = env
+        .data()
+        .napi_state_to_guest_env
+        .get(&(snapi_env as usize))
+    else {
+        return;
+    };
+    if !env.data().envs_awaiting_async_owner.contains(&env_id) {
+        return;
+    }
+    if let Some(async_env) = owner.or_else(|| env.as_async_mut()) {
+        install_persistent_callback_state(env, env_id, snapi_env, async_env);
     }
 }
 
@@ -84,6 +126,13 @@ fn install_callback_state(
 ) -> Option<CallbackStateGuard> {
     if snapi_env.is_null() {
         return None;
+    }
+    // Before saving the active context below, so this guard and any outer
+    // one created later restore the persistent context, never a stack guard.
+    // Empty unless an env was created from a synchronous store.
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    if !env.data().envs_awaiting_async_owner.is_empty() {
+        install_awaited_async_owner(env, snapi_env, None);
     }
 
     let env_ptr = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>();
@@ -464,7 +513,7 @@ pub fn with_callback_state<R>(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub async fn with_callback_state_async<R, F>(
-    env: AsyncFunctionEnvMut<NapiEnv>,
+    mut env: AsyncFunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     future: F,
 ) -> R
@@ -475,10 +524,18 @@ where
         return future.await;
     }
 
+    // An env created from a synchronous store gets its persistent context
+    // here at the latest, before the import suspends and host jobs (Promise
+    // jobs, message deliveries) call into the guest.
+    let owner = env.as_mut();
     let owner_id = {
         let mut locked = env.write().await;
-        let owner_id = locked.data_mut().next_host_buffer_owner();
-        locked.data_mut().host_buffer_copy_frames.push(owner_id);
+        let mut sync_env = locked.as_function_env_mut();
+        if !sync_env.data().envs_awaiting_async_owner.is_empty() {
+            install_awaited_async_owner(&mut sync_env, snapi_env, Some(owner));
+        }
+        let owner_id = sync_env.data_mut().next_host_buffer_owner();
+        sync_env.data_mut().host_buffer_copy_frames.push(owner_id);
         owner_id
     };
     // The environment's persistent Async callback context is the owner of
