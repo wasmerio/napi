@@ -990,35 +990,37 @@ TEST_F(Test70RealmEntryAttack, MoreValuesComeFromTheEnteredRealm) {
   unofficial_napi_realm_scope scope = Enter(s.env, a);
   // Names what failed or is not from A.
   std::vector<std::string> wrong;
-  auto check = [&](const char* name, napi_status status, napi_value value, const char* ctor) {
+  // Takes the value by address: the call that writes it is an argument too,
+  // and arguments are evaluated in no fixed order.
+  auto check = [&](const char* name, napi_status status, napi_value* value, const char* ctor) {
     if (status != napi_ok) {
       wrong.push_back(std::string(name) + ":status" + std::to_string(status));
       ClearException(s.env);
       return;
     }
-    if (!ProtoIs(s.env, value, a_global, ctor)) wrong.push_back(name);
+    if (!ProtoIs(s.env, *value, a_global, ctor)) wrong.push_back(name);
   };
   napi_value v = nullptr, number = nullptr;
   ASSERT_EQ(napi_create_int32(s.env, 3, &number), napi_ok);
-  check("coerce number", napi_coerce_to_object(s.env, number, &v), v, "Number");
+  check("coerce number", napi_coerce_to_object(s.env, number, &v), &v, "Number");
   v = nullptr;
-  check("coerce string", napi_coerce_to_object(s.env, Str(s.env, "x"), &v), v, "String");
+  check("coerce string", napi_coerce_to_object(s.env, Str(s.env, "x"), &v), &v, "String");
   v = nullptr;
-  check("property names", napi_get_property_names(s.env, env_object, &v), v, "Array");
+  check("property names", napi_get_property_names(s.env, env_object, &v), &v, "Array");
   v = nullptr;
   check("all property names",
         napi_get_all_property_names(s.env, env_object, napi_key_own_only, napi_key_enumerable,
                                     napi_key_keep_numbers, &v),
-        v, "Array");
+        &v, "Array");
   napi_value ab = nullptr;
   ASSERT_EQ(napi_create_arraybuffer(s.env, 16, nullptr, &ab), napi_ok);
   v = nullptr;
-  check("dataview", napi_create_dataview(s.env, 8, ab, 0, &v), v, "DataView");
+  check("dataview", napi_create_dataview(s.env, 8, ab, 0, &v), &v, "DataView");
   v = nullptr;
-  check("bigint64array", napi_create_typedarray(s.env, napi_bigint64_array, 1, ab, 0, &v), v,
+  check("bigint64array", napi_create_typedarray(s.env, napi_bigint64_array, 1, ab, 0, &v), &v,
         "BigInt64Array");
   v = nullptr;
-  check("float64array", napi_create_typedarray(s.env, napi_float64_array, 1, ab, 0, &v), v,
+  check("float64array", napi_create_typedarray(s.env, napi_float64_array, 1, ab, 0, &v), &v,
         "Float64Array");
   static char external_bytes[16];
   v = nullptr;
@@ -1027,10 +1029,10 @@ TEST_F(Test70RealmEntryAttack, MoreValuesComeFromTheEnteredRealm) {
                                                         &v);
   // Providers may refuse external buffers.
   if (status != napi_no_external_buffers_allowed) {
-    check("external arraybuffer", status, v, "ArrayBuffer");
+    check("external arraybuffer", status, &v, "ArrayBuffer");
   }
   v = nullptr;
-  check("range error", napi_create_range_error(s.env, nullptr, Str(s.env, "r"), &v), v,
+  check("range error", napi_create_range_error(s.env, nullptr, Str(s.env, "r"), &v), &v,
         "RangeError");
   // Whatever a Buffer's prototype chain, it ends in A's Uint8Array.
   void* data = nullptr;
