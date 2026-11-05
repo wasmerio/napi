@@ -57,6 +57,11 @@ struct napi_agent__ {
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback =
       nullptr;
   void* enqueue_foreground_task_target = nullptr;
+  // The deprecated context-token hooks, called for the realms of the agent's
+  // env. `context_token_data` is the hooks' `data`.
+  unofficial_napi_context_token_callback context_token_assign_callback = nullptr;
+  unofficial_napi_context_token_callback context_token_unassign_callback = nullptr;
+  void* context_token_data = nullptr;
 
   // The one near-heap-limit slot. `near_heap_limit_installed` is true while
   // the provider's trampoline is registered with V8.

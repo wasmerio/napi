@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1314,12 +1315,45 @@ v8::Local<v8::Context> RealmContext(napi_env env, unofficial_napi_realm realm) {
   return realm->context.Get(env->isolate);
 }
 
-// Frees the records of realms whose context was collected.
+// Calls a deprecated context-token hook for `realm`, in the env's realm as
+// every env hook runs.
+void CallContextTokenHook(napi_env env,
+                          unofficial_napi_context_token_callback hook,
+                          unofficial_napi_realm realm) {
+  if (hook == nullptr) return;
+  v8::HandleScope handle_scope(env->isolate);
+  v8::Context::Scope context_scope(env->main_context());
+  napi_realm_frame_scope__ realm_frame(env, nullptr);
+  hook(env, realm, env->agent->context_token_data);
+}
+
+// A realm has a token while either hook is attached, as each context did.
+void AssignRealmToken(napi_env env, unofficial_napi_realm realm) {
+  if (env->agent->context_token_assign_callback == nullptr &&
+      env->agent->context_token_unassign_callback == nullptr) {
+    return;
+  }
+  realm->token_assigned = true;
+  CallContextTokenHook(env, env->agent->context_token_assign_callback, realm);
+}
+
+void UnassignRealmToken(napi_env env, unofficial_napi_realm realm) {
+  if (!realm->token_assigned) return;
+  realm->token_assigned = false;
+  CallContextTokenHook(env, env->agent->context_token_unassign_callback, realm);
+}
+
+// Frees the records of realms whose context was collected. They leave
+// env->realms before any hook runs, so a hook may make realms.
 void ReleaseCollectedRealms(napi_env env) {
   auto& realms = env->realms;
-  realms.erase(std::remove_if(realms.begin(), realms.end(),
-                              [](const auto& realm) { return realm->context.IsEmpty(); }),
-               realms.end());
+  auto collected = std::stable_partition(
+      realms.begin(), realms.end(), [](const auto& realm) { return !realm->context.IsEmpty(); });
+  if (collected == realms.end()) return;
+  std::vector<std::unique_ptr<unofficial_napi_realm__>> released(
+      std::make_move_iterator(collected), std::make_move_iterator(realms.end()));
+  realms.erase(collected, realms.end());
+  for (const auto& realm : released) UnassignRealmToken(env, realm.get());
 }
 
 bool CompileAsModule(v8::Isolate* isolate,
@@ -1619,6 +1653,22 @@ void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   }
 }
 
+void NapiV8ReleaseCollectedRealms(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return;
+  ReleaseCollectedRealms(env);
+}
+
+void NapiV8UnassignRealmTokens(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return;
+  // A hook may make or free realms, so look again after each one.
+  for (;;) {
+    auto it = std::find_if(env->realms.begin(), env->realms.end(),
+                           [](const auto& realm) { return realm->token_assigned; });
+    if (it == env->realms.end()) return;
+    UnassignRealmToken(env, it->get());
+  }
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_create_realm(
@@ -1728,6 +1778,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   if (global_napi == nullptr) return napi_generic_failure;
   if (global_out != nullptr) *global_out = global_napi;
   *realm_out = handle;
+  AssignRealmToken(env, handle);
   return napi_ok;
 }
 

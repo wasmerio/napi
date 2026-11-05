@@ -96,6 +96,9 @@ struct unofficial_napi_realm__ {
   napi_env env = nullptr;
   v8::Global<v8::Context> context;
   std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+  // The record is the realm's context token. True while the realm has one,
+  // until the unassign hook, which runs before the record is freed.
+  bool token_assigned = false;
 };
 
 // A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or

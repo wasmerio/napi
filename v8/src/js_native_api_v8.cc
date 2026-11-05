@@ -993,9 +993,14 @@ napi_env__::~napi_env__() {
   // data's finalizer; and all of it again for what that finalizer leaves
   // pending, until nothing is, so no hint is left pointing at the env. The
   // callback is cleared before it runs, so instance data is finalized once.
+  // Realms still alive give up their context tokens before the cleanup hooks
+  // run, while the embedder's state is intact, and so do realms the hooks
+  // make.
+  NapiV8UnassignRealmTokens(this);
   for (;;) {
     do {
       RunEnvCleanupHooks(this);
+      NapiV8UnassignRealmTokens(this);
       napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
       pending_finalizers.clear();
       pending_buffer_finalizers.clear();

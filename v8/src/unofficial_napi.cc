@@ -1723,6 +1723,11 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   }
 
   napi_agent__* agent = env->agent;
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
+  agent->context_token_assign_callback = hooks->context_token_assign_callback;
+  agent->context_token_unassign_callback = hooks->context_token_unassign_callback;
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
+  agent->context_token_data = hooks->data;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
   {
@@ -1951,6 +1956,8 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env) {
   // memory as possible. RequestGarbageCollectionForTesting is intentionally
   // not used: it aborts unless V8 was initialized with testing-only flags.
   env->isolate->LowMemoryNotification();
+  // Realms collected now are released now, with their context tokens.
+  NapiV8ReleaseCollectedRealms(env);
   return napi_ok;
 }
 

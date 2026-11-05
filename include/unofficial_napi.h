@@ -99,6 +99,10 @@ typedef struct {
   unofficial_napi_guest_heap guest_heap;
 } unofficial_napi_env_create_options;
 
+// Deprecated with the context-token hooks below.
+typedef void (*unofficial_napi_context_token_callback)(napi_env env,
+                                                       void* token,
+                                                       void* data);
 typedef void (*unofficial_napi_foreground_task_callback)(napi_env env,
                                                          void* data);
 typedef void (*unofficial_napi_foreground_task_cleanup)(napi_env env,
@@ -136,33 +140,59 @@ typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
                                                    bool is_heap_oom,
                                                    const char* detail);
 
-// Bits 0 and 1 belonged to the context-token callbacks that version 2 of the
-// hooks struct removed. They are not reused.
 typedef enum {
+  unofficial_napi_env_hook_context_token_assign
+      UNOFFICIAL_NAPI_DEPRECATED_MEMBER("realms replace context tokens") = 1u << 0,
+  unofficial_napi_env_hook_context_token_unassign
+      UNOFFICIAL_NAPI_DEPRECATED_MEMBER("realms replace context tokens") = 1u << 1,
   unofficial_napi_env_hook_enqueue_foreground_task = 1u << 2,
   unofficial_napi_env_hook_fatal_error = 1u << 3,
   unofficial_napi_env_hook_oom_error = 1u << 4,
 } unofficial_napi_env_hook;
 
-enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 2 };
+enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 
 // Immutable embedder callbacks attached as one complete environment state
 // transition. `size` and `version` make additions ABI-compatible. `data` is
 // owned by the embedder and must remain valid until the environment is released.
-// Version 2 removed the context-token callbacks; providers reject version 1.
+//
+// Deprecated: the context-token callbacks. Use unofficial_napi_create_realm and
+// keep per-realm state keyed by the realm's global instead. They are kept for
+// compatibility and removed in a future major release. A provider that accepts
+// them (V8) gives every realm a token, an opaque pointer that stays the same
+// for the realm and is not reused while assigned. It calls
+// `context_token_assign_callback(env, token, data)` when the realm is created
+// (unofficial_napi_create_realm, and so unofficial_napi_contextify_make_context),
+// and `context_token_unassign_callback(env, token, data)` once for each
+// token: when the provider frees the record of a collected realm (in
+// unofficial_napi_create_realm and unofficial_napi_collect_garbage), or, for a
+// realm still alive, when the env is released, before its cleanup hooks run
+// (and after them for realms they made). Both run in the env's realm. Realms
+// made before the hooks were attached get no token. QuickJS does not accept
+// them and never calls them.
+UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
 typedef struct {
   uint32_t size;
   uint32_t version;
   void* data;
+  unofficial_napi_context_token_callback context_token_assign_callback
+      UNOFFICIAL_NAPI_DEPRECATED_MEMBER("realms replace context tokens");
+  unofficial_napi_context_token_callback context_token_unassign_callback
+      UNOFFICIAL_NAPI_DEPRECATED_MEMBER("realms replace context tokens");
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback;
   unofficial_napi_fatal_error_callback fatal_error_callback;
   unofficial_napi_oom_error_callback oom_error_callback;
 } unofficial_napi_env_hooks;
 
+// Reads the deprecated fields too, without warning.
 static inline uint64_t unofficial_napi_env_hooks_requested(
     const unofficial_napi_env_hooks* hooks) {
   if (hooks == NULL) return 0;
   uint64_t requested = 0;
+  if (hooks->context_token_assign_callback != NULL)
+    requested |= unofficial_napi_env_hook_context_token_assign;
+  if (hooks->context_token_unassign_callback != NULL)
+    requested |= unofficial_napi_env_hook_context_token_unassign;
   if (hooks->enqueue_foreground_task_callback != NULL)
     requested |= unofficial_napi_env_hook_enqueue_foreground_task;
   if (hooks->fatal_error_callback != NULL)
@@ -171,6 +201,7 @@ static inline uint64_t unofficial_napi_env_hooks_requested(
     requested |= unofficial_napi_env_hook_oom_error;
   return requested;
 }
+UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     int32_t module_api_version,
@@ -1231,7 +1262,7 @@ static_assert(sizeof(unofficial_napi_env_create_options) ==
 static_assert(sizeof(unofficial_napi_runtime_options) ==
               sizeof(unofficial_napi_wasm32_runtime_options_v1));
 static_assert(sizeof(unofficial_napi_env_hooks) ==
-              sizeof(unofficial_napi_wasm32_env_hooks_v2));
+              sizeof(unofficial_napi_wasm32_env_hooks_v1));
 static_assert(sizeof(unofficial_napi_js_source) ==
               sizeof(unofficial_napi_wasm32_js_source));
 static_assert(sizeof(unofficial_napi_bytecode_open_options) ==
@@ -1250,7 +1281,7 @@ _Static_assert(sizeof(unofficial_napi_runtime_options) ==
                    sizeof(unofficial_napi_wasm32_runtime_options_v1),
                "public runtime-options layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_env_hooks) ==
-                   sizeof(unofficial_napi_wasm32_env_hooks_v2),
+                   sizeof(unofficial_napi_wasm32_env_hooks_v1),
                "public env-hooks layout differs from its wasm32 wire ABI");
 _Static_assert(sizeof(unofficial_napi_js_source) ==
                    sizeof(unofficial_napi_wasm32_js_source),
