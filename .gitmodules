@@ -1,15 +1,3 @@
-[submodule "tests/wast/spec"]
-	path = tests/wast/spec
-	url = https://github.com/WebAssembly/testsuite.git
-[submodule "lib/napi"]
-	path = lib/napi
-	url = https://github.com/wasmerio/napi
-[submodule "wasmer-test-files"]
-	path = wasmer-test-files
-	url = https://github.com/wasmerio/wasmer-test-files.git
-[submodule "lib/wasixv2/codegen"]
-	path = lib/wasix/codegen
-	url = https://github.com/wasix-org/wasixv2-abi.git
-[submodule "tests/wasixv2"]
-	path = tests/wasixv2
-	url = https://github.com/wasix-org/wasixv2-tests.git
+[submodule "quickjs/deps/quickjs"]
+	path = quickjs/deps/quickjs
+	url = https://github.com/wasmerio/quickjs.git

@@ -1,0 +1,17 @@
+[package]
+name = "local/napi-host-js-run-script-test"
+version = "0.0.0"
+entrypoint = "run-script-test"
+
+[[module]]
+name = "run-script-test"
+source = "../../target/wasm32-wasix/release/run_script_test.wasm"
+abi = "wasi"
+
+[[command]]
+name = "run-script-test"
+module = "run-script-test"
+runner = "https://webc.org/runner/wasi"
+
+[command.annotations.wasi]
+atom = "run-script-test"

@@ -1,1 +1,0 @@
-void catch_exception();
