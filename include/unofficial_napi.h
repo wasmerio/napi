@@ -5,6 +5,46 @@
 
 #include "js_native_api.h"
 
+// Marks the API kept only for compatibility with code written against
+// version 1 of these extensions: the contextify calls, the context-token
+// hooks and the module options' `context_or_undefined`. It still works and
+// is removed in a future major release. Define
+// UNOFFICIAL_NAPI_NO_DEPRECATION_WARNINGS to silence the warnings.
+#if defined(UNOFFICIAL_NAPI_NO_DEPRECATION_WARNINGS)
+#define UNOFFICIAL_NAPI_DEPRECATED(message)
+#elif defined(__GNUC__) || defined(__clang__)
+#define UNOFFICIAL_NAPI_DEPRECATED(message) __attribute__((deprecated(message)))
+#elif defined(_MSC_VER)
+#define UNOFFICIAL_NAPI_DEPRECATED(message) __declspec(deprecated(message))
+#else
+#define UNOFFICIAL_NAPI_DEPRECATED(message)
+#endif
+
+// The same for struct fields and enumerators, which MSVC cannot mark.
+#if !defined(UNOFFICIAL_NAPI_NO_DEPRECATION_WARNINGS) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define UNOFFICIAL_NAPI_DEPRECATED_MEMBER(message) __attribute__((deprecated(message)))
+#else
+#define UNOFFICIAL_NAPI_DEPRECATED_MEMBER(message)
+#endif
+
+// Silences deprecation warnings in between, for code that implements the
+// deprecated API. Around a struct with deprecated fields it also keeps C++
+// compilers from warning wherever the struct is merely copied.
+#if defined(__GNUC__) || defined(__clang__)
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN \
+  _Pragma("GCC diagnostic push")                  \
+  _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END _Pragma("GCC diagnostic pop")
+#elif defined(_MSC_VER)
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN \
+  __pragma(warning(push)) __pragma(warning(disable : 4996))
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END __pragma(warning(pop))
+#else
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
+#define UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -807,7 +847,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(n
 
 // Script, function and module compilation. These are engine-specific APIs
 // and are not part of the public Node-API. Each runs or compiles code in
-// `realm_or_null`, or in the env's own realm when it is NULL.
+// `realm_or_null`, or in the env's own realm when it is NULL. The deprecated
+// forms (the contextify calls and version 1 of the option structs) work in
+// the current realm instead, as they did before realms existed.
 
 // Provider-owned compiled JavaScript, compiled for one realm. The handle is
 // bound to its env and must be released explicitly.
@@ -865,12 +907,15 @@ typedef enum {
   unofficial_napi_bytecode_cache_compile_on_reject = 0,
   unofficial_napi_bytecode_cache_validate_only = 1,
 } unofficial_napi_bytecode_cache_policy;
-// Version 2 added `realm_or_null`, the realm the code is compiled for.
+
+// Version 2 appended `realm_or_null`, the realm the code is compiled for (NULL:
+// the env's own). Version 1, which ends before it (`size` at least
+// UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_V1_SIZE), is deprecated but still
+// accepted: it compiles for the current realm.
 #define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 2u
 typedef struct unofficial_napi_bytecode_open_options {
   uint32_t size;
   uint32_t version;
-  unofficial_napi_realm realm_or_null;
   napi_value source_text;
   napi_value filename;
   int32_t shape;
@@ -882,7 +927,12 @@ typedef struct unofficial_napi_bytecode_open_options {
   size_t cache_byte_length;
   uint8_t has_cache;
   uint8_t cache_policy;
+  // Version 2.
+  unofficial_napi_realm realm_or_null;
 } unofficial_napi_bytecode_open_options;
+
+#define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_V1_SIZE \
+  offsetof(unofficial_napi_bytecode_open_options, realm_or_null)
 
 typedef struct unofficial_napi_bytecode_open_result {
   unofficial_napi_bytecode bytecode;
@@ -937,6 +987,69 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_compile_function(
     napi_value host_defined_option_id,
     napi_value* result_out);
 
+// Deprecated: the contextify calls, which take contextified objects instead of
+// realms. Use unofficial_napi_create_realm, unofficial_napi_run_script and
+// unofficial_napi_compile_function. They are kept for compatibility and
+// removed in a future major release. Each is a thin wrapper over the realm
+// API, so the objects and realms of both mix freely.
+
+// Deprecated: use unofficial_napi_create_realm. An object or function sandbox
+// becomes the sandbox of a new realm; a symbol (vm.constants.DONT_CONTEXTIFY)
+// makes a realm with a fresh global. The other arguments become the realm
+// options of the same names (`origin_or_undefined` is `origin`). `result_out`
+// receives the realm's global as create_realm reports it: the sandbox, or the
+// fresh global. Fails with napi_invalid_arg when `name` is NULL, for any other
+// sandbox, and for a sandbox that already belongs to a realm.
+UNOFFICIAL_NAPI_DEPRECATED("use unofficial_napi_create_realm")
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context(
+    napi_env env,
+    napi_value sandbox_or_symbol,
+    napi_value name,
+    napi_value origin_or_undefined,
+    bool allow_code_gen_strings,
+    bool allow_code_gen_wasm,
+    bool own_microtask_queue,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+// Deprecated: use unofficial_napi_run_script. The script runs in the realm
+// `sandbox_or_null` names: the realm of a contextified object (a realm's
+// global or sandbox), the env's realm for the env's own global, or the
+// current realm for NULL, undefined or null. Unlike unofficial_napi_run_script
+// with a NULL realm, that is the realm entered or of the running callback,
+// which is the env's own unless the embedder enters realms. Any other value
+// fails with napi_invalid_arg.
+UNOFFICIAL_NAPI_DEPRECATED("use unofficial_napi_run_script")
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
+    napi_env env,
+    napi_value sandbox_or_null,
+    const unofficial_napi_js_source* source,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    int64_t timeout,
+    bool display_errors,
+    bool break_on_sigint,
+    bool break_on_first_line,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+// Deprecated: use unofficial_napi_compile_function. The function is compiled
+// in the realm `parsing_context_or_undefined` names, which resolves as
+// unofficial_napi_contextify_run_script's `sandbox_or_null` does.
+UNOFFICIAL_NAPI_DEPRECATED("use unofficial_napi_compile_function")
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_compile_function(
+    napi_env env,
+    const unofficial_napi_js_source* source,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value parsing_context_or_undefined,
+    napi_value context_extensions_or_undefined,
+    napi_value params_or_undefined,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_contains_module_syntax(
     napi_env env,
     napi_value code,
@@ -951,9 +1064,19 @@ typedef struct unofficial_napi_module__* unofficial_napi_module;
 
 // Versioned, tagged transaction for creating either kind of module. Keeping
 // creation behind one descriptor gives providers one validation boundary and
-// lets the ABI grow without adding one import per module kind. The module
-// lives in `realm_or_null`, or in the env's realm. Version 2 replaced
-// `context_or_undefined` with it; providers reject version 1.
+// lets the ABI grow without adding one import per module kind.
+//
+// Version 2 appended `realm_or_null`, the realm the module lives in. Version
+// 1, which ends before it (`size` at least
+// UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_V1_SIZE), is deprecated but still
+// accepted. The realm is:
+// - version 2 with `realm_or_null` set: that realm. `context_or_undefined`
+//   must then be NULL, undefined or null, else napi_invalid_arg.
+// - otherwise, from the deprecated `context_or_undefined`: the realm of a
+//   contextified object (a realm's global or sandbox), the env's realm for
+//   the env's own global, and for NULL, undefined or null the env's realm
+//   (version 2) or the current realm (version 1). Any other value is
+//   napi_invalid_arg.
 #define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 2u
 
 typedef enum {
@@ -973,18 +1096,29 @@ typedef struct {
   napi_value synthetic_evaluation_steps;
 } unofficial_napi_synthetic_module_options;
 
+UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
 typedef struct {
   size_t size;
   uint32_t version;
   unofficial_napi_module_kind kind;
   napi_value wrapper;
   napi_value url;
-  unofficial_napi_realm realm_or_null;
+  // Deprecated: use `realm_or_null`, with unofficial_napi_get_realm on the
+  // contextified object. Kept for compatibility and removed in a future major
+  // release.
+  napi_value context_or_undefined
+      UNOFFICIAL_NAPI_DEPRECATED_MEMBER("use realm_or_null");
   union {
     unofficial_napi_source_text_module_options source_text;
     unofficial_napi_synthetic_module_options synthetic;
   } payload;
+  // Version 2.
+  unofficial_napi_realm realm_or_null;
 } unofficial_napi_module_create_options;
+UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
+
+#define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_V1_SIZE \
+  offsetof(unofficial_napi_module_create_options, realm_or_null)
 
 // Immutable metadata produced by the same transaction that creates a module.
 // The layout is selected by options.version, so adding fields requires a new

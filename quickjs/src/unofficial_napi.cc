@@ -8,6 +8,7 @@
 #include "internal/napi_util.h"
 #include "internal/napi_shared_array_buffer.h"
 #include "internal/quickjs_trace.h"
+#include "napi_compat.h"
 #include "node_api.h"
 
 #include <algorithm>
@@ -1230,16 +1231,19 @@ extern "C"
         const unofficial_napi_bytecode_open_options *options,
         unofficial_napi_bytecode_open_result *result)
     {
-        if (!napi_util__::check_env(env) || options == nullptr || result == nullptr ||
-            options->size < sizeof(*options) ||
-            options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
-            options->source_text == nullptr || options->filename == nullptr ||
+        if (!napi_util__::check_env(env) || options == nullptr || result == nullptr)
+            return napi_invalid_arg;
+        unofficial_napi_realm realm = nullptr;
+        napi_status realm_status = napi::compat::bytecode_open_realm(env, options, &realm);
+        if (realm_status != napi_ok)
+            return realm_status;
+        if (options->source_text == nullptr || options->filename == nullptr ||
             (options->cache_policy != unofficial_napi_bytecode_cache_compile_on_reject &&
              options->cache_policy != unofficial_napi_bytecode_cache_validate_only))
             return napi_invalid_arg;
 
         *result = {};
-        JSContext *target = env->contextify().realm_context(options->realm_or_null);
+        JSContext *target = env->contextify().realm_context(realm);
         if (target == nullptr)
             return napi_invalid_arg;
         if (options->has_cache != 0 && options->cache_bytes != nullptr &&
@@ -1347,13 +1351,14 @@ extern "C"
         const unofficial_napi_module_create_options *options,
         unofficial_napi_module_create_result *result_out)
     {
-        if (!napi_util__::check_env(env) || options == nullptr ||
-            options->size < sizeof(*options) ||
-            options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
-            result_out == nullptr)
+        if (!napi_util__::check_env(env) || options == nullptr || result_out == nullptr)
             return napi_invalid_arg;
+        unofficial_napi_realm realm = nullptr;
+        napi_status realm_status = napi::compat::module_create_realm(env, options, &realm);
+        if (realm_status != napi_ok)
+            return realm_status;
         *result_out = {};
-        JSContext *ctx = env->contextify().realm_context(options->realm_or_null);
+        JSContext *ctx = env->contextify().realm_context(realm);
         if (ctx == nullptr)
             return napi_invalid_arg;
         napi_status status = napi_invalid_arg;

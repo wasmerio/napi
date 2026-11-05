@@ -27,7 +27,7 @@ use crate::{
     snapi::*,
 };
 
-use super::{abi, util::*};
+use super::{abi, compat, util::*};
 use crate::snapi_js::{
     host_js_get_named_property, host_js_has_named_property, host_js_put_primitive,
     host_js_set_named_property, host_js_value,
@@ -1753,13 +1753,18 @@ fn guest_unofficial_napi_bytecode_open(
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    let realm =
+        match compat::bytecode_open_realm(env_handle, options.version, options.realm_or_null) {
+            Ok(realm) => realm,
+            Err(status) => return status,
+        };
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
     let status = unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
-            options.realm_or_null,
+            realm,
             options.source_text,
             options.filename,
             options.shape,
@@ -1826,6 +1831,15 @@ fn guest_unofficial_napi_module_wrap_create(
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    let realm = match compat::module_create_realm(
+        env_handle,
+        options.version,
+        options.context_or_undefined,
+        options.realm_or_null,
+    ) {
+        Ok(realm) => realm,
+        Err(status) => return status,
+    };
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
@@ -1835,7 +1849,7 @@ fn guest_unofficial_napi_module_wrap_create(
             options.kind,
             options.wrapper,
             options.url,
-            options.realm_or_null,
+            realm,
             options.source_text,
             options.source_bytecode,
             options.line_offset,

@@ -152,6 +152,8 @@ const WAT: &str = r#"(module
       (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 32)))
   ;; Creates, links, instantiates, evaluates and destroys a source text
   ;; module. Returns 0, or 1000 * step + status for the first failing step.
+  ;; The options are version 1, as a guest built against older headers
+  ;; sends them, with no context: the current realm.
   (func (export "eval_module") (param $ptr i32) (param $len i32) (result i32)
     (local $status i32) (local $module i32)
     (i32.store (i32.const 16) (i32.const 0))
@@ -159,7 +161,7 @@ const WAT: &str = r#"(module
     (i32.store (i32.const 24) (i32.const 0))
     (if (call $create_object (global.get $env) (i32.const 52)) (then unreachable))
     (i32.store (i32.const 128) (i32.const 40))
-    (i32.store (i32.const 132) (i32.const 2))
+    (i32.store (i32.const 132) (i32.const 1))
     (i32.store (i32.const 136) (i32.const 1))
     (i32.store (i32.const 140) (i32.load (i32.const 52)))
     (i32.store (i32.const 144) (call $string (i32.const 180) (i32.const 8)))

@@ -32,6 +32,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "napi_compat.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -1914,17 +1915,18 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
     napi_env env,
     const unofficial_napi_bytecode_open_options* options,
     unofficial_napi_bytecode_open_result* result) {
-  if (env == nullptr || options == nullptr || result == nullptr ||
-      options->size < sizeof(*options) ||
-      options->version != UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION ||
-      options->source_text == nullptr || options->filename == nullptr ||
+  if (env == nullptr || options == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::HandleScope handle_scope(env->isolate);
+  unofficial_napi_realm realm = nullptr;
+  const napi_status realm_status = napi::compat::bytecode_open_realm(env, options, &realm);
+  if (realm_status != napi_ok) return realm_status;
+  if (options->source_text == nullptr || options->filename == nullptr ||
       (options->cache_policy != unofficial_napi_bytecode_cache_compile_on_reject &&
        options->cache_policy != unofficial_napi_bytecode_cache_validate_only)) {
     return napi_invalid_arg;
   }
   *result = {};
-  v8::HandleScope handle_scope(env->isolate);
-  v8::Local<v8::Context> context = RealmContext(env, options->realm_or_null);
+  v8::Local<v8::Context> context = RealmContext(env, realm);
   if (context.IsEmpty()) return napi_invalid_arg;
 
   if (options->has_cache != 0 && options->cache_bytes != nullptr &&
@@ -2571,10 +2573,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
     napi_env env,
     const unofficial_napi_module_create_options* options,
     unofficial_napi_module_create_result* result_out) {
-  if (options == nullptr || options->size < sizeof(*options) ||
-      options->version != UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION ||
-      result_out == nullptr) {
-    return napi_invalid_arg;
+  if (env == nullptr || options == nullptr || result_out == nullptr) return napi_invalid_arg;
+  unofficial_napi_realm realm = nullptr;
+  {
+    v8::HandleScope handle_scope(env->isolate);
+    const napi_status realm_status = napi::compat::module_create_realm(env, options, &realm);
+    if (realm_status != napi_ok) return realm_status;
   }
   *result_out = {};
   napi_status status = napi_invalid_arg;
@@ -2584,7 +2588,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
           env,
           options->wrapper,
           options->url,
-          options->realm_or_null,
+          realm,
           options->payload.source_text.source,
           options->payload.source_text.line_offset,
           options->payload.source_text.column_offset,
@@ -2596,7 +2600,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
           env,
           options->wrapper,
           options->url,
-          options->realm_or_null,
+          realm,
           options->payload.synthetic.export_names,
           options->payload.synthetic.synthetic_evaluation_steps,
           &result_out->module);

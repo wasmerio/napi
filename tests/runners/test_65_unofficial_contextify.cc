@@ -467,7 +467,7 @@ TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
             napi_invalid_arg);
   invalid_options = create_options;
-  invalid_options.version = 1;
+  invalid_options.size = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_V1_SIZE;
   EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &invalid_options, &create_result),
             napi_invalid_arg);
   invalid_options = create_options;

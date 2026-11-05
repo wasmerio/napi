@@ -355,9 +355,11 @@ TEST_F(Test66UnofficialRealm, BytecodeIsOpenedForARealm) {
   options.host_defined_option_id = undefined;
   unofficial_napi_bytecode_open_result opened{};
 
-  unofficial_napi_bytecode_open_options v1 = options;
-  v1.version = 1;
-  EXPECT_EQ(unofficial_napi_bytecode_open(s.env, &v1, &opened), napi_invalid_arg);
+  // Version 2 must be long enough to hold the realm. (Version 1 is
+  // test_71's.)
+  unofficial_napi_bytecode_open_options short_v2 = options;
+  short_v2.size = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_V1_SIZE;
+  EXPECT_EQ(unofficial_napi_bytecode_open(s.env, &short_v2, &opened), napi_invalid_arg);
 
   for (unofficial_napi_realm target : {realm, static_cast<unofficial_napi_realm>(nullptr)}) {
     options.realm_or_null = target;

@@ -49,10 +49,9 @@ struct Wasm32JsSource {
 }
 
 #[repr(C)]
-struct Wasm32BytecodeOpenOptionsV2 {
+struct Wasm32BytecodeOpenOptionsV1 {
     size: u32,
     version: u32,
-    realm_or_null: u32,
     source_text: u32,
     filename: u32,
     shape: i32,
@@ -67,15 +66,29 @@ struct Wasm32BytecodeOpenOptionsV2 {
     reserved: [u8; 2],
 }
 
+/// Version 2 appends the realm to version 1.
 #[repr(C)]
-struct Wasm32ModuleCreateOptionsV2 {
+struct Wasm32BytecodeOpenOptionsV2 {
+    v1: Wasm32BytecodeOpenOptionsV1,
+    realm_or_null: u32,
+}
+
+#[repr(C)]
+struct Wasm32ModuleCreateOptionsV1 {
     size: u32,
     version: u32,
     kind: i32,
     wrapper: u32,
     url: u32,
-    realm_or_null: u32,
+    context_or_undefined: u32,
     payload: [u8; 16],
+}
+
+/// Version 2 appends the realm to version 1.
+#[repr(C)]
+struct Wasm32ModuleCreateOptionsV2 {
+    v1: Wasm32ModuleCreateOptionsV1,
+    realm_or_null: u32,
 }
 
 #[repr(C)]
@@ -118,8 +131,10 @@ struct Wasm32RealmOptionsV1 {
 const JS_SOURCE_SIZE: usize = std::mem::size_of::<Wasm32JsSource>();
 const RUNTIME_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RuntimeOptionsV1>();
 const ENV_CREATE_PREFIX_SIZE: usize = std::mem::size_of::<Wasm32EnvCreateOptionsV1>();
-const BYTECODE_OPEN_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV2>();
-const MODULE_CREATE_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV2>();
+const BYTECODE_OPEN_V1_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV1>();
+const BYTECODE_OPEN_V2_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV2>();
+const MODULE_CREATE_V1_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV1>();
+const MODULE_CREATE_V2_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV2>();
 const MODULE_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32ModuleHooksV1>();
 const ENV_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32EnvHooksV2>();
 const REALM_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RealmOptionsV1>();
@@ -128,8 +143,10 @@ const _: () = assert!(std::mem::size_of::<Wasm32VersionedHeader>() == 8);
 const _: () = assert!(JS_SOURCE_SIZE == 12);
 const _: () = assert!(RUNTIME_OPTIONS_SIZE == 16);
 const _: () = assert!(ENV_CREATE_PREFIX_SIZE == 48);
-const _: () = assert!(BYTECODE_OPEN_SIZE == 52);
-const _: () = assert!(MODULE_CREATE_SIZE == 40);
+const _: () = assert!(BYTECODE_OPEN_V1_SIZE == 48);
+const _: () = assert!(BYTECODE_OPEN_V2_SIZE == 52);
+const _: () = assert!(MODULE_CREATE_V1_SIZE == 40);
+const _: () = assert!(MODULE_CREATE_V2_SIZE == 44);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateJsPayload>() == 16);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateSyntheticPayload>() == 16);
 const _: () = assert!(MODULE_HOOKS_SIZE == 16);
@@ -164,6 +181,29 @@ fn read_versioned(
         return None;
     }
     Some(bytes)
+}
+
+/// Reads a struct that grows at the end, whose version `n` is `sizes[n - 1]`
+/// bytes long. Returns the version and only that version's bytes.
+fn read_grown(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    sizes: &[usize],
+) -> Option<(u32, Vec<u8>)> {
+    if guest_ptr == 0 {
+        return None;
+    }
+    let header = read_guest_bytes(env, guest_ptr, std::mem::size_of::<Wasm32VersionedHeader>())?;
+    let size = u32_at(&header, std::mem::offset_of!(Wasm32VersionedHeader, size))?;
+    let version = u32_at(
+        &header,
+        std::mem::offset_of!(Wasm32VersionedHeader, version),
+    )?;
+    let prefix_size = *sizes.get(usize::try_from(version).ok()?.checked_sub(1)?)?;
+    if size < prefix_size as u32 {
+        return None;
+    }
+    Some((version, read_guest_bytes(env, guest_ptr, prefix_size)?))
 }
 
 pub(crate) fn read_output_header(
@@ -283,7 +323,10 @@ pub(crate) fn read_js_source(
 }
 
 pub(crate) struct BytecodeOpen {
-    /// The guest realm id (0 for the env's own realm).
+    /// 1 or 2. Version 1 compiles for the current realm.
+    pub version: u32,
+    /// The guest realm id of version 2 (0 for the env's own realm); 0 in
+    /// version 1.
     pub realm_or_null: u32,
     pub source_text: u32,
     pub filename: u32,
@@ -301,18 +344,22 @@ pub(crate) fn read_bytecode_open(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
 ) -> Option<BytecodeOpen> {
-    let bytes = read_versioned(env, guest_ptr, BYTECODE_OPEN_SIZE, 2)?;
+    let (version, bytes) = read_grown(
+        env,
+        guest_ptr,
+        &[BYTECODE_OPEN_V1_SIZE, BYTECODE_OPEN_V2_SIZE],
+    )?;
     let cache_ptr = u32_at(
         &bytes,
-        std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, cache_bytes),
+        std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, cache_bytes),
     )?;
     let cache_length = u32_at(
         &bytes,
-        std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, cache_byte_length),
+        std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, cache_byte_length),
     )? as usize;
-    let has_cache = *bytes.get(std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, has_cache))?;
+    let has_cache = *bytes.get(std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, has_cache))?;
     let cache_policy = *bytes.get(std::mem::offset_of!(
-        Wasm32BytecodeOpenOptionsV2,
+        Wasm32BytecodeOpenOptionsV1,
         cache_policy
     ))?;
     let cache = if has_cache != 0 && cache_length != 0 {
@@ -324,37 +371,42 @@ pub(crate) fn read_bytecode_open(
         Vec::new()
     };
     Some(BytecodeOpen {
-        realm_or_null: u32_at(
-            &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, realm_or_null),
-        )?,
+        version,
+        realm_or_null: if version >= 2 {
+            u32_at(
+                &bytes,
+                std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, realm_or_null),
+            )?
+        } else {
+            0
+        },
         source_text: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, source_text),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, source_text),
         )?,
         filename: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, filename),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, filename),
         )?,
         shape: i32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, shape),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, shape),
         )?,
         params_or_undefined: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, params_or_undefined),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, params_or_undefined),
         )?,
         host_defined_option_id: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, host_defined_option_id),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, host_defined_option_id),
         )?,
         line_offset: i32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, line_offset),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, line_offset),
         )?,
         column_offset: i32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, column_offset),
+            std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, column_offset),
         )?,
         cache,
         has_cache,
@@ -363,10 +415,14 @@ pub(crate) fn read_bytecode_open(
 }
 
 pub(crate) struct ModuleCreate {
+    /// 1 or 2.
+    pub version: u32,
     pub kind: i32,
     pub wrapper: u32,
     pub url: u32,
-    /// The guest realm id (0 for the env's own realm).
+    /// The deprecated context's value id (0 for NULL).
+    pub context_or_undefined: u32,
+    /// The guest realm id of version 2 (0 for NULL); 0 in version 1.
     pub realm_or_null: u32,
     pub source_text: u32,
     pub source_bytecode: u32,
@@ -381,12 +437,16 @@ pub(crate) fn read_module_create(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
 ) -> Option<ModuleCreate> {
-    let bytes = read_versioned(env, guest_ptr, MODULE_CREATE_SIZE, 2)?;
+    let (version, bytes) = read_grown(
+        env,
+        guest_ptr,
+        &[MODULE_CREATE_V1_SIZE, MODULE_CREATE_V2_SIZE],
+    )?;
     let kind = i32_at(
         &bytes,
-        std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, kind),
+        std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, kind),
     )?;
-    let payload_offset = std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, payload);
+    let payload_offset = std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, payload);
     let (
         source_text,
         source_bytecode,
@@ -444,19 +504,28 @@ pub(crate) fn read_module_create(
         _ => return None,
     };
     Some(ModuleCreate {
+        version,
         kind,
         wrapper: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, wrapper),
+            std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, wrapper),
         )?,
         url: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, url),
+            std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, url),
         )?,
-        realm_or_null: u32_at(
+        context_or_undefined: u32_at(
             &bytes,
-            std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, realm_or_null),
+            std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, context_or_undefined),
         )?,
+        realm_or_null: if version >= 2 {
+            u32_at(
+                &bytes,
+                std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, realm_or_null),
+            )?
+        } else {
+            0
+        },
         source_text,
         source_bytecode,
         line_offset,
