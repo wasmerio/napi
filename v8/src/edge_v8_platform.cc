@@ -16,6 +16,13 @@
 
 namespace {
 
+// EdgeV8Platform::SetForegroundTaskWaker.
+std::atomic<void (*)()> g_foreground_task_waker{nullptr};
+
+void WakeForForegroundTask() {
+  if (void (*waker)() = g_foreground_task_waker.load(std::memory_order_acquire)) waker();
+}
+
 struct WorkerWarmupState {
   std::mutex mutex;
   std::condition_variable cv;
@@ -254,6 +261,10 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
       }
       if (delay_ms == 0) {
         runner->PostTask(std::move(counted_task), location);
+        // Only a checkpoint runs it (PumpPendingForegroundTasks): wake the
+        // embedder so that one comes now. A delayed task waits for whatever
+        // checkpoint follows its delay, as before.
+        WakeForForegroundTask();
       } else {
         runner->PostDelayedTask(std::move(counted_task), delay_ms / 1000.0, location);
       }
@@ -316,6 +327,10 @@ bool EdgeV8Platform::SetWorkerThreadCount(int count) {
   }
   g_worker_thread_count.store(requested, std::memory_order_release);
   return true;
+}
+
+void EdgeV8Platform::SetForegroundTaskWaker(void (*waker)()) {
+  g_foreground_task_waker.store(waker, std::memory_order_release);
 }
 
 std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create() {
