@@ -253,3 +253,25 @@ TEST_F(Test72HooksKeepTermination, DynamicImportCallback) {
         "after = 'yes';\n");
   }
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// import() with no module hooks calls the `__napi_dynamic_import` helper; only
+// V8 does. V8 rejected the import()'s promise with the null its TryCatch
+// records for the termination and returned it: the JS that imported ran on,
+// and the termination was gone once the run returned.
+TEST_F(Test72HooksKeepTermination, DefaultDynamicImportHelper) {
+  for (const char* setup :
+       {"globalThis.__napi_dynamic_import = (specifier, name) => { terminate(); tick(); };",
+        "Object.defineProperty(globalThis, '__napi_dynamic_import',"
+        "  { get() { terminate(); tick(); }, configurable: true });"}) {
+    SCOPED_TRACE(setup);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(RunScript(s.env, setup), napi_ok);
+    ExpectRunTerminated(
+        s.env,
+        "try { import('x').catch(() => {}); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+  }
+}
+#endif

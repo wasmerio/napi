@@ -131,6 +131,10 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   }
   if ((!helper_value->IsFunction()) &&
       (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
+    // A getter V8 terminated: the import() fails with the termination, which
+    // an empty result reports. A settled promise would let the JS that
+    // imported run on, and V8 drops the termination once that run returns.
+    if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     NapiV8TrackProviderPromise(isolate, promise);
@@ -141,6 +145,7 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   v8::Local<v8::Value> argv[2] = {specifier, resource_name};
   v8::Local<v8::Value> result;
   if (!helper->Call(context, global, 2, argv).ToLocal(&result)) {
+    if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
     if (try_catch.HasCaught()) {
       resolver->Reject(context, try_catch.Exception()).FromMaybe(false);
       try_catch.Reset();
