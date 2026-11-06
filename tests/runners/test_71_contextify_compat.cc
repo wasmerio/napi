@@ -1887,6 +1887,62 @@ TEST_F(Test71ContextifyCompat, ContextTokensFollowRealms) {
   EXPECT_FALSE(log.wrong_env);
 }
 
+// unofficial_napi_memory_pressure frees no realm record, so it runs no token
+// callback: a realm its collection takes keeps its token until
+// unofficial_napi_collect_garbage frees the record. Token hooks are V8's
+// only.
+TEST_F(Test71ContextifyCompat, MemoryPressureLeavesACollectedRealmsTokenToCollectGarbage) {
+  EnvScope s(runtime_.get());
+  TokenLog log;
+  log.env = s.env;
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.data = &log;
+  hooks.context_token_assign_callback = AssignToken;
+  hooks.context_token_unassign_callback = UnassignToken;
+  uint64_t accepted = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+
+  // A realm that nothing keeps, and a weak reference that tells when its
+  // global is collected.
+  napi_ref weak = nullptr;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value global = nullptr;
+    ASSERT_NE(FreshRealm(s.env, &global), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  const size_t assigned = log.events.size();
+
+  ASSERT_EQ(unofficial_napi_memory_pressure(s.env, unofficial_napi_memory_pressure_critical),
+            napi_ok);
+  bool collected = false;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, weak, &global), napi_ok);
+    collected = global == nullptr;
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  EXPECT_TRUE(collected) << "critical pressure did not collect the realm's global";
+  EXPECT_EQ(log.events.size(), assigned) << "memory pressure ran a token callback";
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  ASSERT_EQ(assigned, 1u);
+  ASSERT_EQ(log.events.size(), 2u);
+  EXPECT_EQ(log.events[1], std::make_pair('u', log.events[0].second));
+#else
+  EXPECT_TRUE(log.events.empty());
+#endif
+  ASSERT_EQ(napi_delete_reference(s.env, weak), napi_ok);
+  EXPECT_FALSE(log.wrong_env);
+}
+
 namespace {
 
 // The context-token hooks at release, for realms made while the env is

@@ -476,6 +476,17 @@ typedef enum unofficial_napi_memory_pressure_level {
 //
 // QuickJS: moderate and critical run a full cycle collection.
 //
+// What a collection here frees is finalized as after any other collection.
+// V8 runs no JavaScript and no finalizer in the call: it queues the
+// finalizers for the env's thread, where a task it posts through the enqueue
+// hook (in the call), or else the next unofficial_napi_event_loop_checkpoint,
+// runs them. QuickJS runs the finalizers of the values it frees in the call,
+// in the env's realm, as unofficial_napi_collect_garbage does. Unlike
+// unofficial_napi_collect_garbage, the call frees no record of a collected
+// realm, so it runs no context-token callback (deprecated, V8 only): a realm
+// it collects keeps its token until the next unofficial_napi_create_realm or
+// unofficial_napi_collect_garbage, or the env's release.
+//
 // Host-JavaScript providers: napi_generic_failure for every valid level.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_memory_pressure(
     napi_env env,

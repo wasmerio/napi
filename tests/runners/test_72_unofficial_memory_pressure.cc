@@ -91,6 +91,20 @@ void DeleteGarbageReference(napi_env env) {
   g_garbage = nullptr;
 }
 
+// makeFinalizedGarbage(): an object that points to itself, with a finalizer
+// that counts its runs.
+int g_finalized = 0;
+void CountFinalize(node_api_basic_env /*env*/, void* /*data*/, void* /*hint*/) {
+  ++g_finalized;
+}
+napi_value MakeFinalizedGarbage(napi_env env, napi_callback_info /*info*/) {
+  napi_value object = nullptr;
+  EXPECT_EQ(napi_create_object(env, &object), napi_ok);
+  EXPECT_EQ(napi_set_named_property(env, object, "self", object), napi_ok);
+  EXPECT_EQ(napi_add_finalizer(env, object, nullptr, CountFinalize, nullptr, nullptr), napi_ok);
+  return nullptr;
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 // runBigScript(): compiles and runs g_big_script. Its top-level function is
 // gone once the call returns, so only V8's compilation cache keeps the
@@ -165,6 +179,28 @@ TEST_F(Test72UnofficialMemoryPressure, CriticalPressureCollectsGarbageNow) {
   EXPECT_EQ(garbage, nullptr) << "critical pressure returned before it collected";
   EXPECT_EQ(RunScriptToString(s.env, "garbageIsAlive()"), "false");
   DeleteGarbageReference(s.env);
+}
+
+// Critical pressure finalizes what it frees as any collection does, which is
+// engine-specific: V8 runs no finalizer in the call but queues it for the
+// env's thread, where the next checkpoint runs it (the fixture attaches no
+// enqueue hook to post it to); QuickJS runs it in the call.
+TEST_F(Test72UnofficialMemoryPressure, CriticalPressureFinalizesAsAnyCollection) {
+  EnvScope s(runtime_.get());
+  DefineGlobalFunction(s.env, "makeFinalizedGarbage", MakeFinalizedGarbage);
+  g_finalized = 0;
+  ASSERT_EQ(RunScript(s.env, "makeFinalizedGarbage();"), napi_ok);
+  ASSERT_EQ(g_finalized, 0);
+
+  ASSERT_EQ(unofficial_napi_memory_pressure(s.env, kCritical), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(g_finalized, 0) << "V8 ran a finalizer inside the call";
+  uint32_t state = 0;
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, &state),
+            napi_ok);
+#endif
+  EXPECT_EQ(g_finalized, 1) << "the value critical pressure freed was not finalized";
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
