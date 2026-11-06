@@ -67,7 +67,8 @@ unofficial_napi_module CreateSourceTextModule(napi_env env, const char* text,
 }
 
 // `steps` is the source of the evaluation steps function.
-unofficial_napi_module CreateSyntheticModule(napi_env env, const char* steps) {
+unofficial_napi_module CreateSyntheticModule(napi_env env, const char* steps,
+                                             unofficial_napi_realm realm = nullptr) {
   napi_value wrapper = nullptr;
   napi_value names = nullptr;
   napi_value steps_value = nullptr;
@@ -78,6 +79,7 @@ unofficial_napi_module CreateSyntheticModule(napi_env env, const char* steps) {
   options.size = sizeof(options);
   options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
   options.kind = unofficial_napi_module_synthetic;
+  options.realm_or_null = realm;
   options.wrapper = wrapper;
   options.url = Str(env, "synthetic");
   options.payload.synthetic.export_names = names;
@@ -1080,6 +1082,186 @@ TEST_F(Test77ModuleWrapState, FacadeRunsInModulesRealmAndCrossRealmLinksAreRefus
   auto importer = CreateSourceTextModule(s.env, "import value from 'dep'; export default value;");
   EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &module), napi_pending_exception);
   EXPECT_EQ(TakePendingMessage(s.env), "Linked modules must use the same realm");
+}
+
+TEST_F(Test77ModuleWrapState, SandboxModuleEvaluationSynchronizesGlobals) {
+  EnvScope s(runtime_.get());
+  for (bool sync : {false, true}) {
+    SCOPED_TRACE(sync ? "evaluate_sync" : "evaluate");
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "seed", Str(s.env, "initial")), napi_ok);
+    unofficial_napi_realm_options options{};
+    unofficial_napi_realm_options_init(&options);
+    options.sandbox_or_null = sandbox;
+    unofficial_napi_realm realm = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    auto module = CreateSourceTextModule(s.env,
+        "globalThis.written = seed + ' module'; export default globalThis.written;", realm);
+    ASSERT_NE(module, nullptr);
+    // The sandbox can change between compiling and evaluating the module.
+    ASSERT_EQ(napi_set_named_property(s.env, sandbox, "seed", Str(s.env, "updated")), napi_ok);
+    napi_value result = nullptr;
+    if (sync) {
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result),
+                napi_ok);
+    } else {
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &result), napi_ok);
+      EXPECT_EQ(PromiseOutcome(s.env, result), "resolved");
+      ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &result), napi_ok);
+    }
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_get_named_property(s.env, result, "default", &value), napi_ok);
+    EXPECT_EQ(ValueText(s.env, value), "updated module");
+    ASSERT_EQ(napi_get_named_property(s.env, sandbox, "written", &value), napi_ok);
+    EXPECT_EQ(ValueText(s.env, value), "updated module");
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+}
+
+TEST_F(Test77ModuleWrapState, SandboxModuleWritesSurviveRejectedEvaluation) {
+  EnvScope s(runtime_.get());
+  for (bool sync : {false, true}) {
+    SCOPED_TRACE(sync ? "evaluate_sync" : "evaluate");
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    unofficial_napi_realm_options options{};
+    unofficial_napi_realm_options_init(&options);
+    options.sandbox_or_null = sandbox;
+    unofficial_napi_realm realm = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    auto module = CreateSourceTextModule(s.env,
+        "globalThis.written = 1; throw new Error('expected module error');", realm);
+    ASSERT_NE(module, nullptr);
+    napi_value result = nullptr;
+    if (sync) {
+      EXPECT_EQ(unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result),
+                napi_pending_exception);
+      EXPECT_EQ(TakePendingMessage(s.env), "expected module error");
+    } else {
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &result), napi_ok);
+      EXPECT_EQ(PromiseOutcome(s.env, result), "rejected: expected module error");
+    }
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_get_named_property(s.env, sandbox, "written", &value), napi_ok);
+    EXPECT_EQ(ValueText(s.env, value), "1");
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+}
+
+TEST_F(Test77ModuleWrapState, SyntheticEvaluationPreservesHostSandboxWrites) {
+  EnvScope s(runtime_.get());
+  for (bool source_root : {false, true}) {
+    for (bool rejects : {false, true}) {
+      SCOPED_TRACE(source_root ? "source root" : "synthetic root");
+      SCOPED_TRACE(rejects ? "rejects" : "resolves");
+      napi_value sandbox = nullptr, global = nullptr;
+      ASSERT_EQ(napi_run_script(s.env, Str(s.env, "({ value: 1, sourceValue: 0 })"), &sandbox), napi_ok);
+      ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+      ASSERT_EQ(napi_set_named_property(s.env, global, "sandbox", sandbox), napi_ok);
+      unofficial_napi_realm_options options{};
+      unofficial_napi_realm_options_init(&options);
+      options.sandbox_or_null = sandbox;
+      unofficial_napi_realm realm = nullptr;
+      ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+      std::string steps = "(function() {";
+      if (source_root)
+        steps += "if (sandbox.sourceValue !== 10) throw Error('source write was lost');";
+      steps += "sandbox.value = 2;";
+      if (rejects)
+        steps += "throw Error('expected synthetic error');";
+      steps += "})";
+      auto synthetic = CreateSyntheticModule(s.env, steps.c_str(), realm);
+      ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, synthetic, 0, nullptr), napi_ok);
+      auto root = synthetic;
+      unofficial_napi_module source = nullptr;
+      if (source_root) {
+        source = CreateSourceTextModule(s.env, "globalThis.sourceValue = 10;", realm);
+        root = CreateSourceTextModule(s.env,
+            "import 'source'; import 'synthetic'; export const value = globalThis.value;", realm);
+        ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, source, 0, nullptr), napi_ok);
+        const unofficial_napi_module dependencies[] = {source, synthetic};
+        ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 2, dependencies), napi_ok);
+      }
+      napi_value promise = nullptr;
+      const napi_status evaluated =
+          unofficial_napi_module_wrap_evaluate(s.env, root, -1, false, &promise);
+      if (rejects && !source_root && evaluated == napi_pending_exception) {
+        // V8 propagates a standalone synthetic evaluation callback's thrown
+        // exception directly; a source root instead rejects its promise.
+        EXPECT_EQ(TakePendingMessage(s.env), "expected synthetic error");
+        EXPECT_FALSE(ExceptionPending(s.env));
+      } else {
+        ASSERT_EQ(evaluated, napi_ok);
+        EXPECT_EQ(PromiseOutcome(s.env, promise),
+                  rejects ? "rejected: expected synthetic error" : "resolved");
+      }
+      napi_value value = nullptr;
+      ASSERT_EQ(napi_get_named_property(s.env, sandbox, "value", &value), napi_ok);
+      EXPECT_EQ(ValueText(s.env, value), "2");
+      if (source_root) {
+        ASSERT_EQ(napi_get_named_property(s.env, sandbox, "sourceValue", &value), napi_ok);
+        EXPECT_EQ(ValueText(s.env, value), "10");
+        if (!rejects) {
+          napi_value ns = nullptr;
+          ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, root, &ns), napi_ok);
+          ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+          EXPECT_EQ(ValueText(s.env, value), "2");
+        }
+        EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, root), napi_ok);
+        EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, source), napi_ok);
+      }
+      EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, synthetic), napi_ok);
+    }
+  }
+}
+
+TEST_F(Test77ModuleWrapState, ImportMetaHookPreservesHostSandboxWrites) {
+  EnvScope s(runtime_.get());
+  for (bool rejects : {false, true}) {
+    SCOPED_TRACE(rejects ? "rejects" : "resolves");
+    napi_value sandbox = nullptr, global = nullptr;
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, "({ value: 1, sourceValue: 0 })"), &sandbox), napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "sandbox", sandbox), napi_ok);
+    unofficial_napi_realm_options options{};
+    unofficial_napi_realm_options_init(&options);
+    options.sandbox_or_null = sandbox;
+    unofficial_napi_realm realm = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    const char* hook_source = rejects
+        ? "(function(id, meta) { sandbox.value = 2; throw Error('expected meta error'); })"
+        : "(function(id, meta) {"
+          "if (sandbox.sourceValue !== 10) throw Error('source write was lost');"
+          "sandbox.value = 2; meta.x = 3; })";
+    napi_value callback = nullptr;
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, hook_source), &callback), napi_ok);
+    unofficial_napi_module_hooks hooks{};
+    hooks.size = sizeof(hooks);
+    hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+    hooks.initialize_import_meta_object = callback;
+    ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+    auto module = CreateSourceTextModule(s.env,
+        "globalThis.sourceValue = 10; export const value = import.meta.x;"
+        "export const after = globalThis.value;", realm);
+    napi_value promise = nullptr;
+    ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_ok);
+    EXPECT_EQ(PromiseOutcome(s.env, promise), rejects ? "rejected: expected meta error" : "resolved");
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_get_named_property(s.env, sandbox, "value", &value), napi_ok);
+    EXPECT_EQ(ValueText(s.env, value), "2");
+    if (!rejects) {
+      napi_value ns = nullptr;
+      ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &ns), napi_ok);
+      ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+      EXPECT_EQ(ValueText(s.env, value), "3");
+      ASSERT_EQ(napi_get_named_property(s.env, ns, "after", &value), napi_ok);
+      EXPECT_EQ(ValueText(s.env, value), "2");
+    }
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
 }
 
 namespace {

@@ -1481,20 +1481,23 @@ fn guest_unofficial_napi_bytecode_open(
     status
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_bytecode_serialize(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     bytecode: u32,
     buffer_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut buffer_id = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id) };
+    // Packaging cache bytes can call the guest's Buffer.from.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id)
+    })?;
     if status == 0 && buffer_ptr != 0 {
         write_guest_u32(&mut env, buffer_ptr, buffer_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_bytecode_release(
@@ -1800,21 +1803,23 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
     status
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_create_cached_data(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    // Packaging cache bytes can call the guest's Buffer.from.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create_cached_data(env_handle, handle, &mut result_id)
-    };
+    })?;
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, result_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_set_hooks(

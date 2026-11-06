@@ -6,7 +6,7 @@
 
 use std::ffi::{CString, c_void};
 
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
+use wasmer::{AsStoreMut, AsStoreRef, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasm_bindgen::JsValue;
@@ -18,7 +18,7 @@ use crate::{
     guest::{
         MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{
-            flush_host_buffer_copies_for_owner, install_async_owner,
+            flush_host_buffer_copies_for_owner, guest_memory_buffer, install_async_owner,
             publish_pending_host_buffer_copies, refresh_host_buffer_copies, with_callback_state,
             with_callback_state_async,
         },
@@ -51,11 +51,9 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     }
 
-    #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    let async_env = env.as_async_mut();
     let (env_id, _scope_id) = env.data_mut().register_napi_env(snapi_env_state);
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    install_async_owner(&mut env, env_id, snapi_env_state, async_env);
+    install_async_owner(&mut env, env_id, snapi_env_state);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -425,7 +423,7 @@ fn resolve_current_host_value_to_guest(
     if let Some(guest_ptr) = cached {
         if prepare_cached_guest_data(env, guest_env, handle_id, guest_ptr) {
             let memory = env.data().memory.clone()?;
-            let memory_buffer = memory.as_js().js_buffer();
+            let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
             if crate::snapi_js::copy_value_bytes_to_memory(
                 snapi_env(env, guest_env),
                 handle_id,
@@ -448,7 +446,7 @@ fn resolve_current_host_value_to_guest(
     }
     let guest_ptr = allocate_guest_buffer(env, byte_len)?;
     let memory = env.data().memory.clone()?;
-    let memory_buffer = memory.as_js().js_buffer();
+    let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
     if crate::snapi_js::copy_value_bytes_to_memory(
         snapi_env(env, guest_env),
         handle_id,
@@ -541,11 +539,9 @@ fn guest_unofficial_napi_create_env(
     if status != 0 {
         return status;
     }
-    #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    let async_env = env.as_async_mut();
     let (env_id, scope_id) = env.data_mut().register_napi_env(snapi_env_state);
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    install_async_owner(&mut env, env_id, snapi_env_state, async_env);
+    install_async_owner(&mut env, env_id, snapi_env_state);
     if env_out_ptr != 0 {
         write_guest_u32(&mut env, env_out_ptr, env_id);
     }
@@ -4871,7 +4867,7 @@ fn guest_napi_create_buffer(
             recycle_guest_allocation(&mut env, guest_ptr);
             return 1;
         };
-        let memory_buffer = memory.as_js().js_buffer();
+        let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
         let mut out = 0u32;
         let status = crate::snapi_js::create_guest_buffer_view(
             snapi_env(&env, e),
@@ -5022,7 +5018,7 @@ fn guest_napi_create_buffer_copy(
         let Some(memory) = env.data().memory.clone() else {
             return 1;
         };
-        let memory_buffer = memory.as_js().js_buffer();
+        let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
         let mut out = 0u32;
         let status = crate::snapi_js::create_guest_buffer_view(
             snapi_env(&env, e),
@@ -5200,7 +5196,7 @@ fn guest_unofficial_napi_acquire_buffer_lease(
         let status = crate::snapi_js::copy_value_range_to_memory(
             snapi,
             vh,
-            &memory.as_js().js_buffer(),
+            &guest_memory_buffer(env.as_store_ref(), &memory),
             guest_ptr,
             offset,
             len,
@@ -5267,7 +5263,7 @@ fn guest_unofficial_napi_release_buffer_lease(
         status = crate::snapi_js::copy_memory_range_to_reference(
             snapi,
             lease.host_reference_id,
-            &memory.as_js().js_buffer(),
+            &guest_memory_buffer(env.as_store_ref(), &memory),
             lease.guest_ptr,
             lease.byte_offset,
             lease.byte_len,
@@ -5306,7 +5302,7 @@ fn guest_unofficial_napi_create_guest_backed_typedarray(
         recycle_guest_allocation(&mut env, guest_ptr);
         return 9;
     };
-    let memory_buffer = memory.as_js().js_buffer();
+    let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
     let mut out = 0u32;
     let status = crate::snapi_js::create_guest_typedarray_view(
         snapi_env(&env, e),

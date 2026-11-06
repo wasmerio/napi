@@ -31,6 +31,27 @@ constexpr int32_t kErrored = 5;
 constexpr int32_t kSourcePhase = 1;
 constexpr int32_t kEvaluationPhase = 2;
 
+class context_stack_scope
+{
+public:
+  context_stack_scope(std::vector<JSContext *> &stack, JSContext *ctx)
+      : stack_{stack}, active_{ctx != nullptr}
+  {
+    if (active_)
+      stack_.push_back(ctx);
+  }
+  ~context_stack_scope()
+  {
+    if (active_)
+      stack_.pop_back();
+  }
+  context_stack_scope(const context_stack_scope &) = delete;
+  context_stack_scope &operator=(const context_stack_scope &) = delete;
+private:
+  std::vector<JSContext *> &stack_;
+  bool active_;
+};
+
 bool is_nullish(napi_env env, napi_value value)
 {
   if (value == nullptr)
@@ -458,6 +479,46 @@ JSValue napi_module_wrap__::call_callback(JSValueConst callback,
   if (!JS_IsFunction(ctx_, callback))
     return JS_UNDEFINED;
   return JS_Call(ctx_, callback, JS_UNDEFINED, argc, argv);
+}
+
+JSValue napi_module_wrap__::call_module_callback(record *entry, JSValueConst callback,
+                                                  JSValueConst receiver, int argc,
+                                                  JSValueConst *argv)
+{
+  record_scope active{this, entry};
+  const bool source_running = std::find(source_evaluation_contexts_.begin(),
+      source_evaluation_contexts_.end(), entry->ctx) != source_evaluation_contexts_.end();
+  const bool callback_running = std::find(module_callback_contexts_.begin(),
+      module_callback_contexts_.end(), entry->ctx) != module_callback_contexts_.end();
+  // Source dependencies may have written globals before this host callback.
+  // A nested callback is already on the host side of that boundary: flushing
+  // again would overwrite the outer callback's sandbox changes.
+  if (source_running && !callback_running &&
+      env_->contextify().sync_sandbox_out(entry->ctx) != napi_ok)
+  {
+    napi_util__::rethrow_last_exception(env_, ctx_);
+    return JS_EXCEPTION;
+  }
+  JSValue result;
+  {
+    context_stack_scope callback_scope{module_callback_contexts_, entry->ctx};
+    result = JS_Call(ctx_, callback, receiver, argc, argv);
+  }
+  if (source_running && !env_->termination_requested())
+  {
+    const bool threw = JS_IsException(result);
+    JSValue exception = threw ? JS_GetException(ctx_) : JS_UNDEFINED;
+    if (env_->contextify().sync_sandbox_in(entry->ctx) != napi_ok)
+    {
+      JS_FreeValue(ctx_, exception);
+      JS_FreeValue(ctx_, result);
+      napi_util__::rethrow_last_exception(env_, ctx_);
+      return JS_EXCEPTION;
+    }
+    if (threw)
+      JS_Throw(ctx_, exception);
+  }
+  return result;
 }
 
 napi_status napi_module_wrap__::cache_module_requests(record *entry)
@@ -946,8 +1007,17 @@ napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValu
     if (status != napi_ok)
       return status;
   }
-  // The module evaluates in its realm.
-  JSValue promise = JS_EvaluateModule(entry->ctx, entry->module);
+  // A sandbox realm has a separate engine global. Populate it at evaluation
+  // time, after any changes the embedder made since compiling the module.
+  status = entry->synthetic ? napi_ok : env_->contextify().sync_sandbox_in(entry->ctx);
+  if (status != napi_ok)
+    return status;
+  // The module and its dependencies evaluate in their shared realm.
+  JSValue promise;
+  {
+    context_stack_scope source_scope{source_evaluation_contexts_, entry->synthetic ? nullptr : entry->ctx};
+    promise = JS_EvaluateModule(entry->ctx, entry->module);
+  }
   if (JS_IsException(promise))
     return return_pending_exception("Failed to evaluate module");
   // QuickJS settles an interrupted evaluation as a rejected promise. Report
@@ -957,6 +1027,12 @@ napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValu
     JS_PromiseMarkAsHandled(entry->ctx, promise);
     JS_FreeValue(entry->ctx, promise);
     return napi_util__::fail_if_terminating(env_, ctx_);
+  }
+  status = entry->synthetic ? napi_ok : env_->contextify().sync_sandbox_out(entry->ctx);
+  if (status != napi_ok)
+  {
+    JS_FreeValue(entry->ctx, promise);
+    return status;
   }
   *promise_out = promise;
   return napi_ok;
@@ -1480,7 +1556,7 @@ int napi_module_wrap__::initialize_synthetic_module(JSModuleDef *module)
   record_scope active{this, entry};
   JSValue wrapper = get_wrapper(entry);
   synthetic_steps_running_++;
-  JSValue result = JS_Call(ctx_, entry->synthetic_eval_steps, wrapper, 0, nullptr);
+  JSValue result = call_module_callback(entry, entry->synthetic_eval_steps, wrapper, 0, nullptr);
   synthetic_steps_running_--;
   JS_FreeValue(ctx_, wrapper);
   if (JS_IsException(result))
@@ -1500,7 +1576,7 @@ int napi_module_wrap__::initialize_import_meta(JSModuleDef *module, JSValueConst
       JS_DupValue(ctx_, meta),
       get_wrapper(entry),
   };
-  JSValue result = call_callback(initialize_import_meta_callback_, 3, args);
+  JSValue result = call_module_callback(entry, initialize_import_meta_callback_, JS_UNDEFINED, 3, args);
   for (JSValue arg : args)
     JS_FreeValue(ctx_, arg);
   if (JS_IsException(result))
