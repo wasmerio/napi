@@ -172,11 +172,13 @@ struct napi_env__
 
   bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
 
+  // At release: drops the exception a hook or finalizer left pending.
+  void drop_finalizer_exception();
+
 private:
   void clear_refs_for_teardown();
   void run_cleanup_hooks();
   void finalize_pending_values();
-  void drop_finalizer_exception();
   void finalize_instance_data();
   void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);
 

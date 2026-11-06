@@ -81,10 +81,17 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   // (the runtime frees what is still alive): no user code runs now.
   if (env_->finalizers_done())
     return;
+  // The finalizer may destroy this hint (deleting the reference napi_wrap
+  // returned does).
+  napi_env env = env_;
   // Finalizers run in the env's own realm, also when the collector runs
   // inside another realm.
-  napi_realm_frame_scope__ realm_frame{env_, nullptr, JS_UNDEFINED};
-  finalize_cb_(env_, external_data_, finalize_hint_);
+  napi_realm_frame_scope__ realm_frame{env, nullptr, JS_UNDEFINED};
+  finalize_cb_(env, external_data_, finalize_hint_);
+  // At release nothing can catch what it threw, also when the collector ran
+  // it inside another callback.
+  if (env->is_closing())
+    env->drop_finalizer_exception();
 }
 
 void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)
@@ -96,8 +103,11 @@ void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)
     return;
   released_ = true;
   // Teardown runs the finalizer itself, once the buffer is marked detached,
-  // and destroys the hint.
-  if (detaching_)
+  // and destroys the hint: when it is detaching the buffer, and when other
+  // code detaches or frees it while the release runs, so the finalizer still
+  // runs after the detach completes and as the release orders it.
+  if (detaching_ || (pending_link_.linked() && env_ != nullptr && env_->is_closing() &&
+                     !env_->finalizers_done()))
     return;
   invoke_finalizer();
   destroy_with_runtime(rt, this);
@@ -136,6 +146,8 @@ napi_external_backing_store_hint__ *napi_external_backing_store_hint__::first_pe
 
 void napi_external_backing_store_hint__::finalize_at_teardown()
 {
+  JSContext *ctx = env_->main_context();
+  JSValue array_buffer = JS_UNDEFINED;
   if (JS_GetNativeWeakRefFromLink(&array_buffer_link_) != nullptr)
   {
     // As Node's CallbackInfo::Clean does, detach the buffer before the
@@ -144,22 +156,18 @@ void napi_external_backing_store_hint__::finalize_at_teardown()
     // of the memory, unless ArrayBuffer.prototype.transfer already moved it to
     // a buffer this hint cannot reach (Node cannot either). The reference
     // keeps the buffer alive in case the finalizer drops the last other one.
-    JSContext *ctx = env_->main_context();
-    JSValue array_buffer = JS_DupValue(ctx, array_buffer_);
+    array_buffer = JS_DupValue(ctx, array_buffer_);
     detaching_ = true;
     JS_DetachArrayBuffer(ctx, array_buffer);
     detaching_ = false;
-    if (released_)
-    {
-      // The buffer no longer refers to the hint.
-      invoke_finalizer();
-      JS_FreeValue(ctx, array_buffer);
-      destroy(this);
-      return;
-    }
-    JS_FreeValue(ctx, array_buffer);
   }
+  // Released, by the detach above or earlier in the release: no buffer refers
+  // to the hint any more.
+  const bool released = released_;
   invoke_finalizer();
+  JS_FreeValue(ctx, array_buffer);
+  if (released)
+    destroy(this);
 }
 
 void napi_external_backing_store_hint__::abandon_finalizer()

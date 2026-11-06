@@ -519,6 +519,76 @@ TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRele
   EXPECT_TRUE(after.buffer_detached);
 }
 
+namespace {
+
+// An external array buffer a cleanup hook detaches at release. Its finalizer
+// records whether the buffer was detached when it ran, then throws.
+struct DetachedByAHook {
+  napi_env env = nullptr;
+  uint8_t bytes[8] = {};
+  napi_ref buffer = nullptr;
+  int finalized = 0;
+  bool detached_in_finalizer = false;
+  napi_status detach_status = napi_generic_failure;
+  bool pending_after_detach = true;
+  bool pending_in_instance_data = true;
+};
+
+void FinalizeCheckingItsBuffer(node_api_basic_env basic_env, void*, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
+  auto* detached = static_cast<DetachedByAHook*>(hint);
+  ++detached->finalized;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) == napi_ok) {
+    detached->detached_in_finalizer = IsDetached(env, detached->buffer);
+    napi_close_handle_scope(env, scope);
+  }
+  napi_throw_error(env, nullptr, "finalizer");
+}
+
+void DetachingHook(void* arg) {
+  auto* detached = static_cast<DetachedByAHook*>(arg);
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(detached->env, &scope) != napi_ok) return;
+  napi_value buffer = nullptr;
+  if (napi_get_reference_value(detached->env, detached->buffer, &buffer) == napi_ok) {
+    detached->detach_status = napi_detach_arraybuffer(detached->env, buffer);
+    napi_is_exception_pending(detached->env, &detached->pending_after_detach);
+  }
+  napi_close_handle_scope(detached->env, scope);
+}
+
+void FinalizeInstanceDataAfterTheBuffer(napi_env env, void* data, void*) {
+  auto* detached = static_cast<DetachedByAHook*>(data);
+  napi_is_exception_pending(env, &detached->pending_in_instance_data);
+}
+
+}  // namespace
+
+// A buffer a cleanup hook detaches at release is finalized as the release
+// finalizes the others: after it is detached, and with what it throws dropped
+// before anything else runs.
+TEST_F(Test41InstanceData, ArrayBufferAHookDetachesAtReleaseIsFinalizedDetached) {
+  EnvScope s(runtime_.get());
+  DetachedByAHook detached;
+  detached.env = s.env;
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, detached.bytes, sizeof(detached.bytes),
+                                             FinalizeCheckingItsBuffer, &detached, &buffer),
+            napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, buffer, 1, &detached.buffer), napi_ok);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, DetachingHook, &detached), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &detached, FinalizeInstanceDataAfterTheBuffer, nullptr),
+            napi_ok);
+
+  Release(s);
+  EXPECT_EQ(detached.detach_status, napi_ok);
+  EXPECT_EQ(detached.finalized, 1);
+  EXPECT_TRUE(detached.detached_in_finalizer);
+  EXPECT_FALSE(detached.pending_after_detach);
+  EXPECT_FALSE(detached.pending_in_instance_data);
+}
+
 // ArrayBuffer.prototype.transfer moves an external buffer's memory to a new
 // buffer. Its finalizer still runs once at release, whether the buffer it was
 // made as is alive then or not.
