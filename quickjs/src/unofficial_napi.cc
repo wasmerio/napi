@@ -524,8 +524,8 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* result)
     {
         if (!napi_util__::check_env(env) || result == nullptr) return napi_invalid_arg;
-        *result = false;
-        return napi_generic_failure;
+        *result = JS_IsExecutingJS(napi_util__::runtime(env));
+        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback)

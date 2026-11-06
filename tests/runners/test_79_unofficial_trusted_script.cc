@@ -14,7 +14,7 @@
 #endif
 
 // unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js.
-// V8 implements both; QuickJS reports them as unsupported.
+// Both native providers implement the query; trusted scripts require V8.
 class Test79UnofficialTrustedScript : public FixtureTestBase {};
 
 namespace {
@@ -25,12 +25,12 @@ napi_value Str(napi_env env, const char* value) {
   return out;
 }
 
-#if defined(NAPI_TEST_ENGINE_V8)
 struct MicrotaskRecord {
   unsigned calls = 0;
   unsigned active_calls = 0;
 };
 
+#if defined(NAPI_TEST_ENGINE_V8)
 // makeTrusted(source) wraps a primitive string in a TrustedScript.
 napi_value MakeTrusted(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -43,6 +43,8 @@ napi_value MakeTrusted(napi_env env, napi_callback_info info) {
   }
   return result;
 }
+
+#endif
 
 // executing() reports unofficial_napi_is_executing_js.
 napi_value Executing(napi_env env, napi_callback_info /*info*/) {
@@ -127,6 +129,7 @@ std::string TakeExceptionMessage(napi_env env) {
   return ::testing::AssertionSuccess();
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 uint64_t UsedHeapAfterGc(napi_env env) {
   for (int i = 0; i < 3; ++i) {
     if (unofficial_napi_collect_garbage(env) != napi_ok) return 0;
@@ -166,6 +169,8 @@ v8::ModifyCodeGenerationFromStringsResult EmbedderHook(v8::Local<v8::Context>,
   return result;
 }
 
+#endif
+
 void InstallGlobal(napi_env env, const char* name, napi_callback callback, void* data) {
   napi_value global = nullptr;
   napi_value function = nullptr;
@@ -174,7 +179,6 @@ void InstallGlobal(napi_env env, const char* name, napi_callback callback, void*
             napi_ok);
   ASSERT_EQ(napi_set_named_property(env, global, name, function), napi_ok);
 }
-#endif
 
 }  // namespace
 
@@ -390,6 +394,8 @@ TEST_F(Test79UnofficialTrustedScript, RespectsDisabledCodeGeneration) {
   EXPECT_TRUE(IsTrue(s.env, "eval(makeTrusted('5')) === 5"));
 }
 
+#endif
+
 TEST_F(Test79UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   EnvScope s(runtime_.get());
   MicrotaskRecord record;
@@ -416,11 +422,22 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   ASSERT_EQ(napi_get_value_bool(s.env, reported, &reported_active), napi_ok);
   EXPECT_FALSE(reported_active);
 
+  // Builtin call/bind frames alone also do not count as user JavaScript.
+  napi_value bound = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "Function.prototype.call.bind(executing)"), &bound),
+            napi_ok);
+  ASSERT_EQ(napi_call_function(s.env, global, bound, 0, nullptr, &reported), napi_ok);
+  ASSERT_EQ(napi_get_value_bool(s.env, reported, &reported_active), napi_ok);
+  EXPECT_FALSE(reported_active);
+
   napi_value microtask = nullptr;
   ASSERT_EQ(napi_create_function(
                 s.env, "microtask", NAPI_AUTO_LENGTH, RecordMicrotask, &record, &microtask),
             napi_ok);
   ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, microtask), napi_ok);
+  ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);  // A queued job is not executing yet.
+  EXPECT_EQ(record.calls, 0u);
   ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
                 s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
             napi_ok);
@@ -446,6 +463,7 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   EXPECT_TRUE(same);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test79UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
   TokenCallbackRecord record;
   EnvScope s(runtime_.get());
@@ -469,6 +487,7 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
   EXPECT_EQ(record.status, napi_ok);
   EXPECT_FALSE(record.active);
 }
+#endif
 
 // A native callback from the root context still sees JavaScript frames and
 // microtask checkpoints that belong to another context.
@@ -503,6 +522,11 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
   // queue, and the bound builtin adds no JavaScript frame.
   EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "Promise.resolve().then(Function.prototype.call.bind(microtask)), true"));
+  // QuickJS uses its runtime job queue; V8 has already drained the realm's
+  // own queue. Both queries must see the callback executing in its root realm.
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
   EXPECT_EQ(record.calls, 1u);
   EXPECT_EQ(record.active_calls, 1u);
 
@@ -510,10 +534,9 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
   ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
   EXPECT_FALSE(active);
 }
-#endif
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
-TEST_F(Test79UnofficialTrustedScript, Unsupported) {
+TEST_F(Test79UnofficialTrustedScript, TrustedScriptUnsupported) {
   EnvScope s(runtime_.get());
 
   napi_value result = Str(s.env, "sentinel");
@@ -523,14 +546,9 @@ TEST_F(Test79UnofficialTrustedScript, Unsupported) {
   EXPECT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "1"), nullptr),
             napi_invalid_arg);
 
-  bool active = true;
-  EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_generic_failure);
-  EXPECT_FALSE(active);
-  EXPECT_EQ(unofficial_napi_is_executing_js(s.env, nullptr), napi_invalid_arg);
 }
 #endif
 
-#if defined(NAPI_TEST_ENGINE_V8)
 namespace {
 unofficial_napi_realm MakeRealm(napi_env env, napi_value* global, bool allow_strings = true) {
   unofficial_napi_realm_options options;
@@ -542,6 +560,7 @@ unofficial_napi_realm MakeRealm(napi_env env, napi_value* global, bool allow_str
 }
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test79UnofficialTrustedScript, CreationUsesCurrentRealmAndEvalUsesCallersScope) {
   EnvScope s(runtime_.get());
   napi_value a_global = nullptr, b_global = nullptr, trusted = nullptr;
@@ -599,6 +618,8 @@ TEST_F(Test79UnofficialTrustedScript, ReceivingRealmControlsCodeGenerationPolicy
   EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {try {Function(trusted);} catch(e) {return e instanceof EvalError;} return false;})()"));
 }
 
+#endif
+
 TEST_F(Test79UnofficialTrustedScript, EnteringRealmAloneDoesNotMeanJsIsExecuting) {
   EnvScope s(runtime_.get());
   napi_value global = nullptr;
@@ -612,6 +633,117 @@ TEST_F(Test79UnofficialTrustedScript, EnteringRealmAloneDoesNotMeanJsIsExecuting
   ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
 }
 
+TEST_F(Test79UnofficialTrustedScript, SuspendedCoroutinesDoNotCountAsExecuting) {
+  EnvScope s(runtime_.get());
+  InstallGlobal(s.env, "executing", Executing, nullptr);
+  EXPECT_TRUE(IsTrue(s.env,
+      "globalThis.generator = (function* () {yield executing(); return executing()})(); "
+      "generator.next().value === true"));
+  bool active = true;
+  ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  EXPECT_TRUE(IsTrue(s.env, "generator.next().value === true"));
+  EXPECT_TRUE(IsTrue(s.env,
+      "globalThis.resumeAsync = null; globalThis.asyncActive = false; "
+      "(async () => {await new Promise(resolve => resumeAsync = resolve); "
+      "asyncActive = executing()})(); true"));
+  ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  EXPECT_TRUE(IsTrue(s.env, "resumeAsync(), true"));
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+            napi_ok);
+  EXPECT_TRUE(IsTrue(s.env, "asyncActive === true"));
+  ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+}
+
+namespace {
+napi_value ThrowFromJob(napi_env env, napi_callback_info info) {
+  RecordMicrotask(env, info);
+  auto status = napi_throw_error(env, nullptr, "job failure");
+  EXPECT_TRUE(status == napi_ok || status == napi_pending_exception);
+  return nullptr;
+}
+
+napi_value TerminateFromJs(napi_env env, napi_callback_info info) {
+  RecordMicrotask(env, info);
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  bool active = false;
+  EXPECT_EQ(unofficial_napi_is_executing_js(env, &active), napi_ok);
+  EXPECT_TRUE(active);  // The JavaScript caller has not unwound yet.
+  return nullptr;
+}
+
+void QueryDuringCleanup(void* data) {
+  auto* env = static_cast<napi_env*>(data);
+  bool active = true;
+  EXPECT_EQ(unofficial_napi_is_executing_js(*env, &active), napi_ok);
+  EXPECT_FALSE(active);
+}
+}  // namespace
+
+TEST_F(Test79UnofficialTrustedScript, QueryUnwindsAfterThrowingJob) {
+  EnvScope s(runtime_.get());
+  MicrotaskRecord record;
+  napi_value task = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "throwFromJob", NAPI_AUTO_LENGTH, ThrowFromJob,
+                                &record, &task), napi_ok);
+  ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, task), napi_ok);
+  // Providers differ in reporting uncaught microtask errors; execution state
+  // must unwind regardless, and the query must preserve any pending error.
+  auto status = unofficial_napi_event_loop_checkpoint(
+      s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr);
+  EXPECT_TRUE(status == napi_ok || status == napi_pending_exception);
+  EXPECT_EQ(record.calls, 1u);
+  EXPECT_EQ(record.active_calls, 1u);
+  bool pending_before = false, pending_after = false, active = true;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending_before), napi_ok);
+  ASSERT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending_after), napi_ok);
+  EXPECT_EQ(pending_before, pending_after);
+  if (pending_after) {
+    napi_value exception = nullptr;
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  }
+}
+
+TEST_F(Test79UnofficialTrustedScript, QuerySurvivesTerminationAndCleanup) {
+  napi_env cleanup_env = nullptr;
+  {
+    EnvScope s(runtime_.get());
+    cleanup_env = s.env;
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, QueryDuringCleanup, &cleanup_env), napi_ok);
+    MicrotaskRecord record;
+    InstallGlobal(s.env, "terminateFromJs", TerminateFromJs, &record);
+    napi_value ignored = nullptr;
+    EXPECT_EQ(napi_run_script(s.env, Str(s.env, "terminateFromJs()"), &ignored),
+              napi_pending_exception);
+    EXPECT_EQ(record.calls, 1u);
+    EXPECT_EQ(record.active_calls, 1u);
+    bool active = true;
+    EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+    EXPECT_FALSE(active);
+    EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+    napi_value global = nullptr, terminate = nullptr;
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_get_named_property(s.env, global, "terminateFromJs", &terminate), napi_ok);
+    ASSERT_EQ(unofficial_napi_enqueue_microtask(s.env, terminate), napi_ok);
+    EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr),
+              napi_pending_exception);
+    EXPECT_EQ(record.calls, 2u);
+    EXPECT_EQ(record.active_calls, 2u);
+    active = true;
+    EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+    EXPECT_FALSE(active);
+    EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+    EXPECT_TRUE(IsTrue(s.env, "1 === 1"));
+  }
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
 TEST_F(Test79UnofficialTrustedScript, CreationRefusesTerminationAndQueryKeepsPendingException) {
   EnvScope s(runtime_.get());
   napi_value source = Str(s.env, "42"), result = source;

@@ -18,12 +18,12 @@ Both must be called on the engine's owning thread.
 | Provider | create_trusted_script | is_executing_js |
 |---|---|---|
 | V8 | Native code-like object and code-generation hook | Native stack and microtask-checkpoint state |
-| QuickJS | Unsupported; napi_generic_failure and NULL output | Unsupported; napi_generic_failure and false output |
+| QuickJS | Unsupported; napi_generic_failure and NULL output | Native bytecode-frame and executing-job state |
 | Host JS | Unsupported; napi_generic_failure and zero value id | Unsupported; napi_generic_failure and false output |
 
-Unsupported providers do not emulate direct eval or infer VM execution state
-from adapter bookkeeping. Guest stubs still validate output pointers and zero
-valid outputs. A value id occupies four bytes; a bool occupies one byte.
+Unsupported operations do not emulate direct eval or infer VM execution state
+from adapter bookkeeping. Host-JS guest stubs still validate output pointers and
+zero valid outputs. A value id occupies four bytes; a bool occupies one byte.
 
 ## Trusted-script contract on V8
 
@@ -87,10 +87,10 @@ it cannot enforce a “trusted objects only” policy in that configuration.
 
 `is_executing_js` describes the whole engine instance, across its realms and
 security tokens. It returns true while a user-JavaScript frame exists or a
-microtask checkpoint is running. Provider-driven checkpoints, including a
-realm's own queue, use an agent-wide scoped depth so the answer stays true
-when a callback temporarily runs in a different N-API realm. The query does
-not scan the realm registry or take bridge/provider locks.
+microtask checkpoint (V8) or job (QuickJS) is running. V8 provider-driven
+checkpoints, including a realm's own queue, use an agent-wide scoped depth so
+the answer stays true when a callback temporarily runs in a different N-API
+realm. The query does not scan the realm registry or take bridge/provider locks.
 
 Entering a realm from C++ does not mean JavaScript is executing. A native
 function called directly from C, or through a builtin with no user-JavaScript
@@ -103,10 +103,33 @@ The bridge calls use the existing owner-thread validation. They do not hold
 `g_mu` while invoking the provider; restoring the old recursive lock or
 changing it to a plain-mutex guard would violate the bridge's concurrency model.
 
-## QuickJS follow-up
+### QuickJS execution-state implementation
 
-Native QuickJS support would be useful for embedders using this API across
-providers, but it needs an engine change. At the pinned QuickJS revision,
+The QuickJS fork exposes `JS_IsExecutingJS(JSRuntime*)`. It walks the live frame
+chain and recognizes ordinary, generator, async, and async-generator bytecode
+functions. Native C functions, C function-data callbacks, closures, and builtins
+do not count by themselves. Suspended coroutines are absent from the active
+chain. A runtime-wide job depth spans `JS_ExecutePendingJob`, including cleanup,
+so native-only promise/microtask callbacks count, nested job calls retain the
+outer job's state, and errors or termination unwind the state. Queuing a job
+alone does not make the runtime active.
+
+This is a read-only engine query: it allocates nothing, invokes no JavaScript,
+and does not inspect or clear pending exceptions. It covers every context in
+the runtime and remains accurate when a native callback acts in its creation
+realm while JavaScript runs in another realm. The provider returns `napi_ok`
+with that result. Both the env and runtime must remain live, and calls stay on
+the owning thread.
+
+QuickJS uses its runtime job queue; its realm `own_microtask_queue` option does
+not introduce a separate V8-style checkpoint. The query does not change job
+scheduling or implement that separate queue capability.
+
+## QuickJS trusted-script follow-up
+
+Native QuickJS trusted-script support would be useful for embedders using this
+API across providers, but it needs additional engine changes. At the pinned
+QuickJS revision,
 `JS_EvalObject` returns non-string arguments unchanged before entering the
 parser. The Function constructor separately stringifies its arguments.
 Replacing the global eval function or coercing the object in the provider
@@ -126,17 +149,16 @@ A separate engine/provider follow-up should cover:
 5. Forgery, prototype mutation, proxies, cross-realm scope/policy, termination,
    GC, teardown, Unicode, and native/WASIX regression coverage.
 
-`is_executing_js` is a separate capability: implementing trusted scripts should
-not make it claim support. An execution query would also need native engine
-stack/job state and tests for C-only callbacks versus JavaScript callers.
-
-This PR keeps both QuickJS capabilities explicitly unsupported. It does not
-modify the QuickJS fork or change its pinned revision.
+`is_executing_js` is a separate capability and is implemented in this PR.
+Trusted scripts remain explicitly unsupported on QuickJS. This PR updates the
+pinned fork to include the native execution-state query; it does not emulate
+trusted scripts in the provider.
 
 ## Validation of the realm adaptation
 
 The primary runner is `tests/runners/test_79_unofficial_trusted_script.cc`:
-20 V8 cases and one QuickJS unsupported case. Original direct-eval and brand
+23 V8 cases and seven QuickJS cases (six execution-state cases and one
+unsupported trusted-script case). Original direct-eval and brand
 checks are retained. The new realm coverage includes callback-creation realm,
 receiving-realm lexical scope and policy, realm collection, security-token
 boundaries, entered-but-idle realms, termination, cleanup hooks, and Function's
@@ -145,7 +167,14 @@ checked through `create_realm`; other tests use the explicit realm APIs.
 
 `tests/programs/test_trusted_script.c` drives both helpers and the realm
 imports natively and through WASIX, including pointer bounds, code generation,
-and cross-realm direct eval. A wasm-bindgen test instantiates a WAT guest to
+and cross-realm direct eval. `tests/programs/test_execution_state.c` separately
+checks the query without
+requiring trusted-script support, including native callbacks, promise jobs,
+cross-realm execution and pending exceptions. The QuickJS fork also runs its
+focused `api-test --is-executing-js` regression through `make test` in CI, including
+C-function
+variants, builtins, coroutine suspension, nested job errors, runtime isolation
+and interruption. A wasm-bindgen test instantiates a WAT guest to
 check real host-JS import dispatch, unsupported statuses, output zeroing,
 and the different u32/bool pointer bounds.
 
@@ -154,3 +183,19 @@ PR description. The V8 package is named 11.9.9; its headers report V8
 13.6.233.17. No EdgeJS or WebkitWasm application build is claimed by these
 provider/guest tests, and no execution-query performance improvement is claimed:
 the V8 query still captures a stack trace on each call.
+
+The QuickJS execution-query follow-up uses fork revision `e0247ad` from
+[QuickJS PR #11](https://github.com/wasmerio/quickjs/pull/11). Local macOS arm64
+validation passed the complete Release suites (313 QuickJS and 379 V8 tests),
+the engine's focused regression in Release and Debug with ASan + UBSan, and its
+bundled conformance run (0/120 errors, 10 excluded). The standalone execution-state
+program passes against native QuickJS, native V8, and as WASIX through the V8
+CLI. All seven QuickJS feature cases pass with the combined sanitizers.
+
+The broader QuickJS Debug + ASan + UBSan suite has 309 passes and four failures.
+All four reproduce on the unchanged `317ed89` PR head with QuickJS `870aa7b`:
+`ErrorMetadataSnapshotConsumesPreservedStateAtomically` and the two
+`ModuleStateIsOneAtomicSnapshot` cases trigger UBSan on intentionally invalid
+enum value 99; `RecursionThroughRealms` exceeds the Debug sanitizer stack limit.
+These results do not claim a clean full Debug sanitizer suite. Sanitizer runs
+use `ASAN_OPTIONS=detect_leaks=0` and `UBSAN_OPTIONS=halt_on_error=1`.

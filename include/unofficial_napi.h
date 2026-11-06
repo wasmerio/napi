@@ -674,13 +674,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
     napi_env env, napi_value source, napi_value* result);
 // Owning VM thread only. Reports true only while the VM has a JavaScript frame
 // on its stack (in any context, including other security origins) or is
-// running a microtask checkpoint. A native function called from C through
-// napi_call_function, directly or through a builtin, with no JavaScript frame
+// running a microtask checkpoint (V8) or job (QuickJS). A native function called
+// from C through napi_call_function, directly or through a builtin, with no JavaScript frame
 // below it reports false. Does not execute JS, take provider locks, or replace
 // an existing pending exception, so it may be called from any provider
 // callback, including during termination. It covers the agent's realms;
 // entering a realm alone does not count as executing JavaScript. Unsupported
-// engines return napi_generic_failure with *result set to false.
+// engines return napi_generic_failure with *result set to false. V8 and
+// QuickJS support this query; host JS does not expose native execution state.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
     napi_env env, bool* result);
 
