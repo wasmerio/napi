@@ -251,16 +251,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 //
 // With the deprecated context-token callbacks (unofficial_napi_env_hooks;
 // only V8 accepts them), each pass of 1 and 2 unassigns the token of every
-// realm that has one when it begins, and again between 1 and 2. So the
-// realms alive when the release begins are unassigned before any cleanup
-// hook runs, and a realm a cleanup hook makes is unassigned before the
-// finalizers of 2 run, as main did. A realm a finalizer (the instance-data
-// finalizer too) makes while releasing is pending until its token is
-// unassigned, when the next pass begins: the finalizers after it in its pass
-// see the token still assigned. One an unassign callback makes is unassigned
-// in the same sweep, before the pass goes on. So every token is unassigned
-// once before the env is freed. What an unassign callback makes besides
-// (values, hooks, instance data) is released as the rest.
+// realm that has one when it begins, and again between 1 and 2. A realm made
+// while releasing is pending until the first of these sweeps after it is
+// made unassigns its token (or earlier, if it is collected and its record
+// freed first). So the realms alive when the release begins are unassigned
+// before any cleanup hook runs, and a realm made during 1 (by a cleanup hook,
+// or by a finalizer that runs inside one) is unassigned before the
+// finalizers of 2 run, as main did. A realm a finalizer of 2 or the
+// instance-data finalizer makes is unassigned when the next pass begins: the
+// finalizers after it in 2 see its token still assigned. One an unassign
+// callback makes is unassigned in the same sweep, before the pass goes on.
+// So every token is unassigned once before the env is freed. What an
+// unassign callback makes besides (values, hooks, instance data) is released
+// as the rest.
 //
 // After each hook, token callback and finalizer, an exception it left
 // pending is dropped: nothing can catch it then (Node's CallIntoModule drops

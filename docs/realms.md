@@ -176,13 +176,15 @@ calls take a realm's global or sandbox.
   collected realm (in the next `create_realm` or in `collect_garbage`), or,
   for a realm still alive, during env release. The release unassigns the
   tokens of the realms alive when it begins before the cleanup hooks run,
-  and those of the realms the hooks make after them, before the finalizers
-  run, as `main` did (its contexts' own cleanup hook unassigned them). A
-  realm a finalizer (the instance-data finalizer too) makes while the
-  release runs is pending until the release's next pass unassigns its
-  token, so the finalizers after it in its pass still see the token
-  assigned; one an unassign callback makes is unassigned in the same sweep,
-  and what else that callback makes is released as the rest (see
+  and those of the realms made while the hooks run (by a hook, or by a
+  finalizer that runs inside one) after them, before the release's
+  finalizers run, as `main` did (its contexts' own cleanup hook unassigned
+  them). A realm one of the release's finalizers (the instance-data
+  finalizer too) makes is pending until the release's next pass unassigns
+  its token, so the finalizers after it in its pass still see the token
+  assigned, unless the realm is collected and its record freed first. One
+  an unassign callback makes is unassigned in the same sweep, and what else
+  that callback makes is released as the rest (see
   `unofficial_napi_release_env` in the header). Realms made before the
   hooks were attached get no token. Both hooks run in the env's realm; at
   release what they throw is dropped, as for the other hooks and

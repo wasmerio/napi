@@ -990,15 +990,15 @@ napi_env__::~napi_env__() {
   // realms that have a context token give it up (the deprecated token hooks;
   // in the first round the realms still alive, before the cleanup hooks run,
   // while the embedder's state is intact); the cleanup hooks run, and the
-  // realms they made give up their tokens before the round's finalizers, as
-  // on main; then the finalizers of the values still pending (references
-  // with a finalizer most recent first, as Node's FinalizeAll, then external
-  // buffers, each detached first). Rounds repeat while any of them has
-  // something left: a realm a finalizer makes keeps its token until the next
-  // round. Then the instance data's finalizer; and all of it again for what
-  // that finalizer leaves pending, until nothing is, so no hint is left
-  // pointing at the env and no token is left assigned. The callback is
-  // cleared before it runs, so instance data is finalized once.
+  // realms made while they ran give up their tokens before the round's
+  // finalizers, as on main; then the finalizers of the values still pending
+  // (references with a finalizer most recent first, as Node's FinalizeAll,
+  // then external buffers, each detached first). Rounds repeat while any of
+  // them has something left: a realm one of these finalizers makes keeps its
+  // token until the next round. Then the instance data's finalizer; and all
+  // of it again for what that finalizer leaves pending, until nothing is, so
+  // no hint is left pointing at the env and no token is left assigned. The
+  // callback is cleared before it runs, so instance data is finalized once.
   for (;;) {
     do {
       NapiV8UnassignRealmTokens(this);
