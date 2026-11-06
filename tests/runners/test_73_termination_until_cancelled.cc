@@ -927,6 +927,54 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
 // collected since, then makes the realm. When a hook's JS is terminated, it
 // must fail without making the realm: the V8 calls that make it would clear
 // the termination.
+// During the release, the context-token hooks run with what is pending put
+// aside, and it is put back after. An unassign hook that cancels the
+// termination drops what the termination left pending: put back, the null
+// would be thrown into the JS the cleanup hook runs next.
+namespace {
+bool g_cancel_armed = false;
+void CancellingTokenHook(napi_env env, void* /*token*/, void* /*data*/) {
+  if (!g_cancel_armed) return;
+  g_cancel_armed = false;
+  EXPECT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
+}
+void CleanupHookCancelledByAnUnassignHook(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+    unofficial_napi_realm realm = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  napi_value result = nullptr;
+  EXPECT_EQ(napi_run_script(env, Str(env, "1"), &result), napi_pending_exception);
+  g_cancel_armed = true;
+  ASSERT_EQ(unofficial_napi_collect_garbage(env), napi_ok);
+  EXPECT_FALSE(g_cancel_armed) << "the unassign hook did not run";
+  ReleaseRunsJs(env);
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, UnassignHookCancelsDuringTheRelease) {
+  g_release_result.clear();
+  {
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    unofficial_napi_env_hooks hooks{};
+    hooks.size = sizeof(hooks);
+    hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+    hooks.context_token_unassign_callback = CancellingTokenHook;
+    uint64_t accepted = 0;
+    ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, CleanupHookCancelledByAnUnassignHook, s.env),
+              napi_ok);
+  }
+  EXPECT_EQ(g_release_result, "ok");
+}
+
 TEST_F(Test73TerminationUntilCancelled, CreateRealmAfterATerminatedUnassignHook) {
   for (bool with_sandbox : {true, false}) {
     SCOPED_TRACE(with_sandbox ? "with a sandbox" : "with a fresh global");

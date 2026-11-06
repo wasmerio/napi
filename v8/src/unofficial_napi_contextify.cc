@@ -1382,6 +1382,9 @@ void CallContextTokenHook(napi_env env,
   env->last_exception_source_line.swap(source_line);
   env->last_exception_thrown_at.swap(thrown_at);
   env->last_exception_is_termination = is_termination;
+  // The hook may have cancelled the termination, which drops what it left
+  // pending: that was put aside, so drop it now.
+  if (is_termination && !napi_v8_terminating(env)) napi_v8_drop_pending_termination(env);
 }
 
 // A realm has a token while either hook is attached, as each context did.
