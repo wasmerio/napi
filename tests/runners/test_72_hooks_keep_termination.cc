@@ -302,7 +302,58 @@ TEST_F(Test72HooksKeepTermination, PromiseRejectCallback) {
   EXPECT_EQ(RunScript(s.env, "globalThis.resumed = 'yes';"), napi_ok);
 }
 
+// The promise hooks return nothing too: the same holds for them, in the run
+// that made the promise, or in the microtask checkpoint that runs its
+// reactions.
+TEST_F(Test72HooksKeepTermination, PromiseHooks) {
+  constexpr const char* kHookNames[] = {"init", "before", "after", "resolve"};
+  for (int which = 0; which < 4; ++which) {
+    SCOPED_TRACE(kHookNames[which]);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    napi_value hooks[4] = {nullptr, nullptr, nullptr, nullptr};
+    hooks[which] = Eval(s.env,
+                        "globalThis.armed = false;"
+                        "(...args) => { if (armed) { terminate(); tick(); } }");
+    ASSERT_EQ(unofficial_napi_set_promise_hooks(s.env, hooks[0], hooks[1], hooks[2], hooks[3]),
+              napi_ok);
+    const napi_status run = RunScript(
+        s.env,
+        "try {\n"
+        "  armed = true;\n"
+        "  Promise.resolve(1).then(() => {\n"
+        "    try { tick(); } catch (e) { innerCaught = 'yes'; caughtError = e; }\n"
+        "  });\n"
+        "} catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+    const napi_status checkpoint = unofficial_napi_event_loop_checkpoint(
+        s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr);
+    const napi_status next = RunScript(s.env, "globalThis.next = 'yes';");
+    FinishTermination(s.env);
+    EXPECT_TRUE(run == napi_pending_exception || checkpoint == napi_pending_exception ||
+                next == napi_pending_exception)
+        << "run " << run << ", checkpoint " << checkpoint << ", next run " << next;
+    EXPECT_EQ(GlobalText(s.env, "caught"), "no");
+    EXPECT_EQ(GlobalText(s.env, "innerCaught"), "no");
+    EXPECT_EQ(GlobalText(s.env, "caughtError"), "none");
+    ASSERT_EQ(RunScript(s.env, "armed = false;"), napi_ok);
+  }
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
+// The prepare-stack-trace callback; QuickJS ignores the one set here.
+TEST_F(Test72HooksKeepTermination, PrepareStackTraceCallback) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(
+                s.env, Eval(s.env, "(global, error, trace) => { terminate(); tick(); }")),
+            napi_ok);
+  ExpectRunTerminated(
+      s.env,
+      "try { new Error('x').stack; } catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
+}
+
 // import() with no module hooks calls the `__napi_dynamic_import` helper; only
 // V8 does. V8 rejected the import()'s promise with the null its TryCatch
 // records for the termination and returned it: the JS that imported ran on,
