@@ -1,0 +1,1422 @@
+#ifdef NAPI_MODULE
+#undef NAPI_MODULE
+#endif
+#include "node_api.h"
+
+#include "test_env.h"
+
+#include "unofficial_napi.h"
+
+#include <atomic>
+#include <cstdio>
+#include <memory>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+// The current realm: what N-API creates while a realm is entered or one of
+// its native functions runs, and how long realms entered or used that way
+// live.
+class Test69UnofficialRealmEntry : public FixtureTestBase {};
+
+namespace {
+
+napi_value Str(napi_env env, const char* value) {
+  napi_value out = nullptr;
+  if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &out) != napi_ok) return nullptr;
+  return out;
+}
+
+// Runs `source` with napi_run_script, in the current realm.
+napi_value Eval(napi_env env, const char* source) {
+  napi_value result = nullptr;
+  if (napi_run_script(env, Str(env, source), &result) != napi_ok) return nullptr;
+  return result;
+}
+
+// Runs `source` in `realm` (the env's own realm when null).
+napi_value RunIn(napi_env env, unofficial_napi_realm realm, const char* source) {
+  const unofficial_napi_js_source script = unofficial_napi_js_source_from_text(Str(env, source));
+  napi_value result = nullptr;
+  if (unofficial_napi_run_script(env, realm, &script, Str(env, "realm.js"), 0, 0, -1, true, false,
+                                 false, nullptr, &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+bool StrictEquals(napi_env env, napi_value a, napi_value b) {
+  bool same = false;
+  return a != nullptr && b != nullptr && napi_strict_equals(env, a, b, &same) == napi_ok && same;
+}
+
+napi_value Global(napi_env env) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok) return nullptr;
+  return global;
+}
+
+napi_value Undefined(napi_env env) {
+  napi_value undefined = nullptr;
+  if (napi_get_undefined(env, &undefined) != napi_ok) return nullptr;
+  return undefined;
+}
+
+std::string Utf8(napi_env env, napi_value value) {
+  char buffer[512] = {};
+  size_t length = 0;
+  if (value == nullptr ||
+      napi_get_value_string_utf8(env, value, buffer, sizeof(buffer), &length) != napi_ok) {
+    return "<not a string>";
+  }
+  return std::string(buffer, length);
+}
+
+unofficial_napi_realm CreateRealm(napi_env env,
+                                  napi_value* global_out = nullptr,
+                                  napi_value sandbox = nullptr) {
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = sandbox;
+  unofficial_napi_realm realm = nullptr;
+  if (unofficial_napi_create_realm(env, &options, &realm, global_out) != napi_ok) return nullptr;
+  return realm;
+}
+
+unofficial_napi_realm_scope Enter(napi_env env, unofficial_napi_realm realm) {
+  unofficial_napi_realm_scope scope = 0;
+  EXPECT_EQ(unofficial_napi_enter_realm(env, realm, &scope), napi_ok);
+  EXPECT_NE(scope, 0u);
+  return scope;
+}
+
+void Leave(napi_env env, unofficial_napi_realm_scope scope) {
+  EXPECT_EQ(unofficial_napi_leave_realm(env, scope), napi_ok);
+}
+
+bool IsCollected(napi_env env, napi_ref ref) {
+  napi_value value = nullptr;
+  return napi_get_reference_value(env, ref, &value) == napi_ok && value == nullptr;
+}
+
+napi_value ReturnUndefined(napi_env env, napi_callback_info) {
+  return Undefined(env);
+}
+
+// Makes one of each kind of value N-API creates, in the current realm:
+// [global, object, array, function, error, type error, promise, date,
+//  array buffer, typed array]. A thrown error is checked on its own, since a
+// throw from a callback reaches its caller.
+napi_value MakeValues(napi_env env) {
+  napi_value values[10] = {};
+  napi_deferred deferred = nullptr;
+  napi_value buffer = nullptr;
+  // Reports the first call that fails.
+  int step = 0;
+  auto ok = [&](napi_status status) {
+    ++step;
+    if (status == napi_ok) return true;
+    std::fprintf(stderr, "MakeValues: call %d failed with status %d\n", step, status);
+    return false;
+  };
+  if (!ok(napi_get_global(env, &values[0])) || !ok(napi_create_object(env, &values[1])) ||
+      !ok(napi_create_array(env, &values[2])) ||
+      !ok(napi_create_function(env, "made", NAPI_AUTO_LENGTH, ReturnUndefined, nullptr,
+                               &values[3])) ||
+      !ok(napi_create_error(env, nullptr, Str(env, "error"), &values[4])) ||
+      !ok(napi_create_type_error(env, nullptr, Str(env, "type error"), &values[5])) ||
+      !ok(napi_create_promise(env, &deferred, &values[6])) ||
+      !ok(napi_resolve_deferred(env, deferred, Undefined(env))) ||
+      !ok(napi_create_date(env, 0, &values[7])) ||
+      !ok(napi_create_arraybuffer(env, 8, nullptr, &buffer)) ||
+      !ok(napi_create_typedarray(env, napi_uint8_array, 8, buffer, 0, &values[9]))) {
+    return nullptr;
+  }
+  values[8] = buffer;
+  napi_value array = nullptr;
+  if (napi_create_array_with_length(env, 10, &array) != napi_ok) return nullptr;
+  for (uint32_t i = 0; i < 10; ++i) {
+    if (napi_set_element(env, array, i, values[i]) != napi_ok) return nullptr;
+  }
+  return array;
+}
+
+napi_value MakeValuesCallback(napi_env env, napi_callback_info) {
+  return MakeValues(env);
+}
+
+// Lists what in `values` (from MakeValues) does not come from the realm whose
+// global is `realm_global`; empty when everything does. Runs in the env's
+// realm, so call it with no realm entered.
+std::string ValuesNotFrom(napi_env env, napi_value values, napi_value realm_global) {
+  napi_value global = Global(env);
+  if (values == nullptr || realm_global == nullptr ||
+      napi_set_named_property(env, global, "__values", values) != napi_ok ||
+      napi_set_named_property(env, global, "__realm", realm_global) != napi_ok) {
+    return "<no values>";
+  }
+  napi_value report = Eval(env,
+                           "(() => {"
+                           "  const [g, o, a, f, e, te, p, d, ab, ta] = __values;"
+                           "  const R = __realm;"
+                           "  const proto = Object.getPrototypeOf;"
+                           "  const wrong = [];"
+                           "  const check = (name, ok) => { if (!ok) wrong.push(name); };"
+                           "  check('global', g === R);"
+                           "  check('object', proto(o) === R.Object.prototype);"
+                           "  check('array', proto(a) === R.Array.prototype);"
+                           "  check('function', proto(f) === R.Function.prototype);"
+                           "  check('error', proto(e) === R.Error.prototype);"
+                           "  check('type error', proto(te) === R.TypeError.prototype);"
+                           "  check('promise', proto(p) === R.Promise.prototype);"
+                           "  check('date', proto(d) === R.Date.prototype);"
+                           "  check('array buffer', proto(ab) === R.ArrayBuffer.prototype);"
+                           "  check('typed array', proto(ta) === R.Uint8Array.prototype);"
+                           "  delete globalThis.__values;"
+                           "  delete globalThis.__realm;"
+                           "  return wrong.join(', ');"
+                           "})()");
+  return Utf8(env, report);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, EnteredRealmMakesValuesWithItsIntrinsics) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  napi_value realm_global = nullptr;
+  unofficial_napi_realm realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(realm, nullptr);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  napi_value in_realm = MakeValues(s.env);
+  Leave(s.env, scope);
+  ASSERT_NE(in_realm, nullptr);
+  EXPECT_EQ(ValuesNotFrom(s.env, in_realm, realm_global), "");
+
+  // Without a scope, values come from the env's realm again.
+  napi_value in_env = MakeValues(s.env);
+  ASSERT_NE(in_env, nullptr);
+  EXPECT_EQ(ValuesNotFrom(s.env, in_env, env_global), "");
+}
+
+TEST_F(Test69UnofficialRealmEntry, GetGlobalFollowsTheCurrentRealm) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  napi_value realm_global = nullptr;
+  unofficial_napi_realm realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(realm, nullptr);
+  napi_value sandbox = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  unofficial_napi_realm sandbox_realm = CreateRealm(s.env, nullptr, sandbox);
+  ASSERT_NE(sandbox_realm, nullptr);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), realm_global));
+  // The current realm's global names the realm.
+  unofficial_napi_realm found = nullptr;
+  ASSERT_EQ(unofficial_napi_get_realm(s.env, Global(s.env), &found), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, found, "globalThis"), realm_global));
+  // napi_run_script runs in the current realm; a NULL realm still means the
+  // env's own.
+  EXPECT_TRUE(StrictEquals(s.env, Eval(s.env, "globalThis"), realm_global));
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, nullptr, "globalThis"), env_global));
+
+  // A sandbox realm's global is its sandbox, as create_realm reported.
+  unofficial_napi_realm_scope sandbox_scope = Enter(s.env, sandbox_realm);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), sandbox));
+  found = nullptr;
+  ASSERT_EQ(unofficial_napi_get_realm(s.env, Global(s.env), &found), napi_ok);
+  EXPECT_NE(found, nullptr);
+  Leave(s.env, sandbox_scope);
+
+  // NULL enters the env's realm from inside another.
+  unofficial_napi_realm_scope env_scope = Enter(s.env, nullptr);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+  Leave(s.env, env_scope);
+
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), realm_global));
+  Leave(s.env, scope);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+}
+
+TEST_F(Test69UnofficialRealmEntry, ScopesNestAndCloseInOrder) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  napi_value a_global = nullptr, b_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  unofficial_napi_realm b = CreateRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  EXPECT_EQ(unofficial_napi_enter_realm(nullptr, a, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_enter_realm(s.env, a, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, 0), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, 12345), napi_invalid_arg);
+
+  unofficial_napi_realm_scope in_a = Enter(s.env, a);
+  unofficial_napi_realm_scope in_b = Enter(s.env, b);
+  unofficial_napi_realm_scope in_env = Enter(s.env, nullptr);
+  EXPECT_EQ(std::set<unofficial_napi_realm_scope>({in_a, in_b, in_env}).size(), 3u);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+
+  // Only the innermost scope can be left; a refused leave changes nothing.
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, in_b), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, in_a), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+
+  Leave(s.env, in_env);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, in_env), napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), b_global));
+  Leave(s.env, in_b);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), a_global));
+  Leave(s.env, in_a);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, in_a), napi_invalid_arg);
+
+  // A token is never reused.
+  unofficial_napi_realm_scope again = Enter(s.env, a);
+  EXPECT_EQ(std::set<unofficial_napi_realm_scope>({in_a, in_b, in_env, again}).size(), 4u);
+  Leave(s.env, again);
+}
+
+TEST_F(Test69UnofficialRealmEntry, NativeFunctionRunsInTheRealmThatMadeIt) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr, b_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  unofficial_napi_realm b = CreateRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  napi_value probe = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_create_function(s.env, "probe", NAPI_AUTO_LENGTH, MakeValuesCallback, nullptr,
+                                 &probe),
+            napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "probe", probe), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "probe", probe), napi_ok);
+
+  // The function is one of A's.
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, a, "Object.getPrototypeOf(probe)"),
+                           RunIn(s.env, a, "Function.prototype")));
+
+  // Called from B, from A and from the env's realm, it runs in A.
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, b, "probe()"), a_global), "");
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, a, "probe()"), a_global), "");
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), probe, 0, nullptr, &result), napi_ok);
+  EXPECT_EQ(ValuesNotFrom(s.env, result, a_global), "");
+
+  // Also while B is entered, and B is current again afterwards.
+  scope = Enter(s.env, b);
+  result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), probe, 0, nullptr, &result), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), b_global));
+  Leave(s.env, scope);
+  EXPECT_EQ(ValuesNotFrom(s.env, result, a_global), "");
+}
+
+// EdgeJS never enters a realm: its functions run in the env's realm wherever
+// they are called from.
+TEST_F(Test69UnofficialRealmEntry, FunctionMadeOutsideAScopeRunsInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  napi_value a_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  ASSERT_NE(a, nullptr);
+
+  napi_value probe = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "probe", NAPI_AUTO_LENGTH, MakeValuesCallback, nullptr,
+                                 &probe),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "probe", probe), napi_ok);
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, a, "probe()"), env_global), "");
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), probe, 0, nullptr, &result), napi_ok);
+  // A function made with the env's realm entered from inside A is the env's.
+  unofficial_napi_realm_scope env_scope = Enter(s.env, nullptr);
+  napi_value env_probe = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "envProbe", NAPI_AUTO_LENGTH, MakeValuesCallback, nullptr,
+                                 &env_probe),
+            napi_ok);
+  Leave(s.env, env_scope);
+  Leave(s.env, scope);
+  EXPECT_EQ(ValuesNotFrom(s.env, result, env_global), "");
+
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "envProbe", env_probe), napi_ok);
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, a, "envProbe()"), env_global), "");
+}
+
+namespace {
+
+napi_value ReturnThis(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr) != napi_ok) return nullptr;
+  return self;
+}
+
+napi_value GetGlobalCallback(napi_env env, napi_callback_info) {
+  return Global(env);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ClassesAndPropertiesBelongToTheirRealm) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr, b_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  unofficial_napi_realm b = CreateRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  const napi_property_descriptor properties[] = {
+      {"values", nullptr, MakeValuesCallback, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"global", nullptr, nullptr, GetGlobalCallback, nullptr, nullptr, napi_default, nullptr},
+      {"staticValues", nullptr, MakeValuesCallback, nullptr, nullptr, nullptr, napi_static,
+       nullptr},
+  };
+  napi_value thing = nullptr;
+  napi_value object = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_define_class(s.env, "Thing", NAPI_AUTO_LENGTH, ReturnThis, nullptr, 3, properties,
+                              &thing),
+            napi_ok);
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_define_properties(s.env, object, 2, properties), napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "Thing", thing), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "object", object), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "Thing", thing), napi_ok);
+
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, a,
+                              "[Object.getPrototypeOf(Thing) === Function.prototype,"
+                              " Object.getPrototypeOf(Thing.prototype) === Object.prototype,"
+                              " Object.getPrototypeOf(new Thing()) === Thing.prototype].join()")),
+            "true,true,true");
+  // Constructed, called and read from B, everything runs in A.
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, b, "new Thing().global"), a_global));
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, b, "new Thing().values()"), a_global), "");
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, b, "Thing.staticValues()"), a_global), "");
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, b, "object.global"), a_global));
+  EXPECT_EQ(ValuesNotFrom(s.env, RunIn(s.env, b, "object.values()"), a_global), "");
+}
+
+TEST_F(Test69UnofficialRealmEntry, DeferredBelongsToItsRealm) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  ASSERT_NE(a, nullptr);
+
+  napi_deferred deferred = nullptr;
+  napi_value promise = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_create_promise(s.env, &deferred, &promise), napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "promise", promise), napi_ok);
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, a,
+                              "promise.then((v) => { globalThis.got = v; });"
+                              "String(Object.getPrototypeOf(promise) === Promise.prototype)")),
+            "true");
+
+  // Settled later from the env's realm.
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_create_int32(s.env, 9, &value), napi_ok);
+  ASSERT_EQ(napi_resolve_deferred(s.env, deferred, value), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, a, "String(globalThis.got)")), "9");
+}
+
+namespace {
+
+struct LeakyScope {
+  unofficial_napi_realm realm = nullptr;
+  unofficial_napi_realm_scope outer = 0;
+  unofficial_napi_realm_scope leaked = 0;
+  napi_status leave_outer = napi_ok;
+};
+
+// Enters a realm and returns without leaving it, after trying to leave a
+// scope its caller opened.
+napi_value EnterAndReturn(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok) return nullptr;
+  auto* record = static_cast<LeakyScope*>(data);
+  if (record->outer != 0) record->leave_outer = unofficial_napi_leave_realm(env, record->outer);
+  if (unofficial_napi_enter_realm(env, record->realm, &record->leaked) != napi_ok) return nullptr;
+  return Global(env);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ScopeLeftOpenClosesWhenTheCallbackReturns) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  napi_value a_global = nullptr, b_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  unofficial_napi_realm b = CreateRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  LeakyScope record;
+  record.realm = b;
+  napi_value leaky = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "leaky", NAPI_AUTO_LENGTH, EnterAndReturn, &record,
+                                 &leaky),
+            napi_ok);
+
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), leaky, 0, nullptr, &result), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, result, b_global));
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, record.leaked), napi_invalid_arg);
+
+  // A callback cannot leave a scope its caller opened.
+  record.outer = Enter(s.env, a);
+  ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), leaky, 0, nullptr, &result), napi_ok);
+  EXPECT_EQ(record.leave_outer, napi_invalid_arg);
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), a_global));
+  Leave(s.env, record.outer);
+
+  // Called from script, too.
+  record.outer = 0;
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "leaky", leaky), napi_ok);
+  EXPECT_TRUE(StrictEquals(s.env, RunIn(s.env, a, "leaky()"), b_global));
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+}
+
+TEST_F(Test69UnofficialRealmEntry, PendingExceptionSurvivesLeavingARealm) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr;
+  unofficial_napi_realm a = CreateRealm(s.env, &a_global);
+  ASSERT_NE(a, nullptr);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  const napi_status thrown = napi_throw_type_error(s.env, nullptr, "boom");
+  EXPECT_TRUE(thrown == napi_ok || thrown == napi_pending_exception);
+  Leave(s.env, scope);
+  bool pending = false;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "error", error), napi_ok);
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, a,
+                              "String(Object.getPrototypeOf(error) === TypeError.prototype &&"
+                              " error.message === 'boom')")),
+            "true");
+}
+
+TEST_F(Test69UnofficialRealmEntry, EnteringAnUnknownRealmFails) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_scope scope = 0;
+
+  // Anything but one of this env's realms is refused without being read.
+  int not_a_realm = 0;
+  EXPECT_EQ(unofficial_napi_enter_realm(
+                s.env, reinterpret_cast<unofficial_napi_realm>(&not_a_realm), &scope),
+            napi_invalid_arg);
+  EXPECT_EQ(scope, 0u);
+
+  // A handle that outlived its handle scope is not tried: using it is
+  // undefined behavior, and a newer realm may have the same handle. A realm
+  // used later is kept by its global and found again from it.
+  napi_ref kept_global = nullptr;
+  {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value global = nullptr;
+    ASSERT_NE(CreateRealm(s.env, &global), nullptr);
+    ASSERT_EQ(napi_create_reference(s.env, global, 1, &kept_global), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, kept_global, &global), napi_ok);
+    unofficial_napi_realm found = nullptr;
+    ASSERT_EQ(unofficial_napi_get_realm(s.env, global, &found), napi_ok);
+    ASSERT_NE(found, nullptr);
+    scope = Enter(s.env, found);
+    EXPECT_TRUE(StrictEquals(s.env, Global(s.env), global));
+    Leave(s.env, scope);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(napi_delete_reference(s.env, kept_global), napi_ok);
+
+  // No JavaScript runs on entering or leaving, so both work while
+  // terminating.
+  unofficial_napi_realm live = CreateRealm(s.env);
+  ASSERT_NE(live, nullptr);
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, live, &scope), napi_ok);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+}
+
+TEST_F(Test69UnofficialRealmEntry, RealmLivesWhileItsNativeFunctionIsReachable) {
+  EnvScope s(runtime_.get());
+
+  // Many realms, each reachable only through a native function made in it.
+  constexpr int kRealms = 64;
+  napi_ref functions[kRealms] = {};
+  napi_ref globals[kRealms] = {};
+  for (int i = 0; i < kRealms; ++i) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value global = nullptr;
+    unofficial_napi_realm realm = CreateRealm(s.env, &global);
+    ASSERT_NE(realm, nullptr);
+    ASSERT_NE(RunIn(s.env, realm, "globalThis.payload = new Array(4096).fill(1); 1"), nullptr);
+    unofficial_napi_realm_scope scope = Enter(s.env, realm);
+    napi_value probe = nullptr;
+    ASSERT_EQ(napi_create_function(s.env, "probe", NAPI_AUTO_LENGTH, MakeValuesCallback, nullptr,
+                                   &probe),
+              napi_ok);
+    Leave(s.env, scope);
+    ASSERT_EQ(napi_create_reference(s.env, probe, 1, &functions[i]), napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, global, 0, &globals[i]), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+
+  // Making more realms releases what collected realms left behind; the
+  // reachable ones stay.
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  for (int i = 0; i < 4; ++i) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    ASSERT_NE(CreateRealm(s.env), nullptr);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+
+  for (int i = 0; i < kRealms; ++i) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value global = nullptr, probe = nullptr, result = nullptr;
+    ASSERT_EQ(napi_get_reference_value(s.env, globals[i], &global), napi_ok);
+    ASSERT_NE(global, nullptr);
+    ASSERT_EQ(napi_get_reference_value(s.env, functions[i], &probe), napi_ok);
+    ASSERT_EQ(napi_call_function(s.env, Undefined(s.env), probe, 0, nullptr, &result), napi_ok);
+    EXPECT_EQ(ValuesNotFrom(s.env, result, global), "");
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+
+  // Once its function is unreachable, each realm is collected.
+  for (napi_ref function : functions) ASSERT_EQ(napi_delete_reference(s.env, function), napi_ok);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  for (napi_ref global : globals) {
+    EXPECT_TRUE(IsCollected(s.env, global));
+    ASSERT_EQ(napi_delete_reference(s.env, global), napi_ok);
+  }
+}
+
+namespace {
+
+struct FinalizerRecord {
+  napi_ref env_global = nullptr;
+  bool ran = false;
+  bool saw_env_global = false;
+};
+
+void RecordFinalizerRealm(node_api_basic_env basic_env, void*, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
+  auto* record = static_cast<FinalizerRecord*>(hint);
+  record->ran = true;
+  napi_value env_global = nullptr;
+  if (napi_get_reference_value(env, record->env_global, &env_global) != napi_ok) return;
+  record->saw_env_global = StrictEquals(env, Global(env), env_global);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, FinalizersRunInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  FinalizerRecord record;
+  ASSERT_EQ(napi_create_reference(s.env, Global(s.env), 1, &record.env_global), napi_ok);
+
+  // The object becomes unreachable, and is collected and finalized, with A
+  // entered.
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    napi_value object = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, RecordFinalizerRealm, &record, nullptr),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  Leave(s.env, scope);
+
+  EXPECT_TRUE(record.ran);
+  EXPECT_TRUE(record.saw_env_global);
+  ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
+}
+
+// Scopes opened while the env is released.
+
+namespace {
+
+// Releases the env before the test ends.
+void Release(EnvScope& s) {
+  ASSERT_EQ(unofficial_napi_release_env(s.scope, nullptr), napi_ok);
+  s.scope = nullptr;
+  s.env = nullptr;
+}
+
+struct ReleaseRecord {
+  napi_env env = nullptr;
+  napi_ref env_global = nullptr;
+  napi_ref realm_global = nullptr;
+  unofficial_napi_realm realm = nullptr;
+  napi_status enter_status = napi_generic_failure;
+  napi_status enter_env_realm_status = napi_generic_failure;
+  bool checked = false;
+  bool saw_env_global = false;
+};
+
+// A cleanup hook that enters a realm, makes an object there and returns
+// without leaving it.
+void EnterRealmFromCleanupHook(void* arg) {
+  auto* record = static_cast<ReleaseRecord*>(arg);
+  napi_value global = nullptr;
+  unofficial_napi_realm realm = nullptr;
+  if (napi_get_reference_value(record->env, record->realm_global, &global) != napi_ok ||
+      unofficial_napi_get_realm(record->env, global, &realm) != napi_ok) {
+    return;
+  }
+  unofficial_napi_realm_scope scope = 0;
+  record->enter_status = unofficial_napi_enter_realm(record->env, realm, &scope);
+  napi_value object = nullptr;
+  (void)napi_create_object(record->env, &object);
+}
+
+// A cleanup hook that records whether it acts in the env's realm.
+void CheckEnvRealmFromCleanupHook(void* arg) {
+  auto* record = static_cast<ReleaseRecord*>(arg);
+  record->checked = true;
+  napi_value env_global = nullptr;
+  if (napi_get_reference_value(record->env, record->env_global, &env_global) == napi_ok) {
+    record->saw_env_global = StrictEquals(record->env, Global(record->env), env_global);
+  }
+  (void)napi_delete_reference(record->env, record->env_global);
+  (void)napi_delete_reference(record->env, record->realm_global);
+}
+
+// An instance-data finalizer that enters a realm, then the env's own, and
+// returns without leaving either.
+void EnterRealmFromInstanceDataFinalizer(napi_env env, void* data, void*) {
+  auto* record = static_cast<ReleaseRecord*>(data);
+  record->checked = true;
+  unofficial_napi_realm_scope scope = 0;
+  record->enter_status = unofficial_napi_enter_realm(env, record->realm, &scope);
+  unofficial_napi_realm_scope env_scope = 0;
+  record->enter_env_realm_status = unofficial_napi_enter_realm(env, nullptr, &env_scope);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ScopeACleanupHookLeavesOpenClosesWhenItReturns) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  ASSERT_NE(CreateRealm(s.env, &realm_global), nullptr);
+  ReleaseRecord record;
+  record.env = s.env;
+  ASSERT_EQ(napi_create_reference(s.env, Global(s.env), 1, &record.env_global), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, realm_global, 1, &record.realm_global), napi_ok);
+  // Hooks run in reverse order of registration: the one that enters runs
+  // first.
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, CheckEnvRealmFromCleanupHook, &record), napi_ok);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, EnterRealmFromCleanupHook, &record), napi_ok);
+
+  Release(s);
+  EXPECT_EQ(record.enter_status, napi_ok);
+  EXPECT_TRUE(record.checked);
+  EXPECT_TRUE(record.saw_env_global);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ScopeTheInstanceDataFinalizerLeavesOpenCloses) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  ReleaseRecord record;
+  record.realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(record.realm, nullptr);
+  // The env's global keeps the realm alive until the env is released.
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "realm", realm_global), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, EnterRealmFromInstanceDataFinalizer, nullptr),
+            napi_ok);
+
+  Release(s);
+  EXPECT_TRUE(record.checked);
+  // The finalizer runs after the other finalizers, and a provider may have
+  // let go of its realms by then.
+  EXPECT_TRUE(record.enter_status == napi_ok || record.enter_status == napi_invalid_arg)
+      << record.enter_status;
+  EXPECT_EQ(record.enter_env_realm_status, napi_ok);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ReplacedInstanceDataIsFinalizedInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  napi_value env_global = Global(s.env);
+  ReleaseRecord record;
+  record.realm = CreateRealm(s.env);
+  ASSERT_NE(record.realm, nullptr);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, EnterRealmFromInstanceDataFinalizer, nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, nullptr, nullptr, nullptr), napi_ok);
+  // A provider that finalizes replaced data does it in the env's realm, and
+  // closes the scope the finalizer left open.
+  if (record.checked) {
+    EXPECT_EQ(record.enter_status, napi_ok);
+    EXPECT_EQ(record.enter_env_realm_status, napi_ok);
+  }
+  EXPECT_TRUE(StrictEquals(s.env, Global(s.env), env_global));
+}
+
+// External ArrayBuffer finalizers. An engine may free a backing store
+// wherever its last reference drops: on a collector thread, or inside a
+// detach while another realm is entered. Its finalizer still runs on the
+// env's thread, in the env's realm, as in Node.
+
+namespace {
+
+constexpr char kEnvMarker[] = "__envMarker";
+
+// Marks the env's global, which no other realm's global has.
+void MarkEnvGlobal(napi_env env) {
+  napi_value marker = nullptr;
+  ASSERT_EQ(napi_get_boolean(env, true, &marker), napi_ok);
+  ASSERT_EQ(napi_set_named_property(env, Global(env), kEnvMarker, marker), napi_ok);
+}
+
+// Made on the test's thread, which is the env's.
+struct ExternalFinalizerRecord {
+  std::thread::id env_thread = std::this_thread::get_id();
+  uint8_t bytes[8] = {};
+  std::atomic<int> calls{0};
+  std::atomic<bool> on_env_thread{false};
+  std::atomic<bool> saw_env_global{false};
+};
+
+void RecordExternalFinalizer(node_api_basic_env basic_env, void*, void* hint) {
+  auto* record = static_cast<ExternalFinalizerRecord*>(hint);
+  const bool on_env_thread = std::this_thread::get_id() == record->env_thread;
+  record->on_env_thread = on_env_thread;
+  // N-API is only usable on the env's thread.
+  if (on_env_thread) {
+    auto env = const_cast<napi_env>(basic_env);
+    bool has_marker = false;
+    record->saw_env_global =
+        napi_has_named_property(env, Global(env), kEnvMarker, &has_marker) == napi_ok &&
+        has_marker;
+  }
+  record->calls.fetch_add(1);
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, DetachedExternalArrayBufferIsFinalizedLaterInTheEnvsRealm) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                             RecordExternalFinalizer, &record, &buffer),
+            napi_ok);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  // V8 frees the backing store inside the detach, and the finalizer waits
+  // for the env to drain its finalizers. QuickJS runs it in the detach, in
+  // the env's realm.
+  EXPECT_EQ(record.calls.load(), 0);
+#endif
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+
+// A finalizer still waiting when the env is released runs then, once.
+TEST_F(Test69UnofficialRealmEntry, DetachedExternalArrayBufferIsFinalizedByTheEnvsRelease) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                             RecordExternalFinalizer, &record, &buffer),
+            napi_ok);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+  Leave(s.env, scope);
+  Release(s);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+
+namespace {
+
+void DetachExternalBufferFromInstanceDataFinalizer(napi_env env, void* data, void*) {
+  auto* record = static_cast<ExternalFinalizerRecord*>(data);
+  napi_value buffer = nullptr;
+  if (napi_create_external_arraybuffer(env, record->bytes, sizeof(record->bytes),
+                                       RecordExternalFinalizer, record, &buffer) == napi_ok) {
+    (void)napi_detach_arraybuffer(env, buffer);
+  }
+}
+
+}  // namespace
+
+// The instance-data finalizer runs after the other finalizers in the release.
+// An external buffer it makes and detaches is still finalized, once, on the
+// env's thread and in the env's realm.
+TEST_F(Test69UnofficialRealmEntry, ExternalArrayBufferTheInstanceDataFinalizerDetachesIsFinalized) {
+  ExternalFinalizerRecord record;
+  EnvScope s(runtime_.get());
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_set_instance_data(s.env, &record, DetachExternalBufferFromInstanceDataFinalizer,
+                                   nullptr),
+            napi_ok);
+  Release(s);
+
+  EXPECT_EQ(record.calls.load(), 1);
+  EXPECT_TRUE(record.on_env_thread.load());
+  EXPECT_TRUE(record.saw_env_global.load());
+}
+
+namespace {
+
+struct LateInstanceData {
+  ExternalFinalizerRecord buffer;
+  std::atomic<int> late_finalized{0};
+  std::atomic<bool> late_saw_env_global{false};
+};
+
+void FinalizeLateInstanceData(napi_env env, void* data, void*) {
+  auto* late = static_cast<LateInstanceData*>(data);
+  bool has_marker = false;
+  late->late_saw_env_global =
+      napi_has_named_property(env, Global(env), kEnvMarker, &has_marker) == napi_ok &&
+      has_marker;
+  late->late_finalized.fetch_add(1);
+}
+
+// The buffer's finalizer runs late in the release, and sets instance data.
+void SetInstanceDataFromExternalFinalizer(node_api_basic_env basic_env, void* data, void* hint) {
+  auto* late = static_cast<LateInstanceData*>(hint);
+  RecordExternalFinalizer(basic_env, data, &late->buffer);
+  (void)napi_set_instance_data(basic_env, late, FinalizeLateInstanceData, nullptr);
+}
+
+void DetachLateExternalBuffer(napi_env env, void* data, void*) {
+  auto* late = static_cast<LateInstanceData*>(data);
+  napi_value buffer = nullptr;
+  if (napi_create_external_arraybuffer(env, late->buffer.bytes, sizeof(late->buffer.bytes),
+                                       SetInstanceDataFromExternalFinalizer, late,
+                                       &buffer) == napi_ok) {
+    (void)napi_detach_arraybuffer(env, buffer);
+  }
+}
+
+}  // namespace
+
+// Instance data a finalizer sets during the release is finalized too, once,
+// as Node finalizes references made while it finalizes the others.
+TEST_F(Test69UnofficialRealmEntry, InstanceDataSetByALateFinalizerIsFinalized) {
+  LateInstanceData late;
+  EnvScope s(runtime_.get());
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_set_instance_data(s.env, &late, DetachLateExternalBuffer, nullptr), napi_ok);
+  Release(s);
+
+  EXPECT_EQ(late.buffer.calls.load(), 1);
+  EXPECT_EQ(late.late_finalized.load(), 1);
+  EXPECT_TRUE(late.late_saw_env_global.load());
+}
+
+namespace {
+
+struct ReleaseInARealm {
+  ExternalFinalizerRecord buffer;
+  ExternalFinalizerRecord external;
+  ExternalFinalizerRecord instance_data;
+  ExternalFinalizerRecord hook;
+  napi_env env = nullptr;
+};
+
+void RecordInstanceDataFinalizer(napi_env env, void* data, void*) {
+  RecordExternalFinalizer(env, nullptr, &static_cast<ReleaseInARealm*>(data)->instance_data);
+}
+
+void RecordCleanupHook(void* arg) {
+  auto* release = static_cast<ReleaseInARealm*>(arg);
+  RecordExternalFinalizer(release->env, nullptr, &release->hook);
+}
+
+}  // namespace
+
+// The env is released while another realm is entered, holding values made in
+// that realm. Every hook and finalizer still runs once, on the env's thread,
+// in the env's realm.
+TEST_F(Test69UnofficialRealmEntry, ReleaseRunsInTheEnvsRealmWhileAnotherIsEntered) {
+  ReleaseInARealm release;
+  EnvScope s(runtime_.get());
+  release.env = s.env;
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, RecordCleanupHook, &release), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &release, RecordInstanceDataFinalizer, nullptr), napi_ok);
+
+  // Made in A and kept on A's global; A stays entered.
+  (void)Enter(s.env, a);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, release.buffer.bytes,
+                                             sizeof(release.buffer.bytes),
+                                             RecordExternalFinalizer, &release.buffer, &buffer),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "keptBuffer", buffer), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external(s.env, nullptr, RecordExternalFinalizer, &release.external,
+                                 &external),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "keptExternal", external), napi_ok);
+  Release(s);
+
+  for (const ExternalFinalizerRecord* record :
+       {&release.buffer, &release.external, &release.instance_data, &release.hook}) {
+    EXPECT_EQ(record->calls.load(), 1);
+    EXPECT_TRUE(record->on_env_thread.load());
+    EXPECT_TRUE(record->saw_env_global.load());
+  }
+}
+
+TEST_F(Test69UnofficialRealmEntry, CollectedExternalArrayBuffersAreFinalizedOnTheEnvsThread) {
+  constexpr int kBatches = 16;
+  constexpr int kBuffers = kBatches * 64;
+  auto records = std::make_unique<ExternalFinalizerRecord[]>(kBuffers);
+  auto finalized = [&records] {
+    int calls = 0;
+    for (int i = 0; i < kBuffers; ++i) calls += records[i].calls.load();
+    return calls;
+  };
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+
+  // The buffers become unreachable, and are collected and finalized, with A
+  // entered. Allocation between batches lets V8 collect, and sweep on its own
+  // threads, as it goes.
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  for (int batch = 0; batch < kBatches; ++batch) {
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+    for (int i = batch * (kBuffers / kBatches); i < (batch + 1) * (kBuffers / kBatches); ++i) {
+      ExternalFinalizerRecord& record = records[i];
+      napi_value buffer = nullptr;
+      ASSERT_EQ(napi_create_external_arraybuffer(s.env, record.bytes, sizeof(record.bytes),
+                                                 RecordExternalFinalizer, &record, &buffer),
+                napi_ok);
+    }
+    ASSERT_NE(Eval(s.env, "{ let a = []; for (let i = 0; i < 20000; i++) a.push({ i }); 0 }"),
+              nullptr);
+    ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  }
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  // The collector only hands them to the env. QuickJS runs them as it
+  // collects, on this thread and in the env's realm.
+  EXPECT_EQ(finalized(), 0);
+#endif
+  for (int round = 0; round < 10 && finalized() < kBuffers; ++round) {
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+              napi_ok);
+    if (finalized() < kBuffers) ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  }
+  Leave(s.env, scope);
+
+  int not_once = 0;
+  int off_thread = 0;
+  int in_another_realm = 0;
+  for (int i = 0; i < kBuffers; ++i) {
+    const ExternalFinalizerRecord& record = records[i];
+    if (record.calls.load() != 1) ++not_once;
+    if (record.calls.load() == 0) continue;
+    if (!record.on_env_thread.load()) {
+      ++off_thread;
+    } else if (!record.saw_env_global.load()) {
+      ++in_another_realm;
+    }
+  }
+  EXPECT_EQ(not_once, 0);
+  EXPECT_EQ(off_thread, 0);
+  EXPECT_EQ(in_another_realm, 0);
+}
+
+// Intrinsics in an entered realm: what N-API makes there comes from the
+// realm's own intrinsics, never from whatever its global now holds, which its
+// scripts control.
+
+namespace {
+
+// Saves the realm's Error, RangeError and DataView, then hides Error and
+// DataView behind getters that count every read: Error reads as 1, and
+// DataView as a fake constructor that counts its calls too.
+constexpr char kReplaceErrorAndDataView[] =
+    "globalThis.saved = { Error, RangeError, DataView };"
+    "globalThis.pageCalls = 0;"
+    "Object.defineProperty(globalThis, 'Error', {"
+    "  configurable: true, get() { pageCalls++; return 1; } });"
+    "Object.defineProperty(globalThis, 'DataView', {"
+    "  configurable: true,"
+    "  get() { pageCalls++; return function DataView() { pageCalls++; return {}; }; } });"
+    "0";
+
+// In `realm` (the env's own when null): makes an error, one with a message
+// longer than 256 bytes, a DataView and an out-of-range DataView, and reports
+// how they relate to the intrinsics the realm saved.
+std::string MadeFromSavedIntrinsics(napi_env env, unofficial_napi_realm realm) {
+  const std::string long_message(300, 'm');
+  napi_value made[4] = {};
+  napi_value buffer = nullptr;
+  napi_status range_status = napi_ok;
+  bool pending = false;
+  unofficial_napi_realm_scope scope = Enter(env, realm);
+  const bool ok =
+      napi_create_error(env, nullptr, Str(env, "made"), &made[0]) == napi_ok &&
+      napi_create_error(env, nullptr, Str(env, long_message.c_str()), &made[1]) == napi_ok &&
+      napi_create_arraybuffer(env, 8, nullptr, &buffer) == napi_ok &&
+      napi_create_dataview(env, 4, buffer, 2, &made[2]) == napi_ok &&
+      napi_is_exception_pending(env, &pending) == napi_ok && !pending &&
+      (range_status = napi_create_dataview(env, 200, buffer, 10, &made[3])) ==
+          napi_pending_exception &&
+      napi_get_and_clear_last_exception(env, &made[3]) == napi_ok;
+  napi_value array = nullptr;
+  const bool stored = ok && napi_create_array_with_length(env, 4, &array) == napi_ok &&
+                      napi_set_element(env, array, 0, made[0]) == napi_ok &&
+                      napi_set_element(env, array, 1, made[1]) == napi_ok &&
+                      napi_set_element(env, array, 2, made[2]) == napi_ok &&
+                      napi_set_element(env, array, 3, made[3]) == napi_ok &&
+                      napi_set_named_property(env, Global(env), "made", array) == napi_ok;
+  Leave(env, scope);
+  if (!stored) {
+    return "<not made: pending " + std::to_string(pending) + ", range status " +
+           std::to_string(range_status) + ">";
+  }
+  return Utf8(env, RunIn(env, realm,
+                         "(() => {"
+                         "  const [e, long, view, range] = made;"
+                         "  const proto = Object.getPrototypeOf;"
+                         "  return ["
+                         "    proto(e) === saved.Error.prototype, e instanceof saved.Error,"
+                         "    e.message, long.message.length,"
+                         "    proto(view) === saved.DataView.prototype, view.byteOffset,"
+                         "    view.byteLength,"
+                         "    proto(range) === saved.RangeError.prototype, range.code,"
+                         "    pageCalls].join();"
+                         "})()"));
+}
+
+napi_value ThrowBindingFailed(napi_env env, napi_callback_info) {
+  const napi_status status = napi_throw_error(env, nullptr, "binding failed");
+  if (status != napi_ok && status != napi_pending_exception) return Str(env, "not thrown");
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(Test69UnofficialRealmEntry, ErrorsAndDataViewsComeFromTheRealmsIntrinsics) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm, kReplaceErrorAndDataView), nullptr);
+  const std::string expected =
+      "true,true,made,300,true,2,4,true,ERR_NAPI_INVALID_DATAVIEW_ARGS,0";
+  EXPECT_EQ(MadeFromSavedIntrinsics(s.env, realm), expected);
+
+  // The env's own realm, too.
+  ASSERT_NE(RunIn(s.env, nullptr, kReplaceErrorAndDataView), nullptr);
+  EXPECT_EQ(MadeFromSavedIntrinsics(s.env, nullptr), expected);
+}
+
+TEST_F(Test69UnofficialRealmEntry, ThrowFromARealmsFunctionIsCaughtAsItsError) {
+  EnvScope s(runtime_.get());
+  napi_value realm_global = nullptr;
+  unofficial_napi_realm realm = CreateRealm(s.env, &realm_global);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm, kReplaceErrorAndDataView), nullptr);
+
+  napi_value fail = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_EQ(napi_create_function(s.env, "fail", NAPI_AUTO_LENGTH, ThrowBindingFailed, nullptr,
+                                 &fail),
+            napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(napi_set_named_property(s.env, realm_global, "fail", fail), napi_ok);
+
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm,
+                              "(() => {"
+                              "  try { return String(fail()); } catch (e) {"
+                              "    return [e instanceof saved.Error,"
+                              "      Object.getPrototypeOf(e) === saved.Error.prototype,"
+                              "      e.message, pageCalls].join();"
+                              "  }"
+                              "})()")),
+            "true,true,binding failed,0");
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+}
+
+// Buffer is the env's, as in Node: a buffer made in a realm takes the env
+// realm's Buffer.prototype, and nothing reads the realm's Buffer.
+TEST_F(Test69UnofficialRealmEntry, BuffersNeverReadTheRealmsBuffer) {
+  EnvScope s(runtime_.get());
+  ASSERT_NE(RunIn(s.env, nullptr,
+                  "globalThis.Buffer = class Buffer extends Uint8Array {"
+                  "  static from(view) { return new Buffer(view); } };"
+                  "0"),
+            nullptr);
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm,
+                  "globalThis.pageCalls = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { get() {"
+                  "  pageCalls++;"
+                  "  return { prototype: {}, from() { pageCalls++; return {}; } }; } });"
+                  "0"),
+            nullptr);
+
+  unofficial_napi_bytecode_open_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  options.source_text = Str(s.env, "1 + 1");
+  options.filename = Str(s.env, "script.js");
+  options.shape = unofficial_napi_bytecode_shape_script;
+  options.params_or_undefined = Undefined(s.env);
+  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "hdo"), &options.host_defined_option_id),
+            napi_ok);
+  unofficial_napi_bytecode_open_result opened{};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &options, &opened), napi_ok);
+  ASSERT_NE(opened.bytecode, nullptr);
+
+  napi_value buffer = nullptr;
+  napi_value serialized = nullptr;
+  void* data = nullptr;
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  EXPECT_EQ(napi_create_buffer(s.env, 4, &data, &buffer), napi_ok);
+  EXPECT_EQ(unofficial_napi_bytecode_serialize(s.env, opened.bytecode, &serialized), napi_ok);
+  Leave(s.env, scope);
+  ASSERT_EQ(unofficial_napi_bytecode_release(s.env, opened.bytecode), napi_ok);
+  ASSERT_NE(buffer, nullptr);
+  ASSERT_NE(serialized, nullptr);
+  bool is_typedarray = false;
+  ASSERT_EQ(napi_is_typedarray(s.env, serialized, &is_typedarray), napi_ok);
+  EXPECT_TRUE(is_typedarray);
+
+  // The buffer is a Buffer of the env's realm, and the realm's getter never
+  // ran.
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "made", buffer), napi_ok);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "String(Object.getPrototypeOf(made) === Buffer.prototype)")),
+            "true");
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm, "String(pageCalls)")), "0");
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+struct ImportHookRealms {
+  napi_ref env_global = nullptr;
+  int calls = 0;
+  int this_is_env_global = 0;
+  int global_is_env_global = 0;
+};
+
+napi_value RecordImportHookRealm(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, &self, &data) != napi_ok) return nullptr;
+  auto* record = static_cast<ImportHookRealms*>(data);
+  napi_value env_global = nullptr;
+  if (napi_get_reference_value(env, record->env_global, &env_global) != napi_ok) return nullptr;
+  ++record->calls;
+  if (StrictEquals(env, self, env_global)) ++record->this_is_env_global;
+  if (StrictEquals(env, Global(env), env_global)) ++record->global_is_env_global;
+  napi_value result = nullptr;
+  napi_create_object(env, &result);
+  return result;
+}
+
+}  // namespace
+
+// Env hooks run in the env's realm: the dynamic-import hook's receiver and
+// current realm are the env's, whichever realm imports and is current.
+TEST_F(Test69UnofficialRealmEntry, DynamicImportHookRunsInTheEnvsRealm) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = CreateRealm(s.env);
+  unofficial_napi_realm b = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  ImportHookRealms record;
+  ASSERT_EQ(napi_create_reference(s.env, Global(s.env), 1, &record.env_global), napi_ok);
+  napi_value hook = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "importHook", NAPI_AUTO_LENGTH, RecordImportHookRealm,
+                                 &record, &hook),
+            napi_ok);
+  const unofficial_napi_module_hooks hooks = {
+      sizeof(unofficial_napi_module_hooks), UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION, hook, nullptr};
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+  // import() in A: with nothing entered, with A entered, and with B entered.
+  ASSERT_NE(RunIn(s.env, a, "import('one'); 0"), nullptr);
+  unofficial_napi_realm_scope scope = Enter(s.env, a);
+  ASSERT_NE(Eval(s.env, "import('two'); 0"), nullptr);
+  Leave(s.env, scope);
+  scope = Enter(s.env, b);
+  ASSERT_NE(RunIn(s.env, a, "import('three'); 0"), nullptr);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(record.calls, 3);
+  EXPECT_EQ(record.this_is_env_global, 3);
+  EXPECT_EQ(record.global_is_env_global, 3);
+  ASSERT_EQ(napi_delete_reference(s.env, record.env_global), napi_ok);
+}
+#endif
+// napi_run_script in an entered sandbox realm, and the realm options each
+// provider honors.
+
+namespace {
+
+int32_t Int32Property(napi_env env, napi_value object, const char* name) {
+  napi_value value = nullptr;
+  int32_t out = -1;
+  if (napi_get_named_property(env, object, name, &value) != napi_ok ||
+      napi_get_value_int32(env, value, &out) != napi_ok) {
+    return -1;
+  }
+  return out;
+}
+
+}  // namespace
+
+// A sandbox realm's global is its sandbox, so napi_run_script there reads the
+// sandbox, and its global writes reach the sandbox.
+TEST_F(Test69UnofficialRealmEntry, NapiRunScriptInAnEnteredSandboxRealmUsesTheSandbox) {
+  EnvScope s(runtime_.get());
+  napi_value sandbox = nullptr;
+  napi_value x = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+  ASSERT_EQ(napi_create_int32(s.env, 42, &x), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, sandbox, "x", x), napi_ok);
+  unofficial_napi_realm realm = CreateRealm(s.env, nullptr, sandbox);
+  ASSERT_NE(realm, nullptr);
+
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_TRUE(StrictEquals(s.env, Global(s.env), sandbox));
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "fromNative", Str(s.env, "native")),
+            napi_ok);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "`${typeof x} ${x} ${fromNative}`")), "number 42 native");
+  EXPECT_NE(Eval(s.env, "globalThis.written = 7; var declared = 8; x = 43"), nullptr);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(Int32Property(s.env, sandbox, "written"), 7);
+  EXPECT_EQ(Int32Property(s.env, sandbox, "declared"), 8);
+  EXPECT_EQ(Int32Property(s.env, sandbox, "x"), 43);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "typeof written")), "undefined");
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// Only V8 honors allow_code_gen_strings. The switch belongs to the realm, so
+// it holds for napi_run_script while the realm is entered.
+TEST_F(Test69UnofficialRealmEntry, EnteredRealmKeepsItsStringCodeGenerationSwitch) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.allow_code_gen_strings = false;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+
+  const char* probe =
+      "(() => { try { return String(eval('1 + 1')); } catch (e) { return e.name; } })()";
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, probe)), "EvalError");
+  Leave(s.env, scope);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, probe)), "2");
+}
+#endif
+
+// Typed arrays in an entered realm come from the realm's own constructors,
+// and ranges that don't fit throw that realm's RangeError.
+TEST_F(Test69UnofficialRealmEntry, TypedArraysComeFromTheRealmsIntrinsics) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_NE(RunIn(s.env, realm,
+                  "globalThis.saved = { Uint8Array, Int32Array, RangeError };"
+                  "globalThis.pageCalls = 0;"
+                  "for (const name of ['Uint8Array', 'Int32Array'])"
+                  "  Object.defineProperty(globalThis, name, { configurable: true,"
+                  "    get() { pageCalls++; return function () { pageCalls++; return {}; }; } });"
+                  "0"),
+            nullptr);
+
+  napi_value buffer = nullptr;
+  napi_value made[4] = {};
+  unofficial_napi_realm_scope scope = Enter(s.env, realm);
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 16, nullptr, &buffer), napi_ok);
+  ASSERT_EQ(napi_create_typedarray(s.env, napi_uint8_array, 4, buffer, 1, &made[0]), napi_ok);
+  ASSERT_EQ(napi_create_typedarray(s.env, napi_int32_array, 2, buffer, 8, &made[1]), napi_ok);
+  // Misaligned, then past the end of the buffer.
+  EXPECT_EQ(napi_create_typedarray(s.env, napi_int32_array, 1, buffer, 2, &made[2]),
+            napi_pending_exception);
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &made[2]), napi_ok);
+  EXPECT_EQ(napi_create_typedarray(s.env, napi_int32_array, 4, buffer, 4, &made[3]),
+            napi_pending_exception);
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &made[3]), napi_ok);
+  napi_value array = nullptr;
+  ASSERT_EQ(napi_create_array_with_length(s.env, 4, &array), napi_ok);
+  for (uint32_t i = 0; i < 4; ++i) ASSERT_EQ(napi_set_element(s.env, array, i, made[i]), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "made", array), napi_ok);
+  Leave(s.env, scope);
+
+  EXPECT_EQ(Utf8(s.env, RunIn(s.env, realm,
+                              "(() => {"
+                              "  const [bytes, ints, misaligned, tooLong] = made;"
+                              "  const proto = Object.getPrototypeOf;"
+                              "  return ["
+                              "    proto(bytes) === saved.Uint8Array.prototype, bytes.byteOffset,"
+                              "    bytes.length, proto(ints) === saved.Int32Array.prototype,"
+                              "    ints.length, misaligned instanceof saved.RangeError,"
+                              "    tooLong instanceof saved.RangeError, pageCalls].join();"
+                              "})()")),
+            "true,1,4,true,2,true,true,0");
+}

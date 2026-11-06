@@ -4,6 +4,7 @@ use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Va
 use wasmer_wasix::WasiError;
 use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
+use super::callback_cache::CachedGuestCallback;
 use crate::{NapiEnv, snapi::SnapiEnv};
 
 thread_local! {
@@ -78,25 +79,16 @@ fn call_guest_callback(
                 Value::FuncRef(None) => return 0,
                 _ => return 0,
             };
+            let callback = CachedGuestCallback::new(func, store);
             func_env
                 .as_mut(store)
                 .func_cache
-                .insert(wasm_fn_ptr, func.clone());
-            func
+                .insert(wasm_fn_ptr, callback.clone());
+            callback
         }
     };
-    match func.call(
-        store,
-        &[
-            Value::I32(guest_env as i32),
-            Value::I32(callback_arg as i32),
-        ],
-    ) {
-        Ok(ret_vals) => match ret_vals.first() {
-            Some(Value::I32(v)) => *v as u32,
-            Some(Value::I64(v)) => *v as u32,
-            _ => 0,
-        },
+    match func.call(store, guest_env, callback_arg) {
+        Ok(result) => result,
         Err(err) => {
             if stash_guest_exit(&err) {
                 return 0;
@@ -130,26 +122,16 @@ fn call_guest_callback2(
                 Value::FuncRef(None) => return 0,
                 _ => return 0,
             };
+            let callback = CachedGuestCallback::new(func, store);
             func_env
                 .as_mut(store)
                 .func_cache
-                .insert(wasm_fn_ptr, func.clone());
-            func
+                .insert(wasm_fn_ptr, callback.clone());
+            callback
         }
     };
-    match func.call(
-        store,
-        &[
-            Value::I32(guest_env as i32),
-            Value::I32(arg0 as i32),
-            Value::I32(arg1 as i32),
-        ],
-    ) {
-        Ok(ret_vals) => match ret_vals.first() {
-            Some(Value::I32(v)) => *v as u32,
-            Some(Value::I64(v)) => *v as u32,
-            _ => 0,
-        },
+    match func.call_finalizer(store, guest_env, arg0, arg1) {
+        Ok(result) => result,
         Err(err) => {
             if stash_guest_exit(&err) {
                 return 0;

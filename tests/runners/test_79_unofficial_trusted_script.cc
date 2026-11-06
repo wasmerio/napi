@@ -1,3 +1,8 @@
+#ifdef NAPI_MODULE
+#undef NAPI_MODULE
+#endif
+#include "node_api.h"
+
 #include "test_env.h"
 
 #include "unofficial_napi.h"
@@ -10,7 +15,7 @@
 
 // unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js.
 // V8 implements both; QuickJS reports them as unsupported.
-class Test66UnofficialTrustedScript : public FixtureTestBase {};
+class Test79UnofficialTrustedScript : public FixtureTestBase {};
 
 namespace {
 
@@ -95,16 +100,15 @@ std::string TakeExceptionMessage(napi_env env) {
   return ::testing::AssertionSuccess();
 }
 
-// Evaluates a boolean expression in a contextified sandbox.
+// Evaluates a boolean expression in an explicit realm.
 ::testing::AssertionResult IsTrueIn(napi_env env,
-                                    napi_value sandbox,
-                                    napi_value host_defined_option,
+                                    unofficial_napi_realm realm,
                                     const char* code) {
   const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(Str(env, code));
   napi_value result = nullptr;
   bool value = false;
-  if (unofficial_napi_contextify_run_script(env,
-                                            sandbox,
+  if (unofficial_napi_run_script(env,
+                                            realm,
                                             &source,
                                             Str(env, "trusted-script.js"),
                                             0,
@@ -113,7 +117,7 @@ std::string TakeExceptionMessage(napi_env env) {
                                             true,
                                             false,
                                             false,
-                                            host_defined_option,
+                                            nullptr,
                                             &result) != napi_ok) {
     return ::testing::AssertionFailure() << code << " threw " << TakeExceptionMessage(env);
   }
@@ -144,8 +148,8 @@ struct TokenCallbackRecord {
   bool active = true;
 };
 
-// Context token callbacks run while the provider holds its context-record
-// lock; querying VM state from one must not wait on that lock.
+// Deprecated token hooks still run for new realms. The query remains safe
+// from those hooks and does not infer JS execution from entering a realm.
 void QueryFromTokenCallback(napi_env env, void* /*token*/, void* data) {
   auto* record = static_cast<TokenCallbackRecord*>(data);
   ++record->calls;
@@ -175,7 +179,7 @@ void InstallGlobal(napi_env env, const char* name, napi_callback callback, void*
 }  // namespace
 
 #if defined(NAPI_TEST_ENGINE_V8)
-TEST_F(Test66UnofficialTrustedScript, DirectEvalKeepsLexicalScope) {
+TEST_F(Test79UnofficialTrustedScript, DirectEvalKeepsLexicalScope) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
 
@@ -201,7 +205,7 @@ TEST_F(Test66UnofficialTrustedScript, DirectEvalKeepsLexicalScope) {
   EXPECT_TRUE(IsTrue(s.env, "eval(Object.freeze(makeTrusted('31'))) === 31"));
 }
 
-TEST_F(Test66UnofficialTrustedScript, SourceIgnoresAuthorStringConversion) {
+TEST_F(Test79UnofficialTrustedScript, SourceIgnoresAuthorStringConversion) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
 
@@ -226,7 +230,16 @@ TEST_F(Test66UnofficialTrustedScript, SourceIgnoresAuthorStringConversion) {
                             "return error instanceof TypeError; } return false; })()"));
 }
 
-TEST_F(Test66UnofficialTrustedScript, BrandCannotBeCopiedOrInherited) {
+// Function converts arguments before V8's code-generation hook. Pin the
+// limitation so a direct-eval guarantee is not mistaken for full Trusted Types.
+TEST_F(Test79UnofficialTrustedScript, FunctionConstructorUsesOrdinaryAuthorCoercion) {
+  EnvScope s(runtime_.get());
+  InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
+  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t.toString = () => 'return 2'; return Function(t)() === 2;})()"));
+  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t[Symbol.toPrimitive] = () => 'return 3'; return Function(t)() === 3;})()"));
+}
+
+TEST_F(Test79UnofficialTrustedScript, BrandCannotBeCopiedOrInherited) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
 
@@ -249,7 +262,7 @@ TEST_F(Test66UnofficialTrustedScript, BrandCannotBeCopiedOrInherited) {
 
 // The brand cannot be forged through the private-symbol API: a private symbol
 // with the brand's old registry name names a different property.
-TEST_F(Test66UnofficialTrustedScript, BrandCannotBeForgedWithPrivateSymbol) {
+TEST_F(Test79UnofficialTrustedScript, BrandCannotBeForgedWithPrivateSymbol) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
   napi_value real = nullptr;
@@ -276,7 +289,7 @@ TEST_F(Test66UnofficialTrustedScript, BrandCannotBeForgedWithPrivateSymbol) {
 
 // The isolate-wide hook is installed once. A hook the embedder installs
 // afterwards is not overwritten by later trusted-script creation.
-TEST_F(Test66UnofficialTrustedScript, KeepsEmbedderHookInstalledLater) {
+TEST_F(Test79UnofficialTrustedScript, KeepsEmbedderHookInstalledLater) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
   EXPECT_TRUE(IsTrue(s.env, "eval(makeTrusted('2')) === 2"));
@@ -292,7 +305,7 @@ TEST_F(Test66UnofficialTrustedScript, KeepsEmbedderHookInstalledLater) {
   EXPECT_GT(g_embedder_hook_calls, 0u);
 }
 
-TEST_F(Test66UnofficialTrustedScript, CreateValidatesArguments) {
+TEST_F(Test79UnofficialTrustedScript, CreateValidatesArguments) {
   EnvScope s(runtime_.get());
 
   napi_value number = nullptr;
@@ -320,7 +333,7 @@ TEST_F(Test66UnofficialTrustedScript, CreateValidatesArguments) {
 // Creating trusted scripts retains nothing once they are unreachable. A new
 // template per call left every instantiation in the context's template cache
 // (about 750 KB after 20k calls).
-TEST_F(Test66UnofficialTrustedScript, CreationDoesNotRetainMemory) {
+TEST_F(Test79UnofficialTrustedScript, CreationDoesNotRetainMemory) {
   EnvScope s(runtime_.get());
   napi_value source = Str(s.env, "1");
   napi_value warm = nullptr;
@@ -342,39 +355,33 @@ TEST_F(Test66UnofficialTrustedScript, CreationDoesNotRetainMemory) {
 
 // A trusted script does not bypass a context that disallows code generation
 // from strings, and eval of an unbranded object stays a no-op there.
-TEST_F(Test66UnofficialTrustedScript, RespectsDisabledCodeGeneration) {
+TEST_F(Test79UnofficialTrustedScript, RespectsDisabledCodeGeneration) {
   EnvScope s(runtime_.get());
 
   napi_value sandbox = nullptr;
-  napi_value host = nullptr;
   napi_value context = nullptr;
   napi_value trusted = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
-  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "trusted-script"), &host), napi_ok);
-  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
-                                                    sandbox,
-                                                    Str(s.env, "restricted"),
-                                                    Str(s.env, "test://restricted"),
-                                                    false,
-                                                    true,
-                                                    false,
-                                                    host,
-                                                    &context),
-            napi_ok);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = sandbox;
+  options.allow_code_gen_strings = false;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
   ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "throw 1"), &trusted),
             napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, sandbox, "trusted", trusted), napi_ok);
 
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host,
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "(() => { try { eval(trusted); } catch (error) { "
                        "return error instanceof EvalError; } return false; })()"));
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host,
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "(() => { try { Function(trusted); } catch (error) { "
                        "return error instanceof EvalError; } return false; })()"));
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host,
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "(() => { try { eval('1'); } catch (error) { "
                        "return error instanceof EvalError; } return false; })()"));
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host,
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "(() => { const object = { toString() { throw 1; } }; "
                        "return eval(object) === object; })()"));
 
@@ -383,7 +390,7 @@ TEST_F(Test66UnofficialTrustedScript, RespectsDisabledCodeGeneration) {
   EXPECT_TRUE(IsTrue(s.env, "eval(makeTrusted('5')) === 5"));
 }
 
-TEST_F(Test66UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
+TEST_F(Test79UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   EnvScope s(runtime_.get());
   MicrotaskRecord record;
   InstallGlobal(s.env, "executing", Executing, nullptr);
@@ -439,9 +446,9 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsReportsFramesAndMicrotasks) {
   EXPECT_TRUE(same);
 }
 
-TEST_F(Test66UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
-  EnvScope s(runtime_.get());
+TEST_F(Test79UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
   TokenCallbackRecord record;
+  EnvScope s(runtime_.get());
   unofficial_napi_env_hooks hooks{};
   hooks.size = sizeof(hooks);
   hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
@@ -451,20 +458,13 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
   ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
 
   napi_value sandbox = nullptr;
-  napi_value host = nullptr;
   napi_value context = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
-  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "trusted-script"), &host), napi_ok);
-  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
-                                                    sandbox,
-                                                    Str(s.env, "token"),
-                                                    Str(s.env, "test://token"),
-                                                    true,
-                                                    true,
-                                                    true,
-                                                    host,
-                                                    &context),
-            napi_ok);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = sandbox;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
   EXPECT_EQ(record.calls, 1u);
   EXPECT_EQ(record.status, napi_ok);
   EXPECT_FALSE(record.active);
@@ -472,28 +472,22 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
 
 // A native callback from the root context still sees JavaScript frames and
 // microtask checkpoints that belong to another context.
-TEST_F(Test66UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
+TEST_F(Test79UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
   EnvScope s(runtime_.get());
   MicrotaskRecord record;
 
   napi_value sandbox = nullptr;
-  napi_value host = nullptr;
   napi_value context = nullptr;
   napi_value executing = nullptr;
   napi_value microtask = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
-  ASSERT_EQ(napi_create_symbol(s.env, Str(s.env, "trusted-script"), &host), napi_ok);
   // Own microtask queue: run_script drains it after evaluation.
-  ASSERT_EQ(unofficial_napi_contextify_make_context(s.env,
-                                                    sandbox,
-                                                    Str(s.env, "other"),
-                                                    Str(s.env, "test://other"),
-                                                    true,
-                                                    true,
-                                                    true,
-                                                    host,
-                                                    &context),
-            napi_ok);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = sandbox;
+  options.own_microtask_queue = true;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
   ASSERT_EQ(napi_create_function(
                 s.env, "executing", NAPI_AUTO_LENGTH, Executing, nullptr, &executing),
             napi_ok);
@@ -503,11 +497,11 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
   ASSERT_EQ(napi_set_named_property(s.env, sandbox, "executing", executing), napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, sandbox, "microtask", microtask), napi_ok);
 
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host, "executing() === true"));
+  EXPECT_TRUE(IsTrueIn(s.env, realm, "executing() === true"));
   // A reaction job is queued in its handler's realm. Binding the context's
   // own Function.prototype.call queues the root callback in this context's
   // queue, and the bound builtin adds no JavaScript frame.
-  EXPECT_TRUE(IsTrueIn(s.env, sandbox, host,
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
                        "Promise.resolve().then(Function.prototype.call.bind(microtask)), true"));
   EXPECT_EQ(record.calls, 1u);
   EXPECT_EQ(record.active_calls, 1u);
@@ -519,7 +513,7 @@ TEST_F(Test66UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
 #endif
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
-TEST_F(Test66UnofficialTrustedScript, Unsupported) {
+TEST_F(Test79UnofficialTrustedScript, Unsupported) {
   EnvScope s(runtime_.get());
 
   napi_value result = Str(s.env, "sentinel");
@@ -533,5 +527,169 @@ TEST_F(Test66UnofficialTrustedScript, Unsupported) {
   EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_generic_failure);
   EXPECT_FALSE(active);
   EXPECT_EQ(unofficial_napi_is_executing_js(s.env, nullptr), napi_invalid_arg);
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+unofficial_napi_realm MakeRealm(napi_env env, napi_value* global, bool allow_strings = true) {
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.allow_code_gen_strings = allow_strings;
+  unofficial_napi_realm realm = nullptr;
+  EXPECT_EQ(unofficial_napi_create_realm(env, &options, &realm, global), napi_ok);
+  return realm;
+}
+}
+
+TEST_F(Test79UnofficialTrustedScript, CreationUsesCurrentRealmAndEvalUsesCallersScope) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr, b_global = nullptr, trusted = nullptr;
+  auto a = MakeRealm(s.env, &a_global);
+  auto b = MakeRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, a, &scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "lexical + 2"), &trusted), napi_ok);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "trusted", trusted), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "trusted", trusted), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, a, "Object.getPrototypeOf(Object.getPrototypeOf(trusted)) === Object.prototype"));
+  EXPECT_TRUE(IsTrueIn(s.env, b, "Object.getPrototypeOf(Object.getPrototypeOf(trusted)) !== Object.prototype"));
+  EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {let lexical = 40; return eval(trusted) === 42;})()"));
+  napi_value type_error = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, a_global, "TypeError", &type_error), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "OriginTypeError", type_error), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {try {trusted.toString.call({});} catch(e) {return e instanceof OriginTypeError && !(e instanceof TypeError);} return false;})()"));
+}
+
+TEST_F(Test79UnofficialTrustedScript, NativeFactoryKeepsItsCreationRealmWhenCalledElsewhere) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr, b_global = nullptr, factory = nullptr, a_object = nullptr;
+  auto a = MakeRealm(s.env, &a_global);
+  auto b = MakeRealm(s.env, &b_global);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, a, &scope), napi_ok);
+  ASSERT_EQ(napi_create_function(s.env, "makeTrusted", NAPI_AUTO_LENGTH, MakeTrusted, nullptr, &factory), napi_ok);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, a_global, "Object", &a_object), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "OriginObject", a_object), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "makeTrusted", factory), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {const t = makeTrusted('lexical + 2'); let lexical = 40; return Object.getPrototypeOf(Object.getPrototypeOf(t)) === OriginObject.prototype && eval(t) === 42;})()"));
+}
+
+TEST_F(Test79UnofficialTrustedScript, ReceivingRealmControlsCodeGenerationPolicy) {
+  EnvScope s(runtime_.get());
+  napi_value a_global = nullptr, b_global = nullptr, trusted = nullptr;
+  auto a = MakeRealm(s.env, &a_global);
+  auto b = MakeRealm(s.env, &b_global, false);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, a, &scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "6 * 7"), &trusted), napi_ok);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, a_global, "trusted", trusted), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, b_global, "trusted", trusted), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, a, "eval(trusted) === 42"));
+  EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {try {eval(trusted);} catch(e) {return e instanceof EvalError;} return false;})()"));
+  EXPECT_TRUE(IsTrueIn(s.env, b, "(() => {try {Function(trusted);} catch(e) {return e instanceof EvalError;} return false;})()"));
+}
+
+TEST_F(Test79UnofficialTrustedScript, EnteringRealmAloneDoesNotMeanJsIsExecuting) {
+  EnvScope s(runtime_.get());
+  napi_value global = nullptr;
+  auto realm = MakeRealm(s.env, &global);
+  ASSERT_NE(realm, nullptr);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &scope), napi_ok);
+  bool active = true;
+  EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+}
+
+TEST_F(Test79UnofficialTrustedScript, CreationRefusesTerminationAndQueryKeepsPendingException) {
+  EnvScope s(runtime_.get());
+  napi_value source = Str(s.env, "42"), result = source;
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(unofficial_napi_create_trusted_script(s.env, source, &result), napi_pending_exception);
+  EXPECT_EQ(result, nullptr);
+  bool active = true, pending = false;
+  EXPECT_EQ(unofficial_napi_is_executing_js(s.env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  EXPECT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, source, &result), napi_ok);
+}
+
+TEST_F(Test79UnofficialTrustedScript, SharedTemplateDoesNotRetainFirstCreationRealm) {
+  EnvScope s(runtime_.get());
+  napi_ref weak = nullptr;
+  napi_handle_scope handles = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
+  napi_value global = nullptr, trusted = nullptr;
+  auto realm = MakeRealm(s.env, &global);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak), napi_ok);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "42"), &trusted), napi_ok);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, handles), napi_ok);
+  for (int attempt = 0; attempt < 3; ++attempt) ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  napi_value retained = nullptr;
+  ASSERT_EQ(napi_get_reference_value(s.env, weak, &retained), napi_ok);
+  EXPECT_EQ(retained, nullptr);
+  ASSERT_EQ(napi_delete_reference(s.env, weak), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "43"), &trusted), napi_ok);
+}
+
+namespace {
+struct CleanupRecord {
+  napi_env env = nullptr;
+  unsigned calls = 0;
+};
+void TrustedScriptDuringCleanup(void* data) {
+  auto* record = static_cast<CleanupRecord*>(data);
+  bool active = true;
+  EXPECT_EQ(unofficial_napi_is_executing_js(record->env, &active), napi_ok);
+  EXPECT_FALSE(active);
+  napi_value trusted = nullptr, global = nullptr;
+  EXPECT_EQ(unofficial_napi_create_trusted_script(record->env, Str(record->env, "42"), &trusted), napi_ok);
+  EXPECT_EQ(napi_get_global(record->env, &global), napi_ok);
+  EXPECT_EQ(napi_set_named_property(record->env, global, "cleanupTrusted", trusted), napi_ok);
+  EXPECT_TRUE(IsTrue(record->env, "eval(cleanupTrusted) === 42"));
+  ++record->calls;
+}
+}
+
+TEST_F(Test79UnofficialTrustedScript, AgentStateRemainsUsableDuringCleanupHooks) {
+  CleanupRecord record;
+  {
+    EnvScope s(runtime_.get());
+    record.env = s.env;
+    EXPECT_EQ(napi_add_env_cleanup_hook(s.env, TrustedScriptDuringCleanup, &record), napi_ok);
+  }
+  EXPECT_EQ(record.calls, 1u);
+}
+
+TEST_F(Test79UnofficialTrustedScript, QuerySeesJsAcrossDifferentSecurityTokens) {
+  EnvScope s(runtime_.get());
+  napi_value global = nullptr, callback = nullptr;
+  auto realm = MakeRealm(s.env, &global);
+  ASSERT_NE(realm, nullptr);
+  ASSERT_EQ(napi_create_function(s.env, "executing", NAPI_AUTO_LENGTH, Executing, nullptr, &callback), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "executing", callback), napi_ok);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &scope), napi_ok);
+  auto* isolate = v8::Isolate::GetCurrent();
+  isolate->GetCurrentContext()->SetSecurityToken(v8::String::NewFromUtf8Literal(isolate, "another origin"));
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, realm, "executing() === true"));
 }
 #endif

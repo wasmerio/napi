@@ -20,18 +20,20 @@ public:
   ~napi_module_wrap__();
 
   void teardown();
+  void cancel_termination();
 
-  napi_status create_source_text(napi_value wrapper,
+  // A module lives in the realm whose context `ctx` is.
+  napi_status create_source_text(JSContext *ctx,
+                                 napi_value wrapper,
                                  napi_value url,
-                                 napi_value context_or_undefined,
                                  const unofficial_napi_js_source *source,
                                  int32_t line_offset,
                                  int32_t column_offset,
                                  napi_value host_defined_option_id,
                                  unofficial_napi_module *module_out);
-  napi_status create_synthetic(napi_value wrapper,
+  napi_status create_synthetic(JSContext *ctx,
+                               napi_value wrapper,
                                napi_value url,
-                               napi_value context_or_undefined,
                                napi_value export_names,
                                napi_value synthetic_eval_steps,
                                unofficial_napi_module *module_out);
@@ -97,8 +99,10 @@ private:
 
   struct request_record;
   struct record;
+  class record_scope;
   struct script_referrer;
 
+  JSValue get_wrapper(record *entry) const;
   record *find(unofficial_napi_module module) const;
   record *find_by_module(JSModuleDef *module) const;
   record *find_by_wrapper(JSValueConst wrapper) const;
@@ -115,6 +119,11 @@ private:
   JSValue clone_attributes(JSValueConst value) const;
   napi_status throw_error(const char *code, const char *message);
   napi_status return_pending_exception(const char *message);
+  napi_status throw_if_linking();
+  napi_status link_module(record *entry, JSContext *ctx, JSModuleDef *module, const char *failure);
+  napi_status throw_if_evaluating(record *entry);
+  napi_status throw_if_importing_an_evaluating_synthetic_module(record *entry);
+  napi_status evaluate_unless_terminated(record *entry, JSValue *promise_out);
   napi_status wrap_owned(JSValue value, napi_value *result_out) const;
   JSValue call_callback(JSValueConst callback,
                         int argc,
@@ -122,17 +131,6 @@ private:
   napi_status cache_module_requests(record *entry);
 
   static int synthetic_init(JSContext *ctx, JSModuleDef *module);
-  static int host_import_meta_init(JSContext *ctx,
-                                   JSModuleDef *module,
-                                   JSValueConst meta,
-                                   void *opaque);
-  static JSValue host_dynamic_import(JSContext *ctx,
-                                     JSModuleDef *referrer,
-                                     JSValueConst referrer_name,
-                                     JSValueConst specifier,
-                                     JSValueConst attributes,
-                                     JSModuleImportPhaseEnum phase,
-                                     void *opaque);
 
   // Owning environment and QuickJS context.
   napi_env env_;
@@ -147,6 +145,11 @@ private:
   std::vector<script_referrer> script_referrers_;
   std::vector<pending_provider_promise> pending_dynamic_imports_;
   uint64_t facade_counter_ = 0;
+  JSAtom dependency_key_ = JS_ATOM_NULL;
+  // Synthetic modules whose evaluation steps are running.
+  int synthetic_steps_running_ = 0;
+  // Links running (see link_module).
+  int links_running_ = 0;
 
   // Subsystem lifecycle.
   bool torn_down_ = false;

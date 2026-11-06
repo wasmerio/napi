@@ -181,6 +181,16 @@
       "expected_stdout": "TEST_HIGH_GUEST_POINTERS_OK=1\n"
     },
     {
+      "name": "run_script_compat_test",
+      "description": "main's run_script_test through the deprecated contextify calls and version 1 module and bytecode options: they still build and run, and resolve to the right realm",
+      "expected_stdout": "RUN_SCRIPT_COMPAT_TEST_OK=1\n"
+    },
+    {
+      "name": "test_realm",
+      "description": "Realms: own globals, shared values, native functions in the env's realm, get_realm, sandbox realms, scripts, functions, modules and bytecode in a realm, entering a realm, collection of dropped realms, release with live realms",
+      "expected_stdout": "realm has its own global\nvalues cross realms: x=7\nnative function stays in the env's realm\nget_realm finds the realm by its global\nsandbox realm: input=5 output=10\nvm results: run=4 function=30 module=5 bytecode=6\nentered realm: its global, objects and functions\ncollected 6 of 6 dropped realms\nreleased an env with live realms\nTEST_REALM_OK=1\n"
+    },
+    {
       "name": "test_trusted_script",
       "description": "unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js through the guest imports",
       "expected_stdout": "TEST_TRUSTED_SCRIPT_OK=1\n"

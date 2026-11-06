@@ -1,5 +1,6 @@
 #include "internal/napi_serdes.h"
 
+#include "internal/napi_env.h"
 #include "internal/napi_shared_array_buffer.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
@@ -60,54 +61,15 @@ namespace quickjs::detail
             return true;
         }
 
-        if (JS_GetTypedArrayType(input) >= 0)
+        // A view's own bytes, never what its properties say.
+        napi_view_layout__ layout;
+        if (env->view_layout(input, &layout))
         {
-            size_t offset = 0;
-            JSValue array_buffer = JS_GetTypedArrayBuffer(ctx, input, &offset, &length, nullptr);
-            if (JS_IsException(array_buffer))
-                return false;
-            size_t array_buffer_length = 0;
-            data = JS_GetArrayBuffer(ctx, &array_buffer_length, array_buffer);
-            JS_FreeValue(ctx, array_buffer);
-            if (data == nullptr && JS_HasException(ctx))
-                return false;
-            if (offset > array_buffer_length || length > array_buffer_length - offset)
-                return false;
-            if (length == 0)
+            JS_FreeValue(ctx, layout.buffer);
+            if (layout.byte_length == 0)
                 bytes_out->clear();
             else
-                bytes_out->assign(data + offset, data + offset + length);
-            return true;
-        }
-
-        if (JS_IsDataView(input))
-        {
-            JSValue buffer = JS_GetPropertyStr(ctx, input, "buffer");
-            JSValue byte_offset = JS_GetPropertyStr(ctx, input, "byteOffset");
-            JSValue byte_length = JS_GetPropertyStr(ctx, input, "byteLength");
-            uint32_t offset = 0;
-            uint32_t view_length = 0;
-            bool ok = !JS_IsException(buffer) &&
-                      JS_ToUint32(ctx, &offset, byte_offset) == 0 &&
-                      JS_ToUint32(ctx, &view_length, byte_length) == 0;
-            JS_FreeValue(ctx, byte_offset);
-            JS_FreeValue(ctx, byte_length);
-            if (!ok)
-            {
-                JS_FreeValue(ctx, buffer);
-                return false;
-            }
-            size_t array_buffer_length = 0;
-            data = JS_GetArrayBuffer(ctx, &array_buffer_length, buffer);
-            JS_FreeValue(ctx, buffer);
-            if (data == nullptr && JS_HasException(ctx))
-                return false;
-            if (offset > array_buffer_length || view_length > array_buffer_length - offset)
-                return false;
-            if (view_length == 0)
-                bytes_out->clear();
-            else
-                bytes_out->assign(data + offset, data + offset + view_length);
+                bytes_out->assign(layout.data, layout.data + layout.byte_length);
             return true;
         }
 

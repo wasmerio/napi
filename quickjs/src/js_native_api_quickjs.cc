@@ -133,6 +133,18 @@ JSValue JS_NewStringLenNodeUtf8(JSContext *ctx, const char *str, size_t length)
 
 }
 
+// Like Node's NAPI_PREAMBLE, and NAPI_V8_RETURN_IF_TERMINATING in the V8
+// provider: while the env is terminating, calls that may run JS fail without
+// running it. QuickJS only polls its interrupt handler every 10,000
+// operations, so a getter, setter, proxy trap, valueOf/toString or
+// Symbol.hasInstance would otherwise still run, at least in part.
+#define NAPI_QUICKJS_RETURN_IF_TERMINATING(env)                                \
+  do                                                                           \
+  {                                                                            \
+    if (napi_util__::check_env(env) && (env)->termination_requested())         \
+      return napi_util__::fail_if_terminating((env), (env)->context());        \
+  } while (0)
+
 extern "C"
 {
   napi_status NAPI_CDECL napi_get_last_error_info(
@@ -167,8 +179,7 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr)
       return napi_invalid_arg;
-    auto context = env->context();
-    *result = env->wrap_value_in_current_scope(JS_GetGlobalObject(context), true);
+    *result = env->wrap_value_in_current_scope(env->current_global(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -439,6 +450,7 @@ extern "C"
         napi_external_backing_store_hint__::destroy(hint);
         return napi_util__::return_pending_if_caught(env, "Failed to create external array");
       }
+      hint->track_array_buffer(env->context(), out);
     }
 
     *result = env->wrap_value_in_current_scope(out, true);
@@ -505,14 +517,14 @@ extern "C"
         return napi_invalid_arg;
     }
 
-    size_t byte_len;
-    size_t offset;
-    JSValue abuf = JS_GetTypedArrayBuffer(env->context(), local, &offset, &byte_len, nullptr);
-
-    if (JS_IsException(abuf))
-    {
-      return napi_util__::return_pending_if_caught(env, "Failed to get typed array info");
-    }
+    // Its own layout, never what its properties say. As in Node, a typed
+    // array over a detached buffer, or out of bounds of a shrunk resizable
+    // one, has no elements.
+    napi_view_layout__ layout;
+    if (!env->view_layout(local, &layout))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "Failed to get typed array info");
+    const size_t byte_len = layout.byte_length;
+    JSValue abuf = layout.buffer;
 
     if (length != nullptr)
     {
@@ -547,19 +559,12 @@ extern "C"
 
     if (byte_offset != nullptr)
     {
-      *byte_offset = offset;
+      *byte_offset = layout.byte_offset;
     }
 
     if (data != nullptr)
     {
-      size_t ab_len;
-      uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, abuf);
-      if (ab_data == nullptr)
-      {
-        JS_FreeValue(env->context(), abuf);
-        return napi_util__::return_pending_if_caught(env, "Failed to get array buffer data");
-      }
-      *data = ab_data + offset;
+      *data = layout.data;
     }
 
     if (arraybuffer != nullptr)
@@ -606,41 +611,13 @@ extern "C"
       return napi_ok;
     }
 
+    // Anything else is not an ArrayBuffer, whatever its byteLength property
+    // says (a script can define one on any object).
     if (!JS_IsArrayBuffer(local))
-    {
-      if (JS_IsObject(local))
-      {
-        JSValue byte_len = JS_GetPropertyStr(env->context(), local, "byteLength");
-        if (JS_IsException(byte_len))
-        {
-          JSValue exc = JS_GetException(env->context());
-          JS_FreeValue(env->context(), exc);
-        }
-        else if (!JS_IsUndefined(byte_len))
-        {
-          JS_FreeValue(env->context(), byte_len);
-          *result = true;
-          return napi_ok;
-        }
-        else
-        {
-          JS_FreeValue(env->context(), byte_len);
-        }
-      }
       return napi_arraybuffer_expected;
-    }
 
-    size_t ab_len = 0;
-    uint8_t *data = JS_GetArrayBuffer(env->context(), &ab_len, local);
-    if (data == nullptr && JS_HasException(env->context()))
-    {
-      napi_util__::clear_last_exception(env);
-      *result = true;
-      return napi_ok;
-    }
-
-    *result = false;
-
+    // Leaves an exception that was pending as it was, and adds none.
+    *result = napi_util__::is_detached_array_buffer(env->context(), local);
     return napi_ok;
   }
 
@@ -1285,13 +1262,17 @@ extern "C"
     if (!napi_util__::check_value(env, arraybuffer))
       return napi_util__::invalid_arg(env);
 
+    JSValue value = napi_quickjs_value_inner(env, arraybuffer);
     size_t len = 0;
-    uint8_t *ptr = JS_GetArrayBuffer(env->context(), &len, napi_quickjs_value_inner(env, arraybuffer));
+    uint8_t *ptr = JS_GetArrayBuffer(env->context(), &len, value);
     if (ptr == nullptr && len == 0 && JS_HasException(env->context()))
     {
       JSValue exc = JS_GetException(env->context());
       JS_FreeValue(env->context(), exc);
-      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+      // QuickJS throws for a detached ArrayBuffer. Node reports it as one
+      // with no data and a byte length of 0.
+      if (!JS_IsArrayBuffer(value))
+        return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
     }
 
     if (data != nullptr)
@@ -1362,27 +1343,46 @@ extern "C"
     if (!napi_util__::check_value(env, arraybuffer) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
+    JSContext *ctx = env->context();
+    JSValueConst buffer = napi_quickjs_value_inner(env, arraybuffer);
     size_t ab_len = 0;
-    uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, napi_quickjs_value_inner(env, arraybuffer));
-    if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->context()))
+    uint8_t *ab_data = JS_GetArrayBuffer(ctx, &ab_len, buffer);
+    if (ab_data == nullptr && ab_len == 0 && JS_HasException(ctx))
       return napi_util__::return_pending_if_caught(env, "ArrayBuffer expected");
+    if (byte_offset > ab_len || length > ab_len - byte_offset)
+    {
+      napi_throw_range_error(env, "ERR_NAPI_INVALID_DATAVIEW_ARGS",
+                             "byte_offset + byte_length should be less than or equal to the size in "
+                             "bytes of the array passed in");
+      return napi_quickjs_set_last_error(env, napi_pending_exception, "Invalid DataView range");
+    }
 
-    JSValue global = JS_GetGlobalObject(env->context());
-    JSValue ctor = JS_GetPropertyStr(env->context(), global, "DataView");
-    JS_FreeValue(env->context(), global);
-    if (JS_IsException(ctor))
-      return napi_util__::return_pending_if_caught(env, "Failed to get DataView constructor");
-
+    // The env realm's DataView, read before any script ran, makes the view;
+    // a view for another realm then takes that realm's own DataView.prototype.
+    // Neither step reads the realm's global, which its scripts control.
+    JSValueConst ctor = env->data_view_constructor();
+    if (!JS_IsConstructor(ctx, ctor))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "No DataView constructor");
     JSValue args[] = {
-        napi_quickjs_value_inner(env, arraybuffer),
-        JS_NewInt64(env->context(), static_cast<int64_t>(byte_offset)),
-        JS_NewInt64(env->context(), static_cast<int64_t>(length))};
-    JSValue view = JS_CallConstructor(env->context(), ctor, 3, args);
-    JS_FreeValue(env->context(), args[1]);
-    JS_FreeValue(env->context(), args[2]);
-    JS_FreeValue(env->context(), ctor);
+        JS_DupValue(ctx, buffer),
+        JS_NewInt64(ctx, static_cast<int64_t>(byte_offset)),
+        JS_NewInt64(ctx, static_cast<int64_t>(length))};
+    JSValue view = JS_CallConstructor(ctx, ctor, 3, args);
+    for (JSValue arg : args)
+      JS_FreeValue(ctx, arg);
     if (JS_IsException(view))
       return napi_util__::return_pending_if_caught(env, "DataView construction threw");
+    if (ctx != env->main_context())
+    {
+      JSValue proto = JS_GetClassProto(ctx, JS_GetClassID(view));
+      const int set = JS_SetPrototype(ctx, view, proto);
+      JS_FreeValue(ctx, proto);
+      if (set < 0)
+      {
+        JS_FreeValue(ctx, view);
+        return napi_util__::return_pending_if_caught(env, "Failed to create DataView");
+      }
+    }
 
     *result = env->wrap_value_in_current_scope(view, true);
     return (*result == nullptr) ? napi_generic_failure : napi_quickjs_clear_last_error(env);
@@ -1409,39 +1409,19 @@ extern "C"
     if (!JS_IsDataView(view))
       return napi_util__::invalid_arg(env);
 
-    JSValue len_val = JS_GetPropertyStr(env->context(), view, "byteLength");
-    JSValue offset_val = JS_GetPropertyStr(env->context(), view, "byteOffset");
-    JSValue buffer_val = JS_GetPropertyStr(env->context(), view, "buffer");
-    if (JS_IsException(len_val) || JS_IsException(offset_val) || JS_IsException(buffer_val))
-    {
-      JS_FreeValue(env->context(), len_val);
-      JS_FreeValue(env->context(), offset_val);
-      JS_FreeValue(env->context(), buffer_val);
-      return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
-    }
-
-    uint32_t len = 0;
-    uint32_t offset = 0;
-    JS_ToUint32(env->context(), &len, len_val);
-    JS_ToUint32(env->context(), &offset, offset_val);
-    JS_FreeValue(env->context(), len_val);
-    JS_FreeValue(env->context(), offset_val);
-
+    // Its own layout, never what its properties say. As in Node, a DataView
+    // over a detached buffer, or out of bounds of a shrunk resizable one, has
+    // no bytes.
+    napi_view_layout__ layout;
+    if (!env->view_layout(view, &layout))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "Failed to get DataView info");
+    JSValue buffer_val = layout.buffer;
     if (byte_length != nullptr)
-      *byte_length = len;
+      *byte_length = layout.byte_length;
     if (byte_offset != nullptr)
-      *byte_offset = offset;
+      *byte_offset = layout.byte_offset;
     if (data != nullptr)
-    {
-      size_t ab_len = 0;
-      uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, buffer_val);
-      if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->context()))
-      {
-        JS_FreeValue(env->context(), buffer_val);
-        return napi_util__::return_pending_if_caught(env, "Failed to get DataView ArrayBuffer");
-      }
-      *data = ab_data + offset;
-    }
+      *data = layout.data;
     if (arraybuffer != nullptr)
     {
       *arraybuffer = env->wrap_value_in_current_scope(buffer_val, true);
@@ -1497,6 +1477,7 @@ extern "C"
                                           uint32_t index,
                                           napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || result == nullptr)
       return napi_util__::invalid_arg(env);
     JSValue local = napi_quickjs_value_inner(env, object);
@@ -1517,6 +1498,7 @@ extern "C"
                                           uint32_t index,
                                           napi_value value)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || value == nullptr)
       return napi_util__::invalid_arg(env);
     JSValue local = napi_quickjs_value_inner(env, object);
@@ -1536,6 +1518,7 @@ extern "C"
                                          napi_value constructor,
                                          bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, constructor) || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -1568,6 +1551,7 @@ extern "C"
                                           uint32_t index,
                                           bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || result == nullptr)
       return napi_util__::invalid_arg(env);
     JSValue local = napi_quickjs_value_inner(env, object);
@@ -1595,6 +1579,7 @@ extern "C"
                                              uint32_t index,
                                              bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object))
       return napi_util__::invalid_arg(env);
     JSValue local = napi_quickjs_value_inner(env, object);
@@ -1947,12 +1932,14 @@ extern "C"
       return napi_invalid_arg;
     }
 
-    JSContext *ctx = napi_quickjs_value_context(env, constructor);
+    JSContext *ctx = env->context();
     if (ctx == nullptr)
     {
       return napi_invalid_arg;
     }
-    napi_env_context_scope__ context_scope{env, ctx};
+    napi_status terminating = napi_util__::fail_if_terminating(env, ctx);
+    if (terminating != napi_ok)
+      return terminating;
 
     // 2. Unwrap the constructor JSValue
     // Assuming 'unwrap_value' is your helper to get the JSValue from napi_value
@@ -1980,7 +1967,7 @@ extern "C"
 
     // 6. Wrap and return
     // 'wrap_value' converts the JSValue back into the napi_value handle
-    *result = env->wrap_value_in_current_scope(ctx, instance, true);
+    *result = env->wrap_value_in_current_scope(instance, true);
 
     return napi_ok;
   }
@@ -2002,12 +1989,7 @@ extern "C"
       return napi_util__::invalid_arg(env);
     }
 
-    JSContext *ctx = napi_quickjs_value_context(env, func);
-    if (ctx == nullptr)
-    {
-      return napi_util__::invalid_arg(env);
-    }
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
 
     JSValue js_func = napi_quickjs_value_inner(env, func);
 
@@ -2016,6 +1998,9 @@ extern "C"
     {
       return napi_quickjs_set_last_error(env, napi_function_expected, "Target is not a function");
     }
+    napi_status terminating = napi_util__::fail_if_terminating(env, ctx);
+    if (terminating != napi_ok)
+      return terminating;
 
     // 3. Resolve the receiver ('this' object)
     // If recv is null, Node-API defaults to 'undefined'
@@ -2041,7 +2026,7 @@ extern "C"
     if (result != nullptr)
     {
       // wrap the result; the current handle scope now owns the returned JSValue
-      *result = env->wrap_value_in_current_scope(ctx, js_result, true);
+      *result = env->wrap_value_in_current_scope(js_result, true);
     }
     else
     {
@@ -2057,6 +2042,7 @@ extern "C"
                                                 size_t property_count,
                                                 const napi_property_descriptor *properties)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object))
       return napi_util__::invalid_arg(env);
 
@@ -2198,7 +2184,7 @@ extern "C"
     if (JS_IsException(p))
       return napi_util__::return_pending_if_caught(env, ctx, "Failed to create Promise");
 
-    auto *d = napi_deferred__::create(env, ctx, resolving_funcs[0], resolving_funcs[1]);
+    auto *d = napi_deferred__::create(env, resolving_funcs[0], resolving_funcs[1]);
     if (d == nullptr)
     {
       JS_FreeValue(ctx, resolving_funcs[0]);
@@ -2208,7 +2194,7 @@ extern "C"
     }
 
     *deferred = d;
-    *promise = env->wrap_value_in_current_scope(ctx, p, true);
+    *promise = env->wrap_value_in_current_scope(p, true);
     return (*promise == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2216,14 +2202,11 @@ extern "C"
                                                napi_deferred deferred,
                                                napi_value resolution)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env) || deferred == nullptr || resolution == nullptr)
       return napi_invalid_arg;
 
-    JSContext *ctx = deferred->context();
-    if (ctx == nullptr)
-      return napi_invalid_arg;
-
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
     JSValue ret = deferred->call_resolve(resolution);
     napi_deferred__::destroy(deferred);
 
@@ -2238,14 +2221,11 @@ extern "C"
                                               napi_deferred deferred,
                                               napi_value rejection)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env) || deferred == nullptr || rejection == nullptr)
       return napi_invalid_arg;
 
-    JSContext *ctx = deferred->context();
-    if (ctx == nullptr)
-      return napi_invalid_arg;
-
-    napi_env_context_scope__ context_scope{env, ctx};
+    JSContext *ctx = env->context();
     JSValue ret = deferred->call_reject(rejection);
     napi_deferred__::destroy(deferred);
 
@@ -2270,6 +2250,7 @@ extern "C"
                                                  const char *utf8name,
                                                  bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || utf8name == nullptr || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -2298,6 +2279,7 @@ extern "C"
                                            napi_value key,
                                            napi_value value)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, key) || !napi_util__::check_value(env, value))
     {
       return napi_util__::invalid_arg(env);
@@ -2329,6 +2311,7 @@ extern "C"
                                            napi_value key,
                                            napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, key) || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -2361,6 +2344,7 @@ extern "C"
                                            napi_value key,
                                            bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, key) || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -2393,6 +2377,7 @@ extern "C"
                                               napi_value key,
                                               bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, key))
     {
       return napi_util__::invalid_arg(env);
@@ -2428,6 +2413,7 @@ extern "C"
                                                napi_value key,
                                                bool *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || !napi_util__::check_value(env, key) || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -2460,6 +2446,7 @@ extern "C"
                                                  napi_value object,
                                                  napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     return napi_util__::get_property_names(env,
                             object,
                             napi_key_include_prototypes,
@@ -2475,6 +2462,7 @@ extern "C"
                                                      napi_key_conversion key_conversion,
                                                      napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     return napi_util__::get_property_names(env, object, key_mode, key_filter, key_conversion, result);
   }
 
@@ -2483,6 +2471,7 @@ extern "C"
                                                  const char *utf8name,
                                                  napi_value value)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     // 1. Basic Validation
     if (!napi_util__::check_env(env) || !napi_util__::check_value(env, object) || utf8name == nullptr || !napi_util__::check_value(env, value))
     {
@@ -2519,6 +2508,7 @@ extern "C"
                                                  const char *utf8name,
                                                  napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object) || utf8name == nullptr || result == nullptr)
     {
       return napi_util__::invalid_arg(env);
@@ -2757,6 +2747,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_coerce_to_number(napi_env env, napi_value value, napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
@@ -2770,6 +2761,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_coerce_to_object(napi_env env, napi_value value, napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
@@ -2783,6 +2775,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_coerce_to_string(napi_env env, napi_value value, napi_value *result)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
 
@@ -2799,7 +2792,6 @@ extern "C"
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_invalid_arg;
 
-    napi_env_context_scope__ context_scope{env, napi_quickjs_value_context(env, value)};
     *result = env->wrap_ref_in_root_scope(napi_quickjs_value_inner(env, value), initial_ref_count);
     if (*result == nullptr)
       return napi_generic_failure;
@@ -2884,7 +2876,7 @@ extern "C"
       *result = nullptr;
       return napi_ok;
     }
-    *result = env->wrap_value_in_current_scope(slot->context(), slot->dup_inner(), true);
+    *result = env->wrap_value_in_current_scope(slot->dup_inner(), true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
@@ -2945,7 +2937,9 @@ extern "C"
 
     auto obj = napi_quickjs_value_inner(env, js_object);
     auto *wrap = napi_external__::get_wrap_record(env->context(), obj);
-    if (wrap == nullptr)
+    // A wrap the env's release has finalized is gone: its finalizer may have
+    // freed the native object.
+    if (wrap == nullptr || wrap->finalize_invoked())
       return napi_invalid_arg;
 
     *result = wrap->external_data();
@@ -2962,8 +2956,10 @@ extern "C"
       return napi_object_expected;
 
     auto *wrap = napi_external__::get_wrap_record(env->context(), obj);
-    if (wrap == nullptr)
-      return napi_generic_failure;
+    // As Node, an object with no wrap is an invalid argument; so is one whose
+    // wrap the env's release has finalized, as in napi_unwrap.
+    if (wrap == nullptr || wrap->finalize_invoked())
+      return napi_util__::invalid_arg(env);
 
     *result = wrap->external_data();
 
@@ -3004,18 +3000,15 @@ extern "C"
                                           const char *code,
                                           const char *msg)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
     {
       return napi_invalid_arg;
     }
 
-    JSValue error = napi_util__::create_plain_error(env->context(), msg);
-    if (code != nullptr)
-    {
-      JS_SetPropertyStr(env->context(), error, "code",
-                        JS_NewString(env->context(), code));
-    }
-
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewPlainError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
     napi_util__::set_last_exception(env, error);
 
     return napi_ok;
@@ -3023,6 +3016,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, error))
       return napi_invalid_arg;
     napi_util__::set_last_exception(env, JS_DupValue(env->context(), napi_quickjs_value_inner(env, error)));
@@ -3046,25 +3040,37 @@ extern "C"
 
   napi_status NAPI_CDECL napi_throw_type_error(napi_env env, const char *code, const char *msg)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewTypeError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewTypeError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
   napi_status NAPI_CDECL napi_throw_range_error(napi_env env, const char *code, const char *msg)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewRangeError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewRangeError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
   napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env, const char *code, const char *msg)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_env(env))
       return napi_invalid_arg;
-    napi_util__::set_last_exception(env, napi_util__::create_error_object(env->context(), JS_NewSyntaxError, code, msg));
+    JSValue error = napi_util__::create_error_object(env->context(), JS_NewSyntaxError, code, msg);
+    if (JS_IsException(error))
+      return napi_util__::return_pending_if_caught(env, "Failed to create error");
+    napi_util__::set_last_exception(env, error);
     return napi_pending_exception;
   }
 
@@ -3079,7 +3085,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_create_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
   {
-    return napi_util__::create_plain_error_common(env, code, msg, result);
+    return napi_util__::create_error_common(env, JS_NewPlainError, code, msg, result);
   }
 
   napi_status NAPI_CDECL napi_create_type_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
@@ -3120,7 +3126,13 @@ extern "C"
 
     // Take ownership of the exception before clearing
     JSValue ex = env->take_last_exception();
-
+    // The engine's uncatchable marker is internal control flow. Exposing it
+    // would let a later ordinary throw restart termination after a cancel.
+    if (JS_IsUncatchableError(ex))
+    {
+      JS_FreeValue(env->context(), ex);
+      ex = JS_NULL;
+    }
     *result = env->wrap_value_in_current_scope(ex, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
@@ -3159,11 +3171,24 @@ extern "C"
     JSValue source = napi_quickjs_value_inner(env, script);
     if (!JS_IsString(source))
       return napi_string_expected;
+    napi_status terminating = napi_util__::fail_if_terminating(env, env->context());
+    if (terminating != napi_ok)
+      return terminating;
 
     size_t len;
     const char *str = JS_ToCStringLen(env->context(), &len, source);
     if (str == nullptr)
       return napi_util__::return_pending_if_caught(env, "Failed to convert script to string");
+
+    // A sandbox realm's global is its sandbox (napi_get_global), so the
+    // sandbox is copied into the realm's real global and back, as
+    // unofficial_napi_run_script does.
+    napi_status sync_status = env->contextify().sync_sandbox_in(env->context());
+    if (sync_status != napi_ok)
+    {
+      JS_FreeCString(env->context(), str);
+      return sync_status;
+    }
 
     JSValue out = JS_Eval(env->context(), str, len, "<napi_run_script>", JS_EVAL_TYPE_GLOBAL);
 
@@ -3186,6 +3211,13 @@ extern "C"
     }
 
     JS_FreeCString(env->context(), str);
+
+    sync_status = env->contextify().sync_sandbox_out(env->context());
+    if (sync_status != napi_ok)
+    {
+      JS_FreeValue(env->context(), out);
+      return sync_status;
+    }
 
     *result = env->wrap_value_in_current_scope(out, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -3227,6 +3259,8 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || data == nullptr || result == nullptr)
       return napi_util__::invalid_arg(env);
+    // Making a Buffer reads the env's Buffer, which a getter may be.
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     napi_value arraybuffer = nullptr;
     napi_status status = napi_create_arraybuffer(env, length, data, &arraybuffer);
@@ -3267,6 +3301,8 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr || (length > 0 && data == nullptr))
       return napi_util__::invalid_arg(env);
+    // Making a Buffer reads the env's Buffer, which a getter may be.
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     napi_value arraybuffer = nullptr;
     napi_status status = napi_create_external_arraybuffer(
@@ -3304,6 +3340,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, arraybuffer) || result == nullptr)
       return napi_util__::invalid_arg(env);
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     size_t arraybuffer_length = 0;
     uint8_t *arraybuffer_data = JS_GetArrayBuffer(
@@ -3403,6 +3440,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object))
       return napi_invalid_arg;
 
@@ -3418,6 +3456,7 @@ extern "C"
 
   napi_status NAPI_CDECL napi_object_seal(napi_env env, napi_value object)
   {
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
     if (!napi_util__::check_value(env, object))
       return napi_invalid_arg;
 

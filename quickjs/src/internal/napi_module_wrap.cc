@@ -4,13 +4,16 @@
 #include "internal/napi_env.h"
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
+#include "internal/napi_ref.h"
 #include "node_api.h"
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <new>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -106,14 +109,17 @@ struct napi_module_wrap__::request_record
 
 struct napi_module_wrap__::record
 {
-  napi_module_wrap__ *owner = nullptr;
+  // The realm the module lives in; the record holds it unless it is the env's.
+  JSContext *ctx = nullptr;
   JSModuleDef *module = nullptr;
   JSValue module_value = JS_UNDEFINED;
-  JSValue wrapper = JS_UNDEFINED;
+  napi_ref wrapper_ref = nullptr;
   JSValue host_defined_option_id = JS_UNDEFINED;
   JSValue synthetic_eval_steps = JS_UNDEFINED;
   JSValue source_object = JS_UNDEFINED;
   bool synthetic = false;
+  size_t active_calls = 0;
+  bool destroy_requested = false;
   // XXH3 of the module source text; written into the QJSB header by
   // create_cached_data so the consuming vm.SourceTextModule constructor's
   // deserialize validates source identity (filename stays unenforced).
@@ -121,6 +127,25 @@ struct napi_module_wrap__::record
   std::vector<request_record> requests;
   std::vector<record *> linked_records;
   std::vector<JSValue> linked_module_values;
+};
+
+// A callback reached while linking/evaluating may destroy its own module.
+// Keep the record and its context alive until the engine call returns.
+class napi_module_wrap__::record_scope
+{
+public:
+  record_scope(napi_module_wrap__ *owner, record *entry) : owner_{owner}, entry_{entry}
+  { ++entry_->active_calls; }
+  ~record_scope()
+  {
+    if (--entry_->active_calls == 0 && entry_->destroy_requested)
+      owner_->free_record(entry_);
+  }
+  record_scope(const record_scope &) = delete;
+  record_scope &operator=(const record_scope &) = delete;
+private:
+  napi_module_wrap__ *owner_;
+  record *entry_;
 };
 
 struct napi_module_wrap__::script_referrer
@@ -135,9 +160,6 @@ napi_module_wrap__::napi_module_wrap__(napi_env env, JSContext *context)
       import_module_dynamically_callback_{JS_UNDEFINED},
       initialize_import_meta_callback_{JS_UNDEFINED}
 {
-  JSRuntime *rt = JS_GetRuntime(ctx_);
-  JS_SetModuleImportMetaInitFunc(rt, host_import_meta_init, this);
-  JS_SetModuleDynamicImportFunc(rt, host_dynamic_import, this);
 }
 
 napi_module_wrap__::~napi_module_wrap__()
@@ -149,10 +171,6 @@ void napi_module_wrap__::teardown()
 {
   if (torn_down_)
     return;
-
-  JSRuntime *rt = JS_GetRuntime(ctx_);
-  JS_SetModuleImportMetaInitFunc(rt, nullptr, nullptr);
-  JS_SetModuleDynamicImportFunc(rt, nullptr, nullptr);
 
   while (!records_.empty())
     free_record(records_.back());
@@ -167,7 +185,14 @@ void napi_module_wrap__::teardown()
   import_module_dynamically_callback_ = JS_UNDEFINED;
   JS_FreeValue(ctx_, initialize_import_meta_callback_);
   initialize_import_meta_callback_ = JS_UNDEFINED;
+  JS_FreeAtom(ctx_, dependency_key_);
+  dependency_key_ = JS_ATOM_NULL;
   torn_down_ = true;
+}
+
+JSValue napi_module_wrap__::get_wrapper(record *entry) const
+{
+  return entry->wrapper_ref != nullptr ? entry->wrapper_ref->dup_inner() : JS_UNDEFINED;
 }
 
 napi_module_wrap__::record *napi_module_wrap__::find(unofficial_napi_module module) const
@@ -177,7 +202,7 @@ napi_module_wrap__::record *napi_module_wrap__::find(unofficial_napi_module modu
     return nullptr;
   for (record *candidate : records_)
   {
-    if (candidate == entry)
+    if (candidate == entry && !entry->destroy_requested)
       return entry;
   }
   return nullptr;
@@ -199,7 +224,8 @@ napi_module_wrap__::record *napi_module_wrap__::find_by_wrapper(JSValueConst wra
 {
   for (record *entry : records_)
   {
-    if (entry != nullptr && JS_IsSameValue(ctx_, entry->wrapper, wrapper))
+    if (entry != nullptr && entry->wrapper_ref != nullptr &&
+        JS_IsSameValue(ctx_, entry->wrapper_ref->get_inner(), wrapper))
       return entry;
   }
   return nullptr;
@@ -217,16 +243,33 @@ void napi_module_wrap__::free_record(record *entry)
   if (entry == nullptr)
     return;
 
+  if (entry->active_calls != 0)
+  {
+    entry->destroy_requested = true;
+    return;
+  }
   remove(entry);
+  // A freed address must never become a link to a later record at that address.
+  for (record *dependent : records_)
+    for (record *&linked : dependent->linked_records)
+      if (linked == entry)
+        linked = nullptr;
+  JSValue wrapper = get_wrapper(entry);
+  if (JS_IsObject(wrapper) && dependency_key_ != JS_ATOM_NULL)
+    JS_DeleteProperty(ctx_, wrapper, dependency_key_, 0);
+  JS_FreeValue(ctx_, wrapper);
   for (auto &request : entry->requests)
     JS_FreeValue(ctx_, request.attributes);
   for (JSValue value : entry->linked_module_values)
     JS_FreeValue(ctx_, value);
   JS_FreeValue(ctx_, entry->module_value);
-  JS_FreeValue(ctx_, entry->wrapper);
+  if (entry->wrapper_ref != nullptr)
+    napi_delete_reference(env_, entry->wrapper_ref);
   JS_FreeValue(ctx_, entry->host_defined_option_id);
   JS_FreeValue(ctx_, entry->synthetic_eval_steps);
   JS_FreeValue(ctx_, entry->source_object);
+  if (entry->ctx != nullptr && entry->ctx != ctx_)
+    JS_FreeContext(entry->ctx);
   delete entry;
 }
 
@@ -385,8 +428,15 @@ JSValue napi_module_wrap__::clone_attributes(JSValueConst value) const
 napi_status napi_module_wrap__::throw_error(const char *code, const char *message)
 {
   JSValue error = napi_util__::create_plain_error(ctx_, message);
-  if (code != nullptr)
-    JS_SetPropertyStr(ctx_, error, "code", JS_NewString(ctx_, code));
+  if (JS_IsException(error))
+    return return_pending_exception("Failed to create module error");
+  // Define an own property: inherited setters must not run during shutdown.
+  if (code != nullptr && JS_DefinePropertyValueStr(ctx_, error, "code",
+                          JS_NewString(ctx_, code), JS_PROP_C_W_E) < 0)
+  {
+    JS_FreeValue(ctx_, error);
+    return return_pending_exception("Failed to set module error code");
+  }
   env_->set_last_exception(error);
   return napi_pending_exception;
 }
@@ -407,10 +457,7 @@ JSValue napi_module_wrap__::call_callback(JSValueConst callback,
 {
   if (!JS_IsFunction(ctx_, callback))
     return JS_UNDEFINED;
-  JSValue global = JS_GetGlobalObject(ctx_);
-  JSValue result = JS_Call(ctx_, callback, global, argc, argv);
-  JS_FreeValue(ctx_, global);
-  return result;
+  return JS_Call(ctx_, callback, JS_UNDEFINED, argc, argv);
 }
 
 napi_status napi_module_wrap__::cache_module_requests(record *entry)
@@ -444,18 +491,21 @@ napi_status napi_module_wrap__::cache_module_requests(record *entry)
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
+napi_status napi_module_wrap__::create_source_text(JSContext *ctx,
+                                                   napi_value wrapper,
                                                    napi_value url,
-                                                   napi_value context_or_undefined,
                                                    const unofficial_napi_js_source *source,
                                                    int32_t line_offset,
                                                    int32_t column_offset,
                                                    napi_value host_defined_option_id,
                                                    unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
+  napi_status terminating = napi_util__::fail_if_terminating(env_, ctx_);
+  if (terminating != napi_ok)
+    return terminating;
   (void)column_offset;
-  if (!napi_util__::check_value(env_, wrapper) ||
+  if (ctx == nullptr ||
+      !napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !unofficial_napi_js_source_is_valid(source) ||
       module_out == nullptr)
@@ -477,10 +527,16 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
                                                       url_string.c_str());
   if (JS_IsException(host_id))
     return return_pending_exception("Failed to create module host option");
+  terminating = napi_util__::fail_if_terminating(env_, ctx_);
+  if (terminating != napi_ok)
+  {
+    JS_FreeValue(ctx_, host_id);
+    return terminating;
+  }
 
   JSValue module_value = JS_UNDEFINED;
   if (bytecode_record != nullptr && !JS_IsUndefined(bytecode_record->artifact) &&
-      bytecode_record->ctx == ctx_)
+      bytecode_record->ctx == ctx)
   {
     // Reuse the deserialized/compiled module artifact: same JSModuleDef the
     // bytecode handle registered, so import.meta/dynamic-import records and
@@ -495,7 +551,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
         .filename = url_string.empty() ? "<module>" : url_string.c_str(),
         .line_num = line_offset + 1,
     };
-    module_value = JS_Eval2(ctx_, source_string.c_str(),
+    module_value = JS_Eval2(ctx, source_string.c_str(),
                             source_string.size(), &options);
   }
   if (JS_IsException(module_value))
@@ -504,7 +560,7 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return return_pending_exception("Module compile failed");
   }
 
-  JSModuleDef *module = JS_GetModuleDef(ctx_, module_value);
+  JSModuleDef *module = JS_GetModuleDef(ctx, module_value);
   if (module == nullptr)
   {
     JS_FreeValue(ctx_, host_id);
@@ -519,11 +575,16 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     JS_FreeValue(ctx_, module_value);
     return napi_generic_failure;
   }
-  entry->owner = this;
+  entry->ctx = ctx == ctx_ ? ctx : JS_DupContext(ctx);
   entry->module = module;
   entry->module_value = module_value;
-  entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
   entry->host_defined_option_id = host_id;
+  napi_status wrapper_status = napi_create_reference(env_, wrapper, 0, &entry->wrapper_ref);
+  if (wrapper_status != napi_ok)
+  {
+    free_record(entry);
+    return wrapper_status;
+  }
   entry->source_hash =
       quickjs::detail::napi_bytecode_hash64(source_string.data(), source_string.size());
   records_.push_back(entry);
@@ -535,22 +596,45 @@ napi_status napi_module_wrap__::create_source_text(napi_value wrapper,
     return status;
   }
 
-  JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceURL",
-                    JS_NewString(ctx_, url_string.c_str()));
-  JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceMapURL", JS_UNDEFINED);
+  if (JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceURL",
+                       JS_NewString(ctx_, url_string.c_str())) < 0)
+  {
+    free_record(entry);
+    return return_pending_exception("Failed to set module source URL");
+  }
+  status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+  {
+    free_record(entry);
+    return status;
+  }
+  if (JS_SetPropertyStr(ctx_, napi_quickjs_value_inner(env_, wrapper), "sourceMapURL", JS_UNDEFINED) < 0)
+  {
+    free_record(entry);
+    return return_pending_exception("Failed to set module source map URL");
+  }
+  status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+  {
+    free_record(entry);
+    return status;
+  }
   *module_out = reinterpret_cast<unofficial_napi_module>(entry);
   return napi_ok;
 }
 
-napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
+napi_status napi_module_wrap__::create_synthetic(JSContext *ctx,
+                                                 napi_value wrapper,
                                                  napi_value url,
-                                                 napi_value context_or_undefined,
                                                  napi_value export_names,
                                                  napi_value synthetic_eval_steps,
                                                  unofficial_napi_module *module_out)
 {
-  (void)context_or_undefined;
-  if (!napi_util__::check_value(env_, wrapper) ||
+  napi_status terminating = napi_util__::fail_if_terminating(env_, ctx_);
+  if (terminating != napi_ok)
+    return terminating;
+  if (ctx == nullptr ||
+      !napi_util__::check_value(env_, wrapper) ||
       !napi_util__::check_value(env_, url) ||
       !napi_util__::check_value(env_, export_names) ||
       !napi_util__::check_value(env_, synthetic_eval_steps) ||
@@ -559,7 +643,7 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
 
   *module_out = nullptr;
   std::string url_string = napi_util__::to_utf8(env_, url);
-  JSModuleDef *module = JS_NewCModule(ctx_,
+  JSModuleDef *module = JS_NewCModule(ctx,
                                       url_string.empty() ? "<synthetic>" : url_string.c_str(),
                                       synthetic_init);
   if (module == nullptr)
@@ -576,17 +660,22 @@ napi_status napi_module_wrap__::create_synthetic(napi_value wrapper,
       return return_pending_exception("Failed to read synthetic export name");
     std::string name = value_to_string(ctx_, name_value);
     JS_FreeValue(ctx_, name_value);
-    if (JS_AddModuleExport(ctx_, module, name.c_str()) < 0)
+    if (JS_AddModuleExport(ctx, module, name.c_str()) < 0)
       return return_pending_exception("Failed to add synthetic export");
   }
 
   auto *entry = new (std::nothrow) record{};
   if (entry == nullptr)
     return napi_generic_failure;
-  entry->owner = this;
+  entry->ctx = ctx == ctx_ ? ctx : JS_DupContext(ctx);
   entry->module = module;
   entry->module_value = JS_DupModuleValue(ctx_, module);
-  entry->wrapper = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, wrapper));
+  napi_status wrapper_status = napi_create_reference(env_, wrapper, 0, &entry->wrapper_ref);
+  if (wrapper_status != napi_ok)
+  {
+    free_record(entry);
+    return wrapper_status;
+  }
   entry->host_defined_option_id = JS_UNDEFINED;
   entry->synthetic_eval_steps = JS_DupValue(ctx_, napi_quickjs_value_inner(env_, synthetic_eval_steps));
   entry->synthetic = true;
@@ -612,7 +701,7 @@ napi_status napi_module_wrap__::get_creation_metadata(unofficial_napi_module mod
   if (entry == nullptr || requests_out == nullptr || has_top_level_await_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  JSValue array = JS_NewArray(ctx_);
+  JSValue array = JS_NewArray(env_->context());
   if (JS_IsException(array))
     return return_pending_exception("Failed to create module request array");
 
@@ -647,10 +736,23 @@ napi_status napi_module_wrap__::link(unofficial_napi_module module,
                                      const unofficial_napi_module *linked_modules)
 {
   record *entry = find(module);
-  if (entry == nullptr || (count > 0 && linked_modules == nullptr))
+  if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
   if (count != entry->requests.size())
-    return throw_error("ERR_MODULE_LINK_MISMATCH", "Module link count mismatch");
+    return throw_error("ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
+  if (count > 0 && linked_modules == nullptr)
+    return throw_error("ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
+  if (JS_GetModuleStatus(ctx_, entry->module) != JS_MODULE_STATUS_UNLINKED)
+    return throw_error("ERR_VM_MODULE_ALREADY_LINKED", "Module is already linked");
+  // Validate before replacing any existing links.
+  for (size_t i = 0; i < count; ++i)
+  {
+    record *linked = find(linked_modules[i]);
+    if (linked == nullptr)
+      return throw_error("ERR_VM_MODULE_LINK_FAILURE", "Linked module is invalid");
+    if (linked->ctx != entry->ctx)
+      return throw_error("ERR_VM_MODULE_DIFFERENT_CONTEXT", "Linked modules must use the same realm");
+  }
 
   for (JSValue value : entry->linked_module_values)
     JS_FreeValue(ctx_, value);
@@ -686,6 +788,83 @@ napi_status napi_module_wrap__::link(unofficial_napi_module module,
     entry->linked_records.push_back(linked);
     entry->linked_module_values.push_back(JS_DupModuleValue(ctx_, linked->module));
   }
+  if (dependency_key_ == JS_ATOM_NULL)
+  {
+    JSValue key = JS_NewPrivateSymbol(ctx_, "module dependencies");
+    dependency_key_ = JS_ValueToAtom(ctx_, key);
+    JS_FreeValue(ctx_, key);
+    if (dependency_key_ == JS_ATOM_NULL)
+      return return_pending_exception("Failed to create module dependency key");
+  }
+  JSValue dependencies = JS_NewArray(ctx_);
+  if (JS_IsException(dependencies))
+    return return_pending_exception("Failed to create module dependencies");
+  for (size_t i = 0; i < count; ++i)
+  {
+    if (JS_DefinePropertyValueUint32(ctx_, dependencies, static_cast<uint32_t>(i),
+                                    get_wrapper(entry->linked_records[i]), JS_PROP_C_W_E) < 0)
+    {
+      JS_FreeValue(ctx_, dependencies);
+      return return_pending_exception("Failed to retain module dependency");
+    }
+  }
+  JSValue wrapper = get_wrapper(entry);
+  int retained = JS_DefinePropertyValue(ctx_, wrapper, dependency_key_, dependencies,
+                                        JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
+  JS_FreeValue(ctx_, wrapper);
+  if (retained < 0)
+    return return_pending_exception("Failed to retain module dependencies");
+  return napi_ok;
+}
+
+// QuickJS runs script in the middle of a link when it throws there (an
+// unresolved request, an import the requested module does not export): the
+// error gets its stack through Error.prepareStackTrace. From there script can
+// reach these calls again, with the modules of the first link half done: a
+// second link takes one from "linking" to "linked" under the first, and
+// evaluating one crashes. So no link starts while one runs, as on V8.
+napi_status napi_module_wrap__::throw_if_linking()
+{
+  if (links_running_ == 0)
+    return napi_ok;
+  return throw_error("ERR_VM_MODULE_LINK_FAILURE", "A module instantiation is under way");
+}
+
+// Links `module`, which links what `entry` was linked to. QuickJS's linker
+// asserts that no module it reaches is evaluating, and without the assert
+// takes one back to "linked" under its evaluation. V8 takes such a module as
+// linked. Here a link that would reach one, through the modules not linked
+// yet, is refused.
+napi_status napi_module_wrap__::link_module(record *entry, JSContext *ctx, JSModuleDef *module,
+                                            const char *failure)
+{
+  record_scope active{this, entry};
+  napi_status status = throw_if_linking();
+  if (status != napi_ok)
+    return status;
+  const std::unordered_set<record *> live(records_.begin(), records_.end());
+  std::vector<record *> pending{entry};
+  std::unordered_set<record *> seen{entry};
+  while (!pending.empty())
+  {
+    record *current = pending.back();
+    pending.pop_back();
+    if (JS_GetModuleStatus(ctx_, current->module) != JS_MODULE_STATUS_UNLINKED)
+      continue;
+    for (record *linked : current->linked_records)
+    {
+      if (live.count(linked) == 0 || !seen.insert(linked).second)
+        continue;
+      if (JS_GetModuleStatus(ctx_, linked->module) == JS_MODULE_STATUS_EVALUATING)
+        return throw_error("ERR_VM_MODULE_STATUS", "A module it imports is evaluating");
+      pending.push_back(linked);
+    }
+  }
+  links_running_++;
+  const int linked = JS_LinkModule(ctx, module);
+  links_running_--;
+  if (linked < 0)
+    return return_pending_exception(failure);
   return napi_ok;
 }
 
@@ -694,8 +873,92 @@ napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
   record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
-  if (JS_LinkModule(ctx_, entry->module) < 0)
-    return return_pending_exception("Module linking failed");
+  // A module linked already, also one whose evaluation is under way, stays as
+  // it is, as on V8.
+  if (JS_GetModuleStatus(ctx_, entry->module) >= JS_MODULE_STATUS_LINKED)
+    return napi_ok;
+  return link_module(entry, entry->ctx, entry->module, "Module linking failed");
+}
+
+// Evaluating a module whose evaluation is under way (from its own body or a
+// synthetic module's steps) is refused, as on V8 and in Node's vm for a
+// module whose status is "evaluating". js_evaluate_module asserts against it,
+// and the facade's evaluation crashed on it.
+napi_status napi_module_wrap__::throw_if_evaluating(record *entry)
+{
+  if (JS_GetModuleStatus(ctx_, entry->module) != JS_MODULE_STATUS_EVALUATING)
+    return napi_ok;
+  return throw_error("ERR_VM_MODULE_STATUS", "Module status must not be evaluating");
+}
+
+// Evaluating a module that imports a synthetic module whose evaluation steps
+// are running (from those steps: a CommonJS module that requires an ES module
+// importing it, a cycle Node refuses too) is refused, as on V8, which aborts
+// the process for it. QuickJS would run the module against the synthetic
+// module's exports as they are. What it would link and evaluate is the
+// modules it reaches through the ones not evaluated yet.
+napi_status napi_module_wrap__::throw_if_importing_an_evaluating_synthetic_module(record *entry)
+{
+  if (synthetic_steps_running_ == 0)
+    return napi_ok;
+  // A record another was linked to may be destroyed since.
+  const std::unordered_set<record *> live(records_.begin(), records_.end());
+  std::vector<record *> pending{entry};
+  std::unordered_set<record *> seen{entry};
+  while (!pending.empty())
+  {
+    record *current = pending.back();
+    pending.pop_back();
+    const JSModuleStatusEnum status = JS_GetModuleStatus(ctx_, current->module);
+    if (current->synthetic ||
+        (status != JS_MODULE_STATUS_UNLINKED && status != JS_MODULE_STATUS_LINKED))
+      continue;
+    for (record *linked : current->linked_records)
+    {
+      if (live.count(linked) == 0 || !seen.insert(linked).second)
+        continue;
+      if (linked->synthetic &&
+          JS_GetModuleStatus(ctx_, linked->module) == JS_MODULE_STATUS_EVALUATING)
+        return throw_error("ERR_VM_MODULE_STATUS", "A synthetic module it imports is evaluating");
+      pending.push_back(linked);
+    }
+  }
+  return napi_ok;
+}
+
+napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValue *promise_out)
+{
+  record_scope active{this, entry};
+  napi_status status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+    return status;
+  status = throw_if_evaluating(entry);
+  if (status != napi_ok)
+    return status;
+  status = throw_if_importing_an_evaluating_synthetic_module(entry);
+  if (status != napi_ok)
+    return status;
+  // JS_EvaluateModule links a module that is not linked yet; that link is
+  // one as any other.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED)
+  {
+    status = link_module(entry, entry->ctx, entry->module, "Failed to evaluate module");
+    if (status != napi_ok)
+      return status;
+  }
+  // The module evaluates in its realm.
+  JSValue promise = JS_EvaluateModule(entry->ctx, entry->module);
+  if (JS_IsException(promise))
+    return return_pending_exception("Failed to evaluate module");
+  // QuickJS settles an interrupted evaluation as a rejected promise. Report
+  // it as a failed call instead, as V8 does for a terminated evaluation.
+  if (env_->termination_requested())
+  {
+    JS_PromiseMarkAsHandled(entry->ctx, promise);
+    JS_FreeValue(entry->ctx, promise);
+    return napi_util__::fail_if_terminating(env_, ctx_);
+  }
+  *promise_out = promise;
   return napi_ok;
 }
 
@@ -709,9 +972,10 @@ napi_status napi_module_wrap__::evaluate(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
-  if (JS_IsException(promise))
-    return return_pending_exception("Failed to evaluate module");
+  JSValue promise = JS_UNDEFINED;
+  napi_status status = evaluate_unless_terminated(entry, &promise);
+  if (status != napi_ok)
+    return status;
   return wrap_owned(promise, result_out);
 }
 
@@ -720,15 +984,14 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
                                               napi_value parent_filename,
                                               napi_value *result_out)
 {
-  (void)filename;
-  (void)parent_filename;
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
 
-  JSValue promise = JS_EvaluateModule(ctx_, entry->module);
-  if (JS_IsException(promise))
-    return return_pending_exception("Failed to evaluate module");
+  JSValue promise = JS_UNDEFINED;
+  napi_status status = evaluate_unless_terminated(entry, &promise);
+  if (status != napi_ok)
+    return status;
 
   JSPromiseStateEnum state = JS_PromiseState(ctx_, promise);
   if (state == JS_PROMISE_FULFILLED)
@@ -746,8 +1009,15 @@ napi_status napi_module_wrap__::evaluate_sync(unofficial_napi_module module,
   }
 
   JS_FreeValue(ctx_, promise);
-  return throw_error("ERR_REQUIRE_ASYNC_MODULE",
-                     "require() cannot be used on an ESM graph with top-level await");
+  std::string message =
+      "require() cannot be used on an ESM graph with top-level await. "
+      "Use import() instead. To see where the top-level await comes from, "
+      "use --experimental-print-required-tla.";
+  const std::string parent = parent_filename != nullptr ? napi_util__::to_utf8(env_, parent_filename) : "";
+  const std::string file = filename != nullptr ? napi_util__::to_utf8(env_, filename) : "";
+  if (!parent.empty()) message += "\n  From " + parent + " ";
+  if (!file.empty()) message += "\n  Requiring " + file + " ";
+  return throw_error("ERR_REQUIRE_ASYNC_MODULE", message.c_str());
 }
 
 napi_status napi_module_wrap__::get_namespace(unofficial_napi_module module,
@@ -756,6 +1026,10 @@ napi_status napi_module_wrap__::get_namespace(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  // Instantiating the module makes the bindings its namespace reads; building
+  // it before that crashed. Refused as on V8.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED)
+    return throw_error("ERR_MODULE_NOT_INSTANTIATED", "Module is not instantiated");
   JSValue ns = JS_GetModuleNamespace(ctx_, entry->module);
   if (JS_IsException(ns))
     return return_pending_exception("Failed to get module namespace");
@@ -796,9 +1070,9 @@ napi_status napi_module_wrap__::get_state(unofficial_napi_module module,
         status = kInstantiated;
         break;
       case JS_MODULE_STATUS_EVALUATING:
-      case JS_MODULE_STATUS_EVALUATING_ASYNC:
         status = kEvaluating;
         break;
+      case JS_MODULE_STATUS_EVALUATING_ASYNC:
       case JS_MODULE_STATUS_EVALUATED:
         status = kEvaluated;
         break;
@@ -823,10 +1097,33 @@ napi_status napi_module_wrap__::check_unsettled_top_level_await(unofficial_napi_
                                                                 bool warnings,
                                                                 bool *settled_out)
 {
-  (void)warnings;
-  if (find(module) == nullptr || settled_out == nullptr)
+  record *entry = find(module);
+  if (entry == nullptr || settled_out == nullptr)
     return napi_util__::invalid_arg(env_);
   *settled_out = true;
+  std::vector<record *> pending{entry};
+  std::unordered_set<record *> seen;
+  while (!pending.empty())
+  {
+    record *current = pending.back();
+    pending.pop_back();
+    if (current == nullptr || !seen.insert(current).second)
+      continue;
+    if (JS_GetModuleStatus(ctx_, current->module) == JS_MODULE_STATUS_EVALUATING_ASYNC)
+    {
+      *settled_out = false;
+      if (warnings)
+      {
+        JSAtom name = JS_GetModuleName(ctx_, current->module);
+        const char *url = JS_AtomToCString(ctx_, name);
+        std::fprintf(stderr, "Warning: Detected unsettled top-level await at %s\n",
+                     url != nullptr ? url : "<module>");
+        JS_FreeCString(ctx_, url);
+        JS_FreeAtom(ctx_, name);
+      }
+    }
+    pending.insert(pending.end(), current->linked_records.begin(), current->linked_records.end());
+  }
   return napi_ok;
 }
 
@@ -835,7 +1132,9 @@ napi_status napi_module_wrap__::set_export(unofficial_napi_module module,
                                            napi_value export_value)
 {
   record *entry = find(module);
-  if (entry == nullptr ||
+  // Only a synthetic module has exports to set. JS_SetModuleExport would set
+  // a source text module's own binding.
+  if (entry == nullptr || !entry->synthetic ||
       !napi_util__::check_value(env_, export_name) ||
       !napi_util__::check_value(env_, export_value))
     return napi_util__::invalid_arg(env_);
@@ -845,7 +1144,11 @@ napi_status napi_module_wrap__::set_export(unofficial_napi_module module,
     return napi_pending_exception;
   }
   std::string name = napi_util__::to_utf8(env_, export_name);
-  if (JS_SetModuleExport(ctx_, entry->module, name.c_str(),
+  // Instantiating the module makes its bindings; JS_SetModuleExport would
+  // write through a null reference before that. Throw what an unknown name
+  // throws, as V8 does.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED ||
+      JS_SetModuleExport(ctx_, entry->module, name.c_str(),
                          JS_DupValue(ctx_, napi_quickjs_value_inner(env_, export_value))) < 0)
   {
     env_->set_last_exception(JS_NewReferenceError(ctx_, "Synthetic module export is not defined"));
@@ -872,7 +1175,10 @@ napi_status napi_module_wrap__::get_module_source_object(unofficial_napi_module 
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
   if (JS_IsUndefined(entry->source_object))
-    return napi_generic_failure;
+  {
+    *result_out = nullptr;
+    return napi_ok;
+  }
   return wrap_owned(JS_DupValue(ctx_, entry->source_object), result_out);
 }
 
@@ -1013,7 +1319,24 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  record_scope active{this, entry};
+  *result_out = nullptr;
+  napi_status status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+    return status;
+  // The facade evaluates the module it wraps.
+  status = throw_if_evaluating(entry);
+  if (status != napi_ok)
+    return status;
+  status = throw_if_importing_an_evaluating_synthetic_module(entry);
+  if (status != napi_ok)
+    return status;
+  // Linking the facade links that module too.
+  status = throw_if_linking();
+  if (status != napi_ok)
+    return status;
 
+  JSContext *ctx = entry->ctx;
   std::string filename = "<required-module-facade:" +
                          std::to_string(++facade_counter_) + ">";
   static constexpr const char *kFacadeSource =
@@ -1026,53 +1349,77 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
       .filename = filename.c_str(),
       .line_num = 1,
   };
-  JSValue facade_value = JS_Eval2(ctx_, kFacadeSource, std::strlen(kFacadeSource),
+  JSValue facade_value = JS_Eval2(ctx, kFacadeSource, std::strlen(kFacadeSource),
                                   &options);
   if (JS_IsException(facade_value))
     return return_pending_exception("Failed to compile required module facade");
-  JSModuleDef *facade = JS_GetModuleDef(ctx_, facade_value);
+  JSModuleDef *facade = JS_GetModuleDef(ctx, facade_value);
   if (facade == nullptr)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return napi_generic_failure;
   }
 
-  if (JS_GetModuleRequestCount(ctx_, facade) < 1 ||
-      JS_SetModuleRequestModule(ctx_, facade, 0, entry->module) < 0 ||
-      JS_LinkModule(ctx_, facade) < 0)
+  if (JS_GetModuleRequestCount(ctx, facade) < 1 ||
+      JS_SetModuleRequestModule(ctx, facade, 0, entry->module) < 0)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to link required module facade");
   }
+  status = link_module(entry, ctx, facade, "Failed to link required module facade");
+  if (status != napi_ok)
+  {
+    JS_FreeValue(ctx, facade_value);
+    return status;
+  }
 
-  JSValue promise = JS_EvaluateModule(ctx_, facade);
+  JSValue promise = JS_EvaluateModule(ctx, facade);
   if (JS_IsException(promise))
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to evaluate required module facade");
   }
-  JSPromiseStateEnum state = JS_PromiseState(ctx_, promise);
+  if (env_->termination_requested())
+  {
+    JS_PromiseMarkAsHandled(ctx, promise);
+    JS_FreeValue(ctx, promise);
+    JS_FreeValue(ctx, facade_value);
+    return napi_util__::fail_if_terminating(env_, ctx_);
+  }
+  JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
   if (state == JS_PROMISE_REJECTED)
   {
-    JSValue reason = JS_PromiseResult(ctx_, promise);
-    JS_FreeValue(ctx_, promise);
-    JS_FreeValue(ctx_, facade_value);
+    JS_PromiseMarkAsHandled(ctx, promise);
+    JSValue reason = JS_PromiseResult(ctx, promise);
+    JS_FreeValue(ctx, promise);
+    JS_FreeValue(ctx, facade_value);
     env_->set_last_exception(reason);
     return napi_pending_exception;
   }
-  JS_FreeValue(ctx_, promise);
+  JS_FreeValue(ctx, promise);
   if (state != JS_PROMISE_FULFILLED)
   {
-    JS_FreeValue(ctx_, facade_value);
+    JS_FreeValue(ctx, facade_value);
     return throw_error("ERR_REQUIRE_ASYNC_MODULE",
                        "require() cannot be used on an ESM graph with top-level await");
   }
 
-  JSValue ns = JS_GetModuleNamespace(ctx_, facade);
-  JS_FreeValue(ctx_, facade_value);
+  JSValue ns = JS_GetModuleNamespace(ctx, facade);
+  JS_FreeValue(ctx, facade_value);
   if (JS_IsException(ns))
     return return_pending_exception("Failed to get required module facade namespace");
   return wrap_owned(ns, result_out);
+}
+
+void napi_module_wrap__::cancel_termination()
+{
+  for (record *entry : records_)
+  {
+    JSValue error = JS_GetModuleEvaluationException(ctx_, entry->module);
+    if (JS_IsUncatchableError(error))
+      JS_ClearUncatchableError(ctx_, error);
+    JS_FreeValue(ctx_, error);
+  }
 }
 
 void napi_module_wrap__::register_dynamic_import_referrer(napi_value referrer_name,
@@ -1130,8 +1477,12 @@ int napi_module_wrap__::initialize_synthetic_module(JSModuleDef *module)
   record *entry = find_by_module(module);
   if (entry == nullptr || !JS_IsFunction(ctx_, entry->synthetic_eval_steps))
     return 0;
-  JSValue result = JS_Call(ctx_, entry->synthetic_eval_steps,
-                           entry->wrapper, 0, nullptr);
+  record_scope active{this, entry};
+  JSValue wrapper = get_wrapper(entry);
+  synthetic_steps_running_++;
+  JSValue result = JS_Call(ctx_, entry->synthetic_eval_steps, wrapper, 0, nullptr);
+  synthetic_steps_running_--;
+  JS_FreeValue(ctx_, wrapper);
   if (JS_IsException(result))
     return -1;
   JS_FreeValue(ctx_, result);
@@ -1147,7 +1498,7 @@ int napi_module_wrap__::initialize_import_meta(JSModuleDef *module, JSValueConst
   JSValue args[3] = {
       JS_DupValue(ctx_, entry->host_defined_option_id),
       JS_DupValue(ctx_, meta),
-      JS_DupValue(ctx_, entry->wrapper),
+      get_wrapper(entry),
   };
   JSValue result = call_callback(initialize_import_meta_callback_, 3, args);
   for (JSValue arg : args)
@@ -1231,32 +1582,6 @@ int napi_module_wrap__::synthetic_init(JSContext *ctx, JSModuleDef *module)
   if (!napi_util__::check_env(env))
     return -1;
   return env->module_wrap().initialize_synthetic_module(module);
-}
-
-int napi_module_wrap__::host_import_meta_init(JSContext *ctx,
-                                              JSModuleDef *module,
-                                              JSValueConst meta,
-                                              void *opaque)
-{
-  auto *self = static_cast<napi_module_wrap__ *>(opaque);
-  if (self == nullptr)
-    return 0;
-  return self->initialize_import_meta(module, meta);
-}
-
-JSValue napi_module_wrap__::host_dynamic_import(JSContext *ctx,
-                                                JSModuleDef *referrer,
-                                                JSValueConst referrer_name,
-                                                JSValueConst specifier,
-                                                JSValueConst attributes,
-                                                JSModuleImportPhaseEnum phase,
-                                                void *opaque)
-{
-  auto *self = static_cast<napi_module_wrap__ *>(opaque);
-  if (self == nullptr)
-    return JS_ThrowTypeError(ctx, "Dynamic import callback is not registered");
-  return self->import_module_dynamically(referrer, referrer_name, specifier,
-                                         attributes, phase);
 }
 
 } // namespace quickjs::detail

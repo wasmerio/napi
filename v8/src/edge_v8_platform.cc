@@ -1,5 +1,6 @@
 #include "edge_v8_platform.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
@@ -14,6 +15,13 @@
 #include <v8.h>
 
 namespace {
+
+// EdgeV8Platform::SetForegroundTaskWaker.
+std::atomic<void (*)()> g_foreground_task_waker{nullptr};
+
+void WakeForForegroundTask() {
+  if (void (*waker)() = g_foreground_task_waker.load(std::memory_order_acquire)) waker();
+}
 
 struct WorkerWarmupState {
   std::mutex mutex;
@@ -220,23 +228,25 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
     if (enqueue != nullptr && target != nullptr) {
       ForegroundTaskRecord* record = new (std::nothrow) ForegroundTaskRecord();
       if (record != nullptr) {
-        record->isolate_state.reset();
+        // The hook owns the record from the moment it is called, whatever it
+        // returns (see unofficial_napi_enqueue_foreground_task_callback): it
+        // may refuse and release the record, or have another thread run and
+        // release it, before the call returns. So the record is complete,
+        // including the pending-task count its cleanup gives back, before it
+        // is handed over, and it is never touched afterwards. A refused task
+        // is dropped rather than rerouted; V8 tolerates dropped foreground
+        // tasks.
         record->task = std::move(task);
-        if (enqueue(target,
-                    RunForegroundTaskRecord,
-                    record,
-                    CleanupForegroundTaskRecord,
-                    delay_ms) == napi_ok) {
-          if (isolate_state != nullptr &&
-              isolate_state->platform != nullptr) {
-            isolate_state->platform->AddPendingForegroundTask(isolate_state);
-            record->isolate_state = isolate_state;
-          }
-          return;
+        if (isolate_state != nullptr && isolate_state->platform != nullptr) {
+          isolate_state->platform->AddPendingForegroundTask(isolate_state);
+          record->isolate_state = isolate_state;
         }
-        task = std::move(record->task);
-        record->isolate_state.reset();
-        delete record;
+        (void)enqueue(target,
+                      RunForegroundTaskRecord,
+                      record,
+                      CleanupForegroundTaskRecord,
+                      delay_ms);
+        return;
       }
     }
 
@@ -251,6 +261,10 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
       }
       if (delay_ms == 0) {
         runner->PostTask(std::move(counted_task), location);
+        // Only a checkpoint runs it (PumpPendingForegroundTasks): wake the
+        // embedder so that one comes now. A delayed task waits for whatever
+        // checkpoint follows its delay, as before.
+        WakeForForegroundTask();
       } else {
         runner->PostDelayedTask(std::move(counted_task), delay_ms / 1000.0, location);
       }
@@ -313,6 +327,10 @@ bool EdgeV8Platform::SetWorkerThreadCount(int count) {
   }
   g_worker_thread_count.store(requested, std::memory_order_release);
   return true;
+}
+
+void EdgeV8Platform::SetForegroundTaskWaker(void (*waker)()) {
+  g_foreground_task_waker.store(waker, std::memory_order_release);
 }
 
 std::unique_ptr<EdgeV8Platform> EdgeV8Platform::Create() {
@@ -510,8 +528,8 @@ void EdgeV8Platform::ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env en
   state->runner->ClearTarget(env);
 }
 
-void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
-  if (fallback_ == nullptr || isolate == nullptr) return;
+bool EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
+  if (fallback_ == nullptr || isolate == nullptr) return false;
   // ForegroundTaskRunner::PostTaskCommon forwards to the guest's bound
   // enqueue callback when one is set, but falls back to fallback_'s own
   // GetForegroundTaskRunner() when no guest target is bound (e.g. the guest
@@ -519,9 +537,24 @@ void EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   // calls BindForegroundTaskTarget). Nothing else pumps that fallback
   // runner's queue, so tasks routed there -- including V8-internal work like
   // Heap::PostFinalizationRegistryCleanupTaskIfNeeded's cleanup task -- would
-  // otherwise be posted and never run. Drain it explicitly.
-  while (v8::platform::PumpMessageLoop(fallback_.get(), isolate)) {
+  // otherwise be posted and never run. Admit one task per checkpoint so
+  // self-rescheduling GC work cannot monopolize the guest's event-loop turn.
+  // The caller reports progress to keep the loop runnable for the next task.
+  return v8::platform::PumpMessageLoop(fallback_.get(), isolate);
+}
+
+void EdgeV8Platform::WakeForQueuedForegroundTasks(v8::Isolate* isolate) {
+  std::shared_ptr<IsolateState> state = GetState(isolate);
+  // Only the default queue waits for a checkpoint. Tasks posted there before
+  // a target was bound stay there, so a bound target is no reason to skip.
+  if (!state || !state->runner || !state->runner->used_fallback_runner()) return;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->finished || state->shutdown_started || state->pending_foreground_tasks == 0) {
+      return;
+    }
   }
+  WakeForForegroundTask();
 }
 
 int EdgeV8Platform::NumberOfWorkerThreads() {
@@ -586,13 +619,122 @@ std::unique_ptr<v8::ScopedBlockingCall> EdgeV8Platform::CreateBlockingScope(
   return fallback_ != nullptr ? fallback_->CreateBlockingScope(blocking_type) : nullptr;
 }
 
+namespace {
+
+// A job that nobody waits for gets every worker but one. libplatform runs
+// worker tasks first come, first served, and a job's workers keep running
+// while it has work, never yielding to tasks posted after them. A concurrent
+// marker or sweeper holding every worker would hold back the worker tasks
+// posted after it, such as an optimizing compile or the deletion of a
+// finished one. A compile job's JSHeapBroker keeps every native context's
+// Array and Object prototypes alive until the job is deleted, so a collection
+// that marks its roots meanwhile keeps native contexts that are no longer used.
+//
+// Work someone waits for keeps the whole pool: the limit is lifted while the
+// job's priority is kUserBlocking (V8 raises concurrent marking to it for the
+// mark-compact pause) and once a thread joins the job. The limit is per job,
+// so two background jobs running at once can still take every worker.
+class JobWorkerLimit {
+ public:
+  JobWorkerLimit(size_t background_limit, v8::TaskPriority priority)
+      : background_limit_(background_limit), limit_(LimitFor(priority)) {}
+
+  size_t Get() const { return limit_.load(std::memory_order_relaxed); }
+
+  // Returns true when the limit went up.
+  bool FollowPriority(v8::TaskPriority priority) {
+    const size_t limit = LimitFor(priority);
+    return limit_.exchange(limit, std::memory_order_relaxed) < limit;
+  }
+
+  void Lift() { limit_.store(kNoLimit, std::memory_order_relaxed); }
+
+ private:
+  static constexpr size_t kNoLimit = SIZE_MAX;
+
+  size_t LimitFor(v8::TaskPriority priority) const {
+    return priority == v8::TaskPriority::kUserBlocking ? kNoLimit : background_limit_;
+  }
+
+  const size_t background_limit_;
+  std::atomic<size_t> limit_;
+};
+
+class LimitedJobTask final : public v8::JobTask {
+ public:
+  LimitedJobTask(std::unique_ptr<v8::JobTask> task, std::shared_ptr<JobWorkerLimit> limit)
+      : task_(std::move(task)), limit_(std::move(limit)) {}
+
+  void Run(v8::JobDelegate* delegate) override { task_->Run(delegate); }
+
+  // libplatform also caps this at the pool size (plus one for a joining thread).
+  size_t GetMaxConcurrency(size_t worker_count) const override {
+    return std::min(task_->GetMaxConcurrency(worker_count), limit_->Get());
+  }
+
+ private:
+  std::unique_ptr<v8::JobTask> task_;
+  std::shared_ptr<JobWorkerLimit> limit_;
+};
+
+class LimitedJobHandle final : public v8::JobHandle {
+ public:
+  LimitedJobHandle(std::unique_ptr<v8::JobHandle> handle, std::shared_ptr<JobWorkerLimit> limit)
+      : handle_(std::move(handle)), limit_(std::move(limit)) {}
+
+  void NotifyConcurrencyIncrease() override {
+    started_.store(true, std::memory_order_relaxed);
+    handle_->NotifyConcurrencyIncrease();
+  }
+
+  void Join() override {
+    // Before joining: Join() sizes the job from GetMaxConcurrency().
+    limit_->Lift();
+    handle_->Join();
+  }
+
+  void Cancel() override { handle_->Cancel(); }
+  void CancelAndDetach() override { handle_->CancelAndDetach(); }
+  bool IsActive() override { return handle_->IsActive(); }
+  bool IsValid() override { return handle_->IsValid(); }
+  bool UpdatePriorityEnabled() const override { return handle_->UpdatePriorityEnabled(); }
+
+  // A lower limit takes effect as workers return from Run(), as with any drop
+  // in GetMaxConcurrency().
+  void UpdatePriority(v8::TaskPriority priority) override {
+    handle_->UpdatePriority(priority);
+    // The caller can't know the limit went up, so post the workers it now
+    // allows. A job from CreateJob() that hasn't been started stays unstarted.
+    if (limit_->FollowPriority(priority) && started_.load(std::memory_order_relaxed)) {
+      handle_->NotifyConcurrencyIncrease();
+    }
+  }
+
+ private:
+  std::unique_ptr<v8::JobHandle> handle_;
+  std::shared_ptr<JobWorkerLimit> limit_;
+  std::atomic<bool> started_{false};
+};
+
+}  // namespace
+
 std::unique_ptr<v8::JobHandle> EdgeV8Platform::CreateJobImpl(
     v8::TaskPriority priority,
     std::unique_ptr<v8::JobTask> job_task,
     const v8::SourceLocation& location) {
   (void)location;
-  return v8::platform::NewDefaultJobHandle(this, priority, std::move(job_task),
-                                           static_cast<size_t>(std::max(1, NumberOfWorkerThreads())));
+  const int workers = std::max(1, NumberOfWorkerThreads());
+  // With one worker, every job keeps it. Limited to zero workers, a job would
+  // only run once a thread joins it, and V8 joins some jobs, such as Maglev's
+  // compile job, only when it flushes them.
+  if (workers == 1) {
+    return v8::platform::NewDefaultJobHandle(this, priority, std::move(job_task), 1);
+  }
+  auto limit = std::make_shared<JobWorkerLimit>(static_cast<size_t>(workers - 1), priority);
+  std::unique_ptr<v8::JobHandle> handle = v8::platform::NewDefaultJobHandle(
+      this, priority, std::make_unique<LimitedJobTask>(std::move(job_task), limit),
+      static_cast<size_t>(workers));
+  return std::make_unique<LimitedJobHandle>(std::move(handle), std::move(limit));
 }
 
 void EdgeV8Platform::PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,

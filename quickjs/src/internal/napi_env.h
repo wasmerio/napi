@@ -4,6 +4,7 @@
 #include "../../../include/js_native_api.h"
 #include "../../../include/node_api_types.h"
 #include "../../../include/unofficial_napi.h"
+#include "napi_agent.h"
 #include "napi_callback_info.h"
 #include "napi_buffer.h"
 #include "napi_contextify.h"
@@ -18,26 +19,98 @@
 #include "napi_error_state.h"
 #include "napi_periodic_gate.h"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 #include <quickjs.h>
 
 struct napi_external_backing_store_hint__;
+struct napi_runtime_interrupts__;
 
+// Where a typed array or DataView keeps its bytes, as its internal slots say.
+// The receiver owns `buffer`.
+struct napi_view_layout__
+{
+  JSValue buffer = JS_UNDEFINED;
+  // Null when the buffer is detached.
+  uint8_t *data = nullptr;
+  size_t byte_offset = 0;
+  size_t byte_length = 0;
+};
+
+// A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or
+// a native callback that is running. The innermost frame is the current
+// realm.
+struct napi_realm_frame__
+{
+  // The scope's token; 0 for a callback.
+  uint64_t scope = 0;
+  JSContext *ctx = nullptr;
+  // A function of the realm, which keeps its context alive; undefined for the
+  // env's own realm. A scope owns it until it is left; a callback borrows its
+  // function's.
+  JSValue anchor = JS_UNDEFINED;
+};
+
+// One env of an agent. Its own realm (JSContext) never changes; the realm it
+// acts in is the innermost realm frame's.
 struct napi_env__
 {
-  explicit napi_env__(JSContext *context, int32_t module_api_version);
+  napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version);
   ~napi_env__();
 
+  // Runs the cleanup hooks and every pending finalizer, the instance data's
+  // after the others, again for what they leave pending, while the context is
+  // alive, and lets go of the context. N-API calls on the env fail from then
+  // on.
   void prepare_teardown();
-  void finalize_instance_data();
+  // Native callbacks are refused once teardown has started.
+  bool is_closing() const;
+  // True once teardown has run the finalizers. A finalizer that would run
+  // later, as the runtime frees what was still alive, is dropped.
+  bool finalizers_done() const;
 
+  napi_agent__ *agent() const;
+  // Makes this env own its agent (an env made from an embedder's context).
+  void adopt_agent(std::unique_ptr<napi_agent__> agent);
+  bool is_principal() const;
+  // The current realm's context: the innermost realm frame's, else the env's
+  // own. N-API calls create what they make there.
   JSContext *context() const;
+  // The env's own realm.
   JSContext *main_context() const;
-  JSContext *current_context() const;
-  void set_current_context(JSContext *context);
+  // The env realm's DataView constructor, read when the env was made, before
+  // any script could replace it; undefined if there was none.
+  JSValueConst data_view_constructor() const;
+  // The layout of a typed array or DataView: its ArrayBuffer, byte offset and
+  // byte length, read through the intrinsic getters as the env was made,
+  // never through the view's properties, which scripts can redefine on the
+  // view or on its realm's prototypes. These getters read the view's internal
+  // slots, whatever realm made it, and run no script themselves (an error one
+  // throws can, through Error.prepareStackTrace; the data pointer is read
+  // after them). A view over a detached ArrayBuffer, or out of bounds of a
+  // resizable one that shrank, has no bytes (as in Node; QuickJS's accessors
+  // throw for some of these), and an offset of 0. False for anything else.
+  // Leaves any pending exception as it was.
+  bool view_layout(JSValueConst view, napi_view_layout__ *layout) const;
+  // A function of the current realm that keeps it alive; undefined for the
+  // env's own realm.
+  JSValueConst current_realm_anchor() const;
+  // The current realm's global as unofficial_napi_create_realm reports it:
+  // a sandbox realm's sandbox. A new reference.
+  JSValue current_global();
+  // Pushes the frame of a callback running in `ctx` (borrowing `anchor`) and
+  // returns the depth pop_realm_frames restores.
+  size_t push_realm_frame(JSContext *ctx, JSValueConst anchor);
+  // Pops the frames above `depth`.
+  void pop_realm_frames(size_t depth);
+  // unofficial_napi_enter_realm and unofficial_napi_leave_realm. The scope
+  // takes `anchor`.
+  uint64_t enter_realm(JSContext *ctx, JSValue anchor);
+  bool leave_realm(uint64_t scope);
   int32_t module_api_version() const;
 
   napi_handle_scope root_scope() const;
@@ -46,7 +119,6 @@ struct napi_env__
   void destroy_scope(napi_handle_scope scope);
   napi_scope__ *scope_from_handle(napi_handle_scope scope) const;
   napi_value wrap_value_in_current_scope(JSValue value, bool owned);
-  napi_value wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned);
   JSValue wrap_external_data(void *data);
   JSValue wrap_external_data(void *data, node_api_basic_finalize finalize_cb, void *finalize_hint);
   napi_value__ *value_from_handle(napi_value value);
@@ -64,8 +136,7 @@ struct napi_env__
   template <typename Fn>
   void for_each_active_scope(Fn fn) const
   {
-    for (const auto &scope : scopes_)
-      fn(scope);
+    agent_->for_each_active_scope(fn);
   }
 
   template <typename Fn>
@@ -85,9 +156,16 @@ struct napi_env__
   napi_status clear_last_error();
 
   bool has_last_exception() const;
+  bool last_exception_is_uncatchable() const;
   void clear_last_exception();
   void set_last_exception(JSValue exception);
   JSValue take_last_exception();
+
+  // unofficial_napi_terminate_execution state. Any thread may request
+  // termination; everything else runs on the env's engine thread.
+  void request_termination();
+  void cancel_termination();
+  bool termination_requested() const;
 
   void *instance_data() const;
   void set_instance_data(void *data, napi_finalize finalize_cb, void *finalize_hint);
@@ -96,7 +174,7 @@ struct napi_env__
   napi_status remove_cleanup_hook(napi_cleanup_hook hook, void *arg);
   napi_env_cleanup_hook__ *create_cleanup_hook(napi_cleanup_hook hook, void *arg);
   void destroy_cleanup_hook(napi_env_cleanup_hook__ *entry);
-  napi_deferred__ *create_deferred(JSContext *context, JSValue resolve, JSValue reject);
+  napi_deferred__ *create_deferred(JSValue resolve, JSValue reject);
   void destroy_deferred(napi_deferred__ *deferred);
   napi_external_backing_store_hint__ *create_external_backing_store(
       void *external_data,
@@ -114,28 +192,61 @@ struct napi_env__
   quickjs::detail::napi_module_wrap__ &module_wrap();
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
-  bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks)
+  bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
+
+  // At release: drops the exception a hook or finalizer left pending.
+  void drop_finalizer_exception();
+  // The exceptions pending when the collector runs a finalizer in the middle
+  // of other code: the one JS is throwing, and the provider's.
+  struct pending_exceptions
   {
-    if (embedder_hooks_attached_)
-      return false;
-    embedder_hooks_ = hooks;
-    embedder_hooks_attached_ = true;
-    return true;
-  }
+    JSValue thrown = JS_UNINITIALIZED;
+    JSValue last = JS_UNINITIALIZED;
+  };
+  // At release, around such a finalizer: takes them, so the finalizer runs
+  // with none pending, then drops what it threw and gives them back.
+  pending_exceptions take_pending_exceptions();
+  void restore_pending_exceptions(pending_exceptions taken);
 
 private:
   void clear_refs_for_teardown();
+  void run_cleanup_hooks();
+  void finalize_pending_values();
+  void finalize_instance_data();
+  void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);
 
-  // QuickJS contexts and API version.
-  JSContext *main_context_;
-  JSContext *current_context_;
+  // Set only when this env owns its agent; destroyed last.
+  std::unique_ptr<napi_agent__> owned_agent_;
+
+  // Agent, realm and API version.
+  napi_agent__ *agent_;
+  JSContext *context_;
   int32_t module_api_version_ = 8;
+  JSValue data_view_constructor_ = JS_UNDEFINED;
+  // The getters of the buffer, byteOffset and byteLength properties of
+  // %TypedArray%.prototype and DataView.prototype, read when the env was made;
+  // undefined if there were none.
+  struct view_getters__
+  {
+    JSValue buffer = JS_UNDEFINED;
+    JSValue byte_offset = JS_UNDEFINED;
+    JSValue byte_length = JS_UNDEFINED;
+  };
+  view_getters__ typed_array_getters_;
+  view_getters__ data_view_getters_;
 
-  // Last native/JS error state.
+  // The realms N-API acts in, innermost last. Empty means the env's own.
+  std::vector<napi_realm_frame__> realm_frames_;
+  // The last scope token enter_realm handed out.
+  uint64_t last_realm_scope_ = 0;
+
+  // Last native error state.
   napi::error_state__ error_state_;
-  JSContext *last_exception_context_ = nullptr;
-  JSValue last_exception_;
-  bool has_last_exception_ = false;
+
+  // Termination. QuickJS polls one interrupt handler per runtime, so the
+  // handler lives in a record shared by every env on this env's runtime.
+  std::atomic<bool> termination_requested_{false};
+  napi_runtime_interrupts__ *runtime_interrupts_ = nullptr;
 
   // Instance data finalizer.
   void *instance_data_ = nullptr;
@@ -145,12 +256,11 @@ private:
   // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
 
-  // Scope stack.
-  napi_handle_scope root_scope_ = nullptr;
-  napi_handle_scope current_scope_ = nullptr;
+  // Hints whose finalizers have yet to run, the most recent first. Declared
+  // before the hints' allocator, so it is destroyed after every hint.
+  napi_intrinsic_link__ pending_finalizers_{};
 
   // Env-owned slot allocators.
-  napi_allocator__<napi_scope__, napi_env__> scopes_;
   napi_allocator__<napi_ref__, napi_env__> refs_;
   napi_allocator__<napi_env_cleanup_hook__, napi_env__> cleanup_hooks_;
   napi_allocator__<napi_deferred__, napi_env__> deferreds_;
@@ -162,9 +272,6 @@ private:
   napi::periodic_gate__ lifetime_string_symbol_values_gate_{10000};
 #endif
 
-  // External memory accounting.
-  int64_t external_memory_ = 0;
-
   // Env-owned subsystems.
   napi_buffer__ buffers_;
   napi_promises__ promises_;
@@ -172,24 +279,28 @@ private:
   quickjs::detail::napi_module_wrap__ module_wrap_;
 
   // Env teardown state.
+  bool closing_ = false;
+  bool finalizers_done_ = false;
   bool torn_down_ = false;
   bool clearing_refs_for_teardown_ = false;
-  bool embedder_hooks_attached_ = false;
-  unofficial_napi_env_hooks embedder_hooks_{};
 };
 
-class napi_env_context_scope__
+// Runs the enclosing code in a realm (null: the env's own) and closes any
+// scope it leaves open.
+class napi_realm_frame_scope__
 {
 public:
-  napi_env_context_scope__(napi_env env, JSContext *context);
-  ~napi_env_context_scope__();
-
-  napi_env_context_scope__(const napi_env_context_scope__ &) = delete;
-  napi_env_context_scope__ &operator=(const napi_env_context_scope__ &) = delete;
+  napi_realm_frame_scope__(napi_env env, JSContext *ctx, JSValueConst anchor)
+      : env_{env}, depth_{env->push_realm_frame(ctx, anchor)}
+  {
+  }
+  ~napi_realm_frame_scope__() { env_->pop_realm_frames(depth_); }
+  napi_realm_frame_scope__(const napi_realm_frame_scope__ &) = delete;
+  napi_realm_frame_scope__ &operator=(const napi_realm_frame_scope__ &) = delete;
 
 private:
-  napi_env env_ = nullptr;
-  JSContext *previous_ = nullptr;
+  napi_env env_;
+  size_t depth_;
 };
 
 napi_status napi_quickjs_set_last_error(napi_env env,

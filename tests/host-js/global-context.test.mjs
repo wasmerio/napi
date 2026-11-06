@@ -18,7 +18,9 @@ const directory = await mkdtemp(join(tmpdir(), 'napi-context-test-'));
 let runtime;
 try {
   const modulePath = join(directory, 'context.mjs');
-  await writeFile(modulePath, 'let wasmerNapiActiveGlobalContext;\n' + inline.slice(start, end));
+  // Module-level state the extracted context code reads. Without a native
+  // Worker realm, contexts use the default isolated compatibility scopes.
+  await writeFile(modulePath, 'let wasmerNapiNativeRealm;\nlet wasmerNapiNativeRealmClaimed = false;\n' + inline.slice(start, end));
   runtime = await import(pathToFileURL(modulePath));
 } finally {
   await rm(directory, {recursive:true,force:true});
@@ -27,6 +29,16 @@ try {
 const create = runtime.wasmer_napi_create_global_context;
 const evaluate = runtime.wasmer_napi_context_eval;
 const callback = runtime.wasmer_napi_make_callback;
+const createRegistry = runtime.wasmer_napi_create_realm_registry;
+const createRealm = runtime.wasmer_napi_create_realm_context;
+const realmOf = runtime.wasmer_napi_realm_context;
+const host = create();
+const registry = createRegistry();
+// The realm of `sandbox` in the shared test registry, made on first use.
+const sandboxRealm = (sandbox) => {
+  if (realmOf(registry, sandbox) === undefined) createRealm(registry, sandbox);
+  return realmOf(registry, sandbox);
+};
 const stackFormattingSupported = (() => {
   const saved=Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),marker={};
   try {
@@ -40,31 +52,43 @@ const stackFormattingSupported = (() => {
 
 test('script this and globalThis refer to the virtual global', () => {
   const context = create();
-  const values = evaluate(context.scope,'[this, globalThis, global]');
+  const values = evaluate(context,'[this, globalThis, global]');
   assert.ok(values.every(value => value === context.scope));
+});
+
+test('each context evaluates in itself, whatever ran last', () => {
+  const a=create(), b=create();
+  for (let i=0;i<2;i++) {
+    assert.equal(evaluate(a,'globalThis'),a.scope);
+    assert.equal(evaluate(b,'globalThis'),b.scope);
+  }
+  evaluate(a,'globalThis.answer=1');
+  assert.equal(evaluate(b,'typeof answer'),'undefined');
+  runtime.wasmer_napi_release_global_context(a);
+  runtime.wasmer_napi_release_global_context(b);
 });
 
 test('VM script globals expose builtins without writing to the host global', () => {
   const sandbox = { answer:42 };
   const other = {};
-  const values = evaluate(sandbox,'[this, globalThis, global, this.RegExp, RegExp, answer]');
+  const values = evaluate(sandboxRealm(sandbox),'[this, globalThis, global, this.RegExp, RegExp, answer]');
   assert.ok(values.slice(0,3).every(value => value === values[0]));
   assert.notEqual(values[0],globalThis);
   assert.equal(values[3],RegExp);
   assert.equal(values[4],RegExp);
   assert.equal(values[5],42);
-  assert.equal(evaluate(sandbox,'this'),values[0], 'reuse the VM global across scripts');
+  assert.equal(evaluate(sandboxRealm(sandbox),'this'),values[0], 'reuse the VM global across scripts');
   // Edge stream cleanup uses vm.runInNewContext('this').RegExp this way.
-  assert.equal(evaluate(sandbox,'new this.RegExp("released", "g")[Symbol.replace]("released", "closed")'),'closed');
+  assert.equal(evaluate(sandboxRealm(sandbox),'new this.RegExp("released", "g")[Symbol.replace]("released", "closed")'),'closed');
   const hostProcess = globalThis.process;
   const hostFormatter = Error.prepareStackTrace;
-  evaluate(sandbox,'this.process={vm:true}; Error.prepareStackTrace=()=>"vm stack"; this.answer++');
+  evaluate(sandboxRealm(sandbox),'this.process={vm:true}; Error.prepareStackTrace=()=>"vm stack"; this.answer++');
   assert.equal(globalThis.process,hostProcess);
   assert.equal(Error.prepareStackTrace,hostFormatter);
   assert.equal(sandbox.answer,43);
   assert.deepEqual(sandbox.process,{vm:true});
-  assert.notEqual(evaluate(other,'Error'),evaluate(sandbox,'Error'));
-  assert.notEqual(evaluate(other,'Error.prepareStackTrace'),evaluate(sandbox,'Error.prepareStackTrace'));
+  assert.notEqual(evaluate(sandboxRealm(other),'Error'),evaluate(sandboxRealm(sandbox),'Error'));
+  assert.notEqual(evaluate(sandboxRealm(other),'Error.prepareStackTrace'),evaluate(sandboxRealm(sandbox),'Error.prepareStackTrace'));
 });
 
 test('global accessors retain lazy reads and context-owned writes', () => {
@@ -90,7 +114,7 @@ test('global accessors retain lazy reads and context-owned writes', () => {
 test('a guest process assignment does not replace the worker process', () => {
   const original=globalThis.process;
   const a=create(), b=create();
-  evaluate(a.scope,'globalThis.process={guest:"a"}');
+  evaluate(a,'globalThis.process={guest:"a"}');
   assert.equal(globalThis.process,original);
   assert.equal(b.scope.process,original);
   assert.deepEqual(a.scope.process,{guest:'a'});
@@ -105,14 +129,36 @@ test('closing an inactive context disables only its callbacks', () => {
   assert.deepEqual(fnA.call(receiver,1,2),{receiver,args:[1,2]});
   assert.equal(fnA2(),42);
   assert.throws(()=>fnB(),/active callback/);
-  runtime.wasmer_napi_activate_global_context(a);
   runtime.wasmer_napi_release_global_context(b);
   assert.equal(fnB(),undefined);
-  assert.equal(evaluate(undefined,'globalThis'),a.scope);
+  assert.equal(evaluate(a,'globalThis'),a.scope);
   assert.deepEqual(fnA.call(receiver,3),{receiver,args:[3]});
   runtime.wasmer_napi_release_global_context(a);
   assert.equal(fnA(),undefined);
   assert.equal(fnA2(),undefined);
+});
+
+test('callbacks receive new.target, so napi_get_new_target can tell construction from a call', () => {
+  const context=create(), seen=[];
+  const fn=callback(context,(receiver,args,target)=>{seen.push(target);if(target)receiver.answer=args[0];return undefined;});
+  assert.equal(fn.call({},7),undefined);
+  assert.equal(seen[0],undefined);
+  assert.equal(new fn(42).answer,42);
+  assert.equal(seen[1],fn);
+  class Child extends fn {}
+  const child=new Child(51);
+  assert.equal(child.answer,51);
+  assert.equal(seen[2],Child);
+  assert.ok(child instanceof Child);
+  function Alternate() {}
+  const reflected=Reflect.construct(fn,[63],Alternate);
+  assert.equal(reflected.answer,63);
+  assert.equal(seen[3],Alternate);
+  assert.ok(reflected instanceof Alternate);
+  const outer=callback(context,(_receiver,_args,target)=>{assert.equal(target,outer);new fn(99);});
+  new outer();
+  assert.equal(seen.at(-1),fn);
+  runtime.wasmer_napi_release_global_context(context);
 });
 
 test('retained callback wrappers do not retain closed contexts or dispatch captures', async () => {
@@ -135,7 +181,7 @@ test('retained callback wrappers do not retain closed contexts or dispatch captu
 test('Error constructors, static hooks and prototype writes stay local', () => {
   const a=create(), b=create();
   const hook=Error.prepareStackTrace;
-  evaluate(a.scope,'Error.prepareStackTrace=()=>"guest-a"; Error.prototype.guest="a"; Error.stackTraceLimit=3;');
+  evaluate(a,'Error.prepareStackTrace=()=>"guest-a"; Error.prototype.guest="a"; Error.stackTraceLimit=3;');
   assert.equal(Error.prepareStackTrace,hook);
   assert.equal(Error.prototype.guest,undefined);
   assert.notEqual(a.scope.Error,b.scope.Error);
@@ -146,15 +192,15 @@ test('Error constructors, static hooks and prototype writes stay local', () => {
   assert.equal(ownMethods.toString.value,Error.prototype.toString);
   assert.equal(ownMethods.name.value,'Error');
   assert.equal(ownMethods.message.value,'');
-  assert.equal(evaluate(a.scope,'Error.prototype.toString.call(new Error("details"))'),'Error: details');
+  assert.equal(evaluate(a,'Error.prototype.toString.call(new Error("details"))'),'Error: details');
   assert.equal(Object.getPrototypeOf(a.scope.TypeError.prototype),a.scope.Error.prototype);
-  assert.equal(evaluate(a.scope,'new TypeError("typed").guest'),'a');
-  assert.equal(evaluate(b.scope,'new TypeError("typed").guest'),undefined);
+  assert.equal(evaluate(a,'new TypeError("typed").guest'),'a');
+  assert.equal(evaluate(b,'new TypeError("typed").guest'),undefined);
 });
 
 test('callable errors, subclasses, causes and native N-API errors work', () => {
   const c=create();
-  const values=evaluate(c.scope,`class CustomError extends Error {}; [Error('called'),new TypeError('typed',{cause:42}),new AggregateError([1,2],'many'),new CustomError('custom')]`);
+  const values=evaluate(c,`class CustomError extends Error {}; [Error('called'),new TypeError('typed',{cause:42}),new AggregateError([1,2],'many'),new CustomError('custom')]`);
   for (const value of values) assert.ok(value instanceof c.scope.Error);
   assert.equal(values[0].message,'called');
   assert.ok(values[1] instanceof c.scope.TypeError);
@@ -172,7 +218,7 @@ test('callable errors, subclasses, causes and native N-API errors work', () => {
 test('custom stack formatting is lazy, receives the actual error and restores the host hook', {skip:!stackFormattingSupported}, () => {
   const c=create(), host=Object.getOwnPropertyDescriptor(Error,'prepareStackTrace');
   c.scope.state={calls:0};
-  const error=evaluate(c.scope,`Error.prepareStackTrace=(error,frames)=>{state.calls++;return {error,frames}}; new Error('custom',{cause:42})`);
+  const error=evaluate(c,`Error.prepareStackTrace=(error,frames)=>{state.calls++;return {error,frames}}; new Error('custom',{cause:42})`);
   assert.equal(c.scope.state.calls,0);
   const stack=error.stack;
   assert.equal(stack.error,error);
@@ -180,15 +226,15 @@ test('custom stack formatting is lazy, receives the actual error and restores th
   assert.equal(c.scope.state.calls,1);
   assert.equal(error.stack,stack);
   assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),host);
-  evaluate(c.scope,'Error.prepareStackTrace=()=>{throw new RangeError("formatter failed")}');
-  const bad=evaluate(c.scope,'new Error("bad")');
+  evaluate(c,'Error.prepareStackTrace=()=>{throw new RangeError("formatter failed")}');
+  const bad=evaluate(c,'new Error("bad")');
   assert.throws(()=>bad.stack,/formatter failed/);
   assert.deepEqual(Object.getOwnPropertyDescriptor(Error,'prepareStackTrace'),host);
 });
 
 test('Error.captureStackTrace targets use the local formatter', {skip:!stackFormattingSupported}, () => {
   const c=create();
-  const object=evaluate(c.scope,`Error.prepareStackTrace=(object,frames)=>({object,frames}); const target={}; Error.captureStackTrace(target); target`);
+  const object=evaluate(c,`Error.prepareStackTrace=(object,frames)=>({object,frames}); const target={}; Error.captureStackTrace(target); target`);
   assert.equal(object.stack.object,object);
   assert.ok(object.stack.frames.length>0);
   object.stack='overridden';
@@ -236,7 +282,7 @@ test('delayed stacks keep their owner and capture its frame limit', {skip:!stack
   a.scope.Error.prepareStackTrace=(error,frames)=>({owner:'a',error,frames});
   b.scope.Error.prepareStackTrace=(error,frames)=>({owner:'b',error,frames});
   const source='function first(){return second()} function second(){return third()} function third(){return new TypeError("delayed")} first()';
-  const errorA=evaluate(a.scope,source), errorB=evaluate(b.scope,source);
+  const errorA=evaluate(a,source), errorB=evaluate(b,source);
   const stackB=errorB.stack, stackA=errorA.stack;
   assert.equal(stackA.owner,'a');
   assert.equal(stackB.owner,'b');
@@ -253,8 +299,7 @@ function releasedGuestBufferReferences() {
     const context=create();
     const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
     context.scope.buffer=new Int32Array(memory.buffer);
-    evaluate(context.scope,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
-    runtime.wasmer_napi_activate_global_context(context);
+    evaluate(context,'process={buffer}; Error.prepareStackTrace=()=>process.buffer;');
     runtime.wasmer_napi_release_global_context(context);
     references.push(new WeakRef(memory.buffer));
   }
@@ -266,8 +311,10 @@ function releasedVmReferences() {
   for(let i=0;i<12;i++) {
     const memory=new WebAssembly.Memory({initial:32,maximum:64,shared:true});
     const sandbox={buffer:new Int32Array(memory.buffer)};
-    const scope=evaluate(sandbox,'Error.prepareStackTrace=()=>buffer; this');
-    references.push(new WeakRef(sandbox),new WeakRef(scope),new WeakRef(memory.buffer));
+    const realm=sandboxRealm(sandbox);
+    const scope=evaluate(realm,'Error.prepareStackTrace=()=>buffer; this');
+    references.push(new WeakRef(sandbox),new WeakRef(scope),new WeakRef(realm),
+      new WeakRef(memory.buffer));
   }
   return references;
 }
@@ -286,6 +333,114 @@ async function assertCollected(references) {
 
 test('cached VM globals and their guest buffers are collectible', async () => {
   await assertCollected(releasedVmReferences());
+});
+
+function droppedRealmReferences(own) {
+  const references=[];
+  for(let i=0;i<12;i++) {
+    const key=createRealm(own,i%2 ? {i} : null);
+    const realm=realmOf(own,key);
+    evaluate(realm,'globalThis.payload=new Array(1024).fill(1)');
+    references.push(new WeakRef(key),new WeakRef(realm),new WeakRef(realm.scope));
+  }
+  return references;
+}
+
+test('realms nothing refers to are collected, also while their registry lives', async () => {
+  const own=createRegistry();
+  const kept={};
+  createRealm(own,kept);
+  await assertCollected(droppedRealmReferences(own));
+  // The registry and a realm whose sandbox is still referenced survive.
+  assert.equal(evaluate(realmOf(own,kept),'typeof payload'),'undefined');
+});
+
+// Callbacks made in realms of `own`, each realm referred to only by its
+// callback; `dispatch` is the env's.
+function realmCallbacks(context,own,dispatch) {
+  const callbacks=[], references=[];
+  for(let i=0;i<12;i++) {
+    const key=createRealm(own,i%2 ? {i} : null);
+    const realm=realmOf(own,key);
+    evaluate(realm,'globalThis.payload=new Array(1024).fill(1)');
+    callbacks.push(callback(context,dispatch,realm));
+    references.push(new WeakRef(key),new WeakRef(realm),new WeakRef(realm.scope));
+  }
+  return {callbacks,references};
+}
+
+test('a callback passes its realm to dispatch and alone keeps that realm alive', async () => {
+  const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
+  const context=create(), own=createRegistry(), seen=[];
+  const dispatch=(_receiver,_args,_target,realm)=>{seen.push(realm);};
+  callback(context,dispatch)();
+  assert.deepEqual(seen,[undefined]);
+  seen.length=0;
+  // Only `made` refers to the callbacks: the suspended async frame must not.
+  const made=realmCallbacks(context,own,dispatch), references=made.references;
+  for(let i=0;i<4;i++) { await setTimeout(0); gc(); }
+  assert.equal(references.filter(reference=>reference.deref()).length,references.length);
+  made.callbacks.forEach(fn=>fn());
+  assert.ok(seen.every((realm,i)=>realm===references[3*i+1].deref()));
+  // The env's dispatch table and the registry do not keep them alive.
+  seen.length=0;
+  made.callbacks=undefined;
+  await assertCollected(references);
+  runtime.wasmer_napi_release_global_context(context);
+});
+
+test('a realm\'s global is its sandbox, else its own global', () => {
+  const own=createRegistry(), sandbox={};
+  const sandboxed=realmOf(own,createRealm(own,sandbox));
+  const fresh=realmOf(own,createRealm(own,null));
+  assert.equal(runtime.wasmer_napi_realm_global(sandboxed),sandbox);
+  assert.equal(runtime.wasmer_napi_realm_global(fresh),fresh.scope);
+  assert.equal(realmOf(own,runtime.wasmer_napi_realm_global(fresh)),fresh);
+  assert.equal(runtime.wasmer_napi_realm_global(host),host.scope);
+});
+
+test('realms are found by their global or sandbox only', () => {
+  const own=createRegistry();
+  const sandbox={x:1};
+  const key=createRealm(own,sandbox);
+  assert.equal(key,sandbox);
+  const realm=realmOf(own,sandbox);
+  assert.ok(realm);
+  assert.equal(realmOf(own,realm.scope),realm);
+  assert.equal(evaluate(realm,'x + 1'),2);
+  const fresh=realmOf(own,createRealm(own,null));
+  assert.equal(evaluate(fresh,'globalThis'),fresh.scope);
+  for (const value of [{},function(){},[],host.scope,1,'s',null,undefined]) {
+    assert.equal(realmOf(own,value),undefined);
+  }
+});
+
+test('a sandbox keeps the first realm made for it', () => {
+  const own=createRegistry();
+  const sandbox={};
+  createRealm(own,sandbox);
+  const first=realmOf(own,sandbox);
+  createRealm(own,sandbox);
+  assert.equal(realmOf(own,sandbox),first);
+});
+
+test('realm registries do not share realms', () => {
+  const a=createRegistry(), b=createRegistry();
+  const sandbox={};
+  createRealm(a,sandbox);
+  assert.equal(realmOf(b,sandbox),undefined);
+  createRealm(b,sandbox);
+  assert.notEqual(realmOf(a,sandbox),realmOf(b,sandbox));
+});
+
+test('a realm over the env global leaves the env context alone', () => {
+  const env=create(), own=createRegistry();
+  createRealm(own,env.scope);
+  const realm=realmOf(own,env.scope);
+  assert.notEqual(realm,env);
+  assert.equal(evaluate(env,'globalThis'),env.scope);
+  evaluate(realm,'globalThis.viaRealm=1');
+  assert.equal(env.scope.viaRealm,1);
 });
 
 test('closed virtual contexts and their guest buffers are collectible', async () => {

@@ -140,7 +140,6 @@ static int CreateSourceModule(napi_env env, const char* url, const char* text,
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = wrapper;
   options.url = url_value;
-  options.context_or_undefined = undefined;
   options.payload.source_text.source = &source;
   options.payload.source_text.host_defined_option_id = undefined;
   unofficial_napi_module_create_result result = {0};
@@ -231,6 +230,74 @@ static int CheckModuleEvaluation(napi_env env) {
   CHECK_OR_FAIL(count == 4, "failed dependency was evaluated a second time");
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, root));
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, leaf));
+  return 0;
+}
+
+// Node's ESM loader rejects JSON modules whose request lost its
+// `with { type: 'json' }` attributes (ERR_IMPORT_ATTRIBUTE_MISSING), so every
+// provider must surface parsed import attributes on the created requests.
+static int CheckModuleRequestAttributes(napi_env env) {
+  napi_value wrapper, url_value, source_value, undefined;
+  NAPI_CALL(env, napi_create_object(env, &wrapper));
+  NAPI_CALL(env, napi_create_string_utf8(
+      env, "file:///attributed.mjs", NAPI_AUTO_LENGTH, &url_value));
+  NAPI_CALL(env, napi_create_string_utf8(env,
+      "import data from './data.json' with { type: 'json' };\n"
+      "export const ok = data;",
+      NAPI_AUTO_LENGTH, &source_value));
+  NAPI_CALL(env, napi_get_undefined(env, &undefined));
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(source_value);
+  unofficial_napi_module_create_options options = {0};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = url_value;
+  options.realm_or_null = NULL;
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result result = {0};
+  NAPI_CALL(env, unofficial_napi_module_wrap_create(env, &options, &result));
+  CHECK_OR_FAIL(result.module != NULL,
+                "attributed module compilation did not return a handle");
+  CHECK_OR_FAIL(result.module_requests != NULL,
+                "attributed module compilation did not return requests");
+
+  bool is_array = false;
+  NAPI_CALL(env, napi_is_array(env, result.module_requests, &is_array));
+  CHECK_OR_FAIL(is_array, "module requests was not an array");
+  uint32_t request_count = 0;
+  NAPI_CALL(env, napi_get_array_length(
+      env, result.module_requests, &request_count));
+  CHECK_OR_FAIL(request_count == 1,
+                "attributed module reported the wrong request count");
+
+  napi_value request, specifier, attributes, type_value, phase_value;
+  char text[64];
+  size_t text_length = 0;
+  NAPI_CALL(env, napi_get_element(env, result.module_requests, 0, &request));
+  NAPI_CALL(env, napi_get_named_property(env, request, "specifier", &specifier));
+  NAPI_CALL(env, napi_get_value_string_utf8(
+      env, specifier, text, sizeof(text), &text_length));
+  CHECK_OR_FAIL(strcmp(text, "./data.json") == 0,
+                "attributed request reported the wrong specifier");
+  NAPI_CALL(env, napi_get_named_property(env, request, "attributes", &attributes));
+  napi_valuetype attributes_type = napi_undefined;
+  NAPI_CALL(env, napi_typeof(env, attributes, &attributes_type));
+  CHECK_OR_FAIL(attributes_type == napi_object,
+                "attributed request attributes was not an object");
+  NAPI_CALL(env, napi_get_named_property(env, attributes, "type", &type_value));
+  NAPI_CALL(env, napi_get_value_string_utf8(
+      env, type_value, text, sizeof(text), &text_length));
+  CHECK_OR_FAIL(strcmp(text, "json") == 0,
+                "import attribute 'type: json' was not preserved");
+  NAPI_CALL(env, napi_get_named_property(env, request, "phase", &phase_value));
+  int32_t phase = 0;
+  NAPI_CALL(env, napi_get_value_int32(env, phase_value, &phase));
+  CHECK_OR_FAIL(phase == 2,
+                "attributed request did not report the evaluation phase");
+  NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, result.module));
   return 0;
 }
 
@@ -346,10 +413,9 @@ int main(void) {
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
 
-  // Every code-generation path must select its execution scope explicitly.
-  // In particular, vm compile-function and module compilation must honor the
-  // supplied context rather than falling back to the active environment or
-  // the Wasmer worker's control-plane global.
+  // Code run, compiled or made as a module for a realm runs there. In
+  // particular it must not fall back to the env's own global or the Wasmer
+  // worker's control-plane global.
   napi_value undefined_value;
   NAPI_CALL(env, napi_get_undefined(env, &undefined_value));
   napi_value sandbox;
@@ -358,17 +424,13 @@ int main(void) {
   NAPI_CALL(env, napi_create_int32(env, 73, &context_marker));
   NAPI_CALL(env, napi_set_named_property(
                      env, sandbox, "__napi_context_marker", context_marker));
-  napi_value context;
-  NAPI_CALL(env, unofficial_napi_contextify_make_context(
-                     env,
-                     sandbox,
-                     undefined_value,
-                     undefined_value,
-                     true,
-                     true,
-                     true,
-                     undefined_value,
-                     &context));
+  unofficial_napi_realm_options realm_options;
+  unofficial_napi_realm_options_init(&realm_options);
+  realm_options.sandbox_or_null = sandbox;
+  realm_options.own_microtask_queue = true;
+  unofficial_napi_realm context_realm = NULL;
+  NAPI_CALL(env, unofficial_napi_create_realm(
+                     env, &realm_options, &context_realm, NULL));
 
   napi_value context_source_text;
   NAPI_CALL(env, napi_create_string_utf8(
@@ -379,9 +441,9 @@ int main(void) {
   const unofficial_napi_js_source context_source =
       unofficial_napi_js_source_from_text(context_source_text);
   napi_value context_result;
-  NAPI_CALL(env, unofficial_napi_contextify_run_script(
+  NAPI_CALL(env, unofficial_napi_run_script(
                      env,
-                     context,
+                     context_realm,
                      &context_source,
                      undefined_value,
                      0,
@@ -394,7 +456,7 @@ int main(void) {
                      &context_result));
   NAPI_CALL(env, napi_get_value_int32(env, context_result, &marker));
   CHECK_OR_FAIL(marker == 73,
-                "contextify_run_script escaped its explicit context");
+                "run_script escaped its realm");
 
   napi_value parameters;
   napi_value context_extensions;
@@ -421,13 +483,13 @@ int main(void) {
   const unofficial_napi_js_source function_source =
       unofficial_napi_js_source_from_text(function_source_text);
   napi_value compiled;
-  NAPI_CALL(env, unofficial_napi_contextify_compile_function(
+  NAPI_CALL(env, unofficial_napi_compile_function(
                      env,
+                     context_realm,
                      &function_source,
                      undefined_value,
                      0,
                      0,
-                     context,
                      context_extensions,
                      parameters,
                      undefined_value,
@@ -447,7 +509,7 @@ int main(void) {
                      &function_result));
   NAPI_CALL(env, napi_get_value_int32(env, function_result, &marker));
   CHECK_OR_FAIL(marker == 147,
-                "compile_function escaped its parsing context");
+                "compile_function escaped its realm");
 
   napi_value module_wrapper;
   napi_value module_url;
@@ -472,7 +534,7 @@ int main(void) {
   module_options.kind = unofficial_napi_module_source_text;
   module_options.wrapper = module_wrapper;
   module_options.url = module_url;
-  module_options.context_or_undefined = context;
+  module_options.realm_or_null = context_realm;
   module_options.payload.source_text.source = &module_source;
   module_options.payload.source_text.host_defined_option_id = undefined_value;
   unofficial_napi_module_create_result module_create_result = {0};
@@ -530,7 +592,7 @@ int main(void) {
                      env, module_namespace, "observed", &module_observed));
   NAPI_CALL(env, napi_get_value_int32(env, module_observed, &marker));
   CHECK_OR_FAIL(marker == 73,
-                "module evaluation escaped its explicit context");
+                "module evaluation escaped its realm");
   NAPI_CALL(env, unofficial_napi_module_wrap_destroy(env, module));
 
   // Creating the CommonJS facade evaluates the original module internally,
@@ -561,7 +623,6 @@ int main(void) {
   synthetic_options.kind = unofficial_napi_module_synthetic;
   synthetic_options.wrapper = module_wrapper;
   synthetic_options.url = module_url;
-  synthetic_options.context_or_undefined = undefined_value;
   synthetic_options.payload.synthetic.export_names = facade_exports;
   synthetic_options.payload.synthetic.synthetic_evaluation_steps =
       facade_evaluation_steps;
@@ -840,5 +901,6 @@ int main(void) {
   NAPI_CALL(env, unofficial_napi_release_env(lease_env_scope, NULL));
 
   CHECK_OR_FAIL(CheckModuleEvaluation(env) == 0, "module evaluation regressions failed");
+  CHECK_OR_FAIL(CheckModuleRequestAttributes(env) == 0, "module request attribute regressions failed");
   return PrintSuccess("RUN_SCRIPT_TEST");
 }

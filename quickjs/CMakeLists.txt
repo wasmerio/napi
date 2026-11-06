@@ -56,12 +56,14 @@ file(GLOB_RECURSE NAPI_QUICKJS_SRC_FILES
 
 add_library(napi_quickjs STATIC
   ../lib/src/napi_buffer_lease.cc
+  ../lib/src/napi_compat.cc
   ../lib/src/napi_error_state.cc
   ../lib/src/napi_lifetime_tracker.cc
   ../lib/src/napi_periodic_gate.cc
   ../lib/src/napi_text.cc
   ../lib/src/napi_typedarray_metadata.cc
   src/js_native_api_quickjs.cc
+  src/internal/napi_agent.cc
   src/internal/napi_callback_info.cc
   src/internal/napi_buffer.cc
   src/internal/napi_callsite.cc

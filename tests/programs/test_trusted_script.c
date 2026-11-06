@@ -116,5 +116,39 @@ int main(void) {
   NAPI_CALL(env, napi_typeof(env, result, &type));
   CHECK_OR_FAIL(type == napi_object, "a trusted script is an object");
 
+  // Drive the realm imports too: creation uses the entered realm while eval
+  // uses the receiving caller's lexical scope and code-generation policy.
+  unofficial_napi_realm_options realm_options;
+  unofficial_napi_realm_options_init(&realm_options);
+  unofficial_napi_realm a = NULL, restricted = NULL;
+  napi_value a_global = NULL, restricted_global = NULL, trusted = NULL;
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, &a, &a_global));
+  unofficial_napi_realm_scope realm_scope = 0;
+  NAPI_CALL(env, unofficial_napi_enter_realm(env, a, &realm_scope));
+  NAPI_CALL(env, unofficial_napi_is_executing_js(env, &active));
+  CHECK_OR_FAIL(!active, "entering a realm does not execute JavaScript");
+  NAPI_CALL(env, napi_create_string_utf8(env, "lexical + 2", NAPI_AUTO_LENGTH, &source));
+  NAPI_CALL(env, unofficial_napi_create_trusted_script(env, source, &trusted));
+  NAPI_CALL(env, napi_set_named_property(env, a_global, "trusted", trusted));
+  CHECK_OR_FAIL(ScriptIsTrue(env,
+      "Object.getPrototypeOf(Object.getPrototypeOf(trusted)) === Object.prototype"),
+      "trusted script is allocated in the current realm");
+  CHECK_OR_FAIL(ScriptIsTrue(env,
+      "(() => {let lexical = 40; return eval(trusted) === 42;})()"),
+      "realm direct eval preserves lexical scope");
+  NAPI_CALL(env, unofficial_napi_leave_realm(env, realm_scope));
+  NAPI_CALL(env, napi_set_named_property(env, global, "fromOtherRealm", trusted));
+  CHECK_OR_FAIL(ScriptIsTrue(env,
+      "(() => {let lexical = 21; return eval(fromOtherRealm) === 23;})()"),
+      "a trusted source from another realm uses the receiving lexical scope");
+  realm_options.allow_code_gen_strings = false;
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, &restricted, &restricted_global));
+  NAPI_CALL(env, napi_set_named_property(env, restricted_global, "trusted", trusted));
+  NAPI_CALL(env, unofficial_napi_enter_realm(env, restricted, &realm_scope));
+  CHECK_OR_FAIL(ScriptIsTrue(env,
+      "(() => {try {eval(trusted);} catch(e) {return e instanceof EvalError;} return false;})()"),
+      "trusted script respects the receiving realm's code-generation policy");
+  NAPI_CALL(env, unofficial_napi_leave_realm(env, realm_scope));
+
   return PrintSuccess("TEST_TRUSTED_SCRIPT");
 }

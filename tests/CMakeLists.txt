@@ -321,10 +321,121 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
 )
-add_fixture_test(${_napi_test_prefix}_test_66_unofficial_trusted_script
-  runners/test_66_unofficial_trusted_script.cc
+add_fixture_test(${_napi_test_prefix}_test_66_unofficial_realm
+  runners/test_66_unofficial_realm.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_67_terminate_execution
+  runners/test_67_terminate_execution.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_68_napi_calls_keep_termination
+  runners/test_68_napi_calls_keep_termination.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_69_unofficial_realm_entry
+  runners/test_69_unofficial_realm_entry.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_70_realm_entry_attack
+  runners/test_70_realm_entry_attack.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_71_contextify_compat
+  runners/test_71_contextify_compat.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_75_hooks_keep_termination
+  runners/test_75_hooks_keep_termination.cc
+)
+target_compile_definitions(${_napi_test_prefix}_test_75_hooks_keep_termination PRIVATE NAPI_VERSION=10)
+add_fixture_test(${_napi_test_prefix}_test_78_termination_until_cancelled
+  runners/test_78_termination_until_cancelled.cc
+)
+target_compile_definitions(${_napi_test_prefix}_test_78_termination_until_cancelled PRIVATE NAPI_VERSION=10)
+add_fixture_test(${_napi_test_prefix}_test_79_unofficial_trusted_script
+  runners/test_79_unofficial_trusted_script.cc
+)
+
+add_fixture_test(${_napi_test_prefix}_test_77_module_wrap_state
+  runners/test_77_module_wrap_state.cc
+)
+if(_napi_test_engine STREQUAL "v8")
+  # Only the V8 provider posts engine tasks through the enqueue hook.
+  add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
+    runners/test_66_foreground_task_handoff.cc
+  )
+  # Counts the V8 isolate's handles with the V8 API.
+  add_fixture_test(${_napi_test_prefix}_test_73_event_loop_checkpoint_handles
+    runners/test_73_event_loop_checkpoint_handles.cc
+  )
+  # QuickJS takes name lengths as a size_t; V8 takes an int.
+  add_fixture_test(${_napi_test_prefix}_test_74_name_length_limits
+    runners/test_74_name_length_limits.cc
+  )
+  target_compile_definitions(${_napi_test_prefix}_test_74_name_length_limits PRIVATE NAPI_VERSION=10)
+  # Only the V8 provider writes CPU profiles for NAPI_V8_CPU_PROFILE_DIR, and
+  # only on Linux and macOS. The runner uses POSIX APIs.
+  if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_fixture_test(${_napi_test_prefix}_test_76_env_cpu_profile
+      runners/test_76_env_cpu_profile.cc
+    )
+  endif()
+endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_72_unofficial_memory_pressure
+  runners/test_72_unofficial_memory_pressure.cc
+)
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_checkpoint_test src/v8_foreground_checkpoint_test.cc)
+  target_include_directories(napi_v8_foreground_checkpoint_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_checkpoint_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_checkpoint_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_checkpoint_fairness
+    COMMAND napi_v8_foreground_checkpoint_test)
+endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_background_job_limit_test src/v8_background_job_limit_test.cc)
+  target_include_directories(napi_v8_background_job_limit_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_background_job_limit_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_background_job_limit_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.background_job_limit
+    COMMAND napi_v8_background_job_limit_test 4)
+  add_test(NAME napi_v8.background_job_limit_single_worker
+    COMMAND napi_v8_background_job_limit_test 1)
+  set_tests_properties(napi_v8.background_job_limit napi_v8.background_job_limit_single_worker
+    PROPERTIES TIMEOUT 120)
+endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_task_waker_test src/v8_foreground_task_waker_test.cc)
+  target_include_directories(napi_v8_foreground_task_waker_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_task_waker_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_task_waker_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_task_waker
+    COMMAND napi_v8_foreground_task_waker_test)
+  set_tests_properties(napi_v8.foreground_task_waker PROPERTIES TIMEOUT 120)
+endif()

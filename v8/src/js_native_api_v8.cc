@@ -13,7 +13,6 @@
 #include "internal/napi_ref_with_finalizer.h"
 #include "internal/napi_setter_callback_info.h"
 #include "internal/unofficial_napi_bridge.h"
-#include "napi_typedarray_metadata.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -22,32 +21,80 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <vector>
 
+// Guards `napi_env__::external_backing_store_hints`, the `hint->env` back
+// pointer, and the env's queue of external finalizers.
+//
+// V8 destroys backing stores from its ArrayBufferSweeper, which runs on
+// background threads, so `ExternalBackingStoreDeleter` executes concurrently
+// with the main thread creating new hints. The set was being mutated from both
+// without synchronization, which corrupts the host heap — glibc aborts with
+// "malloc_consolidate(): unaligned fastbin chunk detected" a few hundred
+// requests into a payload-heavy workload. (`GuestHeap` already takes its own
+// mutex for exactly this reason; this container was missed.)
+//
+// Process-global rather than a member because a deleter has to read
+// `hint->env` before it can know which env to lock, and that read races
+// teardown. Never destroyed, matching the other process-lifetime globals here
+// (see the runtime-globals comment in unofficial_napi.cc).
+std::mutex& NapiV8ExternalHintsMutex() {
+  static std::mutex& mutex = *new std::mutex();
+  return mutex;
+}
+
+// Shared by an env and the drains it posts. `env` is the env until its
+// release ends, then null; the last reference frees the token. Each drain
+// releases its reference with its cleanup, on any thread.
+struct napi_env_drain_token__ {
+  explicit napi_env_drain_token__(napi_env env_in) : env(env_in) {}
+
+  std::atomic<napi_env> env;
+  std::atomic<uint32_t> refs{1};
+};
+
 namespace {
 
+void ReleaseDrainToken(napi_env /*env*/, void* data) {
+  auto* token = static_cast<napi_env_drain_token__*>(data);
+  if (token->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete token;
+}
+
+// Runs on the env's thread, as its release does, so the env it reads is alive
+// or null.
 void DrainFinalizerQueueForegroundTask(napi_env env, void* data) {
-  auto* target_env = static_cast<napi_env>(data);
+  auto* token = static_cast<napi_env_drain_token__*>(data);
+  napi_env target_env = token->env.load(std::memory_order_acquire);
   if (target_env == nullptr || target_env != env) return;
   target_env->DrainFinalizerQueue();
+}
+
+// Hands the hook a drain of `env`'s finalizer queues, holding the env's token
+// rather than the env. The hook owns the task from the call on, whatever it
+// returns: its cleanup releases the reference.
+napi_status PostFinalizerQueueDrain(napi_env env,
+                                    unofficial_napi_enqueue_foreground_task_callback enqueue,
+                                    void* target) {
+  napi_env_drain_token__* token = env->drain_token;
+  token->refs.fetch_add(1, std::memory_order_relaxed);
+  return enqueue(target, DrainFinalizerQueueForegroundTask, token, ReleaseDrainToken, 0);
 }
 
 void ScheduleFinalizerQueueDrain(napi_env env) {
   if (env == nullptr || env->finalization_scheduled) return;
 
   env->finalization_scheduled = true;
-  if (env->enqueue_foreground_task_callback != nullptr) {
-    napi_status status = env->enqueue_foreground_task_callback(
-        env->enqueue_foreground_task_target,
-        DrainFinalizerQueueForegroundTask,
-        env,
-        nullptr,
-        0);
+  napi_agent__* agent = env->agent;
+  if (agent != nullptr && agent->enqueue_foreground_task_callback != nullptr) {
+    napi_status status = PostFinalizerQueueDrain(
+        env, agent->enqueue_foreground_task_callback, agent->enqueue_foreground_task_target);
     if (status == napi_ok) return;
   }
 
@@ -71,7 +118,8 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   v8::Local<v8::Object> global = context->Global();
   v8::Local<v8::String> helper_name =
       v8::String::NewFromUtf8Literal(isolate, "__napi_dynamic_import");
-  v8::Local<v8::Value> helper_value;
+  // Undefined unless `process` is an object that has the helper.
+  v8::Local<v8::Value> helper_value = v8::Undefined(isolate);
   v8::Local<v8::String> process_name =
       v8::String::NewFromUtf8Literal(isolate, "process");
   v8::Local<v8::Value> process_value;
@@ -83,6 +131,10 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   }
   if ((!helper_value->IsFunction()) &&
       (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
+    // A getter V8 terminated: the import() fails with the termination, which
+    // an empty result reports. A settled promise would let the JS that
+    // imported run on, and V8 drops the termination once that run returns.
+    if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     NapiV8TrackProviderPromise(isolate, promise);
@@ -93,6 +145,7 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   v8::Local<v8::Value> argv[2] = {specifier, resource_name};
   v8::Local<v8::Value> result;
   if (!helper->Call(context, global, 2, argv).ToLocal(&result)) {
+    if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
     if (try_catch.HasCaught()) {
       resolver->Reject(context, try_catch.Exception()).FromMaybe(false);
       try_catch.Reset();
@@ -119,6 +172,11 @@ inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
 }
 
+void ClearLastException(napi_env env);
+
+// The env's cleanup hooks, at its release: most recent first, in rounds as
+// Node's CleanupQueue::Drain runs them, so a hook added meanwhile runs in the
+// next round.
 void RunEnvCleanupHooks(napi_env env) {
   if (!CheckEnv(env)) return;
 
@@ -155,7 +213,17 @@ void RunEnvCleanupHooks(napi_env env) {
         continue;
       }
 
-      snapshot.hook(snapshot.arg);
+      {
+        // Each hook runs in the env's realm, and a scope it leaves open
+        // closes when it returns. Nothing can catch what it throws: as Node's
+        // CallIntoModule does once JS can no longer run, it is dropped.
+        v8::HandleScope handle_scope(env->isolate);
+        v8::Context::Scope context_scope(env->main_context());
+        napi_realm_frame_scope__ realm_frame(env, nullptr);
+        v8::TryCatch try_catch(env->isolate);
+        snapshot.hook(snapshot.arg);
+        ClearLastException(env);
+      }
 
       it = find_hook(env->env_cleanup_hooks, snapshot);
       if (it != env->env_cleanup_hooks.end()) {
@@ -181,7 +249,10 @@ napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
 void FinalizeBufferRecord(napi_buffer_record* record) {
   if (record == nullptr || record->finalized) return;
   record->finalized = true;
-  if (record->finalize_cb != nullptr) {
+  if (record->finalize_cb == nullptr) return;
+  if (CheckEnv(record->env)) {
+    record->env->CallFinalizer(record->finalize_cb, record->external_data, record->finalize_hint);
+  } else {
     record->finalize_cb(record->env, record->external_data, record->finalize_hint);
   }
 }
@@ -194,6 +265,10 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
     napi_buffer_record* owned_record = TakeBufferRecord(env, record);
     if (owned_record == nullptr) return;
     owned_record->holder.Reset();
+    // Nothing reads the store once the Buffer is gone, and holding it until
+    // the drain would keep its memory until then. Freeing it here, if this
+    // is the last reference, uses no V8, so it is safe in a GC callback.
+    owned_record->backing_store.reset();
     env->EnqueueBufferFinalizer(owned_record);
   } else {
     record->holder.Reset();
@@ -201,91 +276,206 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   }
 }
 
-// Guards `napi_env__::external_backing_store_hints` and the `hint->env` back
-// pointer.
-//
-// V8 destroys backing stores from its ArrayBufferSweeper, which runs on
-// background threads, so `ExternalBackingStoreDeleter` executes concurrently
-// with the main thread creating new hints. The set was being mutated from both
-// without synchronization, which corrupts the host heap — glibc aborts with
-// "malloc_consolidate(): unaligned fastbin chunk detected" a few hundred
-// requests into a payload-heavy workload. (`GuestHeap` already takes its own
-// mutex for exactly this reason; this container was missed.)
-//
-// Process-global rather than a member because a deleter has to read
-// `hint->env` before it can know which env to lock, and that read races
-// teardown. Never destroyed, matching the other process-lifetime globals here
-// (see the runtime-globals comment in unofficial_napi.cc).
-std::mutex& ExternalHintsMutex() {
-  static std::mutex& mutex = *new std::mutex();
-  return mutex;
+// Queues an external backing store's finalizer for the env's thread. Returns
+// true when the caller must then post a drain for it, with
+// PostExternalFinalizerDrain. The caller holds NapiV8ExternalHintsMutex(),
+// which keeps `env` alive: its teardown takes the lock before it lets go of a
+// hint.
+bool QueueExternalFinalizer(napi_env env, const napi_external_finalizer__& finalizer) {
+  env->external_finalizers.push_back(finalizer);
+  env->has_external_finalizers.store(true, std::memory_order_release);
+  // Without a hook, the env's next checkpoint drains the queue; once the env
+  // is being torn down, the teardown does.
+  napi_agent__* agent = env->agent;
+  if (env->external_finalizer_drain_posted || env->releasing || agent == nullptr ||
+      agent->enqueue_foreground_task_callback == nullptr) {
+    return false;
+  }
+  env->external_finalizer_drain_posted = true;
+  ++env->external_drain_posts_in_flight;
+  return true;
 }
 
+// Posts a drain of the env's external finalizers. Called without the lock:
+// the hook may hand the drain to the env's thread and wait for it to run, and
+// the drain takes the lock. The env's teardown waits for the post to finish.
+void PostExternalFinalizerDrain(napi_env env,
+                                unofficial_napi_enqueue_foreground_task_callback enqueue,
+                                void* target) {
+  const bool posted = PostFinalizerQueueDrain(env, enqueue, target) == napi_ok;
+  std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+  // Refused: another deleter may post, or the next checkpoint drains.
+  if (!posted) env->external_finalizer_drain_posted = false;
+  // Notified under the lock: the env may be gone once its teardown sees no
+  // post in flight.
+  if (--env->external_drain_posts_in_flight == 0) {
+    env->external_drain_posts_done.notify_all();
+  }
+}
 
+// Takes the external finalizers deleters queued for `env`. Env thread only.
+std::vector<napi_external_finalizer__> TakeExternalFinalizers(napi_env env) {
+  std::vector<napi_external_finalizer__> taken;
+  if (!env->has_external_finalizers.load(std::memory_order_acquire)) return taken;
+  std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+  taken.swap(env->external_finalizers);
+  env->has_external_finalizers.store(false, std::memory_order_relaxed);
+  env->external_finalizer_drain_posted = false;
+  return taken;
+}
+
+// V8 calls this wherever the last reference to the backing store drops: on
+// one of its own threads, during a GC, or inside a detach or transfer while
+// another realm is entered. None of those may run the finalizer, so, as Node
+// does, this only claims it and hands it to the env's thread. A free
+// callback needs no env, so it runs here and the memory comes back now.
 void ExternalBackingStoreDeleter(void* data,
                                  size_t /*length*/,
                                  void* deleter_data) {
   auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
   if (hint == nullptr) return;
-  // Read the env and unlink in one critical section: the pointer is cleared by
-  // FinalizeExternalBackingStoreHints under the same lock, so reading it
-  // outside would race teardown.
-  napi_env env = nullptr;
-  napi_finalize finalize_cb = nullptr;
+  if (hint->external_data != nullptr) data = hint->external_data;
+  napi_v8_external_free_callback free_cb = nullptr;
+  napi_env post_to = nullptr;
+  unofficial_napi_enqueue_foreground_task_callback enqueue = nullptr;
+  void* target = nullptr;
   {
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    env = hint->env;
+    // Reads the env and unlinks in one critical section: the env's teardown
+    // clears the pointer under the same lock. A cleared pointer means the
+    // teardown has claimed the callback, and maybe run it, already.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    napi_env env = hint->env;
     if (env != nullptr) {
       v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
           record_release(env, hint);
       env->external_backing_store_hints.erase(hint);
       hint->env = nullptr;
+      free_cb = hint->free_cb;
+      if (hint->finalize_cb != nullptr &&
+          QueueExternalFinalizer(
+              env, {hint->finalize_cb, data, hint->finalize_hint, nullptr, hint->id})) {
+        post_to = env;
+        enqueue = env->agent->enqueue_foreground_task_callback;
+        target = env->agent->enqueue_foreground_task_target;
+      }
     }
-    // Claim the callback under the lock so a concurrent teardown sweep cannot
-    // also run it.
-    finalize_cb = hint->finalize_cb;
-    hint->finalize_cb = nullptr;
   }
-  // Outside the lock: a finalizer may re-enter N-API and create or destroy
-  // further hints.
-  if (finalize_cb != nullptr) {
-    finalize_cb(env, hint->external_data != nullptr ? hint->external_data : data,
-                hint->finalize_hint);
-  }
+  if (free_cb != nullptr) free_cb(data, hint->finalize_hint);
   delete hint;
+  if (post_to != nullptr) PostExternalFinalizerDrain(post_to, enqueue, target);
+}
+
+// The env's thread drops the array buffer it tracked for a store whose
+// finalizer is about to run.
+void ForgetExternalArrayBuffer(napi_env env, uint64_t id) {
+  if (id != 0) env->external_array_buffers.erase(id);
+}
+
+// At the env's release: detaches the most recently made external array buffer
+// still tracked, as Node's CallbackInfo::Clean does, then runs its finalizer,
+// so code that runs later sees the buffer detached, never the freed memory.
+// The detach may free the store; its deleter then claims the finalizer and
+// queues it, and FinalizeExternalBackingStoreHints runs it next. Either way
+// the finalizer is claimed once, under the lock. A buffer that
+// ArrayBuffer.prototype.transfer moved the store to is not reachable from
+// here (Node cannot reach it either), and the one it moved it from is
+// detached already: the store stays alive, and the finalizer frees memory
+// that buffer still exposes.
+void FinalizeNewestExternalArrayBuffer(napi_env env) {
+  auto newest = std::prev(env->external_array_buffers.end());
+  const uint64_t id = newest->first;
+  napi_external_backing_store_hint__* hint = newest->second.hint;
+  v8::Global<v8::ArrayBuffer> handle = std::move(newest->second.array_buffer);
+  env->external_array_buffers.erase(newest);
+  {
+    v8::HandleScope handle_scope(env->isolate);
+    v8::Local<v8::ArrayBuffer> array_buffer = handle.Get(env->isolate);
+    handle.Reset();
+    if (!array_buffer.IsEmpty() && array_buffer->IsDetachable()) {
+      v8::Context::Scope context_scope(env->main_context());
+      v8::TryCatch try_catch(env->isolate);
+      (void)array_buffer->Detach(v8::Local<v8::Value>());
+    }
+  }
+  napi_external_finalizer__ finalizer;
+  {
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    // Still in the set: the deleter has not run, so `hint` is alive. A new
+    // hint at the same address has another id.
+    if (env->external_backing_store_hints.count(hint) != 0 && hint->id == id) {
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_release(env, hint);
+      env->external_backing_store_hints.erase(hint);
+      hint->env = nullptr;
+      finalizer = {hint->finalize_cb, hint->external_data, hint->finalize_hint};
+      hint->finalize_cb = nullptr;
+    }
+  }
+  env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
 }
 
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  // Detach the whole set under the lock, then run the finalizers outside it.
-  // A backing store can still outlive the env, so each hint is unlinked from
-  // the dying env rather than deleted here — its deleter frees it later and,
-  // seeing a null env, skips the env-side bookkeeping.
-  // Each entry is the callback claimed from one hint, plus its arguments. The
-  // hints themselves are not touched after the lock is dropped: a concurrent
-  // deleter may already be freeing them.
-  std::vector<std::tuple<napi_finalize, void*, void*>> pending;
-  {
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    std::unordered_set<napi_external_backing_store_hint__*> hints;
-    hints.swap(env->external_backing_store_hints);
-    pending.reserve(hints.size());
-    for (auto* hint : hints) {
-      if (hint == nullptr) continue;
-      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-          record_release(env, hint);
-      hint->env = nullptr;
-      if (hint->finalize_cb != nullptr) {
-        pending.emplace_back(hint->finalize_cb, hint->external_data,
-                             hint->finalize_hint);
-        hint->finalize_cb = nullptr;
+  // At the env's release. Runs the user finalizers of external stores most
+  // recent first, by store id: those deleters queued (their buffers were
+  // detached or collected) and those of the array buffers still tracked, each
+  // detached first. Then claims, under the lock, what the backing stores
+  // still alive hold (the free callbacks of provider-owned memory), and runs
+  // it outside the lock. A backing store can outlive the env, so each live
+  // hint is unlinked from the dying env rather than deleted here — its
+  // deleter frees it later and, seeing a null env, skips the env-side
+  // bookkeeping. The hints are not touched after the lock is dropped: a
+  // concurrent deleter may already be freeing them. Repeats while finalizers
+  // make more external buffers.
+  std::multimap<uint64_t, napi_external_finalizer__> queued;
+  for (;;) {
+    for (const auto& finalizer : TakeExternalFinalizers(env)) {
+      queued.emplace(finalizer.id, finalizer);
+    }
+    const uint64_t newest_tracked = env->external_array_buffers.empty()
+                                        ? 0
+                                        : env->external_array_buffers.rbegin()->first;
+    if (!queued.empty() && queued.rbegin()->first >= newest_tracked) {
+      auto newest = std::prev(queued.end());
+      const napi_external_finalizer__ finalizer = newest->second;
+      queued.erase(newest);
+      ForgetExternalArrayBuffer(env, finalizer.id);
+      env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+      continue;
+    }
+    if (newest_tracked != 0) {
+      FinalizeNewestExternalArrayBuffer(env);
+      continue;
+    }
+    std::vector<napi_external_finalizer__> pending;
+    {
+      std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+      std::unordered_set<napi_external_backing_store_hint__*> hints;
+      hints.swap(env->external_backing_store_hints);
+      pending.reserve(hints.size());
+      for (auto* hint : hints) {
+        if (hint == nullptr) continue;
+        v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+            record_release(env, hint);
+        hint->env = nullptr;
+        if (hint->finalize_cb != nullptr || hint->free_cb != nullptr) {
+          pending.push_back({hint->finalize_cb, hint->external_data, hint->finalize_hint,
+                             hint->free_cb});
+          hint->finalize_cb = nullptr;
+          hint->free_cb = nullptr;
+        }
       }
     }
-  }
+    if (pending.empty()) return;
 
-  for (auto& [finalize_cb, external_data, finalize_hint] : pending) {
-    finalize_cb(env, external_data, finalize_hint);
+    for (const auto& finalizer : pending) {
+      if (finalizer.free_cb != nullptr) {
+        finalizer.free_cb(finalizer.data, finalizer.hint);
+      } else {
+        env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+      }
+    }
   }
 }
 
@@ -304,12 +494,14 @@ bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* len
   return true;
 }
 
-v8::Local<v8::Object> CreateBufferObject(napi_env env,
-                                         std::shared_ptr<v8::BackingStore> backing_store,
-                                         size_t offset,
-                                         size_t length) {
-  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
-  v8::Local<v8::Context> context = env->context();
+// A Buffer viewing `ab`.
+v8::Local<v8::Object> CreateBufferView(napi_env env,
+                                       v8::Local<v8::ArrayBuffer> ab,
+                                       size_t offset,
+                                       size_t length) {
+  // Buffer is the env's: read it from the env's realm, never from the current
+  // one, whose global its scripts control.
+  v8::Local<v8::Context> context = env->main_context();
   v8::Local<v8::Object> global = context->Global();
 
   // Node's napi_create_buffer* APIs produce Buffer instances, not plain
@@ -342,6 +534,14 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
   return view;
 }
 
+// A Buffer over a new ArrayBuffer holding `backing_store`.
+v8::Local<v8::Object> CreateBufferObject(napi_env env,
+                                         std::shared_ptr<v8::BackingStore> backing_store,
+                                         size_t offset,
+                                         size_t length) {
+  return CreateBufferView(env, v8::ArrayBuffer::New(env->isolate, backing_store), offset, length);
+}
+
 inline bool CheckValue(napi_env env, napi_value value) {
   return CheckEnv(env) && value != nullptr;
 }
@@ -352,16 +552,14 @@ void ClearLastException(napi_env env) {
   env->last_exception_message.Reset();
   env->last_exception_source_line.clear();
   env->last_exception_thrown_at.clear();
+  env->last_exception_is_termination = false;
 }
 
 void SetLastException(napi_env env,
                       v8::Local<v8::Value> exception,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  ClearLastException(env);
   if (exception.IsEmpty()) return;
 
   env->last_exception.Reset(env->isolate, exception);
@@ -370,12 +568,32 @@ void SetLastException(napi_env env,
   }
 }
 
+// What `tc` caught becomes N-API's pending exception. For a termination that
+// is the null V8 records for one, marked as such.
+void SetLastExceptionFromTryCatch(napi_env env, const v8::TryCatch& tc) {
+  SetLastException(env, tc.Exception(), tc.Message());
+  if (env != nullptr) env->last_exception_is_termination = tc.HasTerminated();
+}
+
 inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const char* message) {
   if (tc.HasCaught()) {
-    SetLastException(env, tc.Exception(), tc.Message());
+    SetLastExceptionFromTryCatch(env, tc);
     return napi_v8_set_last_error(env, napi_pending_exception, message);
   }
   return napi_v8_set_last_error(env, napi_generic_failure, message);
+}
+
+// Like Node's napi_env__::terminatedOrTerminating(), with its
+// can_call_into_js() that stays false once the env stops: the embedder
+// terminated the env (worker terminate(), process.exit()) and has not
+// cancelled that, or V8 is unwinding with a termination (a script timeout's
+// too). V8 alone forgets a termination: once the outermost JS frame has
+// unwound, and when an API call enters V8 while it unwinds.
+inline bool TerminatedOrTerminating(napi_env env) {
+  return env != nullptr && env->isolate != nullptr &&
+         ((env->agent != nullptr &&
+           env->agent->termination_requested.load(std::memory_order_acquire)) ||
+          env->isolate->IsExecutionTerminating());
 }
 
 inline napi_status InvalidArg(napi_env env) {
@@ -407,8 +625,30 @@ inline v8::PropertyAttribute ToV8PropertyAttributes(napi_property_attributes att
   return static_cast<v8::PropertyAttribute>(v8_attrs);
 }
 
-inline const char* TypedArrayConstructorName(napi_typedarray_type type) {
-  return napi::typedarray_constructor_name(type);
+// Makes a typed array of the current realm's own intrinsic, after the checks
+// Node makes, since v8::TypedArray::New aborts on an out-of-range view.
+template <typename T>
+napi_status CreateTypedArray(napi_env env,
+                             v8::Local<v8::ArrayBuffer> buffer,
+                             size_t element_size,
+                             const char* type_name,
+                             size_t byte_offset,
+                             size_t length,
+                             v8::Local<v8::Value>* result) {
+  if (byte_offset % element_size != 0) {
+    std::string message = std::string("start offset of ") + type_name +
+                          " should be a multiple of " + std::to_string(element_size);
+    napi_throw_range_error(env, "ERR_NAPI_INVALID_TYPEDARRAY_ALIGNMENT", message.c_str());
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid TypedArray alignment");
+  }
+  const size_t buffer_length = buffer->ByteLength();
+  if (byte_offset > buffer_length || length > T::kMaxLength ||
+      length * element_size > buffer_length - byte_offset) {
+    napi_throw_range_error(env, "ERR_NAPI_INVALID_TYPEDARRAY_LENGTH", "Invalid typed array length");
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid TypedArray length");
+  }
+  *result = T::New(buffer, byte_offset, length);
+  return napi_ok;
 }
 
 inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* out_type) {
@@ -442,6 +682,69 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
   return true;
 }
 
+// For a callback V8 runs (a native function, an accessor, a module hook)
+// that returns while the env terminates: makes V8 unwind the JS below it with
+// the termination now. V8 may have forgotten it (an N-API call that entered
+// V8 since cleared it) or not acted on it yet (it acts on a request at its
+// next stack check, which the JS after the call, a catch block say, need not
+// reach). So this asks again and calls a no-op function, whose entry is such
+// a check. A native function the embedder called from C++ has no JS below it
+// to stop, and its caller may have disallowed JS (V8 aborts on JS run then):
+// with `only_below_js`, asking again is all this does then. A module hook
+// must leave V8 with an exception, so it always calls the function.
+void KeepTerminating(napi_env env, bool only_below_js) {
+  v8::Isolate* isolate = env->isolate;
+  if (isolate->IsExecutionTerminating()) return;
+  v8::HandleScope handle_scope(isolate);
+  if (only_below_js && v8::StackTrace::CurrentStackTrace(isolate, 1)->GetFrameCount() == 0) {
+    isolate->TerminateExecution();
+    return;
+  }
+  v8::Local<v8::Context> context = env->main_context();
+  v8::Local<v8::Function> probe;
+  if (!env->agent->termination_probe.IsEmpty()) {
+    probe = env->agent->termination_probe.Get(isolate);
+  } else {
+    // Compiling runs no JS, so it does not act on a request made already.
+    v8::ScriptCompiler::Source source(v8::String::Empty(isolate));
+    if (v8::ScriptCompiler::CompileFunction(context, &source).ToLocal(&probe)) {
+      env->agent->termination_probe.Reset(isolate, probe);
+    }
+  }
+  isolate->TerminateExecution();
+  if (!probe.IsEmpty()) (void)probe->Call(context, v8::Undefined(isolate), 0, nullptr);
+}
+
+// Like Node's napi_env__::CallIntoModule() and HandleThrow(): after a native
+// callback returns, rethrow the exception it left pending, unless the env
+// terminates. Then what is pending is dropped (TryCatch records a
+// termination as a null exception, and rethrowing that would turn the
+// termination into a catchable throw and cancel it), and the termination
+// unwinds the JS that called, as QuickJS's trampoline does. Returns whether
+// that JS unwinds.
+bool HandleCallbackException(napi_env env) {
+  // Every native callback returns through here: the common case, nothing
+  // pending and no termination requested, asks V8 nothing. V8 unwinding
+  // with a termination of its own then needs nothing either.
+  const bool requested = env->agent->termination_requested.load(std::memory_order_acquire);
+  if (!requested && env->last_exception.IsEmpty()) return false;
+  if (requested || env->isolate->IsExecutionTerminating()) {
+    ClearLastException(env);
+    KeepTerminating(env, /*only_below_js=*/true);
+    return true;
+  }
+  env->isolate->ThrowException(env->last_exception.Get(env->isolate));
+  ClearLastException(env);
+  return true;
+}
+
+// A promise settles in its own realm, the one it was made in.
+v8::Local<v8::Context> PromiseContext(napi_env env, v8::Local<v8::Promise::Resolver> resolver) {
+  v8::Local<v8::Context> context;
+  if (!resolver->GetCreationContext().ToLocal(&context)) context = env->main_context();
+  return context;
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
@@ -450,14 +753,13 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   napi_env env = payload->env;
+  // V8 already runs the callback in the function's creation context; N-API
+  // acts in that realm too, and closes the scopes the callback leaves open.
+  napi_realm_frame_scope__ realm_frame(env, payload->realm);
   napi_function_callback_info__ cbinfo(info, payload);
 
   napi_value ret = payload->cb(env, &cbinfo);
-  bool pending_exception = !env->last_exception.IsEmpty();
-  if (pending_exception) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -473,10 +775,7 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_getter_callback_info__ cbinfo(env, payload->data, info);
   napi_value ret = payload->getter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    ClearLastException(env);
-  } else if (ret != nullptr) {
+  if (!HandleCallbackException(env) && ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 }
@@ -493,10 +792,117 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   napi_env env = payload->env;
   napi_setter_callback_info__ cbinfo(env, payload->data, value, info);
   payload->setter_cb(env, &cbinfo);
-  if (!env->last_exception.IsEmpty()) {
-    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
-    ClearLastException(env);
+  (void)HandleCallbackException(env);
+}
+
+// A backing store over external memory. Its deleter hands `finalize_cb` to
+// the env's thread, or runs `free_cb` itself; at most one is set. Sets
+// `*hint_out` to the store's hint, for TrackExternalArrayBuffer.
+std::unique_ptr<v8::BackingStore> NewExternalBackingStore(
+    napi_env env,
+    void* data,
+    size_t length,
+    node_api_basic_finalize finalize_cb,
+    napi_v8_external_free_callback free_cb,
+    void* finalize_hint,
+    napi_external_backing_store_hint__** hint_out) {
+  auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
+  hint->external_data = data;
+  hint->finalize_cb = finalize_cb;
+  hint->finalize_hint = finalize_hint;
+  hint->free_cb = free_cb;
+  if (finalize_cb != nullptr) hint->id = ++env->last_external_id;
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter, hint.get());
+  if (!backing) return nullptr;
+  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+      record_create(env, hint.get());
+  *hint_out = hint.get();
+  {
+    // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    env->external_backing_store_hints.insert(hint.release());
   }
+  return backing;
+}
+
+// Remembers, weakly, the array buffer made over a store with a user
+// finalizer, so the env's release can detach it first.
+void TrackExternalArrayBuffer(napi_env env,
+                              napi_external_backing_store_hint__* hint,
+                              v8::Local<v8::ArrayBuffer> array_buffer) {
+  if (hint->id == 0) return;
+  napi_external_array_buffer__& entry = env->external_array_buffers[hint->id];
+  entry.hint = hint;
+  entry.array_buffer.Reset(env->isolate, array_buffer);
+  entry.array_buffer.SetWeak();
+}
+
+napi_status CreateExternalArrayBuffer(napi_env env,
+                                      void* external_data,
+                                      size_t byte_length,
+                                      node_api_basic_finalize finalize_cb,
+                                      napi_v8_external_free_callback free_cb,
+                                      void* finalize_hint,
+                                      napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+
+  v8::Local<v8::ArrayBuffer> out;
+  if (external_data == nullptr && byte_length == 0) {
+    out = v8::ArrayBuffer::New(env->isolate, 0);
+    out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
+  } else {
+    if (external_data == nullptr) return napi_invalid_arg;
+    napi_external_backing_store_hint__* hint = nullptr;
+    std::unique_ptr<v8::BackingStore> backing = NewExternalBackingStore(
+        env, external_data, byte_length, finalize_cb, free_cb, finalize_hint, &hint);
+    if (!backing) return napi_generic_failure;
+    // The array buffer holds the store, so its hint is alive here.
+    out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
+    TrackExternalArrayBuffer(env, hint, out);
+  }
+
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status CreateExternalBuffer(napi_env env,
+                                 size_t length,
+                                 void* data,
+                                 node_api_basic_finalize finalize_cb,
+                                 napi_v8_external_free_callback free_cb,
+                                 void* finalize_hint,
+                                 napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  // Before the backing store: a failure after it would run the callback,
+  // whose data the caller still owns then.
+  auto* record = env->allocate<napi_buffer_record__>(env);
+  if (record == nullptr) return napi_generic_failure;
+  napi_external_backing_store_hint__* hint = nullptr;
+  record->backing_store =
+      NewExternalBackingStore(env, data, length, finalize_cb, free_cb, finalize_hint, &hint);
+  if (!record->backing_store) {
+    env->release(record);
+    return napi_generic_failure;
+  }
+
+  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
+  // The record holds the store, so its hint is alive here.
+  TrackExternalArrayBuffer(env, hint, buffer_obj.As<v8::ArrayBufferView>()->Buffer());
+  record->holder.Reset(env->isolate, buffer_obj);
+  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
+  buffer_obj
+      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
+      .FromJust();
+  env->buffer_records.push_back(record);
+
+  *result = napi_v8_wrap_value(env, buffer_obj);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
 }  // namespace
@@ -507,17 +913,79 @@ void napi_v8_set_last_exception(napi_env env,
   SetLastException(env, exception, message);
 }
 
+void napi_v8_drop_pending_termination(napi_env env) {
+  if (env != nullptr && env->last_exception_is_termination) ClearLastException(env);
+}
+
+bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value> exception) {
+  if (isolate == nullptr || isolate->IsExecutionTerminating()) return false;
+  isolate->ThrowException(exception);
+  return true;
+}
+
+bool napi_v8_terminating(napi_env env) { return TerminatedOrTerminating(env); }
+
+void napi_v8_keep_terminating_after_interrupt(napi_env env) {
+  if (!TerminatedOrTerminating(env)) return;
+  ClearLastException(env);
+  v8::Isolate* isolate = env->isolate;
+  // A termination the callback's JS ran into is V8's current exception, which
+  // it ignores there and drops later.
+  if (isolate->IsExecutionTerminating()) isolate->CancelTerminateExecution();
+  isolate->TerminateExecution();
+}
+
+napi_status napi_v8_fail_terminating(napi_env env) {
+  if (env->last_exception.IsEmpty()) {
+    env->last_exception.Reset(env->isolate, v8::Null(env->isolate));
+    env->last_exception_is_termination = true;
+  }
+  return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+}
+
+bool napi_v8_rethrow_pending_exception(napi_env env) {
+  if (env == nullptr) return false;
+  // As HandleCallbackException: what is pending while the env terminates is
+  // the null a TryCatch records for the termination, and throwing it would
+  // make the termination a catchable throw and cancel it.
+  if (TerminatedOrTerminating(env)) {
+    ClearLastException(env);
+    KeepTerminating(env, /*only_below_js=*/false);
+    return true;
+  }
+  bool pending = false;
+  napi_value error = nullptr;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending ||
+      napi_get_and_clear_last_exception(env, &error) != napi_ok || error == nullptr) {
+    return false;
+  }
+  // Taking it formats it, which can call the source-map callback: JS that V8
+  // may terminate too.
+  napi_v8_throw_unless_terminating(env->isolate, napi_v8_unwrap_value(error));
+  return true;
+}
+
 napi_handle_scope__::napi_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 
 napi_escapable_handle_scope__::napi_escapable_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 
+// Finalizers run in the env's own realm.
 void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hint) {
   if (cb == nullptr) return;
   v8::HandleScope handle_scope(isolate);
-  v8::Context::Scope context_scope(context());
+  v8::Context::Scope context_scope(main_context());
+  napi_realm_frame_scope__ realm_frame(this, nullptr);
+  if (!releasing) {
+    cb(this, data, hint);
+    return;
+  }
+  // At the release nothing can catch what the finalizer throws: as Node's
+  // CallIntoModule does once JS can no longer run, it is dropped.
+  v8::TryCatch try_catch(isolate);
   cb(this, data, hint);
+  ClearLastException(this);
 }
 
 void napi_env__::InvokeFinalizerFromGC(napi_ref_tracker__* finalizer) {
@@ -542,7 +1010,20 @@ void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
 
 void napi_env__::DrainFinalizerQueue() {
   finalization_scheduled = false;
-  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty()) {
+  // While the env is releasing (a finalizer there may run a checkpoint), its
+  // release pass runs the external finalizers, those queued meanwhile too,
+  // in its order: most recent first.
+  const bool take_external = !releasing;
+  std::vector<napi_external_finalizer__> external;
+  if (take_external) external = TakeExternalFinalizers(this);
+  if (pending_finalizers.empty() && pending_buffer_finalizers.empty() && external.empty()) {
+    return;
+  }
+  v8::HandleScope handle_scope(isolate);
+  v8::Context::Scope context_scope(main_context());
+  napi_realm_frame_scope__ realm_frame(this, nullptr);
+  while (!pending_finalizers.empty() || !pending_buffer_finalizers.empty() ||
+         !external.empty()) {
     while (!pending_finalizers.empty()) {
       napi_ref_tracker__* ref_tracker = *pending_finalizers.begin();
       pending_finalizers.erase(ref_tracker);
@@ -555,46 +1036,177 @@ void napi_env__::DrainFinalizerQueue() {
       FinalizeBufferRecord(record);
       release(record);
     }
+
+    for (const auto& finalizer : external) {
+      ForgetExternalArrayBuffer(this, finalizer.id);
+      CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+    }
+    // A finalizer above can free a backing store, which queues the store's
+    // finalizer.
+    if (take_external) external = TakeExternalFinalizers(this);
   }
+}
+
+namespace {
+
+// Isolate data slot that points at the isolate's napi_agent__.
+constexpr uint32_t kNapiAgentDataSlot = 0;
+
+}  // namespace
+
+napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
+  isolate->SetData(kNapiAgentDataSlot, this);
+  isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+  isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
+  v8::HandleScope handle_scope(isolate);
+  wrap_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap")));
+  buffer_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(
+          isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record")));
+  type_tag_private_key.Reset(
+      isolate,
+      v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_type_tag")));
+}
+
+napi_agent__::~napi_agent__() {
+  termination_probe.Reset();
+  wrap_private_key.Reset();
+  buffer_private_key.Reset();
+  type_tag_private_key.Reset();
+  trusted_script_key.Reset();
+  trusted_script_template.Reset();
+  if (From(isolate) == this) {
+    isolate->SetData(kNapiAgentDataSlot, nullptr);
+  }
+}
+
+napi_agent__* napi_agent__::From(v8::Isolate* isolate) {
+  if (isolate == nullptr) return nullptr;
+  return static_cast<napi_agent__*>(isolate->GetData(kNapiAgentDataSlot));
 }
 
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
+      agent(napi_agent__::From(isolate)),
       context_ref(isolate, context),
       factory_(this) {
   (void)module_api_version;
-  isolate->SetHostImportModuleDynamicallyCallback(NapiHostImportModuleDynamically);
-  v8::Local<v8::Private> wrapKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap"));
-  wrap_private_key.Reset(isolate, wrapKey);
-  v8::Local<v8::Private> bufferKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record"));
-  buffer_private_key.Reset(isolate, bufferKey);
-  v8::Local<v8::Private> typeTagKey = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_type_tag"));
-  type_tag_private_key.Reset(isolate, typeTagKey);
+  if (agent == nullptr) {
+    owned_agent = std::make_unique<napi_agent__>(isolate);
+    agent = owned_agent.get();
+  }
+  if (agent->principal_env == nullptr) {
+    agent->principal_env = this;
+  }
+  drain_token = new napi_env_drain_token__(this);
   napi_v8_clear_last_error(this);
 }
 
 napi_env__::~napi_env__() {
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  RunEnvCleanupHooks(this);
-  napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
-  napi_ref_tracker__::FinalizeAll(&reflist);
-  pending_finalizers.clear();
-  pending_buffer_finalizers.clear();
-  finalization_scheduled = false;
-  FinalizeExternalBackingStoreHints(this);
-  napi_v8_finalize_buffer_records(this);
-
-  if (instance_data_finalize_cb != nullptr) {
-    instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
+  {
+    // A drain posted now could run after the env is gone. Deleters queue
+    // without posting; FinalizeExternalBackingStoreHints runs what they queue.
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    releasing = true;
   }
+  // Every scope closes. Cleanup hooks and finalizers each run in the env's
+  // realm, and a scope one leaves open closes when it returns.
+  PopRealmFrames(0);
+  // The release contract (unofficial_napi_release_env), in rounds: the
+  // realms that have a context token give it up (the deprecated token hooks;
+  // in the first round the realms still alive, before the cleanup hooks run,
+  // while the embedder's state is intact); the cleanup hooks run, and the
+  // realms made while they ran give up their tokens before the round's
+  // finalizers, as on main; then the finalizers of the values still pending
+  // (references with a finalizer most recent first, as Node's FinalizeAll,
+  // then external buffers, each detached first). Rounds repeat while any of
+  // them has something left: a realm one of these finalizers makes keeps its
+  // token until the next round. Then the instance data's finalizer; and all
+  // of it again for what that finalizer leaves pending, until nothing is, so
+  // no hint is left pointing at the env and no token is left assigned. The
+  // callback is cleared before it runs, so instance data is finalized once.
+  for (;;) {
+    do {
+      NapiV8UnassignRealmTokens(this);
+      RunEnvCleanupHooks(this);
+      NapiV8UnassignRealmTokens(this);
+      napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
+      pending_finalizers.clear();
+      pending_buffer_finalizers.clear();
+      FinalizeExternalBackingStoreHints(this);
+    } while (!env_cleanup_hooks.empty() || !napi_ref_tracker__::IsEmpty(&finalizing_reflist) ||
+             NapiV8HasRealmTokens(this));
+    if (instance_data_finalize_cb == nullptr) break;
+    napi_finalize finalize_cb = instance_data_finalize_cb;
+    instance_data_finalize_cb = nullptr;
+    CallFinalizer(finalize_cb, instance_data, instance_data_finalize_hint);
+  }
+  finalization_scheduled = false;
+  // Plain references keep their values until every finalizer has run, as in
+  // Node, whose FinalizeAll(&reflist) comes after the finalizers.
+  napi_v8_finalize_buffer_records(this);
+  napi_ref_tracker__::FinalizeAll(&reflist);
+  // Backstop: nothing above should leave a scope open, and a context still
+  // entered here would abort V8 at the embedder's next Context::Exit.
+  PopRealmFrames(0);
+  // The hooks and finalizers above can make state the runtime keeps by the
+  // env's address (napi_get_and_clear_last_exception keeps the error's
+  // formatting; a module lookup after the loader's cleanup hook makes the
+  // loader's state again). Left behind, an env made later at the same address
+  // would find it, and reset handles of an isolate already disposed.
+  unofficial_napi_internal::ForgetEnvState(this);
+  if (agent != nullptr && agent->principal_env == this) {
+    agent->principal_env = nullptr;
+  }
+  {
+    // A deleter still in the hook, posting a drain, touches the env when the
+    // hook returns. A hook that waits for the env's thread must let go of
+    // the task once the release begins; the release already needs that for
+    // the engine's own tasks.
+    std::unique_lock<std::mutex> lock(NapiV8ExternalHintsMutex());
+    external_drain_posts_done.wait(lock, [this] { return external_drain_posts_in_flight == 0; });
+  }
+  // The hook may still hold drains, and run them after the env is gone: they
+  // find no env in the token.
+  drain_token->env.store(nullptr, std::memory_order_release);
+  ReleaseDrainToken(nullptr, drain_token);
+  drain_token = nullptr;
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 
 v8::Local<v8::Context> napi_env__::context() const {
+  unofficial_napi_realm__* realm = current_realm();
+  return realm != nullptr ? realm->context.Get(isolate) : context_ref.Get(isolate);
+}
+
+v8::Local<v8::Context> napi_env__::main_context() const {
   return context_ref.Get(isolate);
+}
+
+unofficial_napi_realm__* napi_env__::current_realm() const {
+  return realm_frames.empty() ? nullptr : realm_frames.back().realm;
+}
+
+size_t napi_env__::PushRealmFrame(unofficial_napi_realm__* realm) {
+  size_t depth = realm_frames.size();
+  realm_frames.emplace_back();
+  realm_frames.back().realm = realm;
+  return depth;
+}
+
+void napi_env__::PopRealmFrames(size_t depth) {
+  while (realm_frames.size() > depth) {
+    napi_realm_frame__& frame = realm_frames.back();
+    if (!frame.entered.IsEmpty()) {
+      v8::HandleScope handle_scope(isolate);
+      frame.entered.Get(isolate)->Exit();
+    }
+    realm_frames.pop_back();
+  }
 }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -626,6 +1238,20 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
 
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value) {
   return V8LocalValueFromJsValue(value);
+}
+
+napi_status napi_v8_create_external_arraybuffer_with_free(
+    napi_env env, void* data, size_t byte_length, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result) {
+  if (free_cb == nullptr) return napi_invalid_arg;
+  return CreateExternalArrayBuffer(env, data, byte_length, nullptr, free_cb, free_hint, result);
+}
+
+napi_status napi_v8_create_external_buffer_with_free(
+    napi_env env, size_t length, void* data, napi_v8_external_free_callback free_cb,
+    void* free_hint, napi_value* result) {
+  if (free_cb == nullptr) return napi_invalid_arg;
+  return CreateExternalBuffer(env, length, data, nullptr, free_cb, free_hint, result);
 }
 
 void napi_v8_finalize_buffer_records(napi_env env) {
@@ -763,7 +1389,7 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
            env->context(), sign_bit, static_cast<int>(word_count), words)
            .ToLocal(&out)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_v8_set_last_error(env, napi_pending_exception, "BigInt creation threw");
     }
     return napi_generic_failure;
@@ -773,6 +1399,7 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
 }
 
 napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   v8::MaybeLocal<v8::Value> maybe_date = v8::Date::New(env->context(), time);
   if (maybe_date.IsEmpty()) {
@@ -834,36 +1461,8 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     node_api_basic_finalize finalize_cb,
     void* finalize_hint,
     napi_value* result) {
-  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-
-  v8::Local<v8::ArrayBuffer> out;
-  if (external_data == nullptr && byte_length == 0) {
-    out = v8::ArrayBuffer::New(env->isolate, 0);
-    out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
-  } else {
-    if (external_data == nullptr) return napi_invalid_arg;
-    auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
-    hint->external_data = external_data;
-    hint->finalize_cb = finalize_cb;
-    hint->finalize_hint = finalize_hint;
-    auto* hint_ptr = hint.get();
-    std::unique_ptr<v8::BackingStore> backing = v8::ArrayBuffer::NewBackingStore(
-        external_data, byte_length, ExternalBackingStoreDeleter, hint_ptr);
-    if (!backing) {
-      return napi_generic_failure;
-    }
-    v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-        record_create(env, hint.get());
-    {
-      // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
-      std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-      env->external_backing_store_hints.insert(hint.release());
-    }
-    out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
-  }
-
-  *result = napi_v8_wrap_value(env, out);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return CreateExternalArrayBuffer(
+      env, external_data, byte_length, finalize_cb, nullptr, finalize_hint, result);
 }
 
 napi_status NAPI_CDECL napi_is_typedarray(napi_env env, napi_value value, bool* result) {
@@ -881,29 +1480,61 @@ napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(arraybuffer);
   if (!local->IsArrayBuffer()) return napi_arraybuffer_expected;
+  v8::Local<v8::ArrayBuffer> buffer = local.As<v8::ArrayBuffer>();
 
-  const char* ctor_name = TypedArrayConstructorName(type);
-  if (ctor_name == nullptr) return InvalidArg(env);
-
-  v8::TryCatch tc(env->isolate);
-  v8::Local<v8::String> key;
-  if (!v8::String::NewFromUtf8(env->isolate, ctor_name, v8::NewStringType::kNormal).ToLocal(&key)) {
-    return napi_generic_failure;
+  // The current realm's own constructors, never its global's: scripts can
+  // replace those.
+  v8::Context::Scope context_scope(env->context());
+  v8::Local<v8::Value> view;
+  napi_status status = napi_ok;
+  switch (type) {
+    case napi_int8_array:
+      status = CreateTypedArray<v8::Int8Array>(env, buffer, 1, "Int8Array", byte_offset, length, &view);
+      break;
+    case napi_uint8_array:
+      status = CreateTypedArray<v8::Uint8Array>(env, buffer, 1, "Uint8Array", byte_offset, length, &view);
+      break;
+    case napi_uint8_clamped_array:
+      status = CreateTypedArray<v8::Uint8ClampedArray>(
+          env, buffer, 1, "Uint8ClampedArray", byte_offset, length, &view);
+      break;
+    case napi_int16_array:
+      status = CreateTypedArray<v8::Int16Array>(env, buffer, 2, "Int16Array", byte_offset, length, &view);
+      break;
+    case napi_uint16_array:
+      status = CreateTypedArray<v8::Uint16Array>(env, buffer, 2, "Uint16Array", byte_offset, length, &view);
+      break;
+    case napi_int32_array:
+      status = CreateTypedArray<v8::Int32Array>(env, buffer, 4, "Int32Array", byte_offset, length, &view);
+      break;
+    case napi_uint32_array:
+      status = CreateTypedArray<v8::Uint32Array>(env, buffer, 4, "Uint32Array", byte_offset, length, &view);
+      break;
+    case napi_float16_array:
+      // The provider refuses --no-js-float16array, so Float16Array exists.
+      status = CreateTypedArray<v8::Float16Array>(
+          env, buffer, 2, "Float16Array", byte_offset, length, &view);
+      break;
+    case napi_float32_array:
+      status = CreateTypedArray<v8::Float32Array>(
+          env, buffer, 4, "Float32Array", byte_offset, length, &view);
+      break;
+    case napi_float64_array:
+      status = CreateTypedArray<v8::Float64Array>(
+          env, buffer, 8, "Float64Array", byte_offset, length, &view);
+      break;
+    case napi_bigint64_array:
+      status = CreateTypedArray<v8::BigInt64Array>(
+          env, buffer, 8, "BigInt64Array", byte_offset, length, &view);
+      break;
+    case napi_biguint64_array:
+      status = CreateTypedArray<v8::BigUint64Array>(
+          env, buffer, 8, "BigUint64Array", byte_offset, length, &view);
+      break;
+    default:
+      return InvalidArg(env);
   }
-  v8::Local<v8::Value> ctor_value;
-  if (!env->context()->Global()->Get(env->context(), key).ToLocal(&ctor_value) ||
-      !ctor_value->IsFunction()) {
-    return napi_generic_failure;
-  }
-  v8::Local<v8::Value> args[3] = {
-      local,
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
-  };
-  v8::Local<v8::Object> view;
-  if (!ctor_value.As<v8::Function>()->NewInstance(env->context(), 3, args).ToLocal(&view)) {
-    return ReturnPendingIfCaught(env, tc, "Failed to create TypedArray");
-  }
+  if (status != napi_ok) return status;
   *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
@@ -1178,6 +1809,10 @@ napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
   if (utf8description == nullptr && length > 0) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // As in napi_create_string_utf8: V8 takes an int length.
+  if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   const char* desc = (utf8description == nullptr) ? "" : utf8description;
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
   v8::Local<v8::String> key;
@@ -1424,28 +2059,24 @@ napi_status NAPI_CDECL napi_create_dataview(napi_env env,
     return napi_v8_set_last_error(env, napi_arraybuffer_expected, "ArrayBuffer expected");
   }
 
-  v8::TryCatch tc(env->isolate);
-  auto context = env->context();
-  v8::Local<v8::String> ctor_name = v8::String::NewFromUtf8Literal(env->isolate, "DataView");
-  v8::Local<v8::Value> ctor_val;
-  if (!context->Global()->Get(context, ctor_name).ToLocal(&ctor_val) || !ctor_val->IsFunction()) {
-    return napi_generic_failure;
+  const size_t buffer_length = ab->IsArrayBuffer() ? ab.As<v8::ArrayBuffer>()->ByteLength()
+                                                   : ab.As<v8::SharedArrayBuffer>()->ByteLength();
+  if (byte_offset > buffer_length || length > buffer_length - byte_offset) {
+    napi_throw_range_error(env,
+                           "ERR_NAPI_INVALID_DATAVIEW_ARGS",
+                           "byte_offset + byte_length should be less than or equal to the size in "
+                           "bytes of the array passed in");
+    return napi_v8_set_last_error(env, napi_pending_exception, "Invalid DataView range");
   }
-  v8::Local<v8::Function> ctor = ctor_val.As<v8::Function>();
-  v8::Local<v8::Value> args[3] = {
-      ab,
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
-      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
-  };
-  v8::Local<v8::Object> out;
-  if (!ctor->NewInstance(context, 3, args).ToLocal(&out)) {
-    if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
-      return napi_v8_set_last_error(env, napi_pending_exception, "DataView construction threw");
-    }
-    return napi_generic_failure;
-  }
-  *result = napi_v8_wrap_value(env, out);
+
+  // The current realm's own DataView, never its global's (scripts can
+  // replace that).
+  v8::Context::Scope context_scope(env->context());
+  v8::Local<v8::DataView> view =
+      ab->IsArrayBuffer()
+          ? v8::DataView::New(ab.As<v8::ArrayBuffer>(), byte_offset, length)
+          : v8::DataView::New(ab.As<v8::SharedArrayBuffer>(), byte_offset, length);
+  *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -1506,6 +2137,7 @@ napi_status NAPI_CDECL napi_get_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1522,6 +2154,7 @@ napi_status NAPI_CDECL napi_set_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || value == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1538,14 +2171,20 @@ napi_status NAPI_CDECL napi_instanceof(napi_env env,
                                        napi_value object,
                                        napi_value constructor,
                                        bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, constructor) || result == nullptr) {
     return napi_invalid_arg;
   }
   v8::Local<v8::Value> ctor = napi_v8_unwrap_value(constructor);
   if (!ctor->IsFunction()) return napi_function_expected;
-  *result = napi_v8_unwrap_value(object)
-                ->InstanceOf(env->context(), ctor.As<v8::Object>())
-                .FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  v8::Maybe<bool> instance_of =
+      napi_v8_unwrap_value(object)->InstanceOf(env->context(), ctor.As<v8::Object>());
+  if (instance_of.IsNothing()) {
+    *result = false;
+    return ReturnPendingIfCaught(env, tc, "instanceof threw");
+  }
+  *result = instance_of.FromJust();
   return napi_ok;
 }
 
@@ -1553,6 +2192,7 @@ napi_status NAPI_CDECL napi_has_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
                                         bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1569,6 +2209,7 @@ napi_status NAPI_CDECL napi_delete_element(napi_env env,
                                            napi_value object,
                                            uint32_t index,
                                            bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return InvalidArg(env);
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
@@ -1691,11 +2332,18 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
                                             napi_callback cb,
                                             void* data,
                                             napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   if (cb == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
-  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data);
+  // V8 takes an int length: a larger one would turn negative and make V8
+  // run strlen. Node refuses it too.
+  if (utf8name != nullptr && length != NAPI_AUTO_LENGTH &&
+      length > static_cast<size_t>(INT_MAX)) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data, env->current_realm());
   if (payload == nullptr) return napi_generic_failure;
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
@@ -1729,6 +2377,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
                                          size_t property_count,
                                          const napi_property_descriptor* properties,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) {
     return napi_invalid_arg;
   }
@@ -1738,9 +2387,14 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   if (property_count > 0 && properties == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // As in napi_create_function: V8 takes an int length.
+  if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
 
   v8::Local<v8::Context> context = env->context();
-  auto* payload = env->allocate<napi_callback_payload__>(env, constructor, data);
+  auto* payload =
+      env->allocate<napi_callback_payload__>(env, constructor, data, env->current_realm());
   if (payload == nullptr) return napi_generic_failure;
 
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
@@ -1858,6 +2512,7 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
                                          size_t argc,
                                          const napi_value* argv,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, constructor) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> ctorValue = napi_v8_unwrap_value(constructor);
   if (!ctorValue->IsFunction()) return napi_function_expected;
@@ -1870,7 +2525,7 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
   if (!ctor->NewInstance(env->context(), static_cast<int>(argc), args.data())
            .ToLocal(&out)) {
     if (tryCatch.HasCaught()) {
-      SetLastException(env, tryCatch.Exception(), tryCatch.Message());
+      SetLastExceptionFromTryCatch(env, tryCatch);
       return napi_v8_set_last_error(env, napi_pending_exception, "Constructor threw");
     }
     return napi_generic_failure;
@@ -1885,6 +2540,7 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
                                           size_t argc,
                                           const napi_value* argv,
                                           napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, recv) || !CheckValue(env, func)) return napi_invalid_arg;
   auto context = env->context();
   v8::Local<v8::Function> fn;
@@ -1901,7 +2557,7 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
   v8::MaybeLocal<v8::Value> maybe = fn->Call(
       context, napi_v8_unwrap_value(recv), argc, args.data());
   if (tryCatch.HasCaught()) {
-    SetLastException(env, tryCatch.Exception(), tryCatch.Message());
+    SetLastExceptionFromTryCatch(env, tryCatch);
     return napi_v8_set_last_error(env, napi_pending_exception, "Function call threw");
   }
   if (maybe.IsEmpty()) {
@@ -1920,6 +2576,7 @@ napi_status NAPI_CDECL napi_define_properties(
     napi_value object,
     size_t property_count,
     const napi_property_descriptor* properties) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || properties == nullptr) return InvalidArg(env);
   auto context = env->context();
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
@@ -2006,6 +2663,7 @@ napi_status NAPI_CDECL napi_define_properties(
 napi_status NAPI_CDECL napi_create_promise(napi_env env,
                                            napi_deferred* deferred,
                                            napi_value* promise) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || promise == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2030,12 +2688,14 @@ napi_status NAPI_CDECL napi_create_promise(napi_env env,
 napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
                                              napi_deferred deferred,
                                              napi_value resolution) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || resolution == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  if (!resolver->Resolve(env->context(), napi_v8_unwrap_value(resolution)).FromMaybe(false)) {
+  if (!resolver->Resolve(PromiseContext(env, resolver), napi_v8_unwrap_value(resolution))
+           .FromMaybe(false)) {
     return ReturnPendingIfCaught(env, tc, "Failed to resolve promise");
   }
   env->release(deferred);
@@ -2045,12 +2705,14 @@ napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
 napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
                                             napi_deferred deferred,
                                             napi_value rejection) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || rejection == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
-  if (!resolver->Reject(env->context(), napi_v8_unwrap_value(rejection)).FromMaybe(false)) {
+  if (!resolver->Reject(PromiseContext(env, resolver), napi_v8_unwrap_value(rejection))
+           .FromMaybe(false)) {
     return ReturnPendingIfCaught(env, tc, "Failed to reject promise");
   }
   env->release(deferred);
@@ -2069,6 +2731,7 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2094,6 +2757,7 @@ napi_status NAPI_CDECL napi_set_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || value == nullptr) {
     return InvalidArg(env);
   }
@@ -2112,6 +2776,7 @@ napi_status NAPI_CDECL napi_get_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2130,6 +2795,7 @@ napi_status NAPI_CDECL napi_has_property(napi_env env,
                                          napi_value object,
                                          napi_value key,
                                          bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2148,6 +2814,7 @@ napi_status NAPI_CDECL napi_delete_property(napi_env env,
                                             napi_value object,
                                             napi_value key,
                                             bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key)) {
     return InvalidArg(env);
   }
@@ -2168,6 +2835,7 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
                                              napi_value object,
                                              napi_value key,
                                              bool* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || !CheckValue(env, key) || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2189,6 +2857,7 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
 napi_status NAPI_CDECL napi_get_property_names(napi_env env,
                                                napi_value object,
                                                napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -2213,6 +2882,7 @@ napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
                                                    napi_key_filter key_filter,
                                                    napi_key_conversion key_conversion,
                                                    napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -2250,6 +2920,7 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value value) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || value == nullptr) {
     return InvalidArg(env);
   }
@@ -2275,6 +2946,7 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
   }
@@ -2440,6 +3112,7 @@ napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2447,7 +3120,7 @@ napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
   v8::Local<v8::Number> out;
   if (!napi_v8_unwrap_value(value)->ToNumber(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during number coercion");
   }
@@ -2458,6 +3131,7 @@ napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2465,7 +3139,7 @@ napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
   v8::Local<v8::Object> out;
   if (!napi_v8_unwrap_value(value)->ToObject(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during object coercion");
   }
@@ -2476,6 +3150,7 @@ napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
 napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
                                              napi_value value,
                                              napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || value == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2483,7 +3158,7 @@ napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
   v8::Local<v8::String> out;
   if (!napi_v8_unwrap_value(value)->ToString(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during string coercion");
   }
@@ -2573,7 +3248,7 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), wrapKey).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -2603,6 +3278,7 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
         env, object, 0, napi_ref_ownership__::kRuntime, native_object);
   }
   if (ref == nullptr) return napi_generic_failure;
+  ref->MarkWrap();
 
   if (!object
            ->SetPrivate(env->context(),
@@ -2624,7 +3300,7 @@ napi_status NAPI_CDECL napi_unwrap(napi_env env, napi_value js_object, void** re
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   v8::Local<v8::Value> wrapped;
   if (!object->GetPrivate(env->context(), wrapKey).ToLocal(&wrapped) ||
       !wrapped->IsExternal()) {
@@ -2642,7 +3318,7 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   napi_status status = napi_unwrap(env, js_object, &out);
   if (status != napi_ok) return status;
   v8::Local<v8::Object> object = napi_v8_unwrap_value(js_object).As<v8::Object>();
-  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   v8::Local<v8::Value> wrapped;
   if (!object->GetPrivate(env->context(), wrapKey).ToLocal(&wrapped) ||
       !wrapped->IsExternal()) {
@@ -2661,30 +3337,48 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   return napi_ok;
 }
 
-napi_status NAPI_CDECL napi_throw_error(napi_env env,
-                                        const char* code,
-                                        const char* msg) {
-  if (!CheckEnv(env)) return napi_invalid_arg;
+// napi_throw_error and its siblings: makes the error, gives it `code` as Node
+// does, and throws it. Setting the code runs an inherited `code` setter, JS
+// that V8 may terminate: the termination is then what unwinds, and throwing
+// would replace it with a catchable error.
+static napi_status ThrowErrorWithCode(napi_env env,
+                                      v8::Local<v8::Value> (*factory)(v8::Local<v8::String>),
+                                      const char* code,
+                                      const char* msg) {
   v8::Local<v8::String> message;
-  if (!v8::String::NewFromUtf8(
-           env->isolate, (msg == nullptr) ? "N-API error" : msg, v8::NewStringType::kNormal)
+  if (!v8::String::NewFromUtf8(env->isolate, msg, v8::NewStringType::kNormal)
            .ToLocal(&message)) {
     return napi_generic_failure;
   }
-  v8::Local<v8::Object> err_obj = v8::Exception::Error(message).As<v8::Object>();
+  v8::Local<v8::Object> err = factory(message).As<v8::Object>();
   if (code != nullptr) {
     v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
     v8::Local<v8::String> code_val;
     if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-      err_obj->Set(env->context(), code_key, code_val).FromMaybe(false);
+      err->Set(env->context(), code_key, code_val).FromMaybe(false);
     }
   }
-  env->isolate->ThrowException(err_obj);
-  SetLastException(env, err_obj);
+  if (!napi_v8_throw_unless_terminating(env->isolate, err)) {
+    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+  }
+  SetLastException(env, err);
   return napi_pending_exception;
 }
 
+napi_status NAPI_CDECL napi_throw_error(napi_env env,
+                                        const char* code,
+                                        const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  if (!CheckEnv(env)) return napi_invalid_arg;
+  return ThrowErrorWithCode(
+      env,
+      [](v8::Local<v8::String> message) { return v8::Exception::Error(message); },
+      code,
+      (msg == nullptr) ? "N-API error" : msg);
+}
+
 napi_status NAPI_CDECL napi_throw(napi_env env, napi_value error) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, error)) return napi_invalid_arg;
   v8::Local<v8::Value> ex = napi_v8_unwrap_value(error);
   env->isolate->ThrowException(ex);
@@ -2704,6 +3398,10 @@ static napi_status CreateErrorCommon(napi_env env,
                                      napi_value code,
                                      napi_value msg,
                                      napi_value* result) {
+  // Only setting the code can run JS through an inherited setter.
+  if (code != nullptr) {
+    NAPI_V8_RETURN_IF_TERMINATING(env);
+  }
   if (!CheckEnv(env) || msg == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> msg_val = napi_v8_unwrap_value(msg);
   if (!msg_val->IsString()) return napi_string_expected;
@@ -2770,73 +3468,37 @@ napi_status NAPI_CDECL node_api_create_syntax_error(napi_env env,
 napi_status NAPI_CDECL napi_throw_type_error(napi_env env,
                                              const char* code,
                                              const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
-  v8::Local<v8::String> message;
-  if (!v8::String::NewFromUtf8(env->isolate,
-                               (msg == nullptr) ? "Type error" : msg,
-                               v8::NewStringType::kNormal)
-           .ToLocal(&message)) {
-    return napi_generic_failure;
-  }
-  v8::Local<v8::Object> err = v8::Exception::TypeError(message).As<v8::Object>();
-  if (code != nullptr) {
-    v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-    v8::Local<v8::String> code_val;
-    if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-      err->Set(env->context(), code_key, code_val).FromMaybe(false);
-    }
-  }
-  env->isolate->ThrowException(err);
-  SetLastException(env, err);
-  return napi_pending_exception;
+  return ThrowErrorWithCode(
+      env,
+      [](v8::Local<v8::String> message) { return v8::Exception::TypeError(message); },
+      code,
+      (msg == nullptr) ? "Type error" : msg);
 }
 
 napi_status NAPI_CDECL napi_throw_range_error(napi_env env,
                                               const char* code,
                                               const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
-  v8::Local<v8::String> message;
-  if (!v8::String::NewFromUtf8(env->isolate,
-                               (msg == nullptr) ? "Range error" : msg,
-                               v8::NewStringType::kNormal)
-           .ToLocal(&message)) {
-    return napi_generic_failure;
-  }
-  v8::Local<v8::Object> err = v8::Exception::RangeError(message).As<v8::Object>();
-  if (code != nullptr) {
-    v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-    v8::Local<v8::String> code_val;
-    if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-      err->Set(env->context(), code_key, code_val).FromMaybe(false);
-    }
-  }
-  env->isolate->ThrowException(err);
-  SetLastException(env, err);
-  return napi_pending_exception;
+  return ThrowErrorWithCode(
+      env,
+      [](v8::Local<v8::String> message) { return v8::Exception::RangeError(message); },
+      code,
+      (msg == nullptr) ? "Range error" : msg);
 }
 
 napi_status NAPI_CDECL node_api_throw_syntax_error(napi_env env,
                                                    const char* code,
                                                    const char* msg) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
-  v8::Local<v8::String> message;
-  if (!v8::String::NewFromUtf8(env->isolate,
-                               (msg == nullptr) ? "Syntax error" : msg,
-                               v8::NewStringType::kNormal)
-           .ToLocal(&message)) {
-    return napi_generic_failure;
-  }
-  v8::Local<v8::Object> err = v8::Exception::SyntaxError(message).As<v8::Object>();
-  if (code != nullptr) {
-    v8::Local<v8::String> code_key = v8::String::NewFromUtf8Literal(env->isolate, "code");
-    v8::Local<v8::String> code_val;
-    if (v8::String::NewFromUtf8(env->isolate, code, v8::NewStringType::kNormal).ToLocal(&code_val)) {
-      err->Set(env->context(), code_key, code_val).FromMaybe(false);
-    }
-  }
-  env->isolate->ThrowException(err);
-  SetLastException(env, err);
-  return napi_pending_exception;
+  return ThrowErrorWithCode(
+      env,
+      [](v8::Local<v8::String> message) { return v8::Exception::SyntaxError(message); },
+      code,
+      (msg == nullptr) ? "Syntax error" : msg);
 }
 
 napi_status NAPI_CDECL napi_is_exception_pending(napi_env env, bool* result) {
@@ -2861,13 +3523,18 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
     if (!message.IsEmpty()) {
       const std::string source_line =
           unofficial_napi_internal::GetErrorSourceLineForStderrImpl(env, message);
-      unofficial_napi_internal::SetArrowMessageFromString(
-          env->isolate, env->context(), ex, source_line);
-      unofficial_napi_internal::PreserveErrorFormatting(
-          env,
-          ex,
-          source_line,
-          unofficial_napi_internal::GetThrownAtString(env->isolate, message));
+      // That can run the source-map callback, JS that V8 may terminate. The
+      // V8 calls formatting makes would then drop the termination, as
+      // NAPI_V8_RETURN_IF_TERMINATING says entering V8 does.
+      if (!TerminatedOrTerminating(env)) {
+        unofficial_napi_internal::SetArrowMessageFromString(
+            env->isolate, env->context(), ex, source_line);
+        unofficial_napi_internal::PreserveErrorFormatting(
+            env,
+            ex,
+            source_line,
+            unofficial_napi_internal::GetThrownAtString(env->isolate, message));
+      }
     } else {
       (void)unofficial_napi_internal::PreserveErrorSourceMessage(env, wrapped);
     }
@@ -2907,6 +3574,7 @@ napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
 napi_status NAPI_CDECL napi_run_script(napi_env env,
                                        napi_value script,
                                        napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, script) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> source = napi_v8_unwrap_value(script);
   if (!source->IsString()) return napi_string_expected;
@@ -2914,7 +3582,7 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   v8::Local<v8::Script> compiled;
   if (!v8::Script::Compile(env->context(), source.As<v8::String>()).ToLocal(&compiled)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_pending_exception;
     }
     return napi_generic_failure;
@@ -2922,7 +3590,7 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   v8::Local<v8::Value> out;
   if (!compiled->Run(env->context()).ToLocal(&out)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_pending_exception;
     }
     return napi_generic_failure;
@@ -2932,6 +3600,9 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
 }
 
 napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
+  // As Node's NAPI_PREAMBLE: throwing while V8 terminates would replace the
+  // termination with a catchable exception.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || err == nullptr) return napi_invalid_arg;
   SetLastException(env, napi_v8_unwrap_value(err));
   env->isolate->ThrowException(napi_v8_unwrap_value(err));
@@ -2973,6 +3644,7 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
                                           size_t length,
                                           void** data,
                                           napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
@@ -2988,7 +3660,7 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
@@ -3019,45 +3691,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
                                                    node_api_basic_finalize finalize_cb,
                                                    void* finalize_hint,
                                                    napi_value* result) {
-  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Context> context = env->context();
-  v8::Context::Scope context_scope(context);
-
-  auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
-  hint->external_data = data;
-  hint->finalize_cb = finalize_cb;
-  hint->finalize_hint = finalize_hint;
-  auto* hint_ptr = hint.get();
-
-  std::unique_ptr<v8::BackingStore> backing =
-      v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter,
-                                       hint_ptr);
-  if (!backing) {
-    return napi_generic_failure;
-  }
-  v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
-      record_create(env, hint.get());
-  {
-    // Racing V8's ArrayBufferSweeper threads; see ExternalHintsMutex.
-    std::lock_guard<std::mutex> lock(ExternalHintsMutex());
-    env->external_backing_store_hints.insert(hint.release());
-  }
-
-  auto* record = env->allocate<napi_buffer_record__>(env);
-  if (record == nullptr) return napi_generic_failure;
-  record->backing_store = std::move(backing);
-
-  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
-  record->holder.Reset(env->isolate, buffer_obj);
-  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  buffer_obj
-      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
-      .FromJust();
-  env->buffer_records.push_back(record);
-
-  *result = napi_v8_wrap_value(env, buffer_obj);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  return CreateExternalBuffer(env, length, data, finalize_cb, nullptr, finalize_hint, result);
 }
 
 napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
@@ -3084,6 +3718,7 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
     size_t byte_offset,
     size_t byte_length,
     napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(arraybuffer);
   if (!raw->IsArrayBuffer()) return napi_invalid_arg;
@@ -3095,13 +3730,13 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
 
   auto* record = env->allocate<napi_buffer_record__>(env);
   if (record == nullptr) return napi_generic_failure;
-  record->backing_store = ab->GetBackingStore();
 
-  v8::Local<v8::Object> buffer_obj =
-      CreateBufferObject(env, record->backing_store, byte_offset, byte_length);
+  // As Node's Buffer::New(isolate, ab, ...), the Buffer views `ab` itself:
+  // detaching `ab` detaches it too, and `ab` alone holds the store.
+  v8::Local<v8::Object> buffer_obj = CreateBufferView(env, ab, byte_offset, byte_length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
   buffer_obj
       ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
       .FromJust();
@@ -3156,6 +3791,7 @@ napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result
 }
 
 napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -3168,6 +3804,7 @@ napi_status NAPI_CDECL napi_object_freeze(napi_env env, napi_value object) {
 }
 
 napi_status NAPI_CDECL napi_object_seal(napi_env env, napi_value object) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object)) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
@@ -3193,7 +3830,7 @@ napi_status NAPI_CDECL napi_type_tag_object(
   if (!target->IsObject()) return napi_invalid_arg;
 
   v8::Local<v8::Object> object = target.As<v8::Object>();
-  v8::Local<v8::Private> key = env->type_tag_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->type_tag_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), key).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -3226,7 +3863,7 @@ napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
   }
 
   v8::Local<v8::Object> object = target.As<v8::Object>();
-  v8::Local<v8::Private> key = env->type_tag_private_key.Get(env->isolate);
+  v8::Local<v8::Private> key = env->agent->type_tag_private_key.Get(env->isolate);
   v8::Local<v8::Value> tag_value;
   *result = false;
   if (!object->GetPrivate(env->context(), key).ToLocal(&tag_value) ||
