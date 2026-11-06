@@ -15,6 +15,7 @@ on:
       - "rust-toolchain.toml"
       - "src/**"
       - "tests/concurrent_*.rs"
+      - "tests/guest_*.rs"
       - "tests/wat_guest/**"
       - "v8/**"
   pull_request:
@@ -29,6 +30,7 @@ on:
       - "rust-toolchain.toml"
       - "src/**"
       - "tests/concurrent_*.rs"
+      - "tests/guest_*.rs"
       - "tests/wat_guest/**"
       - "v8/**"
   workflow_dispatch:
@@ -79,3 +81,15 @@ jobs:
         run: >-
           ./cargo-standalone.sh test --locked
           --test concurrent_envs --test concurrent_stores
+
+      # The library's unit tests, and WAT guests calling the N-API imports:
+      # callbacks, guest memory reads and writes, C strings and the memory
+      # pressure signal. No WASIX C toolchain is needed either.
+      #
+      # Not run here: manifest_tests, v8_host_control and v8_worker_threads.
+      # They build guests from tests/programs with wasixcc.
+      - name: Test the library and the WAT guests
+        run: >-
+          ./cargo-standalone.sh test --locked --lib
+          --test guest_callbacks --test guest_c_strings
+          --test guest_memory --test guest_memory_pressure
