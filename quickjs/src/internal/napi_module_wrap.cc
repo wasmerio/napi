@@ -696,11 +696,35 @@ napi_status napi_module_wrap__::throw_if_linking()
   return throw_error("ERR_VM_MODULE_LINK_FAILURE", "A module instantiation is under way");
 }
 
-napi_status napi_module_wrap__::link_module(JSContext *ctx, JSModuleDef *module, const char *failure)
+// Links `module`, which links what `entry` was linked to. QuickJS's linker
+// asserts that no module it reaches is evaluating, and without the assert
+// takes one back to "linked" under its evaluation. V8 takes such a module as
+// linked. Here a link that would reach one, through the modules not linked
+// yet, is refused.
+napi_status napi_module_wrap__::link_module(record *entry, JSContext *ctx, JSModuleDef *module,
+                                            const char *failure)
 {
   napi_status status = throw_if_linking();
   if (status != napi_ok)
     return status;
+  const std::unordered_set<record *> live(records_.begin(), records_.end());
+  std::vector<record *> pending{entry};
+  std::unordered_set<record *> seen{entry};
+  while (!pending.empty())
+  {
+    record *current = pending.back();
+    pending.pop_back();
+    if (JS_GetModuleStatus(ctx_, current->module) != JS_MODULE_STATUS_UNLINKED)
+      continue;
+    for (record *linked : current->linked_records)
+    {
+      if (live.count(linked) == 0 || !seen.insert(linked).second)
+        continue;
+      if (JS_GetModuleStatus(ctx_, linked->module) == JS_MODULE_STATUS_EVALUATING)
+        return throw_error("ERR_VM_MODULE_STATUS", "A module it imports is evaluating");
+      pending.push_back(linked);
+    }
+  }
   links_running_++;
   const int linked = JS_LinkModule(ctx, module);
   links_running_--;
@@ -714,7 +738,11 @@ napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
   record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
-  return link_module(entry->ctx, entry->module, "Module linking failed");
+  // A module linked already, also one whose evaluation is under way, stays as
+  // it is, as on V8.
+  if (JS_GetModuleStatus(ctx_, entry->module) >= JS_MODULE_STATUS_LINKED)
+    return napi_ok;
+  return link_module(entry, entry->ctx, entry->module, "Module linking failed");
 }
 
 // Evaluating a module whose evaluation is under way (from its own body or a
@@ -778,7 +806,7 @@ napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValu
   // one as any other.
   if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED)
   {
-    status = link_module(entry->ctx, entry->module, "Failed to evaluate module");
+    status = link_module(entry, entry->ctx, entry->module, "Failed to evaluate module");
     if (status != napi_ok)
       return status;
   }
@@ -1166,7 +1194,7 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
     JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to link required module facade");
   }
-  status = link_module(ctx, facade, "Failed to link required module facade");
+  status = link_module(entry, ctx, facade, "Failed to link required module facade");
   if (status != napi_ok)
   {
     JS_FreeValue(ctx, facade_value);

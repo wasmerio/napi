@@ -875,3 +875,83 @@ TEST_F(Test77ModuleWrapState, RequiredModuleFacadeOfAModuleThatThrowsOrAwaitsFai
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, throws), napi_ok);
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, awaits), napi_ok);
 }
+
+namespace {
+
+// Instantiates, from inside a module's evaluation, that module and then one
+// that imports it; records what each call returned and threw, and the status
+// each module had after it.
+napi_value InstantiateDuringEvaluation(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data), napi_ok);
+  auto* probe = static_cast<InstantiationProbe*>(data);
+  if (probe->entered) return nullptr;
+  probe->entered = true;
+  probe->outcomes.push_back(
+      "self " + Outcome(env, unofficial_napi_module_wrap_instantiate(env, probe->module)) +
+      ", status " + std::to_string(Status(env, probe->module)));
+  probe->outcomes.push_back(
+      "importer " + Outcome(env, unofficial_napi_module_wrap_instantiate(env, probe->other)) +
+      ", status " + std::to_string(Status(env, probe->other)));
+  return nullptr;
+}
+
+}  // namespace
+
+// Instantiating a module from inside its own evaluation (its body, or a
+// synthetic module's steps) does nothing, as on V8: the module is linked
+// already and goes on evaluating. QuickJS linked it again and took it from
+// "evaluating" back to "linked" (its linker asserts against such a module).
+// Instantiating a module that imports one being evaluated is engine-specific:
+// V8 takes the evaluating module as linked and instantiates it; QuickJS's
+// linker cannot link through one (it took it to "linked" too), so the
+// QuickJS provider refuses it with ERR_VM_MODULE_STATUS. Either way it
+// instantiates once the evaluation is done.
+TEST_F(Test77ModuleWrapState, InstantiatingAModuleWhileItEvaluates) {
+  for (bool synthetic : {true, false}) {
+    SCOPED_TRACE(synthetic ? "synthetic" : "source text");
+    EnvScope s(runtime_.get());
+    InstantiationProbe probe;
+    napi_value fn = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_create_function(s.env, "instantiateDuringEvaluation", NAPI_AUTO_LENGTH,
+                                   InstantiateDuringEvaluation, &probe, &fn),
+              napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "instantiateDuringEvaluation", fn), napi_ok);
+    probe.module =
+        synthetic ? CreateSyntheticModule(s.env, "(function() { instantiateDuringEvaluation(); })")
+                  : CreateSourceTextModule(s.env,
+                                           "instantiateDuringEvaluation(); export const value = 1;");
+    probe.other = CreateSourceTextModule(
+        s.env, "import { value } from 'evaluating'; export default value;");
+    ASSERT_NE(probe.module, nullptr);
+    ASSERT_NE(probe.other, nullptr);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.module, 0, nullptr), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.other, 1, &probe.module), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module), napi_ok);
+
+    napi_value promise = nullptr;
+    ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, probe.module, -1, false, &promise),
+              napi_ok);
+    EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+    ASSERT_TRUE(probe.entered);
+    ASSERT_EQ(probe.outcomes.size(), 2u);
+    EXPECT_EQ(probe.outcomes[0], "self 0, status 3");
+#if defined(NAPI_TEST_ENGINE_V8)
+    EXPECT_EQ(probe.outcomes[1], "importer 0, status 2");
+#else
+    EXPECT_EQ(probe.outcomes[1],
+              "importer 10 ERR_VM_MODULE_STATUS: A module it imports is evaluating, status 0");
+#endif
+    EXPECT_EQ(Status(s.env, probe.module), kEvaluated);
+
+    ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.other), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, probe.other, -1, false, &promise),
+              napi_ok);
+    EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+    EXPECT_EQ(Status(s.env, probe.other), kEvaluated);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
+  }
+}

@@ -117,7 +117,7 @@ private:
   napi_status throw_error(const char *code, const char *message);
   napi_status return_pending_exception(const char *message);
   napi_status throw_if_linking();
-  napi_status link_module(JSContext *ctx, JSModuleDef *module, const char *failure);
+  napi_status link_module(record *entry, JSContext *ctx, JSModuleDef *module, const char *failure);
   napi_status throw_if_evaluating(record *entry);
   napi_status throw_if_importing_an_evaluating_synthetic_module(record *entry);
   napi_status evaluate_unless_terminated(record *entry, JSValue *promise_out);
