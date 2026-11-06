@@ -723,12 +723,16 @@ void KeepTerminating(napi_env env, bool only_below_js) {
 // unwinds the JS that called, as QuickJS's trampoline does. Returns whether
 // that JS unwinds.
 bool HandleCallbackException(napi_env env) {
-  if (TerminatedOrTerminating(env)) {
+  // Every native callback returns through here: the common case, nothing
+  // pending and no termination requested, asks V8 nothing. V8 unwinding
+  // with a termination of its own then needs nothing either.
+  const bool requested = env->agent->termination_requested.load(std::memory_order_acquire);
+  if (!requested && env->last_exception.IsEmpty()) return false;
+  if (requested || env->isolate->IsExecutionTerminating()) {
     ClearLastException(env);
     KeepTerminating(env, /*only_below_js=*/true);
     return true;
   }
-  if (env->last_exception.IsEmpty()) return false;
   env->isolate->ThrowException(env->last_exception.Get(env->isolate));
   ClearLastException(env);
   return true;
