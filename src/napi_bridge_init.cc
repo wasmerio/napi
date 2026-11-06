@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -2833,11 +2834,18 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
 
   size_t wanted = argc_ptr != nullptr ? static_cast<size_t>(*argc_ptr) : 0;
   size_t actual = wanted;
-  std::vector<napi_value> argv(wanted);
+  // Every guest callback asks for its arguments: keep common counts off the heap.
+  napi_value inline_argv[16];
+  std::vector<napi_value> heap_argv;
+  napi_value* argv = inline_argv;
+  if (wanted > std::size(inline_argv)) {
+    heap_argv.resize(wanted);
+    argv = heap_argv.data();
+  }
   napi_value this_arg = nullptr;
   void* raw_data = nullptr;
   napi_status s =
-      napi_get_cb_info(env, info, &actual, wanted > 0 ? argv.data() : nullptr,
+      napi_get_cb_info(env, info, &actual, wanted > 0 ? argv : nullptr,
                        &this_arg, &raw_data);
   if (s != napi_ok) return s;
 
