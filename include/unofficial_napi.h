@@ -845,6 +845,83 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_own_non_index_prope
     uint32_t filter_bits,
     napi_value* result_out);
 
+// Defines each element of the array `names` (strings or symbols, in order) on
+// `object` as a lazy data property with `attributes` (napi_writable,
+// napi_enumerable, napi_configurable; nothing else): it takes its place in
+// the key order now and looks like a data property (`in`, hasOwnProperty,
+// Object.keys, for-in see it and call nothing), but its value comes from
+// `initializer`, called as initializer.call(object, name) the first time the
+// property is read (a get, or a descriptor read such as
+// Object.getOwnPropertyDescriptor or Object.defineProperty on it). The value
+// it returns replaces the property in place, as an ordinary data property
+// with the same attributes and position. If it throws, the read throws that
+// and the property stays lazy: the next read calls it again. A read of the
+// property from its own initializer, Object.defineProperty on it included,
+// throws a RangeError and leaves it lazy. An initializer that assigns or
+// deletes the property, or replaces it without reading it (with another lazy
+// definition, say), makes the read throw a TypeError, the property keeping
+// what the initializer did. Assigning or deleting the property before a read
+// replaces it without calling `initializer`. The initializer runs in its own
+// context, with side effects (a throwOnSideEffect evaluation of the property
+// throws).
+//
+// A non-object is napi_object_expected, a non-array `names`
+// napi_array_expected, one with an element that is not a string or symbol, or
+// is an array index ("0" to "4294967294", which would be an element),
+// napi_name_expected, a non-function initializer napi_function_expected, and a
+// throw while reading `names` napi_pending_exception: nothing is defined then.
+// On a typed array, so is every canonical numeric string ("-0", "1.5",
+// "Infinity", "NaN", "4294967295"): a typed array takes it for an integer
+// index and can have no own property by that name. A proxy, or an object with
+// an embedder's named interceptor (V8's ObjectTemplate::SetHandler), is
+// napi_generic_failure, defining nothing. A name that cannot be defined (a
+// non-configurable property, a non-extensible object) stops there with
+// napi_generic_failure and no exception, whether the calling JavaScript is
+// strict or not, the names before it staying defined. Other attribute bits
+// are napi_invalid_arg. While execution is terminating, the call is
+// napi_pending_exception and does nothing.
+//
+// Objects whose own property lookups call other embedder code are not
+// supported either, but the call cannot tell them: the global proxy of a
+// context whose global template has a named interceptor, and an object with
+// an access check callback (ObjectTemplate::SetAccessCheckCallback). That
+// code sees the lookups with which a first read checks the property once its
+// initializer returns, and could make every read throw a TypeError, or
+// change the property under the check and reach V8's CHECK.
+//
+// V8: Object::SetLazyDataProperty. QuickJS: native lazy data properties with
+// the same observable behavior. The host-JavaScript provider has no lazy data
+// properties: napi_invalid_arg for a null argument or other attribute bits,
+// napi_generic_failure otherwise (define the values eagerly instead).
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_lazy_data_properties(
+    napi_env env,
+    napi_value object,
+    napi_value names,
+    napi_value initializer,
+    napi_property_attributes attributes);
+
+// Whether `object`'s own property `key` (a string or symbol) is still a lazy
+// data property from unofficial_napi_define_lazy_data_properties that no read
+// replaced yet: false for a proxy, an object with a named interceptor, a
+// missing key, a data or accessor property. Calls no initializer, JavaScript
+// getter or proxy trap. To tell a lazy property from another native accessor
+// property, it reads that property's descriptor: V8's own (a function's
+// `length`, an array's `length`) have no side effects, but embedder code
+// installed with V8's API is called: an accessor
+// (Object::SetNativeDataProperty, a template), and the interceptor or access
+// check callback of an object that the define cannot tell (see above). A
+// non-object is napi_object_expected, a key that is not a string or symbol
+// napi_name_expected. While execution is terminating, or once code it calls
+// terminates it: napi_pending_exception, `*result_out` false.
+// QuickJS inspects its own property storage directly, calling no other
+// embedder code. The host-JavaScript provider: napi_invalid_arg for a null
+// argument, otherwise `*result_out` false and napi_generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_lazy_data_property(
+    napi_env env,
+    napi_value object,
+    napi_value key,
+    bool* result_out);
+
 // Unofficial helper for Node's internalBinding('v8').getHashSeed().
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_hash_seed(napi_env env,
                                                       uint64_t* hash_seed_out);

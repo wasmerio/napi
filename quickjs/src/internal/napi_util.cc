@@ -669,20 +669,16 @@ napi_status napi_util__::get_property_names(napi_env env,
     if (!(key_filter & (napi_key_writable | napi_key_configurable)))
       return 1;
 
-    JSPropertyDescriptor desc;
-    int has = JS_GetOwnProperty(ctx, &desc, owner, atom);
+    int flags = 0;
+    int has = JS_GetOwnPropertyFlags(ctx, &flags, owner, atom);
     if (has <= 0)
       return has;
 
     bool include = true;
-    if ((key_filter & napi_key_writable) && !(desc.flags & JS_PROP_WRITABLE))
+    if ((key_filter & napi_key_writable) && !(flags & JS_PROP_WRITABLE))
       include = false;
-    if ((key_filter & napi_key_configurable) && !(desc.flags & JS_PROP_CONFIGURABLE))
+    if ((key_filter & napi_key_configurable) && !(flags & JS_PROP_CONFIGURABLE))
       include = false;
-
-    JS_FreeValue(ctx, desc.value);
-    JS_FreeValue(ctx, desc.getter);
-    JS_FreeValue(ctx, desc.setter);
     return include ? 1 : 0;
   };
 

@@ -4,6 +4,7 @@
 #include "internal/napi_serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
+#include "internal/napi_lazy_properties.h"
 #include "internal/napi_promises.h"
 #include "internal/napi_util.h"
 #include "internal/napi_shared_array_buffer.h"
@@ -926,8 +927,8 @@ extern "C"
 
             if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
             {
-                JSPropertyDescriptor desc;
-                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
+                int flags = 0;
+                int has = JS_GetOwnPropertyFlags(ctx, &flags, obj, props[i].atom);
                 if (has < 0)
                 {
                     JS_FreeValue(ctx, key);
@@ -944,15 +945,11 @@ extern "C"
 
                 bool include = true;
                 if ((filter_bits & napi_key_writable) != 0 &&
-                    (desc.flags & JS_PROP_WRITABLE) == 0)
+                    (flags & JS_PROP_WRITABLE) == 0)
                     include = false;
                 if ((filter_bits & napi_key_configurable) != 0 &&
-                    (desc.flags & JS_PROP_CONFIGURABLE) == 0)
+                    (flags & JS_PROP_CONFIGURABLE) == 0)
                     include = false;
-
-                JS_FreeValue(ctx, desc.value);
-                JS_FreeValue(ctx, desc.getter);
-                JS_FreeValue(ctx, desc.setter);
                 if (!include)
                 {
                     JS_FreeValue(ctx, key);
@@ -965,6 +962,25 @@ extern "C"
 
         JS_FreePropertyEnum(ctx, props, prop_count);
         return napi_util__::wrap_owned(env, out, result_out);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
+        napi_env env,
+        napi_value object,
+        napi_value names,
+        napi_value initializer,
+        napi_property_attributes attributes)
+    {
+        return define_lazy_data_properties(env, object, names, initializer, attributes);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_is_lazy_data_property(
+        napi_env env,
+        napi_value object,
+        napi_value key,
+        bool *result_out)
+    {
+        return is_lazy_data_property(env, object, key, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,

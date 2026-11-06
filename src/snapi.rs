@@ -217,6 +217,22 @@ unsafe extern "C" {
         filter_bits: u32,
         out_id: *mut u32,
     ) -> i32;
+    // Native bridge only: the host-JS backend has no lazy data properties.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_define_lazy_data_properties(
+        env: SnapiEnv,
+        object_id: u32,
+        names_id: u32,
+        initializer_id: u32,
+        attributes: i32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_is_lazy_data_property(
+        env: SnapiEnv,
+        object_id: u32,
+        key_id: u32,
+        result_out: *mut i32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
     pub fn snapi_bridge_unofficial_get_error_metadata(
         env: SnapiEnv,

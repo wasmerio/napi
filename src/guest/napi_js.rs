@@ -1222,6 +1222,47 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     status
 }
 
+// No lazy data properties for a guest of the host's JS engine: the guest
+// defines its values eagerly. The arguments are checked as the native
+// providers check them.
+fn guest_unofficial_napi_define_lazy_data_properties(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    names: u32,
+    initializer: u32,
+    attributes: i32,
+) -> i32 {
+    // napi_writable | napi_enumerable | napi_configurable
+    if snapi_env(&env, napi_env).is_null()
+        || object == 0
+        || names == 0
+        || initializer == 0
+        || (attributes & !7) != 0
+    {
+        return 1;
+    }
+    9
+}
+
+fn guest_unofficial_napi_is_lazy_data_property(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    key: u32,
+    result_ptr: u32,
+) -> i32 {
+    if snapi_env(&env, napi_env).is_null()
+        || object == 0
+        || key == 0
+        || result_ptr == 0
+        || !write_guest_u8(&mut env, result_ptr, 0)
+    {
+        return 1;
+    }
+    9
+}
+
 fn guest_unofficial_napi_set_promise_hooks(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -5909,6 +5950,8 @@ pub fn register_napi_imports(
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
+        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_lazy_data_properties),
+        "unofficial_napi_is_lazy_data_property" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_lazy_data_property),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
