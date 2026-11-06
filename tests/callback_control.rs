@@ -1962,6 +1962,115 @@ mod native_frame_tests {
         }
     }
     #[test]
+    #[cfg(all(feature = "wasix", target_os = "linux", target_arch = "x86_64"))]
+    fn native_cpp_callback_cannot_switch_the_callers_context() {
+        if !run_in_subprocess(
+            "native_frame_tests::native_cpp_callback_cannot_switch_the_callers_context",
+            Duration::from_secs(30),
+        ) {
+            return;
+        }
+        // Match GUEST's real JS -> C++ -> Wasm table callback and the original
+        // v1 context fixture. The target context exists before the callback:
+        // NOTSUP must come from borrowed Store custody, not a missing driver/ID.
+        let guest = r#"(module
+          (import "env" "memory" (memory 2 2048 shared))
+          (import "wasix_32v1" "context_create" (func $create (param i32 i32) (result i32)))
+          (import "wasix_32v1" "context_switch" (func $switch (param i64) (result i32)))
+          (import "wasix_32v1" "context_destroy" (func $destroy (param i64) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+          (import "napi" "napi_wasm_init_env" (func $new_env (result i32)))
+          (import "napi" "napi_get_global" (func $global (param i32 i32) (result i32)))
+          (import "napi" "napi_create_function" (func $function (param i32 i32 i32 i32 i32 i32) (result i32)))
+          (import "napi" "napi_set_named_property" (func $set (param i32 i32 i32 i32) (result i32)))
+          (import "napi" "napi_create_string_utf8" (func $string (param i32 i32 i32 i32) (result i32)))
+          (import "napi" "napi_run_script" (func $run (param i32 i32 i32) (result i32)))
+          (import "napi" "napi_get_value_int32" (func $integer (param i32 i32 i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_configure_runtime"
+            (func $configure (param i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
+            (func $gc (param i32) (result i32)))
+          (table (export "__indirect_function_table") 3 funcref)
+          (elem (i32.const 1) $other $callback)
+          (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+          (global (export "__data_end") i32 (i32.const 65536))
+          (global (export "__heap_base") i32 (i32.const 65536))
+          (global $env (mut i32) (i32.const 0))
+          (global $phase (mut i32) (i32.const 0))
+          (global $callbacks (mut i32) (i32.const 0))
+          (data (i32.const 1024) "callback\00")
+          (data (i32.const 2048) "callback(); 42\00")
+          (data (i32.const 3072) "40 + 2\00")
+          (func $equal (param i32 i32)
+            local.get 0 local.get 1 i32.ne if unreachable end)
+          (func $check (param i32) local.get 0 i32.const 0 call $equal)
+          (func $other
+            ;; Entering while C++ is live is a failure even if it later resumes main.
+            global.get $phase i32.const 2 call $equal
+            i32.const 3 global.set $phase
+            i64.const 0 call $switch call $check
+            unreachable)
+          (func $callback (param i32 i32) (result i32)
+            global.get $phase i32.const 1 call $equal
+            i32.const 96 i64.load call $switch i32.const 58 call $equal
+            global.get $phase i32.const 1 call $equal
+            global.get $callbacks i32.const 1 i32.add global.set $callbacks
+            i32.const 0)
+          (func $eval (param $source i32)
+            global.get $env local.get $source i32.const -1 i32.const 16 call $string call $check
+            global.get $env i32.const 16 i32.load i32.const 20 call $run call $check
+            global.get $env i32.const 20 i32.load i32.const 24 call $integer call $check
+            i32.const 24 i32.load i32.const 42 call $equal)
+          (func (export "_start")
+            i32.const 96 i32.const 1 call $create call $check
+            i32.const 0 call $configure call $check
+            call $new_env global.set $env
+            global.get $env i32.eqz if unreachable end
+            global.get $env i32.const 8 call $global call $check
+            global.get $env i32.const 1024 i32.const 8 i32.const 2 i32.const 0 i32.const 12
+            call $function call $check
+            global.get $env i32.const 8 i32.load i32.const 1024 i32.const 12 i32.load
+            call $set call $check
+            i32.const 1 global.set $phase
+            i32.const 2048 call $eval
+            global.get $callbacks i32.const 1 call $equal
+            global.get $phase i32.const 1 call $equal
+            ;; The SAME valid target succeeds once the physical C++ scope has exited.
+            i32.const 2 global.set $phase
+            i32.const 96 i64.load call $switch call $check
+            global.get $phase i32.const 3 call $equal
+            i32.const 96 i64.load call $destroy call $check
+            global.get $env call $gc call $check
+            i32.const 3072 call $eval
+            i32.const 0 call $exit unreachable))"#;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async {
+            let ctx = NapiCtx::builder().max_sessions(1).max_envs(1).build();
+            let machine = wasixv2::Machine::builder()
+                .instantiation_hook(Arc::new(wasmer_napi::NapiHook::new(ctx.clone())))
+                .build();
+            let wasm = wat::parse_str(guest).unwrap();
+            assert_eq!(
+                machine
+                    .run(&wasm, wasixv2::Stdio::from_fns(|_| {}, |_| {}))
+                    .await
+                    .unwrap(),
+                0
+            );
+            machine.shutdown().await;
+            assert_eq!(ctx.active_sessions(), 0);
+            let usage = ctx.budget().snapshot();
+            assert_eq!(usage.live_isolates, 0);
+            assert_eq!(usage.v8_heap_reserved, 0);
+            assert_eq!(usage.v8_external, 0);
+            assert_eq!(usage.wasm_linear, 0);
+        });
+    }
+
+    #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn native_cpp_relocates_and_restores_the_configured_stack_limit() {
         if !run_in_subprocess(
