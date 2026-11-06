@@ -2444,17 +2444,7 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_value value,
     napi_value transfer_list_or_null,
     napi_value* result_out) {
-  if (env == nullptr || env->isolate == nullptr || value == nullptr || result_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  NAPI_V8_RETURN_IF_TERMINATING(env);
-  v8::TryCatch try_catch(env->isolate);
-  const napi_status status = StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
-  if (status == napi_pending_exception && try_catch.HasCaught()) {
-    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
-    napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
-  }
-  return status;
+  return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_message_create(
@@ -2468,7 +2458,6 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   *message_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
-  v8::TryCatch try_catch(isolate);
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
@@ -2479,10 +2468,6 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
 
   serializer.WriteHeader();
   if (serializer.WriteValue(context, input).IsNothing()) {
-    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
-    if (try_catch.HasCaught()) {
-      napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
-    }
     return napi_pending_exception;
   }
 

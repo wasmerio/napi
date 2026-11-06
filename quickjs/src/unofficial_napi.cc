@@ -768,27 +768,20 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
-        JSContext *ctx = napi_util__::context(env);
         size_t size = 0;
-        JSSABTab sab_tab{};
-        uint8_t *bytes = JS_WriteObject2(ctx,
-                                         &size,
-                                         napi_quickjs_value_inner(env, value),
-                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE |
-                                             JS_WRITE_OBJ_SAB_RETAIN,
-                                         &sab_tab);
+        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
+                                        &size,
+                                        napi_quickjs_value_inner(env, value),
+                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
         if (bytes == nullptr)
-            return napi_util__::return_pending_if_caught(env, ctx,
-                                                        "Failed to clone value");
-        JSValue cloned = JS_ReadObject(ctx,
+            return napi_generic_failure;
+        JSValue cloned = JS_ReadObject(napi_util__::context(env),
                                        bytes,
                                        size,
                                        JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
-        js_free(ctx, bytes);
-        JS_FreeSABTab(ctx, &sab_tab);
+        js_free(napi_util__::context(env), bytes);
         if (JS_IsException(cloned))
-            return napi_util__::return_pending_if_caught(env, ctx,
-                                                        "Failed to deserialize cloned value");
+            return napi_pending_exception;
 
         if (transfer_list_or_null != nullptr)
         {

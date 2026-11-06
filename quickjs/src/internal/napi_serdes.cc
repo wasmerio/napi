@@ -232,25 +232,23 @@ namespace quickjs::detail
         }
 
         napi_value value = argc >= 1 && argv[0] != nullptr ? argv[0] : napi_util__::undefined_value(env);
-        JSContext *ctx = napi_util__::context(env);
         size_t size = 0;
-        // V8's default Serializer requires a configured shared-buffer ID hook.
-        // This binding has no such hook; clone/message APIs handle SABs instead.
-        uint8_t *bytes = JS_WriteObject(ctx,
-                                        &size,
-                                        napi_quickjs_value_inner(env, value),
-                                        JS_WRITE_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        uint8_t *bytes = JS_WriteObject2(napi_util__::context(env),
+                                         &size,
+                                         napi_quickjs_value_inner(env, value),
+                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                                         &sab_tab);
         if (bytes == nullptr)
         {
-            if (JS_HasException(ctx))
-                napi_util__::return_pending_if_caught(env, ctx, "Value could not be serialized");
-            else
+            if (!JS_HasException(napi_util__::context(env)))
                 napi_throw_error(env, nullptr, "Value could not be serialized");
             return nullptr;
         }
 
         serializer->bytes.insert(serializer->bytes.end(), bytes, bytes + size);
-        js_free(ctx, bytes);
+        js_free(napi_util__::context(env), bytes);
+        js_free(napi_util__::context(env), sab_tab.tab);
 
         napi_value result = nullptr;
         napi_get_boolean(env, true, &result);
@@ -672,24 +670,20 @@ namespace quickjs::detail
     {
         if (!napi_util__::check_env(env) || value == nullptr || payload_out == nullptr)
             return napi_invalid_arg;
-        *payload_out = nullptr;
-        JSContext *ctx = napi_util__::context(env);
         size_t size = 0;
         JSSABTab sab_tab{};
-        uint8_t *bytes = JS_WriteObject2(ctx,
+        uint8_t *bytes = JS_WriteObject2(napi_util__::context(env),
                                          &size,
                                          napi_quickjs_value_inner(env, value),
-                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE |
-                                             JS_WRITE_OBJ_SAB_RETAIN,
+                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
                                          &sab_tab);
         if (bytes == nullptr)
-            return napi_util__::return_pending_if_caught(env, ctx,
-                                                        "Value could not be serialized");
+            return napi_generic_failure;
         auto *payload = new (std::nothrow) serialized_value();
         if (payload == nullptr)
         {
-            js_free(ctx, bytes);
-            JS_FreeSABTab(ctx, &sab_tab);
+            js_free(napi_util__::context(env), bytes);
+            js_free(napi_util__::context(env), sab_tab.tab);
             return napi_generic_failure;
         }
         payload->length = size;
@@ -702,8 +696,8 @@ namespace quickjs::detail
             if (payload->bytes == nullptr)
             {
                 delete payload;
-                js_free(ctx, bytes);
-                JS_FreeSABTab(ctx, &sab_tab);
+                js_free(napi_util__::context(env), bytes);
+                js_free(napi_util__::context(env), sab_tab.tab);
                 return napi_generic_failure;
             }
             std::memcpy(payload->bytes, bytes, size);
@@ -715,8 +709,8 @@ namespace quickjs::detail
             {
                 delete[] payload->bytes;
                 delete payload;
-                js_free(ctx, bytes);
-                JS_FreeSABTab(ctx, &sab_tab);
+                js_free(napi_util__::context(env), bytes);
+                js_free(napi_util__::context(env), sab_tab.tab);
                 return napi_generic_failure;
             }
             std::memcpy(payload->sab_tab, sab_tab.tab, sizeof(payload->sab_tab[0]) * sab_tab.len);
@@ -724,8 +718,8 @@ namespace quickjs::detail
             for (size_t i = 0; i < payload->sab_tab_len; i++)
                 napi_shared_array_buffer__::dup_data(payload->sab_tab[i]);
         }
-        js_free(ctx, bytes);
-        JS_FreeSABTab(ctx, &sab_tab);
+        js_free(napi_util__::context(env), bytes);
+        js_free(napi_util__::context(env), sab_tab.tab);
         *payload_out = payload;
         return napi_ok;
     }
