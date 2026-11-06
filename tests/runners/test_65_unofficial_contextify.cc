@@ -1472,3 +1472,49 @@ TEST_F(Test65UnofficialContextify, SyntheticModuleWhoseStepsAreNotAFunctionEvalu
     EXPECT_EQ(type, napi_undefined);
   }
 }
+
+// What the import.meta callback throws is thrown from the import.meta
+// expression, as in Node (ModuleWrap's callback rethrows it): the module stops
+// there, and its evaluation rejects with it. V8 left it in N-API's pending
+// exception instead: the module ran on, and the error surfaced from the next
+// N-API call that checked for one.
+TEST_F(Test65UnofficialContextify, ImportMetaCallbackExceptionThrowsFromTheModule) {
+  EnvScope s(runtime_.get());
+  napi_value meta = nullptr;
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env,
+                                "globalThis.metaCalls = 0;"
+                                "(id, meta, wrap) => { metaCalls++; throw new Error('meta'); }"),
+                            &meta),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.initialize_import_meta_object = meta;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(
+      Str(s.env, "globalThis.continued = 'no'; import.meta; globalThis.continued = 'yes';"));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "meta.mjs");
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  const Evaluated evaluated = CreateAndEvaluate(s.env, options);
+  EXPECT_EQ(evaluated.evaluate, napi_ok);
+  EXPECT_EQ(evaluated.pending, "") << "left pending by the evaluation";
+  EXPECT_EQ(evaluated.outcome, "rejected: meta");
+  napi_value continued = nullptr;
+  napi_value calls = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "continued"), &continued), napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "metaCalls"), &calls), napi_ok);
+  EXPECT_EQ(ValueText(s.env, continued), "no");
+  EXPECT_EQ(ValueText(s.env, calls), "1");
+  EXPECT_EQ(TakePendingMessage(s.env), "");
+}

@@ -1311,7 +1311,17 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
   napi_value ignored = nullptr;
   napi_value global = nullptr;
   napi_get_global(env, &global);
-  (void)napi_call_function(env, global, callback, 3, argv, &ignored);
+  if (napi_call_function(env, global, callback, 3, argv, &ignored) != napi_ok) {
+    // What the callback threw is thrown from the import.meta expression, as
+    // Node's callback rethrows it; left in N-API's pending exception, it
+    // would surface from whatever N-API call came next.
+    bool pending = false;
+    napi_value error = nullptr;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending &&
+        napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
+      env->isolate->ThrowException(napi_v8_unwrap_value(error));
+    }
+  }
 }
 
 v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> context,
