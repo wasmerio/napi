@@ -12,6 +12,7 @@
 
 #include "test_env.h"
 
+#include "node_api.h"
 #include "unofficial_napi.h"
 
 #include <string>
@@ -51,6 +52,16 @@ void TerminateNow(napi_env env) {
 napi_value TerminateAndThrow(napi_env env, napi_callback_info /*info*/) {
   TerminateNow(env);
   napi_throw_error(env, nullptr, "after terminate");
+  return nullptr;
+}
+
+// Terminates, then hands its argument to napi_fatal_exception.
+napi_value TerminateThenFatal(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value error = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, &argc, &error, nullptr, nullptr), napi_ok);
+  TerminateNow(env);
+  napi_fatal_exception(env, error);
   return nullptr;
 }
 
@@ -113,6 +124,7 @@ bool FinishTermination(napi_env env) {
 void InstallHelpers(napi_env env) {
   DefineGlobalFunction(env, "terminate", Terminate);
   DefineGlobalFunction(env, "terminateAndThrow", TerminateAndThrow);
+  DefineGlobalFunction(env, "terminateThenFatal", TerminateThenFatal);
   // Each catch block sets its flag first, by a plain store, at which no
   // engine looks for a termination.
   ASSERT_EQ(RunScript(env,
@@ -252,6 +264,18 @@ TEST_F(Test72HooksKeepTermination, DynamicImportCallback) {
         "try { import('x').catch(() => {}); } catch (e) { caught = 'yes'; caughtError = e; }\n"
         "after = 'yes';\n");
   }
+}
+
+// napi_fatal_exception from native code V8 is terminating. V8 threw the
+// error over the termination, and the JS that called the native code caught
+// it and ran on.
+TEST_F(Test72HooksKeepTermination, FatalExceptionWhileTerminating) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ExpectRunTerminated(
+      s.env,
+      "try { terminateThenFatal(new Error('fatal')); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)

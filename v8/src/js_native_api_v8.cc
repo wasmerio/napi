@@ -3516,6 +3516,9 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
 }
 
 napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
+  // As Node's NAPI_PREAMBLE: throwing while V8 terminates would replace the
+  // termination with a catchable exception.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || err == nullptr) return napi_invalid_arg;
   SetLastException(env, napi_v8_unwrap_value(err));
   env->isolate->ThrowException(napi_v8_unwrap_value(err));
