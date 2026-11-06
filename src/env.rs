@@ -32,7 +32,7 @@ use crate::snapi::{
 pub(crate) const RELEASE_REFUSED: i32 = 1;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use crate::{guest::callback::CallbackInvocationCtx, snapi::snapi_bridge_swap_active_callback_ctx};
+use crate::guest::callback::CallbackInvocationCtx;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) struct HostBufferCopy {
@@ -591,21 +591,14 @@ impl NapiEnv {
         }
         self.napi_envs.remove(&env_id);
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        unsafe {
-            snapi_bridge_swap_active_callback_ctx(env, std::ptr::null_mut());
+        {
+            // The host env has already been freed. Its address is only a
+            // bookkeeping key here; clearing its callback pointer would write
+            // into freed memory, possibly reused by another process.
             self.persistent_callback_contexts.remove(&env_id);
             self.envs_awaiting_async_owner.retain(|&id| id != env_id);
         }
         self.napi_state_to_guest_env.remove(&(env as usize));
-    }
-
-    /// Unregisters an env whose release does not depend on this bookkeeping
-    /// (the host-JS backend releases it right after).
-    #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    pub(crate) fn unregister_napi_scope(&mut self, scope_id: u32) -> Option<SnapiEnv> {
-        let (env_id, env) = self.begin_unregister_napi_scope(scope_id)?;
-        self.finish_unregister_napi_env(env_id, env, 0);
-        Some(env)
     }
 
     /// The env an owner scope id stands for, if the scope is registered.
