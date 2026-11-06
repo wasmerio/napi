@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #if defined(NAPI_TEST_ENGINE_V8)
 #include <v8-version.h>
@@ -103,6 +104,41 @@ napi_value MakeFinalizedGarbage(napi_env env, napi_callback_info /*info*/) {
   EXPECT_EQ(napi_set_named_property(env, object, "self", object), napi_ok);
   EXPECT_EQ(napi_add_finalizer(env, object, nullptr, CountFinalize, nullptr, nullptr), napi_ok);
   return nullptr;
+}
+
+// makeFinalizedGarbageCallingJs(): as makeFinalizedGarbage(), with a
+// finalizer that calls setFlag(), JS that sets globalThis.finalizerRanJs.
+int g_js_finalized = 0;
+napi_status g_finalizer_get_status = napi_ok;
+napi_status g_finalizer_call_status = napi_ok;
+void CallJsFinalize(napi_env env, void* /*data*/, void* /*hint*/) {
+  ++g_js_finalized;
+  napi_value global = nullptr;
+  napi_value set_flag = nullptr;
+  napi_value ignored = nullptr;
+  if (napi_get_global(env, &global) != napi_ok) return;
+  g_finalizer_get_status = napi_get_named_property(env, global, "setFlag", &set_flag);
+  if (g_finalizer_get_status != napi_ok) return;
+  g_finalizer_call_status = napi_call_function(env, global, set_flag, 0, nullptr, &ignored);
+}
+napi_value MakeFinalizedGarbageCallingJs(napi_env env, napi_callback_info /*info*/) {
+  napi_value object = nullptr;
+  EXPECT_EQ(napi_create_object(env, &object), napi_ok);
+  EXPECT_EQ(napi_set_named_property(env, object, "self", object), napi_ok);
+  EXPECT_EQ(napi_add_finalizer(env, object, nullptr, CallJsFinalize, nullptr, nullptr), napi_ok);
+  return nullptr;
+}
+
+void MakeGarbageCallingJs(napi_env env) {
+  DefineGlobalFunction(env, "makeFinalizedGarbageCallingJs", MakeFinalizedGarbageCallingJs);
+  g_js_finalized = 0;
+  g_finalizer_get_status = napi_ok;
+  g_finalizer_call_status = napi_ok;
+  ASSERT_EQ(RunScript(env,
+                      "globalThis.setFlag = () => { globalThis.finalizerRanJs = true; };"
+                      "makeFinalizedGarbageCallingJs();"),
+            napi_ok);
+  ASSERT_EQ(g_js_finalized, 0);
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
@@ -202,6 +238,142 @@ TEST_F(Test72UnofficialMemoryPressure, CriticalPressureFinalizesAsAnyCollection)
 #endif
   EXPECT_EQ(g_finalized, 1) << "the value critical pressure freed was not finalized";
 }
+
+// While the env terminates, what critical pressure frees is finalized where
+// it otherwise is, and a call the finalizer makes into JS is refused. V8's
+// checkpoint fails then and runs no finalizer, so with no enqueue hook (the
+// fixture attaches none) V8 runs it at the first checkpoint after the cancel,
+// where its call into JS succeeds. QuickJS runs it in the call, terminating.
+TEST_F(Test72UnofficialMemoryPressure, PressureWhileTerminatingFinalizesAsTheEngineDoes) {
+  EnvScope s(runtime_.get());
+  MakeGarbageCallingJs(s.env);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_memory_pressure(s.env, kCritical), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(g_js_finalized, 0) << "V8 ran a finalizer inside the call";
+  uint32_t state = 0;
+  EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, &state),
+            napi_pending_exception);
+  EXPECT_EQ(g_js_finalized, 0) << "the checkpoint of a terminating env ran a finalizer";
+
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, &state),
+            napi_ok);
+  EXPECT_EQ(g_js_finalized, 1) << "the first checkpoint after the cancel did not finalize";
+  EXPECT_EQ(g_finalizer_call_status, napi_ok);
+  EXPECT_EQ(RunScriptToString(s.env, "String(globalThis.finalizerRanJs)"), "true");
+#else
+  EXPECT_EQ(g_js_finalized, 1) << "QuickJS did not finalize in the call";
+  EXPECT_EQ(g_finalizer_get_status, napi_pending_exception)
+      << "the finalizer's call into JS was not refused";
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(RunScriptToString(s.env, "String(globalThis.finalizerRanJs)"), "undefined");
+#endif
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+struct PostedTask {
+  unofficial_napi_foreground_task_callback callback;
+  void* data;
+  unofficial_napi_foreground_task_cleanup cleanup;
+};
+std::vector<PostedTask>* g_posted = nullptr;
+napi_env g_posting_env = nullptr;
+bool g_queue_closed = false;
+
+// Keeps every task for the test to run on the env's thread, until the queue
+// closes; then releases each task it is given.
+napi_status QueueTask(void* /*target*/,
+                      unofficial_napi_foreground_task_callback callback,
+                      void* data,
+                      unofficial_napi_foreground_task_cleanup cleanup,
+                      uint64_t /*delay_millis*/) {
+  if (g_queue_closed) {
+    if (cleanup != nullptr) cleanup(g_posting_env, data);
+    return napi_generic_failure;
+  }
+  g_posted->push_back({callback, data, cleanup});
+  return napi_ok;
+}
+
+// Releases the queued tasks without running them, and every later one, as an
+// embedder does when the env shuts down.
+void CloseQueue() {
+  g_queue_closed = true;
+  std::vector<PostedTask> tasks;
+  tasks.swap(*g_posted);
+  for (const PostedTask& task : tasks) {
+    if (task.cleanup != nullptr) task.cleanup(g_posting_env, task.data);
+  }
+}
+
+// Closes the queue when it goes out of scope, a failed ASSERT included.
+// Declared after the env, it closes the queue before the env's release, so
+// that every task the hook was given is released.
+struct QueueCloser {
+  ~QueueCloser() { CloseQueue(); }
+};
+
+// Runs the queued tasks, and those they queue, as an event loop turn would.
+size_t RunPostedTasks(napi_env env) {
+  size_t ran = 0;
+  for (int round = 0; round < 16 && !g_posted->empty(); ++round) {
+    std::vector<PostedTask> tasks;
+    tasks.swap(*g_posted);
+    for (const PostedTask& task : tasks) {
+      task.callback(env, task.data);
+      if (task.cleanup != nullptr) task.cleanup(env, task.data);
+      ++ran;
+    }
+  }
+  return ran;
+}
+
+}  // namespace
+
+// With an enqueue hook, V8 posts the drain of the finalizers as a task, and
+// the task runs them also while the env terminates: the finalizer's call into
+// JS is refused then, and it does not run again after the cancel.
+TEST_F(Test72UnofficialMemoryPressure, V8PressureWhileTerminatingPostsTheFinalizers) {
+  std::vector<PostedTask> posted;
+  g_posted = &posted;
+  g_queue_closed = false;
+  EnvScope s(runtime_.get());
+  g_posting_env = s.env;
+  QueueCloser closer;
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.enqueue_foreground_task_callback = QueueTask;
+  uint64_t accepted = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+  ASSERT_NE(accepted & unofficial_napi_env_hook_enqueue_foreground_task, 0u);
+  MakeGarbageCallingJs(s.env);
+  RunPostedTasks(s.env);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_memory_pressure(s.env, kCritical), napi_ok);
+  EXPECT_EQ(g_js_finalized, 0) << "V8 ran a finalizer inside the call";
+  EXPECT_GT(RunPostedTasks(s.env), 0u) << "the drain was not posted";
+  EXPECT_EQ(g_js_finalized, 1) << "the posted task did not finalize while terminating";
+  EXPECT_EQ(g_finalizer_get_status, napi_pending_exception)
+      << "the finalizer's call into JS was not refused";
+
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  uint32_t state = 0;
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, &state),
+            napi_ok);
+  RunPostedTasks(s.env);
+  EXPECT_EQ(g_js_finalized, 1);
+  EXPECT_EQ(RunScriptToString(s.env, "String(globalThis.finalizerRanJs)"), "undefined");
+}
+#endif
 
 #if defined(NAPI_TEST_ENGINE_V8)
 // The point of the call on V8: critical pressure keeps a script that ran

@@ -481,8 +481,13 @@ typedef enum unofficial_napi_memory_pressure_level {
 // finalizers for the env's thread, where a task it posts through the enqueue
 // hook (in the call), or else the next unofficial_napi_event_loop_checkpoint,
 // runs them. QuickJS runs the finalizers of the values it frees in the call,
-// in the env's realm, as unofficial_napi_collect_garbage does. Called while
-// the env is released (by a hook or finalizer that
+// in the env's realm, as unofficial_napi_collect_garbage does. While the env
+// terminates, they still run there (V8's in the posted task, QuickJS's in
+// the call), and a call one makes into JavaScript is refused, as any is
+// then. V8's checkpoint fails then and runs none of them, so with no
+// enqueue hook V8 runs them at the first checkpoint after
+// unofficial_napi_cancel_terminate_execution. Called while the env is
+// released (by a hook or finalizer that
 // unofficial_napi_release_env runs), both engines leave the finalizers of
 // external ArrayBuffers and Buffers to the release's pass, in its order, as
 // for any collection then. Unlike unofficial_napi_collect_garbage, the call
