@@ -2177,6 +2177,11 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     uint32_t* state_out) {
   (void)has_runnable_work;
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // The checkpoint's own handles (the env's context for its microtask queue,
+  // each pending dynamic import's promise) are freed here: an embedder that
+  // runs checkpoints outside any handle scope of its own would otherwise
+  // leave them in the env's root scope, which never closes.
+  v8::HandleScope handle_scope(env->isolate);
   if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
