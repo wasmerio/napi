@@ -445,10 +445,11 @@ bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) cons
     // run script that resizes, transfers or detaches the buffer. So the
     // buffer's data and size are read last: JS_GetArrayBuffer runs no script
     // when it succeeds, and when it throws the buffer is detached for good.
-    // And when a read of the offset or length threw but both were read, the
-    // two may come from different states of the buffer: they are read again,
-    // a few times at most, until no read throws; failing that, the view is
-    // taken as out of bounds.
+    // And when a read of the offset or length threw, the two may come from
+    // different states of the buffer, or the one that threw from a state
+    // the script it ran has changed (it may have brought the view back in
+    // bounds): both are read again, a few times at most, until no read
+    // throws; failing that, the view is taken as out of bounds.
     int64_t offset = -1;
     int64_t length = -1;
     for (int reads = 0; reads < 3; ++reads)
@@ -462,7 +463,7 @@ bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) cons
         length = -1;
       JS_FreeValue(context_, offset_value);
       JS_FreeValue(context_, length_value);
-      if (!threw || offset < 0 || length < 0)
+      if (!threw)
         break;
       offset = -1;
       length = -1;

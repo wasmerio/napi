@@ -742,6 +742,48 @@ TEST_F(Test33TypedArray, ViewOffsetAndLengthComeFromOneStateOfTheBuffer) {
 #endif
 }
 
+// A DataView out of bounds of its resizable buffer: a DataView's byteOffset
+// and byteLength getters throw then (QuickJS reads the view through them), and
+// formatting the error runs Error.prepareStackTrace, here a getter that grows
+// the buffer back. The layout reported is that of the buffer as it is when
+// napi_get_dataview_info returns: the view in bounds again, at offset 8 with
+// 4 bytes, not out of bounds because one read threw before the buffer grew
+// and the other did not. V8 runs no script to read a view: the buffer stays
+// short and the view has no bytes.
+TEST_F(Test33TypedArray, DataViewLayoutAfterErrorFormattingGrowsItsBuffer) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.rab = new ArrayBuffer(16, { maxByteLength: 16 });"
+                  "globalThis.dv = new DataView(rab, 8, 4);"
+                  "globalThis.grows = 0;"
+                  "Object.defineProperty(Error, 'prepareStackTrace', { configurable: true,"
+                  "  get() { grows++; rab.resize(16); return undefined; } });"
+                  "0");
+  napi_value rab = NamedGlobal(s.env, "rab");
+  napi_value dv = NamedGlobal(s.env, "dv");
+  for (int i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    RunBufferScript(s.env, "rab.resize(4); 0");
+    const ViewLayout layout = DataViewLayout(s.env, dv);
+    void* base = nullptr;
+    size_t size = 0;
+    ASSERT_EQ(napi_get_arraybuffer_info(s.env, rab, &base, &size), napi_ok);
+    ASSERT_EQ(layout.status, napi_ok);
+    if (size == 16) {
+      EXPECT_EQ(layout.length, 4u);
+      EXPECT_EQ(layout.offset, 8u);
+      EXPECT_EQ(layout.data, static_cast<uint8_t*>(base) + 8);
+    } else {
+      EXPECT_EQ(size, 4u);
+      EXPECT_EQ(layout.length, 0u);
+    }
+  }
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // V8 runs no script to read a view, so only QuickJS gets here at all.
+  EXPECT_GE(GlobalInt(s.env, "grows"), 3) << "the getter did not run";
+#endif
+}
+
 // The serdes binding unofficial_napi_create_serdes_binding returns is still
 // the binding while the caller makes more values.
 TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
