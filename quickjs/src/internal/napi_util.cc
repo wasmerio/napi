@@ -596,34 +596,18 @@ bool napi_util__::from_quickjs_array_type(int type, napi_typedarray_type *out)
 
 bool napi_util__::is_detached_array_buffer(JSContext *ctx, JSValueConst value)
 {
-  if (!JS_IsArrayBuffer(value))
+  if (ctx == nullptr || !JS_IsArrayBuffer(value))
     return false;
+  // JS_GetArrayBuffer throws for a detached buffer only; what was pending
+  // before is set aside and kept.
+  JSValue earlier = JS_GetException(ctx);
   size_t length = 0;
-  if (JS_GetArrayBuffer(ctx, &length, value) != nullptr || !JS_HasException(ctx))
-    return false;
-  JS_FreeValue(ctx, JS_GetException(ctx));
-  return true;
-}
-
-JSValue napi_util__::detached_view_buffer(JSContext *ctx, JSValueConst view)
-{
-  if (JS_GetTypedArrayType(view) < 0 && !JS_IsDataView(view))
-    return JS_UNDEFINED;
-  JSValue thrown = JS_GetException(ctx);
-  // The buffer getters of typed arrays and DataViews do not throw for a
-  // detached buffer.
-  JSValue buffer = JS_GetPropertyStr(ctx, view, "buffer");
-  if (!JS_IsException(buffer) && is_detached_array_buffer(ctx, buffer))
-  {
-    JS_FreeValue(ctx, thrown);
-    return buffer;
-  }
-  if (JS_IsException(buffer))
+  const bool detached = JS_GetArrayBuffer(ctx, &length, value) == nullptr && JS_HasException(ctx);
+  if (detached)
     JS_FreeValue(ctx, JS_GetException(ctx));
-  else
-    JS_FreeValue(ctx, buffer);
-  JS_Throw(ctx, thrown);
-  return JS_UNDEFINED;
+  if (!JS_IsUninitialized(earlier))
+    JS_Throw(ctx, earlier);
+  return detached;
 }
 
 void *napi_util__::realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size)

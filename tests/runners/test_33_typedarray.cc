@@ -317,6 +317,66 @@ TEST_F(Test33TypedArray, DetachedViewInfoIsEmpty) {
   expect_nothing_pending("data view");
 }
 
+// A view's own `buffer` property, which a script can redefine, does not
+// decide which ArrayBuffer a view has, nor whether it is detached.
+TEST_F(Test33TypedArray, ViewInfoIgnoresARedefinedBufferProperty) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.backing = new ArrayBuffer(16);"
+                  "globalThis.other = new ArrayBuffer(16);"
+                  "globalThis.typed = new Uint8Array(backing);"
+                  "Object.defineProperty(typed, 'buffer', { value: other });"
+                  "globalThis.liveBacking = new ArrayBuffer(16);"
+                  "globalThis.detachedOther = new ArrayBuffer(16);"
+                  "globalThis.view = new DataView(liveBacking, 2, 4);"
+                  "Object.defineProperty(view, 'buffer', { value: detachedOther });"
+                  "0");
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  auto named = [&](const char* name) {
+    napi_value value = nullptr;
+    EXPECT_EQ(napi_get_named_property(s.env, global, name, &value), napi_ok);
+    return value;
+  };
+  napi_value backing = named("backing");
+  napi_value live_backing = named("liveBacking");
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, backing), napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, named("other")), napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, named("detachedOther")), napi_ok);
+
+  // The typed array's own buffer is detached: empty, and that buffer.
+  size_t length = 99;
+  void* data = &length;
+  napi_value viewed = nullptr;
+  size_t offset = 99;
+  ASSERT_EQ(
+      napi_get_typedarray_info(s.env, named("typed"), nullptr, &length, &data, &viewed, &offset),
+      napi_ok);
+  EXPECT_EQ(length, 0u);
+  EXPECT_EQ(data, nullptr);
+  EXPECT_EQ(offset, 0u);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, viewed, backing, &same), napi_ok);
+  EXPECT_TRUE(same) << "the typed array's own ArrayBuffer";
+
+  // The DataView's own buffer is alive: its bytes 2 to 6, and that buffer.
+  void* live_data = nullptr;
+  size_t live_length = 0;
+  ASSERT_EQ(napi_get_arraybuffer_info(s.env, live_backing, &live_data, &live_length), napi_ok);
+  length = 99;
+  data = nullptr;
+  viewed = nullptr;
+  offset = 99;
+  ASSERT_EQ(napi_get_dataview_info(s.env, named("view"), &length, &data, &viewed, &offset),
+            napi_ok);
+  EXPECT_EQ(length, 4u);
+  EXPECT_EQ(offset, 2u);
+  EXPECT_EQ(data, static_cast<uint8_t*>(live_data) + 2);
+  same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, viewed, live_backing, &same), napi_ok);
+  EXPECT_TRUE(same) << "the DataView's own ArrayBuffer";
+}
+
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
 TEST_F(Test33TypedArray, ExternalArrayBufferResizeFailurePreservesBackingStore) {
   ExternalBufferState state;

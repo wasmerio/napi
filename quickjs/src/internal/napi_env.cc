@@ -2,6 +2,7 @@
 
 #include "internal/napi_external.h"
 #include "internal/napi_lifetime_macros.h"
+#include "internal/napi_util.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +39,55 @@ int runtime_interrupt_handler(JSRuntime *rt, void *opaque)
   if (interrupts->previous_handler != nullptr)
     return interrupts->previous_handler(rt, interrupts->previous_opaque);
   return 0;
+}
+
+// The getter of `object`'s own property `name`; undefined if there is none.
+JSValue own_getter(JSContext *ctx, JSValueConst object, const char *name)
+{
+  if (!JS_IsObject(object))
+    return JS_UNDEFINED;
+  JSAtom atom = JS_NewAtom(ctx, name);
+  if (atom == JS_ATOM_NULL)
+  {
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    return JS_UNDEFINED;
+  }
+  JSPropertyDescriptor desc;
+  const int has = JS_GetOwnProperty(ctx, &desc, object, atom);
+  JS_FreeAtom(ctx, atom);
+  if (has < 0)
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  if (has <= 0)
+    return JS_UNDEFINED;
+  JS_FreeValue(ctx, desc.value);
+  JS_FreeValue(ctx, desc.setter);
+  if (JS_IsFunction(ctx, desc.getter))
+    return desc.getter;
+  JS_FreeValue(ctx, desc.getter);
+  return JS_UNDEFINED;
+}
+
+// The getter of `name` on the prototype of `constructor_name` in the global
+// (or on that prototype's own prototype, with `inherited`).
+JSValue prototype_getter(JSContext *ctx, JSValueConst global, const char *constructor_name,
+                         bool inherited, const char *name)
+{
+  JSValue constructor = JS_GetPropertyStr(ctx, global, constructor_name);
+  JSValue prototype = JS_IsObject(constructor)
+                          ? JS_GetPropertyStr(ctx, constructor, "prototype")
+                          : JS_UNDEFINED;
+  if (inherited && JS_IsObject(prototype))
+  {
+    JSValue parent = JS_GetPrototype(ctx, prototype);
+    JS_FreeValue(ctx, prototype);
+    prototype = parent;
+  }
+  JSValue getter = JS_IsException(prototype) ? JS_UNDEFINED : own_getter(ctx, prototype, name);
+  JS_FreeValue(ctx, prototype);
+  JS_FreeValue(ctx, constructor);
+  if (JS_HasException(ctx))
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  return getter;
 }
 
 napi_runtime_interrupts__ *installed_runtime_interrupts(JSRuntime *rt)
@@ -108,6 +158,10 @@ napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_a
     agent_->open_root_scope(this);
     JSValue global = JS_GetGlobalObject(context_);
     JSValue data_view = JS_GetPropertyStr(context_, global, "DataView");
+    // Typed arrays of any realm share these getters' behaviour: they read the
+    // view's internal slot, whatever realm made it.
+    typed_array_buffer_getter_ = prototype_getter(context_, global, "Uint8Array", true, "buffer");
+    data_view_buffer_getter_ = prototype_getter(context_, global, "DataView", false, "buffer");
     JS_FreeValue(context_, global);
     if (JS_IsConstructor(context_, data_view))
       data_view_constructor_ = data_view;
@@ -183,8 +237,14 @@ void napi_env__::prepare_teardown()
   contextify_.teardown();
   buffers_.teardown();
   if (context_ != nullptr)
+  {
     JS_FreeValue(context_, data_view_constructor_);
+    JS_FreeValue(context_, typed_array_buffer_getter_);
+    JS_FreeValue(context_, data_view_buffer_getter_);
+  }
   data_view_constructor_ = JS_UNDEFINED;
+  typed_array_buffer_getter_ = JS_UNDEFINED;
+  data_view_buffer_getter_ = JS_UNDEFINED;
   if (principal)
     agent_->clear_promise_hooks();
   promises_.teardown();
@@ -327,6 +387,37 @@ JSContext *napi_env__::context() const
 JSContext *napi_env__::main_context() const
 {
   return context_;
+}
+
+JSValue napi_env__::view_buffer(JSValueConst view) const
+{
+  JSValueConst getter = JS_IsDataView(view)                ? data_view_buffer_getter_
+                        : JS_GetTypedArrayType(view) >= 0 ? typed_array_buffer_getter_
+                                                          : JS_UNDEFINED;
+  if (context_ == nullptr || JS_IsUndefined(getter))
+    return JS_UNDEFINED;
+  JSValue earlier = JS_GetException(context_);
+  JSValue buffer = JS_Call(context_, getter, view, 0, nullptr);
+  if (JS_IsException(buffer))
+  {
+    JS_FreeValue(context_, JS_GetException(context_));
+    buffer = JS_UNDEFINED;
+  }
+  if (!JS_IsUninitialized(earlier))
+    JS_Throw(context_, earlier);
+  return buffer;
+}
+
+JSValue napi_env__::detached_view_buffer(JSValueConst view) const
+{
+  JSValue buffer = view_buffer(view);
+  if (napi_util__::is_detached_array_buffer(context_, buffer))
+  {
+    JS_FreeValue(context_, JS_GetException(context_));
+    return buffer;
+  }
+  JS_FreeValue(context_, buffer);
+  return JS_UNDEFINED;
 }
 
 JSValueConst napi_env__::data_view_constructor() const

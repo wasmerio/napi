@@ -74,6 +74,17 @@ struct napi_env__
   // The env realm's DataView constructor, read when the env was made, before
   // any script could replace it; undefined if there was none.
   JSValueConst data_view_constructor() const;
+  // The ArrayBuffer a typed array or DataView views, read through the
+  // intrinsic buffer getters as the env was made, never through the view's
+  // own `buffer` property, which scripts can redefine. JS_UNDEFINED for
+  // anything else. Leaves any pending exception as it was.
+  JSValue view_buffer(JSValueConst view) const;
+  // After an accessor of a typed array or DataView threw: the view's
+  // ArrayBuffer if it is detached (QuickJS's accessors throw for it; Node
+  // reports such a view as having no data and a length of 0), with that
+  // exception cleared. Otherwise JS_UNDEFINED, with the exception still
+  // pending.
+  JSValue detached_view_buffer(JSValueConst view) const;
   // A function of the current realm that keeps it alive; undefined for the
   // env's own realm.
   JSValueConst current_realm_anchor() const;
@@ -201,6 +212,10 @@ private:
   JSContext *context_;
   int32_t module_api_version_ = 8;
   JSValue data_view_constructor_ = JS_UNDEFINED;
+  // The getters of %TypedArray%.prototype.buffer and DataView.prototype.buffer,
+  // read when the env was made; undefined if there were none.
+  JSValue typed_array_buffer_getter_ = JS_UNDEFINED;
+  JSValue data_view_buffer_getter_ = JS_UNDEFINED;
 
   // The realms N-API acts in, innermost last. Empty means the env's own.
   std::vector<napi_realm_frame__> realm_frames_;

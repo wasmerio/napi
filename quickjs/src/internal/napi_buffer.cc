@@ -121,7 +121,7 @@ bool napi_buffer__::has_typed_array_backing(JSValueConst value) const
   JSValue arraybuffer = JS_GetTypedArrayBuffer(context_, value, nullptr, nullptr, nullptr);
   // QuickJS throws for a view over a detached buffer, which is still one.
   if (JS_IsException(arraybuffer))
-    arraybuffer = napi_util__::detached_view_buffer(context_, value);
+    arraybuffer = env_->detached_view_buffer(value);
   if (JS_IsUndefined(arraybuffer))
   {
     clear_pending_exception_if_any();
@@ -253,7 +253,7 @@ napi_status napi_buffer__::get_buffer_info(JSValueConst value, void **data, size
   {
     // QuickJS throws for a Buffer over a detached ArrayBuffer. Node reports
     // it as one with no data and a length of 0.
-    JSValue detached = napi_util__::detached_view_buffer(context_, value);
+    JSValue detached = env_->detached_view_buffer(value);
     if (!JS_IsUndefined(detached))
     {
       JS_FreeValue(context_, detached);

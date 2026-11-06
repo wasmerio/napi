@@ -525,7 +525,7 @@ extern "C"
     bool detached = false;
     if (JS_IsException(abuf))
     {
-      abuf = napi_util__::detached_view_buffer(env->context(), local);
+      abuf = env->detached_view_buffer(local);
       if (JS_IsUndefined(abuf))
         return napi_util__::return_pending_if_caught(env, "Failed to get typed array info");
       detached = true;
@@ -1455,7 +1455,10 @@ extern "C"
     if (!JS_IsDataView(view))
       return napi_util__::invalid_arg(env);
 
-    JSValue buffer_val = JS_GetPropertyStr(env->context(), view, "buffer");
+    // The view's own buffer, never what its `buffer` property says.
+    JSValue buffer_val = env->view_buffer(view);
+    if (JS_IsUndefined(buffer_val))
+      buffer_val = JS_GetPropertyStr(env->context(), view, "buffer");
     if (JS_IsException(buffer_val))
       return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
     // QuickJS's byteLength and byteOffset getters throw for a DataView over a

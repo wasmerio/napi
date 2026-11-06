@@ -68,15 +68,10 @@ public:
 
   static void *realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size);
 
-  // QuickJS's accessors throw for a detached ArrayBuffer and the views over
-  // one; Node reports them as having no data and a length of 0.
-  // True for a detached ArrayBuffer. Leaves no exception pending.
+  // True for a detached ArrayBuffer, which QuickJS's accessors throw for
+  // (Node reports it as having no data and a length of 0). Leaves any
+  // pending exception as it was.
   static bool is_detached_array_buffer(JSContext *ctx, JSValueConst value);
-  // After an accessor of a typed array or DataView threw: the view's
-  // ArrayBuffer if it is detached, with that exception cleared; otherwise
-  // (also when `view` is no such view) JS_UNDEFINED, with the exception
-  // still pending.
-  static JSValue detached_view_buffer(JSContext *ctx, JSValueConst view);
 
   static int key_filter_to_gpn(napi_key_filter key_filter);
   static napi_status get_property_names(napi_env env,
