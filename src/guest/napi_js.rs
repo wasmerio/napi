@@ -1222,27 +1222,21 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     status
 }
 
-// No lazy data properties for a guest of the host's JS engine: the guest
-// defines its values eagerly. The arguments are checked as the native
-// providers check them.
+// Reading names and reflecting on a host Proxy can call guest functions.
 fn guest_unofficial_napi_define_lazy_data_properties(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     object: u32,
     names: u32,
     initializer: u32,
     attributes: i32,
 ) -> i32 {
-    // napi_writable | napi_enumerable | napi_configurable
-    if snapi_env(&env, napi_env).is_null()
-        || object == 0
-        || names == 0
-        || initializer == 0
-        || (attributes & !7) != 0
-    {
-        return 1;
-    }
-    9
+    let env_handle = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_define_lazy_data_properties(
+            env_handle, object, names, initializer, attributes,
+        )
+    })
 }
 
 fn guest_unofficial_napi_is_lazy_data_property(
@@ -1252,15 +1246,18 @@ fn guest_unofficial_napi_is_lazy_data_property(
     key: u32,
     result_ptr: u32,
 ) -> i32 {
-    if snapi_env(&env, napi_env).is_null()
-        || object == 0
-        || key == 0
-        || result_ptr == 0
-        || !write_guest_u8(&mut env, result_ptr, 0)
-    {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
         return 1;
     }
-    9
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0;
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_is_lazy_data_property(env_handle, object, key, &mut result)
+    });
+    if status == 0 && !write_guest_u8(&mut env, result_ptr, (result != 0) as u8) {
+        return 1;
+    }
+    status
 }
 
 fn guest_unofficial_napi_set_promise_hooks(

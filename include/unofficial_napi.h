@@ -890,9 +890,14 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_own_non_index_prope
 // change the property under the check and reach V8's CHECK.
 //
 // V8: Object::SetLazyDataProperty. QuickJS: native lazy data properties with
-// the same observable behavior. The host-JavaScript provider has no lazy data
-// properties: napi_invalid_arg for a null argument or other attribute bits,
-// napi_generic_failure otherwise (define the values eagerly instead).
+// the same observable behavior. Host JavaScript uses portable accessors:
+// descriptor reads/redefinitions do not initialize, and descriptors expose
+// get/set until a value read replaces a configurable accessor. Non-configurable
+// accessors (including ones sealed/frozen before that read) memoize the result
+// without changing the descriptor; freeze cannot disable a writable setter.
+// Failed inherited writes throw even from sloppy callers. Guard errors belong
+// to the provider realm. Proxies cannot be detected/rejected portably: their
+// traps can run during define, initialization and queries of tracked objects.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_lazy_data_properties(
     napi_env env,
     napi_value object,
@@ -914,8 +919,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_lazy_data_proper
 // napi_name_expected. While execution is terminating, or once code it calls
 // terminates it: napi_pending_exception, `*result_out` false.
 // QuickJS inspects its own property storage directly, calling no other
-// embedder code. The host-JavaScript provider: napi_invalid_arg for a null
-// argument, otherwise `*result_out` false and napi_generic_failure.
+// embedder code. Host JavaScript checks its own accessor records: false after
+// initialization or assignment, even for a memoizing non-configurable accessor.
+// Untracked objects/proxies return false without running traps; a query on a
+// proxy previously passed to define can run its descriptor trap and throw.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_lazy_data_property(
     napi_env env,
     napi_value object,
