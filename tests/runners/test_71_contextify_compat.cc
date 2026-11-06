@@ -2411,3 +2411,83 @@ TEST_F(Test71ContextifyCompat, AnImportAnUnassignHookMakesAfterTheLoadersCleanup
   EXPECT_TRUE(log.import_outcomes.empty());
 #endif
 }
+
+namespace {
+
+// A finalizer of the release makes a realm and lets the collector free it, so
+// that realm's unassign callback runs inside unofficial_napi_collect_garbage,
+// outside the release's sweeps, and makes another realm. A finalizer of the
+// same pass that runs after it records whether that realm still has its token.
+struct UnassignOutsideASweep {
+  ReleaseTokens* log = nullptr;
+  // Token events while collect_garbage ran (V8: 'u' for the collected realm,
+  // 'a' for the one its unassign callback made).
+  size_t events_inside = 0;
+  void* made_by_unassign = nullptr;
+  bool freeing_ran = false;
+  bool later_ran_after = false;
+  bool assigned_at_later = false;
+};
+
+void FinalizerFreeingARealm(node_api_basic_env, void*, void* hint) {
+  auto* state = static_cast<UnassignOutsideASweep*>(hint);
+  ReleaseTokens* log = state->log;
+  MakeReleaseRealm(log);
+  const size_t made = log->made.size();
+  const size_t events = log->events.size();
+  log->unassign_makes = 1;
+  unofficial_napi_collect_garbage(log->env);
+  log->unassign_makes = 0;
+  state->events_inside = log->events.size() - events;
+  if (log->made.size() > made) state->made_by_unassign = log->made.back();
+  state->freeing_ran = true;
+}
+
+void FinalizerCheckingTheToken(node_api_basic_env, void*, void* hint) {
+  auto* state = static_cast<UnassignOutsideASweep*>(hint);
+  state->later_ran_after = state->freeing_ran;
+  state->assigned_at_later =
+      state->made_by_unassign != nullptr &&
+      std::find(state->log->live.begin(), state->log->live.end(), state->made_by_unassign) !=
+          state->log->live.end();
+}
+
+}  // namespace
+
+// A realm an unassign callback makes is unassigned in the same sweep only
+// when a sweep of the release runs that callback. One that
+// unofficial_napi_collect_garbage runs (here inside a finalizer of the
+// release) is in no sweep: the realm it makes keeps its token while the
+// pass's later finalizers run, until the next pass begins, as a realm a
+// finalizer makes itself. Token hooks are V8's only.
+TEST_F(Test71ContextifyCompat, ARealmAnUnassignCallbackMakesOutsideASweepWaitsForTheNextOne) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  UnassignOutsideASweep state;
+  state.log = &log;
+  // Made first, so finalized after the other (most recent first).
+  napi_value later = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &later), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, later, nullptr, FinalizerCheckingTheToken, &state, nullptr),
+            napi_ok);
+  KeepOnGlobal(s.env, "later", later);
+  napi_value first = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &first), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, first, nullptr, FinalizerFreeingARealm, &state, nullptr),
+            napi_ok);
+  KeepOnGlobal(s.env, "first", first);
+  ReleaseTokensEnv(s);
+  EXPECT_TRUE(state.freeing_ran);
+  EXPECT_TRUE(state.later_ran_after) << "the finalizers ran in another order";
+#if defined(NAPI_TEST_ENGINE_V8)
+  ExpectEveryTokenUnassignedOnce(log, 2);
+  EXPECT_EQ(state.events_inside, 2u) << "the realm was not freed inside collect_garbage";
+  ASSERT_NE(state.made_by_unassign, nullptr);
+  EXPECT_TRUE(state.assigned_at_later);
+#else
+  ExpectEveryTokenUnassignedOnce(log, 1);
+  EXPECT_EQ(state.events_inside, 0u);
+  EXPECT_EQ(state.made_by_unassign, nullptr);
+#endif
+}

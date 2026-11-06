@@ -260,10 +260,13 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // finalizers of 2 run, as main did. A realm a finalizer of 2 or the
 // instance-data finalizer makes is unassigned when the next pass begins: the
 // finalizers after it in 2 see its token still assigned. One an unassign
-// callback makes is unassigned in the same sweep, before the pass goes on.
-// So every token is unassigned once before the env is freed. What an
-// unassign callback makes besides (values, hooks, instance data) is released
-// as the rest.
+// callback makes while a sweep runs it is unassigned in the same sweep,
+// before the pass goes on. One made by an unassign callback that
+// unofficial_napi_create_realm or unofficial_napi_collect_garbage runs (for
+// a collected realm, from a hook or finalizer of the release) waits, as any
+// realm made while releasing, for the first sweep after it. So every token
+// is unassigned once before the env is freed. What an unassign callback
+// makes besides (values, hooks, instance data) is released as the rest.
 //
 // After each hook, token callback and finalizer, an exception it left
 // pending is dropped: nothing can catch it then (Node's CallIntoModule drops

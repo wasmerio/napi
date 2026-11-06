@@ -183,11 +183,14 @@ calls take a realm's global or sandbox.
   finalizer too) makes is pending until the release's next pass unassigns
   its token, so the finalizers after it in its pass still see the token
   assigned, unless the realm is collected and its record freed first. One
-  an unassign callback makes is unassigned in the same sweep, and what else
-  that callback makes is released as the rest (see
-  `unofficial_napi_release_env` in the header). Realms made before the
-  hooks were attached get no token. Both hooks run in the env's realm; at
-  release what they throw is dropped, as for the other hooks and
+  an unassign callback makes while a release sweep runs it is unassigned in
+  the same sweep; one made by an unassign callback that `create_realm` or
+  `collect_garbage` runs (for a collected realm, from a hook or finalizer of
+  the release) waits, as any realm made while releasing, for the first
+  sweep after it. What else an unassign callback makes is released as the
+  rest (see `unofficial_napi_release_env` in the header). Realms made
+  before the hooks were attached get no token. Both hooks run in the env's
+  realm; at release what they throw is dropped, as for the other hooks and
   finalizers. On `main` a context lived until release, so tokens were only
   unassigned then. QuickJS does not accept the hooks and never calls them,
   as on `main`.
