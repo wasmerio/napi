@@ -117,6 +117,7 @@ private:
   napi_status throw_error(const char *code, const char *message);
   napi_status return_pending_exception(const char *message);
   napi_status throw_if_evaluating(record *entry);
+  napi_status throw_if_importing_an_evaluating_synthetic_module(record *entry);
   napi_status evaluate_unless_terminated(record *entry, JSValue *promise_out);
   napi_status wrap_owned(JSValue value, napi_value *result_out) const;
   JSValue call_callback(JSValueConst callback,
@@ -139,6 +140,8 @@ private:
   std::vector<script_referrer> script_referrers_;
   std::vector<pending_provider_promise> pending_dynamic_imports_;
   uint64_t facade_counter_ = 0;
+  // Synthetic modules whose evaluation steps are running.
+  int synthetic_steps_running_ = 0;
 
   // Subsystem lifecycle.
   bool torn_down_ = false;

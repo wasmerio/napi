@@ -619,3 +619,66 @@ TEST_F(Test77ModuleWrapState, RequiredModuleFacadeInstantiatesOrLeavesItsError) 
   EXPECT_EQ(TakePendingErrorName(s.env), "SyntaxError");
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, no_default), napi_ok);
 }
+
+// Evaluating a module that imports a synthetic module whose evaluation steps
+// are running (from those steps: a CommonJS module that requires an ES module
+// importing it) is refused with ERR_VM_MODULE_STATUS on both engines, as
+// Node refuses such a cycle (ERR_REQUIRE_CYCLE_MODULE), whether the module is
+// instantiated already or not. The same holds for the require() facade over
+// it. V8 aborted the process: it evaluates the synthetic module through
+// Module::Evaluate, whose CHECK rejects one that is evaluating. QuickJS ran
+// the module against the synthetic module's exports as they were. Once the
+// steps are done, the module evaluates.
+TEST_F(Test77ModuleWrapState, EvaluatingAModuleThatImportsAnEvaluatingSyntheticModuleIsRefused) {
+  for (bool instantiated : {true, false}) {
+    for (Reentry call : {Reentry::kEvaluate, Reentry::kEvaluateSync, Reentry::kFacade}) {
+      SCOPED_TRACE(std::string(instantiated ? "instantiated, " : "linked, ") +
+                   (call == Reentry::kEvaluate       ? "evaluate"
+                    : call == Reentry::kEvaluateSync ? "evaluate_sync"
+                                                     : "facade"));
+      EnvScope s(runtime_.get());
+      ReentryProbe probe;
+      probe.call = call;
+      napi_value fn = nullptr;
+      napi_value global = nullptr;
+      ASSERT_EQ(napi_create_function(s.env, "evaluateAgain", NAPI_AUTO_LENGTH, EvaluateAgain,
+                                     &probe, &fn),
+                napi_ok);
+      ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+      ASSERT_EQ(napi_set_named_property(s.env, global, "evaluateAgain", fn), napi_ok);
+      ASSERT_EQ(RunText(s.env, "globalThis.after = 'no'; globalThis.ran = 'no'"), "no");
+      unofficial_napi_module synthetic = CreateSyntheticModule(
+          s.env, "(function() { evaluateAgain(); globalThis.after = 'yes'; })");
+      probe.module = CreateSourceTextModule(
+          s.env, "import { value } from 'synthetic'; globalThis.ran = 'yes'; export default 1;");
+      ASSERT_NE(synthetic, nullptr);
+      ASSERT_NE(probe.module, nullptr);
+      ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, synthetic, 0, nullptr), napi_ok);
+      ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.module, 1, &synthetic), napi_ok);
+      if (instantiated) {
+        ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module), napi_ok);
+      } else {
+        ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, synthetic), napi_ok);
+      }
+
+      napi_value promise = nullptr;
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, synthetic, -1, false, &promise),
+                napi_ok);
+      EXPECT_EQ(probe.calls, 1);
+      EXPECT_EQ(probe.status, napi_pending_exception);
+      EXPECT_EQ(probe.pending,
+                "ERR_VM_MODULE_STATUS: A synthetic module it imports is evaluating");
+      EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+      EXPECT_EQ(RunText(s.env, "after"), "yes");
+      EXPECT_EQ(RunText(s.env, "ran"), "no");
+      EXPECT_EQ(Status(s.env, synthetic), kEvaluated);
+
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, probe.module, -1, false, &promise),
+                napi_ok);
+      EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+      EXPECT_EQ(RunText(s.env, "ran"), "yes");
+      EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
+      EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, synthetic), napi_ok);
+    }
+  }
+}

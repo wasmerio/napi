@@ -85,6 +85,8 @@ struct ModuleWrapBindingState {
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
   // Instantiations running (see InstantiationScope).
   int instantiations = 0;
+  // Synthetic modules whose evaluation steps are running.
+  int synthetic_steps_running = 0;
 };
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
@@ -1123,7 +1125,10 @@ v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> 
   if (wrapper != nullptr && callback != nullptr &&
       napi_typeof(env, callback, &callback_type) == napi_ok && callback_type == napi_function) {
     napi_value ignored = nullptr;
-    if (napi_call_function(env, wrapper, callback, 0, nullptr, &ignored) != napi_ok) {
+    GetModuleWrapState(env)->synthetic_steps_running++;
+    const napi_status called = napi_call_function(env, wrapper, callback, 0, nullptr, &ignored);
+    GetModuleWrapState(env)->synthetic_steps_running--;
+    if (called != napi_ok) {
       // Their exception, or the termination that stopped them, fails the
       // evaluation.
       if (!napi_v8_rethrow_pending_exception(env)) {
@@ -2937,6 +2942,45 @@ static bool ThrowIfEvaluating(napi_env env, ModuleWrapRecord* record) {
   return true;
 }
 
+// V8 evaluates a synthetic module that an instantiated source text module
+// requests through Module::Evaluate, which aborts the process for one whose
+// evaluation steps are running (a CHECK). Script reaches that from those
+// steps, for example a CommonJS module that requires an ES module importing
+// it, a cycle Node refuses too. So evaluating `record` is refused when what it
+// would evaluate (the instantiated source text modules it reaches through the
+// modules they were linked to) imports such a module.
+static bool ThrowIfImportingAnEvaluatingSyntheticModule(napi_env env, ModuleWrapRecord* record) {
+  auto* state = GetModuleWrapState(env);
+  if (state == nullptr || state->synthetic_steps_running == 0) return false;
+  // A record another was linked to may be destroyed since.
+  const std::unordered_set<ModuleWrapRecord*> live(state->modules.begin(), state->modules.end());
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  std::vector<ModuleWrapRecord*> pending{record};
+  std::unordered_set<ModuleWrapRecord*> seen{record};
+  while (!pending.empty()) {
+    ModuleWrapRecord* current = pending.back();
+    pending.pop_back();
+    v8::Local<v8::Module> module = current->module.Get(isolate);
+    if (module.IsEmpty() || !module->IsSourceTextModule() ||
+        module->GetStatus() != v8::Module::kInstantiated) {
+      continue;
+    }
+    for (ModuleWrapRecord* linked : current->linked_requests) {
+      if (live.count(linked) == 0 || !seen.insert(linked).second) continue;
+      v8::Local<v8::Module> requested = linked->module.Get(isolate);
+      if (requested.IsEmpty()) continue;
+      if (requested->IsSyntheticModule() &&
+          requested->GetStatus() == v8::Module::kEvaluating) {
+        ThrowCodeError(env, "ERR_VM_MODULE_STATUS", "A synthetic module it imports is evaluating");
+        return true;
+      }
+      pending.push_back(linked);
+    }
+  }
+  return false;
+}
+
 // V8 evaluates only an instantiated module and aborts the process for one
 // that is not. Instantiate it first, as QuickJS's JS_EvaluateModule does.
 static napi_status InstantiateForEvaluation(napi_env env, ModuleWrapRecord* record) {
@@ -2959,6 +3003,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2990,6 +3035,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3294,6 +3340,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;
   }
   if (!instantiated) return ThrowTryCatchException(env, try_catch);
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
 
   v8::Local<v8::Value> evaluated;
   if (!facade->Evaluate(context).ToLocal(&evaluated)) return ThrowTryCatchException(env, try_catch);

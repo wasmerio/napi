@@ -11,6 +11,7 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -703,12 +704,50 @@ napi_status napi_module_wrap__::throw_if_evaluating(record *entry)
   return throw_error("ERR_VM_MODULE_STATUS", "Module status must not be evaluating");
 }
 
+// Evaluating a module that imports a synthetic module whose evaluation steps
+// are running (from those steps: a CommonJS module that requires an ES module
+// importing it, a cycle Node refuses too) is refused, as on V8, which aborts
+// the process for it. QuickJS would run the module against the synthetic
+// module's exports as they are. What it would link and evaluate is the
+// modules it reaches through the ones not evaluated yet.
+napi_status napi_module_wrap__::throw_if_importing_an_evaluating_synthetic_module(record *entry)
+{
+  if (synthetic_steps_running_ == 0)
+    return napi_ok;
+  // A record another was linked to may be destroyed since.
+  const std::unordered_set<record *> live(records_.begin(), records_.end());
+  std::vector<record *> pending{entry};
+  std::unordered_set<record *> seen{entry};
+  while (!pending.empty())
+  {
+    record *current = pending.back();
+    pending.pop_back();
+    const JSModuleStatusEnum status = JS_GetModuleStatus(ctx_, current->module);
+    if (current->synthetic ||
+        (status != JS_MODULE_STATUS_UNLINKED && status != JS_MODULE_STATUS_LINKED))
+      continue;
+    for (record *linked : current->linked_records)
+    {
+      if (live.count(linked) == 0 || !seen.insert(linked).second)
+        continue;
+      if (linked->synthetic &&
+          JS_GetModuleStatus(ctx_, linked->module) == JS_MODULE_STATUS_EVALUATING)
+        return throw_error("ERR_VM_MODULE_STATUS", "A synthetic module it imports is evaluating");
+      pending.push_back(linked);
+    }
+  }
+  return napi_ok;
+}
+
 napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValue *promise_out)
 {
   napi_status status = napi_util__::fail_if_terminating(env_, ctx_);
   if (status != napi_ok)
     return status;
   status = throw_if_evaluating(entry);
+  if (status != napi_ok)
+    return status;
+  status = throw_if_importing_an_evaluating_synthetic_module(entry);
   if (status != napi_ok)
     return status;
   // The module evaluates in its realm.
@@ -1057,6 +1096,9 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   napi_status status = throw_if_evaluating(entry);
   if (status != napi_ok)
     return status;
+  status = throw_if_importing_an_evaluating_synthetic_module(entry);
+  if (status != napi_ok)
+    return status;
 
   JSContext *ctx = entry->ctx;
   std::string filename = "<required-module-facade:" +
@@ -1175,8 +1217,10 @@ int napi_module_wrap__::initialize_synthetic_module(JSModuleDef *module)
   record *entry = find_by_module(module);
   if (entry == nullptr || !JS_IsFunction(ctx_, entry->synthetic_eval_steps))
     return 0;
+  synthetic_steps_running_++;
   JSValue result = JS_Call(ctx_, entry->synthetic_eval_steps,
                            entry->wrapper, 0, nullptr);
+  synthetic_steps_running_--;
   if (JS_IsException(result))
     return -1;
   JS_FreeValue(ctx_, result);
