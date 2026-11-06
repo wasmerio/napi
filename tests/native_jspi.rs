@@ -22,7 +22,7 @@ use std::{
 };
 
 use wasmer::{
-    AsStoreMut, Extern, Function, FunctionType, Instance, Module, Store, Value,
+    AsStoreAsync, AsStoreMut, Extern, Function, FunctionType, Instance, Module, Store, Value,
     sys::{NativeEngineStackBounds, NativeInvocationScope},
 };
 use wasmer_napi::NapiCtx;
