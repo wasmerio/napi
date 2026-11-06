@@ -140,6 +140,10 @@ static inline uint64_t unofficial_napi_env_hooks_requested(
   return requested;
 }
 
+// V8 provider: when the host process sets NAPI_V8_CPU_PROFILE_DIR, each env
+// made by unofficial_napi_create_env records a CPU profile, which
+// unofficial_napi_release_env writes to that directory. See v8/README.md,
+// "Diagnostics".
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options_or_null,
