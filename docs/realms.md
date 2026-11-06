@@ -176,15 +176,16 @@ calls take a realm's global or sandbox.
   collected realm (in the next `create_realm` or in `collect_garbage`), or,
   for a realm still alive, during env release. The release unassigns the
   tokens of the realms alive when it begins before the cleanup hooks run,
-  as `main` did, and a realm made while it runs (by a cleanup hook, a
-  finalizer, the instance-data finalizer or an unassign callback) is pending
-  until the release's next pass unassigns its token; what an unassign
-  callback makes is released as the rest (see `unofficial_napi_release_env`
-  in the header). Realms made before the hooks were attached get no token.
-  Both hooks run in the env's realm; at release what they throw is dropped,
-  as for the other hooks and finalizers. On `main` a context lived until
-  release, so tokens were only unassigned then. QuickJS does not accept the
-  hooks and never calls them, as on `main`.
+  as `main` did. A realm a cleanup hook or a finalizer (the instance-data
+  finalizer too) makes while it runs is pending until the release's next
+  pass unassigns its token; one an unassign callback makes is unassigned in
+  the same sweep, and what else that callback makes is released as the rest
+  (see `unofficial_napi_release_env` in the header). Realms made before the
+  hooks were attached get no token. Both hooks run in the env's realm; at
+  release what they throw is dropped, as for the other hooks and
+  finalizers. On `main` a context lived until release, so tokens were only
+  unassigned then. QuickJS does not accept the hooks and never calls them,
+  as on `main`.
 - **Statuses are `main`'s V8 ones.** `main`'s QuickJS differed: it took a
   NULL `name`, refused a symbol sandbox, returned an already contextified
   sandbox again, compiled in the env's context for a parsing context that

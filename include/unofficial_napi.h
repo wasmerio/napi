@@ -252,11 +252,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // With the deprecated context-token callbacks (unofficial_napi_env_hooks;
 // only V8 accepts them), each pass of 1 and 2 begins by unassigning the token
 // of every realm that has one: in the first pass the realms alive when the
-// release begins, before any cleanup hook runs, as main did. A realm made
-// while releasing (by a hook, a finalizer, the instance-data finalizer or an
-// unassign callback) is pending until its token is unassigned, in the next
-// pass, so every token is unassigned once before the env is freed. What an
-// unassign callback makes (values, hooks, realms, instance data) is released
+// release begins, before any cleanup hook runs, as main did. A realm a hook
+// or a finalizer (the instance-data finalizer too) makes while releasing is
+// pending until its token is unassigned, in the next pass; one an unassign
+// callback makes is unassigned in the same sweep, before the pass goes on.
+// So every token is unassigned once before the env is freed. What an
+// unassign callback makes besides (values, hooks, instance data) is released
 // as the rest.
 //
 // After each hook, token callback and finalizer, an exception it left
