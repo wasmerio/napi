@@ -8410,6 +8410,27 @@ mod tests {
         });
     }
 
+    /// The env's own global as a realm's sandbox, for the deprecated
+    /// imports: named, it names that realm. Nothing names the env's realm,
+    /// also while that realm is entered, since napi_get_global returns the
+    /// sandbox there, the env's own global (as on QuickJS; V8 takes the
+    /// realm).
+    #[wasm_bindgen_test]
+    fn the_env_global_as_a_sandbox_for_the_deprecated_imports() {
+        use crate::guest::compat::{current_realm, realm_from_context};
+        with_env(|env, _| {
+            let env_global = global_id(env);
+            let realm = new_realm(env, env_global).unwrap();
+            assert_ne!(realm, 0);
+            assert_eq!(realm_from_context(env, env_global, true), Ok(realm));
+            assert_eq!(current_realm(env), Ok(0));
+            let scope = enter(env, realm).unwrap();
+            assert_eq!(realm_from_context(env, env_global, true), Ok(realm));
+            assert_eq!(current_realm(env), Ok(0));
+            assert_eq!(leave(env, scope), NAPI_OK);
+        });
+    }
+
     #[wasm_bindgen_test]
     fn functions_and_bytecode_compile_for_their_realm() {
         with_env(|env, state| {

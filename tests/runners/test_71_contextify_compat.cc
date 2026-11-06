@@ -1398,6 +1398,44 @@ TEST_F(Test71ContextifyCompat, NoContextMeansTheCurrentRealm) {
   ASSERT_EQ(napi_delete_reference(s.env, callback.seen), napi_ok);
 }
 
+// The env's own global may be a realm's sandbox (vm.createContext with
+// globalThis). Named as a context it names that realm, as on main's V8, and
+// nothing still means the env's realm while that is current. While the
+// realm is current, nothing means the realm on V8, but the env's realm on
+// QuickJS, whose napi_get_global returns the sandbox there: the env's own
+// global. (An array literal shows the realm a script ran in; a sandbox realm
+// resolves global names such as Array through the sandbox.)
+TEST_F(Test71ContextifyCompat, TheEnvsGlobalAsASandbox) {
+  EnvScope s(runtime_.get());
+
+  napi_value env_global = Global(s.env);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = env_global;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  napi_value env_array = Prototype(s.env, RunIn(s.env, nullptr, "[]"));
+  napi_value realm_array = Prototype(s.env, RunIn(s.env, realm, "[]"));
+  ASSERT_NE(env_array, nullptr);
+  ASSERT_NE(realm_array, nullptr);
+  ASSERT_FALSE(StrictEquals(s.env, env_array, realm_array));
+  auto array_in = [&](napi_value context) {
+    napi_value array = nullptr;
+    EXPECT_EQ(RunInContext(s.env, context, "[]", &array), napi_ok);
+    return Prototype(s.env, array);
+  };
+
+  EXPECT_TRUE(StrictEquals(s.env, array_in(env_global), realm_array));
+  EXPECT_TRUE(StrictEquals(s.env, array_in(nullptr), env_array));
+  EnteredRealm entered(s.env, realm);
+  EXPECT_TRUE(StrictEquals(s.env, array_in(env_global), realm_array));
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_TRUE(StrictEquals(s.env, array_in(nullptr), env_array));
+#else
+  EXPECT_TRUE(StrictEquals(s.env, array_in(nullptr), realm_array));
+#endif
+}
+
 // Version 1 of the bytecode options (main's layout) compiles for the current
 // realm; version 2 for its `realm_or_null`, NULL being the env's own.
 TEST_F(Test71ContextifyCompat, BytecodeOptionsOfBothVersions) {

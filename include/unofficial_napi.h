@@ -1044,12 +1044,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_make_context
     napi_value* result_out);
 
 // Deprecated: use unofficial_napi_run_script. The script runs in the realm
-// `sandbox_or_null` names: the realm of a contextified object (a realm's
-// global or sandbox), the env's realm for the env's own global, or the
-// current realm for NULL, undefined or null. Unlike unofficial_napi_run_script
-// with a NULL realm, that is the realm entered or of the running callback,
-// which is the env's own unless the embedder enters realms. Any other value
-// fails with napi_invalid_arg.
+// `sandbox_or_null` names:
+// - A contextified object (a realm's global or sandbox): its realm. The env's
+//   own global is one when it is a realm's sandbox (vm.createContext with
+//   globalThis), and then names that realm, as on main's V8.
+// - The env's own global otherwise: the env's realm.
+// - NULL, undefined or null: the current realm. Unlike
+//   unofficial_napi_run_script with a NULL realm, that is the realm entered or
+//   of the running callback, which is the env's own unless the embedder
+//   enters realms. While a realm whose sandbox is the env's own global is
+//   current, QuickJS takes the env's realm instead: napi_get_global returns
+//   that sandbox there, and the env's own global names the env's realm.
+// Any other value fails with napi_invalid_arg.
 UNOFFICIAL_NAPI_DEPRECATED("use unofficial_napi_run_script")
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_contextify_run_script(
     napi_env env,
@@ -1103,11 +1109,12 @@ typedef struct unofficial_napi_module__* unofficial_napi_module;
 // accepted. The realm is:
 // - version 2 with `realm_or_null` set: that realm. `context_or_undefined`
 //   must then be NULL, undefined or null, else napi_invalid_arg.
-// - otherwise, from the deprecated `context_or_undefined`: the realm of a
-//   contextified object (a realm's global or sandbox), the env's realm for
-//   the env's own global, and for NULL, undefined or null the env's realm
-//   (version 2) or the current realm (version 1). Any other value is
-//   napi_invalid_arg.
+// - otherwise, from the deprecated `context_or_undefined`, as
+//   unofficial_napi_contextify_run_script's `sandbox_or_null`: the realm of a
+//   contextified object (a realm's global or sandbox, which the env's own
+//   global may be), the env's realm for the env's own global otherwise, and
+//   for NULL, undefined or null the env's realm (version 2) or the current
+//   realm (version 1). Any other value is napi_invalid_arg.
 #define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 2u
 
 typedef enum {

@@ -147,12 +147,21 @@ calls take a realm's global or sandbox.
 - **A context argument** (sandbox, parsing context, `context_or_undefined`)
   is a contextified object, naming its realm, the env's own global, naming
   the env's realm, or nothing. Anything else fails with `napi_invalid_arg`.
+  The env's own global can also be a realm's sandbox
+  (`vm.createContext(globalThis)`). It is then a contextified object and
+  names that realm, as on `main`'s V8.
 - **Nothing** (NULL, `undefined` or `null`) means what the env's context
   meant on `main`: the current realm. That is the env's own realm unless the
   embedder enters a realm or a native function of another realm is running.
   Version 2 of the module options is the exception: there nothing means the
   env's realm, as a NULL `realm_or_null` does. The realm API's NULL is
   always the env's realm.
+  - The current realm is found from the global `napi_get_global` returns,
+    and the env's own global means the env's realm even when it is a realm's
+    sandbox. So while the realm whose sandbox is the env's own global is
+    current, nothing means that realm on V8, but the env's realm on QuickJS
+    and with the host-JS guest imports: there `napi_get_global` returns the
+    sandbox, the env's own global.
 - **Structs grow at the end.** Version 1 of the bytecode-open and
   module-create options keeps `main`'s layout, and version 2 appends
   `realm_or_null`. A provider reads a version 1 struct only up to
