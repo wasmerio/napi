@@ -1186,9 +1186,18 @@ TEST_F(Test77ModuleWrapState, SyntheticEvaluationPreservesHostSandboxWrites) {
         ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, root, 2, dependencies), napi_ok);
       }
       napi_value promise = nullptr;
-      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, root, -1, false, &promise), napi_ok);
-      EXPECT_EQ(PromiseOutcome(s.env, promise),
-                rejects ? "rejected: expected synthetic error" : "resolved");
+      const napi_status evaluated =
+          unofficial_napi_module_wrap_evaluate(s.env, root, -1, false, &promise);
+      if (rejects && !source_root && evaluated == napi_pending_exception) {
+        // V8 propagates a standalone synthetic evaluation callback's thrown
+        // exception directly; a source root instead rejects its promise.
+        EXPECT_EQ(TakePendingMessage(s.env), "expected synthetic error");
+        EXPECT_FALSE(ExceptionPending(s.env));
+      } else {
+        ASSERT_EQ(evaluated, napi_ok);
+        EXPECT_EQ(PromiseOutcome(s.env, promise),
+                  rejects ? "rejected: expected synthetic error" : "resolved");
+      }
       napi_value value = nullptr;
       ASSERT_EQ(napi_get_named_property(s.env, sandbox, "value", &value), napi_ok);
       EXPECT_EQ(ValueText(s.env, value), "2");
