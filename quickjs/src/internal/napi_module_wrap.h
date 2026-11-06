@@ -128,6 +128,9 @@ private:
   JSValue call_callback(JSValueConst callback,
                         int argc,
                         JSValueConst *argv) const;
+  JSValue call_module_callback(record *entry, JSValueConst callback,
+                                JSValueConst receiver, int argc,
+                                JSValueConst *argv);
   napi_status cache_module_requests(record *entry);
 
   static int synthetic_init(JSContext *ctx, JSModuleDef *module);
@@ -148,6 +151,10 @@ private:
   JSAtom dependency_key_ = JS_ATOM_NULL;
   // Synthetic modules whose evaluation steps are running.
   int synthetic_steps_running_ = 0;
+  // Synchronous source evaluations and module host callbacks, innermost last.
+  // Only a source evaluation needs sandbox writeback around host callbacks.
+  std::vector<JSContext *> source_evaluation_contexts_;
+  std::vector<JSContext *> module_callback_contexts_;
   // Links running (see link_module).
   int links_running_ = 0;
 
