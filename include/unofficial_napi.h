@@ -172,6 +172,16 @@ enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 // realms made while it runs too. Both run in the env's realm. Realms made
 // before the hooks were attached get no token. QuickJS does not accept them
 // and never calls them.
+//
+// Outside the release, V8 calls them as they are: in no TryCatch, with no
+// pending exception set aside. An exception the assign callback leaves
+// pending is still pending when unofficial_napi_create_realm returns napi_ok.
+// The unassign callback of a collected realm, which
+// unofficial_napi_create_realm or unofficial_napi_collect_garbage runs, sees
+// its caller's state: an exception the caller has pending is pending in the
+// callback too, and one the callback leaves pending replaces it and is the
+// caller's when the call returns its own status. At the release, what they
+// throw is dropped (see unofficial_napi_release_env).
 UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
 typedef struct {
   uint32_t size;
@@ -266,7 +276,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // a collected realm, from a hook or finalizer of the release) waits, as any
 // realm made while releasing, for the first sweep after it. So every token
 // is unassigned once before the env is freed. What an unassign callback
-// makes besides (values, hooks, instance data) is released as the rest.
+// makes besides (values, hooks, instance data) is released as the rest. An
+// unassign callback that makes a realm every time it is called never lets
+// the release finish, as a finalizer that makes a new value every time does.
 //
 // After each hook, token callback and finalizer, an exception it left
 // pending is dropped: nothing can catch it then (Node's CallIntoModule drops

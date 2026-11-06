@@ -188,12 +188,19 @@ calls take a realm's global or sandbox.
   `collect_garbage` runs (for a collected realm, from a hook or finalizer of
   the release) waits, as any realm made while releasing, for the first
   sweep after it. What else an unassign callback makes is released as the
-  rest (see `unofficial_napi_release_env` in the header). Realms made
+  rest (see `unofficial_napi_release_env` in the header). An unassign
+  callback that makes a realm on every call never lets the release finish,
+  as a finalizer that makes a new value every time does. Realms made
   before the hooks were attached get no token. Both hooks run in the env's
   realm; at release what they throw is dropped, as for the other hooks and
-  finalizers. On `main` a context lived until release, so tokens were only
-  unassigned then. QuickJS does not accept the hooks and never calls them,
-  as on `main`.
+  finalizers. Outside the release V8 calls them as they are, with no
+  TryCatch and no pending exception set aside. An exception the assign
+  callback leaves pending is still pending when `create_realm` returns
+  `napi_ok`. The unassign callback of a collected realm, run inside
+  `create_realm` or `collect_garbage`, sees the caller's pending exception,
+  and one it leaves pending replaces the caller's. On `main` a context lived
+  until release, so tokens were only unassigned then. QuickJS does not
+  accept the hooks and never calls them, as on `main`.
 - **Statuses are `main`'s V8 ones.** `main`'s QuickJS differed: it took a
   NULL `name`, refused a symbol sandbox, returned an already contextified
   sandbox again, compiled in the env's context for a parsing context that
@@ -239,6 +246,36 @@ calls take a realm's global or sandbox.
     sends version 1 module options, and a host-JS test drives the three
     imports from a guest.
 
+## Upgrading from the earlier `next`
+
+Code built against `next` as it was before the deprecated API came back
+(f928811) must be rebuilt. Three structs changed in place there. They have
+`main`'s layouts again now, and the two option structs grow at the end
+instead. Code built against `main` uses version 1 of each, which is
+unaffected.
+
+| Struct, as built against f928811 | Native | wasm32 | Now |
+|---|---|---|---|
+| Bytecode-open options, version 2 | 88 bytes, `realm_or_null` at 8 | 52 bytes, realm at 8 | Accepted and read wrongly, with no error |
+| Module-create options, version 2 | 64 bytes, `realm_or_null` at 32 | 40 bytes, realm at 20 | `napi_invalid_arg` |
+| Env hooks, version 2 | 40 bytes | 24 bytes | `napi_invalid_arg` |
+
+- **Bytecode-open options** keep version 2 and the same size, but
+  `realm_or_null` now comes last (offset 80 native, 48 wasm32), after
+  `cache_policy`. So a struct built against f928811 passes the version and
+  size checks, and every field after `version` is read from the wrong place:
+  its realm as `source_text`, and the realm from its cache flags and
+  padding.
+- **Module-create options** version 2 now appends `realm_or_null` (offset 64
+  native, 40 wasm32) after `main`'s layout, which keeps
+  `context_or_undefined` where f928811 had the realm. A struct built against
+  f928811 is shorter than version 2 now is, and is refused.
+- **Env hooks** are version 1 again, `main`'s layout with the token
+  callbacks (56 bytes native, 32 wasm32). Providers accept only version 1,
+  so f928811's version 2 is refused.
+- WASIX and host-JS guests follow the same rules: both guest backends read
+  the wasm32 layouts above.
+
 ## How the current realm works
 
 Each env keeps a stack of realm frames, innermost last: the scopes
@@ -278,6 +315,29 @@ and interrupt callbacks push the env's realm.
   `ModuleWrap` → `get_realm` on the contextified object, then the call with
   that realm.
 - Everything else, hooks included, goes through the env.
+
+## Views of an ArrayBuffer
+
+`napi_get_typedarray_info`, `napi_get_dataview_info` and
+`napi_get_buffer_info` read a view's layout from its internal slots, never
+from its properties, which its realm's scripts control. Two cases differ
+between the engines:
+
+- **A view that is out of bounds of its resizable buffer**, which shrank
+  under it, has length 0 on both engines. V8 reports the view's own offset
+  and the buffer's data plus that offset, which may lie past the buffer's
+  end. QuickJS
+  reports offset 0 and the buffer's data: its accessors report 0 for such a
+  view, or throw. A view over a detached buffer has length 0, offset 0 and
+  NULL data on both.
+- **Near the engine's stack limit, QuickJS fails these calls.** It reads the
+  slots through the intrinsic getters (`%TypedArray%.prototype.buffer` and
+  the rest, as the env was made), and a getter is a call, which needs stack.
+  When none is left, `napi_get_typedarray_info` and `napi_get_dataview_info`
+  return `napi_generic_failure` and `napi_get_buffer_info` returns
+  `napi_invalid_arg`, with nothing pending. They leave their outputs as they
+  were, except the `type` that `napi_get_typedarray_info` sets first. V8
+  reads the slots directly and does not fail there.
 
 ## Not done
 
