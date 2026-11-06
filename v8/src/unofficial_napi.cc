@@ -955,6 +955,9 @@ v8::Maybe<uint32_t> SerializerContext::GetSharedArrayBufferId(
   v8::Local<v8::Value> hook;
   if (!wrap->Get(context, OneByteString(isolate, "_getSharedArrayBufferId")).ToLocal(&hook) ||
       !hook->IsFunction()) {
+    // A getter V8 terminated: the termination is what fails the write, and
+    // the default would throw a clone error over it.
+    if (isolate->IsExecutionTerminating()) return v8::Nothing<uint32_t>();
     return v8::ValueSerializer::Delegate::GetSharedArrayBufferId(isolate, shared_array_buffer);
   }
 

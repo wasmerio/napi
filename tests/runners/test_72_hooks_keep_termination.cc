@@ -521,6 +521,12 @@ TEST_F(Test72HooksKeepTermination, SerdesHooks) {
            "try { s.writeValue(new Uint8Array(2)); } catch (e) { caught = 'yes'; caughtError = e; }\n"
            "after = 'yes';\n",
            "const s = new serdes.Serializer();\n"
+           "Object.defineProperty(s, '_getSharedArrayBufferId',\n"
+           "  { get() { terminate(); tick(); } });\n"
+           "try { s.writeValue(new SharedArrayBuffer(2)); }\n"
+           "catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+           "const s = new serdes.Serializer();\n"
            "s._getSharedArrayBufferId = (buffer) => { terminate(); tick(); };\n"
            "try { s.writeValue(new SharedArrayBuffer(2)); }\n"
            "catch (e) { caught = 'yes'; caughtError = e; }\n"
