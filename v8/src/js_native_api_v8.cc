@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -340,22 +341,12 @@ void ForgetExternalArrayBuffer(napi_env env, uint64_t id) {
   if (id != 0) env->external_array_buffers.erase(id);
 }
 
-// Runs the external finalizers deleters queued. Env thread only.
-bool RunQueuedExternalFinalizers(napi_env env) {
-  std::vector<napi_external_finalizer__> queued = TakeExternalFinalizers(env);
-  for (const auto& finalizer : queued) {
-    ForgetExternalArrayBuffer(env, finalizer.id);
-    env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
-  }
-  return !queued.empty();
-}
-
 // At the env's release: detaches the most recently made external array buffer
 // still tracked, as Node's CallbackInfo::Clean does, then runs its finalizer,
 // so code that runs later sees the buffer detached, never the freed memory.
 // The detach may free the store; its deleter then claims the finalizer and
-// queues it, and RunQueuedExternalFinalizers runs it. Either way the
-// finalizer is claimed once, under the lock. A buffer that
+// queues it, and FinalizeExternalBackingStoreHints runs it next. Either way
+// the finalizer is claimed once, under the lock. A buffer that
 // ArrayBuffer.prototype.transfer moved the store to is not reachable from
 // here (Node cannot reach it either); the one it moved it from is detached
 // already.
@@ -395,19 +386,34 @@ void FinalizeNewestExternalArrayBuffer(napi_env env) {
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  // At the env's release. Runs the finalizers deleters queued, then, most
-  // recent first, detaches each external array buffer with a user finalizer
-  // and runs its finalizer. Then claims, under the lock, what the backing
-  // stores still alive hold (the free callbacks of provider-owned memory), and
-  // runs it outside the lock. A backing store can outlive the env, so each
-  // live hint is unlinked from the dying env rather than deleted here — its
+  // At the env's release. Runs the user finalizers of external stores most
+  // recent first, by store id: those deleters queued (their buffers were
+  // detached or collected) and those of the array buffers still tracked, each
+  // detached first. Then claims, under the lock, what the backing stores
+  // still alive hold (the free callbacks of provider-owned memory), and runs
+  // it outside the lock. A backing store can outlive the env, so each live
+  // hint is unlinked from the dying env rather than deleted here — its
   // deleter frees it later and, seeing a null env, skips the env-side
   // bookkeeping. The hints are not touched after the lock is dropped: a
   // concurrent deleter may already be freeing them. Repeats while finalizers
   // make more external buffers.
+  std::multimap<uint64_t, napi_external_finalizer__> queued;
   for (;;) {
-    const bool ran_queued = RunQueuedExternalFinalizers(env);
-    if (!env->external_array_buffers.empty()) {
+    for (const auto& finalizer : TakeExternalFinalizers(env)) {
+      queued.emplace(finalizer.id, finalizer);
+    }
+    const uint64_t newest_tracked = env->external_array_buffers.empty()
+                                        ? 0
+                                        : env->external_array_buffers.rbegin()->first;
+    if (!queued.empty() && queued.rbegin()->first >= newest_tracked) {
+      auto newest = std::prev(queued.end());
+      const napi_external_finalizer__ finalizer = newest->second;
+      queued.erase(newest);
+      ForgetExternalArrayBuffer(env, finalizer.id);
+      env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+      continue;
+    }
+    if (newest_tracked != 0) {
       FinalizeNewestExternalArrayBuffer(env);
       continue;
     }
@@ -430,7 +436,7 @@ void FinalizeExternalBackingStoreHints(napi_env env) {
         }
       }
     }
-    if (pending.empty() && !ran_queued) return;
+    if (pending.empty()) return;
 
     for (const auto& finalizer : pending) {
       if (finalizer.free_cb != nullptr) {

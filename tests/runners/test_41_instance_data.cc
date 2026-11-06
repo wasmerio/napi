@@ -338,6 +338,43 @@ TEST_F(Test41InstanceData, ValuesAreFinalizedMostRecentFirstAtRelease) {
   }
 }
 
+// An external array buffer detached before the release keeps its turn. The
+// QuickJS provider finalizes it as it is detached; the V8 provider queues it
+// for the env's thread, and the release then finalizes it after the buffers
+// made after it and before those made before it.
+TEST_F(Test41InstanceData, ArrayBufferDetachedBeforeTheReleaseKeepsItsTurn) {
+  constexpr int kValues = 3;
+  EnvScope s(runtime_.get());
+  int clock = 0;
+  std::vector<Seen> buffers(kValues, Seen{&clock});
+  uint8_t bytes[kValues][8] = {};
+  MarkEnvGlobal(s.env);
+  napi_value middle = nullptr;
+  for (int i = 0; i < kValues; ++i) {
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_create_external_arraybuffer(s.env, bytes[i], sizeof(bytes[i]), FinalizeValue,
+                                               &buffers[i], &value),
+              napi_ok);
+    if (i == 1) {
+      middle = value;
+    } else {
+      Keep(s.env, ("arrayBuffer" + std::to_string(i)).c_str(), value);
+    }
+  }
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, middle), napi_ok);
+  const int detached_at = clock;
+
+  Release(s);
+  for (int i = 0; i < kValues; ++i) {
+    ExpectUsedNapi(buffers[i], ("value " + std::to_string(i)).c_str());
+  }
+  EXPECT_LT(buffers[2].order, buffers[0].order);
+  if (buffers[1].order > detached_at) {
+    EXPECT_GT(buffers[1].order, buffers[2].order);
+    EXPECT_LT(buffers[1].order, buffers[0].order);
+  }
+}
+
 namespace {
 
 bool IsDetached(napi_env env, napi_ref ref) {
