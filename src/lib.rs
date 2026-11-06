@@ -83,6 +83,45 @@ pub fn set_v8_worker_threads(count: Option<u32>) -> Result<(), WorkerThreadsAlre
     Ok(())
 }
 
+/// Sets the process's default time zone, which V8's `Intl` and `Date` use
+/// (DevTools' `Emulation.setTimezoneOverride`): an IANA id, or `None` for the
+/// host's zone again, re-detected from `TZ`. It is process-wide, as V8's Intl
+/// reads ICU's process default; each isolate takes it at its next event-loop
+/// checkpoint, and new isolates start with it.
+///
+/// An id ICU does not know, or a custom id such as `GMT+05:00`, is
+/// [`InvalidTimeZone`] and changes nothing. A provider built against a V8
+/// library that exports no ICU C API (the build warns) also returns
+/// [`InvalidTimeZone`], for every call.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub fn set_process_time_zone(zone: Option<&str>) -> Result<(), InvalidTimeZone> {
+    let zone = zone.unwrap_or("");
+    // Safety: a pointer and length into a live str; the callee copies it.
+    let status = unsafe {
+        snapi::snapi_bridge_set_process_time_zone(
+            zone.as_ptr() as *const std::ffi::c_char,
+            zone.len(),
+        )
+    };
+    if status != 0 {
+        return Err(InvalidTimeZone);
+    }
+    Ok(())
+}
+
+/// The time zone id is not one ICU knows, or the provider cannot change the
+/// zone (see [`set_process_time_zone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTimeZone;
+
+impl Display for InvalidTimeZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a time zone id ICU knows")
+    }
+}
+
+impl std::error::Error for InvalidTimeZone {}
+
 /// The V8 platform already exists, so its worker pool can no longer be resized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerThreadsAlreadyFixed;

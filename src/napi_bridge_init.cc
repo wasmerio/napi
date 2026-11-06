@@ -660,6 +660,12 @@ extern "C" int snapi_bridge_set_v8_worker_thread_count(uint32_t count) {
   return EdgeV8Platform::SetWorkerThreadCount(static_cast<int>(count)) ? 1 : 0;
 }
 
+// Host-only: the process time zone (an IANA id; NULL or length 0: the
+// host's). 0 on success, else the napi_status (napi_invalid_arg: unknown id).
+extern "C" int snapi_bridge_set_process_time_zone(const char* zone, size_t length) {
+  return unofficial_napi_set_process_time_zone(zone, length);
+}
+
 extern "C" int snapi_bridge_init() {
   // Intentionally do not create a N-API env here.
   // Env creation is deferred until the guest explicitly calls
@@ -3852,6 +3858,18 @@ extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return unofficial_napi_notify_datetime_configuration_change(env);
+}
+
+extern "C" int snapi_bridge_unofficial_refresh_intl_defaults(SnapiEnvState* env_state) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_refresh_intl_defaults(bridge_state->env);
+}
+
+extern "C" int snapi_bridge_unofficial_set_default_locale(SnapiEnvState* env_state, const char* tag, size_t length) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_set_default_locale(bridge_state->env, tag, length);
 }
 
 extern "C" int snapi_bridge_unofficial_create_serdes_binding(SnapiEnvState* env_state,

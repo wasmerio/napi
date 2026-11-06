@@ -90,6 +90,8 @@ std::mutex g_runtime_mu;
 // Destroying the platform / these registries in that window is a use-after-free
 // for the teardown thread (Isolate::Delete touches the platform's page
 // allocator and tracing controller). The OS reclaims everything at _exit.
+// The intl override registries further down (g_time_zone_seen,
+// g_default_locale_ids) are kept the same way.
 SharedRuntime& g_runtime = *new SharedRuntime();
 std::unordered_map<v8::Isolate*, napi_env>& g_env_by_isolate =
     *new std::unordered_map<v8::Isolate*, napi_env>();
@@ -593,6 +595,25 @@ v8::IsolateGroup GetOrCreateIsolateGroup() {
 // platform's pending tasks.
 std::mutex g_isolate_lifecycle_mu;
 
+// unofficial_napi_set_default_locale swaps ICU's process default locale
+// under this, and a new isolate caches its default locale under it, so that
+// it never caches another isolate's override. Taken after
+// g_isolate_lifecycle_mu, never before it.
+std::mutex g_locale_mu;
+
+// The process time zone (unofficial_napi_set_process_time_zone). ICU's
+// default zone is changed or re-detected under g_time_zone_mu.
+std::mutex g_time_zone_mu;
+// Bumped by each process time zone change; 0: never changed.
+std::atomic<uint64_t> g_time_zone_generation{0};
+// An override is in place: the environment's TZ is not re-detected.
+std::atomic<bool> g_time_zone_override{false};
+std::mutex g_time_zone_seen_mu;
+// The generation each isolate last dropped its date cache for. Never freed,
+// like the registries at the top of the file.
+std::unordered_map<v8::Isolate*, uint64_t>& g_time_zone_seen =
+    *new std::unordered_map<v8::Isolate*, uint64_t>();
+
 v8::Isolate* CreateIsolateForEnv(EdgeV8Platform* platform,
                                  const v8::Isolate::CreateParams& params) {
   std::lock_guard<std::mutex> lock(g_isolate_lifecycle_mu);
@@ -602,7 +623,15 @@ v8::Isolate* CreateIsolateForEnv(EdgeV8Platform* platform,
     isolate->Dispose();
     return nullptr;
   }
-  v8::Isolate::Initialize(isolate, params);
+  {
+    // Initialize caches ICU's default locale (V8's main-thread LocalIsolate
+    // reads it): not while set_default_locale has it swapped. A V8 that
+    // reads it lazily caches it here instead, under the same lock.
+    std::lock_guard<std::mutex> locale_lock(g_locale_mu);
+    v8::Isolate::Initialize(isolate, params);
+    v8::Isolate::Scope scope(isolate);
+    (void)isolate->GetDefaultLocale();
+  }
   return isolate;
 }
 
@@ -635,6 +664,10 @@ void DisposeIsolateAndWait(EdgeV8Platform* platform,
                            v8::Isolate* isolate,
                            void* shutdown_pump_handle = nullptr) {
   if (isolate == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_time_zone_seen_mu);
+    g_time_zone_seen.erase(isolate);
+  }
 
   PlatformShutdownWaiter waiter;
   {
@@ -2170,6 +2203,249 @@ bool DrainMicrotasksForEnv(napi_env env) {
   return PumpPlatformForegroundTasks(env);
 }
 
+}  // extern "C"
+
+// Process time zone and per-isolate locale overrides (DevTools'
+// Emulation.setTimezoneOverride / setLocaleOverride).
+//
+// V8's Intl reads ICU's process default time zone on every call, and each
+// isolate keeps a date cache built from it, so a time zone override is one
+// per process: ICU's default is replaced, and each isolate drops its date
+// cache at its next event-loop checkpoint (kSkip: no re-detection from TZ).
+//
+// A locale override is per isolate, as far as V8's API allows. V8 caches each
+// isolate's default locale, computed from ICU's process default locale, and
+// set_default_locale swaps ICU's default only while one isolate recomputes
+// it. Isolate creation takes the same lock, so no other isolate caches the
+// override. But other threads that read ICU's default locale during the swap
+// still see it. One such read is the zone name in Date.prototype.toString,
+// which an isolate keeps until its date cache is next dropped.
+//
+// ICU's C API is in libv8.a with V8's ICU major version as a suffix, and no
+// ICU headers ship with it: the prototypes are declared here, with the
+// suffix the build finds in the library (NAPI_ICU_SUFFIX). 0: the library
+// exports no ICU C API, and these overrides fail with napi_generic_failure.
+// The default, 74, is the ICU of the pinned prebuilt V8.
+#ifndef NAPI_ICU_SUFFIX
+#define NAPI_ICU_SUFFIX 74
+#endif
+#if NAPI_ICU_SUFFIX
+#define NAPI_ICU_PASTE(name, suffix) name##_##suffix
+#define NAPI_ICU_EXPAND(name, suffix) NAPI_ICU_PASTE(name, suffix)
+#define NAPI_ICU(name) NAPI_ICU_EXPAND(name, NAPI_ICU_SUFFIX)
+extern "C" {
+void NAPI_ICU(ucal_setDefaultTimeZone)(const char16_t* zone_id, int* status);
+int32_t NAPI_ICU(ucal_getCanonicalTimeZoneID)(const char16_t* id, int32_t length, char16_t* result,
+                                              int32_t capacity, int8_t* is_system_id, int* status);
+int32_t NAPI_ICU(uloc_forLanguageTag)(const char* tag, char* locale_id, int32_t capacity,
+                                      int32_t* parsed_length, int* status);
+int32_t NAPI_ICU(uloc_getName)(const char* locale_id, char* name, int32_t capacity, int* status);
+void NAPI_ICU(uloc_setDefault)(const char* locale_id, int* status);
+const char* NAPI_ICU(uloc_getDefault)(void);
+}
+
+// ICU's C++ TimeZone, for the two static members that V8 uses to re-detect
+// the host's zone (kRedetect). The C API sets a zone only by id, and the zone
+// ICU detects for a POSIX TZ such as "JST-9" has no id that recreates it.
+// Nothing else of the class is declared or used.
+namespace NAPI_ICU(icu) {
+class TimeZone {
+ public:
+  TimeZone() = delete;
+  static TimeZone* detectHostTimeZone();
+  static void adoptDefault(TimeZone* zone);
+};
+}  // namespace NAPI_ICU(icu)
+#endif  // NAPI_ICU_SUFFIX
+
+namespace {
+
+// Drops the isolate's date cache if the process zone changed since it last
+// did (the isolate must be entered, or be the current one).
+void RefreshTimeZoneFor(v8::Isolate* isolate, bool force) {
+  const uint64_t generation = g_time_zone_generation.load(std::memory_order_acquire);
+  if (generation == 0 || isolate == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_time_zone_seen_mu);
+    uint64_t& seen = g_time_zone_seen[isolate];
+    if (seen == generation && !force) return;
+    seen = generation;
+  }
+  isolate->DateTimeConfigurationChangeNotification(v8::Isolate::TimeZoneDetection::kSkip);
+}
+
+#if NAPI_ICU_SUFFIX
+// U_FAILURE: an error code above U_ZERO_ERROR (warnings are negative).
+bool IcuFailed(int status) { return status > 0; }
+// U_BUFFER_OVERFLOW_ERROR.
+constexpr int kIcuBufferOverflow = 15;
+
+std::u16string Utf16FromAscii(const char* text, size_t length) {
+  std::u16string out;
+  out.reserve(length);
+  for (size_t i = 0; i < length; ++i) out.push_back(static_cast<unsigned char>(text[i]));
+  return out;
+}
+
+// Runs fill(buffer, capacity, &status), an ICU call that writes a string, into
+// out, and again into the size ICU asks for if the string does not fit (an
+// ICU id can be longer than its tag: -u-ca- becomes @calendar=). False if ICU
+// fails.
+template <typename Fill>
+bool FillIcuString(std::string* out, Fill fill) {
+  out->resize(160);
+  int status = 0;
+  int32_t written = fill(out->data(), static_cast<int32_t>(out->size()), &status);
+  if (status == kIcuBufferOverflow && written > 0) {
+    out->resize(static_cast<size_t>(written));
+    status = 0;
+    written = fill(out->data(), static_cast<int32_t>(out->size()), &status);
+  }
+  if (IcuFailed(status) || written < 0 || static_cast<size_t>(written) > out->size()) return false;
+  out->resize(static_cast<size_t>(written));
+  return true;
+}
+
+// Makes ICU's default locale saved again if it is not. ICU keeps every
+// default it was given, so this adds no entry (ICU can still allocate while
+// it names the id, and drops a failure there).
+void RestoreIcuDefaultLocale(const std::string& saved) {
+  if (std::strcmp(NAPI_ICU(uloc_getDefault)(), saved.c_str()) == 0) return;
+  int status = 0;
+  NAPI_ICU(uloc_setDefault)(saved.c_str(), &status);
+}
+
+// ICU never frees a default locale it was given, since another thread may
+// still use it: each distinct id set_default_locale swaps in stays allocated
+// for the life of the process. So a process takes at most this many.
+constexpr size_t kMaxDefaultLocaleIds = 1024;
+// The ids swapped in so far. Under g_locale_mu. Never freed, like the
+// registries at the top of the file.
+std::vector<std::string>& g_default_locale_ids = *new std::vector<std::string>();
+#endif  // NAPI_ICU_SUFFIX
+
+}  // namespace
+
+extern "C" {
+
+napi_status NAPI_CDECL unofficial_napi_set_process_time_zone(
+    const char* zone, size_t length) {
+  if (zone == nullptr && length != 0) return napi_invalid_arg;
+#if NAPI_ICU_SUFFIX
+  std::u16string id;
+  if (length > 0) {
+    if (length > 128) return napi_invalid_arg;
+    for (size_t i = 0; i < length; ++i) {
+      const unsigned char c = static_cast<unsigned char>(zone[i]);
+      if (c < 0x21 || c > 0x7e) return napi_invalid_arg;
+    }
+    id = Utf16FromAscii(zone, length);
+    char16_t canonical[129] = {};
+    int8_t system = 0;
+    int status = 0;
+    const int32_t written = NAPI_ICU(ucal_getCanonicalTimeZoneID)(
+        id.c_str(), static_cast<int32_t>(id.size()), canonical, 128, &system, &status);
+    // An unknown id canonicalizes to Etc/Unknown (or fails). A custom id
+    // such as GMT+05:00 is not a system id.
+    static const char16_t kUnknown[] = u"Etc/Unknown";
+    if (IcuFailed(status) || written <= 0 || !system ||
+        std::u16string(canonical, written) == kUnknown) {
+      return napi_invalid_arg;
+    }
+  }
+  // Under the lock that notify_datetime_configuration_change re-detects
+  // under, so that a re-detection never lands after this and undoes it.
+  std::lock_guard<std::mutex> lock(g_time_zone_mu);
+  if (length > 0) {
+    int status = 0;
+    NAPI_ICU(ucal_setDefaultTimeZone)(id.c_str(), &status);
+    if (IcuFailed(status)) return napi_generic_failure;
+  } else {
+    // The host's zone again, re-detected from TZ as kRedetect does. NULL:
+    // ICU is out of memory, and its default zone is unchanged.
+    auto* host = NAPI_ICU(icu)::TimeZone::detectHostTimeZone();
+    if (host == nullptr) return napi_generic_failure;
+    NAPI_ICU(icu)::TimeZone::adoptDefault(host);
+  }
+  g_time_zone_override.store(length > 0, std::memory_order_release);
+  g_time_zone_generation.fetch_add(1, std::memory_order_acq_rel);
+  return napi_ok;
+#else
+  return napi_generic_failure;
+#endif
+}
+
+napi_status NAPI_CDECL unofficial_napi_refresh_intl_defaults(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  RefreshTimeZoneFor(env->isolate, false);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_default_locale(napi_env env, const char* tag, size_t length) {
+  if (env == nullptr || env->isolate == nullptr || (tag == nullptr && length != 0) || length > 256) {
+    return napi_invalid_arg;
+  }
+#if NAPI_ICU_SUFFIX
+  // Length 0: the process default again, with no swap.
+  const bool restore = length == 0;
+  // The tag's ICU id, named as ICU names a default locale it keeps
+  // (uloc_getName: eng_US is en_US, und@calendar=buddhist is
+  // @calendar=buddhist), so that it compares with ICU's default.
+  std::string locale_id;
+  if (!restore) {
+    const std::string bcp47(tag, length);
+    std::string from_tag;
+    int32_t parsed = 0;
+    const bool converted = FillIcuString(&from_tag, [&](char* out, int32_t capacity, int* status) {
+      parsed = 0;
+      return NAPI_ICU(uloc_forLanguageTag)(bcp47.c_str(), out, capacity, &parsed, status);
+    });
+    // The whole tag must parse. "und", the root locale, parses to an empty id.
+    if (!converted || parsed != static_cast<int32_t>(length)) return napi_invalid_arg;
+    // uloc_setDefault names the id the same way: if this fails (out of
+    // memory), ICU would not take the id either.
+    if (!FillIcuString(&locale_id, [&](char* out, int32_t capacity, int* status) {
+          return NAPI_ICU(uloc_getName)(from_tag.c_str(), out, capacity, status);
+        })) {
+      return napi_generic_failure;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_locale_mu);
+  const std::string saved = NAPI_ICU(uloc_getDefault)();
+  // ICU already keeps the process default (saved) and every id swapped in.
+  const bool known = restore || locale_id == saved ||
+                     std::find(g_default_locale_ids.begin(), g_default_locale_ids.end(),
+                               locale_id) != g_default_locale_ids.end();
+  if (!known && g_default_locale_ids.size() >= kMaxDefaultLocaleIds) return napi_generic_failure;
+  // Drops the isolate's cached default locale (and the code that inlined
+  // it) before the swap, which keeps the swap short.
+  env->isolate->LocaleConfigurationChangeNotification();
+  bool swapped = restore;
+  bool changed = false;
+  if (!restore) {
+    int status = 0;
+    NAPI_ICU(uloc_setDefault)(locale_id.c_str(), &status);
+    // uloc_setDefault reports no failure: ICU drops its own status. ICU took
+    // the id if its default now has the id's name. Out of memory, it keeps
+    // its old default or installs an empty (bogus) one: the process default
+    // is put back before the isolate recomputes. ICU drops some allocation
+    // failures without a trace, so out of memory this check is best effort.
+    const char* now = NAPI_ICU(uloc_getDefault)();
+    swapped = std::strcmp(now, locale_id.c_str()) == 0;
+    // Any new default is an entry ICU keeps, and counts against the bound.
+    changed = std::strcmp(now, saved.c_str()) != 0;
+    if (!swapped) RestoreIcuDefaultLocale(saved);
+  }
+  // Recomputed from ICU's default: the override, or the process default.
+  (void)env->isolate->GetDefaultLocale();
+  RestoreIcuDefaultLocale(saved);
+  if ((swapped || changed) && !known) g_default_locale_ids.push_back(locale_id);
+  return swapped ? napi_ok : napi_generic_failure;
+#else
+  return napi_generic_failure;
+#endif
+}
+
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,
@@ -2181,6 +2457,8 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
   }
+  // The process time zone changed since this isolate's last checkpoint.
+  RefreshTimeZoneFor(env->isolate, false);
   const bool host_task_admitted = DrainMicrotasksForEnv(env);
   if (state_out != nullptr) {
     *state_out = NapiV8HasPendingProviderWork(env)
@@ -3020,6 +3298,15 @@ napi_status NAPI_CDECL unofficial_napi_set_continuation_preserved_embedder_data(
 
 napi_status NAPI_CDECL unofficial_napi_notify_datetime_configuration_change(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // Under the time zone lock: a re-detection must not land after a
+  // concurrent set_process_time_zone and undo it.
+  std::lock_guard<std::mutex> lock(g_time_zone_mu);
+  // A process time zone override stands: no re-detection from TZ, which
+  // would replace ICU's default with the host's.
+  if (g_time_zone_override.load(std::memory_order_acquire)) {
+    RefreshTimeZoneFor(env->isolate, true);
+    return napi_ok;
+  }
 #if defined(__POSIX__)
   tzset();
 #elif defined(_WIN32)

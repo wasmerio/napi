@@ -55,6 +55,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
+    // Host only: the JS backend has no process time zone to set.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_set_process_time_zone(zone: *const std::ffi::c_char, length: usize) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
         engine_flags: *const c_char,
         engine_flags_length: u32,
@@ -279,6 +282,12 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_message_drop(payload: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_refresh_intl_defaults(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_set_default_locale(
+        env: SnapiEnv,
+        tag: *const std::ffi::c_char,
+        length: usize,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(
         env: SnapiEnv,

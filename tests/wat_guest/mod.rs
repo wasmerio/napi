@@ -52,6 +52,10 @@ const WAT: &str = r#"(module
     (func $cancel (param i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_request_interrupt"
     (func $request_interrupt (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_set_default_locale"
+    (func $set_default_locale (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_refresh_intl_defaults"
+    (func $refresh_intl_defaults (param i32) (result i32)))
   (import "napi" "napi_create_string_utf8"
     (func $create_string (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_run_script" (func $run_script (param i32 i32 i32) (result i32)))
@@ -185,6 +189,10 @@ const WAT: &str = r#"(module
     (i32.const 0))
   (func (export "checkpoint") (result i32)
     (call $checkpoint (global.get $env) (i32.const 0) (i32.const 0) (i32.const 60)))
+  (func (export "set_default_locale") (param $ptr i32) (param $len i32) (result i32)
+    (call $set_default_locale (global.get $env) (local.get $ptr) (local.get $len)))
+  (func (export "refresh_intl_defaults") (result i32)
+    (call $refresh_intl_defaults (global.get $env)))
   (func (export "integer") (result i32)
     (if (call $get_int32 (global.get $env) (i32.load (i32.const 32)) (i32.const 44))
       (then unreachable))
@@ -389,6 +397,35 @@ impl Guest {
     /// Drains microtasks; returns the checkpoint status.
     pub fn checkpoint(&mut self) -> i32 {
         self.call0("checkpoint")
+    }
+
+    /// `unofficial_napi_set_default_locale` with `tag`; returns the status.
+    pub fn set_default_locale(&mut self, tag: &str) -> i32 {
+        self.call_with_source("set_default_locale", tag)
+    }
+
+    /// `unofficial_napi_set_default_locale` with `tag` placed at guest
+    /// address `ptr`, which may be 0; returns the status. The bytes are
+    /// zeroed again afterwards.
+    pub fn set_default_locale_at(&mut self, ptr: u32, tag: &str) -> i32 {
+        self.memory
+            .view(&self.store)
+            .write(u64::from(ptr), tag.as_bytes())
+            .expect("tag does not fit in guest memory");
+        let status = self
+            .function::<(i32, i32), i32>("set_default_locale")
+            .call(&mut self.store, ptr as i32, tag.len() as i32)
+            .unwrap_or_else(|err| panic!("guest call set_default_locale trapped: {err}"));
+        self.memory
+            .view(&self.store)
+            .write(u64::from(ptr), &vec![0; tag.len()])
+            .expect("tag does not fit in guest memory");
+        status
+    }
+
+    /// `unofficial_napi_refresh_intl_defaults`; returns the status.
+    pub fn refresh_intl_defaults(&mut self) -> i32 {
+        self.call0("refresh_intl_defaults")
     }
 
     /// Runs `source` with `napi_run_script` and returns its int32 result.
