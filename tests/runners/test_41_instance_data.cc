@@ -961,3 +961,161 @@ TEST_F(Test41InstanceData, AnObjectAFinalizerThrowsIsDroppedOnceAtRelease) {
   Release(s);
   ExpectThrownAndFinalizedOnce(thrown);
 }
+
+namespace {
+
+// Counts into `hint`, then throws: what it throws at release is dropped.
+void FinalizeCountingThenThrowing(node_api_basic_env basic_env, void*, void* hint) {
+  ++*static_cast<int*>(hint);
+  napi_throw_error(const_cast<napi_env>(basic_env), nullptr, "finalizer");
+}
+
+// Makes an external finalized by FinalizeCountingThenThrowing, kept only by
+// the global's `name`.
+void KeepThrowingExternal(napi_env env, const char* name, int* finalized) {
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external(env, nullptr, FinalizeCountingThenThrowing, finalized, &external),
+            napi_ok);
+  Keep(env, name, external);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+std::string StringOf(napi_env env, napi_value value) {
+  char text[64] = {};
+  size_t length = 0;
+  if (value == nullptr ||
+      napi_get_value_string_utf8(env, value, text, sizeof(text), &length) != napi_ok) {
+    return "<not a string>";
+  }
+  return std::string(text, length);
+}
+
+// The message of the exception pending on `env`, which it clears.
+std::string TakeExceptionMessage(napi_env env) {
+  napi_value error = nullptr;
+  if (napi_get_and_clear_last_exception(env, &error) != napi_ok || error == nullptr) {
+    return "<none>";
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, error, &type) != napi_ok || type != napi_object) return "<not an object>";
+  napi_value message = nullptr;
+  if (napi_get_named_property(env, error, "message", &message) != napi_ok) return "<no message>";
+  return StringOf(env, message);
+}
+
+// Scripts that throw while they drop the last reference to an external, so
+// an engine that frees values as soon as nothing refers to them finalizes it
+// while the exception is still being thrown.
+const char kCatchWhileFreeing[] =
+    "(function () {"
+    "  try {"
+    "    (function () {"
+    "      let held = globalThis.caughtExternal;"
+    "      globalThis.caughtExternal = undefined;"
+    "      throw new Error('caught');"
+    "    })();"
+    "  } catch (error) {"
+    "    return error instanceof Error ? error.message : 'not an Error: ' + typeof error;"
+    "  }"
+    "  return 'not thrown';"
+    "})()";
+const char kThrowWhileFreeing[] =
+    "(function () {"
+    "  let held = globalThis.uncaughtExternal;"
+    "  globalThis.uncaughtExternal = undefined;"
+    "  throw new Error('uncaught');"
+    "})()";
+
+// What a cleanup hook saw of the exceptions its scripts threw.
+struct InFlight {
+  napi_env env = nullptr;
+  int finalized = 0;
+  napi_status caught_status = napi_generic_failure;
+  std::string caught;
+  napi_status uncaught_status = napi_generic_failure;
+  bool uncaught_pending = false;
+  std::string uncaught;
+};
+
+void HookThrowingWhileFreeing(void* arg) {
+  auto* in_flight = static_cast<InFlight*>(arg);
+  napi_env env = in_flight->env;
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value source = nullptr;
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(env, kCatchWhileFreeing, NAPI_AUTO_LENGTH, &source), napi_ok);
+  in_flight->caught_status = napi_run_script(env, source, &result);
+  if (in_flight->caught_status == napi_ok) in_flight->caught = StringOf(env, result);
+  ASSERT_EQ(napi_create_string_utf8(env, kThrowWhileFreeing, NAPI_AUTO_LENGTH, &source), napi_ok);
+  in_flight->uncaught_status = napi_run_script(env, source, &result);
+  ASSERT_EQ(napi_is_exception_pending(env, &in_flight->uncaught_pending), napi_ok);
+  if (in_flight->uncaught_pending) in_flight->uncaught = TakeExceptionMessage(env);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+// A hook that throws, then closes a scope holding the only reference to an
+// external.
+struct PendingInAHook {
+  napi_env env = nullptr;
+  int finalized = 0;
+  bool pending_before = false;
+  bool pending_after = false;
+  std::string message;
+};
+
+void HookThrowingThenFreeing(void* arg) {
+  auto* hook = static_cast<PendingInAHook*>(arg);
+  napi_env env = hook->env;
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external(env, nullptr, FinalizeCountingThenThrowing, &hook->finalized,
+                                 &external),
+            napi_ok);
+  napi_throw_error(env, nullptr, "hook");
+  ASSERT_EQ(napi_is_exception_pending(env, &hook->pending_before), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  ASSERT_EQ(napi_is_exception_pending(env, &hook->pending_after), napi_ok);
+  if (hook->pending_after) hook->message = TakeExceptionMessage(env);
+}
+
+}  // namespace
+
+// An engine may run a finalizer while JS is throwing, when the throw frees
+// the last reference to a value. At release, what that finalizer throws is
+// dropped, but the exception JS is throwing is not: JS still catches it, and
+// one nothing catches is still pending when napi_run_script returns.
+TEST_F(Test41InstanceData, AnExceptionJsIsThrowingSurvivesAFinalizerAtRelease) {
+  EnvScope s(runtime_.get());
+  InFlight in_flight;
+  in_flight.env = s.env;
+  KeepThrowingExternal(s.env, "caughtExternal", &in_flight.finalized);
+  KeepThrowingExternal(s.env, "uncaughtExternal", &in_flight.finalized);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookThrowingWhileFreeing, &in_flight), napi_ok);
+
+  Release(s);
+  EXPECT_EQ(in_flight.caught_status, napi_ok);
+  EXPECT_EQ(in_flight.caught, "caught");
+  EXPECT_EQ(in_flight.uncaught_status, napi_pending_exception);
+  EXPECT_TRUE(in_flight.uncaught_pending);
+  EXPECT_EQ(in_flight.uncaught, "uncaught");
+  EXPECT_EQ(in_flight.finalized, 2);
+}
+
+// The same for an exception a hook has pending when a finalizer runs inside
+// it: the hook still finds its own exception pending afterwards.
+TEST_F(Test41InstanceData, AHookExceptionSurvivesAFinalizerRunInsideIt) {
+  EnvScope s(runtime_.get());
+  PendingInAHook hook;
+  hook.env = s.env;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookThrowingThenFreeing, &hook), napi_ok);
+
+  Release(s);
+  EXPECT_TRUE(hook.pending_before);
+  EXPECT_TRUE(hook.pending_after);
+  EXPECT_EQ(hook.message, "hook");
+  EXPECT_EQ(hook.finalized, 1);
+}

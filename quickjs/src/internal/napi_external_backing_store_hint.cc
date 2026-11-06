@@ -84,14 +84,23 @@ void napi_external_backing_store_hint__::invoke_finalizer()
   // The finalizer may destroy this hint (deleting the reference napi_wrap
   // returned does).
   napi_env env = env_;
-  // Finalizers run in the env's own realm, also when the collector runs
-  // inside another realm.
-  napi_realm_frame_scope__ realm_frame{env, nullptr, JS_UNDEFINED};
-  finalize_cb_(env, external_data_, finalize_hint_);
-  // At release nothing can catch what it threw, also when the collector ran
-  // it inside another callback.
-  if (env->is_closing())
-    env->drop_finalizer_exception();
+  if (!env->is_closing())
+  {
+    // Finalizers run in the env's own realm, also when the collector runs
+    // inside another realm.
+    napi_realm_frame_scope__ realm_frame{env, nullptr, JS_UNDEFINED};
+    finalize_cb_(env, external_data_, finalize_hint_);
+    return;
+  }
+  // At release nothing can catch what the finalizer throws, so it is
+  // dropped. The collector may run it in the middle of other code, while JS
+  // is throwing or a hook has an exception pending: that one is kept.
+  napi_env__::pending_exceptions outer = env->take_pending_exceptions();
+  {
+    napi_realm_frame_scope__ realm_frame{env, nullptr, JS_UNDEFINED};
+    finalize_cb_(env, external_data_, finalize_hint_);
+  }
+  env->restore_pending_exceptions(outer);
 }
 
 void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)

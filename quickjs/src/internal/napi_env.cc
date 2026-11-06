@@ -250,6 +250,25 @@ void napi_env__::drop_finalizer_exception()
     JS_FreeValue(context_, JS_GetException(context_));
 }
 
+napi_env__::pending_exceptions napi_env__::take_pending_exceptions()
+{
+  pending_exceptions taken;
+  if (context_ != nullptr)
+    taken.thrown = JS_GetException(context_);
+  if (has_last_exception())
+    taken.last = take_last_exception();
+  return taken;
+}
+
+void napi_env__::restore_pending_exceptions(pending_exceptions taken)
+{
+  drop_finalizer_exception();
+  if (!JS_IsUninitialized(taken.last))
+    set_last_exception(taken.last);
+  if (!JS_IsUninitialized(taken.thrown))
+    JS_Throw(context_, taken.thrown);
+}
+
 void napi_env__::finalize_instance_data()
 {
   void *data = instance_data_;

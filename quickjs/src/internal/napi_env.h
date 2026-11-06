@@ -174,6 +174,17 @@ struct napi_env__
 
   // At release: drops the exception a hook or finalizer left pending.
   void drop_finalizer_exception();
+  // The exceptions pending when the collector runs a finalizer in the middle
+  // of other code: the one JS is throwing, and the provider's.
+  struct pending_exceptions
+  {
+    JSValue thrown = JS_UNINITIALIZED;
+    JSValue last = JS_UNINITIALIZED;
+  };
+  // At release, around such a finalizer: takes them, so the finalizer runs
+  // with none pending, then drops what it threw and gives them back.
+  pending_exceptions take_pending_exceptions();
+  void restore_pending_exceptions(pending_exceptions taken);
 
 private:
   void clear_refs_for_teardown();
