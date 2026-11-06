@@ -37,6 +37,7 @@ const NAPI_OK: i32 = 0;
 const NAPI_INVALID_ARG: i32 = 1;
 const NAPI_OBJECT_EXPECTED: i32 = 2;
 const NAPI_STRING_EXPECTED: i32 = 3;
+const NAPI_NAME_EXPECTED: i32 = 4;
 const NAPI_FUNCTION_EXPECTED: i32 = 5;
 const NAPI_NUMBER_EXPECTED: i32 = 6;
 const NAPI_ARRAY_EXPECTED: i32 = 8;
@@ -174,6 +175,135 @@ export function wasmer_napi_get_prototype(value) {
 // prototype fails.
 function wasmerNapiIsObject(value) {
   return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+// Portable lazy properties are accessors until their first successful read.
+// Locked accessors cannot become data properties: they memoize instead. No
+// global reflection or integrity-level builtins are patched to hide this.
+const wasmerNapiLazyGetters = new WeakMap();
+const wasmerNapiLazyHolders = new WeakSet();
+const wasmerNapiLazyGet = Function.call.bind(WeakMap.prototype.get);
+const wasmerNapiLazySet = Function.call.bind(WeakMap.prototype.set);
+const wasmerNapiLazyHasHolder = Function.call.bind(WeakSet.prototype.has);
+const wasmerNapiLazyAddHolder = Function.call.bind(WeakSet.prototype.add);
+const wasmerNapiLazyDescriptor = Object.getOwnPropertyDescriptor;
+const wasmerNapiLazyDefine = Reflect.defineProperty;
+const wasmerNapiLazyApply = Reflect.apply;
+const wasmerNapiLazyNumber = Number;
+const wasmerNapiLazyString = String;
+const wasmerNapiLazyRangeError = RangeError;
+const wasmerNapiLazyTypeError = TypeError;
+const wasmerNapiLazyTypedArrayLength = Function.call.bind(
+  Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'length').get);
+let wasmerNapiLazyInitializing;
+
+function wasmerNapiLazyDefinition(holder, key, descriptor) {
+  if (!descriptor) return undefined;
+  const getter = wasmerNapiLazyDescriptor(descriptor, 'get')?.value;
+  if (typeof getter !== 'function') return undefined;
+  const definition = wasmerNapiLazyGet(wasmerNapiLazyGetters, getter);
+  return definition?.holder === holder && definition.key === key &&
+    definition.setter === wasmerNapiLazyDescriptor(descriptor, 'set')?.value ? definition : undefined;
+}
+function wasmerNapiLazyCommit(definition, descriptor, value) {
+  if (descriptor.configurable && !wasmerNapiLazyDefine(definition.holder, definition.key, {
+    __proto__: null, value, writable: definition.writable,
+    enumerable: descriptor.enumerable, configurable: descriptor.configurable,
+  })) throw new wasmerNapiLazyTypeError('Cannot materialize a lazy property');
+  definition.value = value;
+  definition.initialized = true;
+  definition.initializer = undefined;
+  return value;
+}
+// Capture only the record, so clearing its initializer releases the function
+// and its realm even if somebody saved the accessor's descriptor.
+function wasmerNapiLazyAccessors(definition) {
+  definition.getter = function () {
+    'use strict';
+    if (definition.initialized) return definition.value;
+    for (let running = wasmerNapiLazyInitializing; running; running = running.outer) {
+      if (running.holder === definition.holder && running.key === definition.key) {
+        throw new wasmerNapiLazyRangeError('A lazy property was read by its own initializer');
+      }
+    }
+    const outer = wasmerNapiLazyInitializing;
+    wasmerNapiLazyInitializing = {holder: definition.holder, key: definition.key, outer};
+    let value;
+    try {
+      value = wasmerNapiLazyApply(definition.initializer, definition.holder, [definition.key]);
+    } finally {
+      wasmerNapiLazyInitializing = outer;
+    }
+    const descriptor = wasmerNapiLazyDescriptor(definition.holder, definition.key);
+    if (definition.initialized ||
+        wasmerNapiLazyDefinition(definition.holder, definition.key, descriptor) !== definition) {
+      throw new wasmerNapiLazyTypeError('A lazy property changed while its initializer ran');
+    }
+    return wasmerNapiLazyCommit(definition, descriptor, value);
+  };
+  definition.setter = !definition.writable ? undefined : function (value) {
+    'use strict';
+    if (this !== definition.holder) {
+      if (!wasmerNapiIsObject(this)) {
+        throw new wasmerNapiLazyTypeError('Cannot assign an inherited lazy property');
+      }
+      const own = wasmerNapiLazyDescriptor(this, definition.key);
+      if ((own && wasmerNapiLazyDescriptor(own, 'writable')?.value !== true) ||
+          !wasmerNapiLazyDefine(this, definition.key, own ? {__proto__: null, value} : {
+            __proto__: null, value, writable: true, enumerable: true, configurable: true,
+          })) throw new wasmerNapiLazyTypeError('Cannot assign an inherited lazy property');
+      return;
+    }
+    const descriptor = wasmerNapiLazyDescriptor(definition.holder, definition.key);
+    if (wasmerNapiLazyDefinition(definition.holder, definition.key, descriptor) !== definition) {
+      throw new wasmerNapiLazyTypeError('A lazy property changed before assignment');
+    }
+    wasmerNapiLazyCommit(definition, descriptor, value);
+  };
+  wasmerNapiLazySet(wasmerNapiLazyGetters, definition.getter, definition);
+}
+export function wasmer_napi_define_lazy_data_properties(object, names, initializer, attributes) {
+  if ((attributes & ~7) !== 0) return 1;
+  if (!wasmerNapiIsObject(object)) return 2;
+  if (!wasmerNapiIsArray(names)) return 8;
+  if (typeof initializer !== 'function') return 5;
+  let typedArray = false;
+  try { wasmerNapiLazyTypedArrayLength(object); typedArray = true; } catch {}
+  // Snapshot and validate every name before installing the first accessor.
+  const count = names.length >>> 0, keys = {__proto__: null};
+  for (let i = 0; i < count; ++i) {
+    const key = names[i];
+    if (typeof key !== 'symbol') {
+      if (typeof key !== 'string') return 4;
+      const number = wasmerNapiLazyNumber(key);
+      const canonical = wasmerNapiLazyString(number) === key;
+      if ((canonical && number >= 0 && number < 4294967295 && number % 1 === 0) ||
+          (typedArray && (key === '-0' || canonical))) return 4;
+    }
+    keys[i] = key;
+  }
+  for (let i = 0; i < count; ++i) {
+    const definition = {
+      __proto__: null, holder: object, key: keys[i], initializer,
+      writable: (attributes & 1) !== 0, initialized: false, value: undefined,
+    };
+    wasmerNapiLazyAccessors(definition);
+    if (!wasmerNapiLazyDefine(object, definition.key, {
+      __proto__: null, get: definition.getter, set: definition.setter,
+      enumerable: (attributes & 2) !== 0, configurable: (attributes & 4) !== 0,
+    })) return 9;
+    wasmerNapiLazyAddHolder(wasmerNapiLazyHolders, object);
+  }
+  return 0;
+}
+export function wasmer_napi_is_lazy_data_property(object, key) {
+  // In particular, inspecting an untracked Proxy runs none of its traps.
+  if (!wasmerNapiLazyHasHolder(wasmerNapiLazyHolders, object)) return false;
+  const definition = wasmerNapiLazyDefinition(object, key, wasmerNapiLazyDescriptor(object, key));
+  return definition !== undefined && !definition.initialized;
+}
+export function wasmer_napi_property_writable(object, key, descriptor) {
+  return wasmerNapiLazyDefinition(object, key, descriptor)?.writable ??
+    wasmerNapiLazyDescriptor(descriptor, 'writable')?.value;
 }
 export function wasmer_napi_set_prototype(value, prototype) {
   if (!wasmerNapiIsObject(value) || (prototype !== null && !wasmerNapiIsObject(prototype))) {
@@ -1288,7 +1418,7 @@ export function wasmer_napi_get_all_property_names(value, mode, filter, conversi
       }
       const descriptor = Object.getOwnPropertyDescriptor(object, key);
       if (descriptor === undefined) continue;
-      if ((filter & 1) !== 0 && descriptor.writable !== true) continue;
+      if ((filter & 1) !== 0 && wasmer_napi_property_writable(object, key, descriptor) !== true) continue;
       if ((filter & 2) !== 0 && descriptor.enumerable !== true) continue;
       if ((filter & 4) !== 0 && descriptor.configurable !== true) continue;
 
@@ -1507,6 +1637,16 @@ extern "C" {
     #[wasm_bindgen(catch)]
     fn wasmer_napi_array_length(value: &JsValue) -> Result<f64, JsValue>;
     fn wasmer_napi_is_array(value: &JsValue) -> bool;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_define_lazy_data_properties(
+        object: &JsValue,
+        names: &JsValue,
+        initializer: &JsValue,
+        attributes: i32,
+    ) -> Result<i32, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_is_lazy_data_property(object: &JsValue, key: &JsValue) -> Result<bool, JsValue>;
+    fn wasmer_napi_property_writable(object: &JsValue, key: &JsValue, descriptor: &JsValue) -> JsValue;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_new(ctor: &Function, args: &Array) -> Result<JsValue, JsValue>;
     fn wasmer_napi_symbol(description: &JsValue) -> JsValue;
@@ -4675,6 +4815,81 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_promise_reject_callback(
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_define_lazy_data_properties(
+    env: SnapiEnv,
+    object_id: u32,
+    names_id: u32,
+    initializer_id: u32,
+    attributes: i32,
+) -> i32 {
+    let (object, names, initializer) = {
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        if attributes & !7 != 0 {
+            return NAPI_INVALID_ARG;
+        }
+        let (Some(object), Some(names), Some(initializer)) = (
+            state.agent.get(object_id).cloned(),
+            state.agent.get(names_id).cloned(),
+            state.agent.get(initializer_id).cloned(),
+        ) else {
+            return NAPI_INVALID_ARG;
+        };
+        (object, names, initializer)
+    };
+    // Names getters and Proxy traps can enter the guest. Keep no environment
+    // borrow across the JavaScript call.
+    match wasmer_napi_define_lazy_data_properties(&object, &names, &initializer, attributes) {
+        Ok(status) => status,
+        Err(error) => {
+            if let Ok(state) = unsafe { env_mut(env) } {
+                state.last_exception = Some(error);
+            }
+            NAPI_PENDING_EXCEPTION
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_is_lazy_data_property(
+    env: SnapiEnv,
+    object_id: u32,
+    key_id: u32,
+    result_out: *mut i32,
+) -> i32 {
+    if unsafe { write(result_out, 0) }.is_err() {
+        return NAPI_INVALID_ARG;
+    }
+    let (object, key) = {
+        let Ok(state) = (unsafe { env_mut(env) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        let (Some(object), Some(key)) = (
+            state.agent.get(object_id).cloned(),
+            state.agent.get(key_id).cloned(),
+        ) else {
+            return NAPI_INVALID_ARG;
+        };
+        if !object.is_object() && !object.is_function() {
+            return NAPI_OBJECT_EXPECTED;
+        }
+        if !key.is_string() && !key.is_symbol() {
+            return NAPI_NAME_EXPECTED;
+        }
+        (object, key)
+    };
+    match wasmer_napi_is_lazy_data_property(&object, &key) {
+        Ok(lazy) => unsafe { write(result_out, i32::from(lazy)) }
+            .map_or_else(|status| status, |()| NAPI_OK),
+        Err(error) => {
+            if let Ok(state) = unsafe { env_mut(env) } {
+                state.last_exception = Some(error);
+            }
+            NAPI_PENDING_EXCEPTION
+        }
+    }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
     env: SnapiEnv,
     value_id: u32,
@@ -4725,10 +4940,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
                 continue;
             }
             if filter_bits & 1 != 0
-                && Reflect::get(&descriptor, &JsValue::from_str("writable"))
-                    .ok()
-                    .and_then(|value| value.as_bool())
-                    == Some(false)
+                && wasmer_napi_property_writable(&object, &key, &descriptor).as_bool() == Some(false)
             {
                 continue;
             }
@@ -7874,6 +8086,234 @@ mod tests {
 
     fn leave(env: SnapiEnv, scope: u64) -> i32 {
         unsafe { snapi_bridge_unofficial_leave_realm(env, scope) }
+    }
+
+    #[wasm_bindgen_test]
+    fn lazy_properties_bridge_validates_handles_and_records_exceptions() {
+        with_env(|env, state| {
+            let object = state.agent.insert(Object::new().into());
+            let names = state
+                .agent
+                .insert(Array::of1(&JsValue::from_str("answer")).into());
+            let key = state.agent.insert(JsValue::from_str("answer"));
+            let initializer = state
+                .agent
+                .insert(Function::new_no_args("return 42").into());
+            let number = state.agent.insert(JsValue::from_f64(1.0));
+            let mut lazy = 99;
+            unsafe {
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        ptr::null_mut(),
+                        object,
+                        names,
+                        initializer,
+                        7
+                    ),
+                    NAPI_INVALID_ARG
+                );
+                for bad in [0, u32::MAX] {
+                    assert_eq!(
+                        snapi_bridge_unofficial_define_lazy_data_properties(
+                            env,
+                            bad,
+                            names,
+                            initializer,
+                            7
+                        ),
+                        NAPI_INVALID_ARG
+                    );
+                }
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        object,
+                        names,
+                        initializer,
+                        8
+                    ),
+                    NAPI_INVALID_ARG
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        number,
+                        names,
+                        initializer,
+                        7
+                    ),
+                    NAPI_OBJECT_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        object,
+                        object,
+                        initializer,
+                        7
+                    ),
+                    NAPI_ARRAY_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env, object, names, object, 7
+                    ),
+                    NAPI_FUNCTION_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_is_lazy_data_property(env, number, key, &mut lazy),
+                    NAPI_OBJECT_EXPECTED
+                );
+                assert_eq!(lazy, 0);
+                assert_eq!(
+                    snapi_bridge_unofficial_is_lazy_data_property(env, object, number, &mut lazy),
+                    NAPI_NAME_EXPECTED
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_is_lazy_data_property(
+                        env,
+                        object,
+                        key,
+                        ptr::null_mut()
+                    ),
+                    NAPI_INVALID_ARG
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        object,
+                        names,
+                        initializer,
+                        7
+                    ),
+                    NAPI_OK
+                );
+                assert_eq!(
+                    snapi_bridge_unofficial_is_lazy_data_property(env, object, key, &mut lazy),
+                    NAPI_OK
+                );
+                assert_eq!(lazy, 1);
+            }
+            assert_eq!(
+                Reflect::get(&value(env, object), &value(env, key))
+                    .unwrap()
+                    .as_f64(),
+                Some(42.0)
+            );
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_unofficial_is_lazy_data_property(env, object, key, &mut lazy)
+                },
+                NAPI_OK
+            );
+            assert_eq!(lazy, 0);
+
+            let names = Function::new_no_args(
+                "return Object.defineProperty(['x'], '0', {get() { throw new Error('names getter'); }})"
+            ).call0(&JsValue::UNDEFINED).unwrap();
+            let names = unsafe { env_mut(env) }.unwrap().agent.insert(names);
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        object,
+                        names,
+                        initializer,
+                        7,
+                    )
+                },
+                NAPI_PENDING_EXCEPTION
+            );
+            let error = unsafe { env_mut(env) }
+                .unwrap()
+                .last_exception
+                .take()
+                .unwrap();
+            assert_eq!(Error::from(error).message(), "names getter");
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn lazy_properties_keep_guest_initializer_realm_and_filter_without_initializing() {
+        with_env(|env, state| {
+            let object = state.agent.insert(Object::new().into());
+            let key = state.agent.insert(JsValue::from_str("answer"));
+            let names = state.agent.insert(Array::of1(&value(env, key)).into());
+            let answer = state.agent.insert(JsValue::from_f64(42.0));
+            let calls = Rc::new(Cell::new(0));
+            let realm = new_realm(env, 0).unwrap();
+            let scope = enter(env, realm).unwrap();
+            let initializer = native_function(env, {
+                let calls = calls.clone();
+                move |info| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(current_realm(env), realm);
+                    let (mut argc, mut argv, mut receiver) = (1, [0], 0);
+                    assert_eq!(
+                        unsafe {
+                            snapi_bridge_get_cb_info(
+                                env,
+                                info,
+                                &mut argc,
+                                argv.as_mut_ptr(),
+                                1,
+                                &mut receiver,
+                                ptr::null_mut(),
+                            )
+                        },
+                        NAPI_OK
+                    );
+                    assert_eq!(argc, 1);
+                    assert!(Object::is(&value(env, receiver), &value(env, object)));
+                    assert_eq!(value(env, argv[0]), value(env, key));
+                    answer
+                }
+            });
+            assert_eq!(leave(env, scope), NAPI_OK);
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_unofficial_define_lazy_data_properties(
+                        env,
+                        object,
+                        names,
+                        initializer,
+                        6,
+                    )
+                },
+                NAPI_OK
+            );
+            let mut filtered = 0;
+            for (filter, count) in [(1, 0), (2, 1), (4, 1)] {
+                assert_eq!(
+                    unsafe {
+                        snapi_bridge_unofficial_get_own_non_index_properties(
+                            env,
+                            object,
+                            filter,
+                            &mut filtered,
+                        )
+                    },
+                    NAPI_OK
+                );
+                assert_eq!(Array::from(&value(env, filtered)).length(), count);
+            }
+            assert_eq!(calls.get(), 0);
+            // The property wrapper retains the guest function's creation realm.
+            assert_eq!(
+                Reflect::get(&value(env, object), &value(env, key))
+                    .unwrap()
+                    .as_f64(),
+                Some(42.0)
+            );
+            assert_eq!(
+                Reflect::get(&value(env, object), &value(env, key))
+                    .unwrap()
+                    .as_f64(),
+                Some(42.0)
+            );
+            assert_eq!(calls.get(), 1);
+            assert_eq!(current_realm(env), 0);
+        });
     }
 
     // throw_val unwinds without running Rust destructors, so a callback must
