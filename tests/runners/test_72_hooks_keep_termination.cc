@@ -65,6 +65,34 @@ napi_value TerminateThenFatal(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+// Throws an error with a code through napi_throw_error, napi_throw_type_error,
+// napi_throw_range_error or node_api_throw_syntax_error, as its argument says.
+napi_value ThrowWithCode(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value kind_value = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, &argc, &kind_value, nullptr, nullptr), napi_ok);
+  int32_t kind = 0;
+  EXPECT_EQ(napi_get_value_int32(env, kind_value, &kind), napi_ok);
+  switch (kind) {
+    case 0: napi_throw_error(env, "ERR_TEST", "error"); break;
+    case 1: napi_throw_type_error(env, "ERR_TEST", "type error"); break;
+    case 2: napi_throw_range_error(env, "ERR_TEST", "range error"); break;
+    default: node_api_throw_syntax_error(env, "ERR_TEST", "syntax error"); break;
+  }
+  return nullptr;
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// Instantiates the module its data names; what that left pending is the
+// trampoline's to throw.
+napi_value InstantiateModule(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok) return nullptr;
+  unofficial_napi_module_wrap_instantiate(env, static_cast<unofficial_napi_module>(data));
+  return nullptr;
+}
+#endif
+
 // Evaluates the module its data names and returns the evaluation's promise;
 // what the evaluation left pending is the trampoline's to throw.
 napi_value EvaluateModule(napi_env env, napi_callback_info info) {
@@ -125,6 +153,7 @@ void InstallHelpers(napi_env env) {
   DefineGlobalFunction(env, "terminate", Terminate);
   DefineGlobalFunction(env, "terminateAndThrow", TerminateAndThrow);
   DefineGlobalFunction(env, "terminateThenFatal", TerminateThenFatal);
+  DefineGlobalFunction(env, "throwWithCode", ThrowWithCode);
   // Each catch block sets its flag first, by a plain store, at which no
   // engine looks for a termination.
   ASSERT_EQ(RunScript(env,
@@ -338,6 +367,71 @@ TEST_F(Test72HooksKeepTermination, PromiseHooks) {
     EXPECT_EQ(GlobalText(s.env, "caughtError"), "none");
     ASSERT_EQ(RunScript(s.env, "armed = false;"), napi_ok);
   }
+}
+
+// Errors the providers make with a code get it set as Node sets it, which runs
+// an inherited `code` setter. When V8 terminated the setter, V8's
+// napi_throw_error and its siblings, the serdes binding's constructors and
+// the module loader's link errors threw their error over the termination.
+TEST_F(Test72HooksKeepTermination, ErrorCodeSetter) {
+  constexpr char kCodeSetter[] =
+      "Object.defineProperty(Error.prototype, 'code',"
+      "  { set(value) { terminate(); tick(); }, configurable: true });";
+  for (int kind = 0; kind < 4; ++kind) {
+    SCOPED_TRACE(kind);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(RunScript(s.env, kCodeSetter), napi_ok);
+    const std::string script = "try { throwWithCode(" + std::to_string(kind) +
+                               "); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+                               "after = 'yes';\n";
+    ExpectRunTerminated(s.env, script.c_str());
+  }
+  {
+    SCOPED_TRACE("serdes constructor without new");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    napi_value binding = nullptr;
+    ASSERT_EQ(unofficial_napi_create_serdes_binding(s.env, &binding), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "serdes", binding), napi_ok);
+    ASSERT_EQ(RunScript(s.env, kCodeSetter), napi_ok);
+    ExpectRunTerminated(
+        s.env,
+        "try { serdes.Serializer(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+  }
+#if defined(NAPI_TEST_ENGINE_V8)
+  // QuickJS reports a module that is not linked through its own loader, a
+  // ReferenceError with no code, so no setter runs there.
+  {
+    SCOPED_TRACE("instantiating a module that is not linked");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    napi_value wrapper = nullptr;
+    napi_value undefined = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+    ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_text(Str(s.env, "import 'dep';"));
+    unofficial_napi_module_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+    options.kind = unofficial_napi_module_source_text;
+    options.wrapper = wrapper;
+    options.url = Str(s.env, "unlinked.mjs");
+    options.payload.source_text.source = &source;
+    options.payload.source_text.host_defined_option_id = undefined;
+    unofficial_napi_module_create_result created{};
+    ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+    DefineGlobalFunction(s.env, "instantiateModule", InstantiateModule, created.module);
+    ASSERT_EQ(RunScript(s.env, kCodeSetter), napi_ok);
+    ExpectRunTerminated(
+        s.env,
+        "try { instantiateModule(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, created.module), napi_ok);
+  }
+#endif
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)

@@ -860,7 +860,8 @@ void ThrowTypeErrorWithCode(v8::Local<v8::Context> context,
     (void)exception.As<v8::Object>()->Set(
         context, OneByteString(isolate, "code"), OneByteString(isolate, code));
   }
-  isolate->ThrowException(exception);
+  // Setting the code runs an inherited `code` setter.
+  napi_v8_throw_unless_terminating(isolate, exception);
 }
 
 v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
@@ -933,11 +934,8 @@ void SerializerContext::ThrowDataCloneError(v8::Local<v8::String> message) {
   if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
            .ToLocal(&get_data_clone_error) ||
       !get_data_clone_error->IsFunction()) {
-    // A getter V8 terminated: the termination is what fails the write, and
-    // throwing would replace it with a catchable error.
-    if (!isolate_->IsExecutionTerminating()) {
-      isolate_->ThrowException(v8::Exception::Error(message));
-    }
+    // A getter V8 terminated: the termination is what fails the write.
+    napi_v8_throw_unless_terminating(isolate_, v8::Exception::Error(message));
     return;
   }
 

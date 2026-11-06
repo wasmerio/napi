@@ -884,7 +884,8 @@ void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const st
   }
   napi_value error = nullptr;
   if (!CreateCodeError(env, code, message, &error) || error == nullptr) return;
-  context->GetIsolate()->ThrowException(napi_v8_unwrap_value(error));
+  // Setting the error's code runs an inherited `code` setter.
+  napi_v8_throw_unless_terminating(context->GetIsolate(), napi_v8_unwrap_value(error));
 }
 
 ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> module) {
