@@ -1643,9 +1643,12 @@ void napi_agent__::Shutdown() {
   near_heap_limit_data = nullptr;
   fatal_error_callback = nullptr;
   oom_error_callback = nullptr;
-  // The release runs its hooks and finalizers with JS usable.
+  // The release runs its hooks and finalizers with JS usable. As a cancel,
+  // this drops what the termination left pending: a native function that
+  // a hook's JS calls would otherwise throw it into that JS.
   termination_requested.store(false, std::memory_order_release);
   isolate->CancelTerminateExecution();
+  if (principal_env != nullptr) napi_v8_drop_pending_termination(principal_env);
   termination_probe.Reset();
   isolate->SetPromiseHook(nullptr);
   isolate->SetPromiseRejectCallback(nullptr);

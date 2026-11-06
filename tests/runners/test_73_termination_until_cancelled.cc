@@ -291,17 +291,21 @@ napi_value Eval(napi_env env, const char* source) {
   return result;
 }
 
-std::string GlobalText(napi_env env, const char* name) {
-  napi_value value = nullptr;
+std::string Text(napi_env env, napi_value value) {
   napi_value string = nullptr;
   char text[256] = {};
   size_t length = 0;
-  if (napi_get_named_property(env, Global(env), name, &value) != napi_ok ||
-      napi_coerce_to_string(env, value, &string) != napi_ok ||
+  if (value == nullptr || napi_coerce_to_string(env, value, &string) != napi_ok ||
       napi_get_value_string_utf8(env, string, text, sizeof(text), &length) != napi_ok) {
     return "<unreadable>";
   }
   return std::string(text, length);
+}
+
+std::string GlobalText(napi_env env, const char* name) {
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, Global(env), name, &value) != napi_ok) return "<unreadable>";
+  return Text(env, value);
 }
 
 // What EdgeJS does once the stack has unwound: take the pending exception,
@@ -319,6 +323,7 @@ bool FinishTermination(napi_env env) {
 
 void InstallHelpers(napi_env env) {
   DefineGlobalFunction(env, "terminate", Terminate);
+  DefineGlobalFunction(env, "noop", Noop);
   DefineGlobalFunction(env, "terminateThen", TerminateThen);
   DefineGlobalFunction(env, "callThen", CallThen);
   DefineGlobalFunction(env, "terminateThenCancel", TerminateThenCancel);
@@ -786,6 +791,39 @@ TEST_F(Test73TerminationUntilCancelled, TerminationRequestedInsideTheRelease) {
   // finalizer's run.
   EXPECT_EQ(g_release_runs,
             std::vector<napi_status>(4, napi_pending_exception));
+}
+
+// The release of an env whose termination was never cancelled, as after
+// worker.terminate(). V8's release cancels it and runs the hooks with JS
+// usable; QuickJS keeps it and refuses their JS. Either way, the null the
+// termination left pending must not be thrown into a hook's JS when it calls
+// a native function.
+namespace {
+std::string g_release_result;
+void ReleaseRunsJs(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  napi_value result = nullptr;
+  if (napi_run_script(env,
+                      Str(env,
+                          "(() => { try { noop(); return 'ok'; }\n"
+                          "catch (e) { return 'caught ' + String(e); } })()"),
+                      &result) != napi_ok) {
+    g_release_result = "refused";
+    return;
+  }
+  g_release_result = Text(env, result);
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, ReleaseAfterAnUncancelledTermination) {
+  g_release_result.clear();
+  {
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, ReleaseRunsJs, s.env), napi_ok);
+    EXPECT_EQ(RunScript(s.env, "terminate(); tick();"), napi_pending_exception);
+  }
+  EXPECT_TRUE(g_release_result == "ok" || g_release_result == "refused") << g_release_result;
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
