@@ -3,7 +3,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
 };
 use wasixv2::{Machine, Stdio};
 use wasmer_napi::{NapiCtx, NapiHook, NapiMemoryAccountant, NativeGuestChunk, NativeGuestRefill};
@@ -890,4 +890,400 @@ fn dso_main_wat(startup_dependency: bool) -> String {
     DSO_MAIN
         .replace("{request}", request)
         .replace("{request_len}", request_len)
+}
+
+const NO_NAPI_CONTEXT_GUEST: &str = r#"(module
+    (import "env" "memory" (memory 2 2048 shared))
+    (import "wasix_32v1" "context_create"
+        (func $create (param i32 i32) (result i32)))
+    (import "wasix_32v1" "context_switch"
+        (func $switch (param i64) (result i32)))
+    (import "wasix_32v1" "context_destroy"
+        (func $destroy (param i64) (result i32)))
+    (import "wasix_32v1" "fd_write"
+        (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+    (table (export "__indirect_function_table") 4 funcref)
+    (elem (i32.const 1) $a $b $bad)
+    (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+    (global (export "__data_end") i32 (i32.const 65536))
+    (global (export "__heap_base") i32 (i32.const 65536))
+    (global $phase (mut i32) (i32.const 0))
+    (func $bad (param i32))
+    (func $mark (param $byte i32)
+        i32.const 256 local.get $byte i32.store8
+        i32.const 64 i32.const 256 i32.store
+        i32.const 68 i32.const 1 i32.store
+        i32.const 1 i32.const 64 i32.const 1 i32.const 72 call $write drop)
+    (func $check (param $actual i32) (param $expected i32)
+        local.get $actual local.get $expected i32.ne
+        if i32.const 90 call $exit end)
+    (func $a (local $kept i64)
+        i64.const 0x123456789abcdef local.set $kept
+        i32.const 1 global.set $phase
+        i32.const 65 call $mark
+        i64.load (i32.const 8) call $switch i32.const 0 call $check
+        global.get $phase i32.const 2 call $check
+        local.get $kept i64.const 0x123456789abcdef i64.ne
+        if i32.const 91 call $exit end
+        i32.const 97 call $mark
+        i32.const 3 global.set $phase
+        i64.const 0 call $switch i32.const 0 call $check
+        i32.const 92 call $exit)
+    (func $b
+        global.get $phase i32.const 1 call $check
+        i32.const 2 global.set $phase
+        i32.const 66 call $mark
+        i64.load (i32.const 0) call $switch i32.const 0 call $check
+        i32.const 93 call $exit)
+    (func (export "_start")
+        i32.const 114 call $mark
+        i64.const 0 call $switch i32.const 0 call $check
+        i32.const 0 i32.const 1 call $create i32.const 0 call $check
+        i32.const 8 i32.const 2 call $create i32.const 0 call $check
+        i32.const 16 i32.const 3 call $create i32.const 28 call $check
+        i32.const 131068 i32.const 1 call $create i32.const 78 call $check
+        i64.load (i32.const 0) call $switch i32.const 0 call $check
+        global.get $phase i32.const 3 call $check
+        i32.const 82 call $mark
+        i64.load (i32.const 8) call $destroy i32.const 0 call $check
+        i64.load (i32.const 8) call $destroy i32.const 0 call $check
+        i64.load (i32.const 8) call $switch i32.const 28 call $check
+        i64.const 0 call $destroy i32.const 28 call $check
+        i64.load (i32.const 0) call $destroy i32.const 0 call $check
+        i32.const 0 call $exit))"#;
+
+const NAPI_CONTEXT_GUEST: &str = r#"(module
+    (import "env" "memory" (memory 2 2048 shared))
+    (import "wasix_32v1" "context_create"
+        (func $create (param i32 i32) (result i32)))
+    (import "wasix_32v1" "context_switch"
+        (func $switch (param i64) (result i32)))
+    (import "wasix_32v1" "context_destroy"
+        (func $destroy (param i64) (result i32)))
+    (import "wasix_32v1" "fd_write"
+        (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_configure_runtime"
+        (func $configure (param i32) (result i32)))
+    (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
+        (func $gc (param i32) (result i32)))
+    (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+    (import "napi" "napi_create_string_utf8"
+        (func $string (param i32 i32 i32 i32) (result i32)))
+    (import "napi" "napi_run_script" (func $script (param i32 i32 i32) (result i32)))
+    (import "napi" "napi_get_value_int32" (func $integer (param i32 i32 i32) (result i32)))
+    (table (export "__indirect_function_table") 3 funcref)
+    (elem (i32.const 1) $a $b)
+    (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+    (global (export "__data_end") i32 (i32.const 65536))
+    (global (export "__heap_base") i32 (i32.const 65536))
+    (data (i32.const 1024) "globalThis.keep = new Uint8Array(33554432); keep[0] = 41; keep[33554431] = 1; globalThis.napiContextMarker = 0; keep[0] + keep[33554431]\00")
+    (data (i32.const 2048) "++globalThis.napiContextMarker; keep[0] + keep[33554431]\00")
+    (data (i32.const 2304) "globalThis.napiContextMarker === 3 && keep[0] + keep[33554431] === 42 ? 42 : 0\00")
+    (global $env (mut i32) (i32.const 0))
+    (global $phase (mut i32) (i32.const 0))
+    (func $check (param $actual i32)
+        local.get $actual if i32.const 90 call $exit end)
+    (func $mark (param $byte i32)
+        i32.const 256 local.get $byte i32.store8
+        i32.const 64 i32.const 256 i32.store
+        i32.const 68 i32.const 1 i32.store
+        i32.const 1 i32.const 64 i32.const 1 i32.const 72 call $write drop)
+    (func $init_runtime
+        i32.const 0 call $configure call $check
+        call $init global.set $env
+        global.get $env i32.eqz if i32.const 90 call $exit end)
+    (func $eval (param $source i32)
+        global.get $env local.get $source i32.const -1 i32.const 8 call $string call $check
+        global.get $env i32.const 8 i32.load i32.const 12 call $script call $check
+        global.get $env i32.const 12 i32.load i32.const 16 call $integer call $check
+        i32.const 16 i32.load i32.const 42 i32.ne
+        if i32.const 91 call $exit end)
+    (func $collect
+        global.get $env call $gc call $check)
+    (func $a (local $kept i64)
+        global.get $env i32.eqz
+        if
+            call $init_runtime
+            i32.const 1024 call $eval
+            call $collect
+        end
+        i64.const 0x123456789abcdef local.set $kept
+        i32.const 65 call $mark
+        i32.const 2048 call $eval
+        call $collect
+        i32.const 1 global.set $phase
+        i64.load (i32.const 104) call $switch call $check
+        global.get $phase i32.const 2 i32.ne
+        if i32.const 92 call $exit end
+        local.get $kept i64.const 0x123456789abcdef i64.ne
+        if i32.const 93 call $exit end
+        i32.const 97 call $mark
+        i32.const 2048 call $eval
+        call $collect
+        i32.const 3 global.set $phase
+        i64.const 0 call $switch call $check
+        i32.const 94 call $exit)
+    (func $b
+        global.get $phase i32.const 1 i32.ne
+        if i32.const 95 call $exit end
+        i32.const 2 global.set $phase
+        i32.const 66 call $mark
+        i32.const 2048 call $eval
+        call $collect
+        i64.load (i32.const 96) call $switch call $check
+        i32.const 96 call $exit)
+    (func (export "_start")
+        __MAIN_INIT__
+        i32.const 77 call $mark
+        i64.const 0 call $switch call $check
+        i32.const 96 i32.const 1 call $create call $check
+        i32.const 104 i32.const 2 call $create call $check
+        i64.load (i32.const 96) call $switch call $check
+        global.get $phase i32.const 3 i32.ne
+        if i32.const 97 call $exit end
+        i32.const 77 call $mark
+        i32.const 2304 call $eval
+        call $collect
+        i64.load (i32.const 104) call $destroy call $check
+        i64.load (i32.const 104) call $destroy call $check
+        i64.load (i32.const 104) call $switch i32.const 28 i32.ne
+        if i32.const 98 call $exit end
+        i64.const 0 call $destroy i32.const 28 i32.ne
+        if i32.const 99 call $exit end
+        i64.load (i32.const 96) call $destroy call $check
+        i32.const 0 call $exit))"#;
+
+#[derive(Default)]
+struct ContextThreadAccountant {
+    charged: std::sync::atomic::AtomicU64,
+    charge_threads: Mutex<Vec<std::thread::ThreadId>>,
+    release_threads: Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl NapiMemoryAccountant for ContextThreadAccountant {
+    fn memory_limit(&self) -> u64 {
+        8 * 1024 * 1024 * 1024
+    }
+
+    fn memory_charged(&self) -> u64 {
+        self.charged.load(Ordering::SeqCst)
+    }
+
+    fn try_charge(&self, bytes: u64) -> bool {
+        self.charge_threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        self.charged.fetch_add(bytes, Ordering::SeqCst);
+        true
+    }
+
+    fn uncharge(&self, bytes: u64) {
+        self.release_threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        self.charged.fetch_sub(bytes, Ordering::SeqCst);
+    }
+}
+
+fn run_in_native_test_child(test_name: &str, child_key: &str) -> bool {
+    if std::env::var_os(child_key).is_some() {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_key, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "native context child failed: {status}");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("native context child did not finish");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[tokio::test]
+async fn facade_native_optional_napi_hook_preserves_contexts_without_napi_imports() {
+    if !run_in_native_test_child(
+        "facade_native_optional_napi_hook_preserves_contexts_without_napi_imports",
+        "WASIXV2_NAPI_NO_NAPI_CONTEXT_CHILD",
+    ) {
+        return;
+    }
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let context = NapiCtx::builder().max_sessions(1).max_envs(1).build();
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
+                .build();
+            let wasm = wat::parse_str(NO_NAPI_CONTEXT_GUEST).unwrap();
+            let marks = Arc::new(Mutex::new(Vec::new()));
+            let captured_marks = marks.clone();
+            assert_eq!(
+                machine
+                    .run(
+                        &wasm,
+                        Stdio::from_fns(
+                            move |bytes| {
+                                let current = std::thread::current().id();
+                                captured_marks
+                                    .lock()
+                                    .unwrap()
+                                    .extend(bytes.iter().map(|byte| (*byte, current.clone())));
+                            },
+                            |_| {},
+                        ),
+                    )
+                    .await
+                    .unwrap(),
+                0,
+                "the original non-LIFO context behavior must remain available with an unused NAPI hook"
+            );
+            machine.shutdown().await;
+
+            let marks = marks.lock().unwrap();
+            let bytes: Vec<_> = marks.iter().map(|(byte, _)| *byte).collect();
+            assert_eq!(bytes, b"rABaR");
+            let owner = marks
+                .first()
+                .expect("context imports were observed")
+                .1
+                .clone();
+            assert!(
+                marks.iter().all(|(_, thread)| *thread == owner),
+                "all logical contexts must call host imports on one owner thread"
+            );
+            assert_eq!(context.active_sessions(), 0);
+            let usage = context.budget().snapshot();
+            assert_eq!(usage.live_isolates, 0);
+            assert_eq!(usage.v8_heap_reserved, 0);
+            assert_eq!(usage.v8_external, 0);
+            assert_eq!(usage.wasm_linear, 0);
+            assert_eq!(usage.mem_charged, 0);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn facade_native_napi_context_switches_preserve_refilled_provider() {
+    if !run_in_native_test_child(
+        "facade_native_napi_context_switches_preserve_refilled_provider",
+        "WASIXV2_NAPI_CONTEXT_SWITCH_CHILD",
+    ) {
+        return;
+    }
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (shared, initialize_on_main) in
+                [(true, true), (false, true), (true, false), (false, false)]
+            {
+                let accountant = Arc::new(ContextThreadAccountant::default());
+                let context = NapiCtx::builder()
+                    .max_sessions(1)
+                    .max_envs(1)
+                    .memory_accountant(accountant.clone())
+                    .build();
+                let machine = Machine::builder()
+                    .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
+                    .build();
+                let mut source = NAPI_CONTEXT_GUEST.replace(
+                    "__MAIN_INIT__",
+                    if initialize_on_main {
+                        "call $init_runtime\n        i32.const 1024 call $eval\n        call $collect"
+                    } else {
+                        ""
+                    },
+                );
+                if !shared {
+                    source = source.replace(
+                        "(memory 2 2048 shared)",
+                        "(memory 2 2048)",
+                    );
+                }
+                let wasm = wat::parse_str(&source).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid NAPI context fixture (shared={shared}, initialize_on_main={initialize_on_main}): {error}"
+                    )
+                });
+                let marks = Arc::new(Mutex::new(Vec::new()));
+                let captured_marks = marks.clone();
+                let observed_context = context.clone();
+                assert_eq!(
+                    machine
+                        .run(
+                            &wasm,
+                            Stdio::from_fns(
+                                move |bytes| {
+                                    let current = std::thread::current().id();
+                                    let active = observed_context.active_sessions();
+                                    captured_marks.lock().unwrap().extend(
+                                        bytes.iter().map(|byte| {
+                                            (*byte, current.clone(), active)
+                                        }),
+                                    );
+                                },
+                                |_| {},
+                            ),
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "NAPI context run failed (shared={shared}, initialize_on_main={initialize_on_main}): {error}"
+                            )
+                        }),
+                    0,
+                    "NAPI context guest must complete all switched evaluations"
+                );
+                machine.shutdown().await;
+
+                let marks = marks.lock().unwrap();
+                let bytes: Vec<_> = marks.iter().map(|(byte, _, _)| *byte).collect();
+                assert_eq!(bytes, b"MABaM");
+                let owner = marks
+                    .first()
+                    .expect("NAPI host imports were observed")
+                    .1
+                    .clone();
+                assert!(
+                    marks
+                        .iter()
+                        .all(|(_, thread, active)| *thread == owner && *active == 1),
+                    "attachment-backed NAPI calls and each logical context import must stay on the live owner's thread"
+                );
+                assert_eq!(context.active_sessions(), 0);
+                let usage = context.budget().snapshot();
+                assert_eq!(usage.live_isolates, 0);
+                assert_eq!(usage.v8_heap_reserved, 0);
+                assert_eq!(usage.v8_external, 0);
+                assert_eq!(usage.wasm_linear, 0);
+                assert_eq!(usage.mem_charged, 0);
+                assert_eq!(accountant.memory_charged(), 0);
+
+                let charge_threads = accountant.charge_threads.lock().unwrap();
+                let release_threads = accountant.release_threads.lock().unwrap();
+                assert!(
+                    !charge_threads.is_empty() && !release_threads.is_empty(),
+                    "provider configuration and retirement must both pass through the accountant"
+                );
+                assert!(
+                    charge_threads.iter().all(|thread| *thread == owner)
+                        && release_threads.iter().all(|thread| *thread == owner),
+                    "provider configuration, guest calls, and retirement must share the owner thread"
+                );
+            }
+        })
+        .await;
 }
