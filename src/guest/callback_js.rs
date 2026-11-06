@@ -6,7 +6,7 @@ use wasmer::{AsStoreMut, AsStoreRef, FunctionEnv, FunctionEnvMut, Store, Table, 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::future::Future;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::{AsStoreAsync, AsyncFunctionEnvMut, StoreAsync};
+use wasmer::{AsStoreAsync, AsyncFunctionEnvMut, WeakStoreAsync};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -49,7 +49,9 @@ enum CallbackEnv {
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub(crate) struct AsyncCallbackOwner {
     env: FunctionEnv<NapiEnv>,
-    store: StoreAsync,
+    store_id: usize,
+    // NapiEnv lives inside the store; an owning handle here would form a cycle.
+    store: WeakStoreAsync,
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -57,16 +59,19 @@ impl Clone for AsyncCallbackOwner {
     fn clone(&self) -> Self {
         Self {
             env: self.env.clone(),
-            store: self.store.store(),
+            store_id: self.store_id,
+            store: self.store.clone(),
         }
     }
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 fn async_callback_owner(env: &FunctionEnvMut<NapiEnv>) -> Option<AsyncCallbackOwner> {
+    let store = env.as_store_async()?.store();
     Some(AsyncCallbackOwner {
         env: env.as_ref(),
-        store: env.as_store_async()?.store(),
+        store_id: store.store_id().as_raw().get(),
+        store: store.downgrade(),
     })
 }
 
@@ -78,7 +83,7 @@ impl CallbackEnv {
         let (env, store_id) = match self {
             Self::Sync { env, store_id } => (env, *store_id),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
-            Self::Async(owner) => (&owner.env, owner.store.store_id().as_raw().get()),
+            Self::Async(owner) => (&owner.env, owner.store_id),
         };
         // A synchronous bridge call explicitly lends its store. Never recover
         // a different store merely because it happens to be current.
@@ -95,7 +100,7 @@ impl CallbackEnv {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         if let Self::Async(owner) = self {
             // A busy JSPI store defers the callback to a guest checkpoint.
-            if let Some(mut store) = owner.store.try_write_lock() {
+            if let Some(mut store) = owner.store.upgrade()?.try_write_lock() {
                 return Some(callback(&mut owner.env.clone().into_mut(&mut store)));
             }
         }
@@ -123,7 +128,7 @@ pub(crate) fn install_persistent_callback_state(
 }
 
 /// Gives a new env its persistent callback context, owned by the store's JSPI
-/// shared `StoreAsync` handle. A synchronous store has no such owner yet; some
+/// weak store handle. A synchronous store has no such owner yet; some
 /// embedders promote it to an async store later. Until then the env waits:
 /// the next callback state installed once the store is async, synchronous or
 /// async (a checkpoint, a message wait), installs the context.
@@ -608,7 +613,8 @@ where
         if !sync_env.data().envs_awaiting_async_owner.is_empty() {
             let owner = AsyncCallbackOwner {
                 env: env.as_ref(),
-                store: env.as_store_async().store(),
+                store_id: env.as_store_async().store_id().as_raw().get(),
+                store: env.as_store_async().store().downgrade(),
             };
             install_awaited_async_owner(&mut sync_env, snapi_env, Some(owner));
         }
@@ -772,7 +778,8 @@ mod tests {
         let store = store.into_async();
         let callback = CallbackEnv::Async(AsyncCallbackOwner {
             env: function_env.clone(),
-            store: store.store(),
+            store_id: store.store_id().as_raw().get(),
+            store: store.downgrade(),
         });
         assert_eq!(
             callback.with_env(|env| {
@@ -788,7 +795,13 @@ mod tests {
             callback.with_env(|env| env.data().default_napi_env_id),
             Some(Some(17))
         );
-        drop(callback);
-        assert!(store.into_store().is_ok());
+        // The environment can be retained by host callbacks after cancellation.
+        // They must neither keep the store shared nor dispatch after release.
+        let store = store
+            .into_store()
+            .expect("callbacks must not retain the store");
+        assert!(callback.with_env(|_| ()).is_none());
+        drop(store);
+        assert!(callback.with_env(|_| ()).is_none());
     }
 }

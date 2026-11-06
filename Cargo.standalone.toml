@@ -36,15 +36,15 @@ cli-llvm = ["cli", "wasmer/llvm"]
 anyhow = "1"
 # Pin Wasmer's API, WASIX runtime and import bridges to one immutable revision;
 # mixing these sources with published crates can omit required bridge APIs.
-wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", default-features = false }
+wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", optional = true }
-wasmer-c-api-imports = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", optional = true, default-features = false }
-wasmer-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", optional = true }
+wasmer-cache = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", optional = true }
+wasmer-c-api-imports = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", optional = true, default-features = false }
+wasmer-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", optional = true }
 # Non-optional: `mod guest` (always compiled) re-raises guest WASI process
 # exits through the N-API import layers and needs the WASIX error type.
-virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", optional = true }
+virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
@@ -54,15 +54,15 @@ smallvec = "1.15"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", default-features = false, features = [
+wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", default-features = false, features = [
   "js",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", default-features = false, features = [
+wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", default-features = false, features = [
   "sys-default",
 ] }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "a021148d9829695134936a2524c2bf0a8306bc34", default-features = false, features = [
+wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "08c13afc3b2a8cd793658b42c223278adfc93a0f", default-features = false, features = [
   "sys",
 ] }
 
