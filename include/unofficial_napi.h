@@ -942,7 +942,9 @@ typedef enum {
 // Version 2 appended `realm_or_null`, the realm the code is compiled for (NULL:
 // the env's own). Version 1, which ends before it (`size` at least
 // UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_V1_SIZE), is deprecated but still
-// accepted: it compiles for the current realm.
+// accepted: it compiles for the current realm, as
+// unofficial_napi_contextify_run_script finds it for a NULL `sandbox_or_null`
+// (see its QuickJS note).
 //
 // Zero-initialize the struct (`= {0}` in C, `{}` in C++) before setting its
 // fields. Source written before version 2 that sets `size` to sizeof,
@@ -1119,7 +1121,8 @@ typedef struct unofficial_napi_module__* unofficial_napi_module;
 //   contextified object (a realm's global or sandbox, which the env's own
 //   global may be), the env's realm for the env's own global otherwise, and
 //   for NULL, undefined or null the env's realm (version 2) or the current
-//   realm (version 1). Any other value is napi_invalid_arg.
+//   realm as that call finds it, QuickJS note included (version 1). Any
+//   other value is napi_invalid_arg.
 //
 // Zero-initialize the struct (`= {0}` in C, `{}` in C++) before setting its
 // fields. Source written before version 2 that sets `size` to sizeof,

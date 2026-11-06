@@ -140,7 +140,7 @@ calls take a realm's global or sandbox.
 | `unofficial_napi_contextify_make_context` | `create_realm` | An object or function sandbox becomes `sandbox_or_null`; a symbol (`vm.constants.DONT_CONTEXTIFY`) makes a fresh global. The other arguments become the realm options of the same names. Returns the realm's global: the sandbox, or the fresh global. |
 | `unofficial_napi_contextify_run_script` | `run_script` | The sandbox names the realm, as below. |
 | `unofficial_napi_contextify_compile_function` | `compile_function` | The parsing context names the realm, as below. |
-| Bytecode-open options version 1 | Version 2, `realm_or_null` | Compiles for the current realm. |
+| Bytecode-open options version 1 | Version 2, `realm_or_null` | Compiles for the current realm, as nothing means below. |
 | Module-create options version 1, and `context_or_undefined` in version 2 | Version 2, `realm_or_null` | The context names the realm, as below. |
 | The env hooks' `context_token_assign_callback` and `context_token_unassign_callback` | Per-realm state keyed by the realm's global | Tokens on realms, as below. |
 
@@ -161,7 +161,8 @@ calls take a realm's global or sandbox.
     sandbox. So while the realm whose sandbox is the env's own global is
     current, nothing means that realm on V8, but the env's realm on QuickJS
     and with the host-JS guest imports: there `napi_get_global` returns the
-    sandbox, the env's own global.
+    sandbox, the env's own global. That holds for version 1 of the
+    bytecode-open and module-create options too.
 - **Structs grow at the end.** Version 1 of the bytecode-open and
   module-create options keeps `main`'s layout, and version 2 appends
   `realm_or_null`. A provider reads a version 1 struct only up to

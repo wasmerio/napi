@@ -1165,13 +1165,13 @@ napi_value SyntaxErrorPrototype(napi_env env, const void* options) {
   return Prototype(env, error);
 }
 
-// Creates "export const g = globalThis;" from `options` (main's version-1
-// layout or the current one), evaluates it and returns g. `status_out`
-// receives module_wrap_create's status.
+// Creates `code` ("export const g = globalThis;" unless given) from `options`
+// (main's version-1 layout or the current one), evaluates it and returns g.
+// `status_out` receives module_wrap_create's status.
 template <typename Options>
-napi_value ModuleGlobal(napi_env env, Options options, napi_status* status_out) {
-  const unofficial_napi_js_source source =
-      unofficial_napi_js_source_from_text(Str(env, "export const g = globalThis;"));
+napi_value ModuleGlobal(napi_env env, Options options, napi_status* status_out,
+                        const char* code = "export const g = globalThis;") {
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(Str(env, code));
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = Object(env);
   options.url = Str(env, "compat.mjs");
@@ -1433,6 +1433,59 @@ TEST_F(Test71ContextifyCompat, TheEnvsGlobalAsASandbox) {
   EXPECT_TRUE(StrictEquals(s.env, array_in(nullptr), env_array));
 #else
   EXPECT_TRUE(StrictEquals(s.env, array_in(nullptr), realm_array));
+#endif
+}
+
+// Version 1 of the bytecode and module options takes the current realm as
+// unofficial_napi_contextify_run_script finds it for nothing: while the realm
+// whose sandbox is the env's own global is current, that realm on V8, but the
+// env's realm on QuickJS (see TheEnvsGlobalAsASandbox).
+TEST_F(Test71ContextifyCompat, VersionOneOptionsInTheEnvsGlobalAsASandbox) {
+  EnvScope s(runtime_.get());
+
+  napi_value env_global = Global(s.env);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = env_global;
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+
+  MainBytecodeOpenOptionsV1 bytecode_v1 = MainBytecodeOptions(s.env, "(");
+  unofficial_napi_bytecode_open_options bytecode_v2{};
+  std::memcpy(&bytecode_v2, &bytecode_v1, sizeof(bytecode_v1));
+  bytecode_v2.size = sizeof(bytecode_v2);
+  bytecode_v2.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  napi_value env_syntax = SyntaxErrorPrototype(s.env, &bytecode_v2);
+  bytecode_v2.realm_or_null = realm;
+  napi_value realm_syntax = SyntaxErrorPrototype(s.env, &bytecode_v2);
+  ASSERT_NE(env_syntax, nullptr);
+  ASSERT_NE(realm_syntax, nullptr);
+  ASSERT_FALSE(StrictEquals(s.env, env_syntax, realm_syntax));
+
+  napi_status status = napi_generic_failure;
+  const char* const array_module = "export const g = [];";
+  napi_value env_array =
+      Prototype(s.env, ModuleGlobal(s.env, ModuleOptions(nullptr, nullptr), &status, array_module));
+  napi_value realm_array =
+      Prototype(s.env, ModuleGlobal(s.env, ModuleOptions(realm, nullptr), &status, array_module));
+  ASSERT_NE(env_array, nullptr);
+  ASSERT_NE(realm_array, nullptr);
+  ASSERT_FALSE(StrictEquals(s.env, env_array, realm_array));
+  auto module_array = [&](napi_value context) {
+    return Prototype(s.env, ModuleGlobal(s.env, MainModuleOptions(context), &status, array_module));
+  };
+
+  EXPECT_TRUE(StrictEquals(s.env, SyntaxErrorPrototype(s.env, &bytecode_v1), env_syntax));
+  EXPECT_TRUE(StrictEquals(s.env, module_array(nullptr), env_array));
+  EXPECT_TRUE(StrictEquals(s.env, module_array(env_global), realm_array));
+  EnteredRealm entered(s.env, realm);
+  EXPECT_TRUE(StrictEquals(s.env, module_array(env_global), realm_array));
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_TRUE(StrictEquals(s.env, SyntaxErrorPrototype(s.env, &bytecode_v1), env_syntax));
+  EXPECT_TRUE(StrictEquals(s.env, module_array(nullptr), env_array));
+#else
+  EXPECT_TRUE(StrictEquals(s.env, SyntaxErrorPrototype(s.env, &bytecode_v1), realm_syntax));
+  EXPECT_TRUE(StrictEquals(s.env, module_array(nullptr), realm_array));
 #endif
 }
 

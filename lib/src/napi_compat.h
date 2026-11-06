@@ -29,7 +29,7 @@ napi_status realm_from_context(napi_env env,
                                unofficial_napi_realm* realm_out);
 
 // Checks the size and version of bytecode-open options (version 1 or 2) and
-// returns the realm to compile for: version 1 compiles for the current realm.
+// returns the realm to compile for: version 1 compiles for current_realm's.
 napi_status bytecode_open_realm(napi_env env,
                                 const unofficial_napi_bytecode_open_options* options,
                                 unofficial_napi_realm* realm_out);
