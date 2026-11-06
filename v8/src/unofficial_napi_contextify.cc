@@ -1104,32 +1104,39 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
 
 v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> context,
                                                          v8::Local<v8::Module> module) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Value>();
-  ModuleWrapRecord* record = FindModuleRecordForModule(env, module);
-  if (record == nullptr) return v8::MaybeLocal<v8::Value>();
-
-  napi_value wrapper = GetRefValue(env, record->wrapper_ref);
-  napi_value callback = GetRefValue(env, record->synthetic_eval_steps_ref);
-  if (wrapper == nullptr || callback == nullptr) return v8::MaybeLocal<v8::Value>();
-
-  napi_value ignored = nullptr;
-  if (napi_call_function(env, wrapper, callback, 0, nullptr, &ignored) != napi_ok) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+  v8::Isolate* isolate = context->GetIsolate();
+  napi_env env = GetModuleWrapEnvForIsolate(isolate);
+  ModuleWrapRecord* record = env != nullptr ? FindModuleRecordForModule(env, module) : nullptr;
+  napi_value wrapper = record != nullptr ? GetRefValue(env, record->wrapper_ref) : nullptr;
+  napi_value callback =
+      record != nullptr ? GetRefValue(env, record->synthetic_eval_steps_ref) : nullptr;
+  napi_valuetype callback_type = napi_undefined;
+  // Steps that are gone or not a function are none, as on QuickJS: the module
+  // evaluates and its exports stay undefined. V8 takes an empty result for an
+  // exception thrown and aborts the process when none was, so this returns
+  // one only after throwing.
+  if (wrapper != nullptr && callback != nullptr &&
+      napi_typeof(env, callback, &callback_type) == napi_ok && callback_type == napi_function) {
+    napi_value ignored = nullptr;
+    if (napi_call_function(env, wrapper, callback, 0, nullptr, &ignored) != napi_ok) {
+      bool pending = false;
       napi_value error = nullptr;
-      if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
-        context->GetIsolate()->ThrowException(napi_v8_unwrap_value(error));
+      if (napi_is_exception_pending(env, &pending) == napi_ok && pending &&
+          napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
+        isolate->ThrowException(napi_v8_unwrap_value(error));
+      } else if (!isolate->IsExecutionTerminating()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "Synthetic module evaluation failed")));
       }
+      return v8::MaybeLocal<v8::Value>();
     }
-    return v8::MaybeLocal<v8::Value>();
   }
 
   v8::Local<v8::Promise::Resolver> resolver;
   if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
     return v8::MaybeLocal<v8::Value>();
   }
-  if (resolver->Resolve(context, v8::Undefined(context->GetIsolate())).IsNothing()) {
+  if (resolver->Resolve(context, v8::Undefined(isolate)).IsNothing()) {
     return v8::MaybeLocal<v8::Value>();
   }
   return resolver->GetPromise();

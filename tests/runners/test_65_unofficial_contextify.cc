@@ -1366,3 +1366,109 @@ TEST_F(Test65UnofficialContextify, DynamicImportFromACleanupHookAfterTheLoadersC
         << outcome;
   }
 }
+
+namespace {
+
+std::string ValueText(napi_env env, napi_value value) {
+  napi_value string = nullptr;
+  char text[256] = {};
+  size_t length = 0;
+  if (value == nullptr || napi_coerce_to_string(env, value, &string) != napi_ok ||
+      napi_get_value_string_utf8(env, string, text, sizeof(text), &length) != napi_ok) {
+    return "<unprintable>";
+  }
+  return std::string(text, length);
+}
+
+// Takes the pending exception: its message, or "" when none was pending.
+std::string TakePendingMessage(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return "";
+  napi_value error = nullptr;
+  napi_value message = nullptr;
+  if (napi_get_and_clear_last_exception(env, &error) != napi_ok) return "<not taken>";
+  if (napi_get_named_property(env, error, "message", &message) != napi_ok) return "<no message>";
+  return ValueText(env, message);
+}
+
+// How `promise` settles once the microtasks have run: "resolved", or
+// "rejected: <message>".
+std::string PromiseOutcome(napi_env env, napi_value promise) {
+  napi_value global = nullptr;
+  napi_value outcome = nullptr;
+  if (promise == nullptr || napi_get_global(env, &global) != napi_ok ||
+      napi_set_named_property(env, global, "settling", promise) != napi_ok ||
+      napi_run_script(env,
+                      Str(env,
+                          "globalThis.outcome = 'pending';"
+                          "Promise.resolve(settling).then(() => { outcome = 'resolved'; },"
+                          "  (e) => { outcome = 'rejected: ' + (e && e.message); });"
+                          "0"),
+                      &outcome) != napi_ok) {
+    return "<not observed>";
+  }
+  RunMicrotasks(env);
+  if (napi_get_named_property(env, global, "outcome", &outcome) != napi_ok) return "<unread>";
+  return ValueText(env, outcome);
+}
+
+struct Evaluated {
+  napi_status evaluate = napi_generic_failure;
+  std::string pending;
+  std::string outcome;
+  napi_value ns = nullptr;
+};
+
+// Creates the module, links it to nothing, instantiates and evaluates it.
+Evaluated CreateAndEvaluate(napi_env env, const unofficial_napi_module_create_options& options) {
+  Evaluated out;
+  unofficial_napi_module_create_result created{};
+  EXPECT_EQ(unofficial_napi_module_wrap_create(env, &options, &created), napi_ok);
+  if (created.module == nullptr) return out;
+  EXPECT_EQ(unofficial_napi_module_wrap_link(env, created.module, 0, nullptr), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(env, created.module), napi_ok);
+  napi_value result = nullptr;
+  out.evaluate = unofficial_napi_module_wrap_evaluate(env, created.module, -1, false, &result);
+  out.pending = TakePendingMessage(env);
+  if (out.evaluate == napi_ok) out.outcome = PromiseOutcome(env, result);
+  EXPECT_EQ(unofficial_napi_module_wrap_get_namespace(env, created.module, &out.ns), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(env, created.module), napi_ok);
+  return out;
+}
+
+}  // namespace
+
+// A synthetic module whose evaluation steps are not a function has none to
+// run: it evaluates, and its exports stay undefined. V8's evaluation steps
+// callback returned no result with nothing thrown there, and V8 aborts the
+// process on that (CHECK has_exception()); QuickJS skipped the steps.
+TEST_F(Test65UnofficialContextify, SyntheticModuleWhoseStepsAreNotAFunctionEvaluates) {
+  for (const char* steps_source : {"({})", "undefined"}) {
+    SCOPED_TRACE(steps_source);
+    EnvScope s(runtime_.get());
+    napi_value wrapper = nullptr;
+    napi_value names = nullptr;
+    napi_value steps = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, "['value']"), &names), napi_ok);
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, steps_source), &steps), napi_ok);
+    unofficial_napi_module_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+    options.kind = unofficial_napi_module_synthetic;
+    options.wrapper = wrapper;
+    options.url = Str(s.env, "synthetic");
+    options.payload.synthetic.export_names = names;
+    options.payload.synthetic.synthetic_evaluation_steps = steps;
+    const Evaluated evaluated = CreateAndEvaluate(s.env, options);
+    EXPECT_EQ(evaluated.evaluate, napi_ok);
+    EXPECT_EQ(evaluated.pending, "");
+    EXPECT_EQ(evaluated.outcome, "resolved");
+    napi_value value = nullptr;
+    napi_valuetype type = napi_null;
+    ASSERT_NE(evaluated.ns, nullptr);
+    ASSERT_EQ(napi_get_named_property(s.env, evaluated.ns, "value", &value), napi_ok);
+    ASSERT_EQ(napi_typeof(s.env, value, &type), napi_ok);
+    EXPECT_EQ(type, napi_undefined);
+  }
+}
