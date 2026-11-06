@@ -2198,6 +2198,80 @@ TEST_F(Test71ContextifyCompat, TokensOfRealmsMadeThroughoutTheReleaseAreUnassign
 
 namespace {
 
+// How many token events had happened when each finalizer ran.
+struct EventsAtFinalizers {
+  ReleaseTokens* log = nullptr;
+  std::vector<size_t> seen;
+};
+
+void RecordEventsAtFinalizer(node_api_basic_env, void*, void* hint) {
+  auto* state = static_cast<EventsAtFinalizers*>(hint);
+  state->seen.push_back(state->log->events.size());
+}
+
+// A cleanup hook of the release's second pass: makes a realm, and a value
+// whose finalizer runs in that pass.
+void HookMakingRealmAndFinalizedValue(void* data) {
+  auto* state = static_cast<EventsAtFinalizers*>(data);
+  MakeReleaseRealm(state->log);
+  napi_env env = state->log->env;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return;
+  napi_value object = nullptr;
+  napi_value global = nullptr;
+  if (napi_create_object(env, &object) == napi_ok &&
+      napi_add_finalizer(env, object, nullptr, RecordEventsAtFinalizer, state, nullptr) ==
+          napi_ok &&
+      napi_get_global(env, &global) == napi_ok) {
+    napi_set_named_property(env, global, "finalized_late", object);
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+void RecordEventsThenAddHook(node_api_basic_env basic_env, void* data, void* hint) {
+  RecordEventsAtFinalizer(basic_env, data, hint);
+  napi_add_env_cleanup_hook(const_cast<napi_env>(basic_env), HookMakingRealmAndFinalizedValue,
+                            hint);
+}
+
+}  // namespace
+
+// A realm a cleanup hook makes at release gives up its token after the hooks
+// of that pass, before the pass's finalizers run, as on main (whose contexts'
+// own cleanup hook unassigned them), and in a later pass too.
+TEST_F(Test71ContextifyCompat, TokenOfARealmACleanupHookMakesIsUnassignedBeforeTheFinalizers) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  EventsAtFinalizers state;
+  state.log = &log;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, MakeRealmHook, &log), napi_ok);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, RecordEventsThenAddHook, &state, nullptr),
+            napi_ok);
+  KeepOnGlobal(s.env, "finalized", object);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 2);
+  ASSERT_EQ(state.seen.size(), 2u);
+#if defined(NAPI_TEST_ENGINE_V8)
+  // First pass: the hook's realm is assigned and unassigned, then the
+  // finalizer runs. Second pass: the same for the late hook's realm.
+  ASSERT_EQ(log.events.size(), 4u);
+  EXPECT_EQ(log.events[0], std::make_pair('a', log.made[0]));
+  EXPECT_EQ(log.events[1], std::make_pair('u', log.made[0]));
+  EXPECT_EQ(log.events[2], std::make_pair('a', log.made[1]));
+  EXPECT_EQ(log.events[3], std::make_pair('u', log.made[1]));
+  EXPECT_EQ(state.seen[0], 2u);
+  EXPECT_EQ(state.seen[1], 4u);
+#else
+  EXPECT_EQ(state.seen[0], 0u);
+  EXPECT_EQ(state.seen[1], 0u);
+#endif
+}
+
+namespace {
+
 // A cleanup hook with an exception pending makes a realm the collector frees
 // at once, so its unassign hook runs inside the cleanup hook.
 struct ThrowThenFree {
