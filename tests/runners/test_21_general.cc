@@ -203,6 +203,63 @@ TEST_F(Test21General, NearHeapLimitCallbackUsesOneConfigurationSlot) {
             napi_ok);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+struct NearHeapLimitRecord {
+  napi_env env = nullptr;
+  void* data = nullptr;
+  int calls = 0;
+};
+
+size_t RecordNearHeapLimit(napi_env env,
+                           void* data,
+                           size_t current_heap_limit,
+                           size_t /*initial_heap_limit*/) {
+  auto* record = static_cast<NearHeapLimitRecord*>(data);
+  record->env = env;
+  record->data = data;
+  record->calls++;
+  return current_heap_limit * 2;
+}
+
+}  // namespace
+
+// The trampoline hands the embedder the env and data it was configured with,
+// and releasing the env with the slot still set is clean.
+TEST_F(Test21General, NearHeapLimitCallbackReceivesItsEnvironment) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  options.max_old_generation_size_in_bytes = 16 * 1024 * 1024;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_ok);
+
+  NearHeapLimitRecord record;
+  ASSERT_EQ(unofficial_napi_configure_near_heap_limit_callback(
+                env, RecordNearHeapLimit, &record, 0),
+            napi_ok);
+
+  napi_value source = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(
+                env,
+                "const keep = []; for (let i = 0; i < 400; i++) "
+                "keep.push(new Array(32 * 1024).fill(i)); keep.length",
+                NAPI_AUTO_LENGTH,
+                &source),
+            napi_ok);
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(env, source, &result), napi_ok);
+
+  EXPECT_GT(record.calls, 0);
+  EXPECT_EQ(record.env, env);
+  EXPECT_EQ(record.data, &record);
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+#endif
+
 TEST_F(Test21General, PortedCoreFlow) {
   EnvScope s(runtime_.get());
   napi_value exports = nullptr;

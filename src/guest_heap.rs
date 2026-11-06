@@ -787,7 +787,11 @@ pub extern "C" fn napi_host_guest_heap_release(ctx: *mut c_void) {
 }
 
 /// Finalizer for guest-heap-backed external buffers: frees the allocation and
-/// drops the boxed context. Runs when V8 collects the buffer (any thread).
+/// drops the boxed context. For a buffer it runs in V8's backing-store
+/// deleter, on whatever thread frees the store, or at the env's release for a
+/// buffer still alive then. Attached to another value
+/// (`snapi_bridge_attach_guest_heap_finalizer`), it runs as that value's
+/// finalizer, on the env's thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn napi_host_guest_heap_buffer_finalize(_data: *mut c_void, hint: *mut c_void) {
     if hint.is_null() {

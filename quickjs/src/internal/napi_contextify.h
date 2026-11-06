@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace quickjs::detail
@@ -31,15 +32,31 @@ namespace quickjs::detail
         napi_status preserve_error_source_message(napi_value error);
         napi_status configure_source_maps(bool enabled, napi_value callback);
 
-        napi_status make_context(napi_value sandbox_or_symbol,
-                                 napi_value name,
-                                 napi_value origin_or_undefined,
-                                 bool allow_code_gen_strings,
-                                 bool allow_code_gen_wasm,
-                                 bool own_microtask_queue,
-                                 napi_value host_defined_option_id,
-                                 napi_value *result_out);
-        napi_status run_script(napi_value sandbox_or_null,
+        // Realms: a JSContext on the env's runtime, with its sandbox when it
+        // has one. An unofficial_napi_realm is a context_record.
+        napi_status create_realm(const unofficial_napi_realm_options &options,
+                                 unofficial_napi_realm *realm_out,
+                                 napi_value *global_out);
+        napi_status get_realm(napi_value value, unofficial_napi_realm *realm_out) const;
+        // The context of a live realm of this env and, as a new reference, a
+        // function of the realm that keeps it alive.
+        napi_status realm_to_enter(unofficial_napi_realm realm,
+                                   JSContext **ctx_out,
+                                   JSValue *anchor_out) const;
+        // The key of the realm whose own global is `global` (its sandbox, or
+        // the global itself), as a new reference; undefined for any other
+        // object.
+        JSValue realm_key_for_global(JSValueConst global) const;
+        // The context code for `realm` runs in: the realm's, or the env's
+        // for NULL.
+        JSContext *realm_context(unofficial_napi_realm realm) const;
+        // For napi_run_script in a sandbox realm: copy the sandbox into the
+        // realm's global before the script and back after it, as run_script
+        // does. No-ops for a context without a sandbox.
+        napi_status sync_sandbox_in(JSContext *ctx) const;
+        napi_status sync_sandbox_out(JSContext *ctx) const;
+
+        napi_status run_script(unofficial_napi_realm realm,
                                const unofficial_napi_js_source *source,
                                napi_value filename,
                                int32_t line_offset,
@@ -50,12 +67,11 @@ namespace quickjs::detail
                                bool break_on_first_line,
                                napi_value host_defined_option_id,
                                napi_value *result_out);
-        napi_status dispose_context(napi_value sandbox_or_context_global);
-        napi_status compile_function(const unofficial_napi_js_source *source,
+        napi_status compile_function(unofficial_napi_realm realm,
+                                     const unofficial_napi_js_source *source,
                                      napi_value filename,
                                      int32_t line_offset,
                                      int32_t column_offset,
-                                     napi_value parsing_context_or_undefined,
                                      napi_value context_extensions_or_undefined,
                                      napi_value params_or_undefined,
                                      napi_value host_defined_option_id,
@@ -65,7 +81,8 @@ namespace quickjs::detail
                                            napi_value resource_name_or_undefined,
                                            bool cjs_var_in_scope,
                                            bool *result_out);
-        napi_status bytecode_compile(napi_value source_text,
+        napi_status bytecode_compile(JSContext *target,
+                                     napi_value source_text,
                                      napi_value filename,
                                      int32_t shape,
                                      napi_value params_or_undefined,
@@ -74,7 +91,8 @@ namespace quickjs::detail
                                      int32_t column_offset,
                                      unofficial_napi_bytecode *bytecode_out,
                                      bool *can_parse_as_module_out);
-        napi_status bytecode_deserialize(const uint8_t *bytes,
+        napi_status bytecode_deserialize(JSContext *target,
+                                         const uint8_t *bytes,
                                          size_t byte_length,
                                          napi_value source_text,
                                          napi_value filename,
@@ -111,10 +129,13 @@ namespace quickjs::detail
                                         const std::string &resource_name,
                                         int32_t line_offset,
                                         int32_t column_offset);
-        context_record *find_context_record(JSValueConst sandbox) const;
-        context_record *create_context_record(JSValueConst sandbox,
-                                              JSValueConst host_defined_option_id);
-        void destroy_context_record(context_record *record);
+        context_record *find_live_record(JSValueConst global_or_sandbox) const;
+        context_record *sandbox_record_for(JSContext *ctx) const;
+        context_record *create_context_record(JSValueConst sandbox_or_undefined,
+                                              JSValueConst host_defined_option_id,
+                                              napi_value *key_out);
+        void prune_collected_records();
+        bool ensure_link_atoms();
 
         // Owning environment and QuickJS context.
         napi_env env_;
@@ -124,6 +145,13 @@ namespace quickjs::detail
         bool source_maps_enabled_ = false;
         JSValue source_map_error_source_callback_;
         std::vector<std::unique_ptr<context_record>> contexts_;
+        // A realm's global and its sandbox to the realm. Entries of collected
+        // realms stay until the next prune; a new realm at the same address
+        // replaces them.
+        std::unordered_map<void *, context_record *> records_by_global_;
+        // Private symbols linking a realm's context and its sandbox.
+        JSAtom context_link_atom_ = JS_ATOM_NULL;
+        JSAtom sandbox_link_atom_ = JS_ATOM_NULL;
 
         // Subsystem lifecycle.
         bool torn_down_ = false;

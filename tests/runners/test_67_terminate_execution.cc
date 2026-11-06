@@ -220,11 +220,10 @@ TEST_F(Test67TerminateExecution, TerminateBeforeACallStopsThatCall) {
   EXPECT_EQ(Log(s.env), "called");
 }
 
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
-// V8 acts on a termination at its next stack check, so a plain store right
-// after the terminating callback may still run there. QuickJS stops as soon
-// as the callback returns.
-TEST_F(Test67TerminateExecution, QuickJSStopsAsSoonAsTheCallbackReturns) {
+// The JS stops as soon as the terminating callback returns, also before a
+// plain store, at which V8 does not look for a termination: the provider
+// makes V8 act on it when the callback returns.
+TEST_F(Test67TerminateExecution, StopsAsSoonAsTheCallbackReturns) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
 
@@ -233,6 +232,7 @@ TEST_F(Test67TerminateExecution, QuickJSStopsAsSoonAsTheCallbackReturns) {
   EXPECT_EQ(RunScriptToString(s.env, "typeof globalThis.reached"), "undefined");
 }
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
 TEST_F(Test67TerminateExecution, QuickJSTerminatesInsideAMicrotask) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);

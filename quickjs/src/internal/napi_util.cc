@@ -138,7 +138,6 @@ napi_status napi_util__::return_pending_if_caught(napi_env env, JSContext *ctx, 
   if (ctx != nullptr && JS_HasException(ctx))
   {
     auto exc = JS_GetException(ctx);
-    napi_env_context_scope__ context_scope{env, ctx};
     set_last_exception(env, exc);
     return napi_quickjs_set_last_error(env, napi_pending_exception, message);
   }
@@ -178,6 +177,16 @@ napi_status napi_util__::fail_if_terminating(napi_env env, JSContext *ctx)
 {
   if (!env->termination_requested())
     return napi_ok;
+  // An exception native code left pending stays pending, as on V8: a cancel
+  // drops only the termination's, and the native function's caller then gets
+  // that exception. A termination error the runtime holds goes.
+  if (env->has_last_exception() && !env->last_exception_is_uncatchable())
+  {
+    if (JS_HasException(ctx))
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    return napi_quickjs_set_last_error(env, napi_pending_exception,
+                                       "JavaScript execution is terminating");
+  }
   throw_termination(ctx);
   return return_pending_if_caught(env, ctx, "JavaScript execution is terminating");
 }
@@ -443,7 +452,8 @@ napi_status napi_util__::run_pending_jobs(napi_env env)
       // so the embedder can take it with napi_get_and_clear_last_exception.
       if (env->termination_requested())
         return fail_if_terminating(env, job_ctx != nullptr ? job_ctx : context(env));
-      return napi_pending_exception;
+      return return_pending_if_caught(env, job_ctx != nullptr ? job_ctx : context(env),
+                                      "Pending job failed");
     }
   }
 }
@@ -593,6 +603,22 @@ bool napi_util__::from_quickjs_array_type(int type, napi_typedarray_type *out)
   default:
     return false;
   }
+}
+
+bool napi_util__::is_detached_array_buffer(JSContext *ctx, JSValueConst value)
+{
+  if (ctx == nullptr || !JS_IsArrayBuffer(value))
+    return false;
+  // JS_GetArrayBuffer throws for a detached buffer only; what was pending
+  // before is set aside and kept.
+  JSValue earlier = JS_GetException(ctx);
+  size_t length = 0;
+  const bool detached = JS_GetArrayBuffer(ctx, &length, value) == nullptr && JS_HasException(ctx);
+  if (detached)
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  if (!JS_IsUninitialized(earlier))
+    JS_Throw(ctx, earlier);
+  return detached;
 }
 
 void *napi_util__::realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size)
@@ -752,41 +778,8 @@ napi_status napi_util__::get_property_names(napi_env env,
 
 JSValue napi_util__::create_plain_error(JSContext *ctx, const char *msg)
 {
-  JSValue global = JS_GetGlobalObject(ctx);
-  JSValue error_ctor = JS_GetPropertyStr(ctx, global, "Error");
-  JSValue msg_str = JS_NewString(ctx, msg ? msg : "");
-  JSValue error = JS_CallConstructor(ctx, error_ctor, 1, &msg_str);
-  JS_FreeValue(ctx, msg_str);
-  JS_FreeValue(ctx, error_ctor);
-  JS_FreeValue(ctx, global);
-  return error;
-}
-
-napi_status napi_util__::create_plain_error_common(napi_env env,
-                                                   napi_value code,
-                                                   napi_value msg,
-                                                   napi_value *result)
-{
-  if (!check_env(env) || msg == nullptr || result == nullptr)
-    return napi_invalid_arg;
-
-  JSValue msg_val = napi_quickjs_value_inner(env, msg);
-  if (!JS_IsString(msg_val))
-    return napi_string_expected;
-
-  const char *msg_str = JS_ToCString(env->context(), msg_val);
-  JSValue error = create_plain_error(env->context(), msg_str);
-  JS_FreeCString(env->context(), msg_str);
-
-  if (code != nullptr && !JS_IsUndefined(napi_quickjs_value_inner(env, code)) && !JS_IsNull(napi_quickjs_value_inner(env, code)))
-  {
-    const char *code_str = JS_ToCString(env->context(), napi_quickjs_value_inner(env, code));
-    JS_SetPropertyStr(env->context(), error, "code", JS_NewString(env->context(), code_str));
-    JS_FreeCString(env->context(), code_str);
-  }
-
-  *result = env->wrap_value_in_current_scope(error, true);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  // The realm's own Error, not whatever its global now calls Error.
+  return create_error_object(ctx, JS_NewPlainError, nullptr, msg);
 }
 
 JSValue napi_util__::create_error_object(JSContext *ctx,
@@ -795,6 +788,9 @@ JSValue napi_util__::create_error_object(JSContext *ctx,
                                          const char *msg)
 {
   JSValue error = factory(ctx, "%s", msg ? msg : "");
+  if (JS_IsException(error))
+    return error;
+  // The factory cuts the formatted message at 256 bytes; keep all of it.
   JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, msg ? msg : ""));
   if (code != nullptr)
     JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, code));
@@ -809,6 +805,10 @@ napi_status napi_util__::create_error_common(napi_env env,
 {
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
+  // Making the error reads Error.prepareStackTrace and setting its code runs
+  // an inherited `code` setter: JS, which a terminating env must not run.
+  if (env->termination_requested())
+    return fail_if_terminating(env, context(env));
 
   JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))
@@ -824,6 +824,8 @@ napi_status napi_util__::create_error_common(napi_env env,
   JS_FreeCString(env->context(), msg_str);
   if (code_str != nullptr)
     JS_FreeCString(env->context(), code_str);
+  if (JS_IsException(error))
+    return return_pending_if_caught(env, "Failed to create error");
 
   *result = env->wrap_value_in_current_scope(error, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;

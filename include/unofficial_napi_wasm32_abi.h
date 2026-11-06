@@ -60,6 +60,12 @@ typedef struct {
   uint8_t reserved[2];
 } unofficial_napi_wasm32_bytecode_open_options_v1;
 
+// Version 2 appends the realm.
+typedef struct {
+  unofficial_napi_wasm32_bytecode_open_options_v1 v1;
+  uint32_t realm_or_null;
+} unofficial_napi_wasm32_bytecode_open_options_v2;
+
 typedef struct {
   uint32_t size;
   uint32_t version;
@@ -70,6 +76,12 @@ typedef struct {
   uint8_t payload[16];
 } unofficial_napi_wasm32_module_create_options_v1;
 
+// Version 2 appends the realm.
+typedef struct {
+  unofficial_napi_wasm32_module_create_options_v1 v1;
+  uint32_t realm_or_null;
+} unofficial_napi_wasm32_module_create_options_v2;
+
 typedef struct {
   uint32_t size;
   uint32_t version;
@@ -77,14 +89,30 @@ typedef struct {
   uint32_t initialize_import_meta_object;
 } unofficial_napi_wasm32_module_hooks_v1;
 
+typedef struct {
+  uint32_t size;
+  uint32_t version;
+  uint32_t sandbox_or_null;
+  uint32_t name;
+  uint32_t origin;
+  uint32_t host_defined_option_id;
+  uint8_t allow_code_gen_strings;
+  uint8_t allow_code_gen_wasm;
+  uint8_t own_microtask_queue;
+  uint8_t reserved;
+} unofficial_napi_wasm32_realm_options_v1;
+
 #if defined(__cplusplus)
 static_assert(sizeof(unofficial_napi_wasm32_runtime_options_v1) == 16);
 static_assert(sizeof(unofficial_napi_wasm32_env_create_options_v1) == 48);
 static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 32);
 static_assert(sizeof(unofficial_napi_wasm32_js_source) == 12);
 static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v1) == 48);
+static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v2) == 52);
 static_assert(sizeof(unofficial_napi_wasm32_module_create_options_v1) == 40);
+static_assert(sizeof(unofficial_napi_wasm32_module_create_options_v2) == 44);
 static_assert(sizeof(unofficial_napi_wasm32_module_hooks_v1) == 16);
+static_assert(sizeof(unofficial_napi_wasm32_realm_options_v1) == 28);
 #else
 _Static_assert(sizeof(unofficial_napi_wasm32_runtime_options_v1) == 16,
                "wasm32 runtime-options wire layout changed");
@@ -96,10 +124,16 @@ _Static_assert(sizeof(unofficial_napi_wasm32_js_source) == 12,
                "wasm32 JS-source wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v1) == 48,
                "wasm32 bytecode-open wire layout changed");
+_Static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v2) == 52,
+               "wasm32 bytecode-open wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_module_create_options_v1) == 40,
+               "wasm32 module-create wire layout changed");
+_Static_assert(sizeof(unofficial_napi_wasm32_module_create_options_v2) == 44,
                "wasm32 module-create wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_module_hooks_v1) == 16,
                "wasm32 module-hooks wire layout changed");
+_Static_assert(sizeof(unofficial_napi_wasm32_realm_options_v1) == 28,
+               "wasm32 realm-options wire layout changed");
 #endif
 
 #endif  // UNOFFICIAL_NAPI_WASM32_ABI_H_

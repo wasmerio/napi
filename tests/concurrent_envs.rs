@@ -35,6 +35,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// process-wide lock while doing so.
 #[derive(Clone, Copy, Debug)]
 enum Entry {
+    RunScriptInRealm,
     ContextifyRunScript,
     ModuleEvaluate,
     MicrotaskCheckpoint,
@@ -63,6 +64,7 @@ fn wait_in_one_env_and_notify_from_another(engine: &Engine, module: &Module, ent
             assert_eq!(guest.take(token), 0);
             assert_eq!(guest.install(), 0);
             match entry {
+                Entry::RunScriptInRealm => assert_eq!(guest.run_script_in_realm(WAIT_SCRIPT), 0),
                 Entry::ContextifyRunScript => assert_eq!(guest.eval_contextify(WAIT_SCRIPT), 0),
                 Entry::ModuleEvaluate => assert_eq!(guest.eval_module(WAIT_SCRIPT), 0),
                 Entry::MicrotaskCheckpoint => {
@@ -117,6 +119,12 @@ fn wait_in_one_env_and_notify_from_another(engine: &Engine, module: &Module, ent
 }
 
 #[test]
+fn a_realm_script_does_not_block_other_envs() {
+    let (engine, module) = compile();
+    wait_in_one_env_and_notify_from_another(&engine, &module, Entry::RunScriptInRealm);
+}
+
+#[test]
 fn a_contextified_script_does_not_block_other_envs() {
     let (engine, module) = compile();
     wait_in_one_env_and_notify_from_another(&engine, &module, Entry::ContextifyRunScript);
@@ -144,7 +152,7 @@ fn a_serializer_getter_does_not_block_other_envs() {
 /// not on the thread that owns the environment, and must not wait for the
 /// running script to give anything up.
 #[test]
-fn host_terminate_reaches_an_env_inside_a_contextified_script() {
+fn host_terminate_reaches_an_env_inside_a_realm_script() {
     let (engine, module) = compile();
     let ctx = NapiCtx::default();
     let control = ctx.runtime_control();
@@ -155,7 +163,7 @@ fn host_terminate_reaches_an_env_inside_a_contextified_script() {
         guest.create();
         // Bounded, so a bridge that cannot stop it fails the test instead of
         // spinning forever with every other environment locked out.
-        let status = guest.eval_contextify(
+        let status = guest.run_script_in_realm(
             "signal(); const end = Date.now() + 30000; while (Date.now() < end) {}",
         );
         let _ = status_tx.send(status);

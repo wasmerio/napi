@@ -161,9 +161,12 @@ extern "C" fn wake_for_foreground_task() {
 /// run guest code, and must not take a lock that the host holds around guest
 /// calls. It is called for every isolate's tasks, so a host running several
 /// guests wakes them all, and a guest with nothing to run waits again. Delayed
-/// tasks don't call it: each runs at the first checkpoint after its delay. A
-/// panic in the waker is caught, and its payload leaked, so that it never
-/// unwinds into V8.
+/// tasks don't call it: each runs at the first checkpoint after its delay.
+/// While a guest's env terminates, its checkpoint refuses and runs no task, and
+/// calls no waker, so the guest does not spin;
+/// `unofficial_napi_cancel_terminate_execution` calls the waker again, on the
+/// guest's thread, when tasks still wait. A panic in the waker is caught, and
+/// its payload leaked, so that it never unwinds into V8.
 ///
 /// `None` removes the waker. A waker may call this function itself. A call
 /// that was already under way may still run the waker it replaced after this

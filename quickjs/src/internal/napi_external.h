@@ -15,6 +15,8 @@ public:
   static JSClassID record_class_id();
   static bool is_external(JSValueConst value);
   static void *get_value(JSValueConst value);
+  // The env that created the external.
+  static napi_env get_env(JSValueConst value);
   static napi_external_backing_store_hint__ *get_wrap_record(JSContext *ctx, JSValueConst object);
 
   static const char *type_tag_property();

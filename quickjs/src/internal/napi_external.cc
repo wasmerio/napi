@@ -54,6 +54,15 @@ void *napi_external__::get_value(JSValueConst value)
   return hint == nullptr ? nullptr : hint->external_data();
 }
 
+napi_env napi_external__::get_env(JSValueConst value)
+{
+  if (!is_external(value))
+    return nullptr;
+  auto *hint = static_cast<napi_external_backing_store_hint__ *>(
+      JS_GetOpaque(value, external_class_id));
+  return hint == nullptr ? nullptr : hint->env();
+}
+
 napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *ctx, JSValueConst object)
 {
   auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
@@ -118,8 +127,7 @@ void *napi_external__::realloc_external_array_buffer_data(JSRuntime *rt, void *o
   auto *hint = reinterpret_cast<napi_external_backing_store_hint__ *>(opaque);
   if (hint == nullptr)
     return nullptr;
-  hint->invoke_finalizer();
-  napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
+  hint->release_array_buffer(rt);
   return nullptr;
 }
 

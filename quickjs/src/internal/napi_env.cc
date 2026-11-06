@@ -40,6 +40,85 @@ int runtime_interrupt_handler(JSRuntime *rt, void *opaque)
   return 0;
 }
 
+// The getter of `object`'s own property `name`; undefined if there is none.
+JSValue own_getter(JSContext *ctx, JSValueConst object, const char *name)
+{
+  if (!JS_IsObject(object))
+    return JS_UNDEFINED;
+  JSAtom atom = JS_NewAtom(ctx, name);
+  if (atom == JS_ATOM_NULL)
+  {
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    return JS_UNDEFINED;
+  }
+  JSPropertyDescriptor desc;
+  const int has = JS_GetOwnProperty(ctx, &desc, object, atom);
+  JS_FreeAtom(ctx, atom);
+  if (has < 0)
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  if (has <= 0)
+    return JS_UNDEFINED;
+  JS_FreeValue(ctx, desc.value);
+  JS_FreeValue(ctx, desc.setter);
+  if (JS_IsFunction(ctx, desc.getter))
+    return desc.getter;
+  JS_FreeValue(ctx, desc.getter);
+  return JS_UNDEFINED;
+}
+
+// The getters of `buffer`, `byteOffset` and `byteLength` on the prototype of
+// `constructor_name` in the global (or on that prototype's own prototype, with
+// `inherited`).
+void view_getters(JSContext *ctx, JSValueConst global, const char *constructor_name,
+                  bool inherited, JSValue *buffer, JSValue *byte_offset, JSValue *byte_length)
+{
+  JSValue constructor = JS_GetPropertyStr(ctx, global, constructor_name);
+  JSValue prototype = JS_IsObject(constructor)
+                          ? JS_GetPropertyStr(ctx, constructor, "prototype")
+                          : JS_UNDEFINED;
+  if (inherited && JS_IsObject(prototype))
+  {
+    JSValue parent = JS_GetPrototype(ctx, prototype);
+    JS_FreeValue(ctx, prototype);
+    prototype = parent;
+  }
+  if (!JS_IsException(prototype))
+  {
+    *buffer = own_getter(ctx, prototype, "buffer");
+    *byte_offset = own_getter(ctx, prototype, "byteOffset");
+    *byte_length = own_getter(ctx, prototype, "byteLength");
+  }
+  JS_FreeValue(ctx, prototype);
+  JS_FreeValue(ctx, constructor);
+  if (JS_HasException(ctx))
+    JS_FreeValue(ctx, JS_GetException(ctx));
+}
+
+// Calls an intrinsic getter of a view. Such a getter runs no script, but
+// QuickJS may poll its interrupt handler on the call and throw for a
+// termination request (which the env keeps and raises again itself); the
+// getter is then called again, as the poll restarted its countdown. Sets
+// `*threw` (if given) when the call threw: making the error may have run
+// script.
+JSValue call_view_getter(JSContext *ctx, JSValueConst getter, JSValueConst view,
+                         bool *threw = nullptr)
+{
+  JSValue value = JS_Call(ctx, getter, view, 0, nullptr);
+  if (!JS_IsException(value))
+    return value;
+  if (threw != nullptr)
+    *threw = true;
+  JSValue exception = JS_GetException(ctx);
+  const bool interrupted = JS_IsUncatchableError(exception);
+  JS_FreeValue(ctx, exception);
+  if (!interrupted)
+    return JS_EXCEPTION;
+  value = JS_Call(ctx, getter, view, 0, nullptr);
+  if (JS_IsException(value))
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  return value;
+}
+
 napi_runtime_interrupts__ *installed_runtime_interrupts(JSRuntime *rt)
 {
   auto *handler = reinterpret_cast<JSInterruptHandler *>(
@@ -88,12 +167,10 @@ void detach_runtime_interrupts(JSRuntime *rt,
 }
 } // namespace
 
-napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
-    : main_context_{context},
-      current_context_{context},
+napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_api_version)
+    : agent_{agent},
+      context_{context},
       module_api_version_{module_api_version},
-      last_exception_{JS_UNDEFINED},
-      scopes_{this},
       refs_{this},
       cleanup_hooks_{this},
       deferreds_{this},
@@ -103,8 +180,27 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
       contextify_{this, context},
       module_wrap_{this, context}
 {
-  root_scope_ = create_scope(nullptr);
-  current_scope_ = root_scope_;
+  if (agent_->principal_env() == nullptr)
+    agent_->set_principal_env(this);
+  if (context_ != nullptr)
+  {
+    agent_->open_root_scope(this);
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue data_view = JS_GetPropertyStr(context_, global, "DataView");
+    // Views of any realm share these getters' behaviour: they read the view's
+    // internal slots, whatever realm made it.
+    view_getters(context_, global, "Uint8Array", true, &typed_array_getters_.buffer,
+                 &typed_array_getters_.byte_offset, &typed_array_getters_.byte_length);
+    view_getters(context_, global, "DataView", false, &data_view_getters_.buffer,
+                 &data_view_getters_.byte_offset, &data_view_getters_.byte_length);
+    JS_FreeValue(context_, global);
+    if (JS_IsConstructor(context_, data_view))
+      data_view_constructor_ = data_view;
+    else if (JS_IsException(data_view))
+      JS_FreeValue(context_, JS_GetException(context_));
+    else
+      JS_FreeValue(context_, data_view);
+  }
   clear_last_error();
   runtime_interrupts_ = attach_runtime_interrupts(JS_GetRuntime(context), this);
 }
@@ -112,7 +208,6 @@ napi_env__::napi_env__(JSContext *context, int32_t module_api_version)
 napi_env__::~napi_env__()
 {
   prepare_teardown();
-  finalize_instance_data();
 }
 
 void napi_env__::prepare_teardown()
@@ -120,43 +215,85 @@ void napi_env__::prepare_teardown()
   if (torn_down_)
     return;
 
+  closing_ = true;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown begin");
-  while (!env_cleanup_hooks_.empty())
+  // Every scope closes. Cleanup hooks and finalizers each run in the env's
+  // realm, and a scope one leaves open closes when it returns.
+  pop_realm_frames(0);
+  // The release contract (unofficial_napi_release_env): the cleanup hooks
+  // run, then the finalizers of the values still pending, until neither is
+  // left; then the instance data's finalizer; and all of it again for what
+  // that finalizer leaves pending, until nothing is. They run while the
+  // context and runtime are alive and the root scope is open, so they can use
+  // N-API; what they make is freed below.
+  for (;;)
   {
-    auto *entry = env_cleanup_hooks_.back();
-    env_cleanup_hooks_.pop_back();
-    if (entry != nullptr)
+    run_cleanup_hooks();
+    while (napi_external_backing_store_hint__::first_pending(pending_finalizers_) != nullptr)
     {
-      entry->run();
-      napi_env_cleanup_hook__::destroy(entry);
+      finalize_pending_values();
+      run_cleanup_hooks();
     }
+    if (instance_data_ == nullptr && instance_data_finalize_cb_ == nullptr)
+      break;
+    finalize_instance_data();
+    drop_finalizer_exception();
   }
+  // From here on nothing is finalized: the runtime frees what is still alive
+  // after the context is gone.
+  finalizers_done_ = true;
+  while (auto *hint = napi_external_backing_store_hint__::first_pending(pending_finalizers_))
+    hint->abandon_finalizer();
   cleanup_hooks_.close();
   deferreds_.close();
 
   clear_last_exception();
   clear_refs_for_teardown();
 
-  napi_scope__ *root_scope = scope_from_handle(root_scope_);
-  if (root_scope != nullptr)
+  const bool principal = is_principal();
+  if (principal)
   {
-    root_scope->close();
-    if (main_context_ != nullptr)
-      JS_RunGC(JS_GetRuntime(main_context_));
+    if (agent_->root_scope() != nullptr)
+    {
+      agent_->close_root_scope();
+      JS_RunGC(agent_->runtime());
+    }
+    agent_->close_scopes();
+    agent_->clear_module_hooks();
   }
-  scopes_.close();
-  current_scope_ = nullptr;
-  root_scope_ = nullptr;
+  // Backstop: nothing above should leave a scope open, and a scope's anchor
+  // must be freed while the runtime lives.
+  pop_realm_frames(0);
   module_wrap_.teardown();
   contextify_.teardown();
   buffers_.teardown();
+  if (context_ != nullptr)
+  {
+    JS_FreeValue(context_, data_view_constructor_);
+    for (view_getters__ *getters : {&typed_array_getters_, &data_view_getters_})
+    {
+      JS_FreeValue(context_, getters->buffer);
+      JS_FreeValue(context_, getters->byte_offset);
+      JS_FreeValue(context_, getters->byte_length);
+    }
+  }
+  data_view_constructor_ = JS_UNDEFINED;
+  typed_array_getters_ = {};
+  data_view_getters_ = {};
+  if (principal)
+    agent_->clear_promise_hooks();
   promises_.teardown();
+  if (principal)
+    agent_->clear_values();
   // Detach before the runtime can be freed. The termination flag itself stays
   // valid for the env's whole lifetime, since other threads may still set it.
-  if (main_context_ != nullptr)
-    detach_runtime_interrupts(JS_GetRuntime(main_context_), runtime_interrupts_, this);
+  if (context_ != nullptr)
+    detach_runtime_interrupts(JS_GetRuntime(context_), runtime_interrupts_, this);
   runtime_interrupts_ = nullptr;
   NAPI_QUICKJS_LIFETIME_DUMP(this, "napi_env__ teardown end");
+  // The context is freed after this. Without it every N-API call on the env
+  // fails with napi_invalid_arg instead of touching freed memory.
+  context_ = nullptr;
   torn_down_ = true;
 }
 
@@ -166,6 +303,65 @@ void napi_env__::clear_refs_for_teardown()
   for (napi_ref__ &ref : refs_)
     ref.clear_for_teardown();
   clearing_refs_for_teardown_ = false;
+}
+
+void napi_env__::run_cleanup_hooks()
+{
+  while (!env_cleanup_hooks_.empty())
+  {
+    auto *entry = env_cleanup_hooks_.back();
+    env_cleanup_hooks_.pop_back();
+    if (entry != nullptr)
+    {
+      {
+        napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+        entry->run();
+      }
+      drop_finalizer_exception();
+      napi_env_cleanup_hook__::destroy(entry);
+    }
+  }
+}
+
+void napi_env__::finalize_pending_values()
+{
+  // Externals, wraps, napi_add_finalizer and external buffers each hold a
+  // hint. The ones whose finalizers have yet to run are listed most recent
+  // first, the order Node finalizes in. A value a finalizer makes joins the
+  // list, and one it frees leaves it.
+  while (auto *hint = napi_external_backing_store_hint__::first_pending(pending_finalizers_))
+  {
+    hint->finalize_at_teardown();
+    drop_finalizer_exception();
+  }
+}
+
+void napi_env__::drop_finalizer_exception()
+{
+  // Nothing can catch what a hook or finalizer threw at release. Node's
+  // CallIntoModule also drops it once JS can no longer run.
+  clear_last_exception();
+  if (context_ != nullptr && JS_HasException(context_))
+    JS_FreeValue(context_, JS_GetException(context_));
+}
+
+napi_env__::pending_exceptions napi_env__::take_pending_exceptions()
+{
+  pending_exceptions taken;
+  if (context_ != nullptr)
+    taken.thrown = JS_GetException(context_);
+  if (has_last_exception())
+    taken.last = take_last_exception();
+  return taken;
+}
+
+void napi_env__::restore_pending_exceptions(pending_exceptions taken)
+{
+  drop_finalizer_exception();
+  if (!JS_IsUninitialized(taken.last))
+    set_last_exception(taken.last);
+  if (!JS_IsUninitialized(taken.thrown))
+    JS_Throw(context_, taken.thrown);
 }
 
 void napi_env__::finalize_instance_data()
@@ -178,28 +374,183 @@ void napi_env__::finalize_instance_data()
   instance_data_finalize_cb_ = nullptr;
   instance_data_finalize_hint_ = nullptr;
 
-  if (data != nullptr && finalize_cb != nullptr)
-    finalize_cb(this, data, finalize_hint);
+  call_instance_data_finalizer(data, finalize_cb, finalize_hint);
+}
+
+void napi_env__::call_instance_data_finalizer(void *data,
+                                              napi_finalize finalize_cb,
+                                              void *finalize_hint)
+{
+  // As Node, whatever the data, NULL too.
+  if (finalize_cb == nullptr)
+    return;
+  // In the env's realm, as any finalizer.
+  napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+  finalize_cb(this, data, finalize_hint);
+}
+
+bool napi_env__::is_closing() const
+{
+  return closing_;
+}
+
+bool napi_env__::finalizers_done() const
+{
+  return finalizers_done_;
+}
+
+napi_agent__ *napi_env__::agent() const
+{
+  return agent_;
+}
+
+void napi_env__::adopt_agent(std::unique_ptr<napi_agent__> agent)
+{
+  owned_agent_ = std::move(agent);
+}
+
+bool napi_env__::is_principal() const
+{
+  return agent_->principal_env() == this;
 }
 
 JSContext *napi_env__::context() const
 {
-  return current_context_;
+  return realm_frames_.empty() ? context_ : realm_frames_.back().ctx;
 }
 
 JSContext *napi_env__::main_context() const
 {
-  return main_context_;
+  return context_;
 }
 
-JSContext *napi_env__::current_context() const
+bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) const
 {
-  return current_context_;
+  const view_getters__ *getters = JS_IsDataView(view)                ? &data_view_getters_
+                                  : JS_GetTypedArrayType(view) >= 0 ? &typed_array_getters_
+                                                                    : nullptr;
+  if (context_ == nullptr || layout == nullptr || getters == nullptr ||
+      !JS_IsFunction(context_, getters->buffer) || !JS_IsFunction(context_, getters->byte_offset) ||
+      !JS_IsFunction(context_, getters->byte_length))
+    return false;
+  JSValue earlier = JS_GetException(context_);
+  *layout = {};
+  layout->buffer = call_view_getter(context_, getters->buffer, view);
+  const bool found = JS_IsObject(layout->buffer);
+  if (found)
+  {
+    // The typed array getters report 0 for a view over a detached buffer or
+    // out of bounds; the DataView ones throw. A thrown error (also an
+    // interrupt's) gets its stack through Error.prepareStackTrace, which can
+    // run script that resizes, transfers or detaches the buffer. So the
+    // buffer's data and size are read last: JS_GetArrayBuffer runs no script
+    // when it succeeds, and when it throws the buffer is detached for good.
+    // And when a read of the offset or length threw, the two may come from
+    // different states of the buffer, or the one that threw from a state
+    // the script it ran has changed (it may have brought the view back in
+    // bounds): both are read again, a few times at most, until no read
+    // throws; failing that, the view is taken as out of bounds.
+    int64_t offset = -1;
+    int64_t length = -1;
+    for (int reads = 0; reads < 3; ++reads)
+    {
+      bool threw = false;
+      JSValue offset_value = call_view_getter(context_, getters->byte_offset, view, &threw);
+      JSValue length_value = call_view_getter(context_, getters->byte_length, view, &threw);
+      if (JS_IsException(offset_value) || JS_ToInt64(context_, &offset, offset_value) != 0)
+        offset = -1;
+      if (JS_IsException(length_value) || JS_ToInt64(context_, &length, length_value) != 0)
+        length = -1;
+      JS_FreeValue(context_, offset_value);
+      JS_FreeValue(context_, length_value);
+      if (!threw)
+        break;
+      offset = -1;
+      length = -1;
+    }
+    if (JS_HasException(context_))
+      JS_FreeValue(context_, JS_GetException(context_));
+    size_t buffer_length = 0;
+    // Throws for a detached buffer only.
+    layout->data = JS_GetArrayBuffer(context_, &buffer_length, layout->buffer);
+    if (layout->data == nullptr && JS_HasException(context_))
+      JS_FreeValue(context_, JS_GetException(context_));
+    if (layout->data != nullptr && offset >= 0 && length >= 0 &&
+        static_cast<uint64_t>(offset) <= buffer_length &&
+        static_cast<uint64_t>(length) <= buffer_length - static_cast<uint64_t>(offset))
+    {
+      layout->byte_offset = static_cast<size_t>(offset);
+      layout->byte_length = static_cast<size_t>(length);
+      layout->data += layout->byte_offset;
+    }
+  }
+  else
+  {
+    JS_FreeValue(context_, layout->buffer);
+    layout->buffer = JS_UNDEFINED;
+  }
+  if (!JS_IsUninitialized(earlier))
+    JS_Throw(context_, earlier);
+  return found;
 }
 
-void napi_env__::set_current_context(JSContext *context)
+JSValueConst napi_env__::data_view_constructor() const
 {
-  current_context_ = context == nullptr ? main_context_ : context;
+  return data_view_constructor_;
+}
+
+JSValueConst napi_env__::current_realm_anchor() const
+{
+  return realm_frames_.empty() ? JS_UNDEFINED : realm_frames_.back().anchor;
+}
+
+JSValue napi_env__::current_global()
+{
+  JSContext *ctx = context();
+  JSValue global = JS_GetGlobalObject(ctx);
+  if (ctx == context_)
+    return global;
+  // A sandbox realm reports its sandbox as its global.
+  JSValue key = contextify_.realm_key_for_global(global);
+  if (JS_IsUndefined(key))
+    return global;
+  JS_FreeValue(ctx, global);
+  return key;
+}
+
+size_t napi_env__::push_realm_frame(JSContext *ctx, JSValueConst anchor)
+{
+  const size_t depth = realm_frames_.size();
+  realm_frames_.push_back({0, ctx != nullptr ? ctx : context_, anchor});
+  return depth;
+}
+
+void napi_env__::pop_realm_frames(size_t depth)
+{
+  while (realm_frames_.size() > depth)
+  {
+    napi_realm_frame__ frame = realm_frames_.back();
+    realm_frames_.pop_back();
+    // A scope of the env's own realm holds no anchor.
+    if (frame.scope != 0 && JS_VALUE_HAS_REF_COUNT(frame.anchor))
+      JS_FreeValue(context_, frame.anchor);
+  }
+}
+
+uint64_t napi_env__::enter_realm(JSContext *ctx, JSValue anchor)
+{
+  realm_frames_.push_back({++last_realm_scope_, ctx, anchor});
+  return last_realm_scope_;
+}
+
+bool napi_env__::leave_realm(uint64_t scope)
+{
+  // A callback's frame has token 0, so a scope of an outer callback is never
+  // the innermost one.
+  if (scope == 0 || realm_frames_.empty() || realm_frames_.back().scope != scope)
+    return false;
+  pop_realm_frames(realm_frames_.size() - 1);
+  return true;
 }
 
 int32_t napi_env__::module_api_version() const
@@ -209,40 +560,29 @@ int32_t napi_env__::module_api_version() const
 
 napi_handle_scope napi_env__::root_scope() const
 {
-  return root_scope_;
+  return agent_->root_scope();
 }
 
 napi_handle_scope napi_env__::current_scope() const
 {
-  return current_scope_;
+  return agent_->current_scope();
 }
 
 napi_handle_scope napi_env__::create_scope(napi_handle_scope parent)
 {
-  if (current_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
-  auto *handle = scopes_.allocate(this, parent);
-  return reinterpret_cast<napi_handle_scope>(handle);
+  return agent_->create_scope(this, parent);
 }
 
 void napi_env__::destroy_scope(napi_handle_scope scope)
 {
-  scopes_.destroy(reinterpret_cast<napi_scope__ *>(scope));
+  agent_->destroy_scope(scope);
 }
 
 napi_scope__ *napi_env__::scope_from_handle(napi_handle_scope scope_handle) const
 {
-  using Alloc = decltype(scopes_);
-#ifdef NDEBUG
-  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
-#else
-  auto scope = reinterpret_cast<napi_scope__ *>(scope_handle);
-  assert(scopes_.owns(scope));
-  auto owner = Alloc::unsafe_owner(scope);
-  assert(owner == this);
-#endif
-
-  return scope;
+  return agent_->scope_from_handle(scope_handle);
 }
 
 JSValue napi_env__::wrap_external_data(void *data)
@@ -254,7 +594,7 @@ JSValue napi_env__::wrap_external_data(void *data,
                                        node_api_basic_finalize finalize_cb,
                                        void *finalize_hint)
 {
-  JSContext *ctx = current_context_;
+  JSContext *ctx = context_;
   if (ctx == nullptr)
     return JS_EXCEPTION;
 
@@ -276,40 +616,30 @@ JSValue napi_env__::wrap_external_data(void *data,
 
 napi_value napi_env__::wrap_value_in_current_scope(JSValue value, bool owned)
 {
-  napi_scope__ *scope = scope_from_handle(current_scope_);
+  napi_scope__ *scope = agent_->scope_from_handle(agent_->current_scope());
   return scope == nullptr ? nullptr : scope->wrap_value(value, owned);
-}
-
-napi_value napi_env__::wrap_value_in_current_scope(JSContext *context, JSValue value, bool owned)
-{
-  napi_scope__ *scope = scope_from_handle(current_scope_);
-  return scope == nullptr ? nullptr : scope->wrap_value(context, value, owned);
 }
 
 void napi_env__::delete_value_from_current_scope(napi_value value)
 {
-  napi_scope__ *scope = scope_from_handle(current_scope_);
+  napi_scope__ *scope = agent_->scope_from_handle(agent_->current_scope());
   if (scope != nullptr)
     scope->delete_value(value);
 }
 
 napi_value__ *napi_env__::value_from_handle(napi_value value_handle)
 {
-  using Alloc = decltype(scopes_);
-#ifdef NDEBUG
-  auto value = value_handle;
-#else
-  auto value = value_handle;
+#ifndef NDEBUG
   auto owner = napi_scope__::ValuesAllocator::unsafe_owner(value_handle);
-  assert(scopes_.owns(owner));
+  assert(agent_->owns_scope(owner));
 #endif
 
-  return value;
+  return value_handle;
 }
 
 napi_ref napi_env__::wrap_ref_in_root_scope(JSValueConst value, uint32_t initial_ref_count)
 {
-  if (current_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
 
   napi_ref wrapped = refs_.allocate(this, value, initial_ref_count);
@@ -355,22 +685,22 @@ size_t napi_env__::active_ref_count() const
 
 bool napi_env__::is_current_scope(napi_handle_scope scope) const
 {
-  return current_scope_ == scope;
+  return agent_->is_current_scope(scope);
 }
 
 void napi_env__::set_current_scope(napi_handle_scope scope)
 {
-  current_scope_ = scope;
+  agent_->set_current_scope(scope);
 }
 
 size_t napi_env__::scope_storage_slot_count() const
 {
-  return scopes_.storage_slot_count();
+  return agent_->scope_storage_slot_count();
 }
 
 size_t napi_env__::active_scope_count() const
 {
-  return scopes_.count_active();
+  return agent_->active_scope_count();
 }
 
 #if defined(NAPI_ENABLE_LIFETIME_TRACKER) && defined(NAPI_ENABLE_LIFETIME_PERIODIC_STATS)
@@ -402,12 +732,12 @@ napi_status napi_env__::clear_last_error()
 
 bool napi_env__::has_last_exception() const
 {
-  return has_last_exception_;
+  return agent_->has_pending_exception();
 }
 
 bool napi_env__::last_exception_is_uncatchable() const
 {
-  return has_last_exception_ && JS_IsUncatchableError(last_exception_);
+  return agent_->pending_exception_is_uncatchable();
 }
 
 void napi_env__::request_termination()
@@ -427,33 +757,17 @@ bool napi_env__::termination_requested() const
 
 void napi_env__::clear_last_exception()
 {
-  if (!has_last_exception_)
-    return;
-
-  JS_FreeValue(last_exception_context_ == nullptr ? main_context_ : last_exception_context_, last_exception_);
-  last_exception_context_ = nullptr;
-  last_exception_ = JS_UNDEFINED;
-  has_last_exception_ = false;
+  agent_->clear_pending_exception();
 }
 
 void napi_env__::set_last_exception(JSValue exception)
 {
-  clear_last_exception();
-  last_exception_context_ = current_context_;
-  last_exception_ = exception;
-  has_last_exception_ = true;
+  agent_->set_pending_exception(exception);
 }
 
 JSValue napi_env__::take_last_exception()
 {
-  if (!has_last_exception_)
-    return JS_UNDEFINED;
-
-  JSValue exception = last_exception_;
-  last_exception_context_ = nullptr;
-  last_exception_ = JS_UNDEFINED;
-  has_last_exception_ = false;
-  return exception;
+  return agent_->take_pending_exception();
 }
 
 void *napi_env__::instance_data() const
@@ -471,8 +785,10 @@ void napi_env__::set_instance_data(void *data, napi_finalize finalize_cb, void *
   instance_data_finalize_cb_ = nullptr;
   instance_data_finalize_hint_ = nullptr;
 
-  if (old_data != nullptr && old_finalize_cb != nullptr)
-    old_finalize_cb(this, old_data, old_finalize_hint);
+  // Unlike Node, which never finalizes replaced instance data, this
+  // finalizes it, but only non-NULL data.
+  if (old_data != nullptr)
+    call_instance_data_finalizer(old_data, old_finalize_cb, old_finalize_hint);
 
   instance_data_ = data;
   instance_data_finalize_cb_ = finalize_cb;
@@ -506,7 +822,7 @@ napi_status napi_env__::remove_cleanup_hook(napi_cleanup_hook hook, void *arg)
 
 napi_env_cleanup_hook__ *napi_env__::create_cleanup_hook(napi_cleanup_hook hook, void *arg)
 {
-  if (main_context_ == nullptr || hook == nullptr)
+  if (context_ == nullptr || hook == nullptr)
     return nullptr;
   return cleanup_hooks_.allocate(this, hook, arg);
 }
@@ -516,11 +832,11 @@ void napi_env__::destroy_cleanup_hook(napi_env_cleanup_hook__ *entry)
   cleanup_hooks_.destroy(entry);
 }
 
-napi_deferred__ *napi_env__::create_deferred(JSContext *context, JSValue resolve, JSValue reject)
+napi_deferred__ *napi_env__::create_deferred(JSValue resolve, JSValue reject)
 {
-  if (context == nullptr)
+  if (context_ == nullptr)
     return nullptr;
-  return deferreds_.allocate(this, context, resolve, reject);
+  return deferreds_.allocate(this, resolve, reject);
 }
 
 void napi_env__::destroy_deferred(napi_deferred__ *deferred)
@@ -533,23 +849,13 @@ napi_external_backing_store_hint__ *napi_env__::create_external_backing_store(
     node_api_basic_finalize finalize_cb,
     void *finalize_hint)
 {
-  if (main_context_ == nullptr)
+  if (context_ == nullptr)
     return nullptr;
-  return external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
-}
-
-napi_env_context_scope__::napi_env_context_scope__(napi_env env, JSContext *context)
-    : env_{env},
-      previous_{env == nullptr ? nullptr : env->current_context()}
-{
-  if (env_ != nullptr && context != nullptr)
-    env_->set_current_context(context);
-}
-
-napi_env_context_scope__::~napi_env_context_scope__()
-{
-  if (env_ != nullptr)
-    env_->set_current_context(previous_);
+  napi_external_backing_store_hint__ *hint =
+      external_backing_stores_.allocate(this, external_data, finalize_cb, finalize_hint);
+  if (hint != nullptr && finalize_cb != nullptr && !finalizers_done_)
+    hint->link_pending(pending_finalizers_);
+  return hint;
 }
 
 void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint__ *hint)
@@ -559,21 +865,12 @@ void napi_env__::destroy_external_backing_store(napi_external_backing_store_hint
 
 int64_t napi_env__::adjust_external_memory(int64_t change_in_bytes)
 {
-  if (change_in_bytes > 0 &&
-      external_memory_ > std::numeric_limits<int64_t>::max() - change_in_bytes)
-  {
-    external_memory_ = std::numeric_limits<int64_t>::max();
-  }
-  else if (change_in_bytes < 0 &&
-           external_memory_ < std::numeric_limits<int64_t>::min() - change_in_bytes)
-  {
-    external_memory_ = std::numeric_limits<int64_t>::min();
-  }
-  else
-  {
-    external_memory_ += change_in_bytes;
-  }
-  return external_memory_;
+  return agent_->adjust_external_memory(change_in_bytes);
+}
+
+bool napi_env__::attach_embedder_hooks(const unofficial_napi_env_hooks &hooks)
+{
+  return agent_->attach_embedder_hooks(hooks);
 }
 
 napi_promises__ &napi_env__::promises()

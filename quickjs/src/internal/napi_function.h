@@ -13,12 +13,21 @@ public:
                                  napi_callback cb,
                                  void *data);
 
+  // A function of the env's own realm: data is [callback, data].
   static JSValue trampoline(JSContext *ctx,
                             JSValueConst this_val,
                             int argc,
                             JSValueConst *argv,
                             int magic,
                             JSValue *func_data);
+  // A function of another realm: data is [callback, data, realm anchor,
+  // realm context].
+  static JSValue realm_trampoline(JSContext *ctx,
+                                  JSValueConst this_val,
+                                  int argc,
+                                  JSValueConst *argv,
+                                  int magic,
+                                  JSValue *func_data);
 
   static napi_status make_constructible(napi_env env, JSValue fn);
 
