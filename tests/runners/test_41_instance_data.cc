@@ -891,3 +891,73 @@ TEST_F(Test41InstanceData, ReleaseFinalizesValuesThatFreeOthersInLinearTime) {
   EXPECT_LT(freeing_ms, 20 * keeping_ms + 50)
       << "keeping " << keeping_ms << " ms, freeing " << freeing_ms << " ms";
 }
+
+namespace {
+
+// An object a hook or a finalizer wraps and throws at release. Dropping the
+// exception frees the object, and the release finalizes its wrap.
+struct ThrownWrap {
+  napi_env env = nullptr;
+  napi_status throw_status = napi_generic_failure;
+  int wrap_finalized = 0;
+};
+
+void FinalizeThrownWrap(node_api_basic_env, void*, void* hint) {
+  ++static_cast<ThrownWrap*>(hint)->wrap_finalized;
+}
+
+void ThrowAWrappedObject(ThrownWrap* thrown) {
+  napi_env env = thrown->env;
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(env, &object), napi_ok);
+  ASSERT_EQ(napi_wrap(env, object, nullptr, FinalizeThrownWrap, thrown, nullptr), napi_ok);
+  thrown->throw_status = napi_throw(env, object);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+void HookThrowingAWrappedObject(void* arg) {
+  ThrowAWrappedObject(static_cast<ThrownWrap*>(arg));
+}
+
+void FinalizeThrowingAWrappedObject(node_api_basic_env, void*, void* hint) {
+  ThrowAWrappedObject(static_cast<ThrownWrap*>(hint));
+}
+
+void ExpectThrownAndFinalizedOnce(const ThrownWrap& thrown) {
+  // napi_throw returns napi_ok in Node, napi_pending_exception in QuickJS.
+  EXPECT_TRUE(thrown.throw_status == napi_ok || thrown.throw_status == napi_pending_exception)
+      << thrown.throw_status;
+  EXPECT_EQ(thrown.wrap_finalized, 1);
+}
+
+}  // namespace
+
+// Dropping what a hook threw at release can free the last reference to an
+// object with a finalizer, and so run that finalizer while the exception is
+// being dropped. The exception is dropped, and freed, once.
+TEST_F(Test41InstanceData, AnObjectAHookThrowsIsDroppedOnceAtRelease) {
+  EnvScope s(runtime_.get());
+  ThrownWrap thrown;
+  thrown.env = s.env;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookThrowingAWrappedObject, &thrown), napi_ok);
+
+  Release(s);
+  ExpectThrownAndFinalizedOnce(thrown);
+}
+
+// The same for what a value's finalizer throws at release.
+TEST_F(Test41InstanceData, AnObjectAFinalizerThrowsIsDroppedOnceAtRelease) {
+  EnvScope s(runtime_.get());
+  ThrownWrap thrown;
+  thrown.env = s.env;
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external(s.env, nullptr, FinalizeThrowingAWrappedObject, &thrown,
+                                 &external),
+            napi_ok);
+  Keep(s.env, "external", external);
+
+  Release(s);
+  ExpectThrownAndFinalizedOnce(thrown);
+}

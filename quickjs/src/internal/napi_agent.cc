@@ -144,9 +144,13 @@ bool napi_agent__::pending_exception_is_uncatchable() const
 
 void napi_agent__::set_pending_exception(JSValue exception)
 {
-  clear_pending_exception();
+  // Freeing the old exception can free an object with a finalizer, which
+  // runs now and may itself read, clear or set the pending exception: the new
+  // one is in place first.
+  JSValue old_exception = take_pending_exception();
   pending_exception_ = exception;
   has_pending_exception_ = true;
+  JS_FreeValueRT(runtime_, old_exception);
 }
 
 JSValue napi_agent__::take_pending_exception()
@@ -165,9 +169,9 @@ void napi_agent__::clear_pending_exception()
   if (!has_pending_exception_)
     return;
 
-  JS_FreeValueRT(runtime_, pending_exception_);
-  pending_exception_ = JS_UNDEFINED;
-  has_pending_exception_ = false;
+  // Taken before it is freed: freeing it can free an object with a
+  // finalizer, which runs now and may itself clear the pending exception.
+  JS_FreeValueRT(runtime_, take_pending_exception());
 }
 
 int64_t napi_agent__::adjust_external_memory(int64_t change_in_bytes)
