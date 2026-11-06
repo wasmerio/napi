@@ -298,4 +298,50 @@ TEST_F(Test72HooksKeepTermination, DefaultDynamicImportHelper) {
         "after = 'yes';\n");
   }
 }
+
+// The serializer's and deserializer's hooks; only V8's serdes binding calls
+// them (QuickJS's writes and reads values itself). A `_getDataCloneError`
+// getter V8 terminated made V8 throw the clone error over the termination,
+// and the JS that wrote the value caught it.
+TEST_F(Test72HooksKeepTermination, SerdesHooks) {
+  for (const char* script : {
+           "const s = new serdes.Serializer();\n"
+           "Object.defineProperty(s, '_getDataCloneError', { get() { terminate(); tick(); } });\n"
+           "try { s.writeValue(() => {}); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+           "const s = new serdes.Serializer();\n"
+           "s._getDataCloneError = (message) => { terminate(); tick(); };\n"
+           "try { s.writeValue(() => {}); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+           "const s = new serdes.Serializer();\n"
+           "s._setTreatArrayBufferViewsAsHostObjects(true);\n"
+           "s._writeHostObject = (value) => { terminate(); tick(); };\n"
+           "try { s.writeValue(new Uint8Array(2)); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+           "const s = new serdes.Serializer();\n"
+           "s._getSharedArrayBufferId = (buffer) => { terminate(); tick(); };\n"
+           "try { s.writeValue(new SharedArrayBuffer(2)); }\n"
+           "catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+           "const s = new serdes.Serializer();\n"
+           "s._setTreatArrayBufferViewsAsHostObjects(true);\n"
+           "s._writeHostObject = function (value) { this.writeUint32(7); };\n"
+           "s.writeHeader();\n"
+           "s.writeValue(new Uint8Array(2));\n"
+           "const d = new serdes.Deserializer(s.releaseBuffer());\n"
+           "d._readHostObject = () => { terminate(); tick(); };\n"
+           "d.readHeader();\n"
+           "try { d.readValue(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+           "after = 'yes';\n",
+       }) {
+    SCOPED_TRACE(script);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    napi_value binding = nullptr;
+    ASSERT_EQ(unofficial_napi_create_serdes_binding(s.env, &binding), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "serdes", binding), napi_ok);
+    const std::string wrapped = std::string("(() => {\n") + script + "})();";
+    ExpectRunTerminated(s.env, wrapped.c_str());
+  }
+}
 #endif

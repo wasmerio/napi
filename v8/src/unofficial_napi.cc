@@ -927,7 +927,11 @@ void SerializerContext::ThrowDataCloneError(v8::Local<v8::String> message) {
   if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
            .ToLocal(&get_data_clone_error) ||
       !get_data_clone_error->IsFunction()) {
-    isolate_->ThrowException(v8::Exception::Error(message));
+    // A getter V8 terminated: the termination is what fails the write, and
+    // throwing would replace it with a catchable error.
+    if (!isolate_->IsExecutionTerminating()) {
+      isolate_->ThrowException(v8::Exception::Error(message));
+    }
     return;
   }
 
