@@ -783,6 +783,10 @@ extern "C"
         napi_value transfer_list_or_null,
         napi_value *result_out)
     {
+        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
+        // a proxy trap).
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
         return QuickJSStructuredClone(env, value, transfer_list_or_null, result_out);
     }
 
@@ -791,6 +795,10 @@ extern "C"
         napi_value value,
         unofficial_napi_message *message_out)
     {
+        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
+        // a proxy trap).
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
         return napi_serdes__::serialize_value(
             env, value, reinterpret_cast<void **>(message_out));
     }
@@ -821,6 +829,10 @@ extern "C"
         uint32_t filter_bits,
         napi_value *result_out)
     {
+        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
+        // a proxy trap).
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
         if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
         JSContext *ctx = napi_util__::context(env);
@@ -1171,6 +1183,10 @@ extern "C"
                 return napi_invalid_arg;
             options = *options_or_null;
         }
+        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
+        // a proxy trap).
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
         return napi_util__::check_env(env) ? env->contextify().create_realm(options, realm_out, global_out)
                                            : napi_invalid_arg;
     }
@@ -1331,6 +1347,10 @@ extern "C"
         napi_value host_defined_option_id,
         napi_value *result_out)
     {
+        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
+        // a proxy trap).
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
         return napi_util__::check_env(env) ? env->contextify().compile_function(realm_or_null,
                                                                   source,
                                                                   filename,

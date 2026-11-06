@@ -1752,6 +1752,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
     unofficial_napi_realm* realm_out,
     napi_value* global_out) {
   if (env == nullptr || realm_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
   if (options_or_null != nullptr) {
@@ -2143,6 +2144,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
       result_out == nullptr) {
     return napi_invalid_arg;
   }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   (void)break_on_first_line;
 
   v8::Isolate* isolate = env->isolate;
@@ -2299,6 +2301,7 @@ napi_status NAPI_CDECL unofficial_napi_compile_function(
       result_out == nullptr) {
     return napi_invalid_arg;
   }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
@@ -2853,6 +2856,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
     napi_env env,
     unofficial_napi_module module_handle) {
   if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
@@ -2878,6 +2882,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
     bool /*break_on_sigint*/,
     napi_value* result_out) {
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
@@ -2904,6 +2909,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_value parent_filename,
     napi_value* result_out) {
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   *result_out = nullptr;
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
@@ -3155,6 +3161,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     unofficial_napi_module module,
     napi_value* result_out) {
   if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);

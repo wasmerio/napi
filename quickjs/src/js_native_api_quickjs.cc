@@ -3253,6 +3253,8 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || data == nullptr || result == nullptr)
       return napi_util__::invalid_arg(env);
+    // Making a Buffer reads the env's Buffer, which a getter may be.
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     napi_value arraybuffer = nullptr;
     napi_status status = napi_create_arraybuffer(env, length, data, &arraybuffer);
@@ -3293,6 +3295,8 @@ extern "C"
   {
     if (!napi_util__::check_env(env) || result == nullptr || (length > 0 && data == nullptr))
       return napi_util__::invalid_arg(env);
+    // Making a Buffer reads the env's Buffer, which a getter may be.
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     napi_value arraybuffer = nullptr;
     napi_status status = napi_create_external_arraybuffer(
@@ -3330,6 +3334,7 @@ extern "C"
   {
     if (!napi_util__::check_value(env, arraybuffer) || result == nullptr)
       return napi_util__::invalid_arg(env);
+    NAPI_QUICKJS_RETURN_IF_TERMINATING(env);
 
     size_t arraybuffer_length = 0;
     uint8_t *arraybuffer_data = JS_GetArrayBuffer(

@@ -280,6 +280,15 @@ bool napi_v8_terminating(napi_env env);
 // pending.
 napi_status napi_v8_fail_terminating(napi_env env);
 
+// Like Node's NAPI_PREAMBLE: while the env terminates, calls that enter V8 or
+// may run JS fail without entering V8. Entering V8 clears the termination
+// (V8 13.6's PREPARE_FOR_EXECUTION does), and JS run then runs on with
+// nothing to stop it.
+#define NAPI_V8_RETURN_IF_TERMINATING(env)                                   \
+  do {                                                                       \
+    if (napi_v8_terminating(env)) return napi_v8_fail_terminating(env);      \
+  } while (0)
+
 // For a V8 host callback (a module hook, say) that ran JS through N-API and
 // failed: moves N-API's pending exception into V8, as Node's callbacks
 // rethrow what their TryCatch caught, and returns true. While the env

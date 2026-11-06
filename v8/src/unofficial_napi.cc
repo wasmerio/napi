@@ -1583,6 +1583,7 @@ napi_status StructuredCloneImpl(
   if (env == nullptr || env->isolate == nullptr || value == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
@@ -2222,6 +2223,7 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   if (env == nullptr || env->isolate == nullptr || value == nullptr || message_out == nullptr) {
     return napi_invalid_arg;
   }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   *message_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
@@ -2575,6 +2577,7 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
                                                              size_t length,
                                                              napi_value* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (utf8description == nullptr && length > 0) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
@@ -2615,6 +2618,7 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
   if (env == nullptr || value == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
   }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
   if (raw.IsEmpty() || !raw->IsObject()) return napi_object_expected;
 

@@ -174,6 +174,99 @@ napi_value TerminateThen(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+// N-API calls that run JS, given what makes them run it: native code may
+// make them after a call into JS failed because of a termination. Each
+// payload sets afterCall if its JS runs.
+constexpr const char* kJsCalls[] = {
+    "unofficial_napi_run_script",
+    "unofficial_napi_module_wrap_evaluate",
+    "unofficial_napi_module_wrap_evaluate_sync",
+    "unofficial_napi_get_own_non_index_properties (proxy)",
+    "unofficial_napi_create_realm (proxy sandbox)",
+    "unofficial_napi_structured_clone (getter)",
+    "unofficial_napi_message_create (getter)",
+    "unofficial_napi_compile_function (getter in the extensions)",
+    "napi_create_buffer (Buffer getter)",
+};
+constexpr int kJsCallCount = sizeof(kJsCalls) / sizeof(kJsCalls[0]);
+
+constexpr const char* kJsCallPayloads[] = {
+    "undefined",
+    "undefined",
+    "undefined",
+    "new Proxy({}, { ownKeys() { afterCall = 'yes'; return []; } })",
+    "new Proxy({}, { ownKeys() { afterCall = 'yes'; return []; } })",
+    "({ get x() { afterCall = 'yes'; return 1; } })",
+    "({ get x() { afterCall = 'yes'; return 1; } })",
+    "(() => { const a = [{}]; Object.defineProperty(a, 0, { get() { afterCall = 'yes'; return {}; } }); return a; })()",
+    "(Object.defineProperty(globalThis, 'Buffer', { get() { afterCall = 'yes'; return undefined; }, configurable: true }), undefined)",
+};
+
+// The module kJsCalls's evaluations evaluate.
+unofficial_napi_module g_module = nullptr;
+
+napi_status CallRunningJs(napi_env env, int kind, napi_value payload) {
+  napi_value out = nullptr;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  switch (kind) {
+    case 0: {
+      const unofficial_napi_js_source source =
+          unofficial_napi_js_source_from_text(Str(env, "globalThis.afterCall = 'yes';"));
+      return unofficial_napi_run_script(env, nullptr, &source, Str(env, "after.js"), 0, 0, -1,
+                                        true, false, false, nullptr, &out);
+    }
+    case 1:
+      return unofficial_napi_module_wrap_evaluate(env, g_module, -1, false, &out);
+    case 2:
+      return unofficial_napi_module_wrap_evaluate_sync(env, g_module, Str(env, "m.mjs"),
+                                                       Str(env, "parent.js"), &out);
+    case 3:
+      return unofficial_napi_get_own_non_index_properties(env, payload, 0, &out);
+    case 4: {
+      unofficial_napi_realm_options options;
+      unofficial_napi_realm_options_init(&options);
+      options.sandbox_or_null = payload;
+      unofficial_napi_realm realm = nullptr;
+      return unofficial_napi_create_realm(env, &options, &realm, &out);
+    }
+    case 5:
+      return unofficial_napi_structured_clone(env, payload, nullptr, &out);
+    case 6: {
+      unofficial_napi_message message = nullptr;
+      const napi_status status = unofficial_napi_message_create(env, payload, &message);
+      if (message != nullptr) unofficial_napi_message_drop(message);
+      return status;
+    }
+    case 7: {
+      const unofficial_napi_js_source source =
+          unofficial_napi_js_source_from_text(Str(env, "return 1;"));
+      return unofficial_napi_compile_function(env, nullptr, &source, Str(env, "f.js"), 0, 0,
+                                              payload, undefined, undefined, &out);
+    }
+    default: {
+      void* data = nullptr;
+      return napi_create_buffer(env, 4, &data, &out);
+    }
+  }
+}
+
+// Calls its first argument, a JS function that terminates, then makes the
+// N-API call its second argument names with its third as the payload, as
+// native code that ignores the failed call does.
+napi_value CallThen(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  EXPECT_EQ(napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr), napi_ok);
+  int32_t kind = 0;
+  EXPECT_EQ(napi_get_value_int32(env, argv[1], &kind), napi_ok);
+  napi_value ignored = nullptr;
+  EXPECT_EQ(napi_call_function(env, Global(env), argv[0], 0, nullptr, &ignored),
+            napi_pending_exception);
+  g_status = CallRunningJs(env, kind, argv[2]);
+  return nullptr;
+}
+
 void DefineGlobalFunction(napi_env env, const char* name, napi_callback cb, void* data = nullptr) {
   napi_value fn = nullptr;
   ASSERT_EQ(napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, data, &fn), napi_ok);
@@ -220,6 +313,7 @@ bool FinishTermination(napi_env env) {
 void InstallHelpers(napi_env env) {
   DefineGlobalFunction(env, "terminate", Terminate);
   DefineGlobalFunction(env, "terminateThen", TerminateThen);
+  DefineGlobalFunction(env, "callThen", CallThen);
   DefineGlobalFunction(env, "terminateThenCancel", TerminateThenCancel);
   DefineGlobalFunction(env, "terminateAndSleep", TerminateAndSleep);
   DefineGlobalFunction(env, "runScriptWithTimeout", RunScriptWithTimeout);
@@ -420,6 +514,28 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTermination) {
                                "); } catch (e) { caught = 'yes'; caughtError = e; }\n"
                                "after = 'yes';\n";
     ExpectRunTerminated(s.env, script.c_str());
+  }
+}
+
+// Native code whose call into JS a termination failed, and which then makes
+// an N-API call that runs JS. On V8 the termination is in effect when that
+// call enters V8, which clears it and runs the JS.
+TEST_F(Test73TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
+  for (int kind = 0; kind < kJsCallCount; ++kind) {
+    SCOPED_TRACE(kJsCalls[kind]);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    g_module = MakeModule(s.env, "globalThis.afterCall = 'yes';", nullptr);
+    ASSERT_NE(g_module, nullptr);
+    g_status = napi_ok;
+    const std::string script =
+        std::string("const payload = ") + kJsCallPayloads[kind] + ";\n" +
+        "try { callThen(() => { terminate(); tick(); }, " + std::to_string(kind) +
+        ", payload); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n";
+    ExpectRunTerminated(s.env, script.c_str());
+    EXPECT_EQ(g_status, napi_pending_exception);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, g_module), napi_ok);
   }
 }
 

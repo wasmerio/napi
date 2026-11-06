@@ -596,14 +596,6 @@ inline bool TerminatedOrTerminating(napi_env env) {
           env->isolate->IsExecutionTerminating());
 }
 
-// Like Node's NAPI_PREAMBLE: while terminating, calls that may run JS fail
-// without entering V8. Entering V8 then clears the termination, so the thread
-// would keep running JS after it was told to stop.
-#define NAPI_V8_RETURN_IF_TERMINATING(env)                                   \
-  do {                                                                       \
-    if (TerminatedOrTerminating(env)) return napi_v8_fail_terminating(env);  \
-  } while (0)
-
 inline napi_status InvalidArg(napi_env env) {
   if (CheckEnv(env)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -870,6 +862,7 @@ napi_status CreateExternalBuffer(napi_env env,
                                  napi_v8_external_free_callback free_cb,
                                  void* finalize_hint,
                                  napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
@@ -1383,6 +1376,7 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
 }
 
 napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   v8::MaybeLocal<v8::Value> maybe_date = v8::Date::New(env->context(), time);
   if (maybe_date.IsEmpty()) {
@@ -2311,6 +2305,7 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
                                             napi_callback cb,
                                             void* data,
                                             napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) return napi_invalid_arg;
   if (cb == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -2349,6 +2344,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
                                          size_t property_count,
                                          const napi_property_descriptor* properties,
                                          napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env)) {
     return napi_invalid_arg;
   }
@@ -2630,6 +2626,7 @@ napi_status NAPI_CDECL napi_define_properties(
 napi_status NAPI_CDECL napi_create_promise(napi_env env,
                                            napi_deferred* deferred,
                                            napi_value* promise) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || deferred == nullptr || promise == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
@@ -3606,6 +3603,7 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
                                           size_t length,
                                           void** data,
                                           napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
@@ -3679,6 +3677,7 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
     size_t byte_offset,
     size_t byte_length,
     napi_value* result) {
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(arraybuffer);
   if (!raw->IsArrayBuffer()) return napi_invalid_arg;
