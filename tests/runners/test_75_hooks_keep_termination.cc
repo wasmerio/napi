@@ -12,6 +12,9 @@
 
 #include "test_env.h"
 
+#ifdef NAPI_MODULE
+#undef NAPI_MODULE
+#endif
 #include "node_api.h"
 #include "unofficial_napi.h"
 
