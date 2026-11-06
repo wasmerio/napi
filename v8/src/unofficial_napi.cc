@@ -1648,6 +1648,20 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 #endif
 }
 
+namespace unofficial_napi_internal {
+
+void ForgetEnvState(napi_env env) {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
+  if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
+    ResetPrepareStackTraceState(&prepare_it->second);
+    g_prepare_stack_trace_callbacks.erase(prepare_it);
+  }
+  ResetErrorFormattingState(env);
+}
+
+}  // namespace unofficial_napi_internal
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
@@ -1743,13 +1757,8 @@ static napi_status DestroyEnvInstance(napi_env env) {
     if (g_runtime.platform != nullptr) {
       g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
     }
-    auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
-    if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
-      ResetPrepareStackTraceState(&prepare_it->second);
-      g_prepare_stack_trace_callbacks.erase(prepare_it);
-    }
-    unofficial_napi_internal::ResetErrorFormattingState(env);
   }
+  unofficial_napi_internal::ForgetEnvState(env);
   env->promise_reject_callback.Reset();
   for (auto& hook : env->promise_hooks) {
     hook.Reset();
@@ -1758,6 +1767,7 @@ static napi_status DestroyEnvInstance(napi_env env) {
   if (env->agent != nullptr && env->agent->principal_env == env) {
     env->agent->Shutdown();
   }
+  // Its release forgets the state again once its hooks and finalizers ran.
   delete env;
   return napi_ok;
 }

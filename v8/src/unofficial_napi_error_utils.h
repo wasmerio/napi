@@ -42,6 +42,9 @@ napi_status GetErrorMetadata(napi_env env,
                              unofficial_napi_error_metadata_mode mode,
                              unofficial_napi_error_metadata* out);
 void ResetErrorFormattingState(napi_env env);
+// Drops what the runtime keeps for `env` outside it, keyed by its address:
+// its error formatting and prepare-stack-trace state. Takes the runtime lock.
+void ForgetEnvState(napi_env env);
 
 }  // namespace unofficial_napi_internal
 

@@ -1353,3 +1353,26 @@ TEST_F(Test41InstanceData, TheInstanceDataFinalizerRunsForNullData) {
   EXPECT_EQ(null_data, std::vector<void*>{nullptr});
   EXPECT_EQ(set_at_release, (std::vector<void*>{&marker, nullptr}));
 }
+
+namespace {
+
+// A hook that throws at release and takes the exception back.
+void HookThrowingAndTaking(void* arg) {
+  auto env = static_cast<napi_env>(arg);
+  napi_throw_error(env, nullptr, "taken at release");
+  napi_value error = nullptr;
+  napi_get_and_clear_last_exception(env, &error);
+}
+
+}  // namespace
+
+// What N-API keeps for an env while its release runs (here, the error a hook
+// takes back) goes with the env: envs made later, which may reuse its
+// address, start without it.
+TEST_F(Test41InstanceData, StateMadeAtReleaseGoesWithTheEnv) {
+  for (int i = 0; i < 32; ++i) {
+    EnvScope s(runtime_.get());
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookThrowingAndTaking, s.env), napi_ok);
+    Release(s);
+  }
+}
