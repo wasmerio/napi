@@ -343,10 +343,10 @@ add_fixture_test(${_napi_test_prefix}_test_75_hooks_keep_termination
   runners/test_75_hooks_keep_termination.cc
 )
 target_compile_definitions(${_napi_test_prefix}_test_75_hooks_keep_termination PRIVATE NAPI_VERSION=10)
-add_fixture_test(${_napi_test_prefix}_test_76_termination_until_cancelled
-  runners/test_76_termination_until_cancelled.cc
+add_fixture_test(${_napi_test_prefix}_test_78_termination_until_cancelled
+  runners/test_78_termination_until_cancelled.cc
 )
-target_compile_definitions(${_napi_test_prefix}_test_76_termination_until_cancelled PRIVATE NAPI_VERSION=10)
+target_compile_definitions(${_napi_test_prefix}_test_78_termination_until_cancelled PRIVATE NAPI_VERSION=10)
 add_fixture_test(${_napi_test_prefix}_test_77_module_wrap_state
   runners/test_77_module_wrap_state.cc
 )

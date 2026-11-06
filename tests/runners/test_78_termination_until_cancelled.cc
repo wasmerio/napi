@@ -27,7 +27,7 @@
 #include <v8.h>
 #endif
 
-class Test76TerminationUntilCancelled : public FixtureTestBase {};
+class Test78TerminationUntilCancelled : public FixtureTestBase {};
 
 namespace {
 
@@ -459,7 +459,7 @@ constexpr char kEvaluateModuleInTryCatch[] =
 // TryCatch records a termination as a null exception, which V8 would
 // otherwise throw into that JS as a catchable null; QuickJS drops its
 // uncatchable error at the cancel.
-TEST_F(Test76TerminationUntilCancelled, CancelledInsideANativeFunction) {
+TEST_F(Test78TerminationUntilCancelled, CancelledInsideANativeFunction) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   EXPECT_EQ(RunScript(s.env,
@@ -493,7 +493,7 @@ napi_value ThrowTerminateCancel(napi_env env, napi_callback_info /*info*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, CancelKeepsAnExceptionThrownBefore) {
+TEST_F(Test78TerminationUntilCancelled, CancelKeepsAnExceptionThrownBefore) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   DefineGlobalFunction(s.env, "throwTerminateCancel", ThrowTerminateCancel);
@@ -508,7 +508,7 @@ TEST_F(Test76TerminationUntilCancelled, CancelKeepsAnExceptionThrownBefore) {
 
 // The same inside the import.meta hook, which throws what its callback left
 // pending from the import.meta expression.
-TEST_F(Test76TerminationUntilCancelled, CancelledInsideAModuleHook) {
+TEST_F(Test78TerminationUntilCancelled, CancelledInsideAModuleHook) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   SetModuleHooks(s.env, nullptr,
@@ -534,7 +534,7 @@ TEST_F(Test76TerminationUntilCancelled, CancelledInsideAModuleHook) {
 // timeout expires too: the termination is not the timeout's to cancel, and
 // must not come back as the timeout's catchable error. QuickJS has no
 // timeout, so only the termination stops the script there.
-TEST_F(Test76TerminationUntilCancelled, ScriptTimeoutKeepsTheEmbeddersTermination) {
+TEST_F(Test78TerminationUntilCancelled, ScriptTimeoutKeepsTheEmbeddersTermination) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   g_status = napi_ok;
@@ -548,7 +548,7 @@ TEST_F(Test76TerminationUntilCancelled, ScriptTimeoutKeepsTheEmbeddersTerminatio
 // The run a termination stopped leaves it in effect: the next run fails too
 // until the termination is cancelled. V8 forgets a termination once the
 // outermost JS frame has unwound.
-TEST_F(Test76TerminationUntilCancelled, TopLevelRunKeepsTheTerminationUntilCancelled) {
+TEST_F(Test78TerminationUntilCancelled, TopLevelRunKeepsTheTerminationUntilCancelled) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   napi_value mark = Eval(s.env, "() => { afterCall = 'yes'; }");
@@ -566,7 +566,7 @@ TEST_F(Test76TerminationUntilCancelled, TopLevelRunKeepsTheTerminationUntilCance
 // of the termination. On V8 an N-API call that enters V8 clears the
 // termination, and the trampoline then threw the null the TryCatch recorded
 // for it, which the JS caught.
-TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTermination) {
+TEST_F(Test78TerminationUntilCancelled, NativeCallsAfterTheTermination) {
   for (int kind = 0; kind < kAfterCallCount; ++kind) {
     SCOPED_TRACE(kAfterCalls[kind]);
     EnvScope s(runtime_.get());
@@ -581,7 +581,7 @@ TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTermination) {
 // Native code whose call into JS a termination failed, and which then makes
 // an N-API call that runs JS. On V8 the termination is in effect when that
 // call enters V8, which clears it and runs the JS.
-TEST_F(Test76TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
+TEST_F(Test78TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
   for (int kind = 0; kind < kJsCallCount; ++kind) {
     SCOPED_TRACE(kJsCalls[kind]);
     EnvScope s(runtime_.get());
@@ -627,7 +627,7 @@ constexpr const char* kStoppedCalls[] = {
 };
 constexpr int kStoppedCallCount = sizeof(kStoppedCalls) / sizeof(kStoppedCalls[0]);
 
-TEST_F(Test76TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) {
+TEST_F(Test78TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) {
   for (int kind = 0; kind < kStoppedCallCount; ++kind) {
     SCOPED_TRACE(kStoppedCalls[kind]);
     EnvScope s(runtime_.get());
@@ -680,7 +680,7 @@ TEST_F(Test76TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) 
 
 // The same native code, called from the module hooks test_75 covers: those
 // see what the native function threw.
-TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideModuleHooks) {
+TEST_F(Test78TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideModuleHooks) {
   {
     SCOPED_TRACE("import.meta");
     EnvScope s(runtime_.get());
@@ -753,7 +753,7 @@ void TerminatingFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, FinalizerDrainedAtACheckpoint) {
+TEST_F(Test78TerminationUntilCancelled, FinalizerDrainedAtACheckpoint) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ASSERT_EQ(RunScript(s.env, "globalThis.markAfterCall = () => { afterCall = 'yes'; };"),
@@ -797,7 +797,7 @@ napi_value MarkCleanup(napi_env /*env*/, napi_callback_info /*info*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, FinalizationRegistryCleanupAtACheckpoint) {
+TEST_F(Test78TerminationUntilCancelled, FinalizationRegistryCleanupAtACheckpoint) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   DefineGlobalFunction(s.env, "markCleanup", MarkCleanup);
@@ -832,7 +832,7 @@ napi_value TerminateThenCheckpoint(napi_env env, napi_callback_info /*info*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, CheckpointAfterTheTermination) {
+TEST_F(Test78TerminationUntilCancelled, CheckpointAfterTheTermination) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   DefineGlobalFunction(s.env, "terminateThenCheckpoint", TerminateThenCheckpoint);
@@ -870,7 +870,7 @@ void ReleaseFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, TerminationRequestedInsideTheRelease) {
+TEST_F(Test78TerminationUntilCancelled, TerminationRequestedInsideTheRelease) {
   g_release_runs.clear();
   {
     EnvScope s(runtime_.get());
@@ -912,7 +912,7 @@ void ReleaseRunsJs(void* arg) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, ReleaseAfterAnUncancelledTermination) {
+TEST_F(Test78TerminationUntilCancelled, ReleaseAfterAnUncancelledTermination) {
   g_release_result.clear();
   {
     EnvScope s(runtime_.get());
@@ -929,7 +929,7 @@ TEST_F(Test76TerminationUntilCancelled, ReleaseAfterAnUncancelledTermination) {
 // host-object hook (QuickJS's serdes binding calls none of the serializer's
 // hooks) and the deprecated context-token assign hook (only V8 accepts the
 // context-token hooks).
-TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideV8Hooks) {
+TEST_F(Test78TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideV8Hooks) {
   {
     SCOPED_TRACE("prepare-stack-trace callback");
     EnvScope s(runtime_.get());
@@ -1004,7 +1004,7 @@ napi_value CreateSandboxRealm(napi_env env, napi_callback_info /*info*/) {
   return global;
 }
 
-TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheTokenAssignHook) {
+TEST_F(Test78TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheTokenAssignHook) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   AttachTokenHooks(s.env, true);
@@ -1025,7 +1025,7 @@ TEST_F(Test76TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
 // QuickJS has no counterpart of). No JS called it, so there is none to stop,
 // and V8 aborts on any JS run there: the provider must run none. The
 // termination stays in effect.
-TEST_F(Test76TerminationUntilCancelled, NativeFunctionCalledFromCppWithJsDisallowed) {
+TEST_F(Test78TerminationUntilCancelled, NativeFunctionCalledFromCppWithJsDisallowed) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   napi_value terminate = nullptr;
@@ -1084,7 +1084,7 @@ void CleanupHookCancelledByAnUnassignHook(void* arg) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, UnassignHookCancelsDuringTheRelease) {
+TEST_F(Test78TerminationUntilCancelled, UnassignHookCancelsDuringTheRelease) {
   g_release_result.clear();
   {
     EnvScope s(runtime_.get());
@@ -1101,7 +1101,7 @@ TEST_F(Test76TerminationUntilCancelled, UnassignHookCancelsDuringTheRelease) {
   EXPECT_EQ(g_release_result, "ok");
 }
 
-TEST_F(Test76TerminationUntilCancelled, CreateRealmAfterATerminatedUnassignHook) {
+TEST_F(Test78TerminationUntilCancelled, CreateRealmAfterATerminatedUnassignHook) {
   for (bool with_sandbox : {true, false}) {
     SCOPED_TRACE(with_sandbox ? "with a sandbox" : "with a fresh global");
     EnvScope s(runtime_.get());
@@ -1151,7 +1151,7 @@ napi_value RequestInterrupt(napi_env env, napi_callback_info /*info*/) {
 }
 }  // namespace
 
-TEST_F(Test76TerminationUntilCancelled, InterruptCallbackTerminated) {
+TEST_F(Test78TerminationUntilCancelled, InterruptCallbackTerminated) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ASSERT_EQ(napi_create_reference(s.env, Eval(s.env, "(() => { terminate(); tick(); })"), 1,
