@@ -2859,12 +2859,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
-    napi_env env,
-    unofficial_napi_module module_handle) {
-  if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
-  NAPI_V8_RETURN_IF_TERMINATING(env);
-  ModuleWrapRecord* record = ModuleRecord(module_handle);
+// Instantiates the module and the modules it was linked to.
+static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* record) {
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2881,6 +2877,24 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
+    napi_env env,
+    unofficial_napi_module module_handle) {
+  if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  return InstantiateModuleRecord(env, ModuleRecord(module_handle));
+}
+
+// V8 evaluates only an instantiated module and aborts the process for one
+// that is not. Instantiate it first, as QuickJS's JS_EvaluateModule does.
+static napi_status InstantiateForEvaluation(napi_env env, ModuleWrapRecord* record) {
+  v8::HandleScope handle_scope(env->isolate);
+  if (record->module.Get(env->isolate)->GetStatus() >= v8::Module::kInstantiated) {
+    return napi_ok;
+  }
+  return InstantiateModuleRecord(env, record);
+}
+
 napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
     napi_env env,
     unofficial_napi_module module_handle,
@@ -2890,6 +2904,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  const napi_status instantiated = InstantiateForEvaluation(env, record);
+  if (instantiated != napi_ok) return instantiated;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2918,6 +2934,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
   *result_out = nullptr;
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  const napi_status instantiated = InstantiateForEvaluation(env, record);
+  if (instantiated != napi_ok) return instantiated;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);

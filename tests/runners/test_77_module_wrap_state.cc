@@ -20,6 +20,7 @@ namespace {
 // Module states, as unofficial_napi_module_wrap_get_state reports them.
 constexpr int32_t kUninstantiated = 0;
 constexpr int32_t kInstantiated = 2;
+constexpr int32_t kEvaluated = 4;
 
 napi_value Str(napi_env env, const char* value) {
   napi_value out = nullptr;
@@ -80,6 +81,52 @@ bool ExceptionPending(napi_env env) {
   return pending;
 }
 
+std::string ValueText(napi_env env, napi_value value) {
+  napi_value string = nullptr;
+  char text[256] = {};
+  size_t length = 0;
+  if (value == nullptr || napi_coerce_to_string(env, value, &string) != napi_ok ||
+      napi_get_value_string_utf8(env, string, text, sizeof(text), &length) != napi_ok) {
+    return "<unprintable>";
+  }
+  return std::string(text, length);
+}
+
+std::string RunText(napi_env env, const char* source) {
+  napi_value result = nullptr;
+  if (napi_run_script(env, Str(env, source), &result) != napi_ok) return "<threw>";
+  return ValueText(env, result);
+}
+
+// Takes the pending exception: its message, or "" when none was pending.
+std::string TakePendingMessage(napi_env env) {
+  if (!ExceptionPending(env)) return "";
+  napi_value error = nullptr;
+  napi_value message = nullptr;
+  if (napi_get_and_clear_last_exception(env, &error) != napi_ok) return "<not taken>";
+  if (napi_get_named_property(env, error, "message", &message) != napi_ok) return "<no message>";
+  return ValueText(env, message);
+}
+
+// How `promise` settles once the microtasks have run: "resolved", or
+// "rejected: <message>".
+std::string PromiseOutcome(napi_env env, napi_value promise) {
+  napi_value global = nullptr;
+  if (promise == nullptr || napi_get_global(env, &global) != napi_ok ||
+      napi_set_named_property(env, global, "settling", promise) != napi_ok) {
+    return "<not observed>";
+  }
+  RunText(env,
+      "globalThis.outcome = 'pending';"
+      "Promise.resolve(settling).then(() => { outcome = 'resolved'; },"
+      "  (e) => { outcome = 'rejected: ' + (e && e.message); });"
+      "0");
+  EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
+                env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  return RunText(env, "outcome");
+}
+
 }  // namespace
 
 // A module that is not instantiated has no top-level await under way: the
@@ -127,4 +174,48 @@ TEST_F(Test77ModuleWrapState, CheckUnsettledTopLevelAwaitOfAModuleNotInstantiate
             napi_ok);
   EXPECT_TRUE(settled);
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, synthetic), napi_ok);
+}
+
+// Evaluating a module that is not instantiated instantiates it first, as
+// QuickJS's JS_EvaluateModule does: with nothing to link it to, the module
+// runs; with a request it was not linked for, the evaluation fails as
+// instantiating it does and the module stays uninstantiated. V8's Evaluate
+// takes an instantiated module only, and the V8 provider aborted the process
+// here.
+TEST_F(Test77ModuleWrapState, EvaluatingAModuleNotInstantiatedInstantiatesItFirst) {
+  EnvScope s(runtime_.get());
+  for (bool sync : {false, true}) {
+    SCOPED_TRACE(sync ? "evaluate_sync" : "evaluate");
+    ASSERT_EQ(RunText(s.env, "globalThis.runs = 0"), "0");
+    unofficial_napi_module module = CreateSourceTextModule(
+        s.env, "globalThis.runs++; export const value = 42;");
+    ASSERT_NE(module, nullptr);
+    napi_value result = nullptr;
+    if (sync) {
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result),
+                napi_ok);
+      napi_value value = nullptr;
+      ASSERT_EQ(napi_get_named_property(s.env, result, "value", &value), napi_ok);
+      EXPECT_EQ(ValueText(s.env, value), "42");
+    } else {
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &result), napi_ok);
+      EXPECT_EQ(PromiseOutcome(s.env, result), "resolved");
+    }
+    EXPECT_EQ(Status(s.env, module), kEvaluated);
+    EXPECT_EQ(RunText(s.env, "runs"), "1");
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+
+    unofficial_napi_module unlinked = CreateSourceTextModule(
+        s.env, "import 'missing'; globalThis.runs++;");
+    ASSERT_NE(unlinked, nullptr);
+    result = nullptr;
+    const napi_status status =
+        sync ? unofficial_napi_module_wrap_evaluate_sync(s.env, unlinked, nullptr, nullptr, &result)
+             : unofficial_napi_module_wrap_evaluate(s.env, unlinked, -1, false, &result);
+    EXPECT_EQ(status, napi_pending_exception);
+    EXPECT_NE(TakePendingMessage(s.env), "");
+    EXPECT_EQ(Status(s.env, unlinked), kUninstantiated);
+    EXPECT_EQ(RunText(s.env, "runs"), "1");
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, unlinked), napi_ok);
+  }
 }
