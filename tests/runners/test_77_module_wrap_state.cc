@@ -14,7 +14,21 @@
 #include <string>
 #include <vector>
 
-class Test77ModuleWrapState : public FixtureTestBase {};
+// The default flags, and source-phase imports (`import source`), which V8
+// parses only behind a flag.
+class Test77ModuleWrapState : public FixtureTestBase {
+ protected:
+  static void SetUpTestSuite() {
+    static constexpr char kFlags[] = "--expose-gc --js-float16array --js-source-phase-imports";
+    unofficial_napi_runtime_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
+    options.engine_flags = kFlags;
+    options.engine_flags_length = sizeof(kFlags) - 1;
+    ASSERT_EQ(unofficial_napi_configure_runtime(&options), napi_ok);
+  }
+  static void TearDownTestSuite() {}
+};
 
 namespace {
 
@@ -761,4 +775,65 @@ TEST_F(Test77ModuleWrapState, NoLinkStartsWhileOneRunsFromPrepareStackTrace) {
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
   }
+}
+
+namespace {
+
+// "ok: <default export>" when the module evaluates, through instantiate and
+// evaluate or through the require() facade, else the error's message.
+std::string DefaultExportOf(napi_env env, unofficial_napi_module module, bool facade) {
+  napi_value ns = nullptr;
+  if (facade) {
+    if (unofficial_napi_module_wrap_create_required_module_facade(env, module, &ns) != napi_ok) {
+      return TakePendingMessage(env);
+    }
+  } else {
+    napi_value promise = nullptr;
+    if (unofficial_napi_module_wrap_instantiate(env, module) != napi_ok ||
+        unofficial_napi_module_wrap_evaluate(env, module, -1, false, &promise) != napi_ok) {
+      return TakePendingMessage(env);
+    }
+    const std::string outcome = PromiseOutcome(env, promise);
+    if (outcome != "resolved") return outcome;
+    if (unofficial_napi_module_wrap_get_namespace(env, module, &ns) != napi_ok) {
+      return TakePendingMessage(env);
+    }
+  }
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, ns, "default", &value) != napi_ok) return "<no default>";
+  return "ok: " + ValueText(env, value);
+}
+
+}  // namespace
+
+// The require() facade instantiates a module that has a source-phase import
+// (`import source`) as instantiate does: its source object is the one set on
+// the module it was linked to. V8 instantiated the facade's graph with no
+// source resolver and crashed (SIGSEGV) calling it. QuickJS fails to
+// instantiate such a module at all, through either path, the same way.
+TEST_F(Test77ModuleWrapState, RequiredModuleFacadeResolvesSourcePhaseImports) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency = CreateSourceTextModule(s.env, "export const value = 1;");
+  ASSERT_NE(dependency, nullptr);
+  napi_value source_object = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "({ marker: 'its source' })"), &source_object),
+            napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_set_module_source_object(s.env, dependency, source_object),
+            napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  std::string outcomes[2];
+  for (bool facade : {false, true}) {
+    unofficial_napi_module module = CreateSourceTextModule(
+        s.env, "import source dependency from 'dependency'; export default dependency.marker;");
+    ASSERT_NE(module, nullptr);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 1, &dependency), napi_ok);
+    outcomes[facade] = DefaultExportOf(s.env, module, facade);
+    EXPECT_FALSE(ExceptionPending(s.env));
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+  EXPECT_EQ(outcomes[1], outcomes[0]);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(outcomes[0], "ok: its source");
+#endif
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
 }

@@ -3333,7 +3333,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   bool instantiated = false;
   {
     InstantiationScope instantiating(env);
-    instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
+    // The module's source-phase requests resolve as instantiate resolves
+    // them. V8 calls the source resolver without checking that it is set.
+    instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal,
+                                             ModuleResolveSourceCallback)
+                       .FromMaybe(false);
   }
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
