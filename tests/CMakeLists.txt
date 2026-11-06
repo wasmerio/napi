@@ -358,3 +358,24 @@ if(_napi_test_engine STREQUAL "v8")
   add_test(NAME napi_v8.foreground_checkpoint_fairness
     COMMAND napi_v8_foreground_checkpoint_test)
 endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_background_job_limit_test src/v8_background_job_limit_test.cc)
+  target_include_directories(napi_v8_background_job_limit_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_background_job_limit_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_background_job_limit_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.background_job_limit
+    COMMAND napi_v8_background_job_limit_test 4)
+  add_test(NAME napi_v8.background_job_limit_single_worker
+    COMMAND napi_v8_background_job_limit_test 1)
+  set_tests_properties(napi_v8.background_job_limit napi_v8.background_job_limit_single_worker
+    PROPERTIES TIMEOUT 120)
+endif()
