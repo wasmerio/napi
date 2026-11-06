@@ -533,10 +533,28 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_ar
 // unwinds without running catch or finally blocks, and calls into JS fail with
 // napi_pending_exception until the termination is cancelled. Any thread may
 // call this.
+//
+// A call the termination stops or refuses leaves it as the pending exception
+// (null on V8, QuickJS's uncatchable error) unless another one is pending.
+// When a native callback returns while the env terminates, what it left
+// pending is dropped and the JS that called it unwinds. V8 acts on a
+// termination requested from another thread at its next stack check, and on
+// one an interrupt callback's JS runs into at the stack check after the one
+// that ran the callback.
+//
+// Known QuickJS gap: QuickJS-ng reads Error.prepareStackTrace, which may be a
+// getter, whenever it gives an error its stack, also while a termination
+// unwinds, so such a getter runs as JS then. It also drops whatever that
+// getter throws: a termination the getter runs into does not stop the code
+// after it (a catch block included) until the next call into JS, which
+// fails. Closing that needs a QuickJS-ng change.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
 // Clears a previously requested engine termination on the current env. This is
 // used when embedder code intentionally stops a worker but still needs the
-// current JS stack to unwind normally. Call it on the env's engine thread.
+// current JS stack to unwind normally. Call it on the env's engine thread. A
+// pending exception that stands for the termination is dropped: nothing threw
+// it, so a native callback that cancels returns to its caller as after any
+// call. Any other pending exception stays.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
