@@ -737,7 +737,13 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
       promise,
       value};
   (void)callback->Call(context, v8::Undefined(isolate), 3, args);
-  if (tc.HasCaught() && !tc.HasTerminated()) {
+  if (tc.HasTerminated()) {
+    // V8 goes on after this callback without looking for a termination, and
+    // drops one still left once the call that rejected returns: the env
+    // would run on as if it had never been asked to stop. Ask again, so V8
+    // acts on it at its next check, as on one requested from plain JS.
+    isolate->TerminateExecution();
+  } else if (tc.HasCaught()) {
     // Match Node behavior: V8 expects this callback to return without a pending
     // exception. Print a best-effort diagnostic instead of scheduling it.
     std::fprintf(stderr, "Exception in PromiseRejectCallback:\n");

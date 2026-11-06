@@ -278,6 +278,30 @@ TEST_F(Test72HooksKeepTermination, FatalExceptionWhileTerminating) {
       "after = 'yes';\n");
 }
 
+// The promise reject callback returns nothing, so the JS that rejected goes
+// on until the engine next looks for a termination, and the run may come
+// back before it does. The termination must still not be catchable, nor
+// lost: that run or the next one stops. V8 dropped it once the run returned,
+// and the env ran on as if it had never been asked to stop.
+TEST_F(Test72HooksKeepTermination, PromiseRejectCallback) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ASSERT_EQ(unofficial_napi_set_promise_reject_callback(
+                s.env, Eval(s.env, "(type, promise, reason) => { terminate(); tick(); }")),
+            napi_ok);
+  const napi_status run = RunScript(
+      s.env,
+      "try { Promise.reject(1); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
+  const napi_status next = RunScript(s.env, "globalThis.next = 'yes';");
+  FinishTermination(s.env);
+  EXPECT_TRUE(run == napi_pending_exception || next == napi_pending_exception)
+      << "run " << run << ", next run " << next;
+  EXPECT_EQ(GlobalText(s.env, "caught"), "no");
+  EXPECT_EQ(GlobalText(s.env, "caughtError"), "none");
+  EXPECT_EQ(RunScript(s.env, "globalThis.resumed = 'yes';"), napi_ok);
+}
+
 #if defined(NAPI_TEST_ENGINE_V8)
 // import() with no module hooks calls the `__napi_dynamic_import` helper; only
 // V8 does. V8 rejected the import()'s promise with the null its TryCatch
