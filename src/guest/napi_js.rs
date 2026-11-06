@@ -1234,7 +1234,11 @@ fn guest_unofficial_napi_define_lazy_data_properties(
     let env_handle = snapi_env(&env, napi_env);
     with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_define_lazy_data_properties(
-            env_handle, object, names, initializer, attributes,
+            env_handle,
+            object,
+            names,
+            initializer,
+            attributes,
         )
     })
 }
