@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -320,7 +321,8 @@ void ExternalBackingStoreDeleter(void* data,
       hint->env = nullptr;
       free_cb = hint->free_cb;
       if (hint->finalize_cb != nullptr &&
-          QueueExternalFinalizer(env, {hint->finalize_cb, data, hint->finalize_hint})) {
+          QueueExternalFinalizer(
+              env, {hint->finalize_cb, data, hint->finalize_hint, nullptr, hint->id})) {
         post_to = env;
         enqueue = env->agent->enqueue_foreground_task_callback;
         target = env->agent->enqueue_foreground_task_target;
@@ -332,28 +334,89 @@ void ExternalBackingStoreDeleter(void* data,
   if (post_to != nullptr) PostExternalFinalizerDrain(post_to, enqueue, target);
 }
 
+// The env's thread drops the array buffer it tracked for a store whose
+// finalizer is about to run.
+void ForgetExternalArrayBuffer(napi_env env, uint64_t id) {
+  if (id != 0) env->external_array_buffers.erase(id);
+}
+
+// Runs the external finalizers deleters queued. Env thread only.
+bool RunQueuedExternalFinalizers(napi_env env) {
+  std::vector<napi_external_finalizer__> queued = TakeExternalFinalizers(env);
+  for (const auto& finalizer : queued) {
+    ForgetExternalArrayBuffer(env, finalizer.id);
+    env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+  }
+  return !queued.empty();
+}
+
+// At the env's release: detaches the most recently made external array buffer
+// still tracked, as Node's CallbackInfo::Clean does, then runs its finalizer,
+// so code that runs later sees the buffer detached, never the freed memory.
+// The detach may free the store; its deleter then claims the finalizer and
+// queues it, and RunQueuedExternalFinalizers runs it. Either way the
+// finalizer is claimed once, under the lock. A buffer that
+// ArrayBuffer.prototype.transfer moved the store to is not reachable from
+// here (Node cannot reach it either); the one it moved it from is detached
+// already.
+void FinalizeNewestExternalArrayBuffer(napi_env env) {
+  auto newest = std::prev(env->external_array_buffers.end());
+  const uint64_t id = newest->first;
+  napi_external_backing_store_hint__* hint = newest->second.hint;
+  v8::Global<v8::ArrayBuffer> handle = std::move(newest->second.array_buffer);
+  env->external_array_buffers.erase(newest);
+  {
+    v8::HandleScope handle_scope(env->isolate);
+    v8::Local<v8::ArrayBuffer> array_buffer = handle.Get(env->isolate);
+    handle.Reset();
+    if (!array_buffer.IsEmpty() && array_buffer->IsDetachable()) {
+      v8::Context::Scope context_scope(env->main_context());
+      v8::TryCatch try_catch(env->isolate);
+      (void)array_buffer->Detach(v8::Local<v8::Value>());
+    }
+  }
+  napi_external_finalizer__ finalizer;
+  {
+    std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
+    // Still in the set: the deleter has not run, so `hint` is alive. A new
+    // hint at the same address has another id.
+    if (env->external_backing_store_hints.count(hint) != 0 && hint->id == id) {
+      v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
+          record_release(env, hint);
+      env->external_backing_store_hints.erase(hint);
+      hint->env = nullptr;
+      finalizer = {hint->finalize_cb, hint->external_data, hint->finalize_hint};
+      hint->finalize_cb = nullptr;
+    }
+  }
+  env->CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
+}
+
 void FinalizeExternalBackingStoreHints(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  // Claims, under the lock, the finalizers deleters queued and the finalizers
-  // and free callbacks of the backing stores still alive, then runs them
-  // outside it. A backing store
-  // can outlive the env, so each live hint is unlinked from the dying env
-  // rather than deleted here — its deleter frees it later and, seeing a null
-  // env, skips the env-side bookkeeping. The hints are not touched after the
-  // lock is dropped: a concurrent deleter may already be freeing them.
-  // Repeats while finalizers make more external buffers.
+  // At the env's release. Runs the finalizers deleters queued, then, most
+  // recent first, detaches each external array buffer with a user finalizer
+  // and runs its finalizer. Then claims, under the lock, what the backing
+  // stores still alive hold (the free callbacks of provider-owned memory), and
+  // runs it outside the lock. A backing store can outlive the env, so each
+  // live hint is unlinked from the dying env rather than deleted here — its
+  // deleter frees it later and, seeing a null env, skips the env-side
+  // bookkeeping. The hints are not touched after the lock is dropped: a
+  // concurrent deleter may already be freeing them. Repeats while finalizers
+  // make more external buffers.
   for (;;) {
+    const bool ran_queued = RunQueuedExternalFinalizers(env);
+    if (!env->external_array_buffers.empty()) {
+      FinalizeNewestExternalArrayBuffer(env);
+      continue;
+    }
     std::vector<napi_external_finalizer__> pending;
     {
       std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
-      pending.swap(env->external_finalizers);
-      env->has_external_finalizers.store(false, std::memory_order_relaxed);
-      env->external_finalizer_drain_posted = false;
       std::unordered_set<napi_external_backing_store_hint__*> hints;
       hints.swap(env->external_backing_store_hints);
-      if (pending.empty() && hints.empty()) return;
-      pending.reserve(pending.size() + hints.size());
+      pending.reserve(hints.size());
       for (auto* hint : hints) {
         if (hint == nullptr) continue;
         v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
@@ -367,6 +430,7 @@ void FinalizeExternalBackingStoreHints(napi_env env) {
         }
       }
     }
+    if (pending.empty() && !ran_queued) return;
 
     for (const auto& finalizer : pending) {
       if (finalizer.free_cb != nullptr) {
@@ -644,29 +708,46 @@ void SetterTrampoline(v8::Local<v8::Name> property,
 }
 
 // A backing store over external memory. Its deleter hands `finalize_cb` to
-// the env's thread, or runs `free_cb` itself; at most one is set.
-std::unique_ptr<v8::BackingStore> NewExternalBackingStore(napi_env env,
-                                                          void* data,
-                                                          size_t length,
-                                                          node_api_basic_finalize finalize_cb,
-                                                          napi_v8_external_free_callback free_cb,
-                                                          void* finalize_hint) {
+// the env's thread, or runs `free_cb` itself; at most one is set. Sets
+// `*hint_out` to the store's hint, for TrackExternalArrayBuffer.
+std::unique_ptr<v8::BackingStore> NewExternalBackingStore(
+    napi_env env,
+    void* data,
+    size_t length,
+    node_api_basic_finalize finalize_cb,
+    napi_v8_external_free_callback free_cb,
+    void* finalize_hint,
+    napi_external_backing_store_hint__** hint_out) {
   auto hint = std::make_unique<napi_external_backing_store_hint__>(env);
   hint->external_data = data;
   hint->finalize_cb = finalize_cb;
   hint->finalize_hint = finalize_hint;
   hint->free_cb = free_cb;
+  if (finalize_cb != nullptr) hint->id = ++env->last_external_id;
   std::unique_ptr<v8::BackingStore> backing =
       v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter, hint.get());
   if (!backing) return nullptr;
   v8impl::detail::napi_lifetime__<napi_external_backing_store_hint__>::
       record_create(env, hint.get());
+  *hint_out = hint.get();
   {
     // Racing V8's ArrayBufferSweeper threads; see NapiV8ExternalHintsMutex.
     std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
     env->external_backing_store_hints.insert(hint.release());
   }
   return backing;
+}
+
+// Remembers, weakly, the array buffer made over a store with a user
+// finalizer, so the env's release can detach it first.
+void TrackExternalArrayBuffer(napi_env env,
+                              napi_external_backing_store_hint__* hint,
+                              v8::Local<v8::ArrayBuffer> array_buffer) {
+  if (hint->id == 0) return;
+  napi_external_array_buffer__& entry = env->external_array_buffers[hint->id];
+  entry.hint = hint;
+  entry.array_buffer.Reset(env->isolate, array_buffer);
+  entry.array_buffer.SetWeak();
 }
 
 napi_status CreateExternalArrayBuffer(napi_env env,
@@ -684,10 +765,13 @@ napi_status CreateExternalArrayBuffer(napi_env env,
     out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
   } else {
     if (external_data == nullptr) return napi_invalid_arg;
+    napi_external_backing_store_hint__* hint = nullptr;
     std::unique_ptr<v8::BackingStore> backing = NewExternalBackingStore(
-        env, external_data, byte_length, finalize_cb, free_cb, finalize_hint);
+        env, external_data, byte_length, finalize_cb, free_cb, finalize_hint, &hint);
     if (!backing) return napi_generic_failure;
+    // The array buffer holds the store, so its hint is alive here.
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
+    TrackExternalArrayBuffer(env, hint, out);
   }
 
   *result = napi_v8_wrap_value(env, out);
@@ -709,14 +793,17 @@ napi_status CreateExternalBuffer(napi_env env,
   // whose data the caller still owns then.
   auto* record = env->allocate<napi_buffer_record__>(env);
   if (record == nullptr) return napi_generic_failure;
+  napi_external_backing_store_hint__* hint = nullptr;
   record->backing_store =
-      NewExternalBackingStore(env, data, length, finalize_cb, free_cb, finalize_hint);
+      NewExternalBackingStore(env, data, length, finalize_cb, free_cb, finalize_hint, &hint);
   if (!record->backing_store) {
     env->release(record);
     return napi_generic_failure;
   }
 
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
+  // The record holds the store, so its hint is alive here.
+  TrackExternalArrayBuffer(env, hint, buffer_obj.As<v8::ArrayBufferView>()->Buffer());
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
   v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
@@ -805,6 +892,7 @@ void napi_env__::DrainFinalizerQueue() {
     }
 
     for (const auto& finalizer : external) {
+      ForgetExternalArrayBuffer(this, finalizer.id);
       CallFinalizer(finalizer.cb, finalizer.data, finalizer.hint);
     }
     // A finalizer above can free a backing store, which queues the store's
@@ -881,10 +969,10 @@ napi_env__::~napi_env__() {
   // The release contract (unofficial_napi_release_env): the cleanup hooks
   // run, then the finalizers of the values still pending (references with a
   // finalizer most recent first, as Node's FinalizeAll, then external
-  // buffers), until neither is left; then the instance data's finalizer; and
-  // all of it again for what that finalizer leaves pending, until nothing is,
-  // so no hint is left pointing at the env. The callback is cleared before it
-  // runs, so instance data is finalized once.
+  // buffers, each detached first), until neither is left; then the instance
+  // data's finalizer; and all of it again for what that finalizer leaves
+  // pending, until nothing is, so no hint is left pointing at the env. The
+  // callback is cleared before it runs, so instance data is finalized once.
   for (;;) {
     do {
       RunEnvCleanupHooks(this);

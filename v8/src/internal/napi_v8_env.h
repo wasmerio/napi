@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -63,6 +64,18 @@ struct napi_external_finalizer__ {
   void* data = nullptr;
   void* hint = nullptr;
   napi_v8_external_free_callback free_cb = nullptr;
+  // The store's id (napi_external_backing_store_hint__::id), 0 for none.
+  uint64_t id = 0;
+};
+
+// The array buffer of an external backing store with a user finalizer, held
+// weakly, so the env's release can detach it before the finalizer runs.
+struct napi_external_array_buffer__ {
+  // The store's hint. Compared, and read only under NapiV8ExternalHintsMutex()
+  // while it is still in the env's external_backing_store_hints: its deleter
+  // may have freed it.
+  napi_external_backing_store_hint__* hint = nullptr;
+  v8::Global<v8::ArrayBuffer> array_buffer;
 };
 
 struct napi_callback_info__ {
@@ -162,6 +175,11 @@ struct napi_env__ {
   uint64_t env_cleanup_hook_counter = 0;
   std::vector<napi_buffer_record__*> buffer_records;
   std::unordered_set<napi_external_backing_store_hint__*> external_backing_store_hints;
+  // The array buffers of the external stores with a user finalizer, by store
+  // id, so in the order they were made. An entry goes when its finalizer runs.
+  // Env thread only.
+  std::map<uint64_t, napi_external_array_buffer__> external_array_buffers;
+  uint64_t last_external_id = 0;
   napi_ref_tracker__::RefList reflist;
   napi_ref_tracker__::RefList finalizing_reflist;
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;

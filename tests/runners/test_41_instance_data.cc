@@ -300,6 +300,40 @@ TEST_F(Test41InstanceData, WhatTheInstanceDataFinalizerLeavesIsReleasedInTheSame
   EXPECT_LT(rounds.value.order, rounds.second.order);
 }
 
+// Values are finalized most recent first, as Node's FinalizeAll does. The
+// order between different kinds of values (references such as externals and
+// wraps, and external array buffers) is not specified.
+TEST_F(Test41InstanceData, ValuesAreFinalizedMostRecentFirstAtRelease) {
+  constexpr int kValues = 3;
+  EnvScope s(runtime_.get());
+  int clock = 0;
+  std::vector<Seen> externals(kValues, Seen{&clock});
+  std::vector<Seen> wraps(kValues, Seen{&clock});
+  std::vector<Seen> buffers(kValues, Seen{&clock});
+  uint8_t bytes[kValues][8] = {};
+  MarkEnvGlobal(s.env);
+  for (int i = 0; i < kValues; ++i) {
+    const std::string index = std::to_string(i);
+    KeepExternal(s.env, ("external" + index).c_str(), &externals[i]);
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &value), napi_ok);
+    ASSERT_EQ(napi_wrap(s.env, value, nullptr, FinalizeValue, &wraps[i], nullptr), napi_ok);
+    Keep(s.env, ("wrapped" + index).c_str(), value);
+    ASSERT_EQ(napi_create_external_arraybuffer(s.env, bytes[i], sizeof(bytes[i]), FinalizeValue,
+                                               &buffers[i], &value),
+              napi_ok);
+    Keep(s.env, ("arrayBuffer" + index).c_str(), value);
+  }
+
+  Release(s);
+  for (const auto* kind : {&externals, &wraps, &buffers}) {
+    for (int i = 0; i < kValues; ++i) {
+      ExpectUsedNapi((*kind)[i], ("value " + std::to_string(i)).c_str());
+      if (i > 0) EXPECT_LT((*kind)[i].order, (*kind)[i - 1].order) << "value " << i;
+    }
+  }
+}
+
 namespace {
 
 bool IsDetached(napi_env env, napi_ref ref) {
@@ -349,7 +383,6 @@ napi_value Transfer(napi_env env, napi_value array_buffer) {
 
 }  // namespace
 
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
 namespace {
 
 // What the instance-data finalizer finds of external buffers whose finalizers
@@ -391,7 +424,7 @@ void InspectFreedBuffers(napi_env env, void* data, void*) {
 
 // As Node's CallbackInfo::Clean does, an external buffer is detached before
 // its finalizer frees the memory, so code that runs later at release sees it
-// detached, never the freed memory. The V8 provider does not detach them yet.
+// detached, never the freed memory.
 TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRelease) {
   EnvScope s(runtime_.get());
   AfterFree after;
@@ -433,7 +466,6 @@ TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRele
   EXPECT_EQ(after.element, napi_undefined);
   EXPECT_TRUE(after.buffer_detached);
 }
-#endif
 
 // ArrayBuffer.prototype.transfer moves an external buffer's memory to a new
 // buffer. Its finalizer still runs once at release, whether the buffer it was

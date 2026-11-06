@@ -68,6 +68,9 @@ struct napi_external_backing_store_hint__ {
   // Set instead of `finalize_cb` for memory that only needs freeing
   // (napi_v8_external_free_callback); it gets `finalize_hint`.
   void (*free_cb)(void* data, void* hint) = nullptr;
+  // With `finalize_cb`: the store's key in the env's external_array_buffers.
+  // Never reused, unlike the hint's address.
+  uint64_t id = 0;
 };
 using napi_external_backing_store_hint = napi_external_backing_store_hint__;
 
