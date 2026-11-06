@@ -83,6 +83,8 @@ struct ModuleWrapBindingState {
   std::vector<ModuleWrapRecord*> modules;
   std::vector<PendingProviderPromise> pending_dynamic_imports;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
+  // Instantiations running (see InstantiationScope).
+  int instantiations = 0;
 };
 
 napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
@@ -2859,8 +2861,38 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
   return napi_ok;
 }
 
+// Counts an instantiation as running for its env while it lives. V8 runs no
+// script while it instantiates, except when a request does not resolve: the
+// error ModuleResolveCallback throws then gets its `code` with a plain set,
+// which runs an inherited setter, and from there script can reach these calls
+// again. A second instantiation would walk modules the first has only half
+// prepared (a crash), so none starts while one runs.
+class InstantiationScope {
+ public:
+  explicit InstantiationScope(napi_env env) : state_(GetModuleWrapState(env)) {
+    if (state_ != nullptr) state_->instantiations++;
+  }
+  ~InstantiationScope() {
+    if (state_ != nullptr) state_->instantiations--;
+  }
+  InstantiationScope(const InstantiationScope&) = delete;
+  InstantiationScope& operator=(const InstantiationScope&) = delete;
+
+  // Throws and returns true when an instantiation runs for `env`.
+  static bool ThrowIfRunning(napi_env env) {
+    auto* state = GetModuleWrapState(env);
+    if (state == nullptr || state->instantiations == 0) return false;
+    ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "A module instantiation is under way");
+    return true;
+  }
+
+ private:
+  ModuleWrapBindingState* state_;
+};
+
 // Instantiates the module and the modules it was linked to.
 static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* record) {
+  if (InstantiationScope::ThrowIfRunning(env)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -2868,6 +2900,7 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
   v8::Local<v8::Module> module = record->module.Get(isolate);
 
   v8::TryCatch try_catch(isolate);
+  InstantiationScope instantiating(env);
   auto maybe = module->InstantiateModule(context, ModuleResolveCallback, ModuleResolveSourceCallback);
   if (maybe.IsNothing()) {
     // A termination too: it stays, and is what the call fails with.
@@ -3205,6 +3238,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   ModuleWrapRecord* record = ModuleRecord(module);
   // The facade evaluates the module it wraps.
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
+  // Instantiating the facade instantiates that module too.
+  if (InstantiationScope::ThrowIfRunning(env)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
@@ -3231,7 +3266,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = record;
   }
-  const bool instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
+  bool instantiated = false;
+  {
+    InstantiationScope instantiating(env);
+    instantiated = facade->InstantiateModule(context, LinkRequiredFacadeOriginal).FromMaybe(false);
+  }
   {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;

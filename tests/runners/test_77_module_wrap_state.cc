@@ -12,6 +12,7 @@
 #include "unofficial_napi.h"
 
 #include <string>
+#include <vector>
 
 class Test77ModuleWrapState : public FixtureTestBase {};
 
@@ -327,4 +328,120 @@ TEST_F(Test77ModuleWrapState, EvaluatingAModuleWhileItEvaluatesIsRefused) {
       EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
     }
   }
+}
+
+namespace {
+
+struct InstantiationProbe {
+  unofficial_napi_module module = nullptr;
+  unofficial_napi_module other = nullptr;
+  bool entered = false;
+  std::vector<std::string> outcomes;
+};
+
+std::string Outcome(napi_env env, napi_status status) {
+  const std::string pending = TakePendingCodeAndMessage(env);
+  return std::to_string(status) + (pending.empty() ? "" : " " + pending);
+}
+
+// Makes the calls that would start an instantiation, and two that would not,
+// on the module being instantiated and on another one; records what each
+// returned and threw.
+napi_value CallsDuringInstantiation(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data), napi_ok);
+  auto* probe = static_cast<InstantiationProbe*>(data);
+  // The errors thrown below run the setter too.
+  if (probe->entered) return nullptr;
+  probe->entered = true;
+  napi_value result = nullptr;
+  bool settled = false;
+  auto& out = probe->outcomes;
+  out.push_back("instantiate " +
+                Outcome(env, unofficial_napi_module_wrap_instantiate(env, probe->module)));
+  out.push_back("instantiate other " +
+                Outcome(env, unofficial_napi_module_wrap_instantiate(env, probe->other)));
+  out.push_back("evaluate " + Outcome(env, unofficial_napi_module_wrap_evaluate(
+                                               env, probe->module, -1, false, &result)));
+  out.push_back("evaluate_sync " + Outcome(env, unofficial_napi_module_wrap_evaluate_sync(
+                                                    env, probe->module, nullptr, nullptr, &result)));
+  out.push_back("facade " + Outcome(env, unofficial_napi_module_wrap_create_required_module_facade(
+                                             env, probe->module, &result)));
+  out.push_back("check " + Outcome(env, unofficial_napi_module_wrap_check_unsettled_top_level_await(
+                                            env, probe->module, true, &settled)) +
+                (settled ? " settled" : " unsettled"));
+  out.push_back("namespace " +
+                Outcome(env, unofficial_napi_module_wrap_get_namespace(env, probe->module, &result)));
+  return nullptr;
+}
+
+}  // namespace
+
+// No instantiation starts while one runs: instantiate, and evaluate or the
+// facade on a module that is not instantiated, are refused with
+// ERR_VM_MODULE_LINK_FAILURE. V8 runs script in the middle of an
+// instantiation when a request does not resolve: the error it throws gets its
+// `code` with a plain set, which runs an inherited setter. A second
+// instantiation from there walked modules the first had only half prepared:
+// instantiate and the facade crashed (SIGBUS), and evaluate aborted
+// ("Expected instantiated module"). The asking calls answer as usual, and the
+// failed instantiation leaves the module ready to link and instantiate.
+TEST_F(Test77ModuleWrapState, NoInstantiationStartsWhileOneRuns) {
+  EnvScope s(runtime_.get());
+  InstantiationProbe probe;
+  napi_value fn = nullptr;
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "callsDuringInstantiation", NAPI_AUTO_LENGTH,
+                                 CallsDuringInstantiation, &probe, &fn),
+            napi_ok);
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "callsDuringInstantiation", fn), napi_ok);
+  ASSERT_EQ(RunText(s.env,
+                    "Object.defineProperty(Error.prototype, 'code', {"
+                    "  configurable: true,"
+                    "  set(value) {"
+                    "    callsDuringInstantiation();"
+                    "    Object.defineProperty(this, 'code', {"
+                    "      value, writable: true, configurable: true });"
+                    "  },"
+                    "}); 'set'"),
+            "set");
+  probe.module = CreateSourceTextModule(s.env, "import 'dependency'; export default 1;");
+  probe.other = CreateSourceTextModule(s.env, "export const value = 1;");
+  ASSERT_NE(probe.module, nullptr);
+  ASSERT_NE(probe.other, nullptr);
+
+  // Not linked: the request does not resolve.
+  EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module), napi_pending_exception);
+  EXPECT_NE(TakePendingMessage(s.env), "");
+#if defined(NAPI_TEST_ENGINE_V8)
+  // QuickJS reports the request through its own loader, an error with no
+  // code, so no setter runs while it instantiates.
+  EXPECT_TRUE(probe.entered);
+#endif
+  if (probe.entered) {
+    const std::string refused =
+        "10 ERR_VM_MODULE_LINK_FAILURE: A module instantiation is under way";
+    EXPECT_EQ(probe.outcomes, (std::vector<std::string>{
+                                  "instantiate " + refused,
+                                  "instantiate other " + refused,
+                                  "evaluate " + refused,
+                                  "evaluate_sync " + refused,
+                                  "facade " + refused,
+                                  "check 0 settled",
+                                  "namespace 10 ERR_MODULE_NOT_INSTANTIATED: "
+                                  "Module is not instantiated",
+                              }));
+  }
+  EXPECT_EQ(Status(s.env, probe.module), kUninstantiated);
+  EXPECT_EQ(Status(s.env, probe.other), kUninstantiated);
+
+  ASSERT_EQ(RunText(s.env, "delete Error.prototype.code; 'gone'"), "gone");
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.other, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.module, 1, &probe.other), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module), napi_ok);
+  EXPECT_EQ(Status(s.env, probe.module), kInstantiated);
+  EXPECT_EQ(Status(s.env, probe.other), kInstantiated);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
 }
