@@ -763,6 +763,55 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     status
 }
 
+// Reading `names` can run its elements' getters (author code if an embedder
+// hands it an author array), so this runs in the callback context.
+//
+// An initializer that is a guest function, or calls one, can only reach the
+// guest from an import that lends the store. A first read from one that does
+// not (napi_coerce_to_string, for one) gets undefined from the guest function,
+// as any getter would, and V8 keeps that as the property's value.
+#[allow(clippy::result_large_err)]
+fn guest_unofficial_napi_define_lazy_data_properties(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    names: u32,
+    initializer: u32,
+    attributes: i32,
+) -> Result<i32, WasiError> {
+    let env_handle = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_define_lazy_data_properties(
+            env_handle,
+            object,
+            names,
+            initializer,
+            attributes,
+        )
+    })
+}
+
+fn guest_unofficial_napi_is_lazy_data_property(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    key: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0;
+    let status = unsafe {
+        snapi_bridge_unofficial_is_lazy_data_property(env_handle, object, key, &mut result)
+    };
+    if status == 0 && !write_guest_u8(&mut env, result_ptr, (result != 0) as u8) {
+        return 1;
+    }
+    status
+}
+
 fn guest_unofficial_napi_set_promise_hooks(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -4928,6 +4977,8 @@ pub fn register_napi_imports(
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
+        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_lazy_data_properties),
+        "unofficial_napi_is_lazy_data_property" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_lazy_data_property),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),

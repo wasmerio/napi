@@ -3563,6 +3563,49 @@ extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
   return *out_id != 0 ? napi_ok : napi_generic_failure;
 }
 
+extern "C" int snapi_bridge_unofficial_define_lazy_data_properties(
+    SnapiEnvState* env_state,
+    uint32_t object_id,
+    uint32_t names_id,
+    uint32_t initializer_id,
+    int32_t attributes) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || object_id == 0 || names_id == 0 || initializer_id == 0) {
+    return napi_invalid_arg;
+  }
+  napi_value object = LoadValue(*bridge_state, object_id);
+  napi_value names = LoadValue(*bridge_state, names_id);
+  napi_value initializer = LoadValue(*bridge_state, initializer_id);
+  if (object == nullptr || names == nullptr || initializer == nullptr) return napi_invalid_arg;
+  // Checked before the cast: other guest values are outside the enum's range.
+  if ((attributes & ~(napi_writable | napi_enumerable | napi_configurable)) != 0) {
+    return napi_invalid_arg;
+  }
+  return unofficial_napi_define_lazy_data_properties(
+      bridge_state->env, object, names, initializer,
+      static_cast<napi_property_attributes>(attributes));
+}
+
+extern "C" int snapi_bridge_unofficial_is_lazy_data_property(
+    SnapiEnvState* env_state,
+    uint32_t object_id,
+    uint32_t key_id,
+    int* result_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || result_out == nullptr || object_id == 0 || key_id == 0) {
+    return napi_invalid_arg;
+  }
+  *result_out = 0;
+  napi_value object = LoadValue(*bridge_state, object_id);
+  napi_value key = LoadValue(*bridge_state, key_id);
+  if (object == nullptr || key == nullptr) return napi_invalid_arg;
+  bool result = false;
+  napi_status status =
+      unofficial_napi_is_lazy_data_property(bridge_state->env, object, key, &result);
+  if (status == napi_ok) *result_out = result ? 1 : 0;
+  return status;
+}
+
 extern "C" int snapi_bridge_unofficial_set_promise_hooks(
     SnapiEnvState* env_state,
     uint32_t init_callback_id,

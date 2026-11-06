@@ -894,6 +894,35 @@ extern "C"
         return napi_util__::wrap_owned(env, out, result_out);
     }
 
+    // No lazy data properties in this engine: callers define values eagerly.
+    napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
+        napi_env env,
+        napi_value object,
+        napi_value names,
+        napi_value initializer,
+        napi_property_attributes attributes)
+    {
+        if (!napi_util__::check_env(env) || object == nullptr || names == nullptr ||
+            initializer == nullptr)
+            return napi_invalid_arg;
+        if ((attributes & ~(napi_writable | napi_enumerable | napi_configurable)) != 0)
+            return napi_invalid_arg;
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_is_lazy_data_property(
+        napi_env env,
+        napi_value object,
+        napi_value key,
+        bool *result_out)
+    {
+        if (!napi_util__::check_env(env) || object == nullptr || key == nullptr ||
+            result_out == nullptr)
+            return napi_invalid_arg;
+        *result_out = false;
+        return napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
                                                          uint64_t *hash_seed_out)
     {

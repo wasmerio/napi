@@ -2758,6 +2758,306 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
+namespace {
+
+// unofficial_napi_is_lazy_data_property, and the getter once an initializer
+// returns, read one descriptor while a probe of their isolate is active.
+// Every lazy getter of that isolate then throws without calling its
+// initializer, which leaves its property lazy (V8 replaces it only after a
+// getter that returns). The getter of the property looked for (that holder
+// and name and, when `definition` is set, that definition) also notes the
+// hit, so a native getter that reads another lazy property while the
+// descriptor is read cannot make a false positive. The probes active on a
+// thread form a stack, newest first. A getter uses the newest probe of its
+// own isolate: a native getter can enter another isolate, probe there, and
+// come back, and the outer probe still holds. A lazy getter of an isolate
+// with no active probe runs as usual.
+struct LazyDataProbe {
+  v8::Isolate* isolate;
+  v8::Local<v8::Object> holder;
+  v8::Local<v8::Name> name;
+  v8::Local<v8::Value> definition;
+  LazyDataProbe* outer;
+  bool hit;
+};
+thread_local LazyDataProbe* g_lazy_data_probes = nullptr;
+
+// The lazy properties whose initializers are running on this thread.
+struct LazyDataInitialization {
+  v8::Local<v8::Object> holder;
+  v8::Local<v8::Name> name;
+};
+thread_local std::vector<LazyDataInitialization> g_lazy_data_initializations;
+
+enum class LazyDataCheck { kNotLazy, kLazy, kTerminated };
+
+// Whether `holder`'s own `name` is still a lazy data property (its getter is
+// LazyDataPropertyGetter), from the definition `definition` if that is set.
+// Reading the descriptor throws in probe mode, which changes nothing. Another
+// native accessor's getter, which that read calls, can terminate execution:
+// kTerminated then. The TryCatch keeps the termination with V8 when JS is on
+// the stack and drops it otherwise, as for any other call.
+LazyDataCheck CheckLazyDataProperty(v8::Isolate* isolate,
+                                    v8::Local<v8::Context> context,
+                                    v8::Local<v8::Object> holder,
+                                    v8::Local<v8::Name> name,
+                                    v8::Local<v8::Value> definition) {
+  bool accessor = false;
+  {
+    v8::TryCatch try_catch(isolate);
+    try_catch.SetCaptureMessage(false);
+    if (!holder->HasRealNamedCallbackProperty(context, name).To(&accessor)) {
+      return try_catch.HasTerminated() ? LazyDataCheck::kTerminated : LazyDataCheck::kNotLazy;
+    }
+  }
+  if (!accessor) return LazyDataCheck::kNotLazy;
+  // A JS accessor pair's descriptor calls nothing, and a lazy property's
+  // getter throws here. Another native accessor's getter runs: V8's own have
+  // no side effects.
+  LazyDataProbe probe{isolate, holder, name, definition, g_lazy_data_probes, false};
+  g_lazy_data_probes = &probe;
+  bool terminated = false;
+  {
+    v8::TryCatch try_catch(isolate);
+    // The throw is only a signal: no message, no stack trace.
+    try_catch.SetCaptureMessage(false);
+    v8::MaybeLocal<v8::Value> descriptor = holder->GetOwnPropertyDescriptor(context, name);
+    (void)descriptor;
+    terminated = try_catch.HasTerminated();
+  }
+  g_lazy_data_probes = probe.outer;
+  if (terminated) return LazyDataCheck::kTerminated;
+  return probe.hit ? LazyDataCheck::kLazy : LazyDataCheck::kNotLazy;
+}
+
+// The getter of every unofficial_napi_define_lazy_data_properties property.
+// Its data is the definition: an array, made by each define call, that holds
+// the initializer. V8 replaces the property with the value the getter returns
+// (Object::SetLazyDataProperty), in place, keeping its attributes. It CHECKs
+// that the property is still an accessor then (a fatal error otherwise), so a
+// read from the initializer itself, or an initializer that changed the
+// property, throws here instead of returning.
+void LazyDataPropertyGetter(v8::Local<v8::Name> name,
+                            const v8::PropertyCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Value> definition = info.Data();
+  // The holder, not the receiver (a read through a prototype); the global
+  // proxy for a property of a global object.
+  v8::Local<v8::Object> holder = info.HolderV2();
+  for (LazyDataProbe* probe = g_lazy_data_probes; probe != nullptr; probe = probe->outer) {
+    if (probe->isolate != isolate) continue;
+    if (holder == probe->holder && name->StrictEquals(probe->name) &&
+        (probe->definition.IsEmpty() || definition == probe->definition)) {
+      probe->hit = true;
+    }
+    isolate->ThrowException(v8::Undefined(isolate));
+    return;
+  }
+  if (definition.IsEmpty() || !definition->IsArray()) return;
+  v8::Local<v8::Value> raw_initializer;
+  if (!definition.As<v8::Array>()->Get(isolate->GetCurrentContext(), 0).ToLocal(&raw_initializer) ||
+      !raw_initializer->IsFunction()) {
+    return;
+  }
+  v8::Local<v8::Function> initializer = raw_initializer.As<v8::Function>();
+  // The initializer's realm, whatever context reads the property.
+  v8::Local<v8::Context> context;
+  if (!initializer->GetCreationContext(isolate).ToLocal(&context))
+    context = isolate->GetCurrentContext();
+  v8::Context::Scope context_scope(context);
+  for (const auto& running : g_lazy_data_initializations) {
+    if (running.holder == holder && running.name->StrictEquals(name)) {
+      isolate->ThrowException(v8::Exception::RangeError(v8::String::NewFromUtf8Literal(
+          isolate, "A lazy property was read by its own initializer")));
+      return;
+    }
+  }
+  g_lazy_data_initializations.push_back({holder, name});
+  v8::Local<v8::Value> argv[] = {name};
+  v8::Local<v8::Value> value;
+  // A throw stays pending: the read throws it and the property stays lazy.
+  const bool returned = initializer->Call(context, holder, 1, argv).ToLocal(&value);
+  g_lazy_data_initializations.pop_back();
+  if (!returned) return;
+  switch (CheckLazyDataProperty(isolate, context, holder, name, definition)) {
+    case LazyDataCheck::kLazy:
+      info.GetReturnValue().Set(value);
+      return;
+    case LazyDataCheck::kNotLazy:
+      // Assigned, deleted or replaced meanwhile (by another lazy definition
+      // too): it keeps that.
+      isolate->ThrowException(v8::Exception::TypeError(v8::String::NewFromUtf8Literal(
+          isolate, "A lazy property changed while its initializer ran")));
+      return;
+    case LazyDataCheck::kTerminated:
+      // The termination is pending: an exception thrown now would replace it.
+      return;
+  }
+}
+
+// Whether `name` is an array index ("0" to "4294967294"), which V8 would
+// define as an element: an array's length would not cover it.
+bool IsArrayIndexName(v8::Isolate* isolate, v8::Local<v8::Name> name) {
+  if (!name->IsString()) return false;
+  v8::Local<v8::String> string = name.As<v8::String>();
+  const int length = string->Length();
+  if (length < 1 || length > 10) return false;
+  uint16_t chars[10];
+  string->WriteV2(isolate, 0, static_cast<uint32_t>(length), chars);
+  if (chars[0] == '0') return length == 1;
+  uint64_t index = 0;
+  for (int i = 0; i < length; ++i) {
+    if (chars[i] < '0' || chars[i] > '9') return false;
+    index = index * 10 + (chars[i] - '0');
+  }
+  return index <= 4294967294u;
+}
+
+// Whether `name` is a canonical numeric string: "-0", or a string that
+// ToString(ToNumber(name)) gives back ("1.5", "-1", "Infinity", "NaN",
+// "4294967295"). A typed array takes every such name for an integer index,
+// so it can have no own property by that name, but V8 would define one.
+bool IsCanonicalNumericString(v8::Isolate* isolate,
+                              v8::Local<v8::Context> context,
+                              v8::Local<v8::Name> name) {
+  if (!name->IsString()) return false;
+  v8::Local<v8::String> string = name.As<v8::String>();
+  if (string->StringEquals(v8::String::NewFromUtf8Literal(isolate, "-0"))) return true;
+  v8::Local<v8::Number> number;
+  v8::Local<v8::String> canonical;
+  // Neither conversion runs JS or can throw; a failure would refuse the name.
+  if (!string->ToNumber(context).ToLocal(&number) ||
+      !number->ToString(context).ToLocal(&canonical)) {
+    return true;
+  }
+  return canonical->StringEquals(string);
+}
+
+}  // namespace
+
+napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
+    napi_env env,
+    napi_value object,
+    napi_value names,
+    napi_value initializer,
+    napi_property_attributes attributes) {
+  if (env == nullptr || env->isolate == nullptr || object == nullptr || names == nullptr ||
+      initializer == nullptr) {
+    return napi_invalid_arg;
+  }
+  if ((attributes & ~(napi_writable | napi_enumerable | napi_configurable)) != 0) {
+    return napi_invalid_arg;
+  }
+  v8::Isolate* isolate = env->isolate;
+  // Reading `names` can run JS: entering V8 while terminating would cancel the
+  // termination.
+  if (isolate->IsExecutionTerminating()) {
+    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+  }
+  v8::HandleScope handles(isolate);
+  v8::Local<v8::Value> raw_object = napi_v8_unwrap_value(object);
+  v8::Local<v8::Value> raw_names = napi_v8_unwrap_value(names);
+  v8::Local<v8::Value> raw_initializer = napi_v8_unwrap_value(initializer);
+  if (raw_object.IsEmpty() || !raw_object->IsObject()) return napi_object_expected;
+  if (raw_names.IsEmpty() || !raw_names->IsArray()) return napi_array_expected;
+  if (raw_initializer.IsEmpty() || !raw_initializer->IsFunction()) return napi_function_expected;
+  // V8 defines no accessor on a proxy; its traps are author code.
+  if (raw_object->IsProxy()) return napi_generic_failure;
+  // An embedder's named interceptor sees the descriptor reads that tell a
+  // lazy property from a changed one (after an initializer returns), and
+  // could fake or change what they find: a false TypeError on every read, or
+  // V8's CHECK.
+  if (raw_object.As<v8::Object>()->HasNamedLookupInterceptor()) return napi_generic_failure;
+  const bool typed_array = raw_object->IsTypedArray();
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  v8::TryCatch try_catch(isolate);
+  auto caught = [&]() {
+    if (!try_catch.HasCaught()) return napi_generic_failure;
+    // A termination stays with V8; there is no exception to hand over.
+    if (!try_catch.HasTerminated()) {
+      napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+    }
+    return napi_pending_exception;
+  };
+  // Every name first, so a bad one defines nothing. The length can be up to
+  // 2^32 - 1 with holes, so the reserve is bounded.
+  v8::Local<v8::Array> list = raw_names.As<v8::Array>();
+  const uint32_t count = list->Length();
+  std::vector<v8::Local<v8::Name>> keys;
+  keys.reserve(std::min<uint32_t>(count, 1024));
+  for (uint32_t i = 0; i < count; ++i) {
+    v8::Local<v8::Value> key;
+    if (!list->Get(context, i).ToLocal(&key)) return caught();
+    if (!key->IsName() || IsArrayIndexName(isolate, key.As<v8::Name>()) ||
+        (typed_array && IsCanonicalNumericString(isolate, context, key.As<v8::Name>()))) {
+      return napi_name_expected;
+    }
+    keys.push_back(key.As<v8::Name>());
+  }
+  int flags = v8::None;
+  if ((attributes & napi_writable) == 0) flags |= v8::ReadOnly;
+  if ((attributes & napi_enumerable) == 0) flags |= v8::DontEnum;
+  if ((attributes & napi_configurable) == 0) flags |= v8::DontDelete;
+  // One definition per call, so the getter can tell its property from one a
+  // later call made on the same name.
+  v8::Local<v8::Value> definition = v8::Array::New(isolate, &raw_initializer, 1);
+  v8::Local<v8::Object> target = raw_object.As<v8::Object>();
+  for (const auto& key : keys) {
+    if (!target
+             ->SetLazyDataProperty(context, key, LazyDataPropertyGetter, definition,
+                                   static_cast<v8::PropertyAttribute>(flags))
+             .FromMaybe(false)) {
+      // V8 throws a TypeError here when the calling JS is strict code and
+      // returns false otherwise: the same failure either way. It runs no JS.
+      if (try_catch.HasTerminated()) return napi_pending_exception;
+      try_catch.Reset();
+      return napi_generic_failure;
+    }
+  }
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL unofficial_napi_is_lazy_data_property(
+    napi_env env,
+    napi_value object,
+    napi_value key,
+    bool* result_out) {
+  if (env == nullptr || env->isolate == nullptr || object == nullptr || key == nullptr ||
+      result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result_out = false;
+  v8::Isolate* isolate = env->isolate;
+  // The descriptor read enters V8, which would cancel a termination.
+  if (isolate->IsExecutionTerminating()) {
+    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+  }
+  v8::HandleScope handles(isolate);
+  v8::Local<v8::Value> raw_object = napi_v8_unwrap_value(object);
+  v8::Local<v8::Value> raw_key = napi_v8_unwrap_value(key);
+  if (raw_object.IsEmpty() || !raw_object->IsObject()) return napi_object_expected;
+  if (raw_key.IsEmpty() || !raw_key->IsName()) return napi_name_expected;
+  // A proxy's traps are author code. An object with a named interceptor has
+  // no lazy property (the define refuses it), and its interceptor is embedder
+  // code.
+  if (raw_object->IsProxy() || raw_object.As<v8::Object>()->HasNamedLookupInterceptor()) {
+    return napi_v8_clear_last_error(env);
+  }
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  const LazyDataCheck check = CheckLazyDataProperty(
+      isolate, context, raw_object.As<v8::Object>(), raw_key.As<v8::Name>(),
+      v8::Local<v8::Value>());
+  if (check == LazyDataCheck::kTerminated) {
+    // An embedder's native getter terminated execution while the descriptor
+    // was read. There is no exception to hand over.
+    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+  }
+  *result_out = check == LazyDataCheck::kLazy;
+  return napi_v8_clear_last_error(env);
+}
+
 napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,
                                                      uint64_t* hash_seed_out) {
   if (env == nullptr || env->isolate == nullptr || hash_seed_out == nullptr) {

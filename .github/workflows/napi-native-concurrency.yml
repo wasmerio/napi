@@ -83,8 +83,9 @@ jobs:
           --test concurrent_envs --test concurrent_stores
 
       # The library's unit tests, and WAT guests calling the N-API imports:
-      # callbacks, guest memory reads and writes, C strings and the memory
-      # pressure signal. No WASIX C toolchain is needed either.
+      # callbacks, guest memory reads and writes, C strings, the memory
+      # pressure signal and lazy data properties. No WASIX C toolchain is
+      # needed either.
       #
       # Not run here: manifest_tests, v8_host_control and v8_worker_threads.
       # They build guests from tests/programs with wasixcc.
@@ -93,3 +94,4 @@ jobs:
           ./cargo-standalone.sh test --locked --lib
           --test guest_callbacks --test guest_c_strings
           --test guest_memory --test guest_memory_pressure
+          --test guest_lazy_properties
