@@ -42,6 +42,7 @@ const NAPI_NUMBER_EXPECTED: i32 = 6;
 const NAPI_ARRAY_EXPECTED: i32 = 8;
 const NAPI_GENERIC_FAILURE: i32 = 9;
 const NAPI_PENDING_EXCEPTION: i32 = 10;
+const NAPI_ARRAYBUFFER_EXPECTED: i32 = 19;
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const CALLBACK_DEFERRED: u32 = u32::MAX;
 
@@ -1186,6 +1187,35 @@ export function wasmer_napi_is_arraybuffer(value) {
     return false;
   }
 }
+// The intrinsics behind napi_is_detached_arraybuffer, captured at load so page
+// code replacing them, or Function.prototype.call, changes nothing. Like the
+// byteLength getter, ES2024's detached getter throws for anything but an
+// ArrayBuffer, a SharedArrayBuffer included, so it is the brand check too.
+const wasmerNapiArrayBufferByteLength = Function.call.bind(
+  Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get);
+const wasmerNapiDetachedGetter =
+  Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'detached')?.get;
+const wasmerNapiArrayBufferDetached = wasmerNapiDetachedGetter &&
+  Function.call.bind(wasmerNapiDetachedGetter);
+const wasmerNapiUint8Array = Uint8Array;
+// -1 for a value that is not an ArrayBuffer, 0 for a live one, 1 for a
+// detached one. Never throws.
+export function wasmer_napi_arraybuffer_detached_state(value) {
+  try {
+    if (wasmerNapiArrayBufferDetached) return wasmerNapiArrayBufferDetached(value) ? 1 : 0;
+    wasmerNapiArrayBufferByteLength(value);
+  } catch {
+    return -1;
+  }
+  // Engines that predate the getter (Node 20): a view of no bytes at offset 0
+  // fits any live buffer, empty or resizable, and only a detached one throws.
+  try {
+    new wasmerNapiUint8Array(value, 0, 0);
+    return 0;
+  } catch {
+    return 1;
+  }
+}
 export function wasmer_napi_is_dataview(value) {
   try {
     Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get.call(value);
@@ -1507,6 +1537,7 @@ extern "C" {
     ) -> Result<JsValue, JsValue>;
     fn wasmer_napi_typed_array_kind(value: &JsValue) -> i32;
     fn wasmer_napi_is_arraybuffer(value: &JsValue) -> bool;
+    fn wasmer_napi_arraybuffer_detached_state(value: &JsValue) -> i32;
     fn wasmer_napi_is_dataview(value: &JsValue) -> bool;
     fn wasmer_napi_is_buffer(value: &JsValue) -> bool;
     fn wasmer_napi_buffer_view(buffer: &JsValue, offset: u32, length: u32) -> JsValue;
@@ -6632,8 +6663,20 @@ pub unsafe extern "C" fn snapi_bridge_is_detached_arraybuffer(
     id: u32,
     result: *mut i32,
 ) -> i32 {
-    let _ = (env, id, result);
-    NAPI_GENERIC_FAILURE
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.get(id) else {
+        return NAPI_INVALID_ARG;
+    };
+    // As the V8 backend: anything but an ArrayBuffer, a SharedArrayBuffer
+    // included, is refused. (Node instead reports it as not detached.)
+    let detached = match wasmer_napi_arraybuffer_detached_state(value) {
+        0 => 0,
+        1 => 1,
+        _ => return NAPI_ARRAYBUFFER_EXPECTED,
+    };
+    unsafe { write(result, detached) }.map_or_else(|error| error, |()| NAPI_OK)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_is_sharedarraybuffer(
@@ -7816,6 +7859,68 @@ mod tests {
             rest.sort();
             assert_eq!(rest, [(handles[0], 0, 1), (handles[2], 2, 1)]);
             assert_eq!(take(1), None);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn is_detached_arraybuffer_reports_like_the_v8_backend() {
+        with_env(|env, state| {
+            let cases = [
+                ("new ArrayBuffer(16)", NAPI_OK, 0),
+                ("new ArrayBuffer(0)", NAPI_OK, 0),
+                ("new ArrayBuffer(4, { maxByteLength: 16 })", NAPI_OK, 0),
+                (
+                    "(() => { const b = new ArrayBuffer(4, { maxByteLength: 16 }); \
+                     b.resize(0); return b; })()",
+                    NAPI_OK,
+                    0,
+                ),
+                (
+                    "(() => { const b = new ArrayBuffer(16); \
+                     structuredClone(b, { transfer: [b] }); return b; })()",
+                    NAPI_OK,
+                    1,
+                ),
+                (
+                    "(() => { const b = new ArrayBuffer(0); \
+                     structuredClone(b, { transfer: [b] }); return b; })()",
+                    NAPI_OK,
+                    1,
+                ),
+                (
+                    "(() => { const b = new ArrayBuffer(4, { maxByteLength: 16 }); \
+                     b.transfer(); return b; })()",
+                    NAPI_OK,
+                    1,
+                ),
+                // Not ArrayBuffers: the result is left alone.
+                ("new SharedArrayBuffer(16)", NAPI_ARRAYBUFFER_EXPECTED, -1),
+                ("new Uint8Array(16)", NAPI_ARRAYBUFFER_EXPECTED, -1),
+                ("({ byteLength: 16 })", NAPI_ARRAYBUFFER_EXPECTED, -1),
+                (
+                    "new Proxy(new ArrayBuffer(16), {})",
+                    NAPI_ARRAYBUFFER_EXPECTED,
+                    -1,
+                ),
+                ("undefined", NAPI_ARRAYBUFFER_EXPECTED, -1),
+                ("null", NAPI_ARRAYBUFFER_EXPECTED, -1),
+                ("16", NAPI_ARRAYBUFFER_EXPECTED, -1),
+            ];
+            for (source, status, expected) in cases {
+                let id = state.insert(js_sys::eval(source).unwrap());
+                let mut result = -1;
+                assert_eq!(
+                    unsafe { snapi_bridge_is_detached_arraybuffer(env, id, &mut result) },
+                    status,
+                    "{source}"
+                );
+                assert_eq!(result, expected, "{source}");
+            }
+            let mut result = -1;
+            assert_eq!(
+                unsafe { snapi_bridge_is_detached_arraybuffer(env, 0, &mut result) },
+                NAPI_INVALID_ARG
+            );
         });
     }
 
