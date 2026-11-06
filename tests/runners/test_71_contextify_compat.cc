@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1912,6 +1914,10 @@ struct ReleaseTokens {
   int unassign_makes = 0;
   // How many more unassign hooks throw, one per call.
   int unassign_throws = 0;
+  // How many more unassign hooks import() from a script, one per call, and
+  // what became of each import(): "returned, <how its promise settled>".
+  int unassign_imports = 0;
+  std::vector<std::string> import_outcomes;
 };
 
 void CheckHookRealm(napi_env env, ReleaseTokens* log) {
@@ -1931,6 +1937,53 @@ void CheckHookRealm(napi_env env, ReleaseTokens* log) {
                       env_global == nullptr ||
                       napi_strict_equals(env, global, env_global, &same) != napi_ok || !same;
   napi_close_handle_scope(env, scope);
+}
+
+// Imports from a script in the env's realm, then runs the microtasks: says
+// what became of the import().
+std::string ImportFromAScript(napi_env env) {
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return "no handle scope";
+  napi_value box = nullptr;
+  std::string outcome;
+  if (napi_run_script(env,
+                      Str(env,
+                          "(() => {"
+                          "  const box = { sync: 'none', outcome: 'pending' };"
+                          "  try {"
+                          "    const promise = import('missing');"
+                          "    box.sync = 'returned';"
+                          "    promise.then((ns) => { box.outcome = 'resolved:' + (ns && ns.from); },"
+                          "                 () => { box.outcome = 'rejected'; });"
+                          "  } catch (e) { box.sync = 'threw: ' + e; }"
+                          "  return box;"
+                          "})()"),
+                      &box) != napi_ok) {
+    outcome = "script failed";
+  } else {
+    unofficial_napi_event_loop_checkpoint(env, unofficial_napi_event_loop_checkpoint_microtasks,
+                                          true, nullptr);
+    for (const char* name : {"sync", "outcome"}) {
+      napi_value value = nullptr;
+      char text[128] = {};
+      size_t length = 0;
+      if (napi_get_named_property(env, box, name, &value) != napi_ok ||
+          napi_get_value_string_utf8(env, value, text, sizeof(text), &length) != napi_ok) {
+        std::snprintf(text, sizeof(text), "<unreadable>");
+        length = std::strlen(text);
+      }
+      if (!outcome.empty()) outcome += ", ";
+      outcome.append(text, length);
+    }
+  }
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_value ignored = nullptr;
+    napi_get_and_clear_last_exception(env, &ignored);
+    outcome += " (exception pending)";
+  }
+  napi_close_handle_scope(env, scope);
+  return outcome;
 }
 
 void MakeReleaseRealm(ReleaseTokens* log) {
@@ -1975,6 +2028,10 @@ void UnassignReleaseToken(napi_env env, void* token, void* data) {
   if (log->unassign_throws > 0) {
     --log->unassign_throws;
     napi_throw_error(env, nullptr, "unassign");
+  }
+  if (log->unassign_imports > 0) {
+    --log->unassign_imports;
+    log->import_outcomes.push_back(ImportFromAScript(env));
   }
 }
 
@@ -2317,5 +2374,40 @@ TEST_F(Test71ContextifyCompat, TokenHookExceptionsAtReleaseAreDropped) {
 #if defined(NAPI_TEST_ENGINE_V8)
   EXPECT_EQ(log.unassign_throws, 0);
   EXPECT_EQ(state.events_after, state.events_before + 1);
+#endif
+}
+
+// An unassign callback the release runs after the module loader's cleanup
+// hook (for the realm a later cleanup hook made, in the sweep after the
+// hooks) imports from a script: import() returns a promise, which rejects,
+// since on V8 the loader's hook has let go of the module hooks. The import
+// callback those hooks installed, still the isolate's, found no loader state
+// there and returned no promise with nothing thrown, and V8 aborts the process
+// on that. Token hooks are V8's only, so on QuickJS no unassign callback runs.
+TEST_F(Test71ContextifyCompat, AnImportAnUnassignHookMakesAfterTheLoadersCleanupHookRejects) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  napi_value loader = nullptr;
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env, "(id, specifier) => Promise.resolve({ from: 'hooks' })"),
+                            &loader),
+            napi_ok);
+  unofficial_napi_module_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+  hooks.import_module_dynamically = loader;
+  ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+  EXPECT_EQ(ImportFromAScript(s.env), "returned, resolved:hooks");
+  // Added after the loader's cleanup hook, so it runs before it.
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, MakeRealmHook, &log), napi_ok);
+  log.unassign_imports = 1;
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+#if defined(NAPI_TEST_ENGINE_V8)
+  ASSERT_EQ(log.import_outcomes.size(), 1u);
+  EXPECT_EQ(log.import_outcomes[0], "returned, rejected");
+#else
+  EXPECT_TRUE(log.import_outcomes.empty());
 #endif
 }

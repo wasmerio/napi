@@ -1154,6 +1154,27 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
   return CreateFrozenNullProtoObject(env, names, values);
 }
 
+// The promise of an import() nothing can load: of the importing realm,
+// rejected, as NapiHostImportModuleDynamically and V8 with no import callback
+// reject it. V8 takes an empty result for an exception thrown and aborts the
+// process when none was, so the import callback returns one only after
+// throwing.
+v8::MaybeLocal<v8::Promise> RejectImport(v8::Local<v8::Context> context) {
+  v8::Isolate* isolate = context->GetIsolate();
+  v8::EscapableHandleScope handle_scope(isolate);
+  v8::Context::Scope context_scope(context);
+  v8::Local<v8::Promise::Resolver> resolver;
+  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+    return v8::MaybeLocal<v8::Promise>();
+  }
+  v8::Local<v8::Value> error =
+      v8::Exception::Error(v8::String::NewFromUtf8Literal(isolate, "Not supported"));
+  if (resolver->Reject(context, error).IsNothing()) return v8::MaybeLocal<v8::Promise>();
+  v8::Local<v8::Promise> promise = resolver->GetPromise();
+  NapiV8TrackProviderPromise(isolate, promise);
+  return handle_scope.Escape(promise);
+}
+
 v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     v8::Local<v8::Context> context,
     v8::Local<v8::Data> host_defined_options,
@@ -1161,13 +1182,16 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     v8::Local<v8::String> specifier,
     v8::ModuleImportPhase phase,
     v8::Local<v8::FixedArray> import_attributes) {
+  // The hooks stay the isolate's import callback after the module loader lets
+  // go of them (its cleanup hook, at the env's release), and they may have
+  // had no import callback at all: then nothing can load the module.
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
-  if (env == nullptr) return v8::MaybeLocal<v8::Promise>();
+  if (env == nullptr) return RejectImport(context);
 
   auto* state = GetModuleWrapState(env);
-  if (state == nullptr) return v8::MaybeLocal<v8::Promise>();
+  if (state == nullptr) return RejectImport(context);
   napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
-  if (callback == nullptr) return v8::MaybeLocal<v8::Promise>();
+  if (callback == nullptr) return RejectImport(context);
 
   v8::Isolate* isolate = context->GetIsolate();
   v8::EscapableHandleScope handle_scope(isolate);
@@ -1220,9 +1244,12 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
         napi_value error = nullptr;
         if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
           isolate->ThrowException(napi_v8_unwrap_value(error));
+          return v8::MaybeLocal<v8::Promise>();
         }
       }
-      return v8::MaybeLocal<v8::Promise>();
+      if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
+      // Nothing thrown: the callback is not a function.
+      return handle_scope.EscapeMaybe(RejectImport(context));
     }
   }
 

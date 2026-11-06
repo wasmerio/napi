@@ -3,6 +3,9 @@
 #include "node_api.h"
 #include "unofficial_napi.h"
 
+#include <string>
+#include <vector>
+
 class Test65UnofficialContextify : public FixtureTestBase {};
 
 namespace {
@@ -1142,4 +1145,224 @@ TEST_F(Test65UnofficialContextify, DynamicImportWithNoLoaderRejects) {
   ASSERT_EQ(napi_run_script(s.env, Str(s.env, "outcome"), &result), napi_ok);
   ASSERT_EQ(napi_get_value_string_utf8(s.env, result, text, sizeof(text), &length), napi_ok);
   EXPECT_STREQ(text, "rejected");
+}
+
+namespace {
+
+// Calls import('missing') and returns a box that records what became of it:
+// `sync` is "returned" once import() returned a promise, and `outcome` says
+// how that promise settled.
+constexpr char kImportBox[] =
+    "(() => {"
+    "  const box = { sync: 'none', outcome: 'pending' };"
+    "  try {"
+    "    const promise = import('missing');"
+    "    box.sync = Object.prototype.toString.call(promise) === '[object Promise]'"
+    "               ? 'returned' : 'returned no promise';"
+    "    promise.then((ns) => { box.outcome = 'resolved:' + (ns && ns.from); },"
+    "                 () => { box.outcome = 'rejected'; });"
+    "  } catch (e) { box.sync = 'threw: ' + e; }"
+    "  return box;"
+    "})()";
+
+std::string BoxText(napi_env env, napi_value box, const char* name) {
+  napi_value value = nullptr;
+  napi_value string = nullptr;
+  char text[128] = {};
+  size_t length = 0;
+  if (box == nullptr || napi_get_named_property(env, box, name, &value) != napi_ok ||
+      napi_coerce_to_string(env, value, &string) != napi_ok ||
+      napi_get_value_string_utf8(env, string, text, sizeof(text), &length) != napi_ok) {
+    return "<unreadable>";
+  }
+  return std::string(text, length);
+}
+
+// "returned, rejected" for an import() that returned a promise that rejected.
+std::string ImportOutcome(napi_env env, napi_value box) {
+  return BoxText(env, box, "sync") + ", " + BoxText(env, box, "outcome");
+}
+
+napi_status RunInRealm(napi_env env,
+                       unofficial_napi_realm realm,
+                       const char* code,
+                       napi_value* result_out) {
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(Str(env, code));
+  return unofficial_napi_run_script(env, realm, &source, Str(env, "realm.js"), 0, 0, -1, true,
+                                    false, false, Sym(env, "hdo"), result_out);
+}
+
+void RunMicrotasks(napi_env env) {
+  EXPECT_EQ(unofficial_napi_event_loop_checkpoint(
+                env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+}
+
+}  // namespace
+
+// Module hooks with no dynamic import callback: none at all, only the
+// import.meta one, or one that is not a function. An import() then has
+// nothing to load it with, in the env's realm or in another, and rejects. On
+// V8 the import callback the hooks install returned no promise and threw
+// nothing there, and V8 aborts the process on that (CHECK has_exception()).
+TEST_F(Test65UnofficialContextify, DynamicImportWithModuleHooksButNoImportCallbackRejects) {
+  enum Hooks { kNoCallbacks, kImportMetaOnly, kImportNotAFunction };
+  for (Hooks which : {kNoCallbacks, kImportMetaOnly, kImportNotAFunction}) {
+    SCOPED_TRACE(which == kNoCallbacks     ? "no callbacks"
+                 : which == kImportMetaOnly ? "import.meta callback only"
+                                            : "import callback undefined");
+    EnvScope s(runtime_.get());
+    napi_value undefined = nullptr;
+    ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+    napi_value meta = nullptr;
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, "(() => {})"), &meta), napi_ok);
+    unofficial_napi_module_hooks hooks{};
+    hooks.size = sizeof(hooks);
+    hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+    if (which == kImportMetaOnly) hooks.initialize_import_meta_object = meta;
+    if (which == kImportNotAFunction) hooks.import_module_dynamically = undefined;
+    ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+
+    napi_value sandbox = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &sandbox), napi_ok);
+    unofficial_napi_realm sandbox_realm = nullptr;
+    ASSERT_EQ(CreateSandboxRealm(s.env, sandbox, false, &sandbox_realm), napi_ok);
+    unofficial_napi_realm fresh_realm = nullptr;
+    napi_value fresh_global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &fresh_realm, &fresh_global), napi_ok);
+
+    napi_value env_box = nullptr;
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, kImportBox), &env_box), napi_ok);
+    napi_value sandbox_box = nullptr;
+    ASSERT_EQ(RunInRealm(s.env, sandbox_realm, kImportBox, &sandbox_box), napi_ok);
+    napi_value fresh_box = nullptr;
+    ASSERT_EQ(RunInRealm(s.env, fresh_realm, kImportBox, &fresh_box), napi_ok);
+    RunMicrotasks(s.env);
+    EXPECT_EQ(ImportOutcome(s.env, env_box), "returned, rejected") << "the env's realm";
+    EXPECT_EQ(ImportOutcome(s.env, sandbox_box), "returned, rejected") << "a sandbox realm";
+    EXPECT_EQ(ImportOutcome(s.env, fresh_box), "returned, rejected") << "a fresh realm";
+  }
+}
+
+namespace {
+
+struct ImportsAtRelease {
+  napi_env env = nullptr;
+  bool ran = false;
+  std::vector<std::string> outcomes;
+};
+
+// A module whose evaluation imports; returns its box.
+napi_value ImportFromAModule(napi_env env, std::string* failed) {
+  napi_value wrapper = nullptr;
+  napi_value undefined = nullptr;
+  napi_create_object(env, &wrapper);
+  napi_get_undefined(env, &undefined);
+  const std::string code = std::string("export const box = ") + kImportBox + ";";
+  const unofficial_napi_js_source source =
+      unofficial_napi_js_source_from_text(Str(env, code.c_str()));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(env, "imports.mjs");
+  options.payload.source_text.source = &source;
+  options.payload.source_text.host_defined_option_id = undefined;
+  unofficial_napi_module_create_result created{};
+  if (unofficial_napi_module_wrap_create(env, &options, &created) != napi_ok) {
+    *failed = "create";
+    return nullptr;
+  }
+  napi_value evaluated = nullptr;
+  napi_value ns = nullptr;
+  napi_value box = nullptr;
+  if (unofficial_napi_module_wrap_link(env, created.module, 0, nullptr) != napi_ok) {
+    *failed = "link";
+  } else if (unofficial_napi_module_wrap_instantiate(env, created.module) != napi_ok) {
+    *failed = "instantiate";
+  } else if (unofficial_napi_module_wrap_evaluate(env, created.module, -1, false, &evaluated) !=
+             napi_ok) {
+    *failed = "evaluate";
+  } else if (unofficial_napi_module_wrap_get_namespace(env, created.module, &ns) != napi_ok ||
+             napi_get_named_property(env, ns, "box", &box) != napi_ok) {
+    *failed = "namespace";
+  }
+  unofficial_napi_module_wrap_destroy(env, created.module);
+  return box;
+}
+
+// Added before the module hooks, so the release runs it after the module
+// loader's own cleanup hook (most recent first), which on V8 lets go of the
+// hooks and of the loader's state. It imports from a script; from a module,
+// which makes the loader's state again, with no hooks; and from a script
+// again.
+void ImportAfterTheLoadersCleanupHook(void* arg) {
+  auto* imports = static_cast<ImportsAtRelease*>(arg);
+  napi_env env = imports->env;
+  imports->ran = true;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return;
+  napi_value boxes[3] = {};
+  std::string failed;
+  if (napi_run_script(env, Str(env, kImportBox), &boxes[0]) != napi_ok) failed = "script";
+  if (failed.empty()) boxes[1] = ImportFromAModule(env, &failed);
+  if (failed.empty() && napi_run_script(env, Str(env, kImportBox), &boxes[2]) != napi_ok) {
+    failed = "second script";
+  }
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_value ignored = nullptr;
+    napi_get_and_clear_last_exception(env, &ignored);
+    failed += " (exception pending)";
+  }
+  unofficial_napi_event_loop_checkpoint(env, unofficial_napi_event_loop_checkpoint_microtasks,
+                                        true, nullptr);
+  if (!failed.empty()) imports->outcomes.push_back("failed: " + failed);
+  for (napi_value box : boxes) {
+    if (box != nullptr) imports->outcomes.push_back(ImportOutcome(env, box));
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+}  // namespace
+
+// An import() a cleanup hook makes at release, after the module loader's own
+// cleanup hook, returns a promise that settles. On V8 the loader's hook has
+// let go of the hooks, so it rejects; QuickJS's loader keeps its hooks until
+// the release's pass is over, so they load it. On V8 the import callback the
+// hooks installed, still the isolate's, found no loader state there and
+// returned no promise with nothing thrown, and V8 aborts the process on that.
+TEST_F(Test65UnofficialContextify, DynamicImportFromACleanupHookAfterTheLoadersCleanupHookSettles) {
+  ImportsAtRelease imports;
+  {
+    EnvScope s(runtime_.get());
+    imports.env = s.env;
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, ImportAfterTheLoadersCleanupHook, &imports),
+              napi_ok);
+    napi_value loader = nullptr;
+    ASSERT_EQ(napi_run_script(s.env,
+                              Str(s.env, "(id, specifier) => Promise.resolve({ from: 'hooks' })"),
+                              &loader),
+              napi_ok);
+    unofficial_napi_module_hooks hooks{};
+    hooks.size = sizeof(hooks);
+    hooks.version = UNOFFICIAL_NAPI_MODULE_HOOKS_VERSION;
+    hooks.import_module_dynamically = loader;
+    ASSERT_EQ(unofficial_napi_module_wrap_set_hooks(s.env, &hooks), napi_ok);
+    // Before the release the hooks load it.
+    napi_value box = nullptr;
+    ASSERT_EQ(napi_run_script(s.env, Str(s.env, kImportBox), &box), napi_ok);
+    RunMicrotasks(s.env);
+    EXPECT_EQ(ImportOutcome(s.env, box), "returned, resolved:hooks");
+    ASSERT_EQ(unofficial_napi_release_env(s.scope, nullptr), napi_ok);
+    s.scope = nullptr;
+    s.env = nullptr;
+  }
+  EXPECT_TRUE(imports.ran);
+  ASSERT_EQ(imports.outcomes.size(), 3u);
+  for (const std::string& outcome : imports.outcomes) {
+    EXPECT_TRUE(outcome == "returned, rejected" || outcome == "returned, resolved:hooks")
+        << outcome;
+  }
 }
