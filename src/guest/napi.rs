@@ -538,7 +538,7 @@ fn guest_unofficial_napi_create_private_symbol(
     let wl = length;
     let desc = if desc_ptr != 0 {
         if wl == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, desc_ptr)
+            read_guest_c_string_max(&mut env, desc_ptr, V8_MAX_STRING_BYTES)
         } else {
             read_guest_bytes(&mut env, desc_ptr, wl as usize)
         }
@@ -2304,7 +2304,7 @@ fn guest_napi_set_named_property(
     np: u32,
     v: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2322,7 +2322,7 @@ fn guest_napi_get_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2345,7 +2345,7 @@ fn guest_napi_has_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2528,11 +2528,11 @@ fn guest_napi_throw_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2553,11 +2553,11 @@ fn guest_napi_throw_type_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2578,11 +2578,11 @@ fn guest_napi_throw_range_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -3248,7 +3248,7 @@ fn guest_napi_create_function(
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
         // NAPI_AUTO_LENGTH: read null-terminated string
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3414,7 +3414,7 @@ fn guest_napi_define_class(
     // Read class name
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3517,7 +3517,8 @@ fn guest_napi_define_class(
 
         // Read property name
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -3702,7 +3703,8 @@ fn guest_napi_define_properties(
         ]);
 
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
