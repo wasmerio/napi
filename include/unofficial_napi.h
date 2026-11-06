@@ -195,7 +195,9 @@ typedef enum unofficial_napi_event_loop_checkpoint_state {
 // Complete one provider-owned event-loop checkpoint. The mode describes Node
 // semantics, while the provider owns how those semantics are implemented. The
 // returned state distinguishes an asynchronous host turn from a synchronous
-// engine checkpoint without requiring a separate provider-kind query.
+// engine checkpoint without requiring a separate provider-kind query. The
+// checkpoint may be called with no handle scope open; it leaves no values in
+// the caller's scope.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,

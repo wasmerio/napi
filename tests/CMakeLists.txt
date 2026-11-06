@@ -332,6 +332,10 @@ if(_napi_test_engine STREQUAL "v8")
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
     runners/test_66_foreground_task_handoff.cc
   )
+  # Counts the V8 isolate's handles with the V8 API.
+  add_fixture_test(${_napi_test_prefix}_test_73_event_loop_checkpoint_handles
+    runners/test_73_event_loop_checkpoint_handles.cc
+  )
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
