@@ -6,6 +6,8 @@
 #include "test_env.h"
 #include "upstream_js_test.h"
 
+#include <cstdint>
+
 extern "C" napi_value Init(napi_env env, napi_value exports);
 // node_api.h declares it from NAPI_VERSION 10; this target builds at 8.
 extern "C" napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
@@ -375,6 +377,237 @@ TEST_F(Test33TypedArray, ViewInfoIgnoresARedefinedBufferProperty) {
   same = false;
   ASSERT_EQ(napi_strict_equals(s.env, viewed, live_backing, &same), napi_ok);
   EXPECT_TRUE(same) << "the DataView's own ArrayBuffer";
+}
+
+namespace {
+
+napi_value NamedGlobal(napi_env env, const char* name) {
+  napi_value global = nullptr;
+  napi_value value = nullptr;
+  EXPECT_EQ(napi_get_global(env, &global), napi_ok);
+  EXPECT_EQ(napi_get_named_property(env, global, name, &value), napi_ok) << name;
+  return value;
+}
+
+void SetGlobal(napi_env env, const char* name, napi_value value) {
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(env, global, name, value), napi_ok) << name;
+}
+
+int32_t GlobalInt(napi_env env, const char* name) {
+  int32_t out = -1;
+  EXPECT_EQ(napi_get_value_int32(env, NamedGlobal(env, name), &out), napi_ok) << name;
+  return out;
+}
+
+uint8_t* ArrayBufferData(napi_env env, napi_value array_buffer) {
+  void* data = nullptr;
+  size_t length = 0;
+  EXPECT_EQ(napi_get_arraybuffer_info(env, array_buffer, &data, &length), napi_ok);
+  return static_cast<uint8_t*>(data);
+}
+
+void ExpectNothingPending(napi_env env, const char* what) {
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  EXPECT_FALSE(pending) << what;
+  napi_value exception = nullptr;
+  if (pending) napi_get_and_clear_last_exception(env, &exception);
+}
+
+struct ViewLayout {
+  napi_status status = napi_generic_failure;
+  size_t length = 99;  // elements for a typed array, bytes for a DataView
+  size_t offset = 99;
+  void* data = nullptr;
+  napi_value buffer = nullptr;
+};
+
+ViewLayout TypedArrayLayout(napi_env env, napi_value view) {
+  ViewLayout out;
+  out.status = napi_get_typedarray_info(env, view, nullptr, &out.length, &out.data, &out.buffer,
+                                        &out.offset);
+  return out;
+}
+
+ViewLayout DataViewLayout(napi_env env, napi_value view) {
+  ViewLayout out;
+  out.status = napi_get_dataview_info(env, view, &out.length, &out.data, &out.buffer, &out.offset);
+  return out;
+}
+
+ViewLayout BufferLayout(napi_env env, napi_value view) {
+  ViewLayout out;
+  out.status = napi_get_buffer_info(env, view, &out.data, &out.length);
+  return out;
+}
+
+// A script redefines, on views and on the prototypes they inherit from, every
+// property that tells a view's layout, as getters that count their calls. The
+// layout N-API reports still is the view's own, and no getter runs.
+void ExpectLayoutFromTheViewsSlots(napi_env env, const char* where) {
+  SCOPED_TRACE(where);
+  napi_value backing = RunBufferScript(env, "new ArrayBuffer(32)");
+  ASSERT_NE(backing, nullptr);
+  SetGlobal(env, "backing", backing);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(env, backing, 12, 8, &buffer), napi_ok);
+  SetGlobal(env, "buf", buffer);
+  RunBufferScript(env,
+                  "globalThis.calls = 0;"
+                  "globalThis.typed = new Uint16Array(backing, 4, 6);"
+                  "globalThis.view = new DataView(backing, 2, 8);"
+                  "globalThis.ownTyped = new Uint16Array(backing, 8, 4);"
+                  "globalThis.ownView = new DataView(backing, 6, 4);"
+                  "globalThis.other = new ArrayBuffer(4);"
+                  "{"
+                  "  const lie = (name) => ({ configurable: true,"
+                  "    get() { calls++; return name === 'buffer' ? other : 1 << 30; } });"
+                  "  const names = ['length', 'byteLength', 'byteOffset', 'buffer'];"
+                  "  for (const target of [ownTyped, ownView, buf])"
+                  "    for (const name of names) Object.defineProperty(target, name, lie(name));"
+                  "  const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);"
+                  "  for (const target of [typedArrayPrototype, DataView.prototype])"
+                  "    for (const name of names) Object.defineProperty(target, name, lie(name));"
+                  "}"
+                  "0");
+  uint8_t* base = ArrayBufferData(env, backing);
+  auto expect_layout = [&](const ViewLayout& layout, size_t length, size_t offset,
+                           const char* what) {
+    EXPECT_EQ(layout.status, napi_ok) << what;
+    EXPECT_EQ(layout.length, length) << what;
+    EXPECT_EQ(layout.data, base + offset) << what;
+    if (layout.offset != 99) {
+      EXPECT_EQ(layout.offset, offset) << what;
+    }
+    if (layout.buffer != nullptr) {
+      bool same = false;
+      ASSERT_EQ(napi_strict_equals(env, layout.buffer, backing, &same), napi_ok);
+      EXPECT_TRUE(same) << what << ": its own ArrayBuffer";
+    }
+    ExpectNothingPending(env, what);
+  };
+  expect_layout(TypedArrayLayout(env, NamedGlobal(env, "typed")), 6, 4, "typed array");
+  expect_layout(TypedArrayLayout(env, NamedGlobal(env, "ownTyped")), 4, 8, "own typed array");
+  expect_layout(TypedArrayLayout(env, buffer), 8, 12, "buffer as a typed array");
+  expect_layout(BufferLayout(env, buffer), 8, 12, "buffer");
+  expect_layout(DataViewLayout(env, NamedGlobal(env, "view")), 8, 2, "data view");
+  expect_layout(DataViewLayout(env, NamedGlobal(env, "ownView")), 4, 6, "own data view");
+
+  EXPECT_EQ(GlobalInt(env, "calls"), 0) << "a getter the script defined ran";
+}
+
+}  // namespace
+
+// A typed array's, DataView's or Buffer's length, offset and ArrayBuffer are
+// the ones in its internal slots. Page scripts control their realm's
+// prototypes and can redefine those properties on any view: a length or
+// offset read from them would let a script make native code read or write
+// out of bounds.
+TEST_F(Test33TypedArray, ViewLayoutComesFromItsSlotsInAnyRealm) {
+  EnvScope s(runtime_.get());
+  ExpectLayoutFromTheViewsSlots(s.env, "the env's realm");
+
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  unofficial_napi_realm realm = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  unofficial_napi_realm_scope scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &scope), napi_ok);
+  ExpectLayoutFromTheViewsSlots(s.env, "a realm the env entered");
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, scope), napi_ok);
+}
+
+// As in Node, a view over a resizable ArrayBuffer follows the buffer's size: a
+// length-tracking view reports what of the buffer is past its offset now, and
+// a fixed-length view the buffer shrank under reports a length of 0 (and
+// reports its length again once the buffer grows back), with no exception.
+// Such an out-of-bounds view's offset is left unchecked: V8 reports the view's
+// own, QuickJS 0, as it has no way to read it (its accessors report 0 or
+// throw).
+TEST_F(Test33TypedArray, ViewsOfAResizedBufferReportItsCurrentSize) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.rab = new ArrayBuffer(16, { maxByteLength: 32 });"
+                  "globalThis.tracking = new Uint8Array(rab, 4);"
+                  "globalThis.fixed = new Uint16Array(rab, 4, 4);"
+                  "globalThis.trackingView = new DataView(rab, 2);"
+                  "globalThis.fixedView = new DataView(rab, 2, 8);"
+                  "0");
+  napi_value rab = NamedGlobal(s.env, "rab");
+  napi_value buffer = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, rab, 4, 8, &buffer), napi_ok);
+  napi_value tracking = NamedGlobal(s.env, "tracking");
+  napi_value fixed = NamedGlobal(s.env, "fixed");
+  napi_value tracking_view = NamedGlobal(s.env, "trackingView");
+  napi_value fixed_view = NamedGlobal(s.env, "fixedView");
+
+  auto expect_layout = [&](const ViewLayout& layout, size_t length, const char* what) {
+    EXPECT_EQ(layout.status, napi_ok) << what;
+    EXPECT_EQ(layout.length, length) << what;
+    if (layout.buffer != nullptr) {
+      bool same = false;
+      ASSERT_EQ(napi_strict_equals(s.env, layout.buffer, rab, &same), napi_ok);
+      EXPECT_TRUE(same) << what << ": its own ArrayBuffer";
+    }
+    ExpectNothingPending(s.env, what);
+  };
+  // In bounds, also the data and offset.
+  auto expect_in_bounds = [&](const ViewLayout& layout, size_t length, size_t offset,
+                              const char* what) {
+    expect_layout(layout, length, what);
+    EXPECT_EQ(layout.data, ArrayBufferData(s.env, rab) + offset) << what;
+    if (layout.offset != 99) {
+      EXPECT_EQ(layout.offset, offset) << what;
+    }
+  };
+
+  RunBufferScript(s.env, "rab.resize(8); 0");
+  expect_in_bounds(TypedArrayLayout(s.env, tracking), 4, 4, "shrunk: tracking typed array");
+  expect_layout(TypedArrayLayout(s.env, fixed), 0, "shrunk: fixed typed array");
+  expect_layout(TypedArrayLayout(s.env, buffer), 0, "shrunk: buffer as a typed array");
+  expect_layout(BufferLayout(s.env, buffer), 0, "shrunk: buffer");
+  expect_in_bounds(DataViewLayout(s.env, tracking_view), 6, 2, "shrunk: tracking data view");
+  expect_layout(DataViewLayout(s.env, fixed_view), 0, "shrunk: fixed data view");
+  bool is_buffer = false;
+  EXPECT_EQ(napi_is_buffer(s.env, buffer, &is_buffer), napi_ok);
+  EXPECT_TRUE(is_buffer) << "a Buffer out of bounds is still a Buffer";
+
+  RunBufferScript(s.env, "rab.resize(24); 0");
+  expect_in_bounds(TypedArrayLayout(s.env, tracking), 20, 4, "grown: tracking typed array");
+  expect_in_bounds(TypedArrayLayout(s.env, fixed), 4, 4, "grown: fixed typed array");
+  expect_in_bounds(TypedArrayLayout(s.env, buffer), 8, 4, "grown: buffer as a typed array");
+  expect_in_bounds(BufferLayout(s.env, buffer), 8, 4, "grown: buffer");
+  expect_in_bounds(DataViewLayout(s.env, tracking_view), 22, 2, "grown: tracking data view");
+  expect_in_bounds(DataViewLayout(s.env, fixed_view), 8, 2, "grown: fixed data view");
+}
+
+// A termination request leaves a view's layout as it is (QuickJS polls its
+// interrupt handler, now and then, on the calls that read it).
+TEST_F(Test33TypedArray, ViewLayoutHoldsWhileTerminating) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.typed = new Uint16Array(new ArrayBuffer(32), 4, 6);"
+                  "globalThis.view = new DataView(new ArrayBuffer(32), 2, 8);"
+                  "0");
+  napi_value typed = NamedGlobal(s.env, "typed");
+  napi_value view = NamedGlobal(s.env, "view");
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  int wrong = 0;
+  for (int i = 0; i < 20000; ++i) {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    const ViewLayout typed_layout = TypedArrayLayout(s.env, typed);
+    const ViewLayout view_layout = DataViewLayout(s.env, view);
+    if (typed_layout.status != napi_ok || typed_layout.length != 6 || typed_layout.offset != 4 ||
+        view_layout.status != napi_ok || view_layout.length != 8 || view_layout.offset != 2) {
+      ++wrong;
+    }
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  EXPECT_EQ(wrong, 0);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)

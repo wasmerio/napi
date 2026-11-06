@@ -115,22 +115,10 @@ void napi_buffer__::clear_pending_exception_if_any() const
 
 bool napi_buffer__::has_typed_array_backing(JSValueConst value) const
 {
-  if (context_ == nullptr || !JS_IsObject(value))
-    return false;
-
-  JSValue arraybuffer = JS_GetTypedArrayBuffer(context_, value, nullptr, nullptr, nullptr);
-  // QuickJS throws for a view over a detached buffer, which is still one.
-  if (JS_IsException(arraybuffer))
-    arraybuffer = env_->detached_view_buffer(value);
-  if (JS_IsUndefined(arraybuffer))
-  {
-    clear_pending_exception_if_any();
-    return false;
-  }
-
-  const bool has_backing = !JS_IsUndefined(arraybuffer) && !JS_IsNull(arraybuffer);
-  JS_FreeValue(context_, arraybuffer);
-  return has_backing;
+  // Every typed array has its ArrayBuffer, also one over a detached buffer
+  // or out of bounds of a shrunk resizable one (QuickJS's accessors throw for
+  // these).
+  return context_ != nullptr && JS_GetTypedArrayType(value) >= 0;
 }
 
 bool napi_buffer__::prototype_chain_contains_cached_prototype(JSValueConst value) const
@@ -246,39 +234,16 @@ napi_status napi_buffer__::get_buffer_info(JSValueConst value, void **data, size
   if (!is_buffer(value))
     return napi_quickjs_set_last_error(env_, napi_invalid_arg, "Invalid argument");
 
-  size_t offset = 0;
-  size_t byte_len = 0;
-  JSValue arraybuffer = JS_GetTypedArrayBuffer(context_, value, &offset, &byte_len, nullptr);
-  if (JS_IsException(arraybuffer))
-  {
-    // QuickJS throws for a Buffer over a detached ArrayBuffer. Node reports
-    // it as one with no data and a length of 0.
-    JSValue detached = env_->detached_view_buffer(value);
-    if (!JS_IsUndefined(detached))
-    {
-      JS_FreeValue(context_, detached);
-      if (data != nullptr)
-        *data = nullptr;
-      if (length != nullptr)
-        *length = 0;
-      return napi_quickjs_clear_last_error(env_);
-    }
-    clear_pending_exception_if_any();
+  // Its own layout, never what its properties say. As in Node, a Buffer over
+  // a detached ArrayBuffer, or out of bounds of a shrunk resizable one, has
+  // no data and a length of 0.
+  napi_view_layout__ layout;
+  if (!env_->view_layout(value, &layout))
     return napi_quickjs_set_last_error(env_, napi_invalid_arg, "Invalid argument");
-  }
-
-  size_t arraybuffer_len = 0;
-  uint8_t *arraybuffer_data = JS_GetArrayBuffer(context_, &arraybuffer_len, arraybuffer);
-  JS_FreeValue(context_, arraybuffer);
-  if (arraybuffer_data == nullptr && JS_HasException(context_))
-  {
-    clear_pending_exception_if_any();
-    return napi_quickjs_set_last_error(env_, napi_invalid_arg, "Invalid argument");
-  }
-
+  JS_FreeValue(context_, layout.buffer);
   if (data != nullptr)
-    *data = arraybuffer_data == nullptr ? nullptr : arraybuffer_data + offset;
+    *data = layout.data;
   if (length != nullptr)
-    *length = byte_len;
+    *length = layout.byte_length;
   return napi_quickjs_clear_last_error(env_);
 }

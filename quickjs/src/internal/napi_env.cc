@@ -2,7 +2,6 @@
 
 #include "internal/napi_external.h"
 #include "internal/napi_lifetime_macros.h"
-#include "internal/napi_util.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -67,10 +66,11 @@ JSValue own_getter(JSContext *ctx, JSValueConst object, const char *name)
   return JS_UNDEFINED;
 }
 
-// The getter of `name` on the prototype of `constructor_name` in the global
-// (or on that prototype's own prototype, with `inherited`).
-JSValue prototype_getter(JSContext *ctx, JSValueConst global, const char *constructor_name,
-                         bool inherited, const char *name)
+// The getters of `buffer`, `byteOffset` and `byteLength` on the prototype of
+// `constructor_name` in the global (or on that prototype's own prototype, with
+// `inherited`).
+void view_getters(JSContext *ctx, JSValueConst global, const char *constructor_name,
+                  bool inherited, JSValue *buffer, JSValue *byte_offset, JSValue *byte_length)
 {
   JSValue constructor = JS_GetPropertyStr(ctx, global, constructor_name);
   JSValue prototype = JS_IsObject(constructor)
@@ -82,12 +82,36 @@ JSValue prototype_getter(JSContext *ctx, JSValueConst global, const char *constr
     JS_FreeValue(ctx, prototype);
     prototype = parent;
   }
-  JSValue getter = JS_IsException(prototype) ? JS_UNDEFINED : own_getter(ctx, prototype, name);
+  if (!JS_IsException(prototype))
+  {
+    *buffer = own_getter(ctx, prototype, "buffer");
+    *byte_offset = own_getter(ctx, prototype, "byteOffset");
+    *byte_length = own_getter(ctx, prototype, "byteLength");
+  }
   JS_FreeValue(ctx, prototype);
   JS_FreeValue(ctx, constructor);
   if (JS_HasException(ctx))
     JS_FreeValue(ctx, JS_GetException(ctx));
-  return getter;
+}
+
+// Calls an intrinsic getter of a view. Such a getter runs no script, but
+// QuickJS may poll its interrupt handler on the call and throw for a
+// termination request (which the env keeps and raises again itself); the
+// getter is then called again, as the poll restarted its countdown.
+JSValue call_view_getter(JSContext *ctx, JSValueConst getter, JSValueConst view)
+{
+  JSValue value = JS_Call(ctx, getter, view, 0, nullptr);
+  if (!JS_IsException(value))
+    return value;
+  JSValue exception = JS_GetException(ctx);
+  const bool interrupted = JS_IsUncatchableError(exception);
+  JS_FreeValue(ctx, exception);
+  if (!interrupted)
+    return JS_EXCEPTION;
+  value = JS_Call(ctx, getter, view, 0, nullptr);
+  if (JS_IsException(value))
+    JS_FreeValue(ctx, JS_GetException(ctx));
+  return value;
 }
 
 napi_runtime_interrupts__ *installed_runtime_interrupts(JSRuntime *rt)
@@ -158,10 +182,12 @@ napi_env__::napi_env__(napi_agent__ *agent, JSContext *context, int32_t module_a
     agent_->open_root_scope(this);
     JSValue global = JS_GetGlobalObject(context_);
     JSValue data_view = JS_GetPropertyStr(context_, global, "DataView");
-    // Typed arrays of any realm share these getters' behaviour: they read the
-    // view's internal slot, whatever realm made it.
-    typed_array_buffer_getter_ = prototype_getter(context_, global, "Uint8Array", true, "buffer");
-    data_view_buffer_getter_ = prototype_getter(context_, global, "DataView", false, "buffer");
+    // Views of any realm share these getters' behaviour: they read the view's
+    // internal slots, whatever realm made it.
+    view_getters(context_, global, "Uint8Array", true, &typed_array_getters_.buffer,
+                 &typed_array_getters_.byte_offset, &typed_array_getters_.byte_length);
+    view_getters(context_, global, "DataView", false, &data_view_getters_.buffer,
+                 &data_view_getters_.byte_offset, &data_view_getters_.byte_length);
     JS_FreeValue(context_, global);
     if (JS_IsConstructor(context_, data_view))
       data_view_constructor_ = data_view;
@@ -239,12 +265,16 @@ void napi_env__::prepare_teardown()
   if (context_ != nullptr)
   {
     JS_FreeValue(context_, data_view_constructor_);
-    JS_FreeValue(context_, typed_array_buffer_getter_);
-    JS_FreeValue(context_, data_view_buffer_getter_);
+    for (view_getters__ *getters : {&typed_array_getters_, &data_view_getters_})
+    {
+      JS_FreeValue(context_, getters->buffer);
+      JS_FreeValue(context_, getters->byte_offset);
+      JS_FreeValue(context_, getters->byte_length);
+    }
   }
   data_view_constructor_ = JS_UNDEFINED;
-  typed_array_buffer_getter_ = JS_UNDEFINED;
-  data_view_buffer_getter_ = JS_UNDEFINED;
+  typed_array_getters_ = {};
+  data_view_getters_ = {};
   if (principal)
     agent_->clear_promise_hooks();
   promises_.teardown();
@@ -389,35 +419,56 @@ JSContext *napi_env__::main_context() const
   return context_;
 }
 
-JSValue napi_env__::view_buffer(JSValueConst view) const
+bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) const
 {
-  JSValueConst getter = JS_IsDataView(view)                ? data_view_buffer_getter_
-                        : JS_GetTypedArrayType(view) >= 0 ? typed_array_buffer_getter_
-                                                          : JS_UNDEFINED;
-  if (context_ == nullptr || JS_IsUndefined(getter))
-    return JS_UNDEFINED;
+  const view_getters__ *getters = JS_IsDataView(view)                ? &data_view_getters_
+                                  : JS_GetTypedArrayType(view) >= 0 ? &typed_array_getters_
+                                                                    : nullptr;
+  if (context_ == nullptr || layout == nullptr || getters == nullptr ||
+      !JS_IsFunction(context_, getters->buffer) || !JS_IsFunction(context_, getters->byte_offset) ||
+      !JS_IsFunction(context_, getters->byte_length))
+    return false;
   JSValue earlier = JS_GetException(context_);
-  JSValue buffer = JS_Call(context_, getter, view, 0, nullptr);
-  if (JS_IsException(buffer))
-  {
+  *layout = {};
+  layout->buffer = call_view_getter(context_, getters->buffer, view);
+  bool found = JS_IsObject(layout->buffer);
+  size_t buffer_length = 0;
+  // JS_GetArrayBuffer throws for a detached buffer only.
+  if (found)
+    layout->data = JS_GetArrayBuffer(context_, &buffer_length, layout->buffer);
+  if (layout->data == nullptr && JS_HasException(context_))
     JS_FreeValue(context_, JS_GetException(context_));
-    buffer = JS_UNDEFINED;
+  if (layout->data != nullptr)
+  {
+    // The typed array getters report 0 for a view out of bounds; the DataView
+    // ones throw.
+    JSValue offset_value = call_view_getter(context_, getters->byte_offset, view);
+    JSValue length_value = call_view_getter(context_, getters->byte_length, view);
+    int64_t offset = 0;
+    int64_t length = 0;
+    if (!JS_IsException(offset_value) && !JS_IsException(length_value) &&
+        JS_ToInt64(context_, &offset, offset_value) == 0 &&
+        JS_ToInt64(context_, &length, length_value) == 0 && offset >= 0 && length >= 0 &&
+        static_cast<uint64_t>(offset) <= buffer_length &&
+        static_cast<uint64_t>(length) <= buffer_length - static_cast<uint64_t>(offset))
+    {
+      layout->byte_offset = static_cast<size_t>(offset);
+      layout->byte_length = static_cast<size_t>(length);
+      layout->data += layout->byte_offset;
+    }
+    JS_FreeValue(context_, offset_value);
+    JS_FreeValue(context_, length_value);
+    if (JS_HasException(context_))
+      JS_FreeValue(context_, JS_GetException(context_));
+  }
+  if (!found)
+  {
+    JS_FreeValue(context_, layout->buffer);
+    layout->buffer = JS_UNDEFINED;
   }
   if (!JS_IsUninitialized(earlier))
     JS_Throw(context_, earlier);
-  return buffer;
-}
-
-JSValue napi_env__::detached_view_buffer(JSValueConst view) const
-{
-  JSValue buffer = view_buffer(view);
-  if (napi_util__::is_detached_array_buffer(context_, buffer))
-  {
-    JS_FreeValue(context_, JS_GetException(context_));
-    return buffer;
-  }
-  JS_FreeValue(context_, buffer);
-  return JS_UNDEFINED;
+  return found;
 }
 
 JSValueConst napi_env__::data_view_constructor() const

@@ -517,21 +517,14 @@ extern "C"
         return napi_invalid_arg;
     }
 
-    size_t byte_len;
-    size_t offset;
-    JSValue abuf = JS_GetTypedArrayBuffer(env->context(), local, &offset, &byte_len, nullptr);
-    // QuickJS throws for a typed array over a detached buffer. Node reports
-    // it as one with no data and a length and offset of 0.
-    bool detached = false;
-    if (JS_IsException(abuf))
-    {
-      abuf = env->detached_view_buffer(local);
-      if (JS_IsUndefined(abuf))
-        return napi_util__::return_pending_if_caught(env, "Failed to get typed array info");
-      detached = true;
-      byte_len = 0;
-      offset = 0;
-    }
+    // Its own layout, never what its properties say. As in Node, a typed
+    // array over a detached buffer, or out of bounds of a shrunk resizable
+    // one, has no elements.
+    napi_view_layout__ layout;
+    if (!env->view_layout(local, &layout))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "Failed to get typed array info");
+    const size_t byte_len = layout.byte_length;
+    JSValue abuf = layout.buffer;
 
     if (length != nullptr)
     {
@@ -566,23 +559,12 @@ extern "C"
 
     if (byte_offset != nullptr)
     {
-      *byte_offset = offset;
+      *byte_offset = layout.byte_offset;
     }
 
-    if (data != nullptr && detached)
+    if (data != nullptr)
     {
-      *data = nullptr;
-    }
-    else if (data != nullptr)
-    {
-      size_t ab_len;
-      uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, abuf);
-      if (ab_data == nullptr)
-      {
-        JS_FreeValue(env->context(), abuf);
-        return napi_util__::return_pending_if_caught(env, "Failed to get array buffer data");
-      }
-      *data = ab_data + offset;
+      *data = layout.data;
     }
 
     if (arraybuffer != nullptr)
@@ -1455,54 +1437,19 @@ extern "C"
     if (!JS_IsDataView(view))
       return napi_util__::invalid_arg(env);
 
-    // The view's own buffer, never what its `buffer` property says.
-    JSValue buffer_val = env->view_buffer(view);
-    if (JS_IsUndefined(buffer_val))
-      buffer_val = JS_GetPropertyStr(env->context(), view, "buffer");
-    if (JS_IsException(buffer_val))
-      return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
-    // QuickJS's byteLength and byteOffset getters throw for a DataView over a
-    // detached buffer. Node reports it as one with no data and a length and
-    // offset of 0.
-    const bool detached = napi_util__::is_detached_array_buffer(env->context(), buffer_val);
-    uint32_t len = 0;
-    uint32_t offset = 0;
-    if (!detached)
-    {
-      JSValue len_val = JS_GetPropertyStr(env->context(), view, "byteLength");
-      JSValue offset_val = JS_GetPropertyStr(env->context(), view, "byteOffset");
-      if (JS_IsException(len_val) || JS_IsException(offset_val))
-      {
-        JS_FreeValue(env->context(), len_val);
-        JS_FreeValue(env->context(), offset_val);
-        JS_FreeValue(env->context(), buffer_val);
-        return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
-      }
-      JS_ToUint32(env->context(), &len, len_val);
-      JS_ToUint32(env->context(), &offset, offset_val);
-      JS_FreeValue(env->context(), len_val);
-      JS_FreeValue(env->context(), offset_val);
-    }
-
+    // Its own layout, never what its properties say. As in Node, a DataView
+    // over a detached buffer, or out of bounds of a shrunk resizable one, has
+    // no bytes.
+    napi_view_layout__ layout;
+    if (!env->view_layout(view, &layout))
+      return napi_quickjs_set_last_error(env, napi_generic_failure, "Failed to get DataView info");
+    JSValue buffer_val = layout.buffer;
     if (byte_length != nullptr)
-      *byte_length = len;
+      *byte_length = layout.byte_length;
     if (byte_offset != nullptr)
-      *byte_offset = offset;
-    if (data != nullptr && detached)
-    {
-      *data = nullptr;
-    }
-    else if (data != nullptr)
-    {
-      size_t ab_len = 0;
-      uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, buffer_val);
-      if (ab_data == nullptr && ab_len == 0 && JS_HasException(env->context()))
-      {
-        JS_FreeValue(env->context(), buffer_val);
-        return napi_util__::return_pending_if_caught(env, "Failed to get DataView ArrayBuffer");
-      }
-      *data = ab_data + offset;
-    }
+      *byte_offset = layout.byte_offset;
+    if (data != nullptr)
+      *data = layout.data;
     if (arraybuffer != nullptr)
     {
       *arraybuffer = env->wrap_value_in_current_scope(buffer_val, true);
