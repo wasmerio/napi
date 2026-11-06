@@ -139,6 +139,11 @@ inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
 }
 
+void ClearLastException(napi_env env);
+
+// The env's cleanup hooks, at its release: most recent first, in rounds as
+// Node's CleanupQueue::Drain runs them, so a hook added meanwhile runs in the
+// next round.
 void RunEnvCleanupHooks(napi_env env) {
   if (!CheckEnv(env)) return;
 
@@ -177,11 +182,14 @@ void RunEnvCleanupHooks(napi_env env) {
 
       {
         // Each hook runs in the env's realm, and a scope it leaves open
-        // closes when it returns.
+        // closes when it returns. Nothing can catch what it throws: as Node's
+        // CallIntoModule does once JS can no longer run, it is dropped.
         v8::HandleScope handle_scope(env->isolate);
         v8::Context::Scope context_scope(env->main_context());
         napi_realm_frame_scope__ realm_frame(env, nullptr);
+        v8::TryCatch try_catch(env->isolate);
         snapshot.hook(snapshot.arg);
+        ClearLastException(env);
       }
 
       it = find_hook(env->env_cleanup_hooks, snapshot);
@@ -741,7 +749,15 @@ void napi_env__::CallFinalizer(node_api_basic_finalize cb, void* data, void* hin
   v8::HandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(main_context());
   napi_realm_frame_scope__ realm_frame(this, nullptr);
+  if (!releasing) {
+    cb(this, data, hint);
+    return;
+  }
+  // At the release nothing can catch what the finalizer throws: as Node's
+  // CallIntoModule does once JS can no longer run, it is dropped.
+  v8::TryCatch try_catch(isolate);
   cb(this, data, hint);
+  ClearLastException(this);
 }
 
 void napi_env__::InvokeFinalizerFromGC(napi_ref_tracker__* finalizer) {
@@ -862,25 +878,31 @@ napi_env__::~napi_env__() {
   // Every scope closes. Cleanup hooks and finalizers each run in the env's
   // realm, and a scope one leaves open closes when it returns.
   PopRealmFrames(0);
-  RunEnvCleanupHooks(this);
-  napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
-  napi_ref_tracker__::FinalizeAll(&reflist);
-  pending_finalizers.clear();
-  pending_buffer_finalizers.clear();
-  finalization_scheduled = false;
-  FinalizeExternalBackingStoreHints(this);
-  napi_v8_finalize_buffer_records(this);
-  // External buffers the finalizers above made are finalized too, then the
-  // instance data, then what its finalizer made, so no hint is left pointing
-  // at the env. Instance data a finalizer sets is finalized in turn, as Node
-  // finalizes refs made while it finalizes.
+  // The release contract (unofficial_napi_release_env): the cleanup hooks
+  // run, then the finalizers of the values still pending (references with a
+  // finalizer most recent first, as Node's FinalizeAll, then external
+  // buffers), until neither is left; then the instance data's finalizer; and
+  // all of it again for what that finalizer leaves pending, until nothing is,
+  // so no hint is left pointing at the env. The callback is cleared before it
+  // runs, so instance data is finalized once.
   for (;;) {
-    FinalizeExternalBackingStoreHints(this);
+    do {
+      RunEnvCleanupHooks(this);
+      napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
+      pending_finalizers.clear();
+      pending_buffer_finalizers.clear();
+      FinalizeExternalBackingStoreHints(this);
+    } while (!env_cleanup_hooks.empty() || !napi_ref_tracker__::IsEmpty(&finalizing_reflist));
     if (instance_data_finalize_cb == nullptr) break;
     napi_finalize finalize_cb = instance_data_finalize_cb;
     instance_data_finalize_cb = nullptr;
     CallFinalizer(finalize_cb, instance_data, instance_data_finalize_hint);
   }
+  finalization_scheduled = false;
+  // Plain references keep their values until every finalizer has run, as in
+  // Node, whose FinalizeAll(&reflist) comes after the finalizers.
+  napi_v8_finalize_buffer_records(this);
+  napi_ref_tracker__::FinalizeAll(&reflist);
   // Backstop: nothing above should leave a scope open, and a context still
   // entered here would abort V8 at the embedder's next Context::Exit.
   PopRealmFrames(0);
