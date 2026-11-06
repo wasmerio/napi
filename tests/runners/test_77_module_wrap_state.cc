@@ -534,3 +534,34 @@ TEST_F(Test77ModuleWrapState, SetExportOfABindingThatDoesNotExistThrows) {
   EXPECT_EQ(ValueText(s.env, value), "set");
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
+
+// The namespace of a module that is not instantiated is refused with
+// ERR_MODULE_NOT_INSTANTIATED on both engines, as the V8 provider already
+// did (V8's GetModuleNamespace takes an instantiated module only). QuickJS
+// built the namespace over bindings that do not exist yet and crashed.
+TEST_F(Test77ModuleWrapState, NamespaceOfAModuleNotInstantiatedIsRefused) {
+  EnvScope s(runtime_.get());
+  for (bool synthetic : {false, true}) {
+    SCOPED_TRACE(synthetic ? "synthetic" : "source text");
+    unofficial_napi_module module =
+        synthetic ? CreateSyntheticModule(s.env, "(function() {})")
+                  : CreateSourceTextModule(s.env, "export const value = 1;");
+    ASSERT_NE(module, nullptr);
+    for (bool linked : {false, true}) {
+      SCOPED_TRACE(linked ? "linked" : "not linked");
+      if (linked) {
+        ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
+      }
+      napi_value ns = nullptr;
+      EXPECT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &ns),
+                napi_pending_exception);
+      EXPECT_EQ(TakePendingCodeAndMessage(s.env),
+                "ERR_MODULE_NOT_INSTANTIATED: Module is not instantiated");
+    }
+    ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+    napi_value ns = nullptr;
+    EXPECT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &ns), napi_ok);
+    EXPECT_NE(ns, nullptr);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+}

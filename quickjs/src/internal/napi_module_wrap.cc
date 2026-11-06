@@ -786,6 +786,10 @@ napi_status napi_module_wrap__::get_namespace(unofficial_napi_module module,
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  // Instantiating the module makes the bindings its namespace reads; building
+  // it before that crashed. Refused as on V8.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED)
+    return throw_error("ERR_MODULE_NOT_INSTANTIATED", "Module is not instantiated");
   JSValue ns = JS_GetModuleNamespace(ctx_, entry->module);
   if (JS_IsException(ns))
     return return_pending_exception("Failed to get module namespace");
