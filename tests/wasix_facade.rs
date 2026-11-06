@@ -922,7 +922,7 @@ const NO_NAPI_CONTEXT_GUEST: &str = r#"(module
         i64.const 0x123456789abcdef local.set $kept
         i32.const 1 global.set $phase
         i32.const 65 call $mark
-        i64.load (i32.const 8) call $switch i32.const 0 call $check
+        i32.const 8 i64.load call $switch i32.const 0 call $check
         global.get $phase i32.const 2 call $check
         local.get $kept i64.const 0x123456789abcdef i64.ne
         if i32.const 91 call $exit end
@@ -934,7 +934,7 @@ const NO_NAPI_CONTEXT_GUEST: &str = r#"(module
         global.get $phase i32.const 1 call $check
         i32.const 2 global.set $phase
         i32.const 66 call $mark
-        i64.load (i32.const 0) call $switch i32.const 0 call $check
+        i32.const 0 i64.load call $switch i32.const 0 call $check
         i32.const 93 call $exit)
     (func (export "_start")
         i32.const 114 call $mark
@@ -943,14 +943,14 @@ const NO_NAPI_CONTEXT_GUEST: &str = r#"(module
         i32.const 8 i32.const 2 call $create i32.const 0 call $check
         i32.const 16 i32.const 3 call $create i32.const 28 call $check
         i32.const 131068 i32.const 1 call $create i32.const 78 call $check
-        i64.load (i32.const 0) call $switch i32.const 0 call $check
+        i32.const 0 i64.load call $switch i32.const 0 call $check
         global.get $phase i32.const 3 call $check
         i32.const 82 call $mark
-        i64.load (i32.const 8) call $destroy i32.const 0 call $check
-        i64.load (i32.const 8) call $destroy i32.const 0 call $check
-        i64.load (i32.const 8) call $switch i32.const 28 call $check
+        i32.const 8 i64.load call $destroy i32.const 0 call $check
+        i32.const 8 i64.load call $destroy i32.const 0 call $check
+        i32.const 8 i64.load call $switch i32.const 28 call $check
         i64.const 0 call $destroy i32.const 28 call $check
-        i64.load (i32.const 0) call $destroy i32.const 0 call $check
+        i32.const 0 i64.load call $destroy i32.const 0 call $check
         i32.const 0 call $exit))"#;
 
 const NAPI_CONTEXT_GUEST: &str = r#"(module
@@ -1014,7 +1014,7 @@ const NAPI_CONTEXT_GUEST: &str = r#"(module
         i32.const 2048 call $eval
         call $collect
         i32.const 1 global.set $phase
-        i64.load (i32.const 104) call $switch call $check
+        i32.const 104 i64.load call $switch call $check
         global.get $phase i32.const 2 i32.ne
         if i32.const 92 call $exit end
         local.get $kept i64.const 0x123456789abcdef i64.ne
@@ -1032,7 +1032,7 @@ const NAPI_CONTEXT_GUEST: &str = r#"(module
         i32.const 66 call $mark
         i32.const 2048 call $eval
         call $collect
-        i64.load (i32.const 96) call $switch call $check
+        i32.const 96 i64.load call $switch call $check
         i32.const 96 call $exit)
     (func (export "_start")
         __MAIN_INIT__
@@ -1040,19 +1040,19 @@ const NAPI_CONTEXT_GUEST: &str = r#"(module
         i64.const 0 call $switch call $check
         i32.const 96 i32.const 1 call $create call $check
         i32.const 104 i32.const 2 call $create call $check
-        i64.load (i32.const 96) call $switch call $check
+        i32.const 96 i64.load call $switch call $check
         global.get $phase i32.const 3 i32.ne
         if i32.const 97 call $exit end
         i32.const 77 call $mark
         i32.const 2304 call $eval
         call $collect
-        i64.load (i32.const 104) call $destroy call $check
-        i64.load (i32.const 104) call $destroy call $check
-        i64.load (i32.const 104) call $switch i32.const 28 i32.ne
+        i32.const 104 i64.load call $destroy call $check
+        i32.const 104 i64.load call $destroy call $check
+        i32.const 104 i64.load call $switch i32.const 28 i32.ne
         if i32.const 98 call $exit end
         i64.const 0 call $destroy i32.const 28 i32.ne
         if i32.const 99 call $exit end
-        i64.load (i32.const 96) call $destroy call $check
+        i32.const 96 i64.load call $destroy call $check
         i32.const 0 call $exit))"#;
 
 #[derive(Default)]
