@@ -1,5 +1,6 @@
 #include "edge_v8_platform.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
@@ -589,13 +590,122 @@ std::unique_ptr<v8::ScopedBlockingCall> EdgeV8Platform::CreateBlockingScope(
   return fallback_ != nullptr ? fallback_->CreateBlockingScope(blocking_type) : nullptr;
 }
 
+namespace {
+
+// A job that nobody waits for gets every worker but one. libplatform runs
+// worker tasks first come, first served, and a job's workers keep running
+// while it has work, never yielding to tasks posted after them. A concurrent
+// marker or sweeper holding every worker would hold back the worker tasks
+// posted after it, such as an optimizing compile or the deletion of a
+// finished one. A compile job's JSHeapBroker keeps every native context's
+// Array and Object prototypes alive until the job is deleted, so a collection
+// that marks its roots meanwhile keeps native contexts that are no longer used.
+//
+// Work someone waits for keeps the whole pool: the limit is lifted while the
+// job's priority is kUserBlocking (V8 raises concurrent marking to it for the
+// mark-compact pause) and once a thread joins the job. The limit is per job,
+// so two background jobs running at once can still take every worker.
+class JobWorkerLimit {
+ public:
+  JobWorkerLimit(size_t background_limit, v8::TaskPriority priority)
+      : background_limit_(background_limit), limit_(LimitFor(priority)) {}
+
+  size_t Get() const { return limit_.load(std::memory_order_relaxed); }
+
+  // Returns true when the limit went up.
+  bool FollowPriority(v8::TaskPriority priority) {
+    const size_t limit = LimitFor(priority);
+    return limit_.exchange(limit, std::memory_order_relaxed) < limit;
+  }
+
+  void Lift() { limit_.store(kNoLimit, std::memory_order_relaxed); }
+
+ private:
+  static constexpr size_t kNoLimit = SIZE_MAX;
+
+  size_t LimitFor(v8::TaskPriority priority) const {
+    return priority == v8::TaskPriority::kUserBlocking ? kNoLimit : background_limit_;
+  }
+
+  const size_t background_limit_;
+  std::atomic<size_t> limit_;
+};
+
+class LimitedJobTask final : public v8::JobTask {
+ public:
+  LimitedJobTask(std::unique_ptr<v8::JobTask> task, std::shared_ptr<JobWorkerLimit> limit)
+      : task_(std::move(task)), limit_(std::move(limit)) {}
+
+  void Run(v8::JobDelegate* delegate) override { task_->Run(delegate); }
+
+  // libplatform also caps this at the pool size (plus one for a joining thread).
+  size_t GetMaxConcurrency(size_t worker_count) const override {
+    return std::min(task_->GetMaxConcurrency(worker_count), limit_->Get());
+  }
+
+ private:
+  std::unique_ptr<v8::JobTask> task_;
+  std::shared_ptr<JobWorkerLimit> limit_;
+};
+
+class LimitedJobHandle final : public v8::JobHandle {
+ public:
+  LimitedJobHandle(std::unique_ptr<v8::JobHandle> handle, std::shared_ptr<JobWorkerLimit> limit)
+      : handle_(std::move(handle)), limit_(std::move(limit)) {}
+
+  void NotifyConcurrencyIncrease() override {
+    started_.store(true, std::memory_order_relaxed);
+    handle_->NotifyConcurrencyIncrease();
+  }
+
+  void Join() override {
+    // Before joining: Join() sizes the job from GetMaxConcurrency().
+    limit_->Lift();
+    handle_->Join();
+  }
+
+  void Cancel() override { handle_->Cancel(); }
+  void CancelAndDetach() override { handle_->CancelAndDetach(); }
+  bool IsActive() override { return handle_->IsActive(); }
+  bool IsValid() override { return handle_->IsValid(); }
+  bool UpdatePriorityEnabled() const override { return handle_->UpdatePriorityEnabled(); }
+
+  // A lower limit takes effect as workers return from Run(), as with any drop
+  // in GetMaxConcurrency().
+  void UpdatePriority(v8::TaskPriority priority) override {
+    handle_->UpdatePriority(priority);
+    // The caller can't know the limit went up, so post the workers it now
+    // allows. A job from CreateJob() that hasn't been started stays unstarted.
+    if (limit_->FollowPriority(priority) && started_.load(std::memory_order_relaxed)) {
+      handle_->NotifyConcurrencyIncrease();
+    }
+  }
+
+ private:
+  std::unique_ptr<v8::JobHandle> handle_;
+  std::shared_ptr<JobWorkerLimit> limit_;
+  std::atomic<bool> started_{false};
+};
+
+}  // namespace
+
 std::unique_ptr<v8::JobHandle> EdgeV8Platform::CreateJobImpl(
     v8::TaskPriority priority,
     std::unique_ptr<v8::JobTask> job_task,
     const v8::SourceLocation& location) {
   (void)location;
-  return v8::platform::NewDefaultJobHandle(this, priority, std::move(job_task),
-                                           static_cast<size_t>(std::max(1, NumberOfWorkerThreads())));
+  const int workers = std::max(1, NumberOfWorkerThreads());
+  // With one worker, every job keeps it. Limited to zero workers, a job would
+  // only run once a thread joins it, and V8 joins some jobs, such as Maglev's
+  // compile job, only when it flushes them.
+  if (workers == 1) {
+    return v8::platform::NewDefaultJobHandle(this, priority, std::move(job_task), 1);
+  }
+  auto limit = std::make_shared<JobWorkerLimit>(static_cast<size_t>(workers - 1), priority);
+  std::unique_ptr<v8::JobHandle> handle = v8::platform::NewDefaultJobHandle(
+      this, priority, std::make_unique<LimitedJobTask>(std::move(job_task), limit),
+      static_cast<size_t>(workers));
+  return std::make_unique<LimitedJobHandle>(std::move(handle), std::move(limit));
 }
 
 void EdgeV8Platform::PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,

@@ -69,6 +69,12 @@ pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
 /// parallel jobs are cooperative and the posting thread participates, so the
 /// work migrates onto whichever thread asked for it.
 ///
+/// A V8 job that nobody waits for, such as concurrent marking or sweeping or
+/// an optimizing compile, uses at most `count - 1` of these threads, leaving
+/// one for other background work. A job that V8 waits for (priority
+/// `kUserBlocking`, or joined) uses all of them. With a count of 1, every job
+/// gets the one thread.
+///
 /// The pool is built with the process-wide platform, when the first V8 isolate
 /// is created, so this must be called before then. Afterwards, asking for the
 /// size already in place still succeeds — several components may configure the
