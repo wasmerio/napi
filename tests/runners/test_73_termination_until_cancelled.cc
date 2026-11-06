@@ -802,3 +802,39 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
   napi_delete_reference(s.env, g_token_fn);
 }
 #endif
+
+// An interrupt callback whose JS is terminated, while a run loops: the
+// interrupted JS stops. V8 runs the callback at a stack check (the first
+// tick()'s entry) and acts on the termination at the next one, so the loop
+// body may run once; QuickJS runs the callback inside requestInterrupt().
+namespace {
+napi_ref g_interrupt_fn = nullptr;
+void InterruptCallback(napi_env env, void* /*data*/) {
+  napi_value fn = nullptr;
+  napi_get_reference_value(env, g_interrupt_fn, &fn);
+  napi_value ignored = nullptr;
+  napi_call_function(env, Global(env), fn, 0, nullptr, &ignored);
+}
+napi_value RequestInterrupt(napi_env env, napi_callback_info /*info*/) {
+  EXPECT_EQ(unofficial_napi_request_interrupt(env, InterruptCallback, nullptr), napi_ok);
+  return nullptr;
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, InterruptCallbackTerminated) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ASSERT_EQ(napi_create_reference(s.env, Eval(s.env, "(() => { terminate(); tick(); })"), 1,
+                                  &g_interrupt_fn),
+            napi_ok);
+  DefineGlobalFunction(s.env, "requestInterrupt", RequestInterrupt);
+  ASSERT_EQ(RunScript(s.env, "globalThis.calls = 0;"), napi_ok);
+  ExpectRunTerminated(
+      s.env,
+      "try { requestInterrupt(); for (let i = 0; i < 100000; i++) { tick(); calls++; } }\n"
+      "catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
+  const std::string calls = GlobalText(s.env, "calls");
+  EXPECT_TRUE(calls == "0" || calls == "1") << "calls " << calls;
+  napi_delete_reference(s.env, g_interrupt_fn);
+}

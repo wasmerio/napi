@@ -2203,6 +2203,7 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         v8::Context::Scope context_scope(context);
         napi_realm_frame_scope__ realm_frame(request->env, nullptr);
         request->callback(request->env, request->data);
+        napi_v8_keep_terminating_after_interrupt(request->env);
       },
       request);
   return napi_ok;

@@ -914,6 +914,16 @@ bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value>
 
 bool napi_v8_terminating(napi_env env) { return TerminatedOrTerminating(env); }
 
+void napi_v8_keep_terminating_after_interrupt(napi_env env) {
+  if (!TerminatedOrTerminating(env)) return;
+  ClearLastException(env);
+  v8::Isolate* isolate = env->isolate;
+  // A termination the callback's JS ran into is V8's current exception, which
+  // it ignores there and drops later.
+  if (isolate->IsExecutionTerminating()) isolate->CancelTerminateExecution();
+  isolate->TerminateExecution();
+}
+
 napi_status napi_v8_fail_terminating(napi_env env) {
   if (env->last_exception.IsEmpty()) {
     env->last_exception.Reset(env->isolate, v8::Null(env->isolate));

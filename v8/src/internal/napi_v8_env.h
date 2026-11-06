@@ -274,6 +274,15 @@ bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value>
 // unwinding with a termination. Calls into JS fail meanwhile.
 bool napi_v8_terminating(napi_env env);
 
+// For an interrupt callback (unofficial_napi_request_interrupt) that returns
+// while the env terminates. V8 runs it at a stack check and then goes on with
+// the interrupted JS whatever it left: StackGuard::HandleInterrupts ignores
+// an exception there, a termination too, so the JS would run on with nothing
+// to stop it. This asks V8 for the termination again, so it acts on it at
+// its next stack check, and drops what the callback left pending, as after a
+// native callback.
+void napi_v8_keep_terminating_after_interrupt(napi_env env);
+
 // What a call refused while the env terminates returns:
 // napi_pending_exception, with the null a TryCatch records for a termination
 // pending unless something else is, as QuickJS leaves its uncatchable error
