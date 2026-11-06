@@ -466,6 +466,38 @@ TEST_F(Test73TerminationUntilCancelled, CancelledInsideANativeFunction) {
   EXPECT_FALSE(pending);
 }
 
+// Native code that left an exception pending, then terminates, makes a call
+// the termination refuses, and cancels: the exception it left stays, and is
+// thrown into the JS that called it, as if no termination had happened.
+namespace {
+napi_value ThrowTerminateCancel(napi_env env, napi_callback_info /*info*/) {
+  napi_throw_error(env, nullptr, "kept");
+  bool pending = false;
+  EXPECT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  EXPECT_TRUE(pending);
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  napi_value out = nullptr;
+  void* data = nullptr;
+  EXPECT_EQ(napi_create_buffer(env, 4, &data, &out), napi_pending_exception);
+  EXPECT_EQ(napi_get_named_property(env, Global(env), "tick", &out), napi_pending_exception);
+  EXPECT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
+  return nullptr;
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, CancelKeepsAnExceptionThrownBefore) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  DefineGlobalFunction(s.env, "throwTerminateCancel", ThrowTerminateCancel);
+  EXPECT_EQ(RunScript(s.env,
+                      "try { throwTerminateCancel(); afterCall = 'yes'; }\n"
+                      "catch (e) { caught = 'yes'; caughtError = e.message; }\n"
+                      "after = 'yes';\n"),
+            napi_ok);
+  EXPECT_EQ(Flags(s.env),
+            "caught=yes after=yes innerCaught=no innerAfter=no error=kept afterCall=no");
+}
+
 // The same inside the import.meta hook, which throws what its callback left
 // pending from the import.meta expression.
 TEST_F(Test73TerminationUntilCancelled, CancelledInsideAModuleHook) {

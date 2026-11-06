@@ -177,6 +177,16 @@ napi_status napi_util__::fail_if_terminating(napi_env env, JSContext *ctx)
 {
   if (!env->termination_requested())
     return napi_ok;
+  // An exception native code left pending stays pending, as on V8: a cancel
+  // drops only the termination's, and the native function's caller then gets
+  // that exception. A termination error the runtime holds goes.
+  if (env->has_last_exception() && !env->last_exception_is_uncatchable())
+  {
+    if (JS_HasException(ctx))
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    return napi_quickjs_set_last_error(env, napi_pending_exception,
+                                       "JavaScript execution is terminating");
+  }
   throw_termination(ctx);
   return return_pending_if_caught(env, ctx, "JavaScript execution is terminating");
 }
