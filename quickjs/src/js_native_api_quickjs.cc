@@ -3126,7 +3126,13 @@ extern "C"
 
     // Take ownership of the exception before clearing
     JSValue ex = env->take_last_exception();
-
+    // The engine's uncatchable marker is internal control flow. Exposing it
+    // would let a later ordinary throw restart termination after a cancel.
+    if (JS_IsUncatchableError(ex))
+    {
+      JS_FreeValue(env->context(), ex);
+      ex = JS_NULL;
+    }
     *result = env->wrap_value_in_current_scope(ex, true);
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }

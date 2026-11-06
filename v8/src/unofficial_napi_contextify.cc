@@ -81,6 +81,7 @@ struct ModuleWrapBindingState {
   napi_ref import_module_dynamically_ref = nullptr;
   napi_ref initialize_import_meta_ref = nullptr;
   std::vector<ModuleWrapRecord*> modules;
+  v8::Global<v8::Private> dependency_key;
   std::vector<PendingProviderPromise> pending_dynamic_imports;
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
   // Instantiations running (see InstantiationScope).
@@ -624,12 +625,27 @@ void RemoveModuleRecord(napi_env env, ModuleWrapRecord* record) {
   if (state == nullptr) return;
   auto& modules = state->modules;
   modules.erase(std::remove(modules.begin(), modules.end(), record), modules.end());
+  for (ModuleWrapRecord* dependent : modules)
+    for (ModuleWrapRecord*& linked : dependent->linked_requests)
+      if (linked == record) linked = nullptr;
 }
 
 void DestroyModuleRecord(ModuleWrapRecord* record) {
   if (record == nullptr || record->env == nullptr) return;
   napi_env env = record->env;
   RemoveModuleRecord(env, record);
+  auto* state = GetModuleWrapState(env);
+  if (state != nullptr && !state->dependency_key.IsEmpty()) {
+    v8::HandleScope scope(env->isolate);
+    napi_value wrapper = nullptr;
+    if (napi_get_reference_value(env, record->wrapper_ref, &wrapper) == napi_ok && wrapper != nullptr) {
+      v8::Local<v8::Value> raw = napi_v8_unwrap_value(wrapper);
+      if (raw->IsObject()) {
+        (void)raw.As<v8::Object>()->DeletePrivate(record->context.Get(env->isolate),
+                                               state->dependency_key.Get(env->isolate));
+      }
+    }
+  }
   ResetRef(env, &record->wrapper_ref);
   ResetRef(env, &record->synthetic_eval_steps_ref);
   ResetRef(env, &record->source_object_ref);
@@ -709,11 +725,17 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
 bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, napi_value* out) {
   if (out == nullptr) return false;
   *out = nullptr;
+  if (napi_v8_terminating(env)) {
+    napi_v8_fail_terminating(env);
+    return false;
+  }
 
   v8::Isolate* isolate = env->isolate;
   // Buffer is the env's: read and call it in the env's realm, never in the
   // current one, whose global its scripts control.
   v8::Local<v8::Context> context = env->main_context();
+  v8::Context::Scope context_scope(context);
+  v8::TryCatch caught(isolate);
 
   std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(isolate, size);
   if (!store) return false;
@@ -735,12 +757,21 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
       v8::Local<v8::Value> argv[1] = {view};
       v8::Local<v8::Value> buffer_out;
       if (from_value.As<v8::Function>()->Call(context, buffer_ctor_value, 1, argv).ToLocal(&buffer_out)) {
+        if (napi_v8_terminating(env)) {
+          napi_v8_fail_terminating(env);
+          return false;
+        }
         *out = napi_v8_wrap_value(env, buffer_out);
         return *out != nullptr;
       }
     }
   }
 
+  if (caught.HasCaught() || napi_v8_terminating(env)) {
+    if (napi_v8_terminating(env)) napi_v8_fail_terminating(env);
+    else ThrowTryCatchException(env, caught);
+    return false;
+  }
   *out = napi_v8_wrap_value(env, view);
   return *out != nullptr;
 }
@@ -817,6 +848,7 @@ void CleanupModuleWrapState(void* arg) {
 
   ResetRef(env, &it->second.import_module_dynamically_ref);
   ResetRef(env, &it->second.initialize_import_meta_ref);
+  it->second.dependency_key.Reset();
   for (auto& promise : it->second.pending_dynamic_imports) promise.value.Reset();
   it->second.pending_dynamic_imports.clear();
   g_module_wrap_states.erase(it);
@@ -2134,7 +2166,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
   napi_value buffer = nullptr;
   if (!CreateNodeBufferFromBytes(env, record->bytes.data(), record->bytes.size(), &buffer) ||
       buffer == nullptr) {
-    return napi_generic_failure;
+    return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   }
   v8::Local<v8::Value> buffer_value = napi_v8_unwrap_value(buffer);
   if (buffer_value.IsEmpty()) return napi_generic_failure;
@@ -2635,7 +2667,7 @@ static napi_status CreateSourceTextModule(
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);
-  napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
+  napi_create_reference(env, wrapper, 0, &record->wrapper_ref);
 
   napi_value host_id_value = napi_v8_wrap_value(env, host_id_symbol);
   if (host_id_value != nullptr) {
@@ -2715,7 +2747,7 @@ static napi_status CreateSyntheticModule(
   record->env = env;
   record->context.Reset(isolate, context);
   record->module.Reset(isolate, module);
-  napi_create_reference(env, wrapper, 1, &record->wrapper_ref);
+  napi_create_reference(env, wrapper, 0, &record->wrapper_ref);
   napi_create_reference(env, synthetic_eval_steps, 1, &record->synthetic_eval_steps_ref);
 
   {
@@ -2850,6 +2882,22 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     return napi_pending_exception;
   }
 
+  if (record->module.Get(env->isolate)->GetStatus() != v8::Module::kUninstantiated) {
+    ThrowCodeError(env, "ERR_VM_MODULE_ALREADY_LINKED", "Module is already linked");
+    return napi_pending_exception;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    ModuleWrapRecord* linked = linked_modules != nullptr
+        ? FindModuleRecordForHandle(env, linked_modules[i]) : nullptr;
+    if (linked == nullptr) {
+      ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked module missing");
+      return napi_pending_exception;
+    }
+    if (linked->context.Get(env->isolate) != record->context.Get(env->isolate)) {
+      ThrowCodeError(env, "ERR_VM_MODULE_DIFFERENT_CONTEXT", "Linked modules must use the same realm");
+      return napi_pending_exception;
+    }
+  }
   record->linked_requests.assign(count, nullptr);
   for (size_t i = 0; i < count; ++i) {
     ModuleWrapRecord* linked =
@@ -2869,6 +2917,24 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
       return napi_pending_exception;
     }
   }
+  auto* state = GetModuleWrapState(env);
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = record->context.Get(isolate);
+  v8::Local<v8::Array> dependencies = v8::Array::New(isolate, static_cast<int>(count));
+  for (size_t i = 0; i < count; ++i) {
+    napi_value wrapper = GetRefValue(env, record->linked_requests[i]->wrapper_ref);
+    if (wrapper == nullptr || !dependencies->CreateDataProperty(context, static_cast<uint32_t>(i),
+                                  napi_v8_unwrap_value(wrapper)).FromMaybe(false))
+      return napi_invalid_arg;
+  }
+  napi_value wrapper = GetRefValue(env, record->wrapper_ref);
+  if (wrapper == nullptr) return napi_invalid_arg;
+  if (state->dependency_key.IsEmpty())
+    state->dependency_key.Reset(isolate, v8::Private::New(isolate));
+  if (!napi_v8_unwrap_value(wrapper).As<v8::Object>()->SetPrivate(
+          context, state->dependency_key.Get(isolate), dependencies).FromMaybe(false))
+    return napi_generic_failure;
   return napi_ok;
 }
 
@@ -3234,19 +3300,20 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
     unofficial_napi_module module_handle,
     napi_value* result_out) {
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Module> module = record->module.Get(isolate);
   napi_value out = nullptr;
   if (!module->IsSourceTextModule()) {
-    if (!CreateNodeBufferFromBytes(env, nullptr, 0, &out) || out == nullptr) return napi_generic_failure;
+    if (!CreateNodeBufferFromBytes(env, nullptr, 0, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   } else {
     std::unique_ptr<v8::ScriptCompiler::CachedData> cached_data(
         v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
     const uint8_t* bytes = cached_data ? cached_data->data : nullptr;
     const size_t size = cached_data ? static_cast<size_t>(cached_data->length) : 0;
-    if (!CreateNodeBufferFromBytes(env, bytes, size, &out) || out == nullptr) return napi_generic_failure;
+    if (!CreateNodeBufferFromBytes(env, bytes, size, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   }
   v8::Local<v8::Value> out_value = napi_v8_unwrap_value(out);
   if (out_value.IsEmpty()) return napi_generic_failure;
@@ -3304,7 +3371,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   if (InstantiationScope::ThrowIfRunning(env)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
 
   const char* kFacadeUrl = "node:internal/require_module_default_facade";

@@ -207,6 +207,7 @@ constexpr const char* kJsCalls[] = {
     "unofficial_napi_compile_function (getter in the extensions)",
     "napi_create_buffer (Buffer getter)",
     "napi_create_error (code setter)",
+    "unofficial_napi_module_wrap_create_required_module_facade",
     "unofficial_napi_mark_promise_as_handled (reject callback)",
 };
 constexpr int kJsCallCount = sizeof(kJsCalls) / sizeof(kJsCalls[0]);
@@ -222,6 +223,7 @@ constexpr const char* kJsCallPayloads[] = {
     "(() => { const a = [{}]; Object.defineProperty(a, 0, { get() { afterCall = 'yes'; return {}; } }); return a; })()",
     "(Object.defineProperty(globalThis, 'Buffer', { get() { afterCall = 'yes'; return undefined; }, configurable: true }), undefined)",
     "(Object.defineProperty(Error.prototype, 'code', { set(v) { afterCall = 'yes'; }, configurable: true }), undefined)",
+    "undefined",
     "(() => { const p = Promise.reject(1); return p; })()",
 };
 
@@ -273,6 +275,8 @@ napi_status CallRunningJs(napi_env env, int kind, napi_value payload) {
     }
     case 9:
       return napi_create_error(env, Str(env, "E_CODE"), Str(env, "message"), &out);
+    case 10:
+      return unofficial_napi_module_wrap_create_required_module_facade(env, g_module, &out);
     default:
       return unofficial_napi_mark_promise_as_handled(env, payload);
   }
@@ -590,7 +594,7 @@ TEST_F(Test78TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
     SCOPED_TRACE(kJsCalls[kind]);
     EnvScope s(runtime_.get());
     InstallHelpers(s.env);
-    g_module = MakeModule(s.env, "globalThis.afterCall = 'yes';", nullptr);
+    g_module = MakeModule(s.env, "globalThis.afterCall = 'yes'; export default 1;", nullptr);
     ASSERT_NE(g_module, nullptr);
     // Called again, for a rejected promise a handler is added to.
     ASSERT_EQ(unofficial_napi_set_promise_reject_callback(
@@ -625,6 +629,7 @@ constexpr const char* kStoppedCalls[] = {
     "unofficial_napi_module_wrap_evaluate",
     "unofficial_napi_module_wrap_evaluate_sync",
     "unofficial_napi_get_own_non_index_properties (proxy)",
+    "unofficial_napi_module_wrap_create_required_module_facade",
 #if defined(NAPI_TEST_ENGINE_V8)
     "unofficial_napi_create_realm (proxy sandbox)",
 #endif
@@ -636,7 +641,7 @@ TEST_F(Test78TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) 
     SCOPED_TRACE(kStoppedCalls[kind]);
     EnvScope s(runtime_.get());
     InstallHelpers(s.env);
-    unofficial_napi_module module = MakeModule(s.env, "terminateJs();", nullptr);
+    unofficial_napi_module module = MakeModule(s.env, "terminateJs(); export default 1;", nullptr);
     ASSERT_NE(module, nullptr);
     napi_value proxy =
         Eval(s.env, "new Proxy({}, { ownKeys() { terminateJs(); afterCall = 'yes'; return []; } })");
@@ -659,6 +664,9 @@ TEST_F(Test78TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) 
         break;
       case 3:
         status = unofficial_napi_get_own_non_index_properties(s.env, proxy, 0, &out);
+        break;
+      case 4:
+        status = unofficial_napi_module_wrap_create_required_module_facade(s.env, module, &out);
         break;
       default: {
         unofficial_napi_realm_options options;
@@ -1246,3 +1254,18 @@ TEST_F(Test78TerminationUntilCancelled, CancelWakesTheHostForTheTasksLeftQueued)
   EXPECT_EQ(GlobalText(s.env, "resolved"), "yes");
 }
 #endif
+
+TEST_F(Test78TerminationUntilCancelled, ErrorCreationWithoutCodeUsesProviderTerminationPolicy) {
+  EnvScope s(runtime_.get());
+  napi_value message = Str(s.env, "reason"), error = nullptr;
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(napi_create_error(s.env, nullptr, message, &error), napi_ok);
+  bool is_error = false;
+  EXPECT_EQ(napi_is_error(s.env, error, &is_error), napi_ok);
+  EXPECT_TRUE(is_error);
+#else
+  EXPECT_EQ(napi_create_error(s.env, nullptr, message, &error), napi_pending_exception);
+#endif
+  EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+}

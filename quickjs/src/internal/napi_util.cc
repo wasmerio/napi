@@ -452,7 +452,8 @@ napi_status napi_util__::run_pending_jobs(napi_env env)
       // so the embedder can take it with napi_get_and_clear_last_exception.
       if (env->termination_requested())
         return fail_if_terminating(env, job_ctx != nullptr ? job_ctx : context(env));
-      return napi_pending_exception;
+      return return_pending_if_caught(env, job_ctx != nullptr ? job_ctx : context(env),
+                                      "Pending job failed");
     }
   }
 }

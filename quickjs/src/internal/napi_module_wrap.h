@@ -20,6 +20,7 @@ public:
   ~napi_module_wrap__();
 
   void teardown();
+  void cancel_termination();
 
   // A module lives in the realm whose context `ctx` is.
   napi_status create_source_text(JSContext *ctx,
@@ -98,8 +99,10 @@ private:
 
   struct request_record;
   struct record;
+  class record_scope;
   struct script_referrer;
 
+  JSValue get_wrapper(record *entry) const;
   record *find(unofficial_napi_module module) const;
   record *find_by_module(JSModuleDef *module) const;
   record *find_by_wrapper(JSValueConst wrapper) const;
@@ -142,6 +145,7 @@ private:
   std::vector<script_referrer> script_referrers_;
   std::vector<pending_provider_promise> pending_dynamic_imports_;
   uint64_t facade_counter_ = 0;
+  JSAtom dependency_key_ = JS_ATOM_NULL;
   // Synthetic modules whose evaluation steps are running.
   int synthetic_steps_running_ = 0;
   // Links running (see link_module).

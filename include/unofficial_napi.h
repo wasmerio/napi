@@ -605,12 +605,26 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_ar
 // call this.
 //
 // A call the termination stops or refuses leaves it as the pending exception
-// (null on V8, QuickJS's uncatchable error) unless another one is pending.
+// unless another one is pending. napi_get_and_clear_last_exception returns
+// null for a termination on both providers; QuickJS keeps its uncatchable
+// engine marker internal. Cancelling also makes stored QuickJS module
+// evaluation errors catchable.
 // When a native callback returns while the env terminates, what it left
 // pending is dropped and the JS that called it unwinds. V8 acts on a
 // termination requested from another thread at its next stack check, and on
 // one an interrupt callback's JS runs into at the stack check after the one
-// that ran the callback.
+// that ran the callback. On V8, a builtin called directly from native code
+// (for example forEach or a promise reaction job), with no user JS below its
+// native callback, may finish before another stack check. Such a call can
+// return napi_ok after requesting termination. QuickJS stops it immediately.
+//
+// These unofficial termination helpers deliberately return
+// napi_pending_exception for a refused call for every module_api_version and
+// leave a pending termination marker. Node's shutdown preamble instead uses
+// napi_cannot_run_js for modules targeting N-API >= 10 and leaves no exception.
+// V8 permits error creation without a code while terminating; with a code it
+// refuses because an inherited setter may run. QuickJS refuses both cases
+// because constructing an error can read Error.prepareStackTrace.
 //
 // Known QuickJS gap: QuickJS-ng reads Error.prepareStackTrace, which may be a
 // getter, whenever it gives an error its stack, also while a termination
@@ -627,7 +641,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // call. Any other pending exception stays. V8: the checkpoints the termination
 // refused left the engine's tasks queued, so when some wait for a checkpoint,
 // this calls the host's foreground task waker (wasmer_napi's
-// set_foreground_task_waker) again.
+// set_foreground_task_waker) again. QuickJS preserves promise jobs remaining
+// after an interrupted checkpoint and runs them at a checkpoint after cancel;
+// V8 drops the remaining microtasks when a running microtask is terminated.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
@@ -1304,10 +1320,20 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create(
     const unofficial_napi_module_create_options* options,
     unofficial_napi_module_create_result* result_out);
 
+// Records retain their module and realm until destroy or env release. Their
+// wrapper is weak: an embedder may destroy the record from its wrapper's
+// finalizer. Linking retains dependency wrappers through private JS edges,
+// so unreachable wrapper cycles can be collected. A native handle alone does
+// not retain its wrapper; embedders must keep it alive while using the handle.
+// Explicitly destroying a dependency invalidates its incoming native links;
+// V8 refuses later instantiation through them, while QuickJS can continue
+// with its retained engine module. Never use a destroyed module handle.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_destroy(
     napi_env env,
     unofficial_napi_module module);
 
+// Only uninstantiated modules may be linked. All dependencies must belong
+// to the same realm, else ERR_VM_MODULE_DIFFERENT_CONTEXT is pending.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_link(
     napi_env env,
     unofficial_napi_module module,
@@ -1347,6 +1373,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_state(
     napi_value* error_out,
     bool* has_async_graph_out);
 
+// QuickJS warnings identify the module URL; unlike V8, they do not include
+// the source line and column of the stalled await.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_check_unsettled_top_level_await(
     napi_env env,
     unofficial_napi_module module,

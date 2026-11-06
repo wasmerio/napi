@@ -43,7 +43,9 @@ napi_value Str(napi_env env, const char* value) {
   return out;
 }
 
-unofficial_napi_module CreateSourceTextModule(napi_env env, const char* text) {
+unofficial_napi_module CreateSourceTextModule(napi_env env, const char* text,
+                                              unofficial_napi_realm realm = nullptr,
+                                              napi_value* wrapper_out = nullptr) {
   napi_value wrapper = nullptr;
   napi_value undefined = nullptr;
   EXPECT_EQ(napi_create_object(env, &wrapper), napi_ok);
@@ -54,6 +56,8 @@ unofficial_napi_module CreateSourceTextModule(napi_env env, const char* text) {
   options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
   options.kind = unofficial_napi_module_source_text;
   options.wrapper = wrapper;
+  options.realm_or_null = realm;
+  if (wrapper_out != nullptr) *wrapper_out = wrapper;
   options.url = Str(env, "state.mjs");
   options.payload.source_text.source = &source;
   options.payload.source_text.host_defined_option_id = undefined;
@@ -954,4 +958,293 @@ TEST_F(Test77ModuleWrapState, InstantiatingAModuleWhileItEvaluates) {
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
   }
+}
+
+TEST_F(Test77ModuleWrapState, RelinkingAnInstantiatedModuleIsRefused) {
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "import {value} from 'dep'; export {value};");
+  auto first = CreateSourceTextModule(s.env, "export const value = 'first';");
+  auto second = CreateSourceTextModule(s.env, "export const value = 'second';");
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &first), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, importer), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &second), napi_pending_exception);
+  EXPECT_EQ(TakePendingMessage(s.env), "Module is already linked");
+  napi_value ns = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate_sync(s.env, importer, nullptr, nullptr, &ns), napi_ok);
+  napi_value value = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, value), "first");
+}
+
+TEST_F(Test77ModuleWrapState, DestroyedDependencyCannotBecomeAnotherModule) {
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "import {value} from 'dep'; globalThis.result = value;");
+  auto dependency = CreateSourceTextModule(s.env, "export const value = 'original';");
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &dependency), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+  auto unrelated = CreateSourceTextModule(s.env, "globalThis.wrongModuleRan = true; export const value = 'wrong';");
+  ASSERT_NE(unrelated, nullptr);
+  napi_value promise = nullptr;
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate(s.env, importer, -1, false, &promise), napi_pending_exception);
+  EXPECT_FALSE(TakePendingMessage(s.env).empty());
+#else
+  // QuickJS keeps the actual linked JSModuleDef alive independently of its record.
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate(s.env, importer, -1, false, &promise), napi_ok);
+  EXPECT_EQ(RunText(s.env, "result"), "original");
+#endif
+  EXPECT_EQ(RunText(s.env, "typeof wrongModuleRan"), "undefined");
+}
+
+namespace {
+struct DestroyingModule { unofficial_napi_module module = nullptr; };
+napi_value DestroyAndTerminateModule(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data);
+  auto* state = static_cast<DestroyingModule*>(data);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(env, state->module), napi_ok);
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  return nullptr;
+}
+}
+
+TEST_F(Test77ModuleWrapState, DestroyDuringTerminatedEvaluationKeepsRecordAliveUntilReturn) {
+  EnvScope s(runtime_.get());
+  DestroyingModule state;
+  napi_value global = nullptr, fn = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_create_function(s.env, "stop", NAPI_AUTO_LENGTH, DestroyAndTerminateModule, &state, &fn), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "stop", fn), napi_ok);
+  for (bool facade : {false, true}) {
+    state.module = CreateSourceTextModule(s.env, "stop(); export default 42;");
+    napi_value result = nullptr;
+    EXPECT_EQ(facade
+        ? unofficial_napi_module_wrap_create_required_module_facade(s.env, state.module, &result)
+        : unofficial_napi_module_wrap_evaluate(s.env, state.module, -1, false, &result), napi_pending_exception);
+    EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+    EXPECT_FALSE(ExceptionPending(s.env));
+    EXPECT_EQ(RunText(s.env, "'still usable'"), "still usable");
+  }
+}
+
+TEST_F(Test77ModuleWrapState, PendingTopLevelAwaitHasEvaluatedStatusAndIsUnsettled) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "await new Promise(() => {}); export default 1;");
+  napi_value promise = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_ok);
+  EXPECT_EQ(Status(s.env, module), kEvaluated);
+  bool settled = true;
+  ASSERT_EQ(unofficial_napi_module_wrap_check_unsettled_top_level_await(s.env, module, false, &settled), napi_ok);
+  EXPECT_FALSE(settled);
+  napi_value again = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &again), napi_ok);
+}
+
+TEST_F(Test77ModuleWrapState, FacadeDoesNotRunWhileTerminating) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "globalThis.facadeRan = true; export default 42;");
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  napi_value ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, module, &ns), napi_pending_exception);
+  EXPECT_EQ(ns, nullptr);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(RunText(s.env, "typeof facadeRan"), "undefined");
+}
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test77ModuleWrapState, ModuleErrorCodeBypassesInheritedSetter) {
+  EnvScope s(runtime_.get());
+  ASSERT_EQ(RunText(s.env, "Object.defineProperty(Error.prototype, 'code', {set() {throw Error('setter');}, configurable: true}); 'ok'"), "ok");
+  auto module = CreateSourceTextModule(s.env, "export default 1;");
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, module, 1, nullptr), napi_pending_exception);
+  EXPECT_EQ(TakePendingMessage(s.env), "linked modules array length mismatch");
+  EXPECT_FALSE(ExceptionPending(s.env));
+}
+
+#endif
+
+TEST_F(Test77ModuleWrapState, FacadeRunsInModulesRealmAndCrossRealmLinksAreRefused) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  unofficial_napi_realm realm = nullptr;
+  napi_value global = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "marker", Str(s.env, "module realm")), napi_ok);
+  ASSERT_EQ(RunText(s.env, "globalThis.marker = 'env realm'"), "env realm");
+  auto module = CreateSourceTextModule(s.env, "export default globalThis.marker;", realm);
+  napi_value ns = nullptr, value = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, module, &ns), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "default", &value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, value), "module realm");
+  auto importer = CreateSourceTextModule(s.env, "import value from 'dep'; export default value;");
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &module), napi_pending_exception);
+  EXPECT_EQ(TakePendingMessage(s.env), "Linked modules must use the same realm");
+}
+
+namespace {
+struct FinalizedModule { unofficial_napi_module module; int* finalized; };
+void DestroyFinalizedModule(napi_env env, void* data, void*) {
+  auto* state = static_cast<FinalizedModule*>(data);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(env, state->module), napi_ok);
+  ++*state->finalized;
+  delete state;
+}
+}
+
+TEST_F(Test77ModuleWrapState, ModuleWrappersAndTheirDependencyCyclesCanBeCollected) {
+  int finalized = 0;
+  EnvScope s(runtime_.get());
+  for (bool cycle : {false, true}) {
+    SCOPED_TRACE(cycle);
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value a_wrapper = nullptr, b_wrapper = nullptr;
+    auto a = CreateSourceTextModule(s.env, "import 'b'; export const a = 1;", nullptr, &a_wrapper);
+    auto b = CreateSourceTextModule(s.env, cycle ? "import 'a'; export const b = 2;" : "export const b = 2;", nullptr, &b_wrapper);
+    ASSERT_EQ(napi_add_finalizer(s.env, a_wrapper, new FinalizedModule{a, &finalized}, DestroyFinalizedModule, nullptr, nullptr), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(s.env, b_wrapper, new FinalizedModule{b, &finalized}, DestroyFinalizedModule, nullptr, nullptr), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, a, 1, &b), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, b, cycle ? 1 : 0, cycle ? &a : nullptr), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+    for (int attempt = 0; attempt < 4 && finalized < (cycle ? 4 : 2); ++attempt) {
+      ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+      ASSERT_EQ(unofficial_napi_event_loop_checkpoint(s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr), napi_ok);
+    }
+    EXPECT_EQ(finalized, cycle ? 4 : 2);
+  }
+}
+
+TEST_F(Test77ModuleWrapState, LiveImporterRetainsItsDependencyWrapper) {
+  int finalized = 0;
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "import {value} from 'dep'; export {value};");
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+  napi_value wrapper = nullptr;
+  auto dependency = CreateSourceTextModule(s.env, "export const value = 42;", nullptr, &wrapper);
+  ASSERT_EQ(napi_add_finalizer(s.env, wrapper, new FinalizedModule{dependency, &finalized}, DestroyFinalizedModule, nullptr, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &dependency), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr), napi_ok);
+  EXPECT_EQ(finalized, 0);
+  napi_value ns = nullptr, value = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate_sync(s.env, importer, nullptr, nullptr, &ns), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, value), "42");
+}
+
+namespace {
+napi_value TerminateModule(napi_env env, napi_callback_info) {
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  return nullptr;
+}
+}
+
+TEST_F(Test77ModuleWrapState, CancelledModuleErrorIsCatchableAndCheckpointExceptionCanBeTaken) {
+  EnvScope s(runtime_.get());
+  napi_value global = nullptr, stop = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_create_function(s.env, "stop", NAPI_AUTO_LENGTH, TerminateModule, nullptr, &stop), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "stop", stop), napi_ok);
+  auto module = CreateSourceTextModule(s.env, "stop(); export default 1;");
+  napi_value promise = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_pending_exception);
+  napi_value taken = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &taken), napi_ok);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "taken", taken), napi_ok);
+  EXPECT_EQ(RunText(s.env, "(() => {try {throw taken;} catch(e) {return 'caught';}})()"), "caught");
+  napi_value error = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_state(s.env, module, nullptr, &error, nullptr), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "moduleError", error), napi_ok);
+  EXPECT_EQ(RunText(s.env, "(() => {try {throw moduleError;} catch(e) {return 'caught';}})()"), "caught");
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_ok);
+  EXPECT_EQ(PromiseOutcome(s.env, promise).substr(0, 8), "rejected");
+#endif
+  EXPECT_FALSE(ExceptionPending(s.env));
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test77ModuleWrapState, CachedDataPropagatesBufferExceptionsAndRefusesTermination) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "export default 1;");
+  ASSERT_EQ(RunText(s.env, "globalThis.Buffer = function Buffer() {}; Buffer.from = () => {throw Error('buffer failure');}; 'ok'"), "ok");
+  napi_value cache = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_pending_exception);
+  EXPECT_EQ(TakePendingMessage(s.env), "buffer failure");
+  ASSERT_EQ(RunText(s.env, "Object.defineProperty(globalThis, 'Buffer', {get() {globalThis.bufferGetterRan = true;}, configurable: true}); 'ok'"), "ok");
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_pending_exception);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(RunText(s.env, "typeof bufferGetterRan"), "undefined");
+}
+#endif
+
+TEST_F(Test77ModuleWrapState, FacadeRejectionIsHandled) {
+  EnvScope s(runtime_.get());
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env,
+      "globalThis.rejections = []; (type, promise, reason) => rejections.push(type)"), &callback), napi_ok);
+  ASSERT_EQ(unofficial_napi_set_promise_reject_callback(s.env, callback), napi_ok);
+  auto module = CreateSourceTextModule(s.env, "throw Error('expected'); export default 1;");
+  napi_value ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, module, &ns), napi_pending_exception);
+  EXPECT_EQ(TakePendingMessage(s.env), "expected");
+  // Each notification that a rejection lacked a handler must be balanced.
+  EXPECT_EQ(RunText(s.env, "rejections.reduce((balance, type) => balance + (type === 0 ? 1 : type === 1 ? -1 : 0), 0)"), "0");
+}
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test77ModuleWrapState, ModuleCreationDuringTerminationRunsNoBindingOrSetters) {
+  EnvScope s(runtime_.get());
+  napi_value wrapper = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env,
+      "globalThis.creationRan = false; globalThis.internalBinding = () => {creationRan = true; return {};};"
+      "({set sourceURL(v) {creationRan = true;}, set sourceMapURL(v) {creationRan = true;}})"), &wrapper), napi_ok);
+  auto source = unofficial_napi_js_source_from_text(Str(s.env, "export default 1;"));
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  options.wrapper = wrapper;
+  options.url = Str(s.env, "terminated.mjs");
+  options.payload.source_text.source = &source;
+  unofficial_napi_module_create_result result{};
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &result), napi_pending_exception);
+  EXPECT_EQ(result.module, nullptr);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(RunText(s.env, "creationRan"), "false");
+}
+#endif
+
+TEST_F(Test77ModuleWrapState, DestroyingImporterReleasesItsDependencyWrappers) {
+  int finalized = 0;
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "import 'dep';");
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+  napi_value wrapper = nullptr;
+  auto dependency = CreateSourceTextModule(s.env, "export default 1;", nullptr, &wrapper);
+  ASSERT_EQ(napi_add_finalizer(s.env, wrapper, new FinalizedModule{dependency, &finalized}, DestroyFinalizedModule, nullptr, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &dependency), napi_ok);
+  ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, importer), napi_ok);
+  for (int attempt = 0; attempt < 4 && finalized == 0; ++attempt) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr), napi_ok);
+  }
+  EXPECT_EQ(finalized, 1);
+}
+
+TEST_F(Test77ModuleWrapState, RetainingDependenciesDoesNotCallArrayPrototypeSetters) {
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "import 'dep';");
+  auto dependency = CreateSourceTextModule(s.env, "export default 1;");
+  ASSERT_EQ(RunText(s.env, "globalThis.setterRan = false; Object.defineProperty(Array.prototype, '0', {set() {setterRan = true;}, configurable: true}); 'ok'"), "ok");
+  EXPECT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &dependency), napi_ok);
+  EXPECT_EQ(RunText(s.env, "delete Array.prototype[0]; String(setterRan)"), "false");
 }

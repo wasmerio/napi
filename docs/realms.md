@@ -398,3 +398,37 @@ between the engines:
 - **The deprecated API** came back on top of realms, with its structs grown
   at the end instead of changed in place, so that code built against `main`
   keeps working until a major release removes it.
+
+## Module wrapper ownership
+
+A module record owns its engine module and realm until explicit destruction or
+release of the env. Its reference to the JavaScript wrapper is weak. Embedders
+that tie native records to JavaScript objects should destroy the module from
+the wrapper's finalizer, as EdgeJS does. A raw module handle does not retain
+that wrapper. Keep the wrapper reachable while using its handle.
+
+Links retain dependency wrappers through private properties on the importer's
+wrapper. The collector can therefore reclaim an unreachable import cycle;
+there is no native strong-reference cycle between wrappers. Destroying a
+linked dependency explicitly invalidates native links to its record, so a
+reused record address cannot resolve an import to a different module. V8
+refuses subsequent instantiation through such a link; QuickJS already owns
+its linked engine module and may continue using it. Avoid explicit dependency
+destruction while an importer still needs it.
+
+Linking after instantiation is refused with `ERR_VM_MODULE_ALREADY_LINKED`.
+Cross-realm links are refused with `ERR_VM_MODULE_DIFFERENT_CONTEXT` on both
+providers. A require facade always uses the wrapped module's creation realm.
+QuickJS reports pending asynchronous evaluation as evaluated, as V8's public
+module status does, and detects unsettled top-level await. Its warning gives
+the module URL; exact stalled source positions remain unavailable.
+
+The unofficial termination API has its own status contract: refused calls
+return `napi_pending_exception` for every N-API version and leave a pending
+termination marker. This differs from Node's shutdown preamble, which returns
+`napi_cannot_run_js` for N-API 10 and later without setting an exception.
+Taking a termination exception returns null on both providers. Cancelling
+also makes QuickJS's stored module-evaluation errors catchable. QuickJS keeps
+promise jobs left after an interrupted checkpoint; V8 drops microtasks left
+when a running microtask terminates. After cancelling a QuickJS termination,
+embedders should run a checkpoint only if they intend those jobs to resume.

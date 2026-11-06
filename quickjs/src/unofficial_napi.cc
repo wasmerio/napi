@@ -483,6 +483,7 @@ extern "C"
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
         env->cancel_termination();
+        env->module_wrap().cancel_termination();
         // Drop a termination still pending in the runtime or the env, so the
         // env can run its exit and cleanup callbacks. Other exceptions stay.
         JSContext *ctx = napi_util__::context(env);
