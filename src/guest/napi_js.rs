@@ -27,7 +27,7 @@ use crate::{
     snapi::*,
 };
 
-use super::{abi, compat, util::*};
+use super::{BridgeName, abi, compat, util::*};
 use crate::snapi_js::{
     host_js_get_named_property, host_js_has_named_property, host_js_put_primitive,
     host_js_set_named_property, host_js_value,
@@ -634,6 +634,15 @@ fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env:
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+fn guest_unofficial_napi_memory_pressure(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    level: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
+}
+
 fn provider_event_loop_checkpoint_sync(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -941,11 +950,15 @@ fn guest_unofficial_napi_create_private_symbol(
     let Some(desc) = desc else {
         return 1;
     };
-    let desc_len = desc.len() as u32;
-    let cs = CString::new(desc).unwrap_or_default();
+    let desc = BridgeName::new(desc_ptr, wl, desc);
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), desc_len, &mut out)
+        snapi_bridge_unofficial_create_private_symbol(
+            env_handle,
+            desc.as_ptr(),
+            desc.len(),
+            &mut out,
+        )
     };
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
@@ -4143,12 +4156,10 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
-    let actual_name_len = name_bytes.len() as u32;
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
     let mut out: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_create_function(snapi, c_name.as_ptr(), actual_name_len, reg_id, &mut out)
-    };
+    let s =
+        unsafe { snapi_bridge_create_function(snapi, name.as_ptr(), name.len(), reg_id, &mut out) };
     if s != 0 {
         return s;
     }
@@ -4294,8 +4305,7 @@ fn guest_napi_define_class(
     unsafe { snapi_bridge_register_callback(snapi, ctor_reg_id, e, constructor, ctor_data as u64) };
 
     let pc = prop_count;
-    let actual_name_len = name_bytes.len() as u32;
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
 
     if pc == 0 {
         // No properties — simple case
@@ -4303,8 +4313,8 @@ fn guest_napi_define_class(
         let s = with_cb_context(&mut env, e, || unsafe {
             snapi_bridge_define_class(
                 snapi,
-                c_name.as_ptr(),
-                actual_name_len,
+                name.as_ptr(),
+                name.len(),
                 ctor_reg_id,
                 0,
                 std::ptr::null(),
@@ -4466,8 +4476,8 @@ fn guest_napi_define_class(
     let s = with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_define_class(
             snapi,
-            c_name.as_ptr(),
-            actual_name_len,
+            name.as_ptr(),
+            name.len(),
             ctor_reg_id,
             pc,
             prop_names_ptrs.as_ptr(),
@@ -5851,6 +5861,7 @@ pub fn register_napi_imports(
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
+        "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
         "unofficial_napi_event_loop_checkpoint" => event_loop_checkpoint_import(store, fe),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

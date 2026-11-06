@@ -388,6 +388,20 @@ extern "C"
         return napi_ok;
     }
 
+    // QuickJS keeps no compilation cache: any pressure collects cycles now,
+    // as collect_garbage.
+    napi_status NAPI_CDECL unofficial_napi_memory_pressure(napi_env env, int32_t level)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        if (level < unofficial_napi_memory_pressure_none ||
+            level > unofficial_napi_memory_pressure_critical)
+            return napi_invalid_arg;
+        if (level != unofficial_napi_memory_pressure_none)
+            JS_RunGC(napi_util__::runtime(env));
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
         napi_env env,
         napi_value callback)

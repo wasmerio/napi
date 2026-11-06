@@ -1998,6 +1998,32 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env) {
   return napi_ok;
 }
 
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kNone) ==
+                  unofficial_napi_memory_pressure_none,
+              "memory pressure levels must match V8's");
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kModerate) ==
+                  unofficial_napi_memory_pressure_moderate,
+              "memory pressure levels must match V8's");
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kCritical) ==
+                  unofficial_napi_memory_pressure_critical,
+              "memory pressure levels must match V8's");
+
+napi_status NAPI_CDECL unofficial_napi_memory_pressure(napi_env env, int32_t level) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (level < unofficial_napi_memory_pressure_none ||
+      level > unofficial_napi_memory_pressure_critical) {
+    return napi_invalid_arg;
+  }
+  // On the isolate's thread V8 handles it at once (Heap::CheckMemoryPressure)
+  // and sets the level back to none: critical collects in full, with the
+  // memory-reducing flags; moderate starts incremental marking with them.
+  // Before V8 13.7 neither clears the compilation cache, which
+  // LowMemoryNotification (CollectAllAvailableGarbage) does, so later realms
+  // still find their scripts compiled. V8 13.7 and later clear it here too.
+  env->isolate->MemoryPressureNotification(static_cast<v8::MemoryPressureLevel>(level));
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback) {
@@ -2110,6 +2136,11 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     uint32_t* state_out) {
   (void)has_runnable_work;
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // The checkpoint's own handles (the env's context for its microtask queue,
+  // each pending dynamic import's promise) are freed here: an embedder that
+  // runs checkpoints outside any handle scope of its own would otherwise
+  // leave them in the env's root scope, which never closes.
+  v8::HandleScope handle_scope(env->isolate);
   if (mode != unofficial_napi_event_loop_checkpoint_microtasks &&
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
@@ -2587,6 +2618,12 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (utf8description == nullptr && length > 0) return napi_invalid_arg;
+  // V8 takes an int length: a larger one would turn negative and make V8
+  // run strlen.
+  if (length != NAPI_AUTO_LENGTH &&
+      length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return napi_invalid_arg;
+  }
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope scope(isolate);

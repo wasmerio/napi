@@ -355,10 +355,22 @@ if(_napi_test_engine STREQUAL "v8")
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
     runners/test_66_foreground_task_handoff.cc
   )
+  # Counts the V8 isolate's handles with the V8 API.
+  add_fixture_test(${_napi_test_prefix}_test_73_event_loop_checkpoint_handles
+    runners/test_73_event_loop_checkpoint_handles.cc
+  )
+  # QuickJS takes name lengths as a size_t; V8 takes an int.
+  add_fixture_test(${_napi_test_prefix}_test_74_name_length_limits
+    runners/test_74_name_length_limits.cc
+  )
+  target_compile_definitions(${_napi_test_prefix}_test_74_name_length_limits PRIVATE NAPI_VERSION=10)
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
+)
+add_fixture_test(${_napi_test_prefix}_test_72_unofficial_memory_pressure
+  runners/test_72_unofficial_memory_pressure.cc
 )
 
 if(_napi_test_engine STREQUAL "v8")
@@ -376,4 +388,25 @@ if(_napi_test_engine STREQUAL "v8")
   endif()
   add_test(NAME napi_v8.foreground_checkpoint_fairness
     COMMAND napi_v8_foreground_checkpoint_test)
+endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_background_job_limit_test src/v8_background_job_limit_test.cc)
+  target_include_directories(napi_v8_background_job_limit_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_background_job_limit_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_background_job_limit_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.background_job_limit
+    COMMAND napi_v8_background_job_limit_test 4)
+  add_test(NAME napi_v8.background_job_limit_single_worker
+    COMMAND napi_v8_background_job_limit_test 1)
+  set_tests_properties(napi_v8.background_job_limit napi_v8.background_job_limit_single_worker
+    PROPERTIES TIMEOUT 120)
 endif()

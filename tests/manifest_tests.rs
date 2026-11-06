@@ -1,12 +1,45 @@
+//! Every program in `tests/programs/manifest.json`, built twice and checked
+//! against the same expected output: natively against V8 with
+//! `tests/build-test-native.sh`, and for WASIX with `tests/build-test-wasix.sh`,
+//! run through the `napi_wasmer` CLI, which the test builds first.
+//!
+//! Besides what the other tests need, this one needs `wasixcc` (on `PATH` or
+//! in `~/.wasixcc/bin`) with a WASIX sysroot. The native programs link the V8
+//! that `NAPI_V8_INCLUDE_DIR` and `NAPI_V8_LIBRARY` name, or else the one that
+//! `build.rs` downloaded for a debug build in the same target directory.
+
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// The checkout itself. `cargo-standalone.sh` builds from a temporary
+/// directory that holds only a manifest and symlinks to `src`, `tests` and the
+/// other sources, so `CARGO_MANIFEST_DIR` is not always the checkout. The
+/// `tests` symlink resolves back to the checkout's own `tests` directory.
+fn repo_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let tests = std::fs::canonicalize(&tests)
+            .unwrap_or_else(|err| panic!("failed to resolve {}: {err}", tests.display()));
+        tests
+            .parent()
+            .expect("the tests directory has a parent")
+            .to_path_buf()
+    })
+}
+
+/// The target directory this test was built in, wherever Cargo was told to put
+/// it. The build scripts and the nested CLI build are pointed at it, so they
+/// find the V8 that `build.rs` downloaded and leave their output where this
+/// test looks for it.
+fn cargo_target_dir() -> &'static Path {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("CARGO_TARGET_TMPDIR is inside the target directory")
 }
 
 fn path_from_env_or(name: &str, default: PathBuf) -> PathBuf {
@@ -16,14 +49,10 @@ fn path_from_env_or(name: &str, default: PathBuf) -> PathBuf {
             if path.is_absolute() {
                 path
             } else {
-                crate_root().join(path)
+                repo_root().join(path)
             }
         })
         .unwrap_or(default)
-}
-
-fn cargo_target_dir() -> PathBuf {
-    path_from_env_or("CARGO_TARGET_DIR", crate_root().join("target"))
 }
 
 fn native_test_dir() -> PathBuf {
@@ -40,6 +69,19 @@ fn wasix_test_dir() -> PathBuf {
     )
 }
 
+/// A command run from the checkout with the same target and output
+/// directories as this test.
+fn repo_command(program: &str) -> Command {
+    let root = repo_root();
+    let mut command = Command::new(root.join(program));
+    command
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", cargo_target_dir())
+        .env("NAPI_NATIVE_TEST_OUT_DIR", native_test_dir())
+        .env("NAPI_WASIX_TEST_OUT_DIR", wasix_test_dir());
+    command
+}
+
 #[derive(Deserialize)]
 struct TestManifest {
     tests: Vec<TestCase>,
@@ -54,10 +96,8 @@ struct TestCase {
 }
 
 fn build_native_test(name: &str) -> PathBuf {
-    let root = crate_root();
-    let status = Command::new("./tests/build-test-native.sh")
+    let status = repo_command("tests/build-test-native.sh")
         .arg(name)
-        .current_dir(&root)
         .status()
         .expect("failed to execute tests/build-test-native.sh");
     assert!(status.success(), "failed to build native test: {name}");
@@ -65,10 +105,8 @@ fn build_native_test(name: &str) -> PathBuf {
 }
 
 fn build_wasix_test(name: &str) -> PathBuf {
-    let root = crate_root();
-    let status = Command::new("./tests/build-test-wasix.sh")
+    let status = repo_command("tests/build-test-wasix.sh")
         .arg(name)
-        .current_dir(&root)
         .status()
         .expect("failed to execute tests/build-test-wasix.sh");
     assert!(status.success(), "failed to build WASIX test: {name}");
@@ -79,10 +117,8 @@ fn build_cli_binary() -> PathBuf {
     static CLI_PATH: OnceLock<PathBuf> = OnceLock::new();
     CLI_PATH
         .get_or_init(|| {
-            let root = crate_root();
-            let status = Command::new("./cargo-standalone.sh")
+            let status = repo_command("cargo-standalone.sh")
                 .args(["build", "--features", "cli", "--bin", "napi_wasmer"])
-                .current_dir(&root)
                 .status()
                 .expect("failed to build napi_wasmer CLI binary for tests");
             assert!(status.success(), "failed to build napi_wasmer CLI binary");
@@ -93,9 +129,8 @@ fn build_cli_binary() -> PathBuf {
 
 #[test]
 fn manifest_tests_match_native_and_wasix() {
-    let root = crate_root();
     let cli = build_cli_binary();
-    let manifest_path = root.join("tests/programs/manifest.json");
+    let manifest_path = repo_root().join("tests/programs/manifest.json");
     let manifest_content = std::fs::read_to_string(&manifest_path)
         .expect("failed to read test/programs/manifest.json");
     let manifest: TestManifest =

@@ -23,6 +23,10 @@ class EdgeV8Platform final : public v8::Platform {
   // many, where those threads compete with every tenant's foreground JS and
   // their work is not attributed to anyone.
   //
+  // A job that nobody waits for uses at most count - 1 of these threads,
+  // leaving one for other worker tasks; a job that is kUserBlocking or joined
+  // uses all of them. With a count of 1, every job gets the one thread.
+  //
   // The pool is process-wide and built when the first isolate is created, so
   // this has no effect afterwards; it returns false in that case.
   static bool SetWorkerThreadCount(int count);

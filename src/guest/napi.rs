@@ -19,7 +19,7 @@ use crate::{
     snapi::*,
 };
 
-use super::{abi, compat, util::*};
+use super::{BridgeName, abi, compat, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let _ = unsafe { snapi_bridge_init() };
@@ -340,6 +340,15 @@ fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env:
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+fn guest_unofficial_napi_memory_pressure(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    level: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
+}
+
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -538,7 +547,7 @@ fn guest_unofficial_napi_create_private_symbol(
     let wl = length;
     let desc = if desc_ptr != 0 {
         if wl == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, desc_ptr)
+            read_guest_c_string_max(&mut env, desc_ptr, V8_MAX_STRING_BYTES)
         } else {
             read_guest_bytes(&mut env, desc_ptr, wl as usize)
         }
@@ -548,10 +557,15 @@ fn guest_unofficial_napi_create_private_symbol(
     let Some(desc) = desc else {
         return 1;
     };
-    let cs = CString::new(desc).unwrap_or_default();
+    let desc = BridgeName::new(desc_ptr, wl, desc);
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
+        snapi_bridge_unofficial_create_private_symbol(
+            env_handle,
+            desc.as_ptr(),
+            desc.len(),
+            &mut out,
+        )
     };
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
@@ -2491,7 +2505,7 @@ fn guest_napi_set_named_property(
     np: u32,
     v: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2509,7 +2523,7 @@ fn guest_napi_get_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2532,7 +2546,7 @@ fn guest_napi_has_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2715,11 +2729,11 @@ fn guest_napi_throw_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2740,11 +2754,11 @@ fn guest_napi_throw_type_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2765,11 +2779,11 @@ fn guest_napi_throw_range_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -3435,7 +3449,7 @@ fn guest_napi_create_function(
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
         // NAPI_AUTO_LENGTH: read null-terminated string
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3455,9 +3469,10 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
+    let s =
+        unsafe { snapi_bridge_create_function(snapi, name.as_ptr(), name.len(), reg_id, &mut out) };
     if s != 0 {
         return s;
     }
@@ -3601,7 +3616,7 @@ fn guest_napi_define_class(
     // Read class name
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3617,7 +3632,7 @@ fn guest_napi_define_class(
     unsafe { snapi_bridge_register_callback(snapi, ctor_reg_id, e, constructor, ctor_data as u64) };
 
     let pc = prop_count;
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
 
     if pc == 0 {
         // No properties — simple case
@@ -3625,8 +3640,8 @@ fn guest_napi_define_class(
         let s = unsafe {
             snapi_bridge_define_class(
                 snapi_env(&env, e),
-                c_name.as_ptr(),
-                wl,
+                name.as_ptr(),
+                name.len(),
                 ctor_reg_id,
                 0,
                 std::ptr::null(),
@@ -3704,7 +3719,8 @@ fn guest_napi_define_class(
 
         // Read property name
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -3785,8 +3801,8 @@ fn guest_napi_define_class(
     let s = unsafe {
         snapi_bridge_define_class(
             snapi_env(&env, e),
-            c_name.as_ptr(),
-            wl,
+            name.as_ptr(),
+            name.len(),
             ctor_reg_id,
             pc,
             prop_names_ptrs.as_ptr(),
@@ -3889,7 +3905,8 @@ fn guest_napi_define_properties(
         ]);
 
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -5071,6 +5088,7 @@ pub fn register_napi_imports(
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
+        "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

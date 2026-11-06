@@ -450,6 +450,37 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_leave_realm(
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage(
     napi_env env);
+
+// The levels of unofficial_napi_memory_pressure (V8's MemoryPressureLevel).
+typedef enum unofficial_napi_memory_pressure_level {
+  unofficial_napi_memory_pressure_none = 0,
+  unofficial_napi_memory_pressure_moderate = 1,
+  unofficial_napi_memory_pressure_critical = 2,
+} unofficial_napi_memory_pressure_level;
+
+// Unofficial helper. Tells the engine the embedder is short of memory. Call
+// it on the env's thread, between scripts. `level` is an
+// unofficial_napi_memory_pressure_level, passed as int32_t so that a value
+// outside it can be refused: napi_invalid_arg.
+//
+// V8: Isolate::MemoryPressureNotification. Moderate and critical abort
+// in-flight concurrent optimization jobs. Critical runs a memory-reducing
+// full collection now; when much is left, it runs a second one, or starts
+// incremental marking if the first was slow. Moderate starts memory-reducing
+// incremental marking, which the platform's tasks finish. The level returns
+// to none once handled. Before V8 13.7, neither level empties the
+// compilation cache, which unofficial_napi_collect_garbage
+// (LowMemoryNotification) does; V8 13.7 and later empty it here too. Each
+// full collection ages compiled code as any full collection does, so a
+// script that does not run again is still flushed after several calls.
+//
+// QuickJS: moderate and critical run a full cycle collection.
+//
+// Host-JavaScript providers: napi_generic_failure for every valid level.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_memory_pressure(
+    napi_env env,
+    int32_t level);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback);
@@ -490,7 +521,9 @@ typedef enum unofficial_napi_event_loop_checkpoint_state {
 // Complete one provider-owned event-loop checkpoint. The mode describes Node
 // semantics, while the provider owns how those semantics are implemented. The
 // returned state distinguishes an asynchronous host turn from a synchronous
-// engine checkpoint without requiring a separate provider-kind query.
+// engine checkpoint without requiring a separate provider-kind query. The
+// checkpoint may be called with no handle scope open; it leaves no values in
+// the caller's scope.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_event_loop_checkpoint(
     napi_env env,
     unofficial_napi_event_loop_checkpoint_mode mode,

@@ -28,9 +28,11 @@
 //! Host pointers derived from `base` are handed to V8 as external backing
 //! stores, so the mapping must never move. On 64-bit hosts every wasm32 memory
 //! is `MemoryStyle::Static` with the full range reserved up front (growth can
-//! never remap), which [`GuestHeap::new`] verifies. As defense-in-depth every
-//! grow re-checks the base and aborts the process on a move (continuing would
-//! be immediate use-after-unmap all over the host).
+//! never remap), which [`GuestHeap::new`] verifies. As defense-in-depth the
+//! heap's own grows re-check the base, and so does [`GuestHeap::host_range`]
+//! whenever it reads a length it has not seen (after a grow by the guest);
+//! either aborts the process on a move (continuing would be immediate
+//! use-after-unmap all over the host).
 //!
 //! ## Where the store comes from
 //!
@@ -132,6 +134,11 @@ pub(crate) struct GuestHeap {
     /// Linear-memory bytes this heap has claimed, charged to
     /// [`Pool::WasmLinear`]; uncharged on drop.
     charged: AtomicU64,
+    /// The largest current length of the memory seen so far. A linear memory
+    /// only grows, so a range below it is in bounds (see [`Self::host_range`]).
+    /// Like the chunks this heap claims, this assumes the memory is never
+    /// shrunk with `Memory::reset`.
+    observed_len: AtomicU64,
     inner: Mutex<HeapInner>,
 }
 
@@ -288,6 +295,7 @@ impl GuestHeap {
             max_bytes,
             budget,
             charged: AtomicU64::new(0),
+            observed_len: AtomicU64::new(view.data_size()),
             inner: Mutex::new(HeapInner {
                 memories: vec![memory.clone()],
                 chunks: Vec::new(),
@@ -329,6 +337,52 @@ impl GuestHeap {
         let p = ptr as u64;
         let b = self.base as u64;
         p >= b && p < b + self.max_bytes
+    }
+
+    /// Host address of the guest range `[offset, offset + len)`, if it lies
+    /// inside the memory's current length; `current` reads the memory's base
+    /// and current length (through a `MemoryView`). The base cannot move
+    /// ([`Self::new`] only accepts a statically reserved memory), so only the
+    /// bound needs checking, and a linear memory only grows: a range inside
+    /// the largest length already seen needs no lookup at all. A lookup
+    /// re-checks the base, as the heap's own grows do. Imports read and write
+    /// guest memory several times per call, and each `MemoryView` takes the
+    /// shared memory's lock twice.
+    pub(crate) fn host_range(
+        &self,
+        offset: u64,
+        len: u64,
+        current: impl FnOnce() -> (*mut u8, u64),
+    ) -> Option<*mut u8> {
+        let end = offset.checked_add(len)?;
+        if end > self.observed_len.load(Ordering::Acquire) {
+            let (base_now, now) = current();
+            self.check_base(base_now);
+            self.observed_len.fetch_max(now, Ordering::AcqRel);
+            if end > now {
+                return None;
+            }
+        }
+        if end > self.max_bytes {
+            return None;
+        }
+        // SAFETY: `end` is within the memory's current length, and the whole
+        // range is mapped at the fixed `base`.
+        Some(unsafe { self.base.add(offset as usize) })
+    }
+
+    /// The whole design (external backing stores, cached host pointers)
+    /// relies on the mapping never moving. A moved base means every live
+    /// pointer is dangling: abort before anything dereferences one.
+    fn check_base(&self, base_now: *mut u8) {
+        if base_now != self.base {
+            eprintln!(
+                "[wasmer-napi guest-heap] FATAL: linear memory base moved \
+                 ({:p} -> {base_now:p}); aborting",
+                self.base
+            );
+            std::process::abort();
+        }
     }
 
     pub(crate) fn offset_to_host(&self, offset: u32) -> *mut u8 {
@@ -509,17 +563,7 @@ impl GuestHeap {
         base_now: *mut u8,
         charged_bytes: u64,
     ) -> Option<()> {
-        // The whole design (external backing stores, cached host pointers)
-        // relies on the mapping never moving. A moved base means every live
-        // pointer is dangling: abort before anything dereferences one.
-        if base_now != self.base {
-            eprintln!(
-                "[wasmer-napi guest-heap] FATAL: linear memory base moved on grow \
-                 ({:p} -> {base_now:p}); aborting",
-                self.base
-            );
-            std::process::abort();
-        }
+        self.check_base(base_now);
 
         let start = u64::from(prev.0) * u64::from(WASM_PAGE);
         let len = u64::from(delta_pages) * u64::from(WASM_PAGE);
@@ -1063,5 +1107,98 @@ mod tests {
         assert!(b.is_some(), "refill should cover the pending want");
         assert!(heap.free_offset(b.unwrap()));
         assert!(heap.free_offset(a));
+    }
+
+    /// What `host_range`'s lookup reads: the memory's base and length.
+    fn current(memory: &Memory, store: &Store) -> (*mut u8, u64) {
+        let view = memory.view(store);
+        (view.data_ptr(), view.data_size())
+    }
+
+    /// `host_range` maps a guest range to the fixed base with no length
+    /// lookup while the range ends inside the largest length already seen.
+    /// Past it, one lookup decides, and a successful one is remembered.
+    #[test]
+    fn host_range_checks_the_range_end_against_the_memory_length() {
+        let mut store = Store::default();
+        let (memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let base = heap.base() as usize;
+        let at = |ptr: Option<*mut u8>| ptr.map(|ptr| ptr as usize - base);
+        let no_lookup =
+            || -> (*mut u8, u64) { panic!("looked up the length for a range already seen") };
+        let observed = || heap.observed_len.load(Ordering::Acquire);
+
+        // The heap saw the memory's initial 64 pages; its own prefund has
+        // grown the memory since.
+        let seen = 64 * u64::from(WASM_PAGE);
+        assert_eq!(observed(), seen);
+        let grown = current(&memory, &store).1;
+        assert!(grown > seen);
+
+        // Inside the observed length, and ending exactly at it.
+        assert_eq!(at(heap.host_range(16, 100, no_lookup)), Some(16));
+        assert_eq!(at(heap.host_range(0, seen, no_lookup)), Some(0));
+        assert_eq!(
+            at(heap.host_range(seen - 7, 7, no_lookup)),
+            Some(seen as usize - 7)
+        );
+
+        // Past it, inside the grown memory: one lookup raises the observed
+        // length, so the next range up to the new end needs none.
+        let mut lookups = 0;
+        let first = heap.host_range(seen - 3, 9, || {
+            lookups += 1;
+            current(&memory, &store)
+        });
+        assert_eq!(at(first), Some(seen as usize - 3));
+        assert_eq!(lookups, 1);
+        assert_eq!(observed(), grown);
+        assert_eq!(
+            at(heap.host_range(grown - 1, 1, no_lookup)),
+            Some(grown as usize - 1)
+        );
+
+        // Past the end, by a byte or entirely: refused after the lookup,
+        // and the observed length stays.
+        assert_eq!(
+            heap.host_range(grown - 3, 4, || current(&memory, &store)),
+            None
+        );
+        assert_eq!(heap.host_range(grown, 1, || current(&memory, &store)), None);
+        assert_eq!(observed(), grown);
+        // A smaller length read late (another thread's, before a grow)
+        // never lowers it.
+        assert_eq!(heap.host_range(grown, 1, || (heap.base(), seen)), None);
+        assert_eq!(observed(), grown);
+
+        // The guest grows the memory: the new page is reachable after one
+        // lookup, and its last byte is the last one.
+        memory.grow(&mut store, Pages(1)).expect("guest-style grow");
+        let regrown = current(&memory, &store).1;
+        assert_eq!(regrown, grown + u64::from(WASM_PAGE));
+        assert_eq!(
+            at(heap.host_range(grown - 3, 4, || current(&memory, &store))),
+            Some(grown as usize - 3)
+        );
+        assert_eq!(observed(), regrown);
+        assert_eq!(
+            at(heap.host_range(regrown - 8, 8, no_lookup)),
+            Some(regrown as usize - 8)
+        );
+        assert_eq!(
+            heap.host_range(regrown - 8, 9, || current(&memory, &store)),
+            None
+        );
+
+        // `offset + len` overflowing is refused before any lookup.
+        assert_eq!(heap.host_range(u64::MAX - 3, 8, no_lookup), None);
+        assert_eq!(heap.host_range(1, u64::MAX, no_lookup), None);
+
+        // Nothing past the reserved range is handed out, whatever the
+        // lookup says.
+        assert_eq!(
+            heap.host_range(heap.range_len(), 1, || (heap.base(), u64::MAX)),
+            None
+        );
     }
 }

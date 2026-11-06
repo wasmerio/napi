@@ -1,6 +1,7 @@
 #include "unofficial_napi_error_utils.h"
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -215,6 +216,12 @@ napi_status WrapUtf8String(napi_env env,
   if (out == nullptr) return napi_invalid_arg;
   *out = nullptr;
   if (value.empty()) return napi_ok;
+  // V8 takes an int length: a larger one would turn negative and make V8 run
+  // strlen, then abort. The text joins several strings, so each one's own
+  // limit does not bound it.
+  if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return napi_generic_failure;
+  }
 
   v8::Local<v8::String> string;
   if (!v8::String::NewFromUtf8(env->isolate,
@@ -343,6 +350,8 @@ void SetArrowMessageFromString(v8::Isolate* isolate,
   if (err_obj->GetPrivate(context, arrow_key).ToLocal(&existing_arrow) && existing_arrow->IsString()) {
     return;
   }
+  // As in WrapUtf8String: V8 takes an int length.
+  if (arrow.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return;
 
   v8::Local<v8::String> arrow_v8;
   if (!v8::String::NewFromUtf8(isolate,
