@@ -42,7 +42,9 @@ napi_value Terminate(napi_env env, napi_callback_info /*info*/) {
 
 napi_value Noop(napi_env /*env*/, napi_callback_info /*info*/) { return nullptr; }
 
-// Terminates and calls tick(), so that V8 acts on it.
+// Terminates and calls tick(), as native code that terminates and goes on
+// does. The termination fails the call; V8 acts on it when the native
+// function returns.
 void TerminateNow(napi_env env) {
   EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
   napi_value tick = nullptr;
@@ -51,10 +53,15 @@ void TerminateNow(napi_env env) {
   napi_call_function(env, Global(env), tick, 0, nullptr, &ignored);
 }
 
-// Terminates, then cancels, without taking what the failed call left
-// pending.
+// Calls terminateJs(), JS that terminates, then cancels, without taking
+// what the call, which the termination stopped inside JS, left pending: on
+// V8 the null its TryCatch recorded.
 napi_value TerminateThenCancel(napi_env env, napi_callback_info /*info*/) {
-  TerminateNow(env);
+  napi_value terminate_js = nullptr;
+  napi_value ignored = nullptr;
+  EXPECT_EQ(napi_get_named_property(env, Global(env), "terminateJs", &terminate_js), napi_ok);
+  EXPECT_EQ(napi_call_function(env, Global(env), terminate_js, 0, nullptr, &ignored),
+            napi_pending_exception);
   EXPECT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
   return nullptr;
 }
@@ -321,6 +328,7 @@ void InstallHelpers(napi_env env) {
   // engine looks for a termination.
   ASSERT_EQ(RunScript(env,
                       "globalThis.tick = function tick() {};"
+                      "globalThis.terminateJs = () => { terminate(); tick(); };"
                       "globalThis.caught = 'no'; globalThis.after = 'no';"
                       "globalThis.innerCaught = 'no'; globalThis.innerAfter = 'no';"
                       "globalThis.caughtError = 'none'; globalThis.afterCall = 'no';"),
@@ -424,10 +432,10 @@ constexpr char kEvaluateModuleInTryCatch[] =
 
 }  // namespace
 
-// Native code that terminates, makes a call the termination fails, and
-// cancels the termination before it returns, without taking what that call
-// left pending. Nothing threw that: the JS that called goes on as after any
-// call. V8 records a termination as a null pending exception, which it would
+// Native code whose call into JS a termination stopped, and which cancels the
+// termination before it returns, without taking what that call left pending.
+// Nothing threw that: the JS that called goes on as after any call. V8's
+// TryCatch records a termination as a null exception, which V8 would
 // otherwise throw into that JS as a catchable null; QuickJS drops its
 // uncatchable error at the cancel.
 TEST_F(Test73TerminationUntilCancelled, CancelledInsideANativeFunction) {
@@ -617,9 +625,7 @@ void TerminatingFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
 TEST_F(Test73TerminationUntilCancelled, FinalizerDrainedAtACheckpoint) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
-  ASSERT_EQ(RunScript(s.env,
-                      "globalThis.terminateJs = () => { terminate(); tick(); };"
-                      "globalThis.markAfterCall = () => { afterCall = 'yes'; };"),
+  ASSERT_EQ(RunScript(s.env, "globalThis.markAfterCall = () => { afterCall = 'yes'; };"),
             napi_ok);
   g_finalizer_ran = false;
   {
@@ -700,8 +706,6 @@ TEST_F(Test73TerminationUntilCancelled, TerminationRequestedInsideTheRelease) {
   {
     EnvScope s(runtime_.get());
     InstallHelpers(s.env);
-    ASSERT_EQ(RunScript(s.env, "globalThis.terminateJs = () => { terminate(); tick(); };"),
-              napi_ok);
     napi_value object = nullptr;
     ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
     napi_ref keep = nullptr;
