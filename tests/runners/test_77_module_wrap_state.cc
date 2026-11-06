@@ -837,3 +837,41 @@ TEST_F(Test77ModuleWrapState, RequiredModuleFacadeResolvesSourcePhaseImports) {
 #endif
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
 }
+
+// The require() facade gives no namespace for a module whose evaluation
+// throws (the error is pending, as from evaluate_sync) or awaits (it fails
+// with ERR_REQUIRE_ASYNC_MODULE), on both engines, as QuickJS did. Node
+// checks that the evaluation is fulfilled before it returns the namespace.
+// V8 returned napi_ok and the facade's namespace in both cases.
+TEST_F(Test77ModuleWrapState, RequiredModuleFacadeOfAModuleThatThrowsOrAwaitsFails) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module throws =
+      CreateSourceTextModule(s.env, "export default 1; throw new Error('boom');");
+  unofficial_napi_module awaits =
+      CreateSourceTextModule(s.env, "export default 1; await new Promise(() => {});");
+  ASSERT_NE(throws, nullptr);
+  ASSERT_NE(awaits, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, throws, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, awaits, 0, nullptr), napi_ok);
+
+  napi_value ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, throws, &ns),
+            napi_pending_exception);
+  EXPECT_EQ(ns, nullptr);
+  EXPECT_EQ(TakePendingMessage(s.env), "boom");
+  EXPECT_EQ(Status(s.env, throws), 5);
+
+  ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, awaits, &ns),
+            napi_pending_exception);
+  EXPECT_EQ(ns, nullptr);
+  const std::string pending = TakePendingCodeAndMessage(s.env);
+  EXPECT_EQ(pending.rfind("ERR_REQUIRE_ASYNC_MODULE: require() cannot be used on an ESM graph "
+                          "with top-level await",
+                          0),
+            0u)
+      << pending;
+  EXPECT_FALSE(ExceptionPending(s.env));
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, throws), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, awaits), napi_ok);
+}

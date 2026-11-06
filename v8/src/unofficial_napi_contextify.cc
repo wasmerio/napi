@@ -3348,6 +3348,23 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
 
   v8::Local<v8::Value> evaluated;
   if (!facade->Evaluate(context).ToLocal(&evaluated)) return ThrowTryCatchException(env, try_catch);
+  // The facade is for require(): a module whose evaluation threw or awaits
+  // gives no namespace, as evaluate_sync and QuickJS's facade do (Node checks
+  // that the evaluation is fulfilled).
+  if (evaluated->IsPromise()) {
+    v8::Local<v8::Promise> promise = evaluated.As<v8::Promise>();
+    if (promise->State() == v8::Promise::kRejected) {
+      napi_value promise_value = napi_v8_wrap_value(env, promise);
+      const napi_status handled = unofficial_napi_mark_promise_as_handled(env, promise_value);
+      if (handled != napi_ok && handled != napi_pending_exception) return handled;
+      napi_throw(env, napi_v8_wrap_value(env, promise->Result()));
+      return napi_pending_exception;
+    }
+    if (promise->State() == v8::Promise::kPending) {
+      ThrowCodeError(env, "ERR_REQUIRE_ASYNC_MODULE", RequireAsyncModuleMessage("", ""));
+      return napi_pending_exception;
+    }
+  }
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(facade->GetModuleNamespace()));
   return napi_ok;
 }
