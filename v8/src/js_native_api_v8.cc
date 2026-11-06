@@ -883,7 +883,12 @@ void napi_env__::DequeueFinalizer(napi_ref_tracker__* finalizer) {
 
 void napi_env__::DrainFinalizerQueue() {
   finalization_scheduled = false;
-  std::vector<napi_external_finalizer__> external = TakeExternalFinalizers(this);
+  // While the env is releasing (a finalizer there may run a checkpoint), its
+  // release pass runs the external finalizers, those queued meanwhile too,
+  // in its order: most recent first.
+  const bool take_external = !releasing;
+  std::vector<napi_external_finalizer__> external;
+  if (take_external) external = TakeExternalFinalizers(this);
   if (pending_finalizers.empty() && pending_buffer_finalizers.empty() && external.empty()) {
     return;
   }
@@ -911,7 +916,7 @@ void napi_env__::DrainFinalizerQueue() {
     }
     // A finalizer above can free a backing store, which queues the store's
     // finalizer.
-    external = TakeExternalFinalizers(this);
+    if (take_external) external = TakeExternalFinalizers(this);
   }
 }
 

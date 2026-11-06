@@ -1240,3 +1240,79 @@ TEST_F(Test41InstanceData, AWrapFinalizerFindsItsOwnWrapGoneAtRelease) {
     EXPECT_EQ(self->remove, napi_invalid_arg);
   }
 }
+
+namespace {
+
+// External array buffers A, B and C, made in that order. At release a hook
+// detaches B, then C's finalizer detaches A and runs a checkpoint.
+struct CheckpointAtRelease {
+  napi_env env = nullptr;
+  uint8_t bytes[3][8] = {};
+  napi_ref a = nullptr;
+  napi_ref b = nullptr;
+  std::string order;
+  napi_status detach_a = napi_generic_failure;
+  napi_status detach_b = napi_generic_failure;
+};
+
+struct NamedBuffer {
+  CheckpointAtRelease* state;
+  char name;
+};
+
+void Detach(napi_env env, napi_ref ref, napi_status* status) {
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_get_reference_value(env, ref, &buffer), napi_ok);
+  *status = napi_detach_arraybuffer(env, buffer);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+void HookDetachingB(void* arg) {
+  auto* state = static_cast<CheckpointAtRelease*>(arg);
+  Detach(state->env, state->b, &state->detach_b);
+}
+
+void FinalizeNamedBuffer(node_api_basic_env basic_env, void*, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
+  auto* named = static_cast<NamedBuffer*>(hint);
+  named->state->order += named->name;
+  if (named->name != 'C') return;
+  Detach(env, named->state->a, &named->state->detach_a);
+  // Runs what the env has queued, here in the middle of the release.
+  unofficial_napi_event_loop_checkpoint(env, unofficial_napi_event_loop_checkpoint_microtasks,
+                                        true, nullptr);
+}
+
+}  // namespace
+
+// External buffers are finalized most recent first at release, also when one
+// of their finalizers runs a checkpoint, which runs what the env has queued.
+TEST_F(Test41InstanceData, ACheckpointInAFinalizerKeepsTheReleaseOrder) {
+  EnvScope s(runtime_.get());
+  CheckpointAtRelease state;
+  state.env = s.env;
+  NamedBuffer a{&state, 'A'}, b{&state, 'B'}, c{&state, 'C'};
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, state.bytes[0], 8, FinalizeNamedBuffer, &a,
+                                             &buffer),
+            napi_ok);
+  Keep(s.env, "a", buffer);
+  ASSERT_EQ(napi_create_reference(s.env, buffer, 1, &state.a), napi_ok);
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, state.bytes[1], 8, FinalizeNamedBuffer, &b,
+                                             &buffer),
+            napi_ok);
+  Keep(s.env, "b", buffer);
+  ASSERT_EQ(napi_create_reference(s.env, buffer, 1, &state.b), napi_ok);
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, state.bytes[2], 8, FinalizeNamedBuffer, &c,
+                                             &buffer),
+            napi_ok);
+  Keep(s.env, "c", buffer);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookDetachingB, &state), napi_ok);
+
+  Release(s);
+  EXPECT_EQ(state.detach_b, napi_ok);
+  EXPECT_EQ(state.detach_a, napi_ok);
+  EXPECT_EQ(state.order, "CBA");
+}
