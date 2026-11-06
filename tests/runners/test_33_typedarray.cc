@@ -2,6 +2,10 @@
 #include "upstream_js_test.h"
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
+// node_api.h declares it from NAPI_VERSION 10; this target builds at 8.
+extern "C" napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+    napi_env env, napi_value arraybuffer, size_t byte_offset, size_t byte_length,
+    napi_value* result);
 
 class Test33TypedArray : public FixtureTestBase {};
 
@@ -195,6 +199,35 @@ TEST_F(Test33TypedArray, DetachedArrayBufferInfoIsEmpty) {
   void* data = nullptr;
   size_t length = 0;
   EXPECT_EQ(napi_get_arraybuffer_info(s.env, object, &data, &length), napi_invalid_arg);
+}
+
+// As in Node, node_api_create_buffer_from_arraybuffer makes a Buffer that
+// views the ArrayBuffer itself, so detaching the ArrayBuffer detaches the
+// Buffer too.
+TEST_F(Test33TypedArray, BufferFromAnArrayBufferViewsIt) {
+  EnvScope s(runtime_.get());
+  napi_value array_buffer = nullptr;
+  void* storage = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 16, &storage, &array_buffer), napi_ok);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, array_buffer, 4, 8, &buffer), napi_ok);
+  napi_value viewed = nullptr;
+  size_t length = 0;
+  size_t offset = 0;
+  ASSERT_EQ(napi_get_typedarray_info(s.env, buffer, nullptr, &length, nullptr, &viewed, &offset),
+            napi_ok);
+  bool same = false;
+  ASSERT_EQ(napi_strict_equals(s.env, viewed, array_buffer, &same), napi_ok);
+  EXPECT_TRUE(same);
+  EXPECT_EQ(offset, 4u);
+  EXPECT_EQ(length, 8u);
+
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, array_buffer), napi_ok);
+  napi_value element = nullptr;
+  ASSERT_EQ(napi_get_element(s.env, buffer, 0, &element), napi_ok);
+  napi_valuetype type = napi_number;
+  ASSERT_EQ(napi_typeof(s.env, element, &type), napi_ok);
+  EXPECT_EQ(type, napi_undefined);
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)

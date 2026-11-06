@@ -14,6 +14,10 @@
 #include <vector>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
+// node_api.h declares it from NAPI_VERSION 10; this target builds at 8.
+extern "C" napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+    napi_env env, napi_value arraybuffer, size_t byte_offset, size_t byte_length,
+    napi_value* result);
 
 class Test41InstanceData : public FixtureTestBase {};
 
@@ -393,12 +397,14 @@ struct AfterFree {
   napi_ref array_buffer = nullptr;
   napi_ref view = nullptr;
   napi_ref buffer_array_buffer = nullptr;
+  napi_ref alias = nullptr;
   int frees_seen = 0;
   bool array_buffer_detached = false;
   napi_status info_status = napi_generic_failure;
   void* info_data = nullptr;
   size_t info_length = SIZE_MAX;
   napi_valuetype element = napi_number;
+  napi_valuetype alias_element = napi_number;
   bool buffer_detached = false;
 };
 
@@ -417,6 +423,9 @@ void InspectFreedBuffers(napi_env env, void* data, void*) {
   if (napi_get_reference_value(env, after->view, &value) == napi_ok &&
       napi_get_element(env, value, 3, &element) == napi_ok)
     napi_typeof(env, element, &after->element);
+  if (napi_get_reference_value(env, after->alias, &value) == napi_ok &&
+      napi_get_element(env, value, 0, &element) == napi_ok)
+    napi_typeof(env, element, &after->alias_element);
   napi_close_handle_scope(env, scope);
 }
 
@@ -435,6 +444,11 @@ TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRele
   napi_value view = nullptr;
   ASSERT_EQ(napi_create_typedarray(s.env, napi_uint8_array, 64, array_buffer, 0, &view), napi_ok);
   Keep(s.env, "view", view);
+  // A Buffer over the same memory, made from the array buffer.
+  napi_value alias = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, array_buffer, 8, 16, &alias), napi_ok);
+  Keep(s.env, "alias", alias);
+  ASSERT_EQ(napi_create_reference(s.env, alias, 1, &after.alias), napi_ok);
   napi_value buffer = nullptr;
   ASSERT_EQ(napi_create_external_buffer(s.env, 16, NewBytes(16), FreeOwned, &after.buffer_memory,
                                         &buffer),
@@ -464,6 +478,7 @@ TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRele
   EXPECT_EQ(after.info_data, nullptr);
   EXPECT_EQ(after.info_length, 0u);
   EXPECT_EQ(after.element, napi_undefined);
+  EXPECT_EQ(after.alias_element, napi_undefined);
   EXPECT_TRUE(after.buffer_detached);
 }
 

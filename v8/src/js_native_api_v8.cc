@@ -457,11 +457,11 @@ bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* len
   return true;
 }
 
-v8::Local<v8::Object> CreateBufferObject(napi_env env,
-                                         std::shared_ptr<v8::BackingStore> backing_store,
-                                         size_t offset,
-                                         size_t length) {
-  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
+// A Buffer viewing `ab`.
+v8::Local<v8::Object> CreateBufferView(napi_env env,
+                                       v8::Local<v8::ArrayBuffer> ab,
+                                       size_t offset,
+                                       size_t length) {
   // Buffer is the env's: read it from the env's realm, never from the current
   // one, whose global its scripts control.
   v8::Local<v8::Context> context = env->main_context();
@@ -495,6 +495,14 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
   }
 
   return view;
+}
+
+// A Buffer over a new ArrayBuffer holding `backing_store`.
+v8::Local<v8::Object> CreateBufferObject(napi_env env,
+                                         std::shared_ptr<v8::BackingStore> backing_store,
+                                         size_t offset,
+                                         size_t length) {
+  return CreateBufferView(env, v8::ArrayBuffer::New(env->isolate, backing_store), offset, length);
 }
 
 inline bool CheckValue(napi_env env, napi_value value) {
@@ -3550,10 +3558,10 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
 
   auto* record = env->allocate<napi_buffer_record__>(env);
   if (record == nullptr) return napi_generic_failure;
-  record->backing_store = ab->GetBackingStore();
 
-  v8::Local<v8::Object> buffer_obj =
-      CreateBufferObject(env, record->backing_store, byte_offset, byte_length);
+  // As Node's Buffer::New(isolate, ab, ...), the Buffer views `ab` itself:
+  // detaching `ab` detaches it too, and `ab` alone holds the store.
+  v8::Local<v8::Object> buffer_obj = CreateBufferView(env, ab, byte_offset, byte_length);
   record->holder.Reset(env->isolate, buffer_obj);
   record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
   v8::Local<v8::Private> key = env->agent->buffer_private_key.Get(env->isolate);
