@@ -135,24 +135,27 @@ void napi_env__::prepare_teardown()
   // Every scope closes. Cleanup hooks and finalizers each run in the env's
   // realm, and a scope one leaves open closes when it returns.
   pop_realm_frames(0);
-  // The cleanup hooks run, then the finalizers of the values still alive; a
-  // hook or value one of them adds runs too (Node also runs hooks added during
-  // cleanup), until neither is left. They run while the context and runtime
-  // are alive and the root scope is open, so they can use N-API; what they
-  // make is freed below.
-  run_cleanup_hooks();
-  while (napi_external_backing_store_hint__::first_pending(pending_finalizers_) != nullptr)
+  // The release contract (unofficial_napi_release_env): the cleanup hooks
+  // run, then the finalizers of the values still pending, until neither is
+  // left; then the instance data's finalizer; and all of it again for what
+  // that finalizer leaves pending, until nothing is. They run while the
+  // context and runtime are alive and the root scope is open, so they can use
+  // N-API; what they make is freed below.
+  for (;;)
   {
-    finalize_pending_values();
     run_cleanup_hooks();
+    while (napi_external_backing_store_hint__::first_pending(pending_finalizers_) != nullptr)
+    {
+      finalize_pending_values();
+      run_cleanup_hooks();
+    }
+    if (instance_data_ == nullptr && instance_data_finalize_cb_ == nullptr)
+      break;
+    finalize_instance_data();
+    drop_finalizer_exception();
   }
-  // The instance data's finalizer runs last. Nothing is finalized after it,
-  // but hooks it adds still run.
-  finalize_instance_data();
-  drop_finalizer_exception();
-  run_cleanup_hooks();
-  // A value still pending is never finalized: the runtime frees it after the
-  // context is gone.
+  // From here on nothing is finalized: the runtime frees what is still alive
+  // after the context is gone.
   finalizers_done_ = true;
   while (auto *hint = napi_external_backing_store_hint__::first_pending(pending_finalizers_))
     hint->abandon_finalizer();
@@ -219,6 +222,7 @@ void napi_env__::run_cleanup_hooks()
         napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
         entry->run();
       }
+      drop_finalizer_exception();
       napi_env_cleanup_hook__::destroy(entry);
     }
   }
@@ -239,8 +243,8 @@ void napi_env__::finalize_pending_values()
 
 void napi_env__::drop_finalizer_exception()
 {
-  // Nothing can catch what a finalizer threw at release. Node also clears it
-  // after each finalizer.
+  // Nothing can catch what a hook or finalizer threw at release. Node's
+  // CallIntoModule also drops it once JS can no longer run.
   clear_last_exception();
   if (context_ != nullptr && JS_HasException(context_))
     JS_FreeValue(context_, JS_GetException(context_));

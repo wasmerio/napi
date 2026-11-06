@@ -52,8 +52,9 @@ struct napi_env__
   ~napi_env__();
 
   // Runs the cleanup hooks and every pending finalizer, the instance data's
-  // last, while the context is alive, and lets go of the context. N-API calls
-  // on the env fail from then on.
+  // after the others, again for what they leave pending, while the context is
+  // alive, and lets go of the context. N-API calls on the env fail from then
+  // on.
   void prepare_teardown();
   // Native callbacks are refused once teardown has started.
   bool is_closing() const;

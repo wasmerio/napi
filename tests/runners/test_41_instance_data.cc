@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
@@ -27,10 +28,13 @@ TEST_F(Test41InstanceData, PortedCoreFlow) {
       s, std::string(NAPI_TESTS_ROOT_PATH) + "/js-native-api/test_instance_data/test.js"));
 }
 
-// Finalizers at release. As in Node, every finalizer still pending when the
-// env is released runs while the engine is alive, in the env's realm, and can
-// use N-API. The instance-data finalizer runs last, after every other
-// finalizer (current Node interleaves it with them instead).
+// The release contract (unofficial_napi_release_env). The cleanup hooks run,
+// then the finalizer of every value still pending, most recent first, until
+// neither is left; then the instance-data finalizer; and all of it again for
+// whatever those leave pending, until nothing is. Each runs while the engine
+// is alive, on the env's thread, in the env's realm, and can use N-API.
+// (Node up to 20 also finalized the instance data last; Node 25 interleaves
+// it with the other finalizers.)
 
 namespace {
 
@@ -224,7 +228,7 @@ TEST_F(Test41InstanceData, ValueAFinalizerMakesAtReleaseIsFinalizedToo) {
   ExpectUsedNapi(instance_data, "instance data");
 }
 
-TEST_F(Test41InstanceData, ValueTheInstanceDataFinalizerMakesIsNeverFinalized) {
+TEST_F(Test41InstanceData, ValueTheInstanceDataFinalizerMakesIsFinalized) {
   EnvScope s(runtime_.get());
   int clock = 0;
   Late late{&clock};
@@ -234,9 +238,66 @@ TEST_F(Test41InstanceData, ValueTheInstanceDataFinalizerMakesIsNeverFinalized) {
 
   Release(s);
   ExpectUsedNapi(late.instance_data, "instance data");
-  // Nothing finalizes after the instance data: the engine is gone by the time
-  // the value is freed. (Current Node would finalize it.)
-  EXPECT_EQ(late.made.runs, 0);
+  // What the instance-data finalizer leaves pending is finalized after it, as
+  // Node's FinalizeAll finalizes until its lists are empty.
+  ExpectUsedNapi(late.made, "external the instance-data finalizer made");
+  EXPECT_GT(late.made.order, late.instance_data.order);
+}
+
+namespace {
+
+// What the instance-data finalizer leaves pending: a value, a cleanup hook and
+// new instance data.
+struct Rounds {
+  explicit Rounds(int* clock) : first(clock), hook(clock), value(clock), second(clock) {}
+  napi_env env = nullptr;
+  Seen first;
+  Seen hook;
+  Seen value;
+  Seen second;
+  napi_status add_hook = napi_generic_failure;
+  napi_status set_data = napi_generic_failure;
+};
+
+void RoundsHook(void* arg) {
+  auto* rounds = static_cast<Rounds*>(arg);
+  UseNapi(rounds->env, &rounds->hook);
+}
+
+void FinalizeSecondInstanceData(napi_env env, void* data, void*) {
+  UseNapi(env, &static_cast<Rounds*>(data)->second);
+}
+
+void FinalizeFirstInstanceData(napi_env env, void* data, void*) {
+  auto* rounds = static_cast<Rounds*>(data);
+  UseNapi(env, &rounds->first);
+  KeepExternal(env, "leftValue", &rounds->value);
+  rounds->add_hook = napi_add_env_cleanup_hook(env, RoundsHook, rounds);
+  rounds->set_data = napi_set_instance_data(env, rounds, FinalizeSecondInstanceData, nullptr);
+}
+
+}  // namespace
+
+// The release repeats for what the instance-data finalizer leaves: its hook
+// runs, then its value is finalized, then the instance data it set.
+TEST_F(Test41InstanceData, WhatTheInstanceDataFinalizerLeavesIsReleasedInTheSameOrder) {
+  EnvScope s(runtime_.get());
+  int clock = 0;
+  Rounds rounds{&clock};
+  rounds.env = s.env;
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_set_instance_data(s.env, &rounds, FinalizeFirstInstanceData, nullptr), napi_ok);
+
+  Release(s);
+  EXPECT_EQ(rounds.add_hook, napi_ok);
+  EXPECT_EQ(rounds.set_data, napi_ok);
+  ExpectUsedNapi(rounds.first, "first instance data");
+  ExpectUsedNapi(rounds.hook, "hook it added");
+  ExpectUsedNapi(rounds.value, "value it made");
+  ExpectUsedNapi(rounds.second, "instance data it set");
+  EXPECT_LT(rounds.first.order, rounds.hook.order);
+  EXPECT_LT(rounds.hook.order, rounds.value.order);
+  EXPECT_LT(rounds.value.order, rounds.second.order);
 }
 
 namespace {
@@ -426,25 +487,37 @@ TEST_F(Test41InstanceData, ExternalArrayBufferAFinalizerMakesAtReleaseIsFinalize
   Release(s);
   ExpectUsedNapi(chain.first, "external");
   ExpectUsedNapi(instance_data, "instance data");
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
-  // The V8 provider finalizes such a buffer only after the instance data,
-  // when N-API no longer works.
   ExpectUsedNapi(chain.made, "array buffer its finalizer made");
   EXPECT_LT(chain.made.order, instance_data.order);
-#endif
 }
 
 namespace {
 
-// Cleanup hooks finalizers add at release, and when each ran.
+// Cleanup hooks a hook and finalizers add at release, and when each ran.
 struct LateHooks {
+  napi_env env = nullptr;
   int clock = 0;
+  int registered_hook = 0;
+  int hook_hook = 0;
+  int value = 0;
   int value_hook = 0;
   int instance_data = 0;
   int instance_data_hook = 0;
+  napi_status hook_add = napi_generic_failure;
   napi_status value_add = napi_generic_failure;
   napi_status instance_data_add = napi_generic_failure;
 };
+
+void HookHook(void* arg) {
+  auto* hooks = static_cast<LateHooks*>(arg);
+  hooks->hook_hook = ++hooks->clock;
+}
+
+void RegisteredHook(void* arg) {
+  auto* hooks = static_cast<LateHooks*>(arg);
+  hooks->registered_hook = ++hooks->clock;
+  hooks->hook_add = napi_add_env_cleanup_hook(hooks->env, HookHook, hooks);
+}
 
 void ValueHook(void* arg) {
   auto* hooks = static_cast<LateHooks*>(arg);
@@ -458,6 +531,7 @@ void InstanceDataHook(void* arg) {
 
 void FinalizeAddingAHook(node_api_basic_env env, void*, void* hint) {
   auto* hooks = static_cast<LateHooks*>(hint);
+  hooks->value = ++hooks->clock;
   hooks->value_add = napi_add_env_cleanup_hook(env, ValueHook, hooks);
 }
 
@@ -469,9 +543,14 @@ void FinalizeInstanceDataAddingAHook(napi_env env, void* data, void*) {
 
 }  // namespace
 
-TEST_F(Test41InstanceData, CleanupHooksFinalizersAddAtReleaseRun) {
+// As in Node, a hook added during the release still runs. The hooks run
+// before the values are finalized, and a hook a value's finalizer adds runs
+// before the instance-data finalizer.
+TEST_F(Test41InstanceData, CleanupHooksAddedAtReleaseRun) {
   EnvScope s(runtime_.get());
   LateHooks hooks;
+  hooks.env = s.env;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, RegisteredHook, &hooks), napi_ok);
   napi_value external = nullptr;
   ASSERT_EQ(napi_create_external(s.env, nullptr, FinalizeAddingAHook, &hooks, &external), napi_ok);
   Keep(s.env, "external", external);
@@ -479,41 +558,67 @@ TEST_F(Test41InstanceData, CleanupHooksFinalizersAddAtReleaseRun) {
             napi_ok);
 
   Release(s);
+  EXPECT_EQ(hooks.hook_add, napi_ok);
   EXPECT_EQ(hooks.value_add, napi_ok);
   EXPECT_EQ(hooks.instance_data_add, napi_ok);
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
-  // As in Node, a hook added during teardown still runs; one a value's
-  // finalizer adds runs before the instance-data finalizer. The V8 provider
-  // drops them.
-  EXPECT_GT(hooks.value_hook, 0);
-  EXPECT_LT(hooks.value_hook, hooks.instance_data);
-  EXPECT_GT(hooks.instance_data_hook, hooks.instance_data);
-#endif
+  EXPECT_EQ(hooks.registered_hook, 1);
+  EXPECT_EQ(hooks.hook_hook, 2);
+  EXPECT_EQ(hooks.value, 3);
+  EXPECT_EQ(hooks.value_hook, 4);
+  EXPECT_EQ(hooks.instance_data, 5);
+  EXPECT_EQ(hooks.instance_data_hook, 6);
 }
 
 namespace {
 
+// Exceptions thrown at release by a hook, a value's finalizer and the
+// instance-data finalizer, and whether the next one to run found one pending.
 struct Thrown {
+  napi_env env = nullptr;
   napi_status throw_status = napi_generic_failure;
-  napi_status pending_status = napi_generic_failure;
-  bool pending = true;
+  bool pending_in_value = true;
+  bool pending_in_instance_data = true;
+  bool pending_in_late_hook = true;
+  int checks = 0;
 };
 
+void Check(napi_env env, Thrown* thrown, bool* pending) {
+  if (napi_is_exception_pending(env, pending) == napi_ok) ++thrown->checks;
+}
+
+void ThrowingHook(void* arg) {
+  auto* thrown = static_cast<Thrown*>(arg);
+  napi_throw_error(thrown->env, nullptr, "hook");
+}
+
 void FinalizeThrowing(node_api_basic_env basic_env, void*, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
   auto* thrown = static_cast<Thrown*>(hint);
-  thrown->throw_status = napi_throw_error(const_cast<napi_env>(basic_env), nullptr, "finalizer");
+  Check(env, thrown, &thrown->pending_in_value);
+  thrown->throw_status = napi_throw_error(env, nullptr, "finalizer");
+}
+
+void LateHookAfterAThrow(void* arg) {
+  auto* thrown = static_cast<Thrown*>(arg);
+  Check(thrown->env, thrown, &thrown->pending_in_late_hook);
 }
 
 void FinalizeInstanceDataAfterAThrow(napi_env env, void* data, void*) {
   auto* thrown = static_cast<Thrown*>(data);
-  thrown->pending_status = napi_is_exception_pending(env, &thrown->pending);
+  Check(env, thrown, &thrown->pending_in_instance_data);
+  napi_add_env_cleanup_hook(env, LateHookAfterAThrow, thrown);
+  napi_throw_error(env, nullptr, "instance data");
 }
 
 }  // namespace
 
-TEST_F(Test41InstanceData, AnExceptionAFinalizerThrowsAtReleaseIsNotLeftPending) {
+// Nothing can catch what a hook or finalizer throws at release, so, as Node's
+// CallIntoModule does once JS can no longer run, it is dropped.
+TEST_F(Test41InstanceData, AnExceptionThrownAtReleaseIsNotLeftPending) {
   EnvScope s(runtime_.get());
   Thrown thrown;
+  thrown.env = s.env;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, ThrowingHook, &thrown), napi_ok);
   napi_value external = nullptr;
   ASSERT_EQ(napi_create_external(s.env, nullptr, FinalizeThrowing, &thrown, &external), napi_ok);
   Keep(s.env, "external", external);
@@ -521,13 +626,14 @@ TEST_F(Test41InstanceData, AnExceptionAFinalizerThrowsAtReleaseIsNotLeftPending)
             napi_ok);
 
   Release(s);
-  EXPECT_EQ(thrown.pending_status, napi_ok);
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
-  // Nothing can catch it, so, as Node does after each finalizer, it is
-  // dropped. The V8 provider still leaves it pending.
-  EXPECT_EQ(thrown.throw_status, napi_ok);
-  EXPECT_FALSE(thrown.pending);
-#endif
+  // Node's napi_throw_error returns napi_ok; the V8 provider returns
+  // napi_pending_exception. Either way the error was thrown.
+  EXPECT_TRUE(thrown.throw_status == napi_ok || thrown.throw_status == napi_pending_exception)
+      << thrown.throw_status;
+  EXPECT_EQ(thrown.checks, 3);
+  EXPECT_FALSE(thrown.pending_in_value);
+  EXPECT_FALSE(thrown.pending_in_instance_data);
+  EXPECT_FALSE(thrown.pending_in_late_hook);
 }
 
 namespace {

@@ -67,8 +67,8 @@ namespace
         napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)
         {
-            // Runs every finalizer, the instance data's last, while the
-            // context and runtime are alive.
+            // Runs the cleanup hooks and every finalizer, as the release
+            // contract orders them, while the context and runtime are alive.
             env_to_delete = scope->env;
             status = DestroyEnvInstance(scope->env);
             scope->env = nullptr;

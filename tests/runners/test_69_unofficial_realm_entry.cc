@@ -762,8 +762,8 @@ TEST_F(Test69UnofficialRealmEntry, ScopeTheInstanceDataFinalizerLeavesOpenCloses
 
   Release(s);
   EXPECT_TRUE(record.checked);
-  // The finalizer runs last, and a provider may have let go of its realms by
-  // then.
+  // The finalizer runs after the other finalizers, and a provider may have
+  // let go of its realms by then.
   EXPECT_TRUE(record.enter_status == napi_ok || record.enter_status == napi_invalid_arg)
       << record.enter_status;
   EXPECT_EQ(record.enter_env_realm_status, napi_ok);
@@ -880,7 +880,6 @@ TEST_F(Test69UnofficialRealmEntry, DetachedExternalArrayBufferIsFinalizedByTheEn
   EXPECT_TRUE(record.saw_env_global.load());
 }
 
-#if defined(NAPI_TEST_ENGINE_V8)
 namespace {
 
 void DetachExternalBufferFromInstanceDataFinalizer(napi_env env, void* data, void*) {
@@ -894,10 +893,9 @@ void DetachExternalBufferFromInstanceDataFinalizer(napi_env env, void* data, voi
 
 }  // namespace
 
-// The instance-data finalizer runs last in the release. An external buffer it
-// makes and detaches is still finalized, once. V8 only: the QuickJS provider
-// frees its context before it runs that finalizer, which then cannot make
-// values.
+// The instance-data finalizer runs after the other finalizers in the release.
+// An external buffer it makes and detaches is still finalized, once, on the
+// env's thread and in the env's realm.
 TEST_F(Test69UnofficialRealmEntry, ExternalArrayBufferTheInstanceDataFinalizerDetachesIsFinalized) {
   ExternalFinalizerRecord record;
   EnvScope s(runtime_.get());
@@ -961,7 +959,63 @@ TEST_F(Test69UnofficialRealmEntry, InstanceDataSetByALateFinalizerIsFinalized) {
   EXPECT_EQ(late.late_finalized.load(), 1);
   EXPECT_TRUE(late.late_saw_env_global.load());
 }
-#endif
+
+namespace {
+
+struct ReleaseInARealm {
+  ExternalFinalizerRecord buffer;
+  ExternalFinalizerRecord external;
+  ExternalFinalizerRecord instance_data;
+  ExternalFinalizerRecord hook;
+  napi_env env = nullptr;
+};
+
+void RecordInstanceDataFinalizer(napi_env env, void* data, void*) {
+  RecordExternalFinalizer(env, nullptr, &static_cast<ReleaseInARealm*>(data)->instance_data);
+}
+
+void RecordCleanupHook(void* arg) {
+  auto* release = static_cast<ReleaseInARealm*>(arg);
+  RecordExternalFinalizer(release->env, nullptr, &release->hook);
+}
+
+}  // namespace
+
+// The env is released while another realm is entered, holding values made in
+// that realm. Every hook and finalizer still runs once, on the env's thread,
+// in the env's realm.
+TEST_F(Test69UnofficialRealmEntry, ReleaseRunsInTheEnvsRealmWhileAnotherIsEntered) {
+  ReleaseInARealm release;
+  EnvScope s(runtime_.get());
+  release.env = s.env;
+  unofficial_napi_realm a = CreateRealm(s.env);
+  ASSERT_NE(a, nullptr);
+  MarkEnvGlobal(s.env);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, RecordCleanupHook, &release), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &release, RecordInstanceDataFinalizer, nullptr), napi_ok);
+
+  // Made in A and kept on A's global; A stays entered.
+  (void)Enter(s.env, a);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, release.buffer.bytes,
+                                             sizeof(release.buffer.bytes),
+                                             RecordExternalFinalizer, &release.buffer, &buffer),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "keptBuffer", buffer), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external(s.env, nullptr, RecordExternalFinalizer, &release.external,
+                                 &external),
+            napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "keptExternal", external), napi_ok);
+  Release(s);
+
+  for (const ExternalFinalizerRecord* record :
+       {&release.buffer, &release.external, &release.instance_data, &release.hook}) {
+    EXPECT_EQ(record->calls.load(), 1);
+    EXPECT_TRUE(record->on_env_thread.load());
+    EXPECT_TRUE(record->saw_env_global.load());
+  }
+}
 
 TEST_F(Test69UnofficialRealmEntry, CollectedExternalArrayBuffersAreFinalizedOnTheEnvsThread) {
   constexpr int kBatches = 16;
