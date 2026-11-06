@@ -40,18 +40,18 @@ cli = [
 
 [dependencies]
 anyhow = "1"
-# Exported source uses the private runtime work branch; Cargo.standalone.lock
+# Exported source uses the published private runtime main branch; Cargo.standalone.lock
 # fixes every runtime and WLK package to its exact published revision.
-wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false }
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", optional = true }
-wasmer-c-api-imports = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", optional = true, default-features = false }
-wasmer-types = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", optional = true }
+wasmer-cache = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasmer-c-api-imports = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true, default-features = false }
+wasmer-types = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", optional = true }
-wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false, features = ["sys"], optional = true }
-wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false, optional = true }
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["sys"], optional = true }
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true }
 wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", optional = true }
 wasixv2-syscalls = { git = "https://github.com/wasmerio/wlk", branch = "main", optional = true }
 enum-iterator = "2.3.0"
@@ -63,8 +63,8 @@ wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false, optional = true, features = ["sys"] }
-wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false, features = [
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true, features = ["sys"] }
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = [
   "sys-default",
 ] }
 
@@ -81,12 +81,12 @@ serde_json = "1"
 wat = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2" }
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main" }
 wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "parity/napi-owned-v2", default-features = false, features = ["js", "web", "wasix1"] }
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["js", "web", "wasix1"] }
 wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", features = ["web"] }
 wasm-bindgen-test = "0.3.70"
 
