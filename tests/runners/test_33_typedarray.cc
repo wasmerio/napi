@@ -619,6 +619,21 @@ TEST_F(Test33TypedArray, ViewLayoutHoldsWhileTerminating) {
   ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
 }
 
+// The serdes binding unofficial_napi_create_serdes_binding returns is still
+// the binding while the caller makes more values.
+TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
+  EnvScope s(runtime_.get());
+  napi_value serdes = nullptr;
+  ASSERT_EQ(unofficial_napi_create_serdes_binding(s.env, &serdes), napi_ok);
+  SetGlobal(s.env, "serdes", serdes);
+  napi_value kinds =
+      RunBufferScript(s.env, "typeof serdes.Serializer + ' ' + typeof serdes.Deserializer");
+  char text[64] = {};
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, kinds, text, sizeof(text), &length), napi_ok);
+  EXPECT_STREQ(text, "function function");
+}
+
 // napi_is_detached_arraybuffer, like the other info calls over a detached or
 // out-of-bounds buffer, leaves an exception that was pending as it was and
 // adds none.

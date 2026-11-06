@@ -2871,7 +2871,9 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
 
   v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
+  // The binding is returned past this scope: escaped, it lives in the
+  // caller's.
+  v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
@@ -2919,7 +2921,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
     return napi_generic_failure;
   }
 
-  *result_out = napi_v8_wrap_value(env, target);
+  *result_out = napi_v8_wrap_value(env, handle_scope.Escape(target));
   return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
 }
 
