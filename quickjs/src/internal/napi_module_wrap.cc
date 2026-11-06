@@ -683,14 +683,38 @@ napi_status napi_module_wrap__::link(unofficial_napi_module module,
   return napi_ok;
 }
 
+// QuickJS runs script in the middle of a link when it throws there (an
+// unresolved request, an import the requested module does not export): the
+// error gets its stack through Error.prepareStackTrace. From there script can
+// reach these calls again, with the modules of the first link half done: a
+// second link takes one from "linking" to "linked" under the first, and
+// evaluating one crashes. So no link starts while one runs, as on V8.
+napi_status napi_module_wrap__::throw_if_linking()
+{
+  if (links_running_ == 0)
+    return napi_ok;
+  return throw_error("ERR_VM_MODULE_LINK_FAILURE", "A module instantiation is under way");
+}
+
+napi_status napi_module_wrap__::link_module(JSContext *ctx, JSModuleDef *module, const char *failure)
+{
+  napi_status status = throw_if_linking();
+  if (status != napi_ok)
+    return status;
+  links_running_++;
+  const int linked = JS_LinkModule(ctx, module);
+  links_running_--;
+  if (linked < 0)
+    return return_pending_exception(failure);
+  return napi_ok;
+}
+
 napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
 {
   record *entry = find(module);
   if (entry == nullptr)
     return napi_util__::invalid_arg(env_);
-  if (JS_LinkModule(entry->ctx, entry->module) < 0)
-    return return_pending_exception("Module linking failed");
-  return napi_ok;
+  return link_module(entry->ctx, entry->module, "Module linking failed");
 }
 
 // Evaluating a module whose evaluation is under way (from its own body or a
@@ -750,6 +774,14 @@ napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValu
   status = throw_if_importing_an_evaluating_synthetic_module(entry);
   if (status != napi_ok)
     return status;
+  // JS_EvaluateModule links a module that is not linked yet; that link is
+  // one as any other.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED)
+  {
+    status = link_module(entry->ctx, entry->module, "Failed to evaluate module");
+    if (status != napi_ok)
+      return status;
+  }
   // The module evaluates in its realm.
   JSValue promise = JS_EvaluateModule(entry->ctx, entry->module);
   if (JS_IsException(promise))
@@ -1099,6 +1131,10 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   status = throw_if_importing_an_evaluating_synthetic_module(entry);
   if (status != napi_ok)
     return status;
+  // Linking the facade links that module too.
+  status = throw_if_linking();
+  if (status != napi_ok)
+    return status;
 
   JSContext *ctx = entry->ctx;
   std::string filename = "<required-module-facade:" +
@@ -1125,11 +1161,16 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   }
 
   if (JS_GetModuleRequestCount(ctx, facade) < 1 ||
-      JS_SetModuleRequestModule(ctx, facade, 0, entry->module) < 0 ||
-      JS_LinkModule(ctx, facade) < 0)
+      JS_SetModuleRequestModule(ctx, facade, 0, entry->module) < 0)
   {
     JS_FreeValue(ctx, facade_value);
     return return_pending_exception("Failed to link required module facade");
+  }
+  status = link_module(ctx, facade, "Failed to link required module facade");
+  if (status != napi_ok)
+  {
+    JS_FreeValue(ctx, facade_value);
+    return status;
   }
 
   JSValue promise = JS_EvaluateModule(ctx, facade);

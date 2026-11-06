@@ -682,3 +682,83 @@ TEST_F(Test77ModuleWrapState, EvaluatingAModuleThatImportsAnEvaluatingSyntheticM
     }
   }
 }
+
+// No link starts while one runs, on QuickJS too: instantiate, and evaluate or
+// the facade on a module that is not linked, are refused with
+// ERR_VM_MODULE_LINK_FAILURE. QuickJS runs script in the middle of a link
+// when it throws there (a request that does not resolve, an import the
+// requested module does not export): the error gets its stack through an
+// Error.prepareStackTrace getter. Evaluating the module being linked crashed
+// (SIGSEGV), and a second link took the module from "linking" to "linked"
+// under the first. The asking calls answer as usual, and the failed link
+// leaves the modules ready to link and instantiate.
+TEST_F(Test77ModuleWrapState, NoLinkStartsWhileOneRunsFromPrepareStackTrace) {
+  for (bool resolves : {false, true}) {
+    SCOPED_TRACE(resolves ? "missing export" : "unresolved request");
+    EnvScope s(runtime_.get());
+    InstantiationProbe probe;
+    napi_value fn = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_create_function(s.env, "callsDuringInstantiation", NAPI_AUTO_LENGTH,
+                                   CallsDuringInstantiation, &probe, &fn),
+              napi_ok);
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "callsDuringInstantiation", fn), napi_ok);
+    ASSERT_EQ(RunText(s.env,
+                      "Object.defineProperty(Error, 'prepareStackTrace', {"
+                      "  configurable: true,"
+                      "  get() { callsDuringInstantiation(); return undefined; },"
+                      "}); 'set'"),
+              "set");
+    unofficial_napi_module dependency = CreateSourceTextModule(s.env, "export const value = 1;");
+    probe.module = CreateSourceTextModule(
+        s.env, "import { missing } from 'dependency'; export default missing;");
+    probe.other = CreateSourceTextModule(s.env, "export const value = 1;");
+    ASSERT_NE(dependency, nullptr);
+    ASSERT_NE(probe.module, nullptr);
+    ASSERT_NE(probe.other, nullptr);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+    if (resolves) {
+      ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.module, 1, &dependency), napi_ok);
+    }
+
+    EXPECT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module),
+              napi_pending_exception);
+    EXPECT_NE(TakePendingMessage(s.env), "");
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+    // V8 reads Error.prepareStackTrace only when a stack is read, so no
+    // script runs while it instantiates here.
+    EXPECT_TRUE(probe.entered);
+#endif
+    if (probe.entered) {
+      const std::string refused =
+          "10 ERR_VM_MODULE_LINK_FAILURE: A module instantiation is under way";
+      EXPECT_EQ(probe.outcomes, (std::vector<std::string>{
+                                    "instantiate " + refused,
+                                    "instantiate other " + refused,
+                                    "evaluate " + refused,
+                                    "evaluate_sync " + refused,
+                                    "facade " + refused,
+                                    "check 0 settled",
+                                    "namespace 10 ERR_MODULE_NOT_INSTANTIATED: "
+                                    "Module is not instantiated",
+                                }));
+    }
+    EXPECT_EQ(Status(s.env, probe.module), kUninstantiated);
+    EXPECT_EQ(Status(s.env, probe.other), kUninstantiated);
+
+    ASSERT_EQ(RunText(s.env, "delete Error.prepareStackTrace; 'gone'"), "gone");
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.other, 0, nullptr), napi_ok);
+    unofficial_napi_module linked = CreateSourceTextModule(
+        s.env, "import { value } from 'other'; export default value;");
+    ASSERT_NE(linked, nullptr);
+    ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, linked, 1, &probe.other), napi_ok);
+    ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, linked), napi_ok);
+    EXPECT_EQ(Status(s.env, linked), kInstantiated);
+    EXPECT_EQ(Status(s.env, probe.other), kInstantiated);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, linked), napi_ok);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+  }
+}

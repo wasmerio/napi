@@ -116,6 +116,8 @@ private:
   JSValue clone_attributes(JSValueConst value) const;
   napi_status throw_error(const char *code, const char *message);
   napi_status return_pending_exception(const char *message);
+  napi_status throw_if_linking();
+  napi_status link_module(JSContext *ctx, JSModuleDef *module, const char *failure);
   napi_status throw_if_evaluating(record *entry);
   napi_status throw_if_importing_an_evaluating_synthetic_module(record *entry);
   napi_status evaluate_unless_terminated(record *entry, JSValue *promise_out);
@@ -142,6 +144,8 @@ private:
   uint64_t facade_counter_ = 0;
   // Synthetic modules whose evaluation steps are running.
   int synthetic_steps_running_ = 0;
+  // Links running (see link_module).
+  int links_running_ = 0;
 
   // Subsystem lifecycle.
   bool torn_down_ = false;
