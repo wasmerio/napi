@@ -17,6 +17,11 @@ pub mod util;
 #[path = "util_js.rs"]
 pub mod util;
 
+/// How far, in code units, the JS backend scans for a `NAPI_AUTO_LENGTH`
+/// string's terminator (util_js.rs), and the V8 backend for a UTF-16 one. The
+/// V8 backend's UTF-8 and Latin-1 strings scan to the end of guest memory, or
+/// for names and messages to `V8_MAX_STRING_BYTES` (util.rs
+/// `read_guest_c_string`).
 pub const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;
 
 /// Hard ceilings on host scratch buffers sized by a guest-supplied *count*
