@@ -15,9 +15,14 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+#endif
 
 class Test73TerminationUntilCancelled : public FixtureTestBase {};
 
@@ -1010,6 +1015,35 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
       "try { createRealm(); } catch (e) { caught = 'yes'; caughtError = e; }\nafter = 'yes';\n");
   g_token_armed = false;
   napi_delete_reference(s.env, g_token_fn);
+}
+
+// A native function that terminates, called by the embedder from C++ with JS
+// execution disallowed (v8::Isolate::DisallowJavascriptExecutionScope, which
+// QuickJS has no counterpart of). No JS called it, so there is none to stop,
+// and V8 aborts on any JS run there: the provider must run none. The
+// termination stays in effect.
+TEST_F(Test73TerminationUntilCancelled, NativeFunctionCalledFromCppWithJsDisallowed) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  napi_value terminate = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, Global(s.env), "terminate", &terminate), napi_ok);
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  ASSERT_NE(isolate, nullptr);
+  {
+    v8::HandleScope handle_scope(isolate);
+    // This provider's napi_value is a v8::Local.
+    v8::Local<v8::Value> value;
+    std::memcpy(static_cast<void*>(&value), &terminate, sizeof(terminate));
+    v8::Local<v8::Function> fn = value.As<v8::Function>();
+    v8::Local<v8::Context> context = fn->GetCreationContextChecked();
+    v8::Isolate::DisallowJavascriptExecutionScope no_js(
+        isolate, v8::Isolate::DisallowJavascriptExecutionScope::CRASH_ON_FAILURE);
+    v8::TryCatch try_catch(isolate);
+    (void)fn->Call(context, v8::Undefined(isolate), 0, nullptr);
+  }
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception);
+  FinishTermination(s.env);
+  EXPECT_EQ(GlobalText(s.env, "afterCall"), "no");
 }
 
 // unofficial_napi_create_realm first runs the unassign hooks of the realms

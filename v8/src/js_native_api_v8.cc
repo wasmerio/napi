@@ -682,17 +682,24 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
   return true;
 }
 
-// For a callback V8 runs for JS (a native function, an accessor, a module
-// hook) that returns while the env terminates: makes V8 unwind that JS with
+// For a callback V8 runs (a native function, an accessor, a module hook)
+// that returns while the env terminates: makes V8 unwind the JS below it with
 // the termination now. V8 may have forgotten it (an N-API call that entered
 // V8 since cleared it) or not acted on it yet (it acts on a request at its
 // next stack check, which the JS after the call, a catch block say, need not
 // reach). So this asks again and calls a no-op function, whose entry is such
-// a check. Called only below JS, which the termination then unwinds.
-void KeepTerminating(napi_env env) {
+// a check. A native function the embedder called from C++ has no JS below it
+// to stop, and its caller may have disallowed JS (V8 aborts on JS run then):
+// with `only_below_js`, asking again is all this does then. A module hook
+// must leave V8 with an exception, so it always calls the function.
+void KeepTerminating(napi_env env, bool only_below_js) {
   v8::Isolate* isolate = env->isolate;
   if (isolate->IsExecutionTerminating()) return;
   v8::HandleScope handle_scope(isolate);
+  if (only_below_js && v8::StackTrace::CurrentStackTrace(isolate, 1)->GetFrameCount() == 0) {
+    isolate->TerminateExecution();
+    return;
+  }
   v8::Local<v8::Context> context = env->main_context();
   v8::Local<v8::Function> probe;
   if (!env->agent->termination_probe.IsEmpty()) {
@@ -718,7 +725,7 @@ void KeepTerminating(napi_env env) {
 bool HandleCallbackException(napi_env env) {
   if (TerminatedOrTerminating(env)) {
     ClearLastException(env);
-    KeepTerminating(env);
+    KeepTerminating(env, /*only_below_js=*/true);
     return true;
   }
   if (env->last_exception.IsEmpty()) return false;
@@ -939,7 +946,7 @@ bool napi_v8_rethrow_pending_exception(napi_env env) {
   // make the termination a catchable throw and cancel it.
   if (TerminatedOrTerminating(env)) {
     ClearLastException(env);
-    KeepTerminating(env);
+    KeepTerminating(env, /*only_below_js=*/false);
     return true;
   }
   bool pending = false;
