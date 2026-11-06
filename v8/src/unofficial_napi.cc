@@ -2631,6 +2631,7 @@ napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
                               static_cast<v8::PropertyFilter>(filter_bits),
                               v8::IndexFilter::kSkipIndices)
            .ToLocal(&properties)) {
+    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
     if (try_catch.HasCaught()) {
       napi_v8_set_last_exception(
           env, try_catch.Exception(), try_catch.Message());

@@ -547,6 +547,73 @@ TEST_F(Test73TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
   }
 }
 
+// N-API calls that run JS a termination stops, made by the embedder outside
+// any JS: they must fail with napi_pending_exception and leave the
+// termination pending, as napi_run_script does. Each payload's JS calls
+// terminateJs(). Only V8's create_realm reads a sandbox's own keys (to keep
+// them), so only there does a proxy sandbox run JS.
+constexpr const char* kStoppedCalls[] = {
+    "unofficial_napi_run_script",
+    "unofficial_napi_module_wrap_evaluate",
+    "unofficial_napi_module_wrap_evaluate_sync",
+    "unofficial_napi_get_own_non_index_properties (proxy)",
+#if defined(NAPI_TEST_ENGINE_V8)
+    "unofficial_napi_create_realm (proxy sandbox)",
+#endif
+};
+constexpr int kStoppedCallCount = sizeof(kStoppedCalls) / sizeof(kStoppedCalls[0]);
+
+TEST_F(Test73TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) {
+  for (int kind = 0; kind < kStoppedCallCount; ++kind) {
+    SCOPED_TRACE(kStoppedCalls[kind]);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    unofficial_napi_module module = MakeModule(s.env, "terminateJs();", nullptr);
+    ASSERT_NE(module, nullptr);
+    napi_value proxy =
+        Eval(s.env, "new Proxy({}, { ownKeys() { terminateJs(); afterCall = 'yes'; return []; } })");
+    napi_value out = nullptr;
+    napi_status status = napi_ok;
+    switch (kind) {
+      case 0: {
+        const unofficial_napi_js_source source =
+            unofficial_napi_js_source_from_text(Str(s.env, "terminateJs(); afterCall = 'yes';"));
+        status = unofficial_napi_run_script(s.env, nullptr, &source, Str(s.env, "stopped.js"), 0,
+                                            0, -1, true, false, false, nullptr, &out);
+        break;
+      }
+      case 1:
+        status = unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &out);
+        break;
+      case 2:
+        status = unofficial_napi_module_wrap_evaluate_sync(s.env, module, Str(s.env, "m.mjs"),
+                                                           Str(s.env, "parent.js"), &out);
+        break;
+      case 3:
+        status = unofficial_napi_get_own_non_index_properties(s.env, proxy, 0, &out);
+        break;
+      default: {
+        unofficial_napi_realm_options options;
+        unofficial_napi_realm_options_init(&options);
+        options.sandbox_or_null = proxy;
+        unofficial_napi_realm realm = nullptr;
+        status = unofficial_napi_create_realm(s.env, &options, &realm, &out);
+        break;
+      }
+    }
+    EXPECT_EQ(status, napi_pending_exception);
+    bool pending = false;
+    EXPECT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+    EXPECT_TRUE(pending) << "nothing pending after the call";
+    // Cancelling without taking it drops it: it stands for the termination.
+    EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+    EXPECT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+    EXPECT_FALSE(pending) << "the termination is still pending after the cancel";
+    EXPECT_EQ(Flags(s.env), kNothingRan);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+}
+
 // The same native code, called from the module hooks test_72 covers: those
 // see what the native function threw.
 TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideModuleHooks) {

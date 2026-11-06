@@ -130,7 +130,9 @@ bool IsNullish(napi_env env, napi_value value) {
 }
 
 napi_status ThrowTryCatchException(napi_env env, v8::TryCatch& try_catch) {
-  if (env == nullptr || !try_catch.HasCaught() || try_catch.HasTerminated()) {
+  // A termination stays: it is what the call fails with.
+  if (env != nullptr && try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+  if (env == nullptr || !try_catch.HasCaught()) {
     return napi_pending_exception;
   }
   v8::Local<v8::Value> exception = try_catch.Exception();
@@ -1809,7 +1811,8 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
     // creation must retain V8's normal, uncaught lifecycle.
     v8::TryCatch try_catch(isolate);
     if (!SnapshotOwnProperties(isolate, current, sandbox, &saved_properties)) {
-      if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+      if (try_catch.HasCaught()) {
         napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
       }
       return napi_pending_exception;
@@ -2217,6 +2220,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
       }
       return ThrowTryCatchException(env, try_catch);
     }
+    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
     return napi_generic_failure;
   }
 
@@ -2248,7 +2252,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
     // ran the script go on: it keeps unwinding instead, as in Node, which
     // checks env->is_stopping() first.
     if (env->agent->termination_requested.load(std::memory_order_acquire)) {
-      return napi_pending_exception;
+      return napi_v8_fail_terminating(env);
     }
     isolate->CancelTerminateExecution();
 
@@ -2274,10 +2278,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
       unofficial_napi_internal::AttachSyntaxArrowMessage(
           isolate, target_context, try_catch.Exception(), try_catch.Message());
     }
-    if (!try_catch.HasTerminated()) {
-      return ThrowTryCatchException(env, try_catch);
-    }
-    return napi_pending_exception;
+    return ThrowTryCatchException(env, try_catch);
   }
 
   v8::Local<v8::Value> result;
@@ -2870,9 +2871,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
   v8::TryCatch try_catch(isolate);
   auto maybe = module->InstantiateModule(context, ModuleResolveCallback, ModuleResolveSourceCallback);
   if (maybe.IsNothing()) {
-    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      return ThrowTryCatchException(env, try_catch);
-    }
+    // A termination too: it stays, and is what the call fails with.
+    if (try_catch.HasCaught()) return ThrowTryCatchException(env, try_catch);
     return napi_generic_failure;
   }
   return napi_ok;
@@ -2896,9 +2896,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   v8::TryCatch try_catch(isolate);
   v8::Local<v8::Value> result;
   if (!module->Evaluate(context).ToLocal(&result)) {
-    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      return ThrowTryCatchException(env, try_catch);
-    }
+    // A termination too: it stays, and is what the call fails with.
+    if (try_catch.HasCaught()) return ThrowTryCatchException(env, try_catch);
     return napi_generic_failure;
   }
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(result));
@@ -2925,9 +2924,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
   v8::TryCatch try_catch(isolate);
   v8::Local<v8::Value> result;
   if (!module->Evaluate(context).ToLocal(&result)) {
-    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      return ThrowTryCatchException(env, try_catch);
-    }
+    // A termination too: it stays, and is what the call fails with.
+    if (try_catch.HasCaught()) return ThrowTryCatchException(env, try_catch);
     return napi_generic_failure;
   }
   if (!result->IsPromise()) return napi_generic_failure;
