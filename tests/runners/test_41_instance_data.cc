@@ -302,13 +302,33 @@ TEST_F(Test41InstanceData, WhatTheInstanceDataFinalizerLeavesIsReleasedInTheSame
 
 namespace {
 
-// Memory an external buffer was made over, which its finalizer frees.
+bool IsDetached(napi_env env, napi_ref ref) {
+  napi_value value = nullptr;
+  bool detached = false;
+  return napi_get_reference_value(env, ref, &value) == napi_ok &&
+         napi_is_detached_arraybuffer(env, value, &detached) == napi_ok && detached;
+}
+
+// Memory an external buffer was made over, which its finalizer frees. With
+// `buffer` set, the finalizer records whether that array buffer was detached
+// when it ran.
 struct Owned {
   int frees = 0;
+  napi_ref buffer = nullptr;
+  bool detached_when_freed = false;
 };
 
-void FreeOwned(node_api_basic_env, void* data, void* hint) {
-  ++static_cast<Owned*>(hint)->frees;
+void FreeOwned(node_api_basic_env basic_env, void* data, void* hint) {
+  auto* owned = static_cast<Owned*>(hint);
+  ++owned->frees;
+  if (owned->buffer != nullptr) {
+    auto env = const_cast<napi_env>(basic_env);
+    napi_handle_scope scope = nullptr;
+    if (napi_open_handle_scope(env, &scope) == napi_ok) {
+      owned->detached_when_freed = IsDetached(env, owned->buffer);
+      napi_close_handle_scope(env, scope);
+    }
+  }
   std::free(data);
 }
 
@@ -349,13 +369,6 @@ struct AfterFree {
   bool buffer_detached = false;
 };
 
-bool IsDetached(napi_env env, napi_ref ref) {
-  napi_value value = nullptr;
-  bool detached = false;
-  return napi_get_reference_value(env, ref, &value) == napi_ok &&
-         napi_is_detached_arraybuffer(env, value, &detached) == napi_ok && detached;
-}
-
 void InspectFreedBuffers(napi_env env, void* data, void*) {
   auto* after = static_cast<AfterFree*>(data);
   after->frees_seen = after->array_buffer_memory.frees + after->buffer_memory.frees;
@@ -376,9 +389,9 @@ void InspectFreedBuffers(napi_env env, void* data, void*) {
 
 }  // namespace
 
-// As Node does, an external buffer is detached before its finalizer frees
-// the memory, so code that runs later at release cannot read freed memory
-// through it. The V8 provider does not detach them yet.
+// As Node's CallbackInfo::Clean does, an external buffer is detached before
+// its finalizer frees the memory, so code that runs later at release sees it
+// detached, never the freed memory. The V8 provider does not detach them yet.
 TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRelease) {
   EnvScope s(runtime_.get());
   AfterFree after;
@@ -402,18 +415,21 @@ TEST_F(Test41InstanceData, ExternalBuffersAreDetachedBeforeTheirFinalizersAtRele
   ASSERT_EQ(napi_create_reference(s.env, view, 1, &after.view), napi_ok);
   ASSERT_EQ(napi_create_reference(s.env, buffer_array_buffer, 1, &after.buffer_array_buffer),
             napi_ok);
+  after.array_buffer_memory.buffer = after.array_buffer;
+  after.buffer_memory.buffer = after.buffer_array_buffer;
   ASSERT_EQ(napi_set_instance_data(s.env, &after, InspectFreedBuffers, nullptr), napi_ok);
 
   Release(s);
   EXPECT_EQ(after.frees_seen, 2);
   EXPECT_EQ(after.array_buffer_memory.frees, 1);
   EXPECT_EQ(after.buffer_memory.frees, 1);
+  EXPECT_TRUE(after.array_buffer_memory.detached_when_freed);
+  EXPECT_TRUE(after.buffer_memory.detached_when_freed);
   EXPECT_TRUE(after.array_buffer_detached);
-  // QuickJS refuses the info of a detached buffer; either way it does not
-  // hand out the freed memory.
-  EXPECT_TRUE(after.info_status != napi_ok ||
-              (after.info_data == nullptr && after.info_length == 0))
-      << "status " << after.info_status << ", length " << after.info_length;
+  // A detached array buffer has no data and a byte length of 0, as in Node.
+  EXPECT_EQ(after.info_status, napi_ok);
+  EXPECT_EQ(after.info_data, nullptr);
+  EXPECT_EQ(after.info_length, 0u);
   EXPECT_EQ(after.element, napi_undefined);
   EXPECT_TRUE(after.buffer_detached);
 }

@@ -30,7 +30,8 @@ struct napi_external_backing_store_hint__
 
   void invoke_finalizer();
   // The external array buffer this hint backs let go of the memory: it was
-  // detached or freed.
+  // detached or freed. Runs the finalizer and destroys the hint, unless
+  // teardown is detaching the buffer and does both itself.
   void release_array_buffer(JSRuntime *rt);
   // Remembers the external array buffer this hint backs, so teardown can
   // detach it before running the finalizer.
@@ -40,8 +41,7 @@ struct napi_external_backing_store_hint__
   // pending list until it runs or the hint is destroyed.
   void link_pending(napi_intrinsic_link__ &pending);
   static napi_external_backing_store_hint__ *first_pending(napi_intrinsic_link__ &pending);
-  // Runs the finalizer, detaching the array buffer first. May destroy the
-  // hint.
+  // Detaches the array buffer, then runs the finalizer. May destroy the hint.
   void finalize_at_teardown();
   // Leaves the pending list for good: the finalizer will not run.
   void abandon_finalizer();

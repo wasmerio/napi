@@ -95,9 +95,12 @@ void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)
   if (released_)
     return;
   released_ = true;
+  // Teardown runs the finalizer itself, once the buffer is marked detached,
+  // and destroys the hint.
+  if (detaching_)
+    return;
   invoke_finalizer();
-  if (!detaching_)
-    destroy_with_runtime(rt, this);
+  destroy_with_runtime(rt, this);
 }
 
 void napi_external_backing_store_hint__::track_array_buffer(JSContext *ctx,
@@ -135,23 +138,26 @@ void napi_external_backing_store_hint__::finalize_at_teardown()
 {
   if (JS_GetNativeWeakRefFromLink(&array_buffer_link_) != nullptr)
   {
-    // As Node does, detach the buffer first, so nothing can reach the memory
-    // the finalizer frees. Detaching runs the finalizer, unless
-    // ArrayBuffer.prototype.transfer already moved the memory to a buffer this
-    // hint cannot reach (Node cannot either). The reference keeps the buffer
-    // alive in case the finalizer drops the last other one.
+    // As Node's CallbackInfo::Clean does, detach the buffer before the
+    // finalizer runs, so the finalizer and the code after it see it detached
+    // and nothing reaches the memory the finalizer frees. The detach lets go
+    // of the memory, unless ArrayBuffer.prototype.transfer already moved it to
+    // a buffer this hint cannot reach (Node cannot either). The reference
+    // keeps the buffer alive in case the finalizer drops the last other one.
     JSContext *ctx = env_->main_context();
     JSValue array_buffer = JS_DupValue(ctx, array_buffer_);
     detaching_ = true;
     JS_DetachArrayBuffer(ctx, array_buffer);
     detaching_ = false;
-    JS_FreeValue(ctx, array_buffer);
-    if (finalize_invoked_)
+    if (released_)
     {
       // The buffer no longer refers to the hint.
+      invoke_finalizer();
+      JS_FreeValue(ctx, array_buffer);
       destroy(this);
       return;
     }
+    JS_FreeValue(ctx, array_buffer);
   }
   invoke_finalizer();
 }
