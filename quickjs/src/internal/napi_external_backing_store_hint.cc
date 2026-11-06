@@ -26,6 +26,7 @@ napi_external_backing_store_hint__::~napi_external_backing_store_hint__()
   finalize_cb_ = nullptr;
   finalize_hint_ = nullptr;
   finalize_invoked_ = false;
+  released_ = false;
   weak_target_ = JS_UNDEFINED;
 }
 
@@ -88,6 +89,12 @@ void napi_external_backing_store_hint__::invoke_finalizer()
 
 void napi_external_backing_store_hint__::release_array_buffer(JSRuntime *rt)
 {
+  // QuickJS marks the buffer detached only once this returns, so a finalizer
+  // that detaches the same buffer again calls back in here: the outer call
+  // finishes, and destroys the hint once.
+  if (released_)
+    return;
+  released_ = true;
   invoke_finalizer();
   if (!detaching_)
     destroy_with_runtime(rt, this);

@@ -78,6 +78,8 @@ private:
   JSNativeWeakRefLink array_buffer_link_{};
   // Teardown is detaching array_buffer_ and destroys the hint itself.
   bool detaching_ = false;
+  // The array buffer let go of the memory (release_array_buffer ran).
+  bool released_ = false;
 };
 
 #endif // NAPI_QUICKJS_EXTERNAL_BACKING_STORE_HINT_H_

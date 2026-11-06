@@ -87,6 +87,87 @@ TEST_F(Test33TypedArray, ExternalArrayBufferTransferAndDetachFinalizeOnce) {
   EXPECT_EQ(state.finalized, 1);
 }
 
+namespace {
+
+void CountFinalizer(node_api_basic_env, void*, void* hint) {
+  ++*static_cast<int*>(hint);
+}
+
+// An external array buffer whose finalizer detaches the buffer again, then
+// makes an external, kept on the global.
+struct SelfDetaching {
+  uint8_t bytes[8] = {};
+  napi_ref buffer = nullptr;
+  int finalized = 0;
+  napi_status detach_status = napi_generic_failure;
+  bool detached = false;
+  napi_status made_status = napi_generic_failure;
+  int made_finalized = 0;
+};
+
+void FinalizeDetachingItself(node_api_basic_env basic_env, void* data, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
+  auto* state = static_cast<SelfDetaching*>(hint);
+  EXPECT_EQ(data, state->bytes);
+  ++state->finalized;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return;
+  napi_value buffer = nullptr;
+  if (napi_get_reference_value(env, state->buffer, &buffer) == napi_ok && buffer != nullptr) {
+    state->detach_status = napi_detach_arraybuffer(env, buffer);
+    napi_is_detached_arraybuffer(env, buffer, &state->detached);
+  }
+  napi_value external = nullptr;
+  napi_value global = nullptr;
+  if (napi_create_external(env, nullptr, CountFinalizer, &state->made_finalized, &external) ==
+          napi_ok &&
+      napi_get_global(env, &global) == napi_ok) {
+    state->made_status = napi_set_named_property(env, global, "madeInFinalizer", external);
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+}  // namespace
+
+// The finalizer of an external array buffer may detach that buffer again
+// (napi_detach_arraybuffer runs the finalizer before the buffer is marked
+// detached on some engines). It still runs once, and the provider's
+// bookkeeping stays intact for the values made after it.
+TEST_F(Test33TypedArray, ExternalArrayBufferItsFinalizerDetachesIsFinalizedOnce) {
+  SelfDetaching state;
+  int others = 0;
+  {
+    EnvScope s(runtime_.get());
+    napi_value buffer = nullptr;
+    ASSERT_EQ(napi_create_external_arraybuffer(s.env, state.bytes, sizeof(state.bytes),
+                                               FinalizeDetachingItself, &state, &buffer),
+              napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, buffer, 1, &state.buffer), napi_ok);
+    ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+    // A provider that defers the finalizer runs it here.
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+              napi_ok);
+    EXPECT_EQ(state.finalized, 1);
+    EXPECT_EQ(state.detach_status, napi_ok);
+    EXPECT_TRUE(state.detached);
+    EXPECT_EQ(state.made_status, napi_ok);
+    ASSERT_EQ(napi_delete_reference(s.env, state.buffer), napi_ok);
+
+    // Values made afterwards each get their own finalizer record.
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+    for (const char* name : {"first", "second", "third"}) {
+      napi_value external = nullptr;
+      ASSERT_EQ(napi_create_external(s.env, nullptr, CountFinalizer, &others, &external), napi_ok);
+      ASSERT_EQ(napi_set_named_property(s.env, global, name, external), napi_ok);
+    }
+  }
+  EXPECT_EQ(state.finalized, 1);
+  EXPECT_EQ(state.made_finalized, 1);
+  EXPECT_EQ(others, 3);
+}
+
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
 TEST_F(Test33TypedArray, ExternalArrayBufferResizeFailurePreservesBackingStore) {
   ExternalBufferState state;
