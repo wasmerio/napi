@@ -152,14 +152,24 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // 2. The finalizer of every value still pending runs: napi_wrap,
 //    napi_create_external, napi_add_finalizer, external ArrayBuffers and
 //    Buffers. Values of one kind are finalized most recent first, as Node's
-//    FinalizeAll does; the order between kinds is not specified. An external
-//    ArrayBuffer or Buffer is detached before its finalizer runs, as Node's
-//    CallbackInfo::Clean does, so the finalizer and the code that runs after
-//    it see it detached (byte length 0), never the freed memory. A buffer
-//    that ArrayBuffer.prototype.transfer moved the memory to is not detached:
-//    neither provider, nor Node, can reach it. 1 and 2 repeat until neither
-//    has anything left.
-// 3. The instance-data finalizer runs, after all of those.
+//    FinalizeAll does (also when a finalizer runs
+//    unofficial_napi_event_loop_checkpoint); the order between kinds is not
+//    specified. An external ArrayBuffer or Buffer is detached before its
+//    finalizer runs, as Node's CallbackInfo::Clean does, so the finalizer and
+//    the code that runs after it see it detached (no data, byte length 0),
+//    never the freed memory. The exception is a buffer that
+//    ArrayBuffer.prototype.transfer moved the memory to: neither provider can
+//    find it to detach it (QuickJS learns of it only once it is freed, and
+//    Node cannot either), so the finalizer still runs in its turn and frees
+//    memory that buffer still exposes; code that reads it later in the
+//    release reads freed memory, as in Node. (Waiting for that buffer to be
+//    freed would leak the memory instead: a buffer still alive is freed only
+//    after this pass.) A wrapped object lets go of its wrap before the wrap's
+//    finalizer runs: from then on napi_unwrap and napi_remove_wrap return
+//    napi_invalid_arg for it, as for an object never wrapped. 1 and 2 repeat
+//    until neither has anything left.
+// 3. The instance-data finalizer runs, after all of those, whatever the data
+//    (NULL too), as in Node.
 // 4. 1 to 3 repeat for whatever the instance-data finalizer leaves pending
 //    (values it made and kept, hooks it added, instance data it set), until
 //    nothing is pending, as Node's FinalizeAll finalizes until its lists are
@@ -168,12 +178,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 //
 // After each hook and finalizer, an exception it left pending is dropped:
 // nothing can catch it then (Node's CallIntoModule drops it too once JS can
-// no longer run). Each runs on the env's thread, in the env's realm (also when
-// another realm was entered when the release began), with N-API usable.
-// References made with napi_create_reference keep their values until all of
-// them have run. A finalizer the engine would call after this pass, while it
-// frees the engine instance, is dropped, and nothing touches the env once it
-// is freed.
+// no longer run). An engine may run a finalizer in the middle of other code,
+// when that code frees the last reference to a value (QuickJS does): there
+// only the finalizer's own exception is dropped, and one that JS is throwing,
+// or that a hook has pending, is kept. Each runs on the env's thread, in the
+// env's realm (also when another realm was entered when the release began),
+// with N-API usable. References made with napi_create_reference keep their
+// values until all of them have run. A finalizer the engine would call after
+// this pass, while it frees the engine instance, is dropped, and nothing
+// touches the env once it is freed.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);

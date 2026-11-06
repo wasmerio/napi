@@ -348,8 +348,9 @@ void ForgetExternalArrayBuffer(napi_env env, uint64_t id) {
 // queues it, and FinalizeExternalBackingStoreHints runs it next. Either way
 // the finalizer is claimed once, under the lock. A buffer that
 // ArrayBuffer.prototype.transfer moved the store to is not reachable from
-// here (Node cannot reach it either); the one it moved it from is detached
-// already.
+// here (Node cannot reach it either), and the one it moved it from is
+// detached already: the store stays alive, and the finalizer frees memory
+// that buffer still exposes.
 void FinalizeNewestExternalArrayBuffer(napi_env env) {
   auto newest = std::prev(env->external_array_buffers.end());
   const uint64_t id = newest->first;

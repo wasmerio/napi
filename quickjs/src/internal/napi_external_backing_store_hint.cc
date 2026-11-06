@@ -163,8 +163,12 @@ void napi_external_backing_store_hint__::finalize_at_teardown()
     // finalizer runs, so the finalizer and the code after it see it detached
     // and nothing reaches the memory the finalizer frees. The detach lets go
     // of the memory, unless ArrayBuffer.prototype.transfer already moved it to
-    // a buffer this hint cannot reach (Node cannot either). The reference
-    // keeps the buffer alive in case the finalizer drops the last other one.
+    // another buffer. That buffer holds this hint, but the hint cannot find
+    // it to detach it (Node cannot either), so the finalizer below frees
+    // memory it still exposes; waiting for its release instead would leak the
+    // memory, since a buffer alive now is freed only after the release pass.
+    // The reference keeps the buffer alive in case the finalizer drops the
+    // last other one.
     array_buffer = JS_DupValue(ctx, array_buffer_);
     detaching_ = true;
     JS_DetachArrayBuffer(ctx, array_buffer);
