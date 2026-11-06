@@ -58,6 +58,8 @@ struct UnofficialEnvScope {
   std::optional<v8::Global<v8::Context>> context;
   std::optional<v8::Context::Scope> context_scope;
   napi_env env = nullptr;
+  // Set while unofficial_napi_release_env runs for this owner.
+  bool releasing = false;
 
   explicit UnofficialEnvScope(
       v8::Isolate* isolate_in,
@@ -1933,6 +1935,10 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
                             void* shutdown_pump_handle) {
   if (owner == nullptr) return napi_invalid_arg;
   auto* scope = reinterpret_cast<UnofficialEnvScope*>(owner);
+  // A hook, a finalizer or a native function the release runs may call it
+  // again: that call is refused, and the release under way goes on.
+  if (scope->releasing) return napi_invalid_arg;
+  scope->releasing = true;
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {

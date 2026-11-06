@@ -45,6 +45,8 @@ namespace
         JSContext *ctx = nullptr;
         std::unique_ptr<napi_agent__> agent;
         napi_env env = nullptr;
+        // Set while unofficial_napi_release_env runs for this owner.
+        bool releasing = false;
     };
 
     napi_status DestroyEnvInstance(napi_env env)
@@ -65,6 +67,11 @@ namespace
             return napi_invalid_arg;
 
         auto *scope = reinterpret_cast<UnofficialEnvScope *>(owner);
+        // A hook, a finalizer or a native function the release runs may call
+        // it again: that call is refused, and the release under way goes on.
+        if (scope->releasing)
+            return napi_invalid_arg;
+        scope->releasing = true;
         napi_status status = napi_ok;
         napi_env env_to_delete = nullptr;
         if (scope->env != nullptr)

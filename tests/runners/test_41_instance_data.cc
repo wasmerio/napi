@@ -1515,3 +1515,81 @@ TEST_F(Test41InstanceData, NativeFunctionsRunAtRelease) {
                                       "instance-data finalizer: ok"}));
   EXPECT_EQ(native.calls, 6);
 }
+
+namespace {
+
+// Calls to release an env again while its release runs, and what each
+// returned.
+struct ReleasingAgain {
+  unofficial_napi_env_owner owner = nullptr;
+  std::vector<napi_status> statuses;
+  int finalized = 0;
+};
+
+void HookReleasingItsOwnEnv(void* arg) {
+  auto* again = static_cast<ReleasingAgain*>(arg);
+  again->statuses.push_back(unofficial_napi_release_env(again->owner, nullptr));
+}
+
+napi_value ReleaseFromANativeFunction(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data);
+  auto* again = static_cast<ReleasingAgain*>(data);
+  again->statuses.push_back(unofficial_napi_release_env(again->owner, nullptr));
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+struct HookScript {
+  napi_env env = nullptr;
+  napi_status status = napi_generic_failure;
+};
+
+void HookRunningAScriptThatReleases(void* arg) {
+  auto* hook = static_cast<HookScript*>(arg);
+  napi_value source = nullptr;
+  napi_value result = nullptr;
+  napi_create_string_utf8(hook->env, "releaseAgain()", NAPI_AUTO_LENGTH, &source);
+  hook->status = napi_run_script(hook->env, source, &result);
+}
+
+void FinalizeReleasingAgain(node_api_basic_env, void*, void* hint) {
+  auto* again = static_cast<ReleasingAgain*>(hint);
+  ++again->finalized;
+  again->statuses.push_back(unofficial_napi_release_env(again->owner, nullptr));
+}
+
+}  // namespace
+
+// unofficial_napi_release_env called again for an env while its release runs
+// (from a cleanup hook, from a native function a hook's script calls, from a
+// finalizer) returns napi_invalid_arg and does nothing; the release under way
+// goes on and finishes. Both providers freed the env and its engine instance
+// under the release that was running, which then crashed.
+TEST_F(Test41InstanceData, ReleasingAnEnvWhileItsReleaseRunsIsRefused) {
+  EnvScope s(runtime_.get());
+  ReleasingAgain again;
+  again.owner = s.scope;
+  HookScript hook;
+  hook.env = s.env;
+  napi_value function = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "releaseAgain", NAPI_AUTO_LENGTH,
+                                 ReleaseFromANativeFunction, &again, &function),
+            napi_ok);
+  Keep(s.env, "releaseAgain", function);
+  // Most recent first: the hook that releases, then the script.
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookRunningAScriptThatReleases, &hook), napi_ok);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookReleasingItsOwnEnv, &again), napi_ok);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, FinalizeReleasingAgain, &again, nullptr),
+            napi_ok);
+  Keep(s.env, "finalized", object);
+
+  Release(s);
+  EXPECT_EQ(hook.status, napi_ok);
+  EXPECT_EQ(again.statuses,
+            (std::vector<napi_status>{napi_invalid_arg, napi_invalid_arg, napi_invalid_arg}));
+  EXPECT_EQ(again.finalized, 1);
+}

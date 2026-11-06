@@ -280,9 +280,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // with N-API usable: scripts run, and so do the native functions they or
 // native code call (napi_create_function, napi_define_class, the serdes
 // binding). Node runs no JavaScript there. References made with
-// napi_create_reference keep their values until all of them have run. A finalizer the engine would call after
-// this pass, while it frees the engine instance, is dropped, and nothing
-// touches the env once it is freed.
+// napi_create_reference keep their values until all of them have run. A
+// finalizer the engine would call after this pass, while it frees the engine
+// instance, is dropped, and nothing touches the env once it is freed. Called
+// again for the same owner while its release runs (from a hook, a finalizer
+// or a native function they reach), it returns napi_invalid_arg and does
+// nothing; the release under way goes on.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
