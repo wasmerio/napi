@@ -194,6 +194,8 @@ constexpr const char* kJsCalls[] = {
     "unofficial_napi_message_create (getter)",
     "unofficial_napi_compile_function (getter in the extensions)",
     "napi_create_buffer (Buffer getter)",
+    "napi_create_error (code setter)",
+    "unofficial_napi_mark_promise_as_handled (reject callback)",
 };
 constexpr int kJsCallCount = sizeof(kJsCalls) / sizeof(kJsCalls[0]);
 
@@ -207,6 +209,8 @@ constexpr const char* kJsCallPayloads[] = {
     "({ get x() { afterCall = 'yes'; return 1; } })",
     "(() => { const a = [{}]; Object.defineProperty(a, 0, { get() { afterCall = 'yes'; return {}; } }); return a; })()",
     "(Object.defineProperty(globalThis, 'Buffer', { get() { afterCall = 'yes'; return undefined; }, configurable: true }), undefined)",
+    "(Object.defineProperty(Error.prototype, 'code', { set(v) { afterCall = 'yes'; }, configurable: true }), undefined)",
+    "(() => { const p = Promise.reject(1); return p; })()",
 };
 
 // The module kJsCalls's evaluations evaluate.
@@ -251,10 +255,14 @@ napi_status CallRunningJs(napi_env env, int kind, napi_value payload) {
       return unofficial_napi_compile_function(env, nullptr, &source, Str(env, "f.js"), 0, 0,
                                               payload, undefined, undefined, &out);
     }
-    default: {
+    case 8: {
       void* data = nullptr;
       return napi_create_buffer(env, 4, &data, &out);
     }
+    case 9:
+      return napi_create_error(env, Str(env, "E_CODE"), Str(env, "message"), &out);
+    default:
+      return unofficial_napi_mark_promise_as_handled(env, payload);
   }
 }
 
@@ -540,6 +548,10 @@ TEST_F(Test73TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
     InstallHelpers(s.env);
     g_module = MakeModule(s.env, "globalThis.afterCall = 'yes';", nullptr);
     ASSERT_NE(g_module, nullptr);
+    // Called again, for a rejected promise a handler is added to.
+    ASSERT_EQ(unofficial_napi_set_promise_reject_callback(
+                  s.env, Eval(s.env, "(type, promise, reason) => { if (type === 1) afterCall = 'yes'; }")),
+              napi_ok);
     g_status = napi_ok;
     const std::string script =
         std::string("const payload = ") + kJsCallPayloads[kind] + ";\n" +
@@ -547,6 +559,13 @@ TEST_F(Test73TerminationUntilCancelled, CallsRunningJsAfterTheTermination) {
         ", payload); } catch (e) { caught = 'yes'; caughtError = e; }\n"
         "after = 'yes';\n";
     ExpectRunTerminated(s.env, script.c_str());
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+    // QuickJS marks the promise without calling the reject callback: no JS
+    // runs, and the call succeeds.
+    if (kind == kJsCallCount - 1) {
+      EXPECT_EQ(g_status, napi_ok);
+    } else
+#endif
     EXPECT_EQ(g_status, napi_pending_exception);
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, g_module), napi_ok);
   }

@@ -2401,6 +2401,8 @@ napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(
     napi_env env,
     napi_value promise) {
   if (env == nullptr || promise == nullptr) return napi_invalid_arg;
+  // A rejected promise calls the reject callback, JS.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
 
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(promise);
   if (raw.IsEmpty() || !raw->IsPromise()) return napi_invalid_arg;

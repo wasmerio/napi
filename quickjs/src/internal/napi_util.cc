@@ -794,6 +794,10 @@ napi_status napi_util__::create_error_common(napi_env env,
 {
   if (!check_env(env) || msg == nullptr || result == nullptr)
     return napi_invalid_arg;
+  // Making the error reads Error.prepareStackTrace and setting its code runs
+  // an inherited `code` setter: JS, which a terminating env must not run.
+  if (env->termination_requested())
+    return fail_if_terminating(env, context(env));
 
   JSValue msg_val = napi_quickjs_value_inner(env, msg);
   if (!JS_IsString(msg_val))

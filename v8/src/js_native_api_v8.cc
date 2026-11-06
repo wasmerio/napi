@@ -3371,6 +3371,8 @@ static napi_status CreateErrorCommon(napi_env env,
                                      napi_value code,
                                      napi_value msg,
                                      napi_value* result) {
+  // Setting the code runs an inherited `code` setter.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckEnv(env) || msg == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> msg_val = napi_v8_unwrap_value(msg);
   if (!msg_val->IsString()) return napi_string_expected;
