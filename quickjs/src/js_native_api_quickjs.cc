@@ -611,41 +611,13 @@ extern "C"
       return napi_ok;
     }
 
+    // Anything else is not an ArrayBuffer, whatever its byteLength property
+    // says (a script can define one on any object).
     if (!JS_IsArrayBuffer(local))
-    {
-      if (JS_IsObject(local))
-      {
-        JSValue byte_len = JS_GetPropertyStr(env->context(), local, "byteLength");
-        if (JS_IsException(byte_len))
-        {
-          JSValue exc = JS_GetException(env->context());
-          JS_FreeValue(env->context(), exc);
-        }
-        else if (!JS_IsUndefined(byte_len))
-        {
-          JS_FreeValue(env->context(), byte_len);
-          *result = true;
-          return napi_ok;
-        }
-        else
-        {
-          JS_FreeValue(env->context(), byte_len);
-        }
-      }
       return napi_arraybuffer_expected;
-    }
 
-    size_t ab_len = 0;
-    uint8_t *data = JS_GetArrayBuffer(env->context(), &ab_len, local);
-    if (data == nullptr && JS_HasException(env->context()))
-    {
-      napi_util__::clear_last_exception(env);
-      *result = true;
-      return napi_ok;
-    }
-
-    *result = false;
-
+    // Leaves an exception that was pending as it was, and adds none.
+    *result = napi_util__::is_detached_array_buffer(env->context(), local);
     return napi_ok;
   }
 

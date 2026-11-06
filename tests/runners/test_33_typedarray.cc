@@ -7,6 +7,8 @@
 #include "upstream_js_test.h"
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 // node_api.h declares it from NAPI_VERSION 10; this target builds at 8.
@@ -495,6 +497,13 @@ void ExpectLayoutFromTheViewsSlots(napi_env env, const char* where) {
   expect_layout(DataViewLayout(env, NamedGlobal(env, "view")), 8, 2, "data view");
   expect_layout(DataViewLayout(env, NamedGlobal(env, "ownView")), 4, 6, "own data view");
 
+  // A view is not an ArrayBuffer, whatever its byteLength says.
+  bool detached = true;
+  EXPECT_EQ(napi_is_detached_arraybuffer(env, NamedGlobal(env, "typed"), &detached),
+            napi_arraybuffer_expected);
+  EXPECT_EQ(napi_is_detached_arraybuffer(env, NamedGlobal(env, "ownView"), &detached),
+            napi_arraybuffer_expected);
+  ExpectNothingPending(env, "napi_is_detached_arraybuffer");
   EXPECT_EQ(GlobalInt(env, "calls"), 0) << "a getter the script defined ran";
 }
 
@@ -608,6 +617,77 @@ TEST_F(Test33TypedArray, ViewLayoutHoldsWhileTerminating) {
   }
   EXPECT_EQ(wrong, 0);
   ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+}
+
+// napi_is_detached_arraybuffer, like the other info calls over a detached or
+// out-of-bounds buffer, leaves an exception that was pending as it was and
+// adds none.
+TEST_F(Test33TypedArray, InfoCallsKeepThePendingException) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.detached = new ArrayBuffer(8);"
+                  "globalThis.overDetached = new Uint8Array(detached, 2, 4);"
+                  "globalThis.viewOverDetached = new DataView(detached, 2, 4);"
+                  "globalThis.rab = new ArrayBuffer(16, { maxByteLength: 16 });"
+                  "globalThis.outOfBounds = new Uint8Array(rab, 4, 8);"
+                  "globalThis.viewOutOfBounds = new DataView(rab, 4, 8);"
+                  "rab.resize(4);"
+                  "0");
+  napi_value detached = NamedGlobal(s.env, "detached");
+  napi_value buffer = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, detached, 0, 8, &buffer), napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, detached), napi_ok);
+  napi_value over_detached = NamedGlobal(s.env, "overDetached");
+  napi_value view_over_detached = NamedGlobal(s.env, "viewOverDetached");
+  napi_value out_of_bounds = NamedGlobal(s.env, "outOfBounds");
+  napi_value view_out_of_bounds = NamedGlobal(s.env, "viewOutOfBounds");
+
+  bool is_detached = false;
+  void* data = nullptr;
+  size_t length = 99;
+  const std::pair<const char*, std::function<napi_status()>> calls[] = {
+      {"napi_is_detached_arraybuffer",
+       [&] {
+         is_detached = false;
+         napi_status status = napi_is_detached_arraybuffer(s.env, detached, &is_detached);
+         EXPECT_TRUE(is_detached);
+         return status;
+       }},
+      {"napi_get_arraybuffer_info",
+       [&] { return napi_get_arraybuffer_info(s.env, detached, &data, &length); }},
+      {"typed array over a detached buffer",
+       [&] { return TypedArrayLayout(s.env, over_detached).status; }},
+      {"typed array out of bounds", [&] { return TypedArrayLayout(s.env, out_of_bounds).status; }},
+      {"buffer over a detached buffer, as a typed array",
+       [&] { return TypedArrayLayout(s.env, buffer).status; }},
+      {"buffer over a detached buffer", [&] { return BufferLayout(s.env, buffer).status; }},
+      {"data view over a detached buffer",
+       [&] { return DataViewLayout(s.env, view_over_detached).status; }},
+      {"data view out of bounds",
+       [&] { return DataViewLayout(s.env, view_out_of_bounds).status; }},
+  };
+  for (const auto& [what, call] : calls) {
+    SCOPED_TRACE(what);
+    // With nothing pending, nothing is pending afterwards.
+    EXPECT_EQ(call(), napi_ok);
+    ExpectNothingPending(s.env, "with nothing pending before");
+
+    // With an exception pending, it is the one pending afterwards.
+    napi_throw_error(s.env, nullptr, "earlier");
+    EXPECT_EQ(call(), napi_ok);
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok)
+        << "the earlier exception is no longer pending";
+    char text[64] = {};
+    size_t text_length = 0;
+    napi_value message = nullptr;
+    if (exception != nullptr &&
+        napi_get_named_property(s.env, exception, "message", &message) == napi_ok) {
+      napi_get_value_string_utf8(s.env, message, text, sizeof(text), &text_length);
+    }
+    EXPECT_STREQ(text, "earlier");
+    ExpectNothingPending(s.env, "after the earlier exception was taken");
+  }
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
