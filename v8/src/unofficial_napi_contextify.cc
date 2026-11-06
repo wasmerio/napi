@@ -1764,6 +1764,9 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   }
   *realm_out = nullptr;
   ReleaseCollectedRealms(env);
+  // An unassign hook's JS may have been terminated: making the realm would
+  // enter V8 and clear the termination.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);

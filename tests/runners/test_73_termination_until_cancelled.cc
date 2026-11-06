@@ -786,6 +786,18 @@ void AttachTokenHooks(napi_env env, bool assign) {
 }
 }  // namespace
 
+napi_value CreateSandboxRealm(napi_env env, napi_callback_info /*info*/) {
+  napi_value sandbox = nullptr;
+  napi_create_object(env, &sandbox);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.sandbox_or_null = sandbox;
+  unofficial_napi_realm realm = nullptr;
+  napi_value global = nullptr;
+  g_status = unofficial_napi_create_realm(env, &options, &realm, &global);
+  return global;
+}
+
 TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheTokenAssignHook) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
@@ -800,6 +812,41 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
       "try { createRealm(); } catch (e) { caught = 'yes'; caughtError = e; }\nafter = 'yes';\n");
   g_token_armed = false;
   napi_delete_reference(s.env, g_token_fn);
+}
+
+// unofficial_napi_create_realm first runs the unassign hooks of the realms
+// collected since, then makes the realm. When a hook's JS is terminated, it
+// must fail without making the realm: the V8 calls that make it would clear
+// the termination.
+TEST_F(Test73TerminationUntilCancelled, CreateRealmAfterATerminatedUnassignHook) {
+  for (bool with_sandbox : {true, false}) {
+    SCOPED_TRACE(with_sandbox ? "with a sandbox" : "with a fresh global");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    AttachTokenHooks(s.env, false);
+    ASSERT_EQ(napi_create_reference(s.env, Eval(s.env, "(() => { terminate(); tick(); })"), 1,
+                                    &g_token_fn),
+              napi_ok);
+    {
+      napi_handle_scope scope = nullptr;
+      ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+      unofficial_napi_realm realm = nullptr;
+      napi_value global = nullptr;
+      ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+      ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+    }
+    DefineGlobalFunction(s.env, "createRealm", with_sandbox ? CreateSandboxRealm : CreateRealm);
+    g_token_armed = true;
+    g_status = napi_ok;
+    ExpectRunTerminated(
+        s.env,
+        "gc(); gc();\n"
+        "try { createRealm(); } catch (e) { caught = 'yes'; caughtError = e; }\nafter = 'yes';\n");
+    EXPECT_FALSE(g_token_armed) << "the unassign hook did not run";
+    EXPECT_EQ(g_status, napi_pending_exception);
+    g_token_armed = false;
+    napi_delete_reference(s.env, g_token_fn);
+  }
 }
 #endif
 
