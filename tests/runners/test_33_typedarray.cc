@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <utility>
+#include <vector>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 // node_api.h declares it from NAPI_VERSION 10; this target builds at 8.
@@ -632,6 +633,44 @@ TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
   size_t length = 0;
   ASSERT_EQ(napi_get_value_string_utf8(s.env, kinds, text, sizeof(text), &length), napi_ok);
   EXPECT_STREQ(text, "function function");
+}
+
+// The serdes binding's Serializer copies a view's own bytes: neither what a
+// script redefined on DataView.prototype nor a length-tracking view's length
+// from before its buffer grew.
+TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
+  EnvScope s(runtime_.get());
+  napi_value serdes = nullptr;
+  ASSERT_EQ(unofficial_napi_create_serdes_binding(s.env, &serdes), napi_ok);
+  SetGlobal(s.env, "serdes", serdes);
+  napi_value released = RunBufferScript(
+      s.env,
+      "(() => {"
+      "  globalThis.calls = 0;"
+      "  const backing = new ArrayBuffer(16);"
+      "  new Uint8Array(backing).forEach((_, i, a) => { a[i] = i; });"
+      "  const view = new DataView(backing, 2, 4);"
+      "  const rab = new ArrayBuffer(4, { maxByteLength: 16 });"
+      "  const tracking = new Uint8Array(rab, 1);"
+      "  rab.resize(8);"
+      "  new Uint8Array(rab).forEach((_, i, a) => { a[i] = 100 + i; });"
+      "  const other = new ArrayBuffer(64);"
+      "  for (const name of ['byteLength', 'byteOffset', 'buffer'])"
+      "    Object.defineProperty(DataView.prototype, name, { configurable: true,"
+      "      get() { calls++; return name === 'buffer' ? other : 1; } });"
+      "  const serializer = new serdes.Serializer();"
+      "  serializer.writeRawBytes(view);"
+      "  serializer.writeRawBytes(tracking);"
+      "  return serializer.releaseBuffer();"
+      "})()");
+  ASSERT_NE(released, nullptr);
+  void* data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(napi_get_buffer_info(s.env, released, &data, &length), napi_ok);
+  const std::vector<uint8_t> expected = {2, 3, 4, 5, 101, 102, 103, 104, 105, 106, 107};
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + length), expected);
+  EXPECT_EQ(GlobalInt(s.env, "calls"), 0) << "a getter the script defined ran";
 }
 
 // napi_is_detached_arraybuffer, like the other info calls over a detached or
