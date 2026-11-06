@@ -256,7 +256,7 @@ unaffected.
 
 | Struct, as built against f928811 | Native | wasm32 | Now |
 |---|---|---|---|
-| Bytecode-open options, version 2 | 88 bytes, `realm_or_null` at 8 | 52 bytes, realm at 8 | Accepted and read wrongly, with no error |
+| Bytecode-open options, version 2 | 88 bytes, `realm_or_null` at 8 | 52 bytes, realm at 8 | Passes the checks and is read wrongly |
 | Module-create options, version 2 | 64 bytes, `realm_or_null` at 32 | 40 bytes, realm at 20 | `napi_invalid_arg` |
 | Env hooks, version 2 | 40 bytes | 24 bytes | `napi_invalid_arg` |
 
@@ -265,7 +265,9 @@ unaffected.
   `cache_policy`. So a struct built against f928811 passes the version and
   size checks, and every field after `version` is read from the wrong place:
   its realm as `source_text`, and the realm from its cache flags and
-  padding.
+  padding. With a NULL realm, `source_text` reads as NULL and the call
+  fails with `napi_invalid_arg`. With a realm, the realm handle is used as
+  the source text's `napi_value`, which is undefined behavior.
 - **Module-create options** version 2 now appends `realm_or_null` (offset 64
   native, 40 wasm32) after `main`'s layout, which keeps
   `context_or_undefined` where f928811 had the realm. A struct built against
