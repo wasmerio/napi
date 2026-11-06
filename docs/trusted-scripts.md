@@ -172,8 +172,7 @@ checks the query without
 requiring trusted-script support, including native callbacks, promise jobs,
 cross-realm execution and pending exceptions. The QuickJS fork also runs its
 focused `api-test --is-executing-js` regression through `make test` in CI, including
-C-function
-variants, builtins, coroutine suspension, nested job errors, runtime isolation
+C-function variants, builtins, coroutine suspension, nested job errors, runtime isolation
 and interruption. A wasm-bindgen test instantiates a WAT guest to
 check real host-JS import dispatch, unsupported statuses, output zeroing,
 and the different u32/bool pointer bounds.
@@ -184,7 +183,7 @@ PR description. The V8 package is named 11.9.9; its headers report V8
 provider/guest tests, and no execution-query performance improvement is claimed:
 the V8 query still captures a stack trace on each call.
 
-The QuickJS execution-query follow-up uses fork revision `e0247ad` from
+The QuickJS execution-query follow-up uses fork revision `883881a` from
 [QuickJS PR #11](https://github.com/wasmerio/quickjs/pull/11). Local macOS arm64
 validation passed the complete Release suites (313 QuickJS and 379 V8 tests),
 the engine's focused regression in Release and Debug with ASan + UBSan, and its
