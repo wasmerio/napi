@@ -16,8 +16,8 @@ use wasixv2_exec::{Abis, run_on_owning_thread};
 use wasixv2_host::{LocalFuture, TokioHost};
 use wasixv2_syscalls::{
     AtomicWait, AtomicWord, Caller, Control, CpuTime, Errno, ExitMm, GroupStop, GuestAction, Image,
-    LoaderControl, MaybeFuture, SharedMapping, SharedMappings, SysResult, Syscalls, TaskId,
-    VforkWait,
+    LoaderControl, MaybeFuture, PidView, SharedMapping, SharedMappings, SysResult, Syscalls,
+    TaskId, VforkWait,
 };
 use wasmer::sys::{Cranelift, EngineBuilder, Features};
 use wasmer::{Module, Store};
@@ -232,6 +232,8 @@ impl AtomicWait for TestSyscalls {
 
 impl CpuTime for TestSyscalls {}
 
+impl PidView for TestSyscalls {}
+
 impl ExitMm for TestSyscalls {
     fn exit_mm<'a>(&'a self, _: &'a Caller<'a>) -> LocalFuture<'a, ()> {
         Box::pin(async {})
@@ -322,7 +324,7 @@ async fn napi_hook_suspends_advisory_refill_and_drops_allocator_pending_in_no_yi
             let mut abis = Abis::<TestSyscalls>::wasixv2();
             abis.push_instantiation_hook(Arc::new(NapiHook::new(context.clone())));
             let result = run_on_owning_thread(
-                engine,
+                engine.into(),
                 &module,
                 syscalls.clone(),
                 TaskId(1),
@@ -424,7 +426,7 @@ async fn dropping_the_caller_cancels_a_permanently_pending_napi_refill() {
             let mut abis = Abis::<TestSyscalls>::wasixv2();
             abis.push_instantiation_hook(Arc::new(NapiHook::new(context.clone())));
             let mut run = Box::pin(run_on_owning_thread(
-                engine,
+                engine.into(),
                 &module,
                 syscalls.clone(),
                 TaskId(2),
