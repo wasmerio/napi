@@ -97,12 +97,17 @@ void view_getters(JSContext *ctx, JSValueConst global, const char *constructor_n
 // Calls an intrinsic getter of a view. Such a getter runs no script, but
 // QuickJS may poll its interrupt handler on the call and throw for a
 // termination request (which the env keeps and raises again itself); the
-// getter is then called again, as the poll restarted its countdown.
-JSValue call_view_getter(JSContext *ctx, JSValueConst getter, JSValueConst view)
+// getter is then called again, as the poll restarted its countdown. Sets
+// `*threw` (if given) when the call threw: making the error may have run
+// script.
+JSValue call_view_getter(JSContext *ctx, JSValueConst getter, JSValueConst view,
+                         bool *threw = nullptr)
 {
   JSValue value = JS_Call(ctx, getter, view, 0, nullptr);
   if (!JS_IsException(value))
     return value;
+  if (threw != nullptr)
+    *threw = true;
   JSValue exception = JS_GetException(ctx);
   const bool interrupted = JS_IsUncatchableError(exception);
   JS_FreeValue(ctx, exception);
@@ -440,16 +445,28 @@ bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) cons
     // run script that resizes, transfers or detaches the buffer. So the
     // buffer's data and size are read last: JS_GetArrayBuffer runs no script
     // when it succeeds, and when it throws the buffer is detached for good.
-    JSValue offset_value = call_view_getter(context_, getters->byte_offset, view);
-    JSValue length_value = call_view_getter(context_, getters->byte_length, view);
+    // And when a read of the offset or length threw but both were read, the
+    // two may come from different states of the buffer: they are read again,
+    // a few times at most, until no read throws; failing that, the view is
+    // taken as out of bounds.
     int64_t offset = -1;
     int64_t length = -1;
-    if (JS_IsException(offset_value) || JS_ToInt64(context_, &offset, offset_value) != 0)
+    for (int reads = 0; reads < 3; ++reads)
+    {
+      bool threw = false;
+      JSValue offset_value = call_view_getter(context_, getters->byte_offset, view, &threw);
+      JSValue length_value = call_view_getter(context_, getters->byte_length, view, &threw);
+      if (JS_IsException(offset_value) || JS_ToInt64(context_, &offset, offset_value) != 0)
+        offset = -1;
+      if (JS_IsException(length_value) || JS_ToInt64(context_, &length, length_value) != 0)
+        length = -1;
+      JS_FreeValue(context_, offset_value);
+      JS_FreeValue(context_, length_value);
+      if (!threw || offset < 0 || length < 0)
+        break;
       offset = -1;
-    if (JS_IsException(length_value) || JS_ToInt64(context_, &length, length_value) != 0)
       length = -1;
-    JS_FreeValue(context_, offset_value);
-    JS_FreeValue(context_, length_value);
+    }
     if (JS_HasException(context_))
       JS_FreeValue(context_, JS_GetException(context_));
     size_t buffer_length = 0;

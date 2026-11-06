@@ -665,6 +665,70 @@ TEST_F(Test33TypedArray, ViewDataIsCurrentAfterScriptRunsDuringTheRead) {
 #endif
 }
 
+// A view's offset and length come from one state of its buffer. On QuickJS
+// they are read one after the other, and the error of an interrupt poll
+// during a termination request runs the page's Error.prepareStackTrace getter
+// in between. Here that getter grows the buffer of a view it had left out of
+// bounds (offset 0, length 0) back to hold it (offset 8, length 4), or shrinks
+// it again; an offset from before the getter with a length from after it
+// would give native code the buffer's first 4 bytes as the view's. The getter
+// makes `extra` more calls each time, which moves the poll from one read to
+// the next; the test runs with each of 0, 1 and 2.
+TEST_F(Test33TypedArray, ViewOffsetAndLengthComeFromOneStateOfTheBuffer) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.rab = new ArrayBuffer(16, { maxByteLength: 16 });"
+                  "globalThis.typed = new Uint8Array(rab, 8, 4);"
+                  "globalThis.polls = 0;"
+                  "globalThis.extra = 0;"
+                  "globalThis.noop = () => {};"
+                  "Object.defineProperty(Error, 'prepareStackTrace', { configurable: true,"
+                  "  get() {"
+                  "    polls++;"
+                  "    if (extra > 0) noop();"
+                  "    if (extra > 1) noop();"
+                  "    rab.resize(rab.byteLength === 4 ? 16 : 4);"
+                  "    return undefined;"
+                  "  } });"
+                  "0");
+  napi_value rab = NamedGlobal(s.env, "rab");
+  napi_value typed = NamedGlobal(s.env, "typed");
+  for (int extra = 0; extra < 3; ++extra) {
+    SCOPED_TRACE(extra);
+    napi_value value = nullptr;
+    ASSERT_EQ(napi_create_int32(s.env, extra, &value), napi_ok);
+    SetGlobal(s.env, "extra", value);
+    RunBufferScript(s.env, "rab.resize(4); 0");
+    ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+    int mixed = 0;
+    int wrong = 0;
+    for (int i = 0; i < 40000; ++i) {
+      napi_handle_scope scope = nullptr;
+      ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+      const ViewLayout layout = TypedArrayLayout(s.env, typed);
+      uint8_t* base = ArrayBufferData(s.env, rab);
+      if (layout.status == napi_ok && layout.length == 0) {
+        // Out of bounds.
+      } else if (layout.status == napi_ok && layout.length == 4 && layout.offset == 8 &&
+                 layout.data == base + 8) {
+        // In bounds.
+      } else if (layout.status == napi_ok && layout.length == 4 && layout.offset == 0) {
+        ++mixed;
+      } else {
+        ++wrong;
+      }
+      ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+    }
+    ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+    EXPECT_EQ(mixed, 0) << "an offset from one state of the buffer, a length from another";
+    EXPECT_EQ(wrong, 0);
+  }
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // V8 runs no script to read a view, so only QuickJS gets here at all.
+  EXPECT_GE(GlobalInt(s.env, "polls"), 18) << "the getter ran too seldom to test every read";
+#endif
+}
+
 // The serdes binding unofficial_napi_create_serdes_binding returns is still
 // the binding while the caller makes more values.
 TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
