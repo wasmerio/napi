@@ -10,6 +10,7 @@
 
 #include "test_env.h"
 
+#include "napi_testing.h"
 #include "unofficial_napi.h"
 
 #include <cstddef>
@@ -1525,6 +1526,135 @@ TEST_F(Test71ContextifyCompat, ModuleOptionsOfBothVersions) {
   short_v2.size = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_V1_SIZE;
   EXPECT_EQ(ModuleGlobal(s.env, short_v2, &status), nullptr);
   EXPECT_EQ(status, napi_invalid_arg);
+}
+
+namespace {
+
+// How many napi_values `n` calls of `call` leave in the handle scope they
+// run in. Whatever `call` uses is made before.
+template <typename Call>
+size_t ValuesLeft(napi_env env, Call call) {
+  constexpr int kCalls = 16;
+  napi_handle_scope scope = nullptr;
+  EXPECT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  const size_t before = napi::testing::open_value_count(env);
+  for (int i = 0; i < kCalls; ++i) call();
+  const size_t after = napi::testing::open_value_count(env);
+  EXPECT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  return after - before;
+}
+
+}  // namespace
+
+// Finding the realm a deprecated call names leaves no value behind: each
+// call leaves in the caller's handle scope only what the realm API call it
+// stands for leaves there (its result).
+TEST_F(Test71ContextifyCompat, DeprecatedCallsLeaveOnlyTheirResults) {
+  EnvScope s(runtime_.get());
+
+  napi_value env_global = Global(s.env);
+  napi_value undefined = Undefined(s.env);
+  napi_value a_global = nullptr;
+  unofficial_napi_realm a = FreshRealm(s.env, &a_global);
+  ASSERT_NE(a, nullptr);
+  napi_value filename = Str(s.env, "count.js");
+  const unofficial_napi_js_source script =
+      unofficial_napi_js_source_from_text(Str(s.env, "1"));
+  const unofficial_napi_js_source body =
+      unofficial_napi_js_source_from_text(Str(s.env, "return 1;"));
+  auto run_in_context = [&](napi_value context) {
+    return [&s, &script, filename, context] {
+      napi_value result = nullptr;
+      EXPECT_EQ(unofficial_napi_contextify_run_script(s.env, context, &script, filename, 0, 0, -1,
+                                                      true, false, false, nullptr, &result),
+                napi_ok);
+    };
+  };
+  auto run_in_realm = [&](unofficial_napi_realm realm) {
+    return [&s, &script, filename, realm] {
+      napi_value result = nullptr;
+      EXPECT_EQ(unofficial_napi_run_script(s.env, realm, &script, filename, 0, 0, -1, true, false,
+                                           false, nullptr, &result),
+                napi_ok);
+    };
+  };
+  auto compile_in_context = [&](napi_value context) {
+    return [&s, &body, filename, context] {
+      napi_value result = nullptr;
+      EXPECT_EQ(unofficial_napi_contextify_compile_function(s.env, &body, filename, 0, 0, context,
+                                                            nullptr, nullptr, nullptr, &result),
+                napi_ok);
+    };
+  };
+  auto compile_in_realm = [&](unofficial_napi_realm realm) {
+    return [&s, &body, filename, realm] {
+      napi_value result = nullptr;
+      EXPECT_EQ(unofficial_napi_compile_function(s.env, realm, &body, filename, 0, 0, nullptr,
+                                                 nullptr, nullptr, &result),
+                napi_ok);
+    };
+  };
+  MainBytecodeOpenOptionsV1 bytecode_v1 = MainBytecodeOptions(s.env, "1 + 1");
+  unofficial_napi_bytecode_open_options bytecode_v2{};
+  std::memcpy(&bytecode_v2, &bytecode_v1, sizeof(bytecode_v1));
+  bytecode_v2.size = sizeof(bytecode_v2);
+  bytecode_v2.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  auto open_bytecode = [&](const void* options) {
+    return [&s, options] {
+      unofficial_napi_bytecode_open_result opened{};
+      EXPECT_EQ(unofficial_napi_bytecode_open(
+                    s.env, static_cast<const unofficial_napi_bytecode_open_options*>(options),
+                    &opened),
+                napi_ok);
+      EXPECT_EQ(unofficial_napi_bytecode_release(s.env, opened.bytecode), napi_ok);
+    };
+  };
+  const unofficial_napi_js_source module_source =
+      unofficial_napi_js_source_from_text(Str(s.env, "export const one = 1;"));
+  napi_value wrapper = Object(s.env);
+  napi_value url = Str(s.env, "count.mjs");
+  auto create_module = [&](auto options) {
+    options.kind = unofficial_napi_module_source_text;
+    options.wrapper = wrapper;
+    options.url = url;
+    options.payload.source_text.source = &module_source;
+    options.payload.source_text.host_defined_option_id = undefined;
+    return [&s, options] {
+      unofficial_napi_module_create_result created{};
+      EXPECT_EQ(unofficial_napi_module_wrap_create(
+                    s.env, reinterpret_cast<const unofficial_napi_module_create_options*>(&options),
+                    &created),
+                napi_ok);
+      EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, created.module), napi_ok);
+    };
+  };
+
+  // The env's realm current: no context, the env's global, a realm's global.
+  for (napi_value context : {static_cast<napi_value>(nullptr), undefined, env_global}) {
+    EXPECT_EQ(ValuesLeft(s.env, run_in_context(context)), ValuesLeft(s.env, run_in_realm(nullptr)));
+    EXPECT_EQ(ValuesLeft(s.env, compile_in_context(context)),
+              ValuesLeft(s.env, compile_in_realm(nullptr)));
+  }
+  EXPECT_EQ(ValuesLeft(s.env, run_in_context(a_global)), ValuesLeft(s.env, run_in_realm(a)));
+  EXPECT_EQ(ValuesLeft(s.env, compile_in_context(a_global)), ValuesLeft(s.env, compile_in_realm(a)));
+  EXPECT_EQ(ValuesLeft(s.env, open_bytecode(&bytecode_v1)),
+            ValuesLeft(s.env, open_bytecode(&bytecode_v2)));
+  EXPECT_EQ(ValuesLeft(s.env, create_module(MainModuleOptions(nullptr))),
+            ValuesLeft(s.env, create_module(ModuleOptions(nullptr, nullptr))));
+  EXPECT_EQ(ValuesLeft(s.env, create_module(MainModuleOptions(env_global))),
+            ValuesLeft(s.env, create_module(ModuleOptions(nullptr, nullptr))));
+  EXPECT_EQ(ValuesLeft(s.env, create_module(MainModuleOptions(a_global))),
+            ValuesLeft(s.env, create_module(ModuleOptions(a, nullptr))));
+
+  // Another realm current.
+  EnteredRealm entered(s.env, a);
+  bytecode_v2.realm_or_null = a;
+  EXPECT_EQ(ValuesLeft(s.env, run_in_context(nullptr)), ValuesLeft(s.env, run_in_realm(a)));
+  EXPECT_EQ(ValuesLeft(s.env, compile_in_context(nullptr)), ValuesLeft(s.env, compile_in_realm(a)));
+  EXPECT_EQ(ValuesLeft(s.env, open_bytecode(&bytecode_v1)),
+            ValuesLeft(s.env, open_bytecode(&bytecode_v2)));
+  EXPECT_EQ(ValuesLeft(s.env, create_module(MainModuleOptions(nullptr))),
+            ValuesLeft(s.env, create_module(ModuleOptions(a, nullptr))));
 }
 
 namespace {

@@ -9,6 +9,7 @@
 #include "internal/napi_shared_array_buffer.h"
 #include "internal/quickjs_trace.h"
 #include "napi_compat.h"
+#include "napi_testing.h"
 #include "node_api.h"
 
 #include <algorithm>
@@ -1575,3 +1576,17 @@ extern "C"
     }
 
 } // extern "C"
+
+namespace napi::testing
+{
+    size_t open_value_count(napi_env env)
+    {
+        if (!napi_util__::check_env(env))
+            return 0;
+        size_t count = 0;
+        for (napi_scope__ *scope = env->scope_from_handle(env->current_scope()); scope != nullptr;
+             scope = scope->parent())
+            count += scope->active_value_count();
+        return count;
+    }
+} // namespace napi::testing

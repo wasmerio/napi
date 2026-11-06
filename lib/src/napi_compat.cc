@@ -15,6 +15,24 @@ bool is_nullish(napi_env env, napi_value value, napi_valuetype* type_out) {
   return *type_out == napi_undefined || *type_out == napi_null;
 }
 
+// Runs `lookup` in a handle scope of its own, so that the values it makes
+// (globals, mostly) are not left in the caller's scope, which may be one that
+// never closes. The realm it finds stays valid after the scope closes: on V8
+// and QuickJS a realm handle is the provider's record of the realm, freed only
+// by a later unofficial_napi_create_realm or unofficial_napi_collect_garbage
+// once the realm is collected, and what named the realm keeps it alive (the
+// caller's context value, or the entered scope or running callback of the
+// current realm).
+template <typename Lookup>
+napi_status in_lookup_scope(napi_env env, Lookup lookup) {
+  napi_handle_scope scope = nullptr;
+  napi_status status = napi_open_handle_scope(env, &scope);
+  if (status != napi_ok) return status;
+  status = lookup();
+  const napi_status closed = napi_close_handle_scope(env, scope);
+  return status != napi_ok ? status : closed;
+}
+
 // The env's own global, whichever realm is current.
 napi_status env_global(napi_env env, napi_value* global_out) {
   unofficial_napi_realm_scope scope = 0;
@@ -32,10 +50,8 @@ napi_status is_env_global(napi_env env, napi_value value, bool* result_out) {
   return napi_strict_equals(env, value, global, result_out);
 }
 
-}  // namespace
-
-napi_status current_realm(napi_env env, unofficial_napi_realm* realm_out) {
-  *realm_out = nullptr;
+// current_realm, making values in the caller's scope.
+napi_status find_current_realm(napi_env env, unofficial_napi_realm* realm_out) {
   napi_value global = nullptr;
   napi_status status = napi_get_global(env, &global);
   if (status != napi_ok) return status;
@@ -47,6 +63,13 @@ napi_status current_realm(napi_env env, unofficial_napi_realm* realm_out) {
   if (status != napi_ok) return status;
   if (!env_own) *realm_out = realm;
   return napi_ok;
+}
+
+}  // namespace
+
+napi_status current_realm(napi_env env, unofficial_napi_realm* realm_out) {
+  *realm_out = nullptr;
+  return in_lookup_scope(env, [&] { return find_current_realm(env, realm_out); });
 }
 
 napi_status realm_from_context(napi_env env,
@@ -62,7 +85,8 @@ napi_status realm_from_context(napi_env env,
   if (unofficial_napi_get_realm(env, context, realm_out) != napi_ok) return napi_invalid_arg;
   if (*realm_out != nullptr) return napi_ok;
   bool env_own = false;
-  const napi_status status = is_env_global(env, context, &env_own);
+  const napi_status status =
+      in_lookup_scope(env, [&] { return is_env_global(env, context, &env_own); });
   if (status != napi_ok) return status;
   return env_own ? napi_ok : napi_invalid_arg;
 }

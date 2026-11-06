@@ -6,7 +6,8 @@
 // The deprecated API (the contextify calls and version 1 of the option
 // structs) on the public realm API, the same for every provider. Where it
 // named a context it named a contextified object, the env's own global, or
-// nothing for the current context, which is the current realm now.
+// nothing for the current context, which is the current realm now. Finding
+// the realm leaves no value in the caller's handle scope.
 namespace napi::compat {
 
 // The current realm: NULL for the env's own. The env's own global means the

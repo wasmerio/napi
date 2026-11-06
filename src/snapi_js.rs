@@ -9146,5 +9146,21 @@ mod tests {
                 NAPI_INVALID_ARG
             );
         }
+
+        // A call stores its result and no other id, whatever names the
+        // realm, also with a realm entered.
+        const CALLS: usize = 16;
+        let live = || unsafe { env_mut(env) }.unwrap().agent.value_handles.len();
+        for (context, entered) in [(0, 0), (env_global, 0), (fresh, 0), (0, fresh)] {
+            let scope = (entered != 0).then(|| enter(env, entered).unwrap());
+            let before = live();
+            for _ in 0..CALLS {
+                assert_eq!(run(&mut store, context), Ok(0.into()));
+            }
+            assert_eq!(live() - before, CALLS);
+            if let Some(scope) = scope {
+                assert_eq!(leave(env, scope), NAPI_OK);
+            }
+        }
     }
 }

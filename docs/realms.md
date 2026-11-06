@@ -183,10 +183,15 @@ calls take a realm's global or sandbox.
   realm (#125), `make_context` fails as `create_realm` does, and
   `run_script` with id 0 goes to `evaluate()`.
   - One layer (`src/guest/compat.rs`) maps a context id to a realm id for
-    both guest backends, as `lib/src/napi_compat.cc` does natively. The
-    current realm takes the id of `napi_get_global` and maps it with
-    `get_realm`, so a call with no context can add up to two value ids to
-    the current handle scope.
+    both guest backends, as `lib/src/napi_compat.cc` does natively. It
+    makes the ids of its lookups (the current global, the env's global) in
+    a handle scope of its own, as the native layer makes its values, so a
+    deprecated call leaves in the guest's current handle scope only what
+    the realm call it stands for leaves there. The one exception: with a
+    realm other than the env's current, the call also stores the id of the
+    current global, which names that realm, once per call. A guest built
+    against `main` can be in that case only inside a callback, whose scope
+    frees the id when it returns.
   - Guest env hooks are version 1, `main`'s 32 bytes. As on `main`, the
     bridge gives the provider none of them, so a guest's token callbacks
     are reported as not accepted and never called.

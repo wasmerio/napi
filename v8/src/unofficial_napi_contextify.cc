@@ -1967,7 +1967,6 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
     const unofficial_napi_bytecode_open_options* options,
     unofficial_napi_bytecode_open_result* result) {
   if (env == nullptr || options == nullptr || result == nullptr) return napi_invalid_arg;
-  v8::HandleScope handle_scope(env->isolate);
   unofficial_napi_realm realm = nullptr;
   const napi_status realm_status = napi::compat::bytecode_open_realm(env, options, &realm);
   if (realm_status != napi_ok) return realm_status;
@@ -1977,6 +1976,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
     return napi_invalid_arg;
   }
   *result = {};
+  v8::HandleScope handle_scope(env->isolate);
   v8::Local<v8::Context> context = RealmContext(env, realm);
   if (context.IsEmpty()) return napi_invalid_arg;
 
@@ -2626,11 +2626,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create(
     unofficial_napi_module_create_result* result_out) {
   if (env == nullptr || options == nullptr || result_out == nullptr) return napi_invalid_arg;
   unofficial_napi_realm realm = nullptr;
-  {
-    v8::HandleScope handle_scope(env->isolate);
-    const napi_status realm_status = napi::compat::module_create_realm(env, options, &realm);
-    if (realm_status != napi_ok) return realm_status;
-  }
+  const napi_status realm_status = napi::compat::module_create_realm(env, options, &realm);
+  if (realm_status != napi_ok) return realm_status;
   *result_out = {};
   napi_status status = napi_invalid_arg;
   switch (options->kind) {

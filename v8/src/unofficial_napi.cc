@@ -28,6 +28,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
+#include "napi_testing.h"
 #include "unofficial_napi_error_utils.h"
 #include "edge_v8_platform.h"
 
@@ -2923,3 +2924,13 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
+
+namespace napi::testing {
+
+// napi_values are V8 handles, held by the handle scopes V8 has open.
+size_t open_value_count(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return 0;
+  return static_cast<size_t>(v8::HandleScope::NumberOfHandles(env->isolate));
+}
+
+}  // namespace napi::testing
