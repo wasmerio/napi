@@ -205,10 +205,14 @@ calls take a realm's global or sandbox.
     a handle scope of its own, as the native layer makes its values, so a
     deprecated call leaves in the guest's current handle scope only what
     the realm call it stands for leaves there. The one exception: with a
-    realm other than the env's current, the call also stores the id of the
-    current global, which names that realm, once per call. A guest built
-    against `main` can be in that case only inside a callback, whose scope
-    frees the id when it returns.
+    realm other than the env's current, the call also needs an id of the
+    current global, which names that realm, outside that scope. The WASIX
+    native bridge stores a new one on each call. The host-JS backend gives
+    an object the id it already has while that id is live, so it stores at
+    most one: none while the guest holds an id of the realm's global, else
+    one, which later calls reuse while it lives. A guest built against
+    `main` can be in that case only inside a callback, whose scope frees
+    the id when it returns.
   - Guest env hooks are version 1, `main`'s 32 bytes. As on `main`, the
     bridge gives the provider none of them, so a guest's token callbacks
     are reported as not accepted and never called.

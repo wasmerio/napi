@@ -81,7 +81,9 @@ fn in_lookup_scope<T>(env: SnapiEnv, lookup: impl FnOnce() -> Result<T, i32>) ->
 /// The current realm, which the env's context meant before realms. The env's
 /// own global means the env's realm even when it is also a realm's sandbox.
 /// With the env's realm current no id is stored; with another, one: the id of
-/// the current global, which names that realm.
+/// the current global, which names that realm. The native bridge stores a new
+/// one each call; the host-JS backend hands out the global's live id when it
+/// has one, so there it stores at most one across calls.
 pub(crate) fn current_realm(env: SnapiEnv) -> Result<u32, i32> {
     let other_realm = in_lookup_scope(env, || {
         let mut global = 0u32;
@@ -510,7 +512,7 @@ mod tests {
         );
 
         // With another realm current, the deprecated call also stores the
-        // id that names that realm, once per call.
+        // id that names that realm, once per call on the native bridge.
         let mut scope = 0u64;
         assert_eq!(
             status(unsafe { snapi_bridge_unofficial_enter_realm(env, realm, &mut scope) }),

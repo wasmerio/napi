@@ -9168,20 +9168,50 @@ mod tests {
             );
         }
 
-        // A call stores its result and no other id, whatever names the
-        // realm, also with a realm entered.
+        // The ids `CALLS` calls store, whatever names the realm, also with a
+        // realm entered.
         const CALLS: usize = 16;
         let live = || unsafe { env_mut(env) }.unwrap().agent.value_handles.len();
+        let mut stored = Vec::new();
         for (context, entered) in [(0, 0), (env_global, 0), (fresh, 0), (0, fresh)] {
             let scope = (entered != 0).then(|| enter(env, entered).unwrap());
             let before = live();
             for _ in 0..CALLS {
                 assert_eq!(run(&mut store, context), Ok(0.into()));
             }
-            assert_eq!(live() - before, CALLS);
+            stored.push(live() - before);
             if let Some(scope) = scope {
                 assert_eq!(leave(env, scope), NAPI_OK);
             }
         }
+        // A realm entered whose global has no live id: its id is freed with
+        // the handle scope it was made in.
+        let mut frame = 0u32;
+        assert_eq!(
+            unsafe { snapi_bridge_open_handle_scope(env, &mut frame) },
+            NAPI_OK
+        );
+        assert_eq!(
+            make_context
+                .call(&mut store, guest_env, symbol, name, RESULT)
+                .unwrap(),
+            NAPI_OK
+        );
+        let scope = enter(env, read_u32(&store)).unwrap();
+        assert_eq!(
+            unsafe { snapi_bridge_close_handle_scope(env, frame) },
+            NAPI_OK
+        );
+        let before = live();
+        for _ in 0..CALLS {
+            assert_eq!(run(&mut store, 0), Ok(0.into()));
+        }
+        stored.push(live() - before);
+        assert_eq!(leave(env, scope), NAPI_OK);
+        // Each call stores its result. With another realm current it also
+        // needs an id of the realm's global, and this backend gives an object
+        // its live id: none is stored while the guest holds one, else one in
+        // all, which the later calls reuse.
+        assert_eq!(stored, [CALLS, CALLS, CALLS, CALLS, CALLS + 1]);
     }
 }
