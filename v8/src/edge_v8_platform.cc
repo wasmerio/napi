@@ -543,6 +543,20 @@ bool EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   return v8::platform::PumpMessageLoop(fallback_.get(), isolate);
 }
 
+void EdgeV8Platform::WakeForQueuedForegroundTasks(v8::Isolate* isolate) {
+  std::shared_ptr<IsolateState> state = GetState(isolate);
+  // Only the default queue waits for a checkpoint. Tasks posted there before
+  // a target was bound stay there, so a bound target is no reason to skip.
+  if (!state || !state->runner || !state->runner->used_fallback_runner()) return;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->finished || state->shutdown_started || state->pending_foreground_tasks == 0) {
+      return;
+    }
+  }
+  WakeForForegroundTask();
+}
+
 int EdgeV8Platform::NumberOfWorkerThreads() {
   return fallback_ != nullptr ? fallback_->NumberOfWorkerThreads() : 0;
 }

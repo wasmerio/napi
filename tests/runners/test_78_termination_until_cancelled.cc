@@ -25,6 +25,10 @@
 
 #if defined(NAPI_TEST_ENGINE_V8)
 #include <v8.h>
+
+#include <atomic>
+
+#include "../../v8/src/edge_v8_platform.h"
 #endif
 
 class Test78TerminationUntilCancelled : public FixtureTestBase {};
@@ -1168,3 +1172,77 @@ TEST_F(Test78TerminationUntilCancelled, InterruptCallbackTerminated) {
   EXPECT_TRUE(calls == "0" || calls == "1") << "calls " << calls;
   napi_delete_reference(s.env, g_interrupt_fn);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// The foreground task waker (EdgeV8Platform::SetForegroundTaskWaker, which
+// wasmer_napi::set_foreground_task_waker installs) is called when V8 posts a
+// task that only a checkpoint runs, so that a host sleeping until it is woken
+// takes that checkpoint. While the env terminates, the checkpoint refuses and
+// runs no task; it calls no waker either, so that host takes one turn and
+// sleeps again rather than spinning. The cancel then wakes it again, for the
+// task the refused checkpoints left queued.
+namespace {
+std::thread::id g_waker_thread;
+std::atomic<int> g_env_thread_wakes{0};
+void CountEnvThreadWakes() {
+  // V8 may post tasks of its own from other threads meanwhile.
+  if (std::this_thread::get_id() == g_waker_thread) g_env_thread_wakes.fetch_add(1);
+}
+struct ScopedWaker {
+  ScopedWaker() {
+    g_waker_thread = std::this_thread::get_id();
+    g_env_thread_wakes = 0;
+    EdgeV8Platform::SetForegroundTaskWaker(CountEnvThreadWakes);
+  }
+  ~ScopedWaker() { EdgeV8Platform::SetForegroundTaskWaker(nullptr); }
+  ScopedWaker(const ScopedWaker&) = delete;
+  ScopedWaker& operator=(const ScopedWaker&) = delete;
+};
+napi_status Checkpoint(napi_env env, uint32_t* state_out = nullptr) {
+  uint32_t state = 0;
+  napi_status status = unofficial_napi_event_loop_checkpoint(
+      env, unofficial_napi_event_loop_checkpoint_microtasks, false, &state);
+  if (state_out != nullptr) *state_out = state;
+  return status;
+}
+}  // namespace
+
+TEST_F(Test78TerminationUntilCancelled, CancelWakesTheHostForTheTasksLeftQueued) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  // The tasks V8 queued while the env was made run first.
+  for (int i = 0; i < 64; ++i) {
+    uint32_t state = 0;
+    ASSERT_EQ(Checkpoint(s.env, &state), napi_ok);
+    if ((state & unofficial_napi_event_loop_checkpoint_state_host_tasks_admitted) == 0) break;
+  }
+  ScopedWaker waker;
+  // Atomics.notify on the waiter of a same-thread Atomics.waitAsync: V8
+  // posts the task that resolves its promise.
+  ASSERT_EQ(RunScript(s.env,
+                      "globalThis.resolved = 'no';\n"
+                      "{ const i32 = new Int32Array(new SharedArrayBuffer(16));\n"
+                      "  Atomics.waitAsync(i32, 0, 0).value.then(() => { resolved = 'yes'; });\n"
+                      "  Atomics.notify(i32, 0, 1); }\n"),
+            napi_ok);
+  EXPECT_GE(g_env_thread_wakes.load(), 1) << "posting the task did not wake the host";
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  const int before_checkpoints = g_env_thread_wakes.load();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_EQ(Checkpoint(s.env), napi_pending_exception);
+  }
+  EXPECT_EQ(g_env_thread_wakes.load(), before_checkpoints)
+      << "a checkpoint the termination refused woke the host";
+
+  const int before_cancel = g_env_thread_wakes.load();
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  EXPECT_EQ(g_env_thread_wakes.load(), before_cancel + 1)
+      << "the cancel did not wake the host for the task left queued";
+  EXPECT_EQ(GlobalText(s.env, "resolved"), "no") << "a refused checkpoint ran the task";
+  for (int i = 0; i < 8 && GlobalText(s.env, "resolved") != "yes"; ++i) {
+    ASSERT_EQ(Checkpoint(s.env), napi_ok);
+  }
+  EXPECT_EQ(GlobalText(s.env, "resolved"), "yes");
+}
+#endif

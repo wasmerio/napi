@@ -49,7 +49,7 @@ class EdgeV8Platform final : public v8::Platform {
   // the first checkpoint after its delay. nullptr clears it. A thread that
   // read the previous function just before a change may still call it once
   // afterwards. It takes no data pointer, so that one atomic store publishes
-  // it.
+  // it. WakeForQueuedForegroundTasks calls it too.
   static void SetForegroundTaskWaker(void (*waker)());
 
   ~EdgeV8Platform() override;
@@ -71,6 +71,15 @@ class EdgeV8Platform final : public v8::Platform {
   // Run at most one ready fallback task. Returns true when a task ran so
   // the embedder can admit another loop turn before continuing provider work.
   bool PumpPendingForegroundTasks(v8::Isolate* isolate);
+  // Calls the function SetForegroundTaskWaker set, on this thread, when the
+  // isolate may have tasks waiting that only a checkpoint runs: it has used
+  // the default platform's queue and has tasks pending. Their posts called it
+  // once, but a checkpoint that refused to run them (while the env
+  // terminated) left them queued, and nothing calls it for them again. The
+  // pending tasks may also be delayed ones that aren't due yet, or ones
+  // handed to a bound target: the embedder then finds nothing to run and
+  // waits again.
+  void WakeForQueuedForegroundTasks(v8::Isolate* isolate);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(

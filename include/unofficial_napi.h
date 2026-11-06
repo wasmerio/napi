@@ -624,7 +624,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // current JS stack to unwind normally. Call it on the env's engine thread. A
 // pending exception that stands for the termination is dropped: nothing threw
 // it, so a native callback that cancels returns to its caller as after any
-// call. Any other pending exception stays.
+// call. Any other pending exception stays. V8: the checkpoints the termination
+// refused left the engine's tasks queued, so when some wait for a checkpoint,
+// this calls the host's foreground task waker (wasmer_napi's
+// set_foreground_task_waker) again.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);

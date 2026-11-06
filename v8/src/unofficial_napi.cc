@@ -2344,6 +2344,16 @@ napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) 
   // left there, the native function that cancels would throw it into its
   // caller as a catchable null.
   napi_v8_drop_pending_termination(env);
+  // The checkpoints the termination refused ran none of the tasks V8 queued
+  // for them, and the host's foreground task waker was called only when each
+  // was posted: call it again, so that a host that sleeps until it is woken
+  // takes the checkpoint that runs them now.
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
   return napi_ok;
 }
 
