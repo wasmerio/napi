@@ -269,14 +269,26 @@ void napi_v8_drop_pending_termination(napi_env env);
 // replace the termination with a catchable exception.
 bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value> exception);
 
+// Whether the env terminates: the embedder terminated it
+// (unofficial_napi_terminate_execution) and has not cancelled that, or V8 is
+// unwinding with a termination. Calls into JS fail meanwhile.
+bool napi_v8_terminating(napi_env env);
+
+// What a call refused while the env terminates returns:
+// napi_pending_exception, with the null a TryCatch records for a termination
+// pending unless something else is, as QuickJS leaves its uncatchable error
+// pending.
+napi_status napi_v8_fail_terminating(napi_env env);
+
 // For a V8 host callback (a module hook, say) that ran JS through N-API and
 // failed: moves N-API's pending exception into V8, as Node's callbacks
-// rethrow what their TryCatch caught, and returns true. While V8 is
-// terminating it throws nothing and drops what is pending: throwing would
-// replace the termination with a catchable exception, and the termination
-// unwinds by itself. Returns true then too: either way V8 now has something
-// to unwind with, so the callback may return an empty result. Returns false
-// when nothing was pending and V8 is not terminating.
+// rethrow what their TryCatch caught, and returns true. While the env
+// terminates it drops what is pending instead (throwing would replace the
+// termination with a catchable exception) and makes V8 unwind with the
+// termination, which V8 may have forgotten. Returns true then too: either
+// way V8 now has something to unwind with, so the callback may return an
+// empty result. Returns false when nothing was pending and the env is not
+// terminating.
 bool napi_v8_rethrow_pending_exception(napi_env env);
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);

@@ -74,8 +74,16 @@ struct napi_agent__ {
   // The embedder's termination: set by unofficial_napi_terminate_execution
   // until unofficial_napi_cancel_terminate_execution (or Shutdown) clears
   // it. V8 does not tell it apart from one a script timeout's watchdog asks
-  // for.
+  // for, and forgets it on its own: once the outermost JS frame has unwound,
+  // and whenever an API call enters V8 while it unwinds (V8 13.6's
+  // PREPARE_FOR_EXECUTION clears it). This keeps it, so that calls into JS
+  // fail until it is cancelled, as on QuickJS and as Node's can_call_into_js()
+  // stays false once the env stops.
   std::atomic<bool> termination_requested{false};
+  // A no-op JS function, made the first time it is needed. Called right
+  // after a termination request, it makes V8 act on the request at its
+  // entry, a stack check.
+  v8::Global<v8::Function> termination_probe;
 
   // Profiler sessions. V8's CPU and sampling heap profilers are per isolate.
   v8::CpuProfiler* cpu_profiler = nullptr;

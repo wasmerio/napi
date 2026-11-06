@@ -14,8 +14,10 @@
 #include "unofficial_napi.h"
 
 #include <chrono>
+#include <cstdio>
 #include <string>
 #include <thread>
+#include <vector>
 
 class Test73TerminationUntilCancelled : public FixtureTestBase {};
 
@@ -32,6 +34,13 @@ napi_value Global(napi_env env) {
   EXPECT_EQ(napi_get_global(env, &global), napi_ok);
   return global;
 }
+
+napi_value Terminate(napi_env env, napi_callback_info /*info*/) {
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  return nullptr;
+}
+
+napi_value Noop(napi_env /*env*/, napi_callback_info /*info*/) { return nullptr; }
 
 // Terminates and calls tick(), so that V8 acts on it.
 void TerminateNow(napi_env env) {
@@ -69,6 +78,99 @@ napi_value RunScriptWithTimeout(napi_env env, napi_callback_info /*info*/) {
   napi_value out = nullptr;
   g_status = unofficial_napi_run_script(env, nullptr, &source, Str(env, "timeout.js"), 0, 0, 50,
                                         true, false, false, nullptr, &out);
+  return nullptr;
+}
+
+// N-API calls native code may make after a call into JS failed because of
+// a termination, ignoring the failure. Those that enter V8 would have it
+// forget the termination; those that run JS set afterCall.
+constexpr const char* kAfterCalls[] = {
+    "napi_create_function",
+    "napi_create_promise",
+    "napi_create_date",
+    "napi_define_class",
+    "napi_create_buffer",
+    "unofficial_napi_create_private_symbol",
+    "unofficial_napi_compile_function",
+    "unofficial_napi_get_own_non_index_properties",
+    "unofficial_napi_create_realm (sandbox)",
+    "unofficial_napi_contextify_contains_module_syntax",
+    "unofficial_napi_run_script",
+    "napi_get_and_clear_last_exception",
+};
+constexpr int kAfterCallCount = sizeof(kAfterCalls) / sizeof(kAfterCalls[0]);
+
+napi_status CallAfter(napi_env env, int kind) {
+  napi_value out = nullptr;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  switch (kind) {
+    case 0:
+      return napi_create_function(env, "f", NAPI_AUTO_LENGTH, Noop, nullptr, &out);
+    case 1: {
+      napi_deferred deferred = nullptr;
+      return napi_create_promise(env, &deferred, &out);
+    }
+    case 2:
+      return napi_create_date(env, 0, &out);
+    case 3:
+      return napi_define_class(env, "C", NAPI_AUTO_LENGTH, Noop, nullptr, 0, nullptr, &out);
+    case 4: {
+      void* data = nullptr;
+      return napi_create_buffer(env, 4, &data, &out);
+    }
+    case 5:
+      return unofficial_napi_create_private_symbol(env, "p", NAPI_AUTO_LENGTH, &out);
+    case 6: {
+      const unofficial_napi_js_source source =
+          unofficial_napi_js_source_from_text(Str(env, "return 1;"));
+      return unofficial_napi_compile_function(env, nullptr, &source, Str(env, "f.js"), 0, 0,
+                                              undefined, undefined, undefined, &out);
+    }
+    case 7: {
+      napi_value object = nullptr;
+      napi_create_object(env, &object);
+      return unofficial_napi_get_own_non_index_properties(env, object, 0, &out);
+    }
+    case 8: {
+      napi_value sandbox = nullptr;
+      napi_create_object(env, &sandbox);
+      unofficial_napi_realm_options options;
+      unofficial_napi_realm_options_init(&options);
+      options.sandbox_or_null = sandbox;
+      unofficial_napi_realm realm = nullptr;
+      return unofficial_napi_create_realm(env, &options, &realm, &out);
+    }
+    case 9: {
+      bool result = false;
+      return unofficial_napi_contextify_contains_module_syntax(
+          env, Str(env, "export {}"), Str(env, "m.js"), undefined, false, &result);
+    }
+    case 10: {
+      const unofficial_napi_js_source source =
+          unofficial_napi_js_source_from_text(Str(env, "globalThis.afterCall = 'yes';"));
+      return unofficial_napi_run_script(env, nullptr, &source, Str(env, "after.js"), 0, 0, -1,
+                                        true, false, false, nullptr, &out);
+    }
+    default: {
+      bool pending = false;
+      napi_is_exception_pending(env, &pending);
+      if (!pending) return napi_ok;
+      return napi_get_and_clear_last_exception(env, &out);
+    }
+  }
+}
+
+// Terminates, then makes the N-API call its argument names, as native code
+// that ignores the failed call does.
+napi_value TerminateThen(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value kind_value = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, &argc, &kind_value, nullptr, nullptr), napi_ok);
+  int32_t kind = 0;
+  EXPECT_EQ(napi_get_value_int32(env, kind_value, &kind), napi_ok);
+  TerminateNow(env);
+  g_status = CallAfter(env, kind);
   return nullptr;
 }
 
@@ -116,6 +218,8 @@ bool FinishTermination(napi_env env) {
 }
 
 void InstallHelpers(napi_env env) {
+  DefineGlobalFunction(env, "terminate", Terminate);
+  DefineGlobalFunction(env, "terminateThen", TerminateThen);
   DefineGlobalFunction(env, "terminateThenCancel", TerminateThenCancel);
   DefineGlobalFunction(env, "terminateAndSleep", TerminateAndSleep);
   DefineGlobalFunction(env, "runScriptWithTimeout", RunScriptWithTimeout);
@@ -149,6 +253,21 @@ void ExpectRunTerminated(napi_env env, const char* script) {
   // Cancelling leaves the env usable.
   EXPECT_EQ(RunScript(env, "globalThis.resumed = 'yes';"), napi_ok);
   EXPECT_EQ(GlobalText(env, "resumed"), "yes");
+}
+
+// Runs `script` and expects it, or the next run, to come back terminated,
+// with nothing caught: for callbacks the engine cannot report a failure
+// from.
+void ExpectRunOrNextTerminated(napi_env env, const char* script) {
+  const napi_status run = RunScript(env, script);
+  const napi_status next = RunScript(env, "globalThis.next = 'yes';");
+  FinishTermination(env);
+  EXPECT_TRUE(run == napi_pending_exception || next == napi_pending_exception)
+      << "run " << run << ", next run " << next;
+  EXPECT_EQ(GlobalText(env, "caught"), "no");
+  EXPECT_EQ(GlobalText(env, "innerCaught"), "no");
+  EXPECT_EQ(GlobalText(env, "caughtError"), "none");
+  EXPECT_EQ(RunScript(env, "globalThis.resumed = 'yes';"), napi_ok);
 }
 
 void SetModuleHooks(napi_env env, napi_value import_callback, napi_value meta_callback) {
@@ -270,3 +389,300 @@ TEST_F(Test73TerminationUntilCancelled, ScriptTimeoutKeepsTheEmbeddersTerminatio
       "after = 'yes';\n");
   EXPECT_EQ(g_status, napi_pending_exception);
 }
+
+// The run a termination stopped leaves it in effect: the next run fails too
+// until the termination is cancelled. V8 forgets a termination once the
+// outermost JS frame has unwound.
+TEST_F(Test73TerminationUntilCancelled, TopLevelRunKeepsTheTerminationUntilCancelled) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  napi_value mark = Eval(s.env, "() => { afterCall = 'yes'; }");
+  EXPECT_EQ(RunScript(s.env, "terminate(); tick();"), napi_pending_exception);
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception);
+  napi_value result = nullptr;
+  EXPECT_EQ(napi_call_function(s.env, Global(s.env), mark, 0, nullptr, &result),
+            napi_pending_exception);
+  EXPECT_TRUE(FinishTermination(s.env));
+  EXPECT_EQ(GlobalText(s.env, "afterCall"), "no");
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_ok);
+}
+
+// Native code that goes on with N-API after its call into JS failed because
+// of the termination. On V8 an N-API call that enters V8 clears the
+// termination, and the trampoline then threw the null the TryCatch recorded
+// for it, which the JS caught.
+TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTermination) {
+  for (int kind = 0; kind < kAfterCallCount; ++kind) {
+    SCOPED_TRACE(kAfterCalls[kind]);
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    const std::string script = "try { terminateThen(" + std::to_string(kind) +
+                               "); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+                               "after = 'yes';\n";
+    ExpectRunTerminated(s.env, script.c_str());
+  }
+}
+
+// The same native code, called from the module hooks test_72 covers: those
+// see what the native function threw.
+TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideModuleHooks) {
+  {
+    SCOPED_TRACE("import.meta");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    SetModuleHooks(s.env, nullptr, Eval(s.env, "(id, meta, wrap) => { terminateThen(0); }"));
+    unofficial_napi_module module = MakeModule(
+        s.env,
+        "try { import.meta; } catch (e) { globalThis.innerCaught = 'yes'; caughtError = e; }\n"
+        "globalThis.innerAfter = 'yes';\n",
+        nullptr);
+    ASSERT_NE(module, nullptr);
+    DefineGlobalFunction(s.env, "evaluateModule", EvaluateModule, module);
+    ExpectRunTerminated(s.env, kEvaluateModuleInTryCatch);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+  {
+    SCOPED_TRACE("synthetic steps");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    unofficial_napi_module module =
+        MakeModule(s.env, nullptr, Eval(s.env, "(function () { terminateThen(1); })"));
+    ASSERT_NE(module, nullptr);
+    DefineGlobalFunction(s.env, "evaluateModule", EvaluateModule, module);
+    ExpectRunTerminated(s.env, kEvaluateModuleInTryCatch);
+    EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
+  {
+    SCOPED_TRACE("import()");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    SetModuleHooks(
+        s.env,
+        Eval(s.env, "(id, specifier, phase, attributes, name) => { terminateThen(2); }"),
+        nullptr);
+    ExpectRunTerminated(
+        s.env,
+        "try { import('x').catch(() => {}); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+  }
+  {
+    SCOPED_TRACE("promise reject callback");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(unofficial_napi_set_promise_reject_callback(
+                  s.env, Eval(s.env, "(type, promise, reason) => { terminateThen(3); }")),
+              napi_ok);
+    ExpectRunOrNextTerminated(
+        s.env,
+        "try { Promise.reject(1); tick(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+  }
+}
+
+// A finalizer drained at a checkpoint (V8; QuickJS runs it while it
+// collects) whose JS is terminated. Nothing reports a failure from a
+// finalizer: its next call into JS must fail, and the next run.
+namespace {
+napi_status g_finalizer_first = napi_ok;
+napi_status g_finalizer_second = napi_ok;
+bool g_finalizer_ran = false;
+void TerminatingFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
+  g_finalizer_ran = true;
+  napi_value terminate_js = nullptr;
+  napi_value mark = nullptr;
+  napi_value ignored = nullptr;
+  napi_get_named_property(env, Global(env), "terminateJs", &terminate_js);
+  napi_get_named_property(env, Global(env), "markAfterCall", &mark);
+  g_finalizer_first = napi_call_function(env, Global(env), terminate_js, 0, nullptr, &ignored);
+  g_finalizer_second = napi_call_function(env, Global(env), mark, 0, nullptr, &ignored);
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, FinalizerDrainedAtACheckpoint) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ASSERT_EQ(RunScript(s.env,
+                      "globalThis.terminateJs = () => { terminate(); tick(); };"
+                      "globalThis.markAfterCall = () => { afterCall = 'yes'; };"),
+            napi_ok);
+  g_finalizer_ran = false;
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    napi_value object = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, TerminatingFinalizer, nullptr, nullptr),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  napi_status checkpoint = napi_ok;
+  for (int i = 0; i < 5 && !g_finalizer_ran; ++i) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    checkpoint = unofficial_napi_event_loop_checkpoint(
+        s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr);
+  }
+  ASSERT_TRUE(g_finalizer_ran);
+  EXPECT_EQ(g_finalizer_first, napi_pending_exception);
+  EXPECT_EQ(g_finalizer_second, napi_pending_exception);
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception)
+      << "checkpoint " << checkpoint;
+  FinishTermination(s.env);
+  EXPECT_EQ(GlobalText(s.env, "afterCall"), "no");
+}
+
+// A native function that terminates and then runs a checkpoint with a
+// microtask queued: the checkpoint runs no JS.
+namespace {
+napi_value TerminateThenCheckpoint(napi_env env, napi_callback_info /*info*/) {
+  TerminateNow(env);
+  g_status = unofficial_napi_event_loop_checkpoint(
+      env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr);
+  return nullptr;
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, CheckpointAfterTheTermination) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  DefineGlobalFunction(s.env, "terminateThenCheckpoint", TerminateThenCheckpoint);
+  g_status = napi_ok;
+  ExpectRunTerminated(
+      s.env,
+      "Promise.resolve().then(() => { afterCall = 'yes'; });\n"
+      "try { terminateThenCheckpoint(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
+  EXPECT_EQ(g_status, napi_pending_exception);
+}
+
+// A cleanup hook that terminates while the env is released: the release
+// completes, and the hooks and finalizers after it run no JS.
+namespace {
+std::vector<napi_status> g_release_runs;
+void TerminatingCleanupHook(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  napi_value fn = nullptr;
+  napi_value ignored = nullptr;
+  napi_get_named_property(env, Global(env), "terminateJs", &fn);
+  g_release_runs.push_back(napi_call_function(env, Global(env), fn, 0, nullptr, &ignored));
+  napi_value made = nullptr;
+  (void)napi_create_function(env, "f", NAPI_AUTO_LENGTH, Noop, nullptr, &made);
+  g_release_runs.push_back(napi_run_script(env, Str(env, "afterCall = 'yes'; 1"), &made));
+}
+void LaterCleanupHook(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  napi_value result = nullptr;
+  g_release_runs.push_back(napi_run_script(env, Str(env, "afterCall = 'yes'; 1"), &result));
+}
+void ReleaseFinalizer(napi_env env, void* /*data*/, void* /*hint*/) {
+  napi_value result = nullptr;
+  g_release_runs.push_back(napi_run_script(env, Str(env, "afterCall = 'yes'; 1"), &result));
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, TerminationRequestedInsideTheRelease) {
+  g_release_runs.clear();
+  {
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(RunScript(s.env, "globalThis.terminateJs = () => { terminate(); tick(); };"),
+              napi_ok);
+    napi_value object = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+    napi_ref keep = nullptr;
+    ASSERT_EQ(napi_create_reference(s.env, object, 1, &keep), napi_ok);
+    ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, ReleaseFinalizer, nullptr, nullptr),
+              napi_ok);
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, LaterCleanupHook, s.env), napi_ok);
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, TerminatingCleanupHook, s.env), napi_ok);
+  }
+  // The terminating hook's call and run, the later hook's run, the
+  // finalizer's run.
+  EXPECT_EQ(g_release_runs,
+            std::vector<napi_status>(4, napi_pending_exception));
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+// The same native code, called from the hooks only V8 runs: the
+// prepare-stack-trace callback (QuickJS never calls it), the serializer's
+// host-object hook (QuickJS's serdes binding calls none of the serializer's
+// hooks) and the deprecated context-token assign hook (only V8 accepts the
+// context-token hooks).
+TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideV8Hooks) {
+  {
+    SCOPED_TRACE("prepare-stack-trace callback");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(
+                  s.env, Eval(s.env, "(global, error, trace) => { terminateThen(0); }")),
+              napi_ok);
+    ExpectRunTerminated(
+        s.env,
+        "try { new Error('x').stack; } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n");
+  }
+  {
+    SCOPED_TRACE("serializer host-object hook");
+    EnvScope s(runtime_.get());
+    InstallHelpers(s.env);
+    napi_value binding = nullptr;
+    ASSERT_EQ(unofficial_napi_create_serdes_binding(s.env, &binding), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "serdes", binding), napi_ok);
+    ExpectRunTerminated(
+        s.env,
+        "(() => {\n"
+        "const s = new serdes.Serializer();\n"
+        "s._setTreatArrayBufferViewsAsHostObjects(true);\n"
+        "s._writeHostObject = (value) => { terminateThen(0); };\n"
+        "try { s.writeValue(new Uint8Array(2)); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+        "after = 'yes';\n"
+        "})();");
+  }
+}
+
+namespace {
+napi_ref g_token_fn = nullptr;
+bool g_token_armed = false;
+void TerminatingTokenHook(napi_env env, void* /*token*/, void* /*data*/) {
+  if (!g_token_armed) return;
+  g_token_armed = false;
+  napi_value fn = nullptr;
+  napi_get_reference_value(env, g_token_fn, &fn);
+  napi_value ignored = nullptr;
+  napi_call_function(env, Global(env), fn, 0, nullptr, &ignored);
+}
+napi_value CreateRealm(napi_env env, napi_callback_info /*info*/) {
+  unofficial_napi_realm realm = nullptr;
+  napi_value global = nullptr;
+  g_status = unofficial_napi_create_realm(env, nullptr, &realm, &global);
+  return global;
+}
+void AttachTokenHooks(napi_env env, bool assign) {
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  if (assign) {
+    hooks.context_token_assign_callback = TerminatingTokenHook;
+  } else {
+    hooks.context_token_unassign_callback = TerminatingTokenHook;
+  }
+  uint64_t accepted = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted), napi_ok);
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheTokenAssignHook) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  AttachTokenHooks(s.env, true);
+  ASSERT_EQ(napi_create_reference(s.env, Eval(s.env, "(() => { terminateThen(0); })"), 1,
+                                  &g_token_fn),
+            napi_ok);
+  DefineGlobalFunction(s.env, "createRealm", CreateRealm);
+  g_token_armed = true;
+  ExpectRunTerminated(
+      s.env,
+      "try { createRealm(); } catch (e) { caught = 'yes'; caughtError = e; }\nafter = 'yes';\n");
+  g_token_armed = false;
+  napi_delete_reference(s.env, g_token_fn);
+}
+#endif

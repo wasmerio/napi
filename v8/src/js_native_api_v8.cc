@@ -583,10 +583,17 @@ inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const c
   return napi_v8_set_last_error(env, napi_generic_failure, message);
 }
 
-// Like Node's napi_env__::terminatedOrTerminating(): V8 is terminating the
-// env's JS (worker terminate(), process.exit()).
+// Like Node's napi_env__::terminatedOrTerminating(), with its
+// can_call_into_js() that stays false once the env stops: the embedder
+// terminated the env (worker terminate(), process.exit()) and has not
+// cancelled that, or V8 is unwinding with a termination (a script timeout's
+// too). V8 alone forgets a termination: once the outermost JS frame has
+// unwound, and when an API call enters V8 while it unwinds.
 inline bool TerminatedOrTerminating(napi_env env) {
-  return env != nullptr && env->isolate != nullptr && env->isolate->IsExecutionTerminating();
+  return env != nullptr && env->isolate != nullptr &&
+         ((env->agent != nullptr &&
+           env->agent->termination_requested.load(std::memory_order_acquire)) ||
+          env->isolate->IsExecutionTerminating());
 }
 
 // Like Node's NAPI_PREAMBLE: while terminating, calls that may run JS fail
@@ -594,10 +601,7 @@ inline bool TerminatedOrTerminating(napi_env env) {
 // would keep running JS after it was told to stop.
 #define NAPI_V8_RETURN_IF_TERMINATING(env)                                   \
   do {                                                                       \
-    if (TerminatedOrTerminating(env)) {                                      \
-      return napi_v8_set_last_error(                                         \
-          (env), napi_pending_exception, "Execution is terminating");        \
-    }                                                                        \
+    if (TerminatedOrTerminating(env)) return napi_v8_fail_terminating(env);  \
   } while (0)
 
 inline napi_status InvalidArg(napi_env env) {
@@ -686,16 +690,47 @@ inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* 
   return true;
 }
 
-// Like Node's napi_env__::CallIntoModule() and HandleThrow(): after a native
-// callback returns, rethrow the exception it left pending, unless V8 is
-// terminating. TryCatch records a termination as a null exception, and
-// rethrowing that would turn the termination into a catchable throw and cancel
-// it. Returns whether an exception was pending.
-bool HandleCallbackException(napi_env env) {
-  if (env->last_exception.IsEmpty()) return false;
-  if (!TerminatedOrTerminating(env)) {
-    env->isolate->ThrowException(env->last_exception.Get(env->isolate));
+// For a callback V8 runs for JS (a native function, an accessor, a module
+// hook) that returns while the env terminates: makes V8 unwind that JS with
+// the termination now. V8 may have forgotten it (an N-API call that entered
+// V8 since cleared it) or not acted on it yet (it acts on a request at its
+// next stack check, which the JS after the call, a catch block say, need not
+// reach). So this asks again and calls a no-op function, whose entry is such
+// a check. Called only below JS, which the termination then unwinds.
+void KeepTerminating(napi_env env) {
+  v8::Isolate* isolate = env->isolate;
+  if (isolate->IsExecutionTerminating()) return;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->main_context();
+  v8::Local<v8::Function> probe;
+  if (!env->agent->termination_probe.IsEmpty()) {
+    probe = env->agent->termination_probe.Get(isolate);
+  } else {
+    // Compiling runs no JS, so it does not act on a request made already.
+    v8::ScriptCompiler::Source source(v8::String::Empty(isolate));
+    if (v8::ScriptCompiler::CompileFunction(context, &source).ToLocal(&probe)) {
+      env->agent->termination_probe.Reset(isolate, probe);
+    }
   }
+  isolate->TerminateExecution();
+  if (!probe.IsEmpty()) (void)probe->Call(context, v8::Undefined(isolate), 0, nullptr);
+}
+
+// Like Node's napi_env__::CallIntoModule() and HandleThrow(): after a native
+// callback returns, rethrow the exception it left pending, unless the env
+// terminates. Then what is pending is dropped (TryCatch records a
+// termination as a null exception, and rethrowing that would turn the
+// termination into a catchable throw and cancel it), and the termination
+// unwinds the JS that called, as QuickJS's trampoline does. Returns whether
+// that JS unwinds.
+bool HandleCallbackException(napi_env env) {
+  if (TerminatedOrTerminating(env)) {
+    ClearLastException(env);
+    KeepTerminating(env);
+    return true;
+  }
+  if (env->last_exception.IsEmpty()) return false;
+  env->isolate->ThrowException(env->last_exception.Get(env->isolate));
   ClearLastException(env);
   return true;
 }
@@ -884,13 +919,24 @@ bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value>
   return true;
 }
 
+bool napi_v8_terminating(napi_env env) { return TerminatedOrTerminating(env); }
+
+napi_status napi_v8_fail_terminating(napi_env env) {
+  if (env->last_exception.IsEmpty()) {
+    env->last_exception.Reset(env->isolate, v8::Null(env->isolate));
+    env->last_exception_is_termination = true;
+  }
+  return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
+}
+
 bool napi_v8_rethrow_pending_exception(napi_env env) {
   if (env == nullptr) return false;
-  // As HandleCallbackException: what is pending while V8 terminates is the
-  // null a TryCatch records for the termination, and throwing it would make
-  // the termination a catchable throw and cancel it.
+  // As HandleCallbackException: what is pending while the env terminates is
+  // the null a TryCatch records for the termination, and throwing it would
+  // make the termination a catchable throw and cancel it.
   if (TerminatedOrTerminating(env)) {
     ClearLastException(env);
+    KeepTerminating(env);
     return true;
   }
   bool pending = false;
@@ -1012,6 +1058,7 @@ napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
 }
 
 napi_agent__::~napi_agent__() {
+  termination_probe.Reset();
   wrap_private_key.Reset();
   buffer_private_key.Reset();
   type_tag_private_key.Reset();

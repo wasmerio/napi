@@ -1642,8 +1642,10 @@ void napi_agent__::Shutdown() {
   near_heap_limit_data = nullptr;
   fatal_error_callback = nullptr;
   oom_error_callback = nullptr;
+  // The release runs its hooks and finalizers with JS usable.
   termination_requested.store(false, std::memory_order_release);
   isolate->CancelTerminateExecution();
+  termination_probe.Reset();
   isolate->SetPromiseHook(nullptr);
   isolate->SetPromiseRejectCallback(nullptr);
   isolate->SetFatalErrorHandler(nullptr);
@@ -2077,21 +2079,23 @@ bool PumpPlatformForegroundTasks(napi_env env) {
   return false;
 }
 
-bool DrainMicrotasksForEnv(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return false;
+// Returns false, having run no more JS, once the env terminates (a
+// finalizer or a microtask may terminate it).
+bool DrainMicrotasksForEnv(napi_env env, bool* host_task_admitted) {
+  *host_task_admitted = false;
   env->DrainFinalizerQueue();
+  if (napi_v8_terminating(env)) return false;
   v8::Local<v8::Context> context = env->main_context();
-  if (!context.IsEmpty()) {
-    v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
-    if (queue != nullptr) {
-      queue->PerformCheckpoint(env->isolate);
-      env->DrainFinalizerQueue();
-      return PumpPlatformForegroundTasks(env);
-    }
+  v8::MicrotaskQueue* queue = context.IsEmpty() ? nullptr : context->GetMicrotaskQueue();
+  if (queue != nullptr) {
+    queue->PerformCheckpoint(env->isolate);
+  } else {
+    env->isolate->PerformMicrotaskCheckpoint();
   }
-  env->isolate->PerformMicrotaskCheckpoint();
   env->DrainFinalizerQueue();
-  return PumpPlatformForegroundTasks(env);
+  if (napi_v8_terminating(env)) return false;
+  *host_task_admitted = PumpPlatformForegroundTasks(env);
+  return true;
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
@@ -2105,7 +2109,13 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
       mode != unofficial_napi_event_loop_checkpoint_host_tasks) {
     return napi_invalid_arg;
   }
-  const bool host_task_admitted = DrainMicrotasksForEnv(env);
+  // As the calls into JS: a terminating env runs none, and a termination a
+  // finalizer or a microtask runs into fails the checkpoint, as on QuickJS,
+  // so the event loop stops instead of going on as if nothing happened.
+  bool host_task_admitted = false;
+  if (napi_v8_terminating(env) || !DrainMicrotasksForEnv(env, &host_task_admitted)) {
+    return napi_v8_fail_terminating(env);
+  }
   if (state_out != nullptr) {
     *state_out = NapiV8HasPendingProviderWork(env)
                      ? unofficial_napi_event_loop_checkpoint_state_pending_provider_work
