@@ -1297,13 +1297,17 @@ extern "C"
     if (!napi_util__::check_value(env, arraybuffer))
       return napi_util__::invalid_arg(env);
 
+    JSValue value = napi_quickjs_value_inner(env, arraybuffer);
     size_t len = 0;
-    uint8_t *ptr = JS_GetArrayBuffer(env->context(), &len, napi_quickjs_value_inner(env, arraybuffer));
+    uint8_t *ptr = JS_GetArrayBuffer(env->context(), &len, value);
     if (ptr == nullptr && len == 0 && JS_HasException(env->context()))
     {
       JSValue exc = JS_GetException(env->context());
       JS_FreeValue(env->context(), exc);
-      return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
+      // QuickJS throws for a detached ArrayBuffer. Node reports it as one
+      // with no data and a byte length of 0.
+      if (!JS_IsArrayBuffer(value))
+        return napi_quickjs_set_last_error(env, napi_invalid_arg, "Invalid argument");
     }
 
     if (data != nullptr)

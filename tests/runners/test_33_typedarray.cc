@@ -168,6 +168,35 @@ TEST_F(Test33TypedArray, ExternalArrayBufferItsFinalizerDetachesIsFinalizedOnce)
   EXPECT_EQ(others, 3);
 }
 
+// As in Node, a detached ArrayBuffer has no data and a byte length of 0.
+TEST_F(Test33TypedArray, DetachedArrayBufferInfoIsEmpty) {
+  ExternalBufferState state;
+  EnvScope s(runtime_.get());
+  napi_value owned = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 16, nullptr, &owned), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(s.env, state.bytes, sizeof(state.bytes),
+                                             FinalizeExternalBuffer, &state, &external),
+            napi_ok);
+  for (napi_value buffer : {owned, external}) {
+    ASSERT_EQ(napi_detach_arraybuffer(s.env, buffer), napi_ok);
+    void* data = &state;
+    size_t length = 1;
+    EXPECT_EQ(napi_get_arraybuffer_info(s.env, buffer, &data, &length), napi_ok);
+    EXPECT_EQ(data, nullptr);
+    EXPECT_EQ(length, 0u);
+    bool pending = true;
+    ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+    EXPECT_FALSE(pending);
+  }
+  // Not an ArrayBuffer at all is still an invalid argument.
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  void* data = nullptr;
+  size_t length = 0;
+  EXPECT_EQ(napi_get_arraybuffer_info(s.env, object, &data, &length), napi_invalid_arg);
+}
+
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
 TEST_F(Test33TypedArray, ExternalArrayBufferResizeFailurePreservesBackingStore) {
   ExternalBufferState state;
