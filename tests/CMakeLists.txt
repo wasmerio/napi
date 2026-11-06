@@ -387,3 +387,21 @@ if(_napi_test_engine STREQUAL "v8")
   set_tests_properties(napi_v8.background_job_limit napi_v8.background_job_limit_single_worker
     PROPERTIES TIMEOUT 120)
 endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_task_waker_test src/v8_foreground_task_waker_test.cc)
+  target_include_directories(napi_v8_foreground_task_waker_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_task_waker_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_task_waker_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_task_waker
+    COMMAND napi_v8_foreground_task_waker_test)
+  set_tests_properties(napi_v8.foreground_task_waker PROPERTIES TIMEOUT 120)
+endif()

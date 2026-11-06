@@ -14,6 +14,7 @@ on:
       - "lib/**"
       - "rust-toolchain.toml"
       - "src/**"
+      - "tests/foreground_task_waker.rs"
       - "tests/concurrent_*.rs"
       - "tests/guest_*.rs"
       - "tests/wat_guest/**"
@@ -29,6 +30,7 @@ on:
       - "lib/**"
       - "rust-toolchain.toml"
       - "src/**"
+      - "tests/foreground_task_waker.rs"
       - "tests/concurrent_*.rs"
       - "tests/guest_*.rs"
       - "tests/wat_guest/**"
@@ -77,9 +79,10 @@ jobs:
 
       # WAT guests, each in its own Wasmer store and thread, against the real
       # C++ bridge and V8. No WASIX C toolchain is needed.
-      - name: Test concurrent environments and stores
+      - name: Test concurrent environments and stores, and the foreground task waker
         run: >-
           ./cargo-standalone.sh test --locked
+          --test foreground_task_waker
           --test concurrent_envs --test concurrent_stores
 
       # The library's unit tests, and WAT guests calling the N-API imports:

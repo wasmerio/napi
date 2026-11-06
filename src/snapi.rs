@@ -54,6 +54,9 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 // through `snapi_js::host_js_*` entry points or direct guest memory access.
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
+    // Host only: the JS backend has no V8 platform queue to wake for.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_set_foreground_task_waker(waker: Option<extern "C" fn()>);
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
         engine_flags: *const c_char,

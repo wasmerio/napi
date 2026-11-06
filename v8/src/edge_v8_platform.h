@@ -31,6 +31,27 @@ class EdgeV8Platform final : public v8::Platform {
   // this has no effect afterwards; it returns false in that case.
   static bool SetWorkerThreadCount(int count);
 
+  // Sets a function to call when an immediate foreground task is queued
+  // where only an event-loop checkpoint runs it. For an isolate with no
+  // foreground task target bound (see BindForegroundTaskTarget), a task waits
+  // in the default platform's queue until PumpPendingForegroundTasks runs it.
+  // V8 posts such tasks from any thread, for example to resolve an
+  // Atomics.waitAsync that another thread's Atomics.notify woke, or to finish
+  // a WebAssembly.compile. An embedder whose thread sleeps until its next
+  // event can wake that thread from this function.
+  //
+  // The function is process-wide: it is called for every isolate's tasks, on
+  // the thread that posted the task, after the task is queued. That thread
+  // can be the isolate's own, in the middle of running JS or a garbage
+  // collection, and V8 may hold its own locks then. So the function must be
+  // quick, must not call into V8, and must not take a lock that the
+  // isolate's thread may hold. A delayed task doesn't call it, and runs at
+  // the first checkpoint after its delay. nullptr clears it. A thread that
+  // read the previous function just before a change may still call it once
+  // afterwards. It takes no data pointer, so that one atomic store publishes
+  // it.
+  static void SetForegroundTaskWaker(void (*waker)());
+
   ~EdgeV8Platform() override;
 
   bool RegisterIsolate(v8::Isolate* isolate);
