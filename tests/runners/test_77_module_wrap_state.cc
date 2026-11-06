@@ -445,3 +445,39 @@ TEST_F(Test77ModuleWrapState, NoInstantiationStartsWhileOneRuns) {
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.other), napi_ok);
 }
+
+// set_export sets a synthetic module's export and takes no other module: for
+// a source text module it returns napi_invalid_arg, as the host-JS provider
+// does, and the module's exports stay its own. V8 aborted the process (an
+// ApiCheck in SetSyntheticModuleExport). QuickJS crashed before the module
+// was instantiated, and after that overwrote the module's binding.
+TEST_F(Test77ModuleWrapState, SetExportTakesOnlySyntheticModules) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module module = CreateSourceTextModule(s.env, "export let value = 'one';");
+  ASSERT_NE(module, nullptr);
+  for (const char* name : {"value", "missing"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(unofficial_napi_module_wrap_set_export(s.env, module, Str(s.env, name),
+                                                     Str(s.env, "two")),
+              napi_invalid_arg);
+    EXPECT_FALSE(ExceptionPending(s.env));
+  }
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+  napi_value promise = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_ok);
+  EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+  for (const char* name : {"value", "missing"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(unofficial_napi_module_wrap_set_export(s.env, module, Str(s.env, name),
+                                                     Str(s.env, "two")),
+              napi_invalid_arg);
+    EXPECT_FALSE(ExceptionPending(s.env));
+  }
+  napi_value ns = nullptr;
+  napi_value value = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &ns), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, value), "one");
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}

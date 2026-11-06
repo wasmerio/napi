@@ -3134,6 +3134,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
     napi_value export_value) {
   if (env == nullptr || module == nullptr || export_name == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  v8::HandleScope handle_scope(env->isolate);
+  // Only a synthetic module has exports to set. V8 aborts the process for
+  // any other.
+  if (!record->module.Get(env->isolate)->IsSyntheticModule()) return napi_invalid_arg;
   v8::Local<v8::Value> name = napi_v8_unwrap_value(export_name);
   v8::Local<v8::Value> value =
       export_value != nullptr ? napi_v8_unwrap_value(export_value) : v8::Undefined(env->isolate).As<v8::Value>();

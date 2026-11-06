@@ -865,7 +865,9 @@ napi_status napi_module_wrap__::set_export(unofficial_napi_module module,
                                            napi_value export_value)
 {
   record *entry = find(module);
-  if (entry == nullptr ||
+  // Only a synthetic module has exports to set. JS_SetModuleExport would set
+  // a source text module's own binding.
+  if (entry == nullptr || !entry->synthetic ||
       !napi_util__::check_value(env_, export_name) ||
       !napi_util__::check_value(env_, export_value))
     return napi_util__::invalid_arg(env_);
