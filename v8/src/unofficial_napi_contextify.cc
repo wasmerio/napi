@@ -1317,10 +1317,16 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
 
 v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> context,
                                                       v8::Local<v8::String> specifier,
-                                                      v8::Local<v8::FixedArray> /*import_attributes*/,
-                                                      v8::Local<v8::Module> /*referrer*/) {
+                                                      v8::Local<v8::FixedArray> import_attributes,
+                                                      v8::Local<v8::Module> referrer) {
   napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
   if (env == nullptr) return v8::MaybeLocal<v8::Module>();
+  // Instantiating the facade instantiates the module it wraps, if that is not
+  // done yet, and the modules it requests: those resolve to what they were
+  // linked to, as instantiate resolves them. Only the facade is unknown here.
+  if (FindModuleRecordForModule(env, referrer) != nullptr) {
+    return ModuleResolveCallback(context, specifier, import_attributes, referrer);
+  }
   auto* state = GetModuleWrapState(env);
   if (state == nullptr || state->temporary_required_module_facade_original == nullptr ||
       state->temporary_required_module_facade_original->module.IsEmpty()) {
@@ -3267,9 +3273,11 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
                           false,
                           true);
   v8::ScriptCompiler::Source source(OneByteString(isolate, kFacadeSource), origin);
+  // What instantiating or evaluating the facade throws is N-API's to report.
+  v8::TryCatch try_catch(isolate);
   v8::Local<v8::Module> facade;
   if (!v8::ScriptCompiler::CompileModule(isolate, &source).ToLocal(&facade)) {
-    return napi_pending_exception;
+    return ThrowTryCatchException(env, try_catch);
   }
 
   {
@@ -3285,10 +3293,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;
   }
-  if (!instantiated) return napi_pending_exception;
+  if (!instantiated) return ThrowTryCatchException(env, try_catch);
 
   v8::Local<v8::Value> evaluated;
-  if (!facade->Evaluate(context).ToLocal(&evaluated)) return napi_pending_exception;
+  if (!facade->Evaluate(context).ToLocal(&evaluated)) return ThrowTryCatchException(env, try_catch);
   *result_out = napi_v8_wrap_value(env, handle_scope.Escape(facade->GetModuleNamespace()));
   return napi_ok;
 }

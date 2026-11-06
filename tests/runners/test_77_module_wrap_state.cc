@@ -565,3 +565,57 @@ TEST_F(Test77ModuleWrapState, NamespaceOfAModuleNotInstantiatedIsRefused) {
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
   }
 }
+
+// The require() facade instantiates the module it wraps, if needed, with
+// the modules that module was linked to, as instantiate does and as on
+// QuickJS. When the facade cannot be made, because the module does not
+// instantiate or has no default export to re-export, the call fails with
+// that error pending in N-API. V8 resolved the module's own requests with
+// the facade's resolver, which knows only 'original': a module that was not
+// instantiated yet did not instantiate. And V8 returned
+// napi_pending_exception with nothing pending: the error went to whatever
+// JS was on the stack, or was lost, or (from the facade's resolver) was
+// never thrown.
+TEST_F(Test77ModuleWrapState, RequiredModuleFacadeInstantiatesOrLeavesItsError) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module dependency = CreateSourceTextModule(s.env, "export const value = 2;");
+  unofficial_napi_module linked =
+      CreateSourceTextModule(s.env, "import { value } from 'dependency'; export default value;");
+  ASSERT_NE(dependency, nullptr);
+  ASSERT_NE(linked, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, dependency, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, linked, 1, &dependency), napi_ok);
+  napi_value facade = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, linked, &facade),
+            napi_ok);
+  napi_value default_value = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, facade, "default", &default_value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, default_value), "2");
+  EXPECT_EQ(Status(s.env, linked), kEvaluated);
+  EXPECT_EQ(Status(s.env, dependency), kEvaluated);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, linked), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+
+  unofficial_napi_module unlinked =
+      CreateSourceTextModule(s.env, "import 'missing'; export default 1;");
+  ASSERT_NE(unlinked, nullptr);
+  napi_value ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, unlinked, &ns),
+            napi_pending_exception);
+  EXPECT_NE(TakePendingMessage(s.env), "");
+  EXPECT_EQ(Status(s.env, unlinked), kUninstantiated);
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, unlinked), napi_ok);
+
+  unofficial_napi_module no_default = CreateSourceTextModule(s.env, "export const value = 1;");
+  ASSERT_NE(no_default, nullptr);
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, no_default, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, no_default), napi_ok);
+  napi_value promise = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, no_default, -1, false, &promise), napi_ok);
+  EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+  ns = nullptr;
+  EXPECT_EQ(unofficial_napi_module_wrap_create_required_module_facade(s.env, no_default, &ns),
+            napi_pending_exception);
+  EXPECT_EQ(TakePendingErrorName(s.env), "SyntaxError");
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, no_default), napi_ok);
+}
