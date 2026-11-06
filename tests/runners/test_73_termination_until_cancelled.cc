@@ -13,7 +13,9 @@
 #include "node_api.h"
 #include "unofficial_napi.h"
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 class Test73TerminationUntilCancelled : public FixtureTestBase {};
 
@@ -48,6 +50,28 @@ napi_value TerminateThenCancel(napi_env env, napi_callback_info /*info*/) {
   return nullptr;
 }
 
+// Terminates, then sleeps long enough for a 50 ms script timeout to expire
+// meanwhile.
+napi_value TerminateAndSleep(napi_env env, napi_callback_info /*info*/) {
+  EXPECT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  return nullptr;
+}
+
+// The status of the N-API call a native function below made last.
+napi_status g_status = napi_ok;
+
+// Runs a script with a 50 ms timeout that terminates while the timeout
+// expires.
+napi_value RunScriptWithTimeout(napi_env env, napi_callback_info /*info*/) {
+  const unofficial_napi_js_source source = unofficial_napi_js_source_from_text(
+      Str(env, "terminateAndSleep(); tick(); afterCall = 'yes';"));
+  napi_value out = nullptr;
+  g_status = unofficial_napi_run_script(env, nullptr, &source, Str(env, "timeout.js"), 0, 0, 50,
+                                        true, false, false, nullptr, &out);
+  return nullptr;
+}
+
 void DefineGlobalFunction(napi_env env, const char* name, napi_callback cb, void* data = nullptr) {
   napi_value fn = nullptr;
   ASSERT_EQ(napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, data, &fn), napi_ok);
@@ -78,8 +102,23 @@ std::string GlobalText(napi_env env, const char* name) {
   return std::string(text, length);
 }
 
+// What EdgeJS does once the stack has unwound: take the pending exception,
+// then cancel the termination. Returns whether one was pending.
+bool FinishTermination(napi_env env) {
+  bool pending = false;
+  EXPECT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  if (pending) {
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(env, &exception), napi_ok);
+  }
+  EXPECT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
+  return pending;
+}
+
 void InstallHelpers(napi_env env) {
   DefineGlobalFunction(env, "terminateThenCancel", TerminateThenCancel);
+  DefineGlobalFunction(env, "terminateAndSleep", TerminateAndSleep);
+  DefineGlobalFunction(env, "runScriptWithTimeout", RunScriptWithTimeout);
   // Each catch block sets its flag first, by a plain store, at which no
   // engine looks for a termination.
   ASSERT_EQ(RunScript(env,
@@ -96,6 +135,20 @@ std::string Flags(napi_env env) {
          " innerCaught=" + GlobalText(env, "innerCaught") +
          " innerAfter=" + GlobalText(env, "innerAfter") +
          " error=" + GlobalText(env, "caughtError") + " afterCall=" + GlobalText(env, "afterCall");
+}
+
+constexpr char kNothingRan[] =
+    "caught=no after=no innerCaught=no innerAfter=no error=none afterCall=no";
+
+// Runs `script` and expects it to come back terminated, with nothing it
+// wrapped in try/catch caught, and nothing after that run.
+void ExpectRunTerminated(napi_env env, const char* script) {
+  EXPECT_EQ(RunScript(env, script), napi_pending_exception);
+  EXPECT_TRUE(FinishTermination(env)) << "nothing pending after the run";
+  EXPECT_EQ(Flags(env), kNothingRan);
+  // Cancelling leaves the env usable.
+  EXPECT_EQ(RunScript(env, "globalThis.resumed = 'yes';"), napi_ok);
+  EXPECT_EQ(GlobalText(env, "resumed"), "yes");
 }
 
 void SetModuleHooks(napi_env env, napi_value import_callback, napi_value meta_callback) {
@@ -201,4 +254,19 @@ TEST_F(Test73TerminationUntilCancelled, CancelledInsideAModuleHook) {
   EXPECT_EQ(Flags(s.env),
             "caught=no after=yes innerCaught=no innerAfter=yes error=none afterCall=yes");
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+
+// A script run with a timeout that the embedder terminates while the
+// timeout expires too: the termination is not the timeout's to cancel, and
+// must not come back as the timeout's catchable error. QuickJS has no
+// timeout, so only the termination stops the script there.
+TEST_F(Test73TerminationUntilCancelled, ScriptTimeoutKeepsTheEmbeddersTermination) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  g_status = napi_ok;
+  ExpectRunTerminated(
+      s.env,
+      "try { runScriptWithTimeout(); } catch (e) { caught = 'yes'; caughtError = e; }\n"
+      "after = 'yes';\n");
+  EXPECT_EQ(g_status, napi_pending_exception);
 }

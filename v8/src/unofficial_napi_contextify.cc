@@ -2237,6 +2237,14 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
   }
 
   if (timed_out || received_signal) {
+    // The embedder may have terminated the env meanwhile (process.exit(),
+    // worker.terminate()). That termination is not the timeout's to cancel,
+    // and turned into the timeout's catchable error it would let the JS that
+    // ran the script go on: it keeps unwinding instead, as in Node, which
+    // checks env->is_stopping() first.
+    if (env->agent->termination_requested.load(std::memory_order_acquire)) {
+      return napi_pending_exception;
+    }
     isolate->CancelTerminateExecution();
 
     napi_value error = nullptr;

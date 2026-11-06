@@ -1,6 +1,7 @@
 #ifndef NAPI_V8_AGENT_H_
 #define NAPI_V8_AGENT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -19,9 +20,10 @@ class CpuProfiler;
 // its principal env; envs for other realms of the isolate will share it.
 //
 // Only the isolate's own thread reads or writes these fields, except
-// `allocator` and `hash_seed`, which are fixed once the agent is set up, and
-// the enqueue hook, which backing-store deleters read on any thread under
-// NapiV8ExternalHintsMutex().
+// `allocator` and `hash_seed`, which are fixed once the agent is set up, the
+// enqueue hook, which backing-store deleters read on any thread under
+// NapiV8ExternalHintsMutex(), and `termination_requested`, which any thread
+// may set.
 struct napi_agent__ {
   explicit napi_agent__(v8::Isolate* isolate);
   ~napi_agent__();
@@ -68,6 +70,12 @@ struct napi_agent__ {
   unofficial_napi_near_heap_limit_callback near_heap_limit_callback = nullptr;
   void* near_heap_limit_data = nullptr;
   bool near_heap_limit_installed = false;
+
+  // The embedder's termination: set by unofficial_napi_terminate_execution
+  // until unofficial_napi_cancel_terminate_execution (or Shutdown) clears
+  // it. V8 does not tell it apart from one a script timeout's watchdog asks
+  // for.
+  std::atomic<bool> termination_requested{false};
 
   // Profiler sessions. V8's CPU and sampling heap profilers are per isolate.
   v8::CpuProfiler* cpu_profiler = nullptr;

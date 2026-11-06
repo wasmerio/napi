@@ -1642,6 +1642,7 @@ void napi_agent__::Shutdown() {
   near_heap_limit_data = nullptr;
   fatal_error_callback = nullptr;
   oom_error_callback = nullptr;
+  termination_requested.store(false, std::memory_order_release);
   isolate->CancelTerminateExecution();
   isolate->SetPromiseHook(nullptr);
   isolate->SetPromiseRejectCallback(nullptr);
@@ -2139,12 +2140,20 @@ napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
 
 napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // Any thread may call this (worker.terminate() does): the agent is fixed
+  // once the env exists, and its flag is atomic.
+  if (env->agent != nullptr) {
+    env->agent->termination_requested.store(true, std::memory_order_release);
+  }
   env->isolate->TerminateExecution();
   return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (env->agent != nullptr) {
+    env->agent->termination_requested.store(false, std::memory_order_release);
+  }
   env->isolate->CancelTerminateExecution();
   // A call the termination failed left its null pending. Nothing threw it:
   // left there, the native function that cancels would throw it into its
