@@ -1328,11 +1328,12 @@ void ImportAfterTheLoadersCleanupHook(void* arg) {
 }  // namespace
 
 // An import() a cleanup hook makes at release, after the module loader's own
-// cleanup hook, returns a promise that settles. On V8 the loader's hook has
-// let go of the hooks, so it rejects; QuickJS's loader keeps its hooks until
-// the release's pass is over, so they load it. On V8 the import callback the
+// cleanup hook, returns a promise that settles. On V8 the import callback the
 // hooks installed, still the isolate's, found no loader state there and
 // returned no promise with nothing thrown, and V8 aborts the process on that.
+// How it settles is the providers' own: V8's loader lets go of its hooks in
+// its cleanup hook, so the import() rejects; QuickJS's loader keeps them
+// until the release's pass is over, so they load it.
 TEST_F(Test65UnofficialContextify, DynamicImportFromACleanupHookAfterTheLoadersCleanupHookSettles) {
   ImportsAtRelease imports;
   {
@@ -1360,11 +1361,12 @@ TEST_F(Test65UnofficialContextify, DynamicImportFromACleanupHookAfterTheLoadersC
     s.env = nullptr;
   }
   EXPECT_TRUE(imports.ran);
-  ASSERT_EQ(imports.outcomes.size(), 3u);
-  for (const std::string& outcome : imports.outcomes) {
-    EXPECT_TRUE(outcome == "returned, rejected" || outcome == "returned, resolved:hooks")
-        << outcome;
-  }
+#if defined(NAPI_TEST_ENGINE_V8)
+  const std::string expected = "returned, rejected";
+#else
+  const std::string expected = "returned, resolved:hooks";
+#endif
+  EXPECT_EQ(imports.outcomes, std::vector<std::string>(3, expected));
 }
 
 namespace {
