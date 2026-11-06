@@ -255,6 +255,16 @@ void napi_v8_set_last_exception(
     v8::Local<v8::Value> exception,
     v8::Local<v8::Message> message = v8::Local<v8::Message>());
 
+// For a V8 host callback (a module hook, say) that ran JS through N-API and
+// failed: moves N-API's pending exception into V8, as Node's callbacks
+// rethrow what their TryCatch caught, and returns true. While V8 is
+// terminating it throws nothing and drops what is pending: throwing would
+// replace the termination with a catchable exception, and the termination
+// unwinds by itself. Returns true then too: either way V8 now has something
+// to unwind with, so the callback may return an empty result. Returns false
+// when nothing was pending and V8 is not terminating.
+bool napi_v8_rethrow_pending_exception(napi_env env);
+
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_finalize_buffer_records(napi_env env);

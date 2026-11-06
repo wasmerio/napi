@@ -1119,12 +1119,9 @@ v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> 
       napi_typeof(env, callback, &callback_type) == napi_ok && callback_type == napi_function) {
     napi_value ignored = nullptr;
     if (napi_call_function(env, wrapper, callback, 0, nullptr, &ignored) != napi_ok) {
-      bool pending = false;
-      napi_value error = nullptr;
-      if (napi_is_exception_pending(env, &pending) == napi_ok && pending &&
-          napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
-        isolate->ThrowException(napi_v8_unwrap_value(error));
-      } else if (!isolate->IsExecutionTerminating()) {
+      // Their exception, or the termination that stopped them, fails the
+      // evaluation.
+      if (!napi_v8_rethrow_pending_exception(env)) {
         isolate->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8Literal(isolate, "Synthetic module evaluation failed")));
       }
@@ -1246,15 +1243,9 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
     napi_value global = nullptr;
     napi_get_global(env, &global);
     if (napi_call_function(env, global, callback, 5, argv, &result) != napi_ok) {
-      bool pending = false;
-      if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-        napi_value error = nullptr;
-        if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
-          isolate->ThrowException(napi_v8_unwrap_value(error));
-          return v8::MaybeLocal<v8::Promise>();
-        }
-      }
-      if (isolate->IsExecutionTerminating()) return v8::MaybeLocal<v8::Promise>();
+      // What the callback threw is thrown from the import() expression; a
+      // termination keeps unwinding.
+      if (napi_v8_rethrow_pending_exception(env)) return v8::MaybeLocal<v8::Promise>();
       // Nothing thrown: the callback is not a function.
       return handle_scope.EscapeMaybe(RejectImport(context));
     }
@@ -1313,14 +1304,9 @@ void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
   napi_get_global(env, &global);
   if (napi_call_function(env, global, callback, 3, argv, &ignored) != napi_ok) {
     // What the callback threw is thrown from the import.meta expression, as
-    // Node's callback rethrows it; left in N-API's pending exception, it
-    // would surface from whatever N-API call came next.
-    bool pending = false;
-    napi_value error = nullptr;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending &&
-        napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
-      env->isolate->ThrowException(napi_v8_unwrap_value(error));
-    }
+    // Node's callback rethrows it unless V8 is terminating; left in N-API's
+    // pending exception, it would surface from whatever N-API call came next.
+    (void)napi_v8_rethrow_pending_exception(env);
   }
 }
 

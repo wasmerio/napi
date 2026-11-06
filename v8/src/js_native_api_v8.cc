@@ -864,6 +864,25 @@ void napi_v8_set_last_exception(napi_env env,
   SetLastException(env, exception, message);
 }
 
+bool napi_v8_rethrow_pending_exception(napi_env env) {
+  if (env == nullptr) return false;
+  // As HandleCallbackException: what is pending while V8 terminates is the
+  // null a TryCatch records for the termination, and throwing it would make
+  // the termination a catchable throw and cancel it.
+  if (TerminatedOrTerminating(env)) {
+    ClearLastException(env);
+    return true;
+  }
+  bool pending = false;
+  napi_value error = nullptr;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending ||
+      napi_get_and_clear_last_exception(env, &error) != napi_ok || error == nullptr) {
+    return false;
+  }
+  env->isolate->ThrowException(napi_v8_unwrap_value(error));
+  return true;
+}
+
 napi_handle_scope__::napi_handle_scope__(napi_env env)
     : env(env), wrapper(env->isolate) {}
 
