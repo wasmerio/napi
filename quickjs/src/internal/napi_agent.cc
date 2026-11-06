@@ -398,8 +398,33 @@ JSValue napi_agent__::dynamic_import(JSContext *ctx,
 {
   auto *agent = static_cast<napi_agent__ *>(opaque);
   napi_env env = agent == nullptr ? nullptr : agent->env_for_context(ctx);
-  if (!napi_util__::check_env(env))
-    return JS_ThrowTypeError(ctx, "Dynamic import callback is not registered");
-  return env->module_wrap().import_module_dynamically(referrer, referrer_name, specifier,
-                                                      attributes, phase);
+  JSValue promise = napi_util__::check_env(env)
+                        ? env->module_wrap().import_module_dynamically(
+                              referrer, referrer_name, specifier, attributes, phase)
+                        : JS_ThrowTypeError(ctx, "Dynamic import callback is not registered");
+  if (!JS_IsException(promise))
+    return promise;
+  // import() rejects what failed, as V8 does; QuickJS would throw it from
+  // the import() expression instead. Termination still unwinds.
+  JSValue error = JS_GetException(ctx);
+  if (JS_IsUncatchableError(error))
+    return JS_Throw(ctx, error);
+  JSValue resolving_funcs[2];
+  promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+  if (JS_IsException(promise))
+  {
+    JS_FreeValue(ctx, error);
+    return promise;
+  }
+  JSValue rejected = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &error);
+  JS_FreeValue(ctx, error);
+  JS_FreeValue(ctx, resolving_funcs[0]);
+  JS_FreeValue(ctx, resolving_funcs[1]);
+  if (JS_IsException(rejected))
+  {
+    JS_FreeValue(ctx, promise);
+    return JS_EXCEPTION;
+  }
+  JS_FreeValue(ctx, rejected);
+  return promise;
 }

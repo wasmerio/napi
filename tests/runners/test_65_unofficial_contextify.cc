@@ -1118,3 +1118,28 @@ TEST_F(Test65UnofficialContextify, ModuleStateMadeAtReleaseGoesWithTheEnv) {
     s.env = nullptr;
   }
 }
+
+// A script's import() in an env with no module loader and no `process`
+// object, so nothing to load the module with, rejects.
+TEST_F(Test65UnofficialContextify, DynamicImportWithNoLoaderRejects) {
+  EnvScope s(runtime_.get());
+  napi_value result = nullptr;
+  ASSERT_EQ(napi_run_script(s.env,
+                            Str(s.env,
+                                "globalThis.outcome = 'pending';"
+                                "import('missing').then(() => { outcome = 'resolved'; },"
+                                "                       () => { outcome = 'rejected'; });"
+                                "typeof process"),
+                            &result),
+            napi_ok);
+  char text[32] = {};
+  size_t length = 0;
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, text, sizeof(text), &length), napi_ok);
+  EXPECT_STREQ(text, "undefined");
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "outcome"), &result), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(s.env, result, text, sizeof(text), &length), napi_ok);
+  EXPECT_STREQ(text, "rejected");
+}

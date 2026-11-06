@@ -118,7 +118,8 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   v8::Local<v8::Object> global = context->Global();
   v8::Local<v8::String> helper_name =
       v8::String::NewFromUtf8Literal(isolate, "__napi_dynamic_import");
-  v8::Local<v8::Value> helper_value;
+  // Undefined unless `process` is an object that has the helper.
+  v8::Local<v8::Value> helper_value = v8::Undefined(isolate);
   v8::Local<v8::String> process_name =
       v8::String::NewFromUtf8Literal(isolate, "process");
   v8::Local<v8::Value> process_value;
