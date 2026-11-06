@@ -1892,8 +1892,10 @@ TEST_F(Test71ContextifyCompat, ContextTokensFollowRealms) {
 // unofficial_napi_collect_garbage frees the record. Token hooks are V8's
 // only.
 TEST_F(Test71ContextifyCompat, MemoryPressureLeavesACollectedRealmsTokenToCollectGarbage) {
-  EnvScope s(runtime_.get());
+  // Declared before the env: the release unassigns the token of a realm still
+  // alive when a failed ASSERT ends the test, and the callback writes here.
   TokenLog log;
+  EnvScope s(runtime_.get());
   log.env = s.env;
   unofficial_napi_env_hooks hooks{};
   hooks.size = sizeof(hooks);
