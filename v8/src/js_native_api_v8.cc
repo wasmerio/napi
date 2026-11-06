@@ -1199,6 +1199,10 @@ napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
   if (utf8description == nullptr && length > 0) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // As in napi_create_string_utf8: V8 takes an int length.
+  if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   const char* desc = (utf8description == nullptr) ? "" : utf8description;
   const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
   v8::Local<v8::String> key;
@@ -1726,6 +1730,12 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (cb == nullptr || result == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // V8 takes an int length: a larger one would turn negative and make V8
+  // run strlen. Node refuses it too.
+  if (utf8name != nullptr && length != NAPI_AUTO_LENGTH &&
+      length > static_cast<size_t>(INT_MAX)) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   auto* payload = env->allocate<napi_callback_payload__>(env, cb, data);
   if (payload == nullptr) return napi_generic_failure;
 
@@ -1767,6 +1777,10 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   if (property_count > 0 && properties == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  // As in napi_create_function: V8 takes an int length.
+  if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
