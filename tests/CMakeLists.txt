@@ -341,6 +341,13 @@ if(_napi_test_engine STREQUAL "v8")
     runners/test_74_name_length_limits.cc
   )
   target_compile_definitions(${_napi_test_prefix}_test_74_name_length_limits PRIVATE NAPI_VERSION=10)
+  # Only the V8 provider writes CPU profiles for NAPI_V8_CPU_PROFILE_DIR, and
+  # only on Linux and macOS. The runner uses POSIX APIs.
+  if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_fixture_test(${_napi_test_prefix}_test_76_env_cpu_profile
+      runners/test_76_env_cpu_profile.cc
+    )
+  endif()
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
