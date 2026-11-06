@@ -103,7 +103,9 @@ JSValue invoke_callback(JSContext *caller_ctx,
                         JSValue *func_data)
 {
   auto env = napi_external__::get_env(func_data[0]);
-  if (!napi_util__::check_env(env) || env->is_closing())
+  // The release's hooks and finalizers can use N-API, native functions too
+  // (unofficial_napi_release_env); once they are done no user code runs.
+  if (!napi_util__::check_env(env) || env->finalizers_done())
     return JS_ThrowReferenceError(caller_ctx, "Null NAPI env");
   // Closes the scopes the callback leaves open once everything below is done.
   napi_realm_frame_scope__ realm_frame{env, realm_ctx, realm_anchor};

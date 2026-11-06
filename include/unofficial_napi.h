@@ -274,8 +274,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // only the finalizer's own exception is dropped, and one that JS is throwing,
 // or that a hook has pending, is kept. Each runs on the env's thread, in the
 // env's realm (also when another realm was entered when the release began),
-// with N-API usable. References made with napi_create_reference keep their
-// values until all of them have run. A finalizer the engine would call after
+// with N-API usable: scripts run, and so do the native functions they or
+// native code call (napi_create_function, napi_define_class, the serdes
+// binding). Node runs no JavaScript there. References made with
+// napi_create_reference keep their values until all of them have run. A finalizer the engine would call after
 // this pass, while it frees the engine instance, is dropped, and nothing
 // touches the env once it is freed.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(

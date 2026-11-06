@@ -1376,3 +1376,142 @@ TEST_F(Test41InstanceData, StateMadeAtReleaseGoesWithTheEnv) {
     Release(s);
   }
 }
+
+namespace {
+
+// Native code reached from the release: a function napi_create_function made
+// before it, called from native code and from a script, and the serdes
+// binding, a pair of classes napi_define_class makes, made then and used from
+// a script.
+struct NativeAtRelease {
+  napi_env env = nullptr;
+  napi_ref function = nullptr;
+  int calls = 0;
+  std::vector<std::string> results;
+};
+
+napi_value CountNativeCall(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data);
+  ++static_cast<NativeAtRelease*>(data)->calls;
+  napi_value result = nullptr;
+  napi_create_int32(env, 7, &result);
+  return result;
+}
+
+int32_t IntOr(napi_env env, napi_value value, int32_t otherwise) {
+  int32_t out = 0;
+  return value != nullptr && napi_get_value_int32(env, value, &out) == napi_ok ? out : otherwise;
+}
+
+std::string UseNativeCode(NativeAtRelease* native) {
+  napi_env env = native->env;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return "no handle scope";
+  std::string outcome = "ok";
+  napi_value global = nullptr;
+  napi_value function = nullptr;
+  napi_value result = nullptr;
+  napi_status status = napi_get_global(env, &global);
+  if (status == napi_ok) status = napi_get_reference_value(env, native->function, &function);
+  if (status == napi_ok) status = napi_call_function(env, global, function, 0, nullptr, &result);
+  if (status != napi_ok || IntOr(env, result, -1) != 7) {
+    outcome = "napi_call_function " + std::to_string(status);
+  }
+  napi_value source = nullptr;
+  if (outcome == "ok") {
+    result = nullptr;
+    status = napi_create_string_utf8(env, "nativeAtRelease() + 1", NAPI_AUTO_LENGTH, &source);
+    if (status == napi_ok) status = napi_run_script(env, source, &result);
+    if (status != napi_ok || IntOr(env, result, -1) != 8) {
+      outcome = "a script's call " + std::to_string(status);
+    }
+  }
+  napi_value serdes = nullptr;
+  if (outcome == "ok") {
+    result = nullptr;
+    status = unofficial_napi_create_serdes_binding(env, &serdes);
+    if (status == napi_ok) status = napi_set_named_property(env, global, "serdesAtRelease", serdes);
+    if (status == napi_ok) {
+      status = napi_create_string_utf8(
+          env,
+          "(() => {"
+          "  const serializer = new serdesAtRelease.Serializer();"
+          "  serializer.writeHeader();"
+          "  serializer.writeValue({ a: [1, 2, 3] });"
+          "  const deserializer = new serdesAtRelease.Deserializer(serializer.releaseBuffer());"
+          "  deserializer.readHeader();"
+          "  return deserializer.readValue().a[1];"
+          "})()",
+          NAPI_AUTO_LENGTH, &source);
+    }
+    if (status == napi_ok) status = napi_run_script(env, source, &result);
+    if (status != napi_ok || IntOr(env, result, -1) != 2) {
+      outcome = "serdes " + std::to_string(status);
+    }
+  }
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_value error = nullptr;
+    napi_value message = nullptr;
+    char text[128] = {};
+    size_t length = 0;
+    napi_get_and_clear_last_exception(env, &error);
+    if (napi_get_named_property(env, error, "message", &message) == napi_ok &&
+        napi_get_value_string_utf8(env, message, text, sizeof(text), &length) == napi_ok) {
+      outcome += std::string(": ") + text;
+    }
+  }
+  napi_close_handle_scope(env, scope);
+  return outcome;
+}
+
+void HookUsingNativeCode(void* arg) {
+  auto* native = static_cast<NativeAtRelease*>(arg);
+  native->results.push_back("cleanup hook: " + UseNativeCode(native));
+}
+
+void FinalizeUsingNativeCode(node_api_basic_env, void*, void* hint) {
+  auto* native = static_cast<NativeAtRelease*>(hint);
+  native->results.push_back("finalizer: " + UseNativeCode(native));
+}
+
+void FinalizeInstanceDataUsingNativeCode(napi_env, void* data, void*) {
+  auto* native = static_cast<NativeAtRelease*>(data);
+  native->results.push_back("instance-data finalizer: " + UseNativeCode(native));
+}
+
+}  // namespace
+
+// The hooks and finalizers the release runs can use N-API, native functions
+// too: one napi_create_function made, called from native code and from a
+// script, and the serdes binding's classes. QuickJS refused every native
+// callback once the release began ("Null NAPI env"), V8 none.
+TEST_F(Test41InstanceData, NativeFunctionsRunAtRelease) {
+  EnvScope s(runtime_.get());
+  NativeAtRelease native;
+  native.env = s.env;
+  napi_value function = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "nativeAtRelease", NAPI_AUTO_LENGTH, CountNativeCall,
+                                 &native, &function),
+            napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, function, 1, &native.function), napi_ok);
+  Keep(s.env, "nativeAtRelease", function);
+  EXPECT_EQ(UseNativeCode(&native), "ok") << "before the release";
+  ASSERT_EQ(native.calls, 2);
+  native.calls = 0;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookUsingNativeCode, &native), napi_ok);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, object, nullptr, FinalizeUsingNativeCode, &native, nullptr),
+            napi_ok);
+  Keep(s.env, "finalized", object);
+  ASSERT_EQ(napi_set_instance_data(s.env, &native, FinalizeInstanceDataUsingNativeCode, nullptr),
+            napi_ok);
+
+  Release(s);
+  EXPECT_EQ(native.results,
+            (std::vector<std::string>{"cleanup hook: ok", "finalizer: ok",
+                                      "instance-data finalizer: ok"}));
+  EXPECT_EQ(native.calls, 6);
+}
