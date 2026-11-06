@@ -255,6 +255,12 @@ void napi_v8_set_last_exception(
     v8::Local<v8::Value> exception,
     v8::Local<v8::Message> message = v8::Local<v8::Message>());
 
+// Throws `exception` into V8 unless V8 is terminating, and returns whether it
+// threw. Making an exception can run JS that V8 terminates (an inherited
+// `code` setter, a getter, the source-map callback), and throwing would then
+// replace the termination with a catchable exception.
+bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value> exception);
+
 // For a V8 host callback (a module hook, say) that ran JS through N-API and
 // failed: moves N-API's pending exception into V8, as Node's callbacks
 // rethrow what their TryCatch caught, and returns true. While V8 is

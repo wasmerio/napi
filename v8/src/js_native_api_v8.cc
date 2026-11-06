@@ -869,6 +869,12 @@ void napi_v8_set_last_exception(napi_env env,
   SetLastException(env, exception, message);
 }
 
+bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value> exception) {
+  if (isolate == nullptr || isolate->IsExecutionTerminating()) return false;
+  isolate->ThrowException(exception);
+  return true;
+}
+
 bool napi_v8_rethrow_pending_exception(napi_env env) {
   if (env == nullptr) return false;
   // As HandleCallbackException: what is pending while V8 terminates is the
@@ -884,7 +890,9 @@ bool napi_v8_rethrow_pending_exception(napi_env env) {
       napi_get_and_clear_last_exception(env, &error) != napi_ok || error == nullptr) {
     return false;
   }
-  env->isolate->ThrowException(napi_v8_unwrap_value(error));
+  // Taking it formats it, which can call the source-map callback: JS that V8
+  // may terminate too.
+  napi_v8_throw_unless_terminating(env->isolate, napi_v8_unwrap_value(error));
   return true;
 }
 
@@ -3444,13 +3452,18 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
     if (!message.IsEmpty()) {
       const std::string source_line =
           unofficial_napi_internal::GetErrorSourceLineForStderrImpl(env, message);
-      unofficial_napi_internal::SetArrowMessageFromString(
-          env->isolate, env->context(), ex, source_line);
-      unofficial_napi_internal::PreserveErrorFormatting(
-          env,
-          ex,
-          source_line,
-          unofficial_napi_internal::GetThrownAtString(env->isolate, message));
+      // That can run the source-map callback, JS that V8 may terminate. The
+      // V8 calls formatting makes would then drop the termination, as
+      // NAPI_V8_RETURN_IF_TERMINATING says entering V8 does.
+      if (!TerminatedOrTerminating(env)) {
+        unofficial_napi_internal::SetArrowMessageFromString(
+            env->isolate, env->context(), ex, source_line);
+        unofficial_napi_internal::PreserveErrorFormatting(
+            env,
+            ex,
+            source_line,
+            unofficial_napi_internal::GetThrownAtString(env->isolate, message));
+      }
     } else {
       (void)unofficial_napi_internal::PreserveErrorSourceMessage(env, wrapped);
     }

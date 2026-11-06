@@ -354,6 +354,39 @@ TEST_F(Test72HooksKeepTermination, PrepareStackTraceCallback) {
       "after = 'yes';\n");
 }
 
+// What a module hook threw is formatted as it is taken from N-API, which calls
+// the source-map callback; only V8's provider calls that callback. A hook that
+// asks for the termination and throws before V8 acts on it has V8 act on it in
+// that callback, the first JS to run after. V8 still threw the hook's error
+// over the termination, and the module caught it.
+TEST_F(Test72HooksKeepTermination, SourceMapCallbackWhileTakingAHookError) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  ASSERT_EQ(RunScript(s.env, "globalThis.mapped = 0;"), napi_ok);
+  ASSERT_EQ(unofficial_napi_configure_source_maps(
+                s.env, true, Eval(s.env, "(name, line, column) => { mapped++; }")),
+            napi_ok);
+  // The hook comes from a named script, so its error's message names one.
+  const unofficial_napi_js_source hook_source = unofficial_napi_js_source_from_text(
+      Str(s.env, "(id, meta, wrap) => { terminate(); throw new Error('meta'); }"));
+  napi_value hook = nullptr;
+  ASSERT_EQ(unofficial_napi_run_script(s.env, nullptr, &hook_source, Str(s.env, "hook.js"), 0, 0,
+                                       -1, true, false, false, nullptr, &hook),
+            napi_ok);
+  SetModuleHooks(s.env, nullptr, hook);
+  unofficial_napi_module module = MakeModule(
+      s.env,
+      "try { import.meta; } catch (e) { globalThis.innerCaught = 'yes'; caughtError = e; }\n"
+      "globalThis.innerAfter = 'yes';\n",
+      nullptr);
+  ASSERT_NE(module, nullptr);
+  DefineGlobalFunction(s.env, "evaluateModule", EvaluateModule, module);
+  ExpectRunTerminated(s.env, kEvaluateModuleInTryCatch);
+  // V8 acted on the termination as it entered the callback, which never ran.
+  EXPECT_EQ(GlobalText(s.env, "mapped"), "0");
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+
 // import() with no module hooks calls the `__napi_dynamic_import` helper; only
 // V8 does. V8 rejected the import()'s promise with the null its TryCatch
 // records for the termination and returned it: the JS that imported ran on,
