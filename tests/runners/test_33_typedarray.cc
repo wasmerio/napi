@@ -693,6 +693,28 @@ TEST_F(Test33TypedArray, ViewOffsetAndLengthComeFromOneStateOfTheBuffer) {
                   "0");
   napi_value rab = NamedGlobal(s.env, "rab");
   napi_value typed = NamedGlobal(s.env, "typed");
+  // The layout the view has with its buffer as it is now: no script runs
+  // between the end of the read and this check.
+  enum class Read { kRight, kMixed, kWrong };
+  auto read = [&] {
+    const ViewLayout layout = TypedArrayLayout(s.env, typed);
+    void* base = nullptr;
+    size_t size = 0;
+    EXPECT_EQ(napi_get_arraybuffer_info(s.env, rab, &base, &size), napi_ok);
+    const bool in_bounds = size == 16;
+    if (layout.status == napi_ok &&
+        (in_bounds ? layout.length == 4 && layout.offset == 8 &&
+                         layout.data == static_cast<uint8_t*>(base) + 8
+                   : layout.length == 0))
+      return Read::kRight;
+    if (layout.status == napi_ok && layout.length == 4 && layout.offset == 0)
+      return Read::kMixed;
+    return Read::kWrong;
+  };
+  RunBufferScript(s.env, "rab.resize(16); 0");
+  EXPECT_EQ(read(), Read::kRight) << "in bounds";
+  RunBufferScript(s.env, "rab.resize(4); 0");
+  EXPECT_EQ(read(), Read::kRight) << "out of bounds";
   for (int extra = 0; extra < 3; ++extra) {
     SCOPED_TRACE(extra);
     napi_value value = nullptr;
@@ -705,23 +727,14 @@ TEST_F(Test33TypedArray, ViewOffsetAndLengthComeFromOneStateOfTheBuffer) {
     for (int i = 0; i < 40000; ++i) {
       napi_handle_scope scope = nullptr;
       ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
-      const ViewLayout layout = TypedArrayLayout(s.env, typed);
-      uint8_t* base = ArrayBufferData(s.env, rab);
-      if (layout.status == napi_ok && layout.length == 0) {
-        // Out of bounds.
-      } else if (layout.status == napi_ok && layout.length == 4 && layout.offset == 8 &&
-                 layout.data == base + 8) {
-        // In bounds.
-      } else if (layout.status == napi_ok && layout.length == 4 && layout.offset == 0) {
-        ++mixed;
-      } else {
-        ++wrong;
-      }
+      const Read outcome = read();
+      mixed += outcome == Read::kMixed;
+      wrong += outcome == Read::kWrong;
       ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
     }
     ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
     EXPECT_EQ(mixed, 0) << "an offset from one state of the buffer, a length from another";
-    EXPECT_EQ(wrong, 0);
+    EXPECT_EQ(wrong, 0) << "not the layout of the buffer as it is";
   }
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
   // V8 runs no script to read a view, so only QuickJS gets here at all.
