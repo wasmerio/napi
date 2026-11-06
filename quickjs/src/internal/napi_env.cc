@@ -286,7 +286,8 @@ void napi_env__::call_instance_data_finalizer(void *data,
                                               napi_finalize finalize_cb,
                                               void *finalize_hint)
 {
-  if (data == nullptr || finalize_cb == nullptr)
+  // As Node, whatever the data, NULL too.
+  if (finalize_cb == nullptr)
     return;
   // In the env's realm, as any finalizer.
   napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
@@ -619,7 +620,10 @@ void napi_env__::set_instance_data(void *data, napi_finalize finalize_cb, void *
   instance_data_finalize_cb_ = nullptr;
   instance_data_finalize_hint_ = nullptr;
 
-  call_instance_data_finalizer(old_data, old_finalize_cb, old_finalize_hint);
+  // Unlike Node, which never finalizes replaced instance data, this
+  // finalizes it, but only non-NULL data.
+  if (old_data != nullptr)
+    call_instance_data_finalizer(old_data, old_finalize_cb, old_finalize_hint);
 
   instance_data_ = data;
   instance_data_finalize_cb_ = finalize_cb;

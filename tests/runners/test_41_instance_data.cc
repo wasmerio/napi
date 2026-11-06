@@ -1316,3 +1316,40 @@ TEST_F(Test41InstanceData, ACheckpointInAFinalizerKeepsTheReleaseOrder) {
   EXPECT_EQ(state.detach_a, napi_ok);
   EXPECT_EQ(state.order, "CBA");
 }
+
+namespace {
+
+// Records the data each instance-data finalizer call gets.
+void RecordInstanceData(napi_env, void* data, void* hint) {
+  static_cast<std::vector<void*>*>(hint)->push_back(data);
+}
+
+// Records, then sets NULL instance data with a finalizer.
+void RecordThenSetNullInstanceData(napi_env env, void* data, void* hint) {
+  RecordInstanceData(env, data, hint);
+  EXPECT_EQ(napi_set_instance_data(env, nullptr, RecordInstanceData, hint), napi_ok);
+}
+
+}  // namespace
+
+// As in Node, the release calls the instance-data finalizer whatever the
+// data, NULL too, also when the instance-data finalizer set it.
+TEST_F(Test41InstanceData, TheInstanceDataFinalizerRunsForNullData) {
+  std::vector<void*> null_data;
+  {
+    EnvScope s(runtime_.get());
+    ASSERT_EQ(napi_set_instance_data(s.env, nullptr, RecordInstanceData, &null_data), napi_ok);
+    Release(s);
+  }
+  int marker = 0;
+  std::vector<void*> set_at_release;
+  {
+    EnvScope s(runtime_.get());
+    ASSERT_EQ(
+        napi_set_instance_data(s.env, &marker, RecordThenSetNullInstanceData, &set_at_release),
+        napi_ok);
+    Release(s);
+  }
+  EXPECT_EQ(null_data, std::vector<void*>{nullptr});
+  EXPECT_EQ(set_at_release, (std::vector<void*>{&marker, nullptr}));
+}
