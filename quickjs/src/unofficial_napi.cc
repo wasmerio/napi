@@ -236,6 +236,11 @@ extern "C"
         return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
     }
 
+    // The env takes the getters of buffer, byteOffset and byteLength on
+    // %TypedArray%.prototype and DataView.prototype, and the DataView
+    // constructor, from the context's global when it is made, and trusts
+    // them to locate views' memory: `context` must be one no script has run
+    // in, as the fresh one unofficial_napi_create_env makes is.
     napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
         JSContext *context, int32_t module_api_version, napi_env *result)
     {
