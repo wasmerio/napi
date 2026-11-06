@@ -17,7 +17,7 @@
 
 #include <string>
 
-class Test72HooksKeepTermination : public FixtureTestBase {};
+class Test75HooksKeepTermination : public FixtureTestBase {};
 
 namespace {
 
@@ -243,7 +243,7 @@ constexpr char kEvaluateModuleInTryCatch[] =
 // The import.meta callback. V8 threw the null its TryCatch records for the
 // termination from the import.meta expression: the module caught it and ran
 // on, and the termination was gone.
-TEST_F(Test72HooksKeepTermination, ImportMetaCallback) {
+TEST_F(Test75HooksKeepTermination, ImportMetaCallback) {
   for (const char* body : kTerminatingBodies) {
     SCOPED_TRACE(body);
     EnvScope s(runtime_.get());
@@ -264,7 +264,7 @@ TEST_F(Test72HooksKeepTermination, ImportMetaCallback) {
 
 // A synthetic module's evaluation steps. V8 threw the null from the module's
 // evaluation, which the JS that evaluated it caught.
-TEST_F(Test72HooksKeepTermination, SyntheticModuleEvaluationSteps) {
+TEST_F(Test75HooksKeepTermination, SyntheticModuleEvaluationSteps) {
   for (const char* body : kTerminatingBodies) {
     SCOPED_TRACE(body);
     EnvScope s(runtime_.get());
@@ -280,7 +280,7 @@ TEST_F(Test72HooksKeepTermination, SyntheticModuleEvaluationSteps) {
 
 // The module hooks' import() callback. V8 threw the null from the import()
 // expression.
-TEST_F(Test72HooksKeepTermination, DynamicImportCallback) {
+TEST_F(Test75HooksKeepTermination, DynamicImportCallback) {
   for (const char* body : kTerminatingBodies) {
     SCOPED_TRACE(body);
     EnvScope s(runtime_.get());
@@ -298,7 +298,7 @@ TEST_F(Test72HooksKeepTermination, DynamicImportCallback) {
 // napi_fatal_exception from native code V8 is terminating. V8 threw the
 // error over the termination, and the JS that called the native code caught
 // it and ran on.
-TEST_F(Test72HooksKeepTermination, FatalExceptionWhileTerminating) {
+TEST_F(Test75HooksKeepTermination, FatalExceptionWhileTerminating) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ExpectRunTerminated(
@@ -312,7 +312,7 @@ TEST_F(Test72HooksKeepTermination, FatalExceptionWhileTerminating) {
 // back before it does. The termination must still not be catchable, nor
 // lost: that run or the next one stops. V8 dropped it once the run returned,
 // and the env ran on as if it had never been asked to stop.
-TEST_F(Test72HooksKeepTermination, PromiseRejectCallback) {
+TEST_F(Test75HooksKeepTermination, PromiseRejectCallback) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ASSERT_EQ(unofficial_napi_set_promise_reject_callback(
@@ -334,7 +334,7 @@ TEST_F(Test72HooksKeepTermination, PromiseRejectCallback) {
 // The promise hooks return nothing too: the same holds for them, in the run
 // that made the promise, or in the microtask checkpoint that runs its
 // reactions.
-TEST_F(Test72HooksKeepTermination, PromiseHooks) {
+TEST_F(Test75HooksKeepTermination, PromiseHooks) {
   constexpr const char* kHookNames[] = {"init", "before", "after", "resolve"};
   for (int which = 0; which < 4; ++which) {
     SCOPED_TRACE(kHookNames[which]);
@@ -373,7 +373,7 @@ TEST_F(Test72HooksKeepTermination, PromiseHooks) {
 // an inherited `code` setter. When V8 terminated the setter, V8's
 // napi_throw_error and its siblings, the serdes binding's constructors and
 // the module loader's link errors threw their error over the termination.
-TEST_F(Test72HooksKeepTermination, ErrorCodeSetter) {
+TEST_F(Test75HooksKeepTermination, ErrorCodeSetter) {
   constexpr char kCodeSetter[] =
       "Object.defineProperty(Error.prototype, 'code',"
       "  { set(value) { terminate(); tick(); }, configurable: true });";
@@ -436,7 +436,7 @@ TEST_F(Test72HooksKeepTermination, ErrorCodeSetter) {
 
 #if defined(NAPI_TEST_ENGINE_V8)
 // The prepare-stack-trace callback; QuickJS ignores the one set here.
-TEST_F(Test72HooksKeepTermination, PrepareStackTraceCallback) {
+TEST_F(Test75HooksKeepTermination, PrepareStackTraceCallback) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ASSERT_EQ(unofficial_napi_set_prepare_stack_trace_callback(
@@ -453,7 +453,7 @@ TEST_F(Test72HooksKeepTermination, PrepareStackTraceCallback) {
 // asks for the termination and throws before V8 acts on it has V8 act on it in
 // that callback, the first JS to run after. V8 still threw the hook's error
 // over the termination, and the module caught it.
-TEST_F(Test72HooksKeepTermination, SourceMapCallbackWhileTakingAHookError) {
+TEST_F(Test75HooksKeepTermination, SourceMapCallbackWhileTakingAHookError) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
   ASSERT_EQ(RunScript(s.env, "globalThis.mapped = 0;"), napi_ok);
@@ -485,7 +485,7 @@ TEST_F(Test72HooksKeepTermination, SourceMapCallbackWhileTakingAHookError) {
 // V8 does. V8 rejected the import()'s promise with the null its TryCatch
 // records for the termination and returned it: the JS that imported ran on,
 // and the termination was gone once the run returned.
-TEST_F(Test72HooksKeepTermination, DefaultDynamicImportHelper) {
+TEST_F(Test75HooksKeepTermination, DefaultDynamicImportHelper) {
   for (const char* setup :
        {"globalThis.__napi_dynamic_import = (specifier, name) => { terminate(); tick(); };",
         "Object.defineProperty(globalThis, '__napi_dynamic_import',"
@@ -505,7 +505,7 @@ TEST_F(Test72HooksKeepTermination, DefaultDynamicImportHelper) {
 // them (QuickJS's writes and reads values itself). A `_getDataCloneError`
 // getter V8 terminated made V8 throw the clone error over the termination,
 // and the JS that wrote the value caught it.
-TEST_F(Test72HooksKeepTermination, SerdesHooks) {
+TEST_F(Test75HooksKeepTermination, SerdesHooks) {
   for (const char* script : {
            "const s = new serdes.Serializer();\n"
            "Object.defineProperty(s, '_getDataCloneError', { get() { terminate(); tick(); } });\n"

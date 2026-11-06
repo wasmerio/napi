@@ -339,14 +339,14 @@ add_fixture_test(${_napi_test_prefix}_test_70_realm_entry_attack
 add_fixture_test(${_napi_test_prefix}_test_71_contextify_compat
   runners/test_71_contextify_compat.cc
 )
-add_fixture_test(${_napi_test_prefix}_test_72_hooks_keep_termination
-  runners/test_72_hooks_keep_termination.cc
+add_fixture_test(${_napi_test_prefix}_test_75_hooks_keep_termination
+  runners/test_75_hooks_keep_termination.cc
 )
-target_compile_definitions(${_napi_test_prefix}_test_72_hooks_keep_termination PRIVATE NAPI_VERSION=10)
-add_fixture_test(${_napi_test_prefix}_test_73_termination_until_cancelled
-  runners/test_73_termination_until_cancelled.cc
+target_compile_definitions(${_napi_test_prefix}_test_75_hooks_keep_termination PRIVATE NAPI_VERSION=10)
+add_fixture_test(${_napi_test_prefix}_test_76_termination_until_cancelled
+  runners/test_76_termination_until_cancelled.cc
 )
-target_compile_definitions(${_napi_test_prefix}_test_73_termination_until_cancelled PRIVATE NAPI_VERSION=10)
+target_compile_definitions(${_napi_test_prefix}_test_76_termination_until_cancelled PRIVATE NAPI_VERSION=10)
 if(_napi_test_engine STREQUAL "v8")
   # Only the V8 provider posts engine tasks through the enqueue hook.
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff
