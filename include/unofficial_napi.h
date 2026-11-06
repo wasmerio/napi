@@ -943,6 +943,11 @@ typedef enum {
 // the env's own). Version 1, which ends before it (`size` at least
 // UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_V1_SIZE), is deprecated but still
 // accepted: it compiles for the current realm.
+//
+// Zero-initialize the struct (`= {0}` in C, `{}` in C++) before setting its
+// fields. Source written before version 2 that sets `size` to sizeof,
+// `version` to UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION and only the
+// fields it knew sends version 2 with an indeterminate `realm_or_null`.
 #define UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION 2u
 typedef struct unofficial_napi_bytecode_open_options {
   uint32_t size;
@@ -1115,6 +1120,11 @@ typedef struct unofficial_napi_module__* unofficial_napi_module;
 //   global may be), the env's realm for the env's own global otherwise, and
 //   for NULL, undefined or null the env's realm (version 2) or the current
 //   realm (version 1). Any other value is napi_invalid_arg.
+//
+// Zero-initialize the struct (`= {0}` in C, `{}` in C++) before setting its
+// fields. Source written before version 2 that sets `size` to sizeof,
+// `version` to UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION and only the
+// fields it knew sends version 2 with an indeterminate `realm_or_null`.
 #define UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION 2u
 
 typedef enum {

@@ -187,6 +187,10 @@ calls take a realm's global or sandbox.
   id 0 or an id that named no value, and ran with no sandbox for such an
   id. They now return `main`'s V8 and native-bridge statuses
   (`napi_invalid_arg`).
+- **Zero-initialize the option structs** (`= {0}` in C, `{}` in C++)
+  before setting their fields. Source written against `main` that sets
+  `size` to `sizeof`, `version` to the version macro and only the fields it
+  knew sends version 2 with an indeterminate `realm_or_null`.
 - **Guest ABI.** The wasm32 layouts of version 1 are `main`'s, and version 2
   appends a u32 realm id. The guest imports
   `unofficial_napi_contextify_make_context`, `…_run_script` and
