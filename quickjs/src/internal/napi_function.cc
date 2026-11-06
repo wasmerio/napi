@@ -42,6 +42,36 @@ private:
   napi_handle_scope parent_ = nullptr;
   napi_handle_scope scope_ = nullptr;
 };
+
+// Native code up the stack can have an exception pending when JS calls a
+// native callback: an N-API call that makes an error (one over a detached
+// buffer, say) formats it through Error.prepareStackTrace, which a page can
+// define as a getter that calls native code. That exception is not the
+// callback's to see or to throw. It is set aside while the callback runs, and
+// is the one pending again once the callback's own has been thrown.
+class quickjs_outer_exception_scope__
+{
+public:
+  explicit quickjs_outer_exception_scope__(napi_env env) : env_{env}
+  {
+    if (env_->has_last_exception())
+    {
+      held_ = true;
+      exception_ = env_->take_last_exception();
+    }
+  }
+
+  ~quickjs_outer_exception_scope__()
+  {
+    if (held_)
+      env_->set_last_exception(exception_);
+  }
+
+private:
+  napi_env env_ = nullptr;
+  bool held_ = false;
+  JSValue exception_ = JS_UNDEFINED;
+};
 } // namespace
 
 JSValue napi_function__::create_internal(napi_env env,
@@ -111,6 +141,7 @@ JSValue invoke_callback(JSContext *caller_ctx,
     new_target = this_val;
   }
 
+  quickjs_outer_exception_scope__ outer_exception{env};
   auto info = napi_callback_info__{env, effective_this, new_target, argc, argv, user_data};
   auto result = cb(env, reinterpret_cast<napi_callback_info>(&info));
 

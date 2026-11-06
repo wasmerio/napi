@@ -718,12 +718,13 @@ TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
   EXPECT_EQ(GlobalInt(s.env, "calls"), 0) << "a getter the script defined ran";
 }
 
+namespace {
+
 // napi_is_detached_arraybuffer, like the other info calls over a detached or
 // out-of-bounds buffer, leaves an exception that was pending as it was and
 // adds none.
-TEST_F(Test33TypedArray, InfoCallsKeepThePendingException) {
-  EnvScope s(runtime_.get());
-  RunBufferScript(s.env,
+void ExpectInfoCallsKeepThePendingException(napi_env env) {
+  RunBufferScript(env,
                   "globalThis.detached = new ArrayBuffer(8);"
                   "globalThis.overDetached = new Uint8Array(detached, 2, 4);"
                   "globalThis.viewOverDetached = new DataView(detached, 2, 4);"
@@ -732,14 +733,14 @@ TEST_F(Test33TypedArray, InfoCallsKeepThePendingException) {
                   "globalThis.viewOutOfBounds = new DataView(rab, 4, 8);"
                   "rab.resize(4);"
                   "0");
-  napi_value detached = NamedGlobal(s.env, "detached");
+  napi_value detached = NamedGlobal(env, "detached");
   napi_value buffer = nullptr;
-  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, detached, 0, 8, &buffer), napi_ok);
-  ASSERT_EQ(napi_detach_arraybuffer(s.env, detached), napi_ok);
-  napi_value over_detached = NamedGlobal(s.env, "overDetached");
-  napi_value view_over_detached = NamedGlobal(s.env, "viewOverDetached");
-  napi_value out_of_bounds = NamedGlobal(s.env, "outOfBounds");
-  napi_value view_out_of_bounds = NamedGlobal(s.env, "viewOutOfBounds");
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(env, detached, 0, 8, &buffer), napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(env, detached), napi_ok);
+  napi_value over_detached = NamedGlobal(env, "overDetached");
+  napi_value view_over_detached = NamedGlobal(env, "viewOverDetached");
+  napi_value out_of_bounds = NamedGlobal(env, "outOfBounds");
+  napi_value view_out_of_bounds = NamedGlobal(env, "viewOutOfBounds");
 
   bool is_detached = false;
   void* data = nullptr;
@@ -748,45 +749,86 @@ TEST_F(Test33TypedArray, InfoCallsKeepThePendingException) {
       {"napi_is_detached_arraybuffer",
        [&] {
          is_detached = false;
-         napi_status status = napi_is_detached_arraybuffer(s.env, detached, &is_detached);
+         napi_status status = napi_is_detached_arraybuffer(env, detached, &is_detached);
          EXPECT_TRUE(is_detached);
          return status;
        }},
       {"napi_get_arraybuffer_info",
-       [&] { return napi_get_arraybuffer_info(s.env, detached, &data, &length); }},
+       [&] { return napi_get_arraybuffer_info(env, detached, &data, &length); }},
       {"typed array over a detached buffer",
-       [&] { return TypedArrayLayout(s.env, over_detached).status; }},
-      {"typed array out of bounds", [&] { return TypedArrayLayout(s.env, out_of_bounds).status; }},
+       [&] { return TypedArrayLayout(env, over_detached).status; }},
+      {"typed array out of bounds", [&] { return TypedArrayLayout(env, out_of_bounds).status; }},
       {"buffer over a detached buffer, as a typed array",
-       [&] { return TypedArrayLayout(s.env, buffer).status; }},
-      {"buffer over a detached buffer", [&] { return BufferLayout(s.env, buffer).status; }},
+       [&] { return TypedArrayLayout(env, buffer).status; }},
+      {"buffer over a detached buffer", [&] { return BufferLayout(env, buffer).status; }},
       {"data view over a detached buffer",
-       [&] { return DataViewLayout(s.env, view_over_detached).status; }},
+       [&] { return DataViewLayout(env, view_over_detached).status; }},
       {"data view out of bounds",
-       [&] { return DataViewLayout(s.env, view_out_of_bounds).status; }},
+       [&] { return DataViewLayout(env, view_out_of_bounds).status; }},
   };
   for (const auto& [what, call] : calls) {
     SCOPED_TRACE(what);
     // With nothing pending, nothing is pending afterwards.
     EXPECT_EQ(call(), napi_ok);
-    ExpectNothingPending(s.env, "with nothing pending before");
+    ExpectNothingPending(env, "with nothing pending before");
 
     // With an exception pending, it is the one pending afterwards.
-    napi_throw_error(s.env, nullptr, "earlier");
+    napi_throw_error(env, nullptr, "earlier");
     EXPECT_EQ(call(), napi_ok);
     napi_value exception = nullptr;
-    EXPECT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok)
+    EXPECT_EQ(napi_get_and_clear_last_exception(env, &exception), napi_ok)
         << "the earlier exception is no longer pending";
     char text[64] = {};
     size_t text_length = 0;
     napi_value message = nullptr;
     if (exception != nullptr &&
-        napi_get_named_property(s.env, exception, "message", &message) == napi_ok) {
-      napi_get_value_string_utf8(s.env, message, text, sizeof(text), &text_length);
+        napi_get_named_property(env, exception, "message", &message) == napi_ok) {
+      napi_get_value_string_utf8(env, message, text, sizeof(text), &text_length);
     }
     EXPECT_STREQ(text, "earlier");
-    ExpectNothingPending(s.env, "after the earlier exception was taken");
+    ExpectNothingPending(env, "after the earlier exception was taken");
   }
+}
+
+napi_value CountNativeCall(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data), napi_ok);
+  ++*static_cast<int*>(data);
+  bool pending = true;
+  EXPECT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  EXPECT_FALSE(pending) << "a native callback started with another's exception pending";
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(Test33TypedArray, InfoCallsKeepThePendingException) {
+  EnvScope s(runtime_.get());
+  ExpectInfoCallsKeepThePendingException(s.env);
+}
+
+// On QuickJS an info call over a detached or out-of-bounds buffer makes an
+// error, and formats it through Error.prepareStackTrace, which a page can
+// define as a getter that calls native code. The exception native code up the
+// stack has pending is not that callback's: it neither sees it nor throws it
+// into the getter, and it is still the one pending when the info call returns.
+TEST_F(Test33TypedArray, InfoCallsKeepThePendingExceptionWhenErrorFormattingCallsNativeCode) {
+  EnvScope s(runtime_.get());
+  int native_calls = 0;
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "countNativeCall", NAPI_AUTO_LENGTH, CountNativeCall,
+                                 &native_calls, &fn),
+            napi_ok);
+  SetGlobal(s.env, "countNativeCall", fn);
+  RunBufferScript(s.env,
+                  "Object.defineProperty(Error, 'prepareStackTrace', { configurable: true,"
+                  "  get() { countNativeCall(); return undefined; } });"
+                  "0");
+  ExpectInfoCallsKeepThePendingException(s.env);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // V8 makes no error to read a buffer or a view, so only QuickJS gets here.
+  EXPECT_GT(native_calls, 0) << "the getter never ran: nothing was tested";
+#endif
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
