@@ -81,6 +81,7 @@ unsafe extern "C" {
     /// `RELEASE_REFUSED`).
     pub fn snapi_bridge_unofficial_env_release_refused(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
+    pub fn snapi_bridge_unofficial_memory_pressure(env: SnapiEnv, level: i32) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
         env: SnapiEnv,
         mode: i32,

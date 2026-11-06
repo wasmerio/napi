@@ -340,6 +340,15 @@ fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env:
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+fn guest_unofficial_napi_memory_pressure(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    level: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
+}
+
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -4886,6 +4895,7 @@ pub fn register_napi_imports(
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
+        "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

@@ -3258,6 +3258,14 @@ extern "C" int snapi_bridge_unofficial_collect_garbage(
   return unofficial_napi_collect_garbage(env);
 }
 
+extern "C" int snapi_bridge_unofficial_memory_pressure(
+    SnapiEnvState* env_state,
+    int32_t level) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_memory_pressure(bridge_state->env, level);
+}
+
 extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     SnapiEnvState* env_state,
     int mode,
