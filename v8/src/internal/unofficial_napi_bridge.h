@@ -13,8 +13,11 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
 // Frees the records of collected realms, unassigning their context tokens.
 void NapiV8ReleaseCollectedRealms(napi_env env);
-// Unassigns the context token of every realm that still has one.
+// Unassigns the context token of every realm that still has one, also of
+// realms the unassign hooks make.
 void NapiV8UnassignRealmTokens(napi_env env);
+// True while a realm of the env has a context token.
+bool NapiV8HasRealmTokens(napi_env env);
 void NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);

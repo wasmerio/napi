@@ -986,26 +986,28 @@ napi_env__::~napi_env__() {
   // Every scope closes. Cleanup hooks and finalizers each run in the env's
   // realm, and a scope one leaves open closes when it returns.
   PopRealmFrames(0);
-  // The release contract (unofficial_napi_release_env): the cleanup hooks
-  // run, then the finalizers of the values still pending (references with a
-  // finalizer most recent first, as Node's FinalizeAll, then external
-  // buffers, each detached first), until neither is left; then the instance
-  // data's finalizer; and all of it again for what that finalizer leaves
-  // pending, until nothing is, so no hint is left pointing at the env. The
-  // callback is cleared before it runs, so instance data is finalized once.
-  // Realms still alive give up their context tokens before the cleanup hooks
-  // run, while the embedder's state is intact, and so do realms the hooks
-  // make.
-  NapiV8UnassignRealmTokens(this);
+  // The release contract (unofficial_napi_release_env), in rounds: the
+  // realms that have a context token give it up (the deprecated token hooks;
+  // in the first round the realms still alive, before the cleanup hooks run,
+  // while the embedder's state is intact); the cleanup hooks run; then the
+  // finalizers of the values still pending (references with a finalizer most
+  // recent first, as Node's FinalizeAll, then external buffers, each
+  // detached first). Rounds repeat while any of them has something left: a
+  // realm a hook or finalizer makes keeps its token until the next round.
+  // Then the instance data's finalizer; and all of it again for what that
+  // finalizer leaves pending, until nothing is, so no hint is left pointing
+  // at the env and no token is left assigned. The callback is cleared before
+  // it runs, so instance data is finalized once.
   for (;;) {
     do {
-      RunEnvCleanupHooks(this);
       NapiV8UnassignRealmTokens(this);
+      RunEnvCleanupHooks(this);
       napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
       pending_finalizers.clear();
       pending_buffer_finalizers.clear();
       FinalizeExternalBackingStoreHints(this);
-    } while (!env_cleanup_hooks.empty() || !napi_ref_tracker__::IsEmpty(&finalizing_reflist));
+    } while (!env_cleanup_hooks.empty() || !napi_ref_tracker__::IsEmpty(&finalizing_reflist) ||
+             NapiV8HasRealmTokens(this));
     if (instance_data_finalize_cb == nullptr) break;
     napi_finalize finalize_cb = instance_data_finalize_cb;
     instance_data_finalize_cb = nullptr;

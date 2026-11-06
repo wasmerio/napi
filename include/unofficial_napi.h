@@ -163,13 +163,15 @@ enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 // for the realm and is not reused while assigned. It calls
 // `context_token_assign_callback(env, token, data)` when the realm is created
 // (unofficial_napi_create_realm, and so unofficial_napi_contextify_make_context),
-// and `context_token_unassign_callback(env, token, data)` once for each
-// token: when the provider frees the record of a collected realm (in
-// unofficial_napi_create_realm and unofficial_napi_collect_garbage), or, for a
-// realm still alive, when the env is released, before its cleanup hooks run
-// (and after them for realms they made). Both run in the env's realm. Realms
-// made before the hooks were attached get no token. QuickJS does not accept
-// them and never calls them.
+// and `context_token_unassign_callback(env, token, data)` exactly once for
+// each token, before the env is freed: when the provider frees the record of
+// a collected realm (in unofficial_napi_create_realm and
+// unofficial_napi_collect_garbage), or, for a realm still alive, during the
+// env's release (unofficial_napi_release_env), which unassigns the tokens of
+// the realms alive when it begins before the cleanup hooks run, and those of
+// realms made while it runs too. Both run in the env's realm. Realms made
+// before the hooks were attached get no token. QuickJS does not accept them
+// and never calls them.
 UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
 typedef struct {
   uint32_t size;
@@ -247,10 +249,22 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 //    empty. An addon that makes a new value in every finalizer never
 //    finishes, as in Node.
 //
-// After each hook and finalizer, an exception it left pending is dropped:
-// nothing can catch it then (Node's CallIntoModule drops it too once JS can
-// no longer run). An engine may run a finalizer in the middle of other code,
-// when that code frees the last reference to a value (QuickJS does): there
+// With the deprecated context-token callbacks (unofficial_napi_env_hooks;
+// only V8 accepts them), each pass of 1 and 2 begins by unassigning the token
+// of every realm that has one: in the first pass the realms alive when the
+// release begins, before any cleanup hook runs, as main did. A realm made
+// while releasing (by a hook, a finalizer, the instance-data finalizer or an
+// unassign callback) is pending until its token is unassigned, in the next
+// pass, so every token is unassigned once before the env is freed. What an
+// unassign callback makes (values, hooks, realms, instance data) is released
+// as the rest.
+//
+// After each hook, token callback and finalizer, an exception it left
+// pending is dropped: nothing can catch it then (Node's CallIntoModule drops
+// it too once JS can no longer run). An engine may run a finalizer in the
+// middle of other code, when that code frees the last reference to a value
+// (QuickJS does; V8 runs the unassign callback of a collected realm inside
+// unofficial_napi_create_realm and unofficial_napi_collect_garbage): there
 // only the finalizer's own exception is dropped, and one that JS is throwing,
 // or that a hook has pending, is kept. Each runs on the env's thread, in the
 // env's realm (also when another realm was entered when the release began),

@@ -13,6 +13,7 @@
 #include "napi_testing.h"
 #include "unofficial_napi.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <utility>
@@ -1882,4 +1883,365 @@ TEST_F(Test71ContextifyCompat, ContextTokensFollowRealms) {
   EXPECT_EQ(log.events[0].first, 'c');
 #endif
   EXPECT_FALSE(log.wrong_env);
+}
+
+namespace {
+
+// The context-token hooks at release, for realms made while the env is
+// released. Each assign must have exactly one unassign, before the env is
+// freed, and both run in the env's realm. A token stays the same for its realm
+// and is not reused while assigned.
+struct ReleaseTokens {
+  napi_env env = nullptr;
+  // The env's own global: a hook runs in the env's realm if it is the global.
+  napi_ref env_global = nullptr;
+  // 'a' assign, 'u' unassign, in order.
+  std::vector<std::pair<char, void*>> events;
+  // Tokens assigned and not yet unassigned.
+  std::vector<void*> live;
+  // Realms the test made, with the token each was given (its handle).
+  std::vector<void*> made;
+  int failed_makes = 0;
+  bool wrong_env = false;
+  bool wrong_realm = false;
+  bool reused = false;
+  bool unassigned_unknown = false;
+  // Hooks that found an exception pending when they began.
+  int pending_at_hook = 0;
+  // How many more realms the unassign hook makes, one per call.
+  int unassign_makes = 0;
+  // How many more unassign hooks throw, one per call.
+  int unassign_throws = 0;
+};
+
+void CheckHookRealm(napi_env env, ReleaseTokens* log) {
+  log->wrong_env |= env != log->env;
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) ++log->pending_at_hook;
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) {
+    log->wrong_realm = true;
+    return;
+  }
+  napi_value global = nullptr;
+  napi_value env_global = nullptr;
+  bool same = false;
+  log->wrong_realm |= napi_get_global(env, &global) != napi_ok ||
+                      napi_get_reference_value(env, log->env_global, &env_global) != napi_ok ||
+                      env_global == nullptr ||
+                      napi_strict_equals(env, global, env_global, &same) != napi_ok || !same;
+  napi_close_handle_scope(env, scope);
+}
+
+void MakeReleaseRealm(ReleaseTokens* log) {
+  napi_handle_scope scope = nullptr;
+  if (napi_open_handle_scope(log->env, &scope) != napi_ok) {
+    ++log->failed_makes;
+    return;
+  }
+  unofficial_napi_realm realm = nullptr;
+  napi_value global = nullptr;
+  if (unofficial_napi_create_realm(log->env, nullptr, &realm, &global) == napi_ok &&
+      realm != nullptr) {
+    log->made.push_back(realm);
+  } else {
+    ++log->failed_makes;
+  }
+  napi_close_handle_scope(log->env, scope);
+}
+
+void AssignReleaseToken(napi_env env, void* token, void* data) {
+  auto* log = static_cast<ReleaseTokens*>(data);
+  CheckHookRealm(env, log);
+  log->reused |= std::find(log->live.begin(), log->live.end(), token) != log->live.end();
+  log->live.push_back(token);
+  log->events.emplace_back('a', token);
+}
+
+void UnassignReleaseToken(napi_env env, void* token, void* data) {
+  auto* log = static_cast<ReleaseTokens*>(data);
+  CheckHookRealm(env, log);
+  auto it = std::find(log->live.begin(), log->live.end(), token);
+  if (it == log->live.end()) {
+    log->unassigned_unknown = true;
+  } else {
+    log->live.erase(it);
+  }
+  log->events.emplace_back('u', token);
+  if (log->unassign_makes > 0) {
+    --log->unassign_makes;
+    MakeReleaseRealm(log);
+  }
+  if (log->unassign_throws > 0) {
+    --log->unassign_throws;
+    napi_throw_error(env, nullptr, "unassign");
+  }
+}
+
+void MakeRealmHook(void* data) {
+  MakeReleaseRealm(static_cast<ReleaseTokens*>(data));
+}
+
+void FinalizeMakingRealm(node_api_basic_env, void*, void* hint) {
+  MakeReleaseRealm(static_cast<ReleaseTokens*>(hint));
+}
+
+void FinalizeAddingRealmHook(node_api_basic_env basic_env, void*, void* hint) {
+  napi_add_env_cleanup_hook(const_cast<napi_env>(basic_env), MakeRealmHook, hint);
+}
+
+void FinalizeInstanceDataMakingRealm(napi_env, void* data, void*) {
+  MakeReleaseRealm(static_cast<ReleaseTokens*>(data));
+}
+
+// Makes an env whose token hooks record into `log`.
+void AttachReleaseTokens(EnvScope& s, ReleaseTokens* log) {
+  log->env = s.env;
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_create_reference(s.env, global, 1, &log->env_global), napi_ok);
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  hooks.data = log;
+  hooks.context_token_assign_callback = AssignReleaseToken;
+  hooks.context_token_unassign_callback = UnassignReleaseToken;
+  uint64_t accepted = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(s.env, &hooks, &accepted), napi_ok);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(accepted, static_cast<uint64_t>(unofficial_napi_env_hook_context_token_assign |
+                                            unofficial_napi_env_hook_context_token_unassign));
+#else
+  EXPECT_EQ(accepted, 0u);
+#endif
+}
+
+// Sets `name` on the env's global, which keeps `value` until the release.
+void KeepOnGlobal(napi_env env, const char* name, napi_value value) {
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(env, global, name, value), napi_ok);
+}
+
+void KeepFinalizedObject(napi_env env, napi_finalize finalize, ReleaseTokens* log) {
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(env, &object), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(env, object, nullptr, finalize, log, nullptr), napi_ok);
+  KeepOnGlobal(env, "finalized", object);
+}
+
+void KeepWrappedObject(napi_env env, napi_finalize finalize, ReleaseTokens* log) {
+  static int native = 0;
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(env, &object), napi_ok);
+  ASSERT_EQ(napi_wrap(env, object, &native, finalize, log, nullptr), napi_ok);
+  KeepOnGlobal(env, "wrapped", object);
+}
+
+void KeepExternalArrayBuffer(napi_env env, napi_finalize finalize, ReleaseTokens* log) {
+  static char bytes[16] = {};
+  napi_value array_buffer = nullptr;
+  ASSERT_EQ(napi_create_external_arraybuffer(env, bytes, sizeof(bytes), finalize, log,
+                                             &array_buffer),
+            napi_ok);
+  KeepOnGlobal(env, "external", array_buffer);
+}
+
+void ReleaseTokensEnv(EnvScope& s) {
+  ASSERT_EQ(unofficial_napi_release_env(s.scope, nullptr), napi_ok);
+  s.scope = nullptr;
+  s.env = nullptr;
+}
+
+// V8: every token assigned was unassigned once, before the release returned,
+// in the env's realm, and was the handle of a realm the test made. QuickJS
+// calls neither hook.
+void ExpectEveryTokenUnassignedOnce(const ReleaseTokens& log, size_t realms) {
+  EXPECT_EQ(log.failed_makes, 0);
+  EXPECT_EQ(log.made.size(), realms);
+#if defined(NAPI_TEST_ENGINE_V8)
+  size_t assigned = 0;
+  size_t unassigned = 0;
+  std::vector<void*> live;
+  for (const auto& event : log.events) {
+    if (event.first == 'a') {
+      ++assigned;
+      EXPECT_EQ(std::count(live.begin(), live.end(), event.second), 0);
+      live.push_back(event.second);
+    } else {
+      ++unassigned;
+      auto it = std::find(live.begin(), live.end(), event.second);
+      ASSERT_NE(it, live.end());
+      live.erase(it);
+    }
+  }
+  EXPECT_EQ(assigned, realms);
+  EXPECT_EQ(unassigned, realms);
+  EXPECT_TRUE(live.empty());
+  EXPECT_TRUE(log.live.empty());
+  for (void* token : log.made) {
+    EXPECT_NE(std::find_if(log.events.begin(), log.events.end(),
+                           [&](const auto& event) {
+                             return event.first == 'a' && event.second == token;
+                           }),
+              log.events.end());
+  }
+  EXPECT_FALSE(log.reused);
+  EXPECT_FALSE(log.unassigned_unknown);
+  EXPECT_FALSE(log.wrong_env);
+  EXPECT_FALSE(log.wrong_realm);
+#else
+  EXPECT_TRUE(log.events.empty());
+#endif
+}
+
+}  // namespace
+
+TEST_F(Test71ContextifyCompat, TokenOfARealmARefFinalizerMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  KeepFinalizedObject(s.env, FinalizeMakingRealm, &log);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+}
+
+TEST_F(Test71ContextifyCompat, TokenOfARealmAWrapFinalizerMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  KeepWrappedObject(s.env, FinalizeMakingRealm, &log);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+}
+
+TEST_F(Test71ContextifyCompat, TokenOfARealmAnExternalBufferFinalizerMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  KeepExternalArrayBuffer(s.env, FinalizeMakingRealm, &log);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+}
+
+TEST_F(Test71ContextifyCompat, TokenOfARealmTheInstanceDataFinalizerMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  ASSERT_EQ(napi_set_instance_data(s.env, &log, FinalizeInstanceDataMakingRealm, nullptr),
+            napi_ok);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+}
+
+// A hook a finalizer adds at release runs in a later round of the release.
+TEST_F(Test71ContextifyCompat, TokenOfARealmALateHookMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  KeepFinalizedObject(s.env, FinalizeAddingRealmHook, &log);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 1);
+}
+
+// The unassign hook of a realm alive at release makes a realm, and so does
+// the unassign hook of that one.
+TEST_F(Test71ContextifyCompat, TokenOfARealmAnUnassignHookMakesAtReleaseIsUnassigned) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  MakeReleaseRealm(&log);
+  log.unassign_makes = 2;
+  ReleaseTokensEnv(s);
+#if defined(NAPI_TEST_ENGINE_V8)
+  ExpectEveryTokenUnassignedOnce(log, 3);
+  EXPECT_EQ(log.unassign_makes, 0);
+#else
+  ExpectEveryTokenUnassignedOnce(log, 1);
+#endif
+}
+
+// All of them in one release, with what each makes handled in turn: a realm
+// alive when the release begins, one a cleanup hook makes, and those values'
+// finalizers, a late hook, the instance-data finalizer and unassign hooks
+// make.
+TEST_F(Test71ContextifyCompat, TokensOfRealmsMadeThroughoutTheReleaseAreUnassignedOnce) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  MakeReleaseRealm(&log);
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, MakeRealmHook, &log), napi_ok);
+  KeepFinalizedObject(s.env, FinalizeMakingRealm, &log);
+  KeepWrappedObject(s.env, FinalizeMakingRealm, &log);
+  KeepExternalArrayBuffer(s.env, FinalizeMakingRealm, &log);
+  napi_value late = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &late), napi_ok);
+  ASSERT_EQ(napi_add_finalizer(s.env, late, nullptr, FinalizeAddingRealmHook, &log, nullptr),
+            napi_ok);
+  KeepOnGlobal(s.env, "late", late);
+  ASSERT_EQ(napi_set_instance_data(s.env, &log, FinalizeInstanceDataMakingRealm, nullptr),
+            napi_ok);
+  log.unassign_makes = 3;
+  ReleaseTokensEnv(s);
+#if defined(NAPI_TEST_ENGINE_V8)
+  ExpectEveryTokenUnassignedOnce(log, 10);
+  EXPECT_EQ(log.unassign_makes, 0);
+#else
+  ExpectEveryTokenUnassignedOnce(log, 7);
+#endif
+  // The realm alive when the release began gave up its token first, before
+  // the cleanup hooks ran.
+  if (!log.events.empty()) {
+    EXPECT_EQ(log.events[1], std::make_pair('u', log.made[0]));
+  }
+}
+
+namespace {
+
+// A cleanup hook with an exception pending makes a realm the collector frees
+// at once, so its unassign hook runs inside the cleanup hook.
+struct ThrowThenFree {
+  ReleaseTokens* log = nullptr;
+  bool pending_after_free = false;
+  size_t events_before = 0;
+  size_t events_after = 0;
+};
+
+void HookThrowingThenFreeingARealm(void* data) {
+  auto* state = static_cast<ThrowThenFree*>(data);
+  napi_env env = state->log->env;
+  MakeReleaseRealm(state->log);
+  napi_throw_error(env, nullptr, "hook");
+  state->events_before = state->log->events.size();
+  unofficial_napi_collect_garbage(env);
+  state->events_after = state->log->events.size();
+  napi_is_exception_pending(env, &state->pending_after_free);
+}
+
+}  // namespace
+
+// What a token hook throws at release is dropped, as what a cleanup hook or a
+// finalizer throws: nothing can catch it. A hook that runs inside other code
+// (here collect_garbage, freeing a collected realm, in a cleanup hook) runs
+// with no exception pending, and the one that code has pending is kept.
+TEST_F(Test71ContextifyCompat, TokenHookExceptionsAtReleaseAreDropped) {
+  EnvScope s(runtime_.get());
+  ReleaseTokens log;
+  AttachReleaseTokens(s, &log);
+  MakeReleaseRealm(&log);
+  MakeReleaseRealm(&log);
+  log.unassign_throws = 1;
+  ThrowThenFree state;
+  state.log = &log;
+  ASSERT_EQ(napi_add_env_cleanup_hook(s.env, HookThrowingThenFreeingARealm, &state), napi_ok);
+  ReleaseTokensEnv(s);
+  ExpectEveryTokenUnassignedOnce(log, 3);
+  EXPECT_TRUE(state.pending_after_free);
+  // The second unassign hook did not find the first one's exception, and the
+  // one inside the cleanup hook ran with none pending either.
+  EXPECT_EQ(log.pending_at_hook, 0);
+#if defined(NAPI_TEST_ENGINE_V8)
+  EXPECT_EQ(log.unassign_throws, 0);
+  EXPECT_EQ(state.events_after, state.events_before + 1);
+#endif
 }

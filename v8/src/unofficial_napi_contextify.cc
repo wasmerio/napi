@@ -1316,7 +1316,11 @@ v8::Local<v8::Context> RealmContext(napi_env env, unofficial_napi_realm realm) {
 }
 
 // Calls a deprecated context-token hook for `realm`, in the env's realm as
-// every env hook runs.
+// every env hook runs. At the release, as a finalizer there, it runs with no
+// exception pending, and what it throws is dropped: nothing can catch it. It
+// may run inside other code then (create_realm and collect_garbage free the
+// records of collected realms), and the exception that code has pending is
+// kept.
 void CallContextTokenHook(napi_env env,
                           unofficial_napi_context_token_callback hook,
                           unofficial_napi_realm realm) {
@@ -1324,7 +1328,24 @@ void CallContextTokenHook(napi_env env,
   v8::HandleScope handle_scope(env->isolate);
   v8::Context::Scope context_scope(env->main_context());
   napi_realm_frame_scope__ realm_frame(env, nullptr);
-  hook(env, realm, env->agent->context_token_data);
+  if (!env->releasing) {
+    hook(env, realm, env->agent->context_token_data);
+    return;
+  }
+  v8::Global<v8::Value> exception = std::move(env->last_exception);
+  v8::Global<v8::Message> message = std::move(env->last_exception_message);
+  std::string source_line;
+  std::string thrown_at;
+  source_line.swap(env->last_exception_source_line);
+  thrown_at.swap(env->last_exception_thrown_at);
+  {
+    v8::TryCatch try_catch(env->isolate);
+    hook(env, realm, env->agent->context_token_data);
+  }
+  env->last_exception = std::move(exception);
+  env->last_exception_message = std::move(message);
+  env->last_exception_source_line.swap(source_line);
+  env->last_exception_thrown_at.swap(thrown_at);
 }
 
 // A realm has a token while either hook is attached, as each context did.
@@ -1667,6 +1688,12 @@ void NapiV8UnassignRealmTokens(napi_env env) {
     if (it == env->realms.end()) return;
     UnassignRealmToken(env, it->get());
   }
+}
+
+bool NapiV8HasRealmTokens(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return false;
+  return std::any_of(env->realms.begin(), env->realms.end(),
+                     [](const auto& realm) { return realm->token_assigned; });
 }
 
 extern "C" {

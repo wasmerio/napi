@@ -172,13 +172,19 @@ calls take a realm's global or sandbox.
 - **Context tokens.** V8 accepts the token callbacks, as on `main`. A realm's
   token is its record, which outlives the assignment. V8 assigns it when
   `create_realm` (and so `make_context`) makes the realm, and unassigns it
-  once: when it frees the record of the collected realm (in the next
-  `create_realm` or in `collect_garbage`), or, for a realm still alive, at
-  env release before the cleanup hooks run (and after them for realms they
-  made). Realms made before the hooks were attached get no token. Both
-  hooks run in the env's realm. On `main` a context lived until release, so
-  tokens were only unassigned then. QuickJS does not accept the hooks and
-  never calls them, as on `main`.
+  exactly once, before the env is freed: when it frees the record of the
+  collected realm (in the next `create_realm` or in `collect_garbage`), or,
+  for a realm still alive, during env release. The release unassigns the
+  tokens of the realms alive when it begins before the cleanup hooks run,
+  as `main` did, and a realm made while it runs (by a cleanup hook, a
+  finalizer, the instance-data finalizer or an unassign callback) is pending
+  until the release's next pass unassigns its token; what an unassign
+  callback makes is released as the rest (see `unofficial_napi_release_env`
+  in the header). Realms made before the hooks were attached get no token.
+  Both hooks run in the env's realm; at release what they throw is dropped,
+  as for the other hooks and finalizers. On `main` a context lived until
+  release, so tokens were only unassigned then. QuickJS does not accept the
+  hooks and never calls them, as on `main`.
 - **Statuses are `main`'s V8 ones.** `main`'s QuickJS differed: it took a
   NULL `name`, refused a symbol sandbox, returned an already contextified
   sandbox again, compiled in the env's context for a parsing context that
