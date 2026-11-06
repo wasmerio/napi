@@ -336,6 +336,11 @@ if(_napi_test_engine STREQUAL "v8")
   add_fixture_test(${_napi_test_prefix}_test_73_event_loop_checkpoint_handles
     runners/test_73_event_loop_checkpoint_handles.cc
   )
+  # QuickJS takes name lengths as a size_t; V8 takes an int.
+  add_fixture_test(${_napi_test_prefix}_test_74_name_length_limits
+    runners/test_74_name_length_limits.cc
+  )
+  target_compile_definitions(${_napi_test_prefix}_test_74_name_length_limits PRIVATE NAPI_VERSION=10)
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator

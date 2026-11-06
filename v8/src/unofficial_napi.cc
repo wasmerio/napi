@@ -2690,6 +2690,12 @@ napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
                                                              napi_value* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
   if (utf8description == nullptr && length > 0) return napi_invalid_arg;
+  // V8 takes an int length: a larger one would turn negative and make V8
+  // run strlen.
+  if (length != NAPI_AUTO_LENGTH &&
+      length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return napi_invalid_arg;
+  }
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope scope(isolate);
