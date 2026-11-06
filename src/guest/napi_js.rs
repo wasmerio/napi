@@ -590,11 +590,15 @@ fn guest_unofficial_napi_release_env(
     if status != 0 {
         return status;
     }
-    let Some(snapi_env_state) = env.data_mut().unregister_napi_scope(scope_id) else {
+    let Some((env_id, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
+    else {
         return 1;
     };
     let loop_id = loop_ptr;
-    unsafe { snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id) }
+    let status = unsafe { snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id) };
+    env.data_mut()
+        .finish_unregister_napi_env(env_id, snapi_env_state, status);
+    status
 }
 
 fn guest_unofficial_napi_attach_env(

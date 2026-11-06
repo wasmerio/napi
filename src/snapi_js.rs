@@ -7990,6 +7990,33 @@ mod tests {
         assert_eq!(unsafe { snapi_bridge_unofficial_release_env(env) }, NAPI_OK);
     }
 
+    #[wasm_bindgen_test]
+    fn post_release_unregistration_does_not_touch_the_host_env() {
+        with_env(|env, state| {
+            let mut owner = crate::NapiEnv::new(
+                crate::budget::ResourceBudget::unlimited(),
+                None,
+                std::sync::Arc::default(),
+                std::sync::Arc::default(),
+            );
+            let (env_id, scope_id) = owner.register_napi_env(env);
+            assert_eq!(
+                owner.begin_unregister_napi_scope(scope_id),
+                Some((env_id, env))
+            );
+
+            // After release the address can already belong to another env.
+            // Simulate that reuse with a live env so a stale write is observable
+            // without corrupting the allocator by writing into freed memory.
+            let mut marker = 42u32;
+            let callback_ctx = (&mut marker as *mut u32).cast::<c_void>();
+            state.agent.active_callback_ctx = callback_ctx;
+            owner.finish_unregister_napi_env(env_id, env, NAPI_OK);
+            assert_eq!(state.agent.active_callback_ctx, callback_ctx);
+            assert!(!owner.napi_envs.contains_key(&env_id));
+        });
+    }
+
     /// A guest callback or finalizer body: takes the cbinfo id or the
     /// finalizer's data, returns what the guest function would.
     type GuestFunction = Rc<dyn Fn(u32) -> u32>;
