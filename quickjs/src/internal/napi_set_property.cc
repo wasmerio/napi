@@ -2,6 +2,13 @@
 
 namespace quickjs::detail
 {
+    enum class set_failure_action
+    {
+        rethrow,
+        define_own,
+        refuse_lazy_write,
+    };
+
     void clear_pending_exception(JSContext *ctx)
     {
         if (!JS_HasException(ctx))
@@ -37,17 +44,35 @@ namespace quickjs::detail
         return (descriptor.flags & JS_PROP_WRITABLE) == 0;
     }
 
-    // Brief: should_define_own_property_after_set_failure belongs to the property assignment compatibility layer.
-    // It recognizes inherited descriptor shapes Node expects to shadow with an own property.
-    // Inputs stay as QuickJS handles owned by the caller.
-    // Descriptor/prototype lookup failures are cleared and reported as a conservative false.
-    // Keep changes narrow so this compatibility bridge remains easy to remove.
-    bool should_define_own_property_after_set_failure(JSContext *ctx,
-                                                      JSValueConst object,
-                                                      JSAtom property)
+    // V8's native Set API silently refuses a readonly lazy data property.
+    // Inspect its flags without the descriptor read that would initialize it.
+    set_failure_action lazy_set_failure_action(JSContext *ctx,
+                                               JSValueConst object,
+                                               JSAtom property)
     {
+        int flags = 0;
+        int has = JS_GetOwnPropertyFlags(ctx, &flags, object, property);
+        if (has < 0)
+        {
+            clear_pending_exception(ctx);
+            return set_failure_action::rethrow;
+        }
+        return has > 0 && (flags & JS_PROP_WRITABLE) == 0
+                   ? set_failure_action::refuse_lazy_write
+                   : set_failure_action::rethrow;
+    }
+
+    // Keep lazy values unread while choosing a native assignment fallback.
+    // Other inherited descriptors retain the existing shadowing behavior.
+    // Lookup failures preserve the original assignment exception.
+    set_failure_action choose_set_failure_action(JSContext *ctx,
+                                                 JSValueConst object,
+                                                 JSAtom property)
+    {
+        if (JS_IsLazyDataProperty(ctx, object, property))
+            return lazy_set_failure_action(ctx, object, property);
         if (object_has_own_property(ctx, object, property))
-            return false;
+            return set_failure_action::rethrow;
 
         JSValue prototype = JS_GetPrototype(ctx, object);
         while (!JS_IsNull(prototype))
@@ -55,7 +80,14 @@ namespace quickjs::detail
             if (JS_IsException(prototype))
             {
                 clear_pending_exception(ctx);
-                return false;
+                return set_failure_action::rethrow;
+            }
+
+            if (JS_IsLazyDataProperty(ctx, prototype, property))
+            {
+                set_failure_action action = lazy_set_failure_action(ctx, prototype, property);
+                JS_FreeValue(ctx, prototype);
+                return action;
             }
 
             JSPropertyDescriptor descriptor;
@@ -64,7 +96,7 @@ namespace quickjs::detail
             {
                 JS_FreeValue(ctx, prototype);
                 clear_pending_exception(ctx);
-                return false;
+                return set_failure_action::rethrow;
             }
 
             if (has_property != 0)
@@ -72,7 +104,8 @@ namespace quickjs::detail
                 bool should_shadow = descriptor_blocks_assignment_without_setter(descriptor);
                 free_property_descriptor(ctx, &descriptor);
                 JS_FreeValue(ctx, prototype);
-                return should_shadow;
+                return should_shadow ? set_failure_action::define_own
+                                     : set_failure_action::rethrow;
             }
 
             JSValue next_prototype = JS_GetPrototype(ctx, prototype);
@@ -81,7 +114,7 @@ namespace quickjs::detail
         }
 
         JS_FreeValue(ctx, prototype);
-        return false;
+        return set_failure_action::rethrow;
     }
 
     // Brief: set_property_with_node_compat belongs to the property assignment compatibility layer.
@@ -99,7 +132,13 @@ namespace quickjs::detail
             return rc;
 
         JSValue exception = JS_GetException(ctx);
-        if (should_define_own_property_after_set_failure(ctx, object, property))
+        set_failure_action action = choose_set_failure_action(ctx, object, property);
+        if (action == set_failure_action::refuse_lazy_write)
+        {
+            JS_FreeValue(ctx, exception);
+            return 0;
+        }
+        if (action == set_failure_action::define_own)
         {
             JS_FreeValue(ctx, exception);
             return JS_DefinePropertyValue(ctx,

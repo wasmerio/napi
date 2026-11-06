@@ -4,6 +4,7 @@
 #include "internal/napi_serdes.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
+#include "internal/napi_lazy_properties.h"
 #include "internal/napi_promises.h"
 #include "internal/napi_util.h"
 #include "internal/napi_shared_array_buffer.h"
@@ -767,20 +768,27 @@ extern "C"
     {
         if (!napi_util__::check_env(env) || value == nullptr || result_out == nullptr)
             return napi_invalid_arg;
+        JSContext *ctx = napi_util__::context(env);
         size_t size = 0;
-        uint8_t *bytes = JS_WriteObject(napi_util__::context(env),
-                                        &size,
-                                        napi_quickjs_value_inner(env, value),
-                                        JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE);
+        JSSABTab sab_tab{};
+        uint8_t *bytes = JS_WriteObject2(ctx,
+                                         &size,
+                                         napi_quickjs_value_inner(env, value),
+                                         JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE |
+                                             JS_WRITE_OBJ_SAB_RETAIN,
+                                         &sab_tab);
         if (bytes == nullptr)
-            return napi_generic_failure;
-        JSValue cloned = JS_ReadObject(napi_util__::context(env),
+            return napi_util__::return_pending_if_caught(env, ctx,
+                                                        "Failed to clone value");
+        JSValue cloned = JS_ReadObject(ctx,
                                        bytes,
                                        size,
                                        JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
-        js_free(napi_util__::context(env), bytes);
+        js_free(ctx, bytes);
+        JS_FreeSABTab(ctx, &sab_tab);
         if (JS_IsException(cloned))
-            return napi_pending_exception;
+            return napi_util__::return_pending_if_caught(env, ctx,
+                                                        "Failed to deserialize cloned value");
 
         if (transfer_list_or_null != nullptr)
         {
@@ -926,8 +934,8 @@ extern "C"
 
             if ((filter_bits & (napi_key_writable | napi_key_configurable)) != 0)
             {
-                JSPropertyDescriptor desc;
-                int has = JS_GetOwnProperty(ctx, &desc, obj, props[i].atom);
+                int flags = 0;
+                int has = JS_GetOwnPropertyFlags(ctx, &flags, obj, props[i].atom);
                 if (has < 0)
                 {
                     JS_FreeValue(ctx, key);
@@ -944,15 +952,11 @@ extern "C"
 
                 bool include = true;
                 if ((filter_bits & napi_key_writable) != 0 &&
-                    (desc.flags & JS_PROP_WRITABLE) == 0)
+                    (flags & JS_PROP_WRITABLE) == 0)
                     include = false;
                 if ((filter_bits & napi_key_configurable) != 0 &&
-                    (desc.flags & JS_PROP_CONFIGURABLE) == 0)
+                    (flags & JS_PROP_CONFIGURABLE) == 0)
                     include = false;
-
-                JS_FreeValue(ctx, desc.value);
-                JS_FreeValue(ctx, desc.getter);
-                JS_FreeValue(ctx, desc.setter);
                 if (!include)
                 {
                     JS_FreeValue(ctx, key);
@@ -967,7 +971,6 @@ extern "C"
         return napi_util__::wrap_owned(env, out, result_out);
     }
 
-    // No lazy data properties in this engine: callers define values eagerly.
     napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
         napi_env env,
         napi_value object,
@@ -975,12 +978,7 @@ extern "C"
         napi_value initializer,
         napi_property_attributes attributes)
     {
-        if (!napi_util__::check_env(env) || object == nullptr || names == nullptr ||
-            initializer == nullptr)
-            return napi_invalid_arg;
-        if ((attributes & ~(napi_writable | napi_enumerable | napi_configurable)) != 0)
-            return napi_invalid_arg;
-        return napi_generic_failure;
+        return define_lazy_data_properties(env, object, names, initializer, attributes);
     }
 
     napi_status NAPI_CDECL unofficial_napi_is_lazy_data_property(
@@ -989,11 +987,7 @@ extern "C"
         napi_value key,
         bool *result_out)
     {
-        if (!napi_util__::check_env(env) || object == nullptr || key == nullptr ||
-            result_out == nullptr)
-            return napi_invalid_arg;
-        *result_out = false;
-        return napi_generic_failure;
+        return is_lazy_data_property(env, object, key, result_out);
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_hash_seed(napi_env env,

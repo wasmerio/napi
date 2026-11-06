@@ -889,10 +889,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_own_non_index_prope
 // initializer returns, and could make every read throw a TypeError, or
 // change the property under the check and reach V8's CHECK.
 //
-// V8: Object::SetLazyDataProperty. QuickJS and host-JavaScript providers have
-// no lazy data properties: napi_invalid_arg for a null argument or other
-// attribute bits, napi_generic_failure otherwise (define the values eagerly
-// instead).
+// V8: Object::SetLazyDataProperty. QuickJS: native lazy data properties with
+// the same observable behavior. The host-JavaScript provider has no lazy data
+// properties: napi_invalid_arg for a null argument or other attribute bits,
+// napi_generic_failure otherwise (define the values eagerly instead).
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_lazy_data_properties(
     napi_env env,
     napi_value object,
@@ -913,8 +913,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_lazy_data_proper
 // non-object is napi_object_expected, a key that is not a string or symbol
 // napi_name_expected. While execution is terminating, or once code it calls
 // terminates it: napi_pending_exception, `*result_out` false.
-// QuickJS and host-JavaScript providers: napi_invalid_arg for a null argument,
-// otherwise `*result_out` false and napi_generic_failure.
+// QuickJS inspects its own property storage directly, calling no other
+// embedder code. The host-JavaScript provider: napi_invalid_arg for a null
+// argument, otherwise `*result_out` false and napi_generic_failure.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_lazy_data_property(
     napi_env env,
     napi_value object,

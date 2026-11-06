@@ -32,10 +32,12 @@ const WAT: &str = r#"(module
     (func $define_lazy (param i32 i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_is_lazy_data_property"
     (func $is_lazy (param i32 i32 i32 i32) (result i32)))
-  (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_make_context"
-    (func $make_context (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
-  (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
-    (func $contextify_run_script
+  (import "napi_extension_wasmer_v0" "unofficial_napi_create_realm"
+    (func $create_realm (param i32 i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_get_realm"
+    (func $get_realm (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_run_script"
+    (func $realm_run_script
       (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_create_string_utf8"
     (func $create_string (param i32 i32 i32 i32) (result i32)))
@@ -146,17 +148,13 @@ const WAT: &str = r#"(module
     (global.set $sp (local.get $f))
     (i32.load offset=32 (local.get $f)))
 
-  ;; makeContext(): a new contextify context's global.
+  ;; makeContext(): a new explicit realm's global. The realm handle is
+  ;; scoped; runIn obtains it again from the live global for each use.
   (func $make_context_cb (param $env i32) (param $info i32) (result i32)
     (local $f i32)
     (local.set $f (call $push))
-    (if (call $create_object (local.get $env) (local.get $f)) (then unreachable))
-    (if (call $create_string (local.get $env) (i32.const 140) (i32.const 7)
-          (i32.add (local.get $f) (i32.const 4)))
-      (then unreachable))
-    (if (call $make_context (local.get $env) (i32.load (local.get $f))
-          (i32.load offset=4 (local.get $f)) (i32.const 0) (i32.const 1) (i32.const 1)
-          (i32.const 0) (i32.const 0) (i32.add (local.get $f) (i32.const 8)))
+    (if (call $create_realm (local.get $env) (i32.const 0)
+          (local.get $f) (i32.add (local.get $f) (i32.const 8)))
       (then unreachable))
     (global.set $sp (local.get $f))
     (i32.load offset=8 (local.get $f)))
@@ -170,6 +168,9 @@ const WAT: &str = r#"(module
     (if (call $get_cb_info (local.get $env) (local.get $info) (local.get $f)
           (i32.add (local.get $f) (i32.const 4)) (i32.const 0) (i32.const 0))
       (then unreachable))
+    (if (call $get_realm (local.get $env) (i32.load offset=4 (local.get $f))
+          (i32.add (local.get $f) (i32.const 12)))
+      (then unreachable))
     (i32.store offset=16 (local.get $f) (i32.const 0))
     (i32.store offset=20 (local.get $f) (i32.load offset=8 (local.get $f)))
     (i32.store offset=24 (local.get $f) (i32.const 0))
@@ -177,7 +178,7 @@ const WAT: &str = r#"(module
           (i32.add (local.get $f) (i32.const 28)))
       (then unreachable))
     (i32.store offset=32 (local.get $f) (i32.const 0))
-    (drop (call $contextify_run_script (local.get $env) (i32.load offset=4 (local.get $f))
+    (drop (call $realm_run_script (local.get $env) (i32.load offset=12 (local.get $f))
       (i32.add (local.get $f) (i32.const 16)) (i32.load offset=28 (local.get $f))
       (i32.const 0) (i32.const 0) (i64.const -1) (i32.const 1) (i32.const 0) (i32.const 0)
       (i32.const 0) (i32.add (local.get $f) (i32.const 32))))

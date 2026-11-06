@@ -2444,7 +2444,17 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_value value,
     napi_value transfer_list_or_null,
     napi_value* result_out) {
-  return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  v8::TryCatch try_catch(env->isolate);
+  const napi_status status = StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
+  if (status == napi_pending_exception && try_catch.HasCaught()) {
+    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+    napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+  }
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_message_create(
@@ -2458,6 +2468,7 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   *message_out = nullptr;
 
   v8::Isolate* isolate = env->isolate;
+  v8::TryCatch try_catch(isolate);
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
@@ -2468,6 +2479,10 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
 
   serializer.WriteHeader();
   if (serializer.WriteValue(context, input).IsNothing()) {
+    if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+    if (try_catch.HasCaught()) {
+      napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+    }
     return napi_pending_exception;
   }
 
@@ -3140,9 +3155,7 @@ napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
   v8::Isolate* isolate = env->isolate;
   // Reading `names` can run JS: entering V8 while terminating would cancel the
   // termination.
-  if (isolate->IsExecutionTerminating()) {
-    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
-  }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   v8::HandleScope handles(isolate);
   v8::Local<v8::Value> raw_object = napi_v8_unwrap_value(object);
   v8::Local<v8::Value> raw_names = napi_v8_unwrap_value(names);
@@ -3190,7 +3203,13 @@ napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
   if ((attributes & napi_configurable) == 0) flags |= v8::DontDelete;
   // One definition per call, so the getter can tell its property from one a
   // later call made on the same name.
-  v8::Local<v8::Value> definition = v8::Array::New(isolate, &raw_initializer, 1);
+  // This bookkeeping object must not retain a realm entered only for the
+  // define call. The initializer already keeps its own creation realm alive.
+  v8::Local<v8::Value> definition;
+  {
+    v8::Context::Scope principal_scope(env->main_context());
+    definition = v8::Array::New(isolate, &raw_initializer, 1);
+  }
   v8::Local<v8::Object> target = raw_object.As<v8::Object>();
   for (const auto& key : keys) {
     if (!target
@@ -3219,9 +3238,7 @@ napi_status NAPI_CDECL unofficial_napi_is_lazy_data_property(
   *result_out = false;
   v8::Isolate* isolate = env->isolate;
   // The descriptor read enters V8, which would cancel a termination.
-  if (isolate->IsExecutionTerminating()) {
-    return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");
-  }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
   v8::HandleScope handles(isolate);
   v8::Local<v8::Value> raw_object = napi_v8_unwrap_value(object);
   v8::Local<v8::Value> raw_key = napi_v8_unwrap_value(key);
