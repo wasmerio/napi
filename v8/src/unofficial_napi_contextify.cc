@@ -1369,6 +1369,8 @@ void CallContextTokenHook(napi_env env,
   std::string thrown_at;
   source_line.swap(env->last_exception_source_line);
   thrown_at.swap(env->last_exception_thrown_at);
+  const bool is_termination = env->last_exception_is_termination;
+  env->last_exception_is_termination = false;
   {
     v8::TryCatch try_catch(env->isolate);
     hook(env, realm, env->agent->context_token_data);
@@ -1377,6 +1379,7 @@ void CallContextTokenHook(napi_env env,
   env->last_exception_message = std::move(message);
   env->last_exception_source_line.swap(source_line);
   env->last_exception_thrown_at.swap(thrown_at);
+  env->last_exception_is_termination = is_termination;
 }
 
 // A realm has a token while either hook is attached, as each context did.

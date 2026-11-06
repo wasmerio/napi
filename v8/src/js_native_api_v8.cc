@@ -552,16 +552,14 @@ void ClearLastException(napi_env env) {
   env->last_exception_message.Reset();
   env->last_exception_source_line.clear();
   env->last_exception_thrown_at.clear();
+  env->last_exception_is_termination = false;
 }
 
 void SetLastException(napi_env env,
                       v8::Local<v8::Value> exception,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-  env->last_exception_source_line.clear();
-  env->last_exception_thrown_at.clear();
+  ClearLastException(env);
   if (exception.IsEmpty()) return;
 
   env->last_exception.Reset(env->isolate, exception);
@@ -570,9 +568,16 @@ void SetLastException(napi_env env,
   }
 }
 
+// What `tc` caught becomes N-API's pending exception. For a termination that
+// is the null V8 records for one, marked as such.
+void SetLastExceptionFromTryCatch(napi_env env, const v8::TryCatch& tc) {
+  SetLastException(env, tc.Exception(), tc.Message());
+  if (env != nullptr) env->last_exception_is_termination = tc.HasTerminated();
+}
+
 inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const char* message) {
   if (tc.HasCaught()) {
-    SetLastException(env, tc.Exception(), tc.Message());
+    SetLastExceptionFromTryCatch(env, tc);
     return napi_v8_set_last_error(env, napi_pending_exception, message);
   }
   return napi_v8_set_last_error(env, napi_generic_failure, message);
@@ -867,6 +872,10 @@ void napi_v8_set_last_exception(napi_env env,
                                 v8::Local<v8::Value> exception,
                                 v8::Local<v8::Message> message) {
   SetLastException(env, exception, message);
+}
+
+void napi_v8_drop_pending_termination(napi_env env) {
+  if (env != nullptr && env->last_exception_is_termination) ClearLastException(env);
 }
 
 bool napi_v8_throw_unless_terminating(v8::Isolate* isolate, v8::Local<v8::Value> exception) {
@@ -1317,7 +1326,7 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
            env->context(), sign_bit, static_cast<int>(word_count), words)
            .ToLocal(&out)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_v8_set_last_error(env, napi_pending_exception, "BigInt creation threw");
     }
     return napi_generic_failure;
@@ -2436,7 +2445,7 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
   if (!ctor->NewInstance(env->context(), static_cast<int>(argc), args.data())
            .ToLocal(&out)) {
     if (tryCatch.HasCaught()) {
-      SetLastException(env, tryCatch.Exception(), tryCatch.Message());
+      SetLastExceptionFromTryCatch(env, tryCatch);
       return napi_v8_set_last_error(env, napi_pending_exception, "Constructor threw");
     }
     return napi_generic_failure;
@@ -2468,7 +2477,7 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
   v8::MaybeLocal<v8::Value> maybe = fn->Call(
       context, napi_v8_unwrap_value(recv), argc, args.data());
   if (tryCatch.HasCaught()) {
-    SetLastException(env, tryCatch.Exception(), tryCatch.Message());
+    SetLastExceptionFromTryCatch(env, tryCatch);
     return napi_v8_set_last_error(env, napi_pending_exception, "Function call threw");
   }
   if (maybe.IsEmpty()) {
@@ -3030,7 +3039,7 @@ napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
   v8::Local<v8::Number> out;
   if (!napi_v8_unwrap_value(value)->ToNumber(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during number coercion");
   }
@@ -3049,7 +3058,7 @@ napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
   v8::Local<v8::Object> out;
   if (!napi_v8_unwrap_value(value)->ToObject(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during object coercion");
   }
@@ -3068,7 +3077,7 @@ napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
   v8::Local<v8::String> out;
   if (!napi_v8_unwrap_value(value)->ToString(env->context()).ToLocal(&out)) {
     if (try_catch.HasCaught()) {
-      SetLastException(env, try_catch.Exception(), try_catch.Message());
+      SetLastExceptionFromTryCatch(env, try_catch);
     }
     return napi_v8_set_last_error(env, napi_pending_exception, "Exception during string coercion");
   }
@@ -3488,7 +3497,7 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   v8::Local<v8::Script> compiled;
   if (!v8::Script::Compile(env->context(), source.As<v8::String>()).ToLocal(&compiled)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_pending_exception;
     }
     return napi_generic_failure;
@@ -3496,7 +3505,7 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   v8::Local<v8::Value> out;
   if (!compiled->Run(env->context()).ToLocal(&out)) {
     if (tc.HasCaught()) {
-      SetLastException(env, tc.Exception(), tc.Message());
+      SetLastExceptionFromTryCatch(env, tc);
       return napi_pending_exception;
     }
     return napi_generic_failure;

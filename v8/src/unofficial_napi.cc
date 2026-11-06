@@ -2146,6 +2146,10 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   env->isolate->CancelTerminateExecution();
+  // A call the termination failed left its null pending. Nothing threw it:
+  // left there, the native function that cancels would throw it into its
+  // caller as a catchable null.
+  napi_v8_drop_pending_termination(env);
   return napi_ok;
 }
 

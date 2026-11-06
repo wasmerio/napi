@@ -172,6 +172,10 @@ struct napi_env__ {
   v8::Global<v8::Message> last_exception_message;
   std::string last_exception_source_line;
   std::string last_exception_thrown_at;
+  // The pending exception is the null a TryCatch records for a termination.
+  // Nothing threw it, so cancelling the termination drops it, as QuickJS
+  // drops its uncatchable error then.
+  bool last_exception_is_termination = false;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
@@ -254,6 +258,10 @@ void napi_v8_set_last_exception(
     napi_env env,
     v8::Local<v8::Value> exception,
     v8::Local<v8::Message> message = v8::Local<v8::Message>());
+
+// Drops N-API's pending exception if it stands for a termination: what
+// unofficial_napi_cancel_terminate_execution does with it.
+void napi_v8_drop_pending_termination(napi_env env);
 
 // Throws `exception` into V8 unless V8 is terminating, and returns whether it
 // threw. Making an exception can run JS that V8 terminates (an inherited
