@@ -32,6 +32,7 @@ struct napi_callback_payload__;
 struct napi_deferred__;
 struct napi_env__;
 struct napi_env_cleanup_hook__;
+struct napi_env_drain_token__;
 struct napi_escapable_handle_scope__;
 struct napi_external_backing_store_hint__;
 struct napi_external_wrapper__;
@@ -188,6 +189,10 @@ struct napi_env__ {
   std::unordered_set<napi_ref_tracker__*> pending_finalizers;
   std::unordered_set<napi_buffer_record__*> pending_buffer_finalizers;
   bool finalization_scheduled = false;
+  // What each drain the env posts to the embedder's hook holds instead of the
+  // env: the hook may keep a drain past the release and run it then. The
+  // release clears the token's env, so such a drain does nothing.
+  napi_env_drain_token__* drain_token = nullptr;
   // External backing-store finalizers their deleters queued for the env's
   // thread. Deleters run on any thread, so the fields below are guarded by
   // NapiV8ExternalHintsMutex(); `has_external_finalizers` is also read

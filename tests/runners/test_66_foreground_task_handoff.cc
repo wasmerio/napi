@@ -59,6 +59,8 @@ struct HookedTask {
   unofficial_napi_foreground_task_callback callback = nullptr;
   void* data = nullptr;
   unofficial_napi_foreground_task_cleanup cleanup = nullptr;
+  // The thread that posted it.
+  std::thread::id poster;
 };
 
 enum class HookMode {
@@ -122,7 +124,7 @@ napi_status EnqueueHook(void* target,
                         uint64_t /*delay_millis*/) {
   auto* state = static_cast<HookState*>(target);
   if (state == nullptr || callback == nullptr) return napi_invalid_arg;
-  const HookedTask task{callback, data, cleanup};
+  const HookedTask task{callback, data, cleanup, std::this_thread::get_id()};
   state->enqueued.fetch_add(1);
 
   switch (state->mode) {
@@ -553,6 +555,64 @@ TEST_F(Test66ForegroundTaskHandoff,
     EXPECT_EQ(counts.off_thread.load(), 0);
     env.Release();
   }
+  EXPECT_EQ(hook.released.load(), hook.enqueued.load());
+}
+
+// An embedder whose loop outlives the env may still hold a drain the provider
+// posted, and run it after the env is released: the release does not wait for
+// the drains it posted, as it does for the engine's tasks. Run then, a drain
+// finds the env gone and leaves it alone.
+TEST_F(Test66ForegroundTaskHandoff, ADrainRunAfterTheReleaseLeavesTheEnvAlone) {
+  ExternalFinalizerCounts counts;
+  HookState hook(HookMode::kQueue);
+  std::deque<HookedTask> kept;
+  {
+    HookedEnv env(&hook);
+    ASSERT_NE(env.env(), nullptr);
+    ASSERT_TRUE(env.attached());
+    // A store freed on another thread: its deleter posts a drain from there.
+    std::shared_ptr<v8::BackingStore> store;
+    ASSERT_NO_FATAL_FAILURE(MakeDetachedExternalBuffer(env.env(), &counts, &store));
+    std::thread dropper([&store] { store.reset(); });
+    const std::thread::id dropper_id = dropper.get_id();
+    dropper.join();
+    // A value the collector finds dead: the drain for its finalizer is posted
+    // from this thread.
+    napi_handle_scope handles = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env.env(), &handles), napi_ok);
+    napi_value external = nullptr;
+    ASSERT_EQ(napi_create_external(env.env(), new uint8_t[1](), CountExternalFinalizer, &counts,
+                                   &external),
+              napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env.env(), handles), napi_ok);
+    ASSERT_EQ(unofficial_napi_collect_garbage(env.env()), napi_ok);
+    EXPECT_EQ(counts.calls.load(), 0);
+
+    // Keeps the drains (the task posted from the dropper's thread, and those
+    // with its callback). Releases the engine's tasks and refuses more, as an
+    // embedder does at shutdown: the release waits for those.
+    std::deque<HookedTask> engine;
+    {
+      std::lock_guard<std::mutex> lock(hook.mutex);
+      auto drain = std::find_if(hook.queue.begin(), hook.queue.end(),
+                                [&](const HookedTask& task) { return task.poster == dropper_id; });
+      const unofficial_napi_foreground_task_callback drain_callback =
+          drain != hook.queue.end() ? drain->callback : nullptr;
+      for (const HookedTask& task : hook.queue) {
+        (task.callback == drain_callback ? kept : engine).push_back(task);
+      }
+      hook.queue.clear();
+    }
+    for (const HookedTask& task : engine) ReleaseTask(&hook, task);
+    CloseQueue(&hook);
+    ASSERT_FALSE(kept.empty()) << "the deleter posted no drain";
+    env.Release();
+  }
+  // The release ran both finalizers.
+  EXPECT_EQ(counts.calls.load(), 2);
+  for (const HookedTask& task : kept) RunTask(&hook, task);
+  EXPECT_EQ(counts.calls.load(), 2);
+  EXPECT_EQ(counts.off_thread.load(), 0);
   EXPECT_EQ(hook.released.load(), hook.enqueued.load());
 }
 

@@ -50,12 +50,41 @@ std::mutex& NapiV8ExternalHintsMutex() {
   return mutex;
 }
 
+// Shared by an env and the drains it posts. `env` is the env until its
+// release ends, then null; the last reference frees the token. Each drain
+// releases its reference with its cleanup, on any thread.
+struct napi_env_drain_token__ {
+  explicit napi_env_drain_token__(napi_env env_in) : env(env_in) {}
+
+  std::atomic<napi_env> env;
+  std::atomic<uint32_t> refs{1};
+};
+
 namespace {
 
+void ReleaseDrainToken(napi_env /*env*/, void* data) {
+  auto* token = static_cast<napi_env_drain_token__*>(data);
+  if (token->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete token;
+}
+
+// Runs on the env's thread, as its release does, so the env it reads is alive
+// or null.
 void DrainFinalizerQueueForegroundTask(napi_env env, void* data) {
-  auto* target_env = static_cast<napi_env>(data);
+  auto* token = static_cast<napi_env_drain_token__*>(data);
+  napi_env target_env = token->env.load(std::memory_order_acquire);
   if (target_env == nullptr || target_env != env) return;
   target_env->DrainFinalizerQueue();
+}
+
+// Hands the hook a drain of `env`'s finalizer queues, holding the env's token
+// rather than the env. The hook owns the task from the call on, whatever it
+// returns: its cleanup releases the reference.
+napi_status PostFinalizerQueueDrain(napi_env env,
+                                    unofficial_napi_enqueue_foreground_task_callback enqueue,
+                                    void* target) {
+  napi_env_drain_token__* token = env->drain_token;
+  token->refs.fetch_add(1, std::memory_order_relaxed);
+  return enqueue(target, DrainFinalizerQueueForegroundTask, token, ReleaseDrainToken, 0);
 }
 
 void ScheduleFinalizerQueueDrain(napi_env env) {
@@ -64,12 +93,8 @@ void ScheduleFinalizerQueueDrain(napi_env env) {
   env->finalization_scheduled = true;
   napi_agent__* agent = env->agent;
   if (agent != nullptr && agent->enqueue_foreground_task_callback != nullptr) {
-    napi_status status = agent->enqueue_foreground_task_callback(
-        agent->enqueue_foreground_task_target,
-        DrainFinalizerQueueForegroundTask,
-        env,
-        nullptr,
-        0);
+    napi_status status = PostFinalizerQueueDrain(
+        env, agent->enqueue_foreground_task_callback, agent->enqueue_foreground_task_target);
     if (status == napi_ok) return;
   }
 
@@ -271,8 +296,7 @@ bool QueueExternalFinalizer(napi_env env, const napi_external_finalizer__& final
 void PostExternalFinalizerDrain(napi_env env,
                                 unofficial_napi_enqueue_foreground_task_callback enqueue,
                                 void* target) {
-  const bool posted =
-      enqueue(target, DrainFinalizerQueueForegroundTask, env, nullptr, 0) == napi_ok;
+  const bool posted = PostFinalizerQueueDrain(env, enqueue, target) == napi_ok;
   std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
   // Refused: another deleter may post, or the next checkpoint drains.
   if (!posted) env->external_finalizer_drain_posted = false;
@@ -972,6 +996,7 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
   if (agent->principal_env == nullptr) {
     agent->principal_env = this;
   }
+  drain_token = new napi_env_drain_token__(this);
   napi_v8_clear_last_error(this);
 }
 
@@ -1039,6 +1064,11 @@ napi_env__::~napi_env__() {
     std::unique_lock<std::mutex> lock(NapiV8ExternalHintsMutex());
     external_drain_posts_done.wait(lock, [this] { return external_drain_posts_in_flight == 0; });
   }
+  // The hook may still hold drains, and run them after the env is gone: they
+  // find no env in the token.
+  drain_token->env.store(nullptr, std::memory_order_release);
+  ReleaseDrainToken(nullptr, drain_token);
+  drain_token = nullptr;
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 
