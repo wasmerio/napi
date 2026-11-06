@@ -198,6 +198,14 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_retain_env(env: SnapiEnv);
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_unretain_env(env: SnapiEnv);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_create_trusted_script(
+        env: SnapiEnv,
+        source_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_is_executing_js(env: SnapiEnv, result_out: *mut i32) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
         env: SnapiEnv,
@@ -307,8 +315,11 @@ unsafe extern "C" {
         realm_out: *mut u32,
         global_out: *mut u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_get_realm(env: SnapiEnv, value_id: u32, realm_out: *mut u32)
-        -> i32;
+    pub fn snapi_bridge_unofficial_get_realm(
+        env: SnapiEnv,
+        value_id: u32,
+        realm_out: *mut u32,
+    ) -> i32;
     // Makes the realm `realm_id` (0: the env's own) current until
     // snapi_bridge_unofficial_leave_realm closes the scope written to
     // `scope_out`, as unofficial_napi_enter_realm does.

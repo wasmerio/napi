@@ -646,6 +646,45 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_terminate_execution(nap
 // V8 drops the remaining microtasks when a running microtask is terminated.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
 
+// Provider intrinsic trusted source. V8 evaluates it through its native code
+// generation hook: direct eval retains lexical scope and never calls author
+// toString/@@toPrimitive. Its private brand survives prototype changes, cannot
+// be copied, inherited or recreated (unofficial_napi_create_private_symbol
+// cannot name it), and does not bypass a context's codegen restriction.
+// Creation acts in the current N-API realm: both the object and its native
+// default toString belong to that realm. No explicit realm argument is needed.
+// Eval uses its caller's lexical scope and the receiving realm's codegen
+// restriction, even when the trusted source was made in another realm.
+// Function(trusted) uses ordinary string coercion; only eval's source lookup
+// bypasses author toString/@@toPrimitive. The default native toString enables
+// Function(trusted) but is not a hardened Function-constructor integration.
+// Source must be a primitive string. While terminating, V8 refuses creation
+// with napi_pending_exception. Creation and the query below remain usable
+// during cleanup hooks while the env and its agent are still live.
+// QuickJS and host-JS are unsupported: they return napi_generic_failure and
+// zero the output. QuickJS support needs a native direct-eval engine hook.
+// The hook is isolate-wide: the first call on an isolate installs this
+// provider's ModifyCodeGenerationFromStrings callback, replacing any callback
+// the embedder installed. V8 cannot report the previous callback, so it is not
+// chained. A callback the embedder installs afterwards is kept, and trusted
+// scripts then follow that callback instead. For other values the hook keeps
+// V8's behavior: eval returns non-string objects unchanged, and strings follow
+// each context's code generation setting.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
+    napi_env env, napi_value source, napi_value* result);
+// Owning VM thread only. Reports true only while the VM has a JavaScript frame
+// on its stack (in any context, including other security origins) or is
+// running a microtask checkpoint (V8) or job (QuickJS). A native function called
+// from C through napi_call_function, directly or through a builtin, with no JavaScript frame
+// below it reports false. Does not execute JS, take provider locks, or replace
+// an existing pending exception, so it may be called from any provider
+// callback, including during termination. It covers the agent's realms;
+// entering a realm alone does not count as executing JavaScript. Unsupported
+// engines return napi_generic_failure with *result set to false. V8 and
+// QuickJS support this query; host JS does not expose native execution state.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
+    napi_env env, bool* result);
+
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
 // Unofficial helper. Requests execution of a callback on the target env's

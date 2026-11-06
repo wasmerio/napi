@@ -1076,6 +1076,8 @@ napi_agent__::~napi_agent__() {
   wrap_private_key.Reset();
   buffer_private_key.Reset();
   type_tag_private_key.Reset();
+  trusted_script_key.Reset();
+  trusted_script_template.Reset();
   if (From(isolate) == this) {
     isolate->SetData(kNapiAgentDataSlot, nullptr);
   }

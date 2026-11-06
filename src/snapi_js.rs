@@ -8037,8 +8037,9 @@ mod tests {
                  Object.defineProperty(f, Symbol.hasInstance, { value() { throw new Error('hasInstance'); } }); \
                  return f; })()",
             ));
-            let throwing_ctor =
-                state.agent.insert(make("(function () { throw new Error('construct'); })"));
+            let throwing_ctor = state
+                .agent
+                .insert(make("(function () { throw new Error('construct'); })"));
             let revoked = state.agent.insert(make(
                 "(() => { const { proxy, revoke } = Proxy.revocable([], {}); revoke(); return proxy; })()",
             ));
@@ -8453,18 +8454,36 @@ mod tests {
         let script = state.agent.insert_primitive(source.into());
         let mut out = 0;
         let status = unsafe {
-            snapi_bridge_unofficial_run_script(env, realm, script, 0, 0, 0, 0, -1, 1, 0, 0, 0, &mut out)
+            snapi_bridge_unofficial_run_script(
+                env, realm, script, 0, 0, 0, 0, -1, 1, 0, 0, 0, &mut out,
+            )
         };
         if status != NAPI_OK {
             return Err(status);
         }
-        Ok(unsafe { env_mut(env) }.unwrap().agent.get(out).unwrap().clone())
+        Ok(unsafe { env_mut(env) }
+            .unwrap()
+            .agent
+            .get(out)
+            .unwrap()
+            .clone())
     }
 
     fn new_realm(env: SnapiEnv, sandbox: u32) -> Result<u32, i32> {
         let (mut realm, mut global) = (0, 0);
         let status = unsafe {
-            snapi_bridge_unofficial_create_realm(env, sandbox, 0, 0, 0, 1, 1, 0, &mut realm, &mut global)
+            snapi_bridge_unofficial_create_realm(
+                env,
+                sandbox,
+                0,
+                0,
+                0,
+                1,
+                1,
+                0,
+                &mut realm,
+                &mut global,
+            )
         };
         if status != NAPI_OK {
             return Err(status);
@@ -8514,7 +8533,10 @@ mod tests {
             assert_eq!(realm_of(env, number), Err(NAPI_OBJECT_EXPECTED));
             assert_eq!(run_in(env, other, "1").unwrap_err(), NAPI_INVALID_ARG);
             let mut env_global = 0;
-            assert_eq!(unsafe { snapi_bridge_get_global(env, &mut env_global) }, NAPI_OK);
+            assert_eq!(
+                unsafe { snapi_bridge_get_global(env, &mut env_global) },
+                NAPI_OK
+            );
             assert_eq!(realm_of(env, env_global), Ok(0));
             // It may still be a sandbox, as with vm.createContext(globalThis),
             // and the env keeps evaluating in its own context.
@@ -8560,7 +8582,17 @@ mod tests {
             assert_eq!(
                 unsafe {
                     snapi_bridge_unofficial_compile_function(
-                        env, realm, body, 0, 0, 0, 0, 0, 0, 0, &mut compiled,
+                        env,
+                        realm,
+                        body,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &mut compiled,
                     )
                 },
                 NAPI_OK
@@ -8570,7 +8602,10 @@ mod tests {
                 Reflect::get(state.agent.get(compiled).unwrap(), &"function".into())
                     .unwrap()
                     .unchecked_into();
-            assert_eq!(function.call0(&JsValue::UNDEFINED).unwrap().as_f64(), Some(10.0));
+            assert_eq!(
+                function.call0(&JsValue::UNDEFINED).unwrap().as_f64(),
+                Some(10.0)
+            );
 
             let source = state.agent.insert_primitive("x".into());
             let open = |realm_id: u32, out: &mut u32| {
@@ -8996,6 +9031,88 @@ mod tests {
         assert!(retained.call0(&JsValue::UNDEFINED).unwrap().is_undefined());
         drop(retained);
         assert_eq!(wasm_bindgen::externref_heap_live_count(), before);
+    }
+
+    /// Unsupported trusted-script imports still validate guest pointers and
+    /// zero their outputs. Exercise real Wasmer dispatch, not adapter inference.
+    #[wasm_bindgen_test]
+    fn guest_trusted_script_imports_report_unsupported_and_validate_outputs() {
+        use wasmer::{FunctionEnv, Imports, Instance, Memory, MemoryType, Module, Store};
+        let mut store = Store::default();
+        let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
+        let env = new_env();
+        let mut napi_env = crate::env::NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        napi_env.memory = Some(memory.clone());
+        let (guest_env, _) = napi_env.register_napi_env(env);
+        let fe = FunctionEnv::new(&mut store, napi_env);
+        let mut imports = Imports::new();
+        crate::guest::napi::register_napi_imports(&mut store, &fe, &mut imports);
+        imports.define("env", "memory", memory.clone());
+        let module = Module::new(
+            &store,
+            wat::parse_str(
+                r#"(module
+          (import "env" "memory" (memory 1))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_create_trusted_script"
+            (func $create (param i32 i32 i32) (result i32)))
+          (import "napi_extension_wasmer_v0" "unofficial_napi_is_executing_js"
+            (func $executing (param i32 i32) (result i32)))
+          (func (export "create") (param i32 i32) (result i32)
+            (call $create (local.get 0) (i32.const 0) (local.get 1)))
+          (func (export "executing") (param i32 i32) (result i32)
+            (call $executing (local.get 0) (local.get 1))))"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let create = instance
+            .exports
+            .get_typed_function::<(u32, u32), i32>(&store, "create")
+            .unwrap();
+        let executing = instance
+            .exports
+            .get_typed_function::<(u32, u32), i32>(&store, "executing")
+            .unwrap();
+        memory.view(&store).write(64, &[0x7f; 4]).unwrap();
+        assert_eq!(
+            create.call(&mut store, guest_env, 64).unwrap(),
+            NAPI_GENERIC_FAILURE
+        );
+        let mut out = [0xff; 4];
+        memory.view(&store).read(64, &mut out).unwrap();
+        assert_eq!(out, [0; 4]);
+        memory.view(&store).write(64, &[0x7f]).unwrap();
+        assert_eq!(
+            executing.call(&mut store, guest_env, 64).unwrap(),
+            NAPI_GENERIC_FAILURE
+        );
+        memory.view(&store).read(64, &mut out[..1]).unwrap();
+        assert_eq!(out[0], 0);
+        for pointer in [0, 65536, u32::MAX] {
+            assert_eq!(
+                create.call(&mut store, guest_env, pointer).unwrap(),
+                NAPI_INVALID_ARG
+            );
+            assert_eq!(
+                executing.call(&mut store, guest_env, pointer).unwrap(),
+                NAPI_INVALID_ARG
+            );
+        }
+        // A u32 result needs four bytes; the bool result needs only one.
+        assert_eq!(
+            create.call(&mut store, guest_env, 65535).unwrap(),
+            NAPI_INVALID_ARG
+        );
+        assert_eq!(
+            executing.call(&mut store, guest_env, 65535).unwrap(),
+            NAPI_GENERIC_FAILURE
+        );
     }
 
     /// A guest that uses the realm imports as a C guest does: the scope token

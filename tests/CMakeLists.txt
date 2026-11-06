@@ -347,6 +347,10 @@ add_fixture_test(${_napi_test_prefix}_test_78_termination_until_cancelled
   runners/test_78_termination_until_cancelled.cc
 )
 target_compile_definitions(${_napi_test_prefix}_test_78_termination_until_cancelled PRIVATE NAPI_VERSION=10)
+add_fixture_test(${_napi_test_prefix}_test_79_unofficial_trusted_script
+  runners/test_79_unofficial_trusted_script.cc
+)
+
 add_fixture_test(${_napi_test_prefix}_test_77_module_wrap_state
   runners/test_77_module_wrap_state.cc
 )

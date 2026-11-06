@@ -52,6 +52,14 @@ struct napi_agent__ {
   v8::Global<v8::Private> buffer_private_key;
   v8::Global<v8::Private> type_tag_private_key;
 
+  // Trusted-script brand/hook installation and reusable code-like template.
+  // One per engine, shared by every realm. Private::New keeps the brand
+  // distinct from any key an embedder can create by name.
+  v8::Global<v8::Private> trusted_script_key;
+  v8::Global<v8::ObjectTemplate> trusted_script_template;
+  // Includes own queues while a callback switches the current N-API realm.
+  unsigned microtask_checkpoints = 0;
+
   // Embedder hooks from unofficial_napi_attach_env, attached once.
   bool embedder_hooks_attached = false;
   unofficial_napi_fatal_error_callback fatal_error_callback = nullptr;
@@ -88,6 +96,20 @@ struct napi_agent__ {
   // Profiler sessions. V8's CPU and sampling heap profilers are per isolate.
   v8::CpuProfiler* cpu_profiler = nullptr;
   std::vector<unofficial_napi_profile> active_profiles;
+};
+
+// Tracks every provider-driven checkpoint, including a realm's own queue.
+// Callbacks may switch N-API realms while that queue is still draining.
+class napi_microtask_checkpoint_scope__ {
+ public:
+  explicit napi_microtask_checkpoint_scope__(napi_agent__* agent) : agent_(agent) {
+    ++agent_->microtask_checkpoints;
+  }
+  ~napi_microtask_checkpoint_scope__() { --agent_->microtask_checkpoints; }
+  napi_microtask_checkpoint_scope__(const napi_microtask_checkpoint_scope__&) = delete;
+  napi_microtask_checkpoint_scope__& operator=(const napi_microtask_checkpoint_scope__&) = delete;
+ private:
+  napi_agent__* agent_;
 };
 
 #endif  // NAPI_V8_AGENT_H_
