@@ -32,6 +32,9 @@ cli = [
   "dep:wasmer-types",
 ]
 
+# Compile the standalone CLI with LLVM instead of its default Cranelift backend.
+cli-llvm = ["cli", "wasmer/llvm"]
+
 [dependencies]
 anyhow = "1"
 # This manifest is consumed as `wasmer/lib/napi`, so Wasmer dependencies must

@@ -3,7 +3,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, FileSystem};
-use wasmer::sys::{Cranelift, EngineBuilder, Features};
+#[cfg(not(feature = "cli-llvm"))]
+use wasmer::sys::Cranelift as CliCompiler;
+#[cfg(feature = "cli-llvm")]
+use wasmer::sys::LLVM as CliCompiler;
+use wasmer::sys::{EngineBuilder, Features};
 use wasmer::{Module, Store};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_types::ModuleHash;
@@ -35,7 +39,7 @@ fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
     let mut features = Features::default();
     features.exceptions(true);
 
-    let mut engine = EngineBuilder::new(Cranelift::default())
+    let mut engine = EngineBuilder::new(CliCompiler::default())
         .set_features(Some(features))
         .engine();
     // Charge the guest's (imported) wasm linear memory against the app budget.
@@ -50,6 +54,11 @@ fn wasmer_cache_dir() -> PathBuf {
     std::env::var_os("WASMER_NAPI_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("wasmer-napi-cache"))
+        .join(if cfg!(feature = "cli-llvm") {
+            "llvm"
+        } else {
+            "cranelift"
+        })
 }
 
 fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {

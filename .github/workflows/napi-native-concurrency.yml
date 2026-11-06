@@ -59,7 +59,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96"
+          toolchain: "1.99"
 
       - name: Install native build dependencies
         run: |
@@ -73,9 +73,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-napi-concurrency-rust-1.96-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-napi-concurrency-rust-1.99-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-napi-concurrency-rust-1.96-
+            ${{ runner.os }}-napi-concurrency-rust-1.99-
 
       # WAT guests, each in its own Wasmer store and thread, against the real
       # C++ bridge and V8. No WASIX C toolchain is needed.
