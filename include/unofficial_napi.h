@@ -490,11 +490,12 @@ typedef enum unofficial_napi_memory_pressure_level {
 // released (by a hook or finalizer that
 // unofficial_napi_release_env runs), both engines leave the finalizers of
 // external ArrayBuffers and Buffers to the release's pass, in its order, as
-// for any collection then. Unlike unofficial_napi_collect_garbage, the call
-// frees no record of a collected realm, so it runs no context-token callback
-// (deprecated, V8 only): a realm it collects keeps its token until the next
-// unofficial_napi_create_realm or unofficial_napi_collect_garbage, or the
-// env's release.
+// for any collection then. The call frees no record of a collected realm, so
+// it runs no context-token callback (deprecated, V8 only). On V8 that differs
+// from unofficial_napi_collect_garbage, which frees them: a realm the call
+// collects keeps its token until the next unofficial_napi_create_realm or
+// unofficial_napi_collect_garbage, or the env's release. QuickJS frees them
+// in the next unofficial_napi_create_realm after either call.
 //
 // Host-JavaScript providers: napi_generic_failure for every valid level.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_memory_pressure(

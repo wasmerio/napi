@@ -420,3 +420,75 @@ TEST_F(Test72UnofficialMemoryPressure, V8CriticalPressureKeepsCompiledScripts) {
   g_big_script.clear();
 }
 #endif
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+namespace {
+
+// Counts the runs of the finalizer of a realm's host-defined option id, which
+// the realm's record holds until it is freed.
+int g_host_id_finalized = 0;
+void CountHostIdFinalize(napi_env /*env*/, void* /*data*/, void* /*hint*/) {
+  ++g_host_id_finalized;
+}
+
+// Makes a realm that nothing keeps, whose host-defined option id has a
+// finalizer, and returns a weak reference to its global.
+napi_ref MakeUnreachableRealm(napi_env env) {
+  napi_handle_scope scope = nullptr;
+  EXPECT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value host_id = nullptr;
+  EXPECT_EQ(napi_create_object(env, &host_id), napi_ok);
+  EXPECT_EQ(napi_add_finalizer(env, host_id, nullptr, CountHostIdFinalize, nullptr, nullptr),
+            napi_ok);
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  options.host_defined_option_id = host_id;
+  unofficial_napi_realm realm = nullptr;
+  napi_value global = nullptr;
+  EXPECT_EQ(unofficial_napi_create_realm(env, &options, &realm, &global), napi_ok);
+  napi_ref weak = nullptr;
+  EXPECT_EQ(napi_create_reference(env, global, 0, &weak), napi_ok);
+  EXPECT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  return weak;
+}
+
+bool Collected(napi_env env, napi_ref weak) {
+  napi_handle_scope scope = nullptr;
+  EXPECT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value value = nullptr;
+  EXPECT_EQ(napi_get_reference_value(env, weak, &value), napi_ok);
+  EXPECT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  return value == nullptr;
+}
+
+}  // namespace
+
+// QuickJS frees the record of a collected realm, and with it the realm's
+// host-defined option id, only when it next makes a realm: neither critical
+// pressure nor unofficial_napi_collect_garbage frees it.
+TEST_F(Test72UnofficialMemoryPressure, QuickJSFreesACollectedRealmsRecordAtTheNextRealm) {
+  EnvScope s(runtime_.get());
+  g_host_id_finalized = 0;
+  napi_ref weak = MakeUnreachableRealm(s.env);
+  ASSERT_NE(weak, nullptr);
+  EXPECT_FALSE(Collected(s.env, weak));
+
+  ASSERT_EQ(unofficial_napi_memory_pressure(s.env, kCritical), napi_ok);
+  EXPECT_TRUE(Collected(s.env, weak)) << "critical pressure did not collect the realm";
+  EXPECT_EQ(g_host_id_finalized, 0) << "memory pressure freed the collected realm's record";
+
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  EXPECT_EQ(g_host_id_finalized, 0) << "collect_garbage freed the collected realm's record";
+
+  {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    unofficial_napi_realm realm = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  EXPECT_EQ(g_host_id_finalized, 1) << "the next realm did not free the collected realm's record";
+  ASSERT_EQ(napi_delete_reference(s.env, weak), napi_ok);
+}
+#endif
