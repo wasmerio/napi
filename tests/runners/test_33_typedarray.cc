@@ -1,3 +1,8 @@
+#ifdef NAPI_MODULE
+#undef NAPI_MODULE
+#endif
+#include "node_api.h"
+
 #include "test_env.h"
 #include "upstream_js_test.h"
 
@@ -228,6 +233,88 @@ TEST_F(Test33TypedArray, BufferFromAnArrayBufferViewsIt) {
   napi_valuetype type = napi_number;
   ASSERT_EQ(napi_typeof(s.env, element, &type), napi_ok);
   EXPECT_EQ(type, napi_undefined);
+}
+
+// As in Node, a view over a detached ArrayBuffer has no data and a length and
+// offset of 0: a typed array, a DataView and a Buffer, and an external Buffer
+// whose ArrayBuffer is detached (as the release does before its finalizer).
+// A Buffer is still a Buffer.
+TEST_F(Test33TypedArray, DetachedViewInfoIsEmpty) {
+  ExternalBufferState state;
+  EnvScope s(runtime_.get());
+  napi_value array_buffer = nullptr;
+  ASSERT_EQ(napi_create_arraybuffer(s.env, 16, nullptr, &array_buffer), napi_ok);
+  napi_value typed_array = nullptr;
+  ASSERT_EQ(napi_create_typedarray(s.env, napi_uint8_array, 8, array_buffer, 4, &typed_array),
+            napi_ok);
+  napi_value buffer = nullptr;
+  ASSERT_EQ(node_api_create_buffer_from_arraybuffer(s.env, array_buffer, 2, 6, &buffer), napi_ok);
+  napi_value data_view = nullptr;
+  ASSERT_EQ(napi_create_dataview(s.env, 8, array_buffer, 8, &data_view), napi_ok);
+  napi_value external = nullptr;
+  ASSERT_EQ(napi_create_external_buffer(s.env, sizeof(state.bytes), state.bytes,
+                                        FinalizeExternalBuffer, &state, &external),
+            napi_ok);
+  napi_value external_array_buffer = nullptr;
+  ASSERT_EQ(napi_get_typedarray_info(s.env, external, nullptr, nullptr, nullptr,
+                                     &external_array_buffer, nullptr),
+            napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, array_buffer), napi_ok);
+  ASSERT_EQ(napi_detach_arraybuffer(s.env, external_array_buffer), napi_ok);
+
+  auto expect_nothing_pending = [&](const char* what) {
+    bool pending = true;
+    ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+    EXPECT_FALSE(pending) << what;
+    napi_value exception = nullptr;
+    if (pending) napi_get_and_clear_last_exception(s.env, &exception);
+  };
+  auto expect_same = [&](napi_value viewed, napi_value expected, const char* what) {
+    bool same = false;
+    ASSERT_NE(viewed, nullptr) << what;
+    ASSERT_EQ(napi_strict_equals(s.env, viewed, expected, &same), napi_ok);
+    EXPECT_TRUE(same) << what;
+  };
+
+  for (napi_value view : {typed_array, buffer, external}) {
+    const char* what = view == typed_array ? "typed array" : view == buffer ? "buffer" : "external";
+    napi_typedarray_type type = napi_int8_array;
+    size_t length = 99;
+    void* data = &state;
+    napi_value viewed = nullptr;
+    size_t offset = 99;
+    EXPECT_EQ(napi_get_typedarray_info(s.env, view, &type, &length, &data, &viewed, &offset),
+              napi_ok)
+        << what;
+    EXPECT_EQ(type, napi_uint8_array) << what;
+    EXPECT_EQ(length, 0u) << what;
+    EXPECT_EQ(data, nullptr) << what;
+    EXPECT_EQ(offset, 0u) << what;
+    expect_same(viewed, view == external ? external_array_buffer : array_buffer, what);
+    expect_nothing_pending(what);
+  }
+  for (napi_value view : {buffer, external}) {
+    const char* what = view == buffer ? "buffer" : "external";
+    bool is_buffer = false;
+    EXPECT_EQ(napi_is_buffer(s.env, view, &is_buffer), napi_ok) << what;
+    EXPECT_TRUE(is_buffer) << what;
+    size_t length = 99;
+    void* data = &state;
+    EXPECT_EQ(napi_get_buffer_info(s.env, view, &data, &length), napi_ok) << what;
+    EXPECT_EQ(length, 0u) << what;
+    EXPECT_EQ(data, nullptr) << what;
+    expect_nothing_pending(what);
+  }
+  size_t length = 99;
+  void* data = &state;
+  napi_value viewed = nullptr;
+  size_t offset = 99;
+  EXPECT_EQ(napi_get_dataview_info(s.env, data_view, &length, &data, &viewed, &offset), napi_ok);
+  EXPECT_EQ(length, 0u);
+  EXPECT_EQ(data, nullptr);
+  EXPECT_EQ(offset, 0u);
+  expect_same(viewed, array_buffer, "data view");
+  expect_nothing_pending("data view");
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)

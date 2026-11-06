@@ -520,10 +520,17 @@ extern "C"
     size_t byte_len;
     size_t offset;
     JSValue abuf = JS_GetTypedArrayBuffer(env->context(), local, &offset, &byte_len, nullptr);
-
+    // QuickJS throws for a typed array over a detached buffer. Node reports
+    // it as one with no data and a length and offset of 0.
+    bool detached = false;
     if (JS_IsException(abuf))
     {
-      return napi_util__::return_pending_if_caught(env, "Failed to get typed array info");
+      abuf = napi_util__::detached_view_buffer(env->context(), local);
+      if (JS_IsUndefined(abuf))
+        return napi_util__::return_pending_if_caught(env, "Failed to get typed array info");
+      detached = true;
+      byte_len = 0;
+      offset = 0;
     }
 
     if (length != nullptr)
@@ -562,7 +569,11 @@ extern "C"
       *byte_offset = offset;
     }
 
-    if (data != nullptr)
+    if (data != nullptr && detached)
+    {
+      *data = nullptr;
+    }
+    else if (data != nullptr)
     {
       size_t ab_len;
       uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, abuf);
@@ -1444,29 +1455,41 @@ extern "C"
     if (!JS_IsDataView(view))
       return napi_util__::invalid_arg(env);
 
-    JSValue len_val = JS_GetPropertyStr(env->context(), view, "byteLength");
-    JSValue offset_val = JS_GetPropertyStr(env->context(), view, "byteOffset");
     JSValue buffer_val = JS_GetPropertyStr(env->context(), view, "buffer");
-    if (JS_IsException(len_val) || JS_IsException(offset_val) || JS_IsException(buffer_val))
-    {
-      JS_FreeValue(env->context(), len_val);
-      JS_FreeValue(env->context(), offset_val);
-      JS_FreeValue(env->context(), buffer_val);
+    if (JS_IsException(buffer_val))
       return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
-    }
-
+    // QuickJS's byteLength and byteOffset getters throw for a DataView over a
+    // detached buffer. Node reports it as one with no data and a length and
+    // offset of 0.
+    const bool detached = napi_util__::is_detached_array_buffer(env->context(), buffer_val);
     uint32_t len = 0;
     uint32_t offset = 0;
-    JS_ToUint32(env->context(), &len, len_val);
-    JS_ToUint32(env->context(), &offset, offset_val);
-    JS_FreeValue(env->context(), len_val);
-    JS_FreeValue(env->context(), offset_val);
+    if (!detached)
+    {
+      JSValue len_val = JS_GetPropertyStr(env->context(), view, "byteLength");
+      JSValue offset_val = JS_GetPropertyStr(env->context(), view, "byteOffset");
+      if (JS_IsException(len_val) || JS_IsException(offset_val))
+      {
+        JS_FreeValue(env->context(), len_val);
+        JS_FreeValue(env->context(), offset_val);
+        JS_FreeValue(env->context(), buffer_val);
+        return napi_util__::return_pending_if_caught(env, "Failed to get DataView info");
+      }
+      JS_ToUint32(env->context(), &len, len_val);
+      JS_ToUint32(env->context(), &offset, offset_val);
+      JS_FreeValue(env->context(), len_val);
+      JS_FreeValue(env->context(), offset_val);
+    }
 
     if (byte_length != nullptr)
       *byte_length = len;
     if (byte_offset != nullptr)
       *byte_offset = offset;
-    if (data != nullptr)
+    if (data != nullptr && detached)
+    {
+      *data = nullptr;
+    }
+    else if (data != nullptr)
     {
       size_t ab_len = 0;
       uint8_t *ab_data = JS_GetArrayBuffer(env->context(), &ab_len, buffer_val);
