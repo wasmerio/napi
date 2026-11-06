@@ -2885,6 +2885,19 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
   return InstantiateModuleRecord(env, ModuleRecord(module_handle));
 }
 
+// Evaluating a module whose evaluation is under way (from its own body or a
+// synthetic module's steps) is refused, as Node's vm refuses a module whose
+// status is "evaluating". V8 aborts the process for it (a CHECK in
+// Module::Evaluate).
+static bool ThrowIfEvaluating(napi_env env, ModuleWrapRecord* record) {
+  v8::HandleScope handle_scope(env->isolate);
+  if (record->module.Get(env->isolate)->GetStatus() != v8::Module::kEvaluating) {
+    return false;
+  }
+  ThrowCodeError(env, "ERR_VM_MODULE_STATUS", "Module status must not be evaluating");
+  return true;
+}
+
 // V8 evaluates only an instantiated module and aborts the process for one
 // that is not. Instantiate it first, as QuickJS's JS_EvaluateModule does.
 static napi_status InstantiateForEvaluation(napi_env env, ModuleWrapRecord* record) {
@@ -2904,6 +2917,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
   v8::Isolate* isolate = env->isolate;
@@ -2934,6 +2948,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
   *result_out = nullptr;
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
   v8::Isolate* isolate = env->isolate;
@@ -3188,6 +3203,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module);
+  // The facade evaluates the module it wraps.
+  if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();

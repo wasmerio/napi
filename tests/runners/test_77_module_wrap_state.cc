@@ -219,3 +219,112 @@ TEST_F(Test77ModuleWrapState, EvaluatingAModuleNotInstantiatedInstantiatesItFirs
     EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, unlinked), napi_ok);
   }
 }
+
+namespace {
+
+constexpr int32_t kEvaluating = 3;
+
+// Takes the pending exception: "<code>: <message>", or "" when none was
+// pending.
+std::string TakePendingCodeAndMessage(napi_env env) {
+  if (!ExceptionPending(env)) return "";
+  napi_value error = nullptr;
+  napi_value code = nullptr;
+  napi_value message = nullptr;
+  if (napi_get_and_clear_last_exception(env, &error) != napi_ok) return "<not taken>";
+  if (napi_get_named_property(env, error, "code", &code) != napi_ok ||
+      napi_get_named_property(env, error, "message", &message) != napi_ok) {
+    return "<unreadable>";
+  }
+  return ValueText(env, code) + ": " + ValueText(env, message);
+}
+
+enum class Reentry { kEvaluate, kEvaluateSync, kFacade };
+
+struct ReentryProbe {
+  Reentry call = Reentry::kEvaluate;
+  unofficial_napi_module module = nullptr;
+  int calls = 0;
+  int32_t status_inside = -1;
+  napi_status status = napi_ok;
+  std::string pending;
+};
+
+// Evaluates the probe's module from inside its own evaluation, and takes
+// what that left pending so that the evaluation goes on.
+napi_value EvaluateAgain(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  EXPECT_EQ(napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data), napi_ok);
+  auto* probe = static_cast<ReentryProbe*>(data);
+  probe->calls++;
+  probe->status_inside = Status(env, probe->module);
+  napi_value result = nullptr;
+  switch (probe->call) {
+    case Reentry::kEvaluate:
+      probe->status = unofficial_napi_module_wrap_evaluate(env, probe->module, -1, false, &result);
+      break;
+    case Reentry::kEvaluateSync:
+      probe->status = unofficial_napi_module_wrap_evaluate_sync(
+          env, probe->module, nullptr, nullptr, &result);
+      break;
+    case Reentry::kFacade:
+      probe->status = unofficial_napi_module_wrap_create_required_module_facade(
+          env, probe->module, &result);
+      break;
+  }
+  probe->pending = TakePendingCodeAndMessage(env);
+  return nullptr;
+}
+
+}  // namespace
+
+// Evaluating a module from inside its own evaluation (its body, or a
+// synthetic module's steps) is refused with ERR_VM_MODULE_STATUS, as Node's
+// vm refuses a module whose status is "evaluating", and the evaluation under
+// way goes on. The same holds for the require() facade, which evaluates the
+// module it wraps. V8 aborted the process (a CHECK in Module::Evaluate).
+// QuickJS gave the evaluation's promise, unsettled, to evaluate, failed
+// evaluate_sync with ERR_REQUIRE_ASYNC_MODULE, and made the facade over
+// bindings the body had not reached yet.
+TEST_F(Test77ModuleWrapState, EvaluatingAModuleWhileItEvaluatesIsRefused) {
+  for (bool synthetic : {false, true}) {
+    for (Reentry call : {Reentry::kEvaluate, Reentry::kEvaluateSync, Reentry::kFacade}) {
+      SCOPED_TRACE(std::string(synthetic ? "synthetic, " : "source text, ") +
+                   (call == Reentry::kEvaluate       ? "evaluate"
+                    : call == Reentry::kEvaluateSync ? "evaluate_sync"
+                                                     : "facade"));
+      EnvScope s(runtime_.get());
+      ReentryProbe probe;
+      probe.call = call;
+      napi_value fn = nullptr;
+      napi_value global = nullptr;
+      ASSERT_EQ(napi_create_function(s.env, "evaluateAgain", NAPI_AUTO_LENGTH, EvaluateAgain,
+                                     &probe, &fn),
+                napi_ok);
+      ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+      ASSERT_EQ(napi_set_named_property(s.env, global, "evaluateAgain", fn), napi_ok);
+      ASSERT_EQ(RunText(s.env, "globalThis.after = 'no'"), "no");
+      probe.module =
+          synthetic ? CreateSyntheticModule(
+                          s.env, "(function() { evaluateAgain(); globalThis.after = 'yes'; })")
+                    : CreateSourceTextModule(s.env,
+                                             "evaluateAgain(); globalThis.after = 'yes';\n"
+                                             "export default 1;");
+      ASSERT_NE(probe.module, nullptr);
+      ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, probe.module, 0, nullptr), napi_ok);
+      ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.module), napi_ok);
+
+      napi_value promise = nullptr;
+      ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, probe.module, -1, false, &promise),
+                napi_ok);
+      EXPECT_EQ(probe.calls, 1);
+      EXPECT_EQ(probe.status_inside, kEvaluating);
+      EXPECT_EQ(probe.status, napi_pending_exception);
+      EXPECT_EQ(probe.pending, "ERR_VM_MODULE_STATUS: Module status must not be evaluating");
+      EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+      EXPECT_EQ(RunText(s.env, "after"), "yes");
+      EXPECT_EQ(Status(s.env, probe.module), kEvaluated);
+      EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, probe.module), napi_ok);
+    }
+  }
+}

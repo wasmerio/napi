@@ -692,9 +692,23 @@ napi_status napi_module_wrap__::instantiate(unofficial_napi_module module)
   return napi_ok;
 }
 
+// Evaluating a module whose evaluation is under way (from its own body or a
+// synthetic module's steps) is refused, as on V8 and in Node's vm for a
+// module whose status is "evaluating". js_evaluate_module asserts against it,
+// and the facade's evaluation crashed on it.
+napi_status napi_module_wrap__::throw_if_evaluating(record *entry)
+{
+  if (JS_GetModuleStatus(ctx_, entry->module) != JS_MODULE_STATUS_EVALUATING)
+    return napi_ok;
+  return throw_error("ERR_VM_MODULE_STATUS", "Module status must not be evaluating");
+}
+
 napi_status napi_module_wrap__::evaluate_unless_terminated(record *entry, JSValue *promise_out)
 {
   napi_status status = napi_util__::fail_if_terminating(env_, ctx_);
+  if (status != napi_ok)
+    return status;
+  status = throw_if_evaluating(entry);
   if (status != napi_ok)
     return status;
   // The module evaluates in its realm.
@@ -1029,6 +1043,10 @@ napi_status napi_module_wrap__::create_required_module_facade(unofficial_napi_mo
   record *entry = find(module);
   if (entry == nullptr || result_out == nullptr)
     return napi_util__::invalid_arg(env_);
+  // The facade evaluates the module it wraps.
+  napi_status status = throw_if_evaluating(entry);
+  if (status != napi_ok)
+    return status;
 
   JSContext *ctx = entry->ctx;
   std::string filename = "<required-module-facade:" +
