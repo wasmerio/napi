@@ -215,6 +215,11 @@ void *napi_external_backing_store_hint__::external_data() const
   return external_data_;
 }
 
+bool napi_external_backing_store_hint__::finalize_invoked() const
+{
+  return finalize_invoked_;
+}
+
 JSValue napi_external_backing_store_hint__::weak_target() const
 {
   return weak_target_;

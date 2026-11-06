@@ -2992,7 +2992,9 @@ extern "C"
 
     auto obj = napi_quickjs_value_inner(env, js_object);
     auto *wrap = napi_external__::get_wrap_record(env->context(), obj);
-    if (wrap == nullptr)
+    // A wrap the env's release has finalized is gone: its finalizer may have
+    // freed the native object.
+    if (wrap == nullptr || wrap->finalize_invoked())
       return napi_invalid_arg;
 
     *result = wrap->external_data();
@@ -3009,8 +3011,10 @@ extern "C"
       return napi_object_expected;
 
     auto *wrap = napi_external__::get_wrap_record(env->context(), obj);
-    if (wrap == nullptr)
-      return napi_generic_failure;
+    // As Node, an object with no wrap is an invalid argument; so is one whose
+    // wrap the env's release has finalized, as in napi_unwrap.
+    if (wrap == nullptr || wrap->finalize_invoked())
+      return napi_util__::invalid_arg(env);
 
     *result = wrap->external_data();
 

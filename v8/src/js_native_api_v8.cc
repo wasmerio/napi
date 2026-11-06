@@ -3104,6 +3104,7 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
         env, object, 0, napi_ref_ownership__::kRuntime, native_object);
   }
   if (ref == nullptr) return napi_generic_failure;
+  ref->MarkWrap();
 
   if (!object
            ->SetPrivate(env->context(),

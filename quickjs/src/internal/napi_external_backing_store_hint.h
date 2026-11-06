@@ -49,6 +49,8 @@ struct napi_external_backing_store_hint__
   napi_env env() const;
   JSRuntime *runtime() const;
   void *external_data() const;
+  // The finalizer has run, or is running.
+  bool finalize_invoked() const;
   JSValue weak_target() const;
   JSValue finalizer_target(JSValue fallback) const;
   void set_weak_target(JSValue weak_target);

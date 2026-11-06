@@ -33,6 +33,8 @@ struct napi_ref__ : public napi_ref_tracker__ {
   void Invalidate();
   void Finalize() override;
   napi_ref_ownership__ ownership() const { return ownership_; }
+  // napi_wrap made this reference for its object.
+  void MarkWrap() { wrap_ = true; }
 
   napi_ref__(napi_env__* env,
              v8::Local<v8::Value> value,
@@ -47,11 +49,13 @@ struct napi_ref__ : public napi_ref_tracker__ {
  private:
   static void WeakCallback(const v8::WeakCallbackInfo<napi_ref__>& info);
   void SetWeak();
+  void ForgetWrap();
 
   v8::Global<v8::Value> value_;
   uint32_t refcount_ = 0;
   napi_ref_ownership__ ownership_ = napi_ref_ownership__::kUserland;
   bool can_be_weak_ = false;
+  bool wrap_ = false;
 };
 
 #endif  // NAPI_V8_REF_H_

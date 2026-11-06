@@ -1119,3 +1119,124 @@ TEST_F(Test41InstanceData, AHookExceptionSurvivesAFinalizerRunInsideIt) {
   EXPECT_EQ(hook.message, "hook");
   EXPECT_EQ(hook.finalized, 1);
 }
+
+namespace {
+
+// A wrap the release finalizes while its object is still reachable, through
+// the global and through a reference, and what the instance-data finalizer
+// then finds on the object.
+struct FinalizedWrap {
+  napi_ref object = nullptr;
+  int native = 1;
+  int fresh_native = 2;
+  int finalized = 0;
+  int fresh_finalized = 0;
+  napi_status unwrap_by_reference = napi_generic_failure;
+  napi_status unwrap_by_global = napi_generic_failure;
+  napi_status remove = napi_generic_failure;
+};
+
+void FinalizeTheWrap(node_api_basic_env, void* data, void* hint) {
+  auto* wrap = static_cast<FinalizedWrap*>(hint);
+  EXPECT_EQ(data, &wrap->native);
+  ++wrap->finalized;
+}
+
+void FinalizeTheFreshWrap(node_api_basic_env, void* data, void* hint) {
+  auto* wrap = static_cast<FinalizedWrap*>(hint);
+  EXPECT_EQ(data, &wrap->fresh_native);
+  ++wrap->fresh_finalized;
+}
+
+void FinalizeInstanceDataUnwrapping(napi_env env, void* data, void*) {
+  auto* wrap = static_cast<FinalizedWrap*>(data);
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  // A wrap made now may take what the finalized one let go of.
+  napi_value fresh = nullptr;
+  ASSERT_EQ(napi_create_object(env, &fresh), napi_ok);
+  ASSERT_EQ(napi_wrap(env, fresh, &wrap->fresh_native, FinalizeTheFreshWrap, wrap, nullptr),
+            napi_ok);
+  Keep(env, "fresh", fresh);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_get_reference_value(env, wrap->object, &object), napi_ok);
+  ASSERT_NE(object, nullptr);
+  void* native = nullptr;
+  wrap->unwrap_by_reference = napi_unwrap(env, object, &native);
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(env, &global), napi_ok);
+  napi_value by_global = nullptr;
+  ASSERT_EQ(napi_get_named_property(env, global, "wrapped", &by_global), napi_ok);
+  wrap->unwrap_by_global = napi_unwrap(env, by_global, &native);
+  wrap->remove = napi_remove_wrap(env, object, &native);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+// Wraps whose finalizers remove the wrap of their own object at release.
+struct RemovingItsWrap {
+  napi_ref object = nullptr;
+  napi_ref wrap = nullptr;
+  int finalized = 0;
+  napi_status remove = napi_generic_failure;
+};
+
+void FinalizeRemovingItsWrap(node_api_basic_env basic_env, void*, void* hint) {
+  auto env = const_cast<napi_env>(basic_env);
+  auto* self = static_cast<RemovingItsWrap*>(hint);
+  ++self->finalized;
+  napi_handle_scope scope = nullptr;
+  ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_get_reference_value(env, self->object, &object), napi_ok);
+  ASSERT_NE(object, nullptr);
+  void* native = nullptr;
+  self->remove = napi_remove_wrap(env, object, &native);
+  ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+}
+
+}  // namespace
+
+// Once the release has finalized a wrap, its object no longer has it, also
+// while the object is still reachable: napi_unwrap and napi_remove_wrap fail
+// as for an object never wrapped, rather than reach what the finalizer let go
+// of, or a wrap made later.
+TEST_F(Test41InstanceData, AWrapFinalizedAtReleaseIsGoneFromItsObject) {
+  EnvScope s(runtime_.get());
+  FinalizedWrap wrap;
+  napi_value object = nullptr;
+  ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+  ASSERT_EQ(napi_wrap(s.env, object, &wrap.native, FinalizeTheWrap, &wrap, nullptr), napi_ok);
+  Keep(s.env, "wrapped", object);
+  ASSERT_EQ(napi_create_reference(s.env, object, 1, &wrap.object), napi_ok);
+  ASSERT_EQ(napi_set_instance_data(s.env, &wrap, FinalizeInstanceDataUnwrapping, nullptr),
+            napi_ok);
+
+  Release(s);
+  EXPECT_EQ(wrap.finalized, 1);
+  EXPECT_EQ(wrap.unwrap_by_reference, napi_invalid_arg);
+  EXPECT_EQ(wrap.unwrap_by_global, napi_invalid_arg);
+  EXPECT_EQ(wrap.remove, napi_invalid_arg);
+  EXPECT_EQ(wrap.fresh_finalized, 1);
+}
+
+// A wrap's finalizer that removes the wrap of its own object at release finds
+// it gone too, whether the provider or a reference napi_wrap returned owns
+// the wrap. Each is finalized once.
+TEST_F(Test41InstanceData, AWrapFinalizerFindsItsOwnWrapGoneAtRelease) {
+  EnvScope s(runtime_.get());
+  RemovingItsWrap owned, referenced;
+  for (RemovingItsWrap* self : {&owned, &referenced}) {
+    napi_value object = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &object), napi_ok);
+    ASSERT_EQ(napi_wrap(s.env, object, nullptr, FinalizeRemovingItsWrap, self,
+                        self == &referenced ? &self->wrap : nullptr),
+              napi_ok);
+    ASSERT_EQ(napi_create_reference(s.env, object, 1, &self->object), napi_ok);
+  }
+
+  Release(s);
+  for (const RemovingItsWrap* self : {&owned, &referenced}) {
+    EXPECT_EQ(self->finalized, 1);
+    EXPECT_EQ(self->remove, napi_invalid_arg);
+  }
+}
