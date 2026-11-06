@@ -620,6 +620,51 @@ TEST_F(Test33TypedArray, ViewLayoutHoldsWhileTerminating) {
   ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
 }
 
+// Reading a view's layout can run script on QuickJS: the error of an
+// interrupt poll (during a termination request) or of a DataView out of
+// bounds gets its stack through Error.prepareStackTrace, which a script can
+// define as a getter. Here that getter resizes the view's buffer, which moves
+// its bytes; the data reported is still where they are now.
+TEST_F(Test33TypedArray, ViewDataIsCurrentAfterScriptRunsDuringTheRead) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.rab = new ArrayBuffer(16, { maxByteLength: 1 << 20 });"
+                  "globalThis.typed = new Uint8Array(rab, 4, 4);"
+                  "globalThis.resizes = 0;"
+                  "Object.defineProperty(Error, 'prepareStackTrace', { configurable: true,"
+                  "  get() {"
+                  "    resizes++;"
+                  "    rab.resize(rab.byteLength === 16 ? 1 << 20 : 16);"
+                  "    return undefined;"
+                  "  } });"
+                  "0");
+  napi_value rab = NamedGlobal(s.env, "rab");
+  napi_value typed = NamedGlobal(s.env, "typed");
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  int wrong = 0;
+  unsigned sum = 0;
+  for (int i = 0; i < 20000; ++i) {
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
+    const ViewLayout layout = TypedArrayLayout(s.env, typed);
+    if (layout.status != napi_ok || layout.length != 4 || layout.offset != 4 ||
+        layout.data != ArrayBufferData(s.env, rab) + 4) {
+      ++wrong;
+    } else {
+      // Under ASan, reading stale data would be a use after free.
+      for (size_t j = 0; j < layout.length; ++j) sum += static_cast<uint8_t*>(layout.data)[j];
+    }
+    ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
+  }
+  EXPECT_EQ(wrong, 0);
+  EXPECT_EQ(sum, 0u);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  // V8 runs no script to read a view, so only QuickJS gets here at all.
+  EXPECT_GT(GlobalInt(s.env, "resizes"), 0) << "the getter never ran: nothing was tested";
+#endif
+}
+
 // The serdes binding unofficial_napi_create_serdes_binding returns is still
 // the binding while the caller makes more values.
 TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {

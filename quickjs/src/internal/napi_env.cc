@@ -431,24 +431,33 @@ bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) cons
   JSValue earlier = JS_GetException(context_);
   *layout = {};
   layout->buffer = call_view_getter(context_, getters->buffer, view);
-  bool found = JS_IsObject(layout->buffer);
-  size_t buffer_length = 0;
-  // JS_GetArrayBuffer throws for a detached buffer only.
+  const bool found = JS_IsObject(layout->buffer);
   if (found)
-    layout->data = JS_GetArrayBuffer(context_, &buffer_length, layout->buffer);
-  if (layout->data == nullptr && JS_HasException(context_))
-    JS_FreeValue(context_, JS_GetException(context_));
-  if (layout->data != nullptr)
   {
-    // The typed array getters report 0 for a view out of bounds; the DataView
-    // ones throw.
+    // The typed array getters report 0 for a view over a detached buffer or
+    // out of bounds; the DataView ones throw. A thrown error (also an
+    // interrupt's) gets its stack through Error.prepareStackTrace, which can
+    // run script that resizes, transfers or detaches the buffer. So the
+    // buffer's data and size are read last: JS_GetArrayBuffer runs no script
+    // when it succeeds, and when it throws the buffer is detached for good.
     JSValue offset_value = call_view_getter(context_, getters->byte_offset, view);
     JSValue length_value = call_view_getter(context_, getters->byte_length, view);
-    int64_t offset = 0;
-    int64_t length = 0;
-    if (!JS_IsException(offset_value) && !JS_IsException(length_value) &&
-        JS_ToInt64(context_, &offset, offset_value) == 0 &&
-        JS_ToInt64(context_, &length, length_value) == 0 && offset >= 0 && length >= 0 &&
+    int64_t offset = -1;
+    int64_t length = -1;
+    if (JS_IsException(offset_value) || JS_ToInt64(context_, &offset, offset_value) != 0)
+      offset = -1;
+    if (JS_IsException(length_value) || JS_ToInt64(context_, &length, length_value) != 0)
+      length = -1;
+    JS_FreeValue(context_, offset_value);
+    JS_FreeValue(context_, length_value);
+    if (JS_HasException(context_))
+      JS_FreeValue(context_, JS_GetException(context_));
+    size_t buffer_length = 0;
+    // Throws for a detached buffer only.
+    layout->data = JS_GetArrayBuffer(context_, &buffer_length, layout->buffer);
+    if (layout->data == nullptr && JS_HasException(context_))
+      JS_FreeValue(context_, JS_GetException(context_));
+    if (layout->data != nullptr && offset >= 0 && length >= 0 &&
         static_cast<uint64_t>(offset) <= buffer_length &&
         static_cast<uint64_t>(length) <= buffer_length - static_cast<uint64_t>(offset))
     {
@@ -456,12 +465,8 @@ bool napi_env__::view_layout(JSValueConst view, napi_view_layout__ *layout) cons
       layout->byte_length = static_cast<size_t>(length);
       layout->data += layout->byte_offset;
     }
-    JS_FreeValue(context_, offset_value);
-    JS_FreeValue(context_, length_value);
-    if (JS_HasException(context_))
-      JS_FreeValue(context_, JS_GetException(context_));
   }
-  if (!found)
+  else
   {
     JS_FreeValue(context_, layout->buffer);
     layout->buffer = JS_UNDEFINED;

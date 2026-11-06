@@ -89,11 +89,12 @@ struct napi_env__
   // byte length, read through the intrinsic getters as the env was made,
   // never through the view's properties, which scripts can redefine on the
   // view or on its realm's prototypes. These getters read the view's internal
-  // slots, whatever realm made it, and run no script. A view over a detached
-  // ArrayBuffer, or out of bounds of a resizable one that shrank, has no
-  // bytes (as in Node; QuickJS's accessors throw for some of these), and an
-  // offset of 0. False for anything else. Leaves any pending exception as it
-  // was.
+  // slots, whatever realm made it, and run no script themselves (an error one
+  // throws can, through Error.prepareStackTrace; the data pointer is read
+  // after them). A view over a detached ArrayBuffer, or out of bounds of a
+  // resizable one that shrank, has no bytes (as in Node; QuickJS's accessors
+  // throw for some of these), and an offset of 0. False for anything else.
+  // Leaves any pending exception as it was.
   bool view_layout(JSValueConst view, napi_view_layout__ *layout) const;
   // A function of the current realm that keeps it alive; undefined for the
   // env's own realm.
