@@ -4255,6 +4255,16 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) 
     NAPI_GENERIC_FAILURE
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_memory_pressure(env: SnapiEnv, level: i32) -> i32 {
+    let _ = env;
+    // A level outside unofficial_napi_memory_pressure_level (0 to 2) is
+    // napi_invalid_arg, as on the native providers.
+    if !(0..=2).contains(&level) {
+        return NAPI_INVALID_ARG;
+    }
+    NAPI_GENERIC_FAILURE
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_set_prepare_stack_trace_callback(
     env: SnapiEnv,
     callback_id: u32,

@@ -337,6 +337,9 @@ endif()
 add_fixture_test(${_napi_test_prefix}_test_allocator
   src/napi_allocator_test.cc
 )
+add_fixture_test(${_napi_test_prefix}_test_72_unofficial_memory_pressure
+  runners/test_72_unofficial_memory_pressure.cc
+)
 
 if(_napi_test_engine STREQUAL "v8")
   add_executable(napi_v8_foreground_checkpoint_test src/v8_foreground_checkpoint_test.cc)

@@ -2068,6 +2068,32 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage(napi_env env) {
   return napi_ok;
 }
 
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kNone) ==
+                  unofficial_napi_memory_pressure_none,
+              "memory pressure levels must match V8's");
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kModerate) ==
+                  unofficial_napi_memory_pressure_moderate,
+              "memory pressure levels must match V8's");
+static_assert(static_cast<int>(v8::MemoryPressureLevel::kCritical) ==
+                  unofficial_napi_memory_pressure_critical,
+              "memory pressure levels must match V8's");
+
+napi_status NAPI_CDECL unofficial_napi_memory_pressure(napi_env env, int32_t level) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (level < unofficial_napi_memory_pressure_none ||
+      level > unofficial_napi_memory_pressure_critical) {
+    return napi_invalid_arg;
+  }
+  // On the isolate's thread V8 handles it at once (Heap::CheckMemoryPressure)
+  // and sets the level back to none: critical collects in full, with the
+  // memory-reducing flags; moderate starts incremental marking with them.
+  // Before V8 13.7 neither clears the compilation cache, which
+  // LowMemoryNotification (CollectAllAvailableGarbage) does, so later realms
+  // still find their scripts compiled. V8 13.7 and later clear it here too.
+  env->isolate->MemoryPressureNotification(static_cast<v8::MemoryPressureLevel>(level));
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
     napi_env env,
     napi_value callback) {

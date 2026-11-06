@@ -40,6 +40,8 @@ const WAT: &str = r#"(module
     (func $checkpoint (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
     (func $collect_garbage (param i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_memory_pressure"
+    (func $memory_pressure (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_create"
     (func $message_create (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_take"
@@ -213,6 +215,8 @@ const WAT: &str = r#"(module
     (call $request_interrupt (local.get $env) (i32.const 5) (i32.const 0)))
   (func (export "release_status") (result i32) (global.get $release_status))
   (func (export "collect") (result i32) (call $collect_garbage (global.get $env)))
+  (func (export "memory_pressure") (param $level i32) (result i32)
+    (call $memory_pressure (global.get $env) (local.get $level)))
 
   ;; Interrupt callback: record `data` if it runs for this guest's own env.
   (func $on_interrupt (param $env i32) (param $data i32) (result i32)
@@ -470,5 +474,11 @@ impl Guest {
     /// status.
     pub fn collect(&mut self) -> i32 {
         self.call0("collect")
+    }
+
+    /// `unofficial_napi_memory_pressure` on this guest's env; returns the
+    /// status.
+    pub fn memory_pressure(&mut self, level: i32) -> i32 {
+        self.call1("memory_pressure", level)
     }
 }
