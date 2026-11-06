@@ -347,6 +347,9 @@ add_fixture_test(${_napi_test_prefix}_test_76_termination_until_cancelled
   runners/test_76_termination_until_cancelled.cc
 )
 target_compile_definitions(${_napi_test_prefix}_test_76_termination_until_cancelled PRIVATE NAPI_VERSION=10)
+add_fixture_test(${_napi_test_prefix}_test_77_module_wrap_state
+  runners/test_77_module_wrap_state.cc
+)
 if(_napi_test_engine STREQUAL "v8")
   # Only the V8 provider posts engine tasks through the enqueue hook.
   add_fixture_test(${_napi_test_prefix}_test_66_foreground_task_handoff

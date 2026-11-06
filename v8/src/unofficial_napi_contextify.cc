@@ -3043,6 +3043,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_awa
   v8::Local<v8::Module> module = record->module.Get(isolate);
 
   if (!module->IsSourceTextModule()) return napi_ok;
+  // A module that is not instantiated has no top-level await under way, as
+  // on QuickJS. IsGraphAsync aborts the process for one.
+  if (module->GetStatus() < v8::Module::kInstantiated) return napi_ok;
   if (!module->IsGraphAsync()) return napi_ok;
 
   auto stalled_messages = std::get<1>(module->GetStalledTopLevelAwaitMessages(isolate));
