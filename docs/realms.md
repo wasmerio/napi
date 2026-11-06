@@ -182,7 +182,11 @@ calls take a realm's global or sandbox.
   NULL `name`, refused a symbol sandbox, returned an already contextified
   sandbox again, compiled in the env's context for a parsing context that
   was not contextified, and ignored `context_or_undefined`. It now behaves
-  as V8 does.
+  as V8 does. So do the host-JS guest imports, which are stricter than
+  `main`'s host-JS was: it ignored `name`, made a fresh object for sandbox
+  id 0 or an id that named no value, and ran with no sandbox for such an
+  id. They now return `main`'s V8 and native-bridge statuses
+  (`napi_invalid_arg`).
 - **Guest ABI.** The wasm32 layouts of version 1 are `main`'s, and version 2
   appends a u32 realm id. The guest imports
   `unofficial_napi_contextify_make_context`, `…_run_script` and
