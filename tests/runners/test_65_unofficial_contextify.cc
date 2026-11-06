@@ -1,5 +1,6 @@
 #include "test_env.h"
 
+#include "node_api.h"
 #include "unofficial_napi.h"
 
 class Test65UnofficialContextify : public FixtureTestBase {};
@@ -1058,3 +1059,62 @@ TEST_F(Test65UnofficialContextify, PrepareStackTraceResultIsNotRewritten) {
             napi_ok);
 }
 #endif
+
+namespace {
+
+struct LoaderAtRelease {
+  napi_env env = nullptr;
+  unofficial_napi_module module = nullptr;
+};
+
+// A cleanup hook that runs after the module loader has let go of its modules:
+// it asks about the entry module's top-level await, as Node does at exit, by
+// a handle the loader no longer knows, then imports dynamically.
+void UseTheLoaderAtRelease(void* arg) {
+  auto* loader = static_cast<LoaderAtRelease*>(arg);
+  bool settled = false;
+  (void)unofficial_napi_module_wrap_check_unsettled_top_level_await(
+      loader->env, loader->module, false, &settled);
+  napi_value ignored = nullptr;
+  (void)napi_run_script(loader->env,
+                        Str(loader->env, "globalThis.process = {};\n"
+                                         "import('gone').catch(() => {});"),
+                        &ignored);
+}
+
+}  // namespace
+
+// What the module loader keeps for an env, made while its release runs (here
+// after the loader's own cleanup), goes with the env: envs made later, which
+// may reuse its address, start without it.
+TEST_F(Test65UnofficialContextify, ModuleStateMadeAtReleaseGoesWithTheEnv) {
+  for (int i = 0; i < 32; ++i) {
+    EnvScope s(runtime_.get());
+    LoaderAtRelease loader;
+    loader.env = s.env;
+    // Added before the module below, so it runs after the loader's cleanup.
+    ASSERT_EQ(napi_add_env_cleanup_hook(s.env, UseTheLoaderAtRelease, &loader), napi_ok);
+
+    napi_value wrapper = nullptr;
+    napi_value undefined = nullptr;
+    ASSERT_EQ(napi_create_object(s.env, &wrapper), napi_ok);
+    ASSERT_EQ(napi_get_undefined(s.env, &undefined), napi_ok);
+    const unofficial_napi_js_source source =
+        unofficial_napi_js_source_from_text(Str(s.env, "export const value = 1;"));
+    unofficial_napi_module_create_options options{};
+    options.size = sizeof(options);
+    options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+    options.kind = unofficial_napi_module_source_text;
+    options.wrapper = wrapper;
+    options.url = Str(s.env, "entry.mjs");
+    options.payload.source_text.source = &source;
+    options.payload.source_text.host_defined_option_id = undefined;
+    unofficial_napi_module_create_result created{};
+    ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &created), napi_ok);
+    loader.module = created.module;
+
+    ASSERT_EQ(unofficial_napi_release_env(s.scope, nullptr), napi_ok);
+    s.scope = nullptr;
+    s.env = nullptr;
+  }
+}

@@ -1651,7 +1651,10 @@ void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> conte
 
 namespace unofficial_napi_internal {
 
-void ForgetEnvState(napi_env env) {
+namespace {
+
+// The env's error formatting and prepare-stack-trace state.
+void ForgetErrorFormattingState(napi_env env) {
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
   if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
@@ -1659,6 +1662,13 @@ void ForgetEnvState(napi_env env) {
     g_prepare_stack_trace_callbacks.erase(prepare_it);
   }
   ResetErrorFormattingState(env);
+}
+
+}  // namespace
+
+void ForgetEnvState(napi_env env) {
+  ForgetErrorFormattingState(env);
+  ForgetModuleWrapState(env);
 }
 
 }  // namespace unofficial_napi_internal
@@ -1764,7 +1774,9 @@ static napi_status DestroyEnvInstance(napi_env env) {
       g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
     }
   }
-  unofficial_napi_internal::ForgetEnvState(env);
+  // The module loader's state stays for its cleanup hook, which the release
+  // runs; the release's end drops whatever is left (ForgetEnvState).
+  unofficial_napi_internal::ForgetErrorFormattingState(env);
   env->promise_reject_callback.Reset();
   for (auto& hook : env->promise_hooks) {
     hook.Reset();

@@ -1661,6 +1661,20 @@ bool CompileBytecodeRecord(napi_env env,
 
 }  // namespace
 
+namespace unofficial_napi_internal {
+
+// The loader's cleanup hook drops an env's state when the release runs it, but
+// a lookup after that (unofficial_napi_module_wrap_check_unsettled_top_level_await,
+// a dynamic import) makes it again, without the hook. Its records and
+// references are the env's, which frees them with it.
+void ForgetModuleWrapState(napi_env env) {
+  std::lock_guard<std::mutex> lock(g_module_wrap_mu);
+  g_module_wrap_cleanup_hooks.erase(env);
+  g_module_wrap_states.erase(env);
+}
+
+}  // namespace unofficial_napi_internal
+
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   unofficial_napi_realm realm = RealmForContext(context);
   return realm != nullptr && realm->env == env;

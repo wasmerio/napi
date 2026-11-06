@@ -1050,8 +1050,9 @@ napi_env__::~napi_env__() {
   PopRealmFrames(0);
   // The hooks and finalizers above can make state the runtime keeps by the
   // env's address (napi_get_and_clear_last_exception keeps the error's
-  // formatting). Left behind, an env made later at the same address would
-  // find it, and reset handles of an isolate already disposed.
+  // formatting; a module lookup after the loader's cleanup hook makes the
+  // loader's state again). Left behind, an env made later at the same address
+  // would find it, and reset handles of an isolate already disposed.
   unofficial_napi_internal::ForgetEnvState(this);
   if (agent != nullptr && agent->principal_env == this) {
     agent->principal_env = nullptr;
