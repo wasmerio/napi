@@ -481,3 +481,56 @@ TEST_F(Test77ModuleWrapState, SetExportTakesOnlySyntheticModules) {
   EXPECT_EQ(ValueText(s.env, value), "one");
   EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
 }
+
+namespace {
+
+// Takes the pending exception: its constructor's name, or "" when none was
+// pending.
+std::string TakePendingErrorName(napi_env env) {
+  if (!ExceptionPending(env)) return "";
+  napi_value error = nullptr;
+  napi_value name = nullptr;
+  if (napi_get_and_clear_last_exception(env, &error) != napi_ok) return "<not taken>";
+  if (napi_get_named_property(env, error, "name", &name) != napi_ok) return "<no name>";
+  return ValueText(env, name);
+}
+
+}  // namespace
+
+// Setting an export the synthetic module does not have (yet) throws a
+// ReferenceError: one of its export names before the module is
+// instantiated, which makes its bindings, or a name it never had. Before,
+// V8 returned napi_generic_failure and left the ReferenceError it threw to
+// whatever JS was on the stack, if any, instead of N-API. QuickJS crashed
+// before the module was instantiated.
+TEST_F(Test77ModuleWrapState, SetExportOfABindingThatDoesNotExistThrows) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module module = CreateSyntheticModule(s.env, "(function() {})");
+  ASSERT_NE(module, nullptr);
+  for (const char* name : {"value", "missing"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(unofficial_napi_module_wrap_set_export(s.env, module, Str(s.env, name),
+                                                     Str(s.env, "early")),
+              napi_pending_exception);
+    EXPECT_EQ(TakePendingErrorName(s.env), "ReferenceError");
+  }
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, module, 0, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+  EXPECT_EQ(unofficial_napi_module_wrap_set_export(s.env, module, Str(s.env, "missing"),
+                                                   Str(s.env, "late")),
+            napi_pending_exception);
+  EXPECT_EQ(TakePendingErrorName(s.env), "ReferenceError");
+  EXPECT_EQ(unofficial_napi_module_wrap_set_export(s.env, module, Str(s.env, "value"),
+                                                   Str(s.env, "set")),
+            napi_ok);
+  EXPECT_FALSE(ExceptionPending(s.env));
+  napi_value promise = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_evaluate(s.env, module, -1, false, &promise), napi_ok);
+  EXPECT_EQ(PromiseOutcome(s.env, promise), "resolved");
+  napi_value ns = nullptr;
+  napi_value value = nullptr;
+  ASSERT_EQ(unofficial_napi_module_wrap_get_namespace(s.env, module, &ns), napi_ok);
+  ASSERT_EQ(napi_get_named_property(s.env, ns, "value", &value), napi_ok);
+  EXPECT_EQ(ValueText(s.env, value), "set");
+  EXPECT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}

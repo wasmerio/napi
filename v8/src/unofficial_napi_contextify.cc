@@ -3142,7 +3142,13 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
   v8::Local<v8::Value> value =
       export_value != nullptr ? napi_v8_unwrap_value(export_value) : v8::Undefined(env->isolate).As<v8::Value>();
   if (name.IsEmpty() || !name->IsString()) return napi_invalid_arg;
+  // V8 throws a ReferenceError for a name the module has no binding for (yet:
+  // instantiating the module makes its bindings). It is N-API's to report.
+  v8::TryCatch try_catch(env->isolate);
   if (record->module.Get(env->isolate)->SetSyntheticModuleExport(env->isolate, name.As<v8::String>(), value).IsNothing()) {
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      return ThrowTryCatchException(env, try_catch);
+    }
     return napi_generic_failure;
   }
   return napi_ok;

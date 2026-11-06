@@ -877,7 +877,11 @@ napi_status napi_module_wrap__::set_export(unofficial_napi_module module,
     return napi_pending_exception;
   }
   std::string name = napi_util__::to_utf8(env_, export_name);
-  if (JS_SetModuleExport(ctx_, entry->module, name.c_str(),
+  // Instantiating the module makes its bindings; JS_SetModuleExport would
+  // write through a null reference before that. Throw what an unknown name
+  // throws, as V8 does.
+  if (JS_GetModuleStatus(ctx_, entry->module) < JS_MODULE_STATUS_LINKED ||
+      JS_SetModuleExport(ctx_, entry->module, name.c_str(),
                          JS_DupValue(ctx_, napi_quickjs_value_inner(env_, export_value))) < 0)
   {
     env_->set_last_exception(JS_NewReferenceError(ctx_, "Synthetic module export is not defined"));
