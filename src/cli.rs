@@ -3,11 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, FileSystem};
-#[cfg(not(feature = "cli-llvm"))]
-use wasmer::sys::Cranelift as CliCompiler;
 #[cfg(feature = "cli-llvm")]
-use wasmer::sys::LLVM as CliCompiler;
-use wasmer::sys::{EngineBuilder, Features};
+use wasmer::sys::LLVM;
+use wasmer::sys::{Cranelift, EngineBuilder, Features};
 use wasmer::{Module, Store};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_types::ModuleHash;
@@ -35,13 +33,53 @@ pub struct LoadedWasm {
     pub module_hash: ModuleHash,
 }
 
-fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
+#[derive(Clone, Copy)]
+enum CliCompiler {
+    Cranelift,
+    #[cfg(feature = "cli-llvm")]
+    Llvm,
+}
+
+impl CliCompiler {
+    fn from_env() -> Result<Self> {
+        match std::env::var("WASMER_NAPI_COMPILER") {
+            Ok(name) => match name.as_str() {
+                "cranelift" => Ok(Self::Cranelift),
+                #[cfg(feature = "cli-llvm")]
+                "llvm" => Ok(Self::Llvm),
+                #[cfg(not(feature = "cli-llvm"))]
+                "llvm" => anyhow::bail!("LLVM requires building with --features cli-llvm"),
+                _ => anyhow::bail!("WASMER_NAPI_COMPILER must be cranelift or llvm"),
+            },
+            Err(std::env::VarError::NotPresent) => {
+                #[cfg(feature = "cli-llvm")]
+                return Ok(Self::Llvm);
+                #[cfg(not(feature = "cli-llvm"))]
+                return Ok(Self::Cranelift);
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cranelift => "cranelift",
+            #[cfg(feature = "cli-llvm")]
+            Self::Llvm => "llvm",
+        }
+    }
+}
+
+fn create_cli_store(budget: Arc<ResourceBudget>, compiler: CliCompiler) -> Store {
     let mut features = Features::default();
     features.exceptions(true);
 
-    let mut engine = EngineBuilder::new(CliCompiler::default())
-        .set_features(Some(features))
-        .engine();
+    let builder = match compiler {
+        CliCompiler::Cranelift => EngineBuilder::new(Cranelift::default()),
+        #[cfg(feature = "cli-llvm")]
+        CliCompiler::Llvm => EngineBuilder::new(LLVM::default()),
+    };
+    let mut engine = builder.set_features(Some(features)).engine();
     // Charge the guest's (imported) wasm linear memory against the app budget.
     // The runtime instantiates the guest with this engine, so its budgeted
     // tunables cover the main store and every worker store cloned from it.
@@ -50,20 +88,20 @@ fn create_cli_store(budget: Arc<ResourceBudget>) -> Store {
     Store::new(engine)
 }
 
-fn wasmer_cache_dir() -> PathBuf {
+fn wasmer_cache_dir(compiler: CliCompiler) -> PathBuf {
     std::env::var_os("WASMER_NAPI_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("wasmer-napi-cache"))
-        .join(if cfg!(feature = "cli-llvm") {
-            "llvm"
-        } else {
-            "cranelift"
-        })
+        .join(compiler.name())
 }
 
-fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {
+fn load_or_compile_module(
+    store: &Store,
+    wasm_bytes: &[u8],
+    compiler: CliCompiler,
+) -> Result<Module> {
     let key = CacheHash::generate(wasm_bytes);
-    let mut cache = FileSystemCache::new(wasmer_cache_dir())
+    let mut cache = FileSystemCache::new(wasmer_cache_dir(compiler))
         .context("failed to create/access Wasmer cache directory")?;
 
     if let Ok(module) = unsafe { cache.load(store, key) } {
@@ -124,9 +162,10 @@ pub fn load_wasix_module_with_budget(
     let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("failed to read wasm file at {}", wasm_path.display()))?;
 
-    let store = create_cli_store(budget);
+    let compiler = CliCompiler::from_env()?;
+    let store = create_cli_store(budget, compiler);
 
-    let module = load_or_compile_module(&store, &wasm_bytes)?;
+    let module = load_or_compile_module(&store, &wasm_bytes, compiler)?;
 
     let module_hash = ModuleHash::sha256(&wasm_bytes);
 
