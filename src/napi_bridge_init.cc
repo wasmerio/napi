@@ -760,6 +760,13 @@ extern "C" int snapi_bridge_init() {
   return 1;
 }
 
+// Host-only: the function to call, from any thread, after V8 queues a
+// foreground task that only an env's next event-loop checkpoint runs
+// (EdgeV8Platform::SetForegroundTaskWaker). NULL clears it.
+extern "C" void snapi_bridge_set_foreground_task_waker(void (*waker)()) {
+  EdgeV8Platform::SetForegroundTaskWaker(waker);
+}
+
 // ============================================================
 // Value creation
 // ============================================================

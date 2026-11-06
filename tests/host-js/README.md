@@ -3,8 +3,8 @@
 Run the context tests directly, without compiling Wasmer or installing npm dependencies:
 
 ```sh
-node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
-bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
+node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs tests/host-js/detached-arraybuffer.test.mjs
+bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs tests/host-js/detached-arraybuffer.test.mjs
 ```
 
 The tests extract the context implementation from the JavaScript embedded in
@@ -35,6 +35,15 @@ functions, checkpoints, release and the bracketing hooks go to the
 bridge without letting its errors escape, and the bridge global is removed once
 captured; a bridge that can't be removed is refused. Without it, contexts stay
 isolated.
+
+`detached-arraybuffer.test.mjs` loads the whole embedded JavaScript into a
+`vm` realm, with and without ES2024's `ArrayBuffer.prototype.detached`, and
+checks the inspection behind `napi_is_detached_arraybuffer`: live, empty and
+resizable buffers, from that realm or another, are not detached; transferred
+ones are; a SharedArrayBuffer, a view, a proxy or a look-alike is not an
+ArrayBuffer. Page code that afterwards replaces the ArrayBuffer getters,
+`Function.prototype.call` or `Uint8Array`, with functions that throw or that
+accept anything, changes none of these answers.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
 hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip

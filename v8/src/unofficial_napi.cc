@@ -25,6 +25,7 @@
 #include <v8-profiler.h>
 
 #include "internal/node_v8_default_flags.h"
+#include "internal/napi_env_cpu_profile.h"
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
 #include "internal/unofficial_napi_bridge.h"
@@ -60,6 +61,8 @@ struct UnofficialEnvScope {
   napi_env env = nullptr;
   // Set while unofficial_napi_release_env runs for this owner.
   bool releasing = false;
+  // Set when NAPI_V8_CPU_PROFILE_DIR asks for this env's CPU profile.
+  std::unique_ptr<v8impl::detail::env_cpu_profile::State> cpu_profile;
 
   explicit UnofficialEnvScope(
       v8::Isolate* isolate_in,
@@ -400,6 +403,139 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
 
 bool IsEnvThreadEntered(napi_env env) {
   return env != nullptr && env->isolate != nullptr && v8::Isolate::GetCurrent() == env->isolate;
+}
+
+// NAPI_V8_CPU_PROFILE_DIR (internal/napi_env_cpu_profile.h). Returns the
+// session when one started. A session that can't start is recorded here and
+// nothing is returned, as when the variable is unset or empty.
+std::unique_ptr<v8impl::detail::env_cpu_profile::State> StartEnvCPUProfile(napi_env env) {
+  using namespace v8impl::detail::env_cpu_profile;
+  const char* directory = std::getenv(kDirectoryVariable);
+  if (directory == nullptr || directory[0] == '\0') return nullptr;
+  static std::atomic<uint64_t> attempted{0};
+  const uint64_t ordinal = attempted.fetch_add(1, std::memory_order_relaxed) + 1;
+  // Only the first env past the limit says so.
+  if (ordinal > kMaxSessions + 1) return nullptr;
+  auto state = std::make_unique<State>();
+  state->ordinal = static_cast<unsigned>(ordinal);
+  auto refuse = [&state](const char* status) -> std::unique_ptr<State> {
+    state->status = status;
+    Record(*state);
+    return nullptr;
+  };
+  if (ordinal > kMaxSessions) return refuse("session_limit_reached");
+#if NAPI_V8_ENV_CPU_PROFILE_POSIX
+  if (!Open(*state, directory)) return refuse(state->status);
+  if (!IsEnvThreadEntered(env)) return refuse("start_wrong_thread");
+  napi_agent__* agent = env->agent;
+  if (agent->cpu_profiler == nullptr) {
+    agent->cpu_profiler = v8::CpuProfiler::New(env->isolate);
+  }
+  v8::CpuProfiler* profiler = agent->cpu_profiler;
+  if (profiler == nullptr) return refuse("profiler_allocation_failed");
+  auto session = std::make_unique<unofficial_napi_profile__>();
+  state->start_begin_ns = NowNs();
+  const v8::CpuProfilingResult started = profiler->Start(
+      v8::CpuProfilingOptions{v8::CpuProfilingMode::kLeafNodeLineNumbers, kMaxSamples});
+  state->start_end_ns = NowNs();
+  if (started.status != v8::CpuProfilingStatus::kStarted) {
+    return refuse("profiler_start_failed");
+  }
+  session->kind = unofficial_napi_profile_cpu;
+  session->provider_id = static_cast<uint32_t>(started.id);
+  state->session = session.get();
+  // Listed with the env's other sessions, so env teardown stops it if
+  // FinishEnvCPUProfile can't.
+  agent->active_profiles.push_back(session.release());
+  state->status = "recording";
+  state->cleanup = "pending";
+  return state;
+#else
+  (void)env;
+  (void)directory;
+  return refuse("unsupported_host_platform");
+#endif
+}
+
+// Stops the env's session, writes its profile, and records how it went. Runs
+// before the env is torn down, on the thread that releases it.
+void FinishEnvCPUProfile(napi_env env,
+                         std::unique_ptr<v8impl::detail::env_cpu_profile::State> state) {
+  using namespace v8impl::detail::env_cpu_profile;
+  if (state == nullptr) return;
+  // Like unofficial_napi_profile_stop, this needs the env's isolate to be the
+  // thread's current one. It may not be when envs on one thread are released
+  // out of reverse creation order: releasing an env restores the isolate that
+  // was current when it was created. (That order isn't supported anyway: V8's
+  // Isolate::Exit then reads an isolate that was already disposed.) The
+  // session then stays listed with the env's, and env teardown stops and
+  // frees it like any session left running.
+  if (state->owner != std::this_thread::get_id() || !IsEnvThreadEntered(env)) {
+    state->status = state->owner != std::this_thread::get_id() ? "stop_wrong_thread"
+                                                               : "stop_isolate_not_current";
+    state->cleanup = "left_to_env_teardown";
+    Record(*state);
+    return;
+  }
+  v8::CpuProfiler* profiler = nullptr;
+  {
+    napi_agent__* agent = env->agent;
+    auto& sessions = agent->active_profiles;
+    auto session = std::find(sessions.begin(), sessions.end(), state->session);
+    if (session != sessions.end() && agent->cpu_profiler != nullptr) {
+      sessions.erase(session);
+      profiler = agent->cpu_profiler;
+    }
+  }
+  if (profiler == nullptr) {
+    // Not listed any more: whoever removed it owns it, so it is neither
+    // stopped nor freed here.
+    state->session = nullptr;
+    state->status = "session_missing";
+    state->cleanup = "not_owned";
+    Record(*state);
+    return;
+  }
+  state->stop_begin_ns = NowNs();
+  v8::CpuProfile* profile = profiler->Stop(state->session->provider_id);
+  state->stop_end_ns = NowNs();
+  delete state->session;
+  state->session = nullptr;
+  state->cleanup = "stopped";
+  if (profile == nullptr) {
+    state->status = "profile_stop_failed";
+    Record(*state);
+    return;
+  }
+  state->samples = profile->GetSamplesCount();
+  state->profile_start_us = profile->GetStartTime();
+  state->profile_end_us = profile->GetEndTime();
+  // A profile that reached the cap may have dropped samples, even if none
+  // arrived after it: it is written, but not marked valid.
+  state->sample_limit =
+      state->samples < 0 || static_cast<unsigned>(state->samples) >= kMaxSamples;
+  Stream stream;
+  const char* export_error = ExportProfile(profile, env->isolate, stream, &state->nodes);
+  profile->Delete();
+  state->byte_limit = stream.truncated;
+  if (stream.truncated) {
+    state->status = "byte_limit_reached";
+  } else if (export_error != nullptr) {
+    state->status = export_error;
+  } else if (!stream.complete) {
+    state->status = "export_incomplete";
+  } else {
+    state->status = state->sample_limit ? "sample_limit_reached" : "complete";
+#if NAPI_V8_ENV_CPU_PROFILE_POSIX
+    if (WriteAll(state->profile_fd, stream.bytes, &state->io_errno)) {
+      state->output_bytes = stream.bytes.size();
+      state->valid = !state->sample_limit;
+    } else {
+      state->status = "profile_write_failed";
+    }
+#endif
+  }
+  Record(*state);
 }
 
 size_t NearHeapLimitCallback(void* raw_agent,
@@ -1944,6 +2080,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     return (status == napi_ok) ? napi_generic_failure : status;
   }
 
+  scope->cpu_profile = StartEnvCPUProfile(scope->env);
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
@@ -1960,6 +2097,7 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
+    FinishEnvCPUProfile(scope->env, std::move(scope->cpu_profile));
     status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }

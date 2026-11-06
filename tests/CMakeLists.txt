@@ -364,6 +364,13 @@ if(_napi_test_engine STREQUAL "v8")
     runners/test_74_name_length_limits.cc
   )
   target_compile_definitions(${_napi_test_prefix}_test_74_name_length_limits PRIVATE NAPI_VERSION=10)
+  # Only the V8 provider writes CPU profiles for NAPI_V8_CPU_PROFILE_DIR, and
+  # only on Linux and macOS. The runner uses POSIX APIs.
+  if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_fixture_test(${_napi_test_prefix}_test_76_env_cpu_profile
+      runners/test_76_env_cpu_profile.cc
+    )
+  endif()
 endif()
 
 add_fixture_test(${_napi_test_prefix}_test_allocator
@@ -409,4 +416,22 @@ if(_napi_test_engine STREQUAL "v8")
     COMMAND napi_v8_background_job_limit_test 1)
   set_tests_properties(napi_v8.background_job_limit napi_v8.background_job_limit_single_worker
     PROPERTIES TIMEOUT 120)
+endif()
+
+if(_napi_test_engine STREQUAL "v8")
+  add_executable(napi_v8_foreground_task_waker_test src/v8_foreground_task_waker_test.cc)
+  target_include_directories(napi_v8_foreground_task_waker_test PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+    "${${_napi_engine_include_var}}"
+  )
+  target_link_libraries(napi_v8_foreground_task_waker_test PRIVATE
+    ${_napi_test_engine_target}
+    "${${_napi_engine_library_var}}"
+  )
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(napi_v8_foreground_task_waker_test PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  add_test(NAME napi_v8.foreground_task_waker
+    COMMAND napi_v8_foreground_task_waker_test)
+  set_tests_properties(napi_v8.foreground_task_waker PROPERTIES TIMEOUT 120)
 endif()
