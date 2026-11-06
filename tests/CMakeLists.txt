@@ -318,6 +318,16 @@ add_fixture_test(${_napi_test_prefix}_test_41_instance_data
   runners/test_41_instance_data.cc
   ${NAPI_TESTS_ROOT}/js-native-api/test_instance_data/test_instance_data.c
 )
+add_fixture_test(${_napi_test_prefix}_test_71_unofficial_intl_overrides
+  runners/test_71_unofficial_intl_overrides.cc
+)
+if(_napi_test_engine STREQUAL "v8" AND TARGET ${_napi_test_prefix}_test_71_unofficial_intl_overrides)
+  get_target_property(_napi_icu_suffix_for_test ${_napi_test_engine_target} NAPI_ICU_SUFFIX)
+  if(_napi_icu_suffix_for_test MATCHES "^[0-9]+$")
+    target_compile_definitions(${_napi_test_prefix}_test_71_unofficial_intl_overrides
+      PRIVATE NAPI_ICU_SUFFIX=${_napi_icu_suffix_for_test})
+  endif()
+endif()
 add_fixture_test(${_napi_test_prefix}_test_65_unofficial_contextify
   runners/test_65_unofficial_contextify.cc
 )

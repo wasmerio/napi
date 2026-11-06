@@ -651,7 +651,50 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_continuation_preser
     napi_value value);
 
 // Unofficial helper. Refreshes V8 date/timezone configuration after TZ changes.
+// While unofficial_napi_set_process_time_zone has set a zone, TZ is not
+// re-read: the call only drops this isolate's date cache.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(napi_env env);
+
+#if !defined(__wasm__)
+// Unofficial helper, host only (not a guest import: a guest may not change a
+// process-wide setting). Sets the process's default time zone to an IANA id
+// (ASCII). Length 0 gives back the host's zone, re-detected from TZ as
+// unofficial_napi_notify_datetime_configuration_change does; zone NULL with
+// a non-zero length is napi_invalid_arg. An id ICU does not know, and a
+// custom id such as GMT+05:00, are napi_invalid_arg and change nothing.
+// Every isolate takes the zone at its next event-loop checkpoint (or
+// unofficial_napi_refresh_intl_defaults); new isolates start with it. Date
+// follows it only with V8's default --icu-timezone-data (without it, Date
+// reads TZ). Providers without ICU (QuickJS, or a V8 library that exports
+// no ICU C API) return napi_generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_process_time_zone(const char* zone, size_t length);
+#endif
+
+// Unofficial helper. Takes a pending change to the process-wide Intl
+// defaults (today: the time zone) now, rather than at the next event-loop
+// checkpoint.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_refresh_intl_defaults(napi_env env);
+
+// Unofficial helper. Sets this env's isolate's default locale (a BCP 47 tag
+// of up to 256 bytes; length 0: the process default again). napi_invalid_arg
+// for a malformed tag. V8 has no per-isolate setter: ICU's process default
+// is swapped while the isolate recomputes its cached one. During that swap,
+// other isolates' direct reads of ICU's default see the tag, for example the
+// zone name in Date.prototype.toString (which, in this isolate, follows the
+// process default and not the tag). A V8 compile task of this isolate that
+// starts on a worker thread just before the swap can cache the process
+// default for it first, and the tag is then lost without an error. ICU
+// never frees a locale it was given, so a process takes at most 1024
+// distinct locales, one quota for all its isolates and guests; a new one
+// after that is napi_generic_failure, and the isolate keeps its locale. If
+// ICU's default does not become the tag, the call is napi_generic_failure and
+// the isolate is on the process default. ICU drops some allocation failures
+// without reporting them, so when memory runs out the result is best effort.
+// Providers without ICU (QuickJS, or a V8 library that exports no ICU C API)
+// return napi_generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_default_locale(napi_env env,
+                                                                          const char* tag,
+                                                                          size_t length);
 
 // Unofficial helper. Creates the native internalBinding('serdes') object
 // containing Serializer and Deserializer constructors.

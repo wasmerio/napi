@@ -65,6 +65,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NAPI_V8_V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=NAPI_V8_V8_LIBRARY");
     println!("cargo:rerun-if-env-changed=NAPI_V8_V8_MONOLITH_LIB");
+    println!("cargo:rerun-if-env-changed=NM");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
@@ -202,6 +203,15 @@ fn main() {
             build.define(entry, Some("1"));
         }
     }
+
+    // ICU's C API in libv8.a carries V8's ICU major version as a suffix
+    // (ucal_setDefaultTimeZone_74), and no ICU headers ship with the prebuilt
+    // V8: the bridge declares the prototypes with the suffix found here. 0
+    // builds the time zone and locale overrides as napi_generic_failure.
+    build.define(
+        "NAPI_ICU_SUFFIX",
+        Some(icu_suffix(&v8.library_path).as_str()),
+    );
 
     build.compile("napi_bridge");
 
@@ -583,4 +593,44 @@ fn env_truthy(name: &str) -> bool {
             !normalized.is_empty() && normalized != "0" && normalized.to_lowercase() != "false"
         })
         .unwrap_or(false)
+}
+
+/// The suffix of ICU's C API symbols that the V8 library defines (`74` for
+/// `ucal_setDefaultTimeZone_74`), found with `nm`. "0" when `nm` is missing or
+/// the library defines none: a component build, for one, leaves ICU in its
+/// own libraries, and a guessed suffix would not link.
+fn icu_suffix(library: &Path) -> String {
+    let nm = env::var("NM").unwrap_or_else(|_| "nm".into());
+    let Ok(output) = std::process::Command::new(&nm)
+        .arg("-g")
+        .arg(library)
+        .output()
+    else {
+        println!(
+            "cargo:warning={nm} is unavailable; building without the ICU time zone and locale overrides"
+        );
+        return "0".to_string();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // "<address> T _ucal_setDefaultTimeZone_74": defined, not U.
+        let mut fields = line.split_whitespace().rev();
+        let (Some(name), Some("T")) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some(digits) = name
+            .trim_start_matches('_')
+            .strip_prefix("ucal_setDefaultTimeZone_")
+        else {
+            continue;
+        };
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return digits.to_string();
+        }
+    }
+    println!(
+        "cargo:warning={} defines no ucal_setDefaultTimeZone_<version>; building without the ICU time zone and locale overrides",
+        library.display()
+    );
+    "0".to_string()
 }
