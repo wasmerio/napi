@@ -675,9 +675,9 @@ TEST_F(Test73TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideModu
   }
 }
 
-// A finalizer drained at a checkpoint (V8; QuickJS runs it while it
-// collects) whose JS is terminated. Nothing reports a failure from a
-// finalizer: its next call into JS must fail, and the next run.
+// A finalizer whose JS is terminated. Nothing reports a failure from a
+// finalizer: its next call into JS must fail, and the checkpoint and the
+// next run.
 namespace {
 napi_status g_finalizer_first = napi_ok;
 napi_status g_finalizer_second = napi_ok;
@@ -709,17 +709,55 @@ TEST_F(Test73TerminationUntilCancelled, FinalizerDrainedAtACheckpoint) {
               napi_ok);
     ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
   }
+  // V8 runs the finalizer at the checkpoint; QuickJS when it frees the
+  // object, before. Either way the checkpoint after it fails.
   napi_status checkpoint = napi_ok;
-  for (int i = 0; i < 5 && !g_finalizer_ran; ++i) {
+  for (int i = 0; i < 5; ++i) {
     ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
     checkpoint = unofficial_napi_event_loop_checkpoint(
         s.env, unofficial_napi_event_loop_checkpoint_microtasks, false, nullptr);
+    if (g_finalizer_ran) break;
   }
   ASSERT_TRUE(g_finalizer_ran);
   EXPECT_EQ(g_finalizer_first, napi_pending_exception);
   EXPECT_EQ(g_finalizer_second, napi_pending_exception);
-  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception)
-      << "checkpoint " << checkpoint;
+  EXPECT_EQ(checkpoint, napi_pending_exception);
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception);
+  FinishTermination(s.env);
+  EXPECT_EQ(GlobalText(s.env, "afterCall"), "no");
+}
+
+// A FinalizationRegistry cleanup callback, which the checkpoint runs (V8:
+// as a foreground task it pumps; QuickJS: as a job), and whose JS is
+// terminated: the checkpoint must fail.
+namespace {
+bool g_cleanup_ran = false;
+napi_value MarkCleanup(napi_env /*env*/, napi_callback_info /*info*/) {
+  g_cleanup_ran = true;
+  return nullptr;
+}
+}  // namespace
+
+TEST_F(Test73TerminationUntilCancelled, FinalizationRegistryCleanupAtACheckpoint) {
+  EnvScope s(runtime_.get());
+  InstallHelpers(s.env);
+  DefineGlobalFunction(s.env, "markCleanup", MarkCleanup);
+  ASSERT_EQ(RunScript(s.env,
+                      "globalThis.registry = new FinalizationRegistry(() => {\n"
+                      "  markCleanup(); terminate(); tick(); afterCall = 'yes';\n"
+                      "});\n"
+                      "(() => { registry.register({}, 1); })();\n"),
+            napi_ok);
+  g_cleanup_ran = false;
+  napi_status checkpoint = napi_ok;
+  for (int i = 0; i < 20 && !g_cleanup_ran; ++i) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    checkpoint = unofficial_napi_event_loop_checkpoint(
+        s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, nullptr);
+  }
+  ASSERT_TRUE(g_cleanup_ran);
+  EXPECT_EQ(checkpoint, napi_pending_exception);
+  EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception);
   FinishTermination(s.env);
   EXPECT_EQ(GlobalText(s.env, "afterCall"), "no");
 }

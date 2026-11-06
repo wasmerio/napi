@@ -2084,7 +2084,7 @@ bool PumpPlatformForegroundTasks(napi_env env) {
 }
 
 // Returns false, having run no more JS, once the env terminates (a
-// finalizer or a microtask may terminate it).
+// finalizer, a microtask or a task may terminate it).
 bool DrainMicrotasksForEnv(napi_env env, bool* host_task_admitted) {
   *host_task_admitted = false;
   env->DrainFinalizerQueue();
@@ -2098,8 +2098,9 @@ bool DrainMicrotasksForEnv(napi_env env, bool* host_task_admitted) {
   }
   env->DrainFinalizerQueue();
   if (napi_v8_terminating(env)) return false;
+  // The task may run JS too (a FinalizationRegistry's cleanup).
   *host_task_admitted = PumpPlatformForegroundTasks(env);
-  return true;
+  return !napi_v8_terminating(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
@@ -2114,8 +2115,9 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     return napi_invalid_arg;
   }
   // As the calls into JS: a terminating env runs none, and a termination a
-  // finalizer or a microtask runs into fails the checkpoint, as on QuickJS,
-  // so the event loop stops instead of going on as if nothing happened.
+  // finalizer, a microtask or a task runs into fails the checkpoint, as on
+  // QuickJS, so the event loop stops instead of going on as if nothing
+  // happened.
   bool host_task_admitted = false;
   if (napi_v8_terminating(env) || !DrainMicrotasksForEnv(env, &host_task_admitted)) {
     return napi_v8_fail_terminating(env);
