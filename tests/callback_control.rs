@@ -1962,7 +1962,17 @@ mod native_frame_tests {
         }
     }
     #[test]
-    #[cfg(all(feature = "wasix", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "wasix",
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn native_cpp_callback_cannot_switch_the_callers_context() {
         if !run_in_subprocess(
             "native_frame_tests::native_cpp_callback_cannot_switch_the_callers_context",
@@ -2071,7 +2081,16 @@ mod native_frame_tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn native_cpp_relocates_and_restores_the_configured_stack_limit() {
         if !run_in_subprocess(
             "native_frame_tests::native_cpp_relocates_and_restores_the_configured_stack_limit",
@@ -2265,7 +2284,16 @@ mod native_frame_tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn native_cpp_zero_stack_budget_retires_failed_creation() {
         if !run_in_subprocess(
             "native_frame_tests::native_cpp_zero_stack_budget_retires_failed_creation",
@@ -2334,7 +2362,16 @@ mod native_frame_tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn native_cpp_preserves_same_stack_nested_js_roots_and_exceptions() {
         if run_in_subprocess(
             "native_frame_tests::native_cpp_preserves_same_stack_nested_js_roots_and_exceptions",
@@ -2345,7 +2382,16 @@ mod native_frame_tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn native_cpp_refuses_same_isolate_host_body_reentry_across_stacks() {
         if run_in_subprocess(
             "native_frame_tests::native_cpp_refuses_same_isolate_host_body_reentry_across_stacks",
@@ -2355,7 +2401,16 @@ mod native_frame_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn nested_stack_proof(cross_stack: bool) {
         use wasmer::FunctionEnv;
         unsafe extern "C" {
@@ -2662,10 +2717,14 @@ mod native_frame_tests {
 
     #[cfg(all(
         feature = "native-stack-diagnostics",
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     mod scanner_proofs {
         use super::*;

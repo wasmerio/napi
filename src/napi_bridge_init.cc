@@ -23,7 +23,7 @@
 #define NAPI_EXPERIMENTAL
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || (defined(__APPLE__) && defined(__MACH__))
 #include <pthread.h>
 #endif
 #if defined(__GLIBC__)
@@ -102,6 +102,14 @@ struct PhysicalNativeFrame {
 };
 thread_local PhysicalNativeFrame* current_native_frame = nullptr;
 
+// Explicit asm labels are assembler spellings, so Mach-O needs the extra
+// leading underscore even for the audited C++ mangled names.
+#if defined(__APPLE__) && defined(__MACH__)
+#define SNAPI_NATIVE_SYMBOL(name) "_" name
+#else
+#define SNAPI_NATIVE_SYMBOL(name) name
+#endif
+
 #if defined(SNAPI_PINNED_V8_STACK_LIMIT)
 // Exact pinned native ABI: the installed public header publishes StackGuard's
 // isolate offset and size. In 13.6 its first field is Isolate*, followed by
@@ -115,17 +123,20 @@ static_assert(v8::internal::Internals::kIsolateStackGuardOffset % sizeof(uintptr
 #if defined(USE_SIMULATOR) || defined(V8_USE_ADDRESS_SANITIZER) || defined(V8_USE_SAFE_STACK)
 #error "native stack ABI requires the audited nonsimulator, nonsanitized V8 profile"
 #endif
-// Exact SysV64 member-call ABI from the audited archive. Use V8's own
-// temporary stack-switch operation: public Isolate::SetStackLimit also updates
-// configured stack_size by subtracting from the unrelated OS stack start.
+#if defined(__APPLE__) && (!defined(__aarch64__) || defined(__arm64e__))
+#error "pinned Darwin native stack ABI requires the audited plain arm64 profile"
+#endif
+// Exact target member-call ABI from the separately audited archives. Use
+// V8's own temporary stack-switch operation: public Isolate::SetStackLimit
+// also updates configured stack_size using the physical-origin adapter.
 extern "C" void SnapiSetStackLimitForStackSwitching(void*, uintptr_t) noexcept
-    asm("_ZN2v88internal10StackGuard30SetStackLimitForStackSwitchingEm");
+    asm(SNAPI_NATIVE_SYMBOL("_ZN2v88internal10StackGuard30SetStackLimitForStackSwitchingEm"));
 extern "C" uintptr_t SnapiOriginalGetStackStart() noexcept
-    asm("snapi_original_v8_get_stack_start");
+    asm(SNAPI_NATIVE_SYMBOL("snapi_original_v8_get_stack_start"));
 extern "C" uintptr_t SnapiOriginalGetStackStartUnchecked() noexcept
-    asm("snapi_original_v8_get_stack_start_unchecked");
+    asm(SNAPI_NATIVE_SYMBOL("snapi_original_v8_get_stack_start_unchecked"));
 extern "C" void SnapiOriginalStackGuardInitThread(void*, const void*) noexcept
-    asm("snapi_original_v8_stack_guard_init_thread");
+    asm(SNAPI_NATIVE_SYMBOL("snapi_original_v8_stack_guard_init_thread"));
 #endif
 
 bool ReadNativeRealStackLimit(v8::Isolate* target, uintptr_t* limit) noexcept {
@@ -195,6 +206,17 @@ bool NativeThreadStackRange(NativeStackRange* out) noexcept {
   const uintptr_t libc_start = reinterpret_cast<uintptr_t>(__libc_stack_end);
   if (low <= libc_start && libc_start <= out->base) out->base = libc_start;
 #endif
+#elif defined(__APPLE__) && defined(__MACH__)
+  // Apple reports usable stack bounds, including the main-thread rlimit.
+  // Its guard is below this interval; do not subtract another guard page.
+  // This helper also runs on a coroutine to locate its paused OS caller,
+  // so current-SP containment belongs to physical-origin admission instead.
+  const uintptr_t base = reinterpret_cast<uintptr_t>(
+      pthread_get_stackaddr_np(pthread_self()));
+  const size_t size = pthread_get_stacksize_np(pthread_self());
+  if (size == 0 || size >= base) return false;
+  out->low = base - size;
+  out->base = base;
 #else
   return false;
 #endif
@@ -206,7 +228,7 @@ bool NativeThreadStackRange(NativeStackRange* out) noexcept {
 // Only the audited release archive defines this exact two-word native prefix.
 // No Stack/Heap offset discovery or replacement StackVisitor implementation.
 extern "C" void SnapiOriginalStackScanner(void*, void*)
-    asm("snapi_original_v8_stack_iterate_pointers_until_marker");
+    asm(SNAPI_NATIVE_SYMBOL("snapi_original_v8_stack_iterate_pointers_until_marker"));
 extern "C" void PushAllRegistersAndIterateStack(
     void*, void*, void (*)(void*, void*, const void*));
 
@@ -248,8 +270,9 @@ extern "C" void SnapiProbePushRegisters(
     void*, void*, void (*)(void*, void*, const void*));
 extern "C" void snapi_bridge_native_probe_with_register(
     void (*)(void*), void*, int);
-// These are real external SysV calls. Register values are encoded only in
+// Real external target-ABI calls. Register values are encoded only in
 // instruction immediates, not Rust locals/arguments that could mask a spill bug.
+#if defined(__linux__) && defined(__x86_64__)
 asm(
     ".text\n"
     ".p2align 4\n"
@@ -294,6 +317,113 @@ asm(
     "ret\n"
     ".cfi_endproc\n"
     ".size snapi_bridge_native_probe_with_register,.-snapi_bridge_native_probe_with_register\n");
+#elif defined(__APPLE__) && defined(__MACH__) && defined(__x86_64__)
+asm(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl _SnapiProbePushRegisters\n"
+    ".private_extern _SnapiProbePushRegisters\n"
+    "_SnapiProbePushRegisters:\n"
+    ".cfi_startproc\n"
+    "push %r12\n"
+    ".cfi_adjust_cfa_offset 8\n"
+    ".cfi_offset %r12,-16\n"
+    "movabs $0x51a7c0de19b4e601,%r12\n"
+    "call _PushAllRegistersAndIterateStack\n"
+    "pop %r12\n"
+    ".cfi_restore %r12\n"
+    ".cfi_adjust_cfa_offset -8\n"
+    "ret\n"
+    ".cfi_endproc\n"
+    ".p2align 4\n"
+    ".globl _snapi_bridge_native_probe_with_register\n"
+    ".private_extern _snapi_bridge_native_probe_with_register\n"
+    "_snapi_bridge_native_probe_with_register:\n"
+    ".cfi_startproc\n"
+    "push %r12\n"
+    ".cfi_adjust_cfa_offset 8\n"
+    ".cfi_offset %r12,-16\n"
+    "movabs $0x51a7c0de19b4e602,%r12\n"
+    "test %edx,%edx\n"
+    "jnz 1f\n"
+    "movabs $0x51a7c0de19b4e604,%r12\n"
+    "1:\n"
+    "mov %rdi,%r8\n"
+    "mov %rsi,%rdi\n"
+    "call *%r8\n"
+    "pop %r12\n"
+    ".cfi_restore %r12\n"
+    ".cfi_adjust_cfa_offset -8\n"
+    "ret\n"
+    ".cfi_endproc\n");
+#elif defined(__APPLE__) && defined(__MACH__) && defined(__aarch64__)
+asm(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl _SnapiProbePushRegisters\n"
+    ".private_extern _SnapiProbePushRegisters\n"
+    "_SnapiProbePushRegisters:\n"
+    ".cfi_startproc\n"
+    "stp x29, x30, [sp, #-32]!\n"
+    ".cfi_def_cfa_offset 32\n"
+    ".cfi_offset 29, -32\n"
+    ".cfi_offset 30, -24\n"
+    "stp x19, x20, [sp, #16]\n"
+    ".cfi_offset 19, -16\n"
+    ".cfi_offset 20, -8\n"
+    "mov x29, sp\n"
+    ".cfi_def_cfa_register 29\n"
+    "movz x19, #0xe601\n"
+    "movk x19, #0x19b4, lsl #16\n"
+    "movk x19, #0xc0de, lsl #32\n"
+    "movk x19, #0x51a7, lsl #48\n"
+    "bl _PushAllRegistersAndIterateStack\n"
+    "ldp x19, x20, [sp, #16]\n"
+    ".cfi_restore 19\n"
+    ".cfi_restore 20\n"
+    "ldp x29, x30, [sp], #32\n"
+    ".cfi_restore 29\n"
+    ".cfi_restore 30\n"
+    ".cfi_def_cfa sp, 0\n"
+    "ret\n"
+    ".cfi_endproc\n"
+    ".p2align 2\n"
+    ".globl _snapi_bridge_native_probe_with_register\n"
+    ".private_extern _snapi_bridge_native_probe_with_register\n"
+    "_snapi_bridge_native_probe_with_register:\n"
+    ".cfi_startproc\n"
+    "stp x29, x30, [sp, #-32]!\n"
+    ".cfi_def_cfa_offset 32\n"
+    ".cfi_offset 29, -32\n"
+    ".cfi_offset 30, -24\n"
+    "stp x19, x20, [sp, #16]\n"
+    ".cfi_offset 19, -16\n"
+    ".cfi_offset 20, -8\n"
+    "mov x29, sp\n"
+    ".cfi_def_cfa_register 29\n"
+    "movz x19, #0xe602\n"
+    "cbnz w2, 1f\n"
+    "movz x19, #0xe604\n"
+    "1:\n"
+    "movk x19, #0x19b4, lsl #16\n"
+    "movk x19, #0xc0de, lsl #32\n"
+    "movk x19, #0x51a7, lsl #48\n"
+    "mov x9, x0\n"
+    "mov x0, x1\n"
+    "blr x9\n"
+    "ldp x19, x20, [sp, #16]\n"
+    ".cfi_restore 19\n"
+    ".cfi_restore 20\n"
+    "ldp x29, x30, [sp], #32\n"
+    ".cfi_restore 29\n"
+    ".cfi_restore 30\n"
+    ".cfi_def_cfa sp, 0\n"
+    "ret\n"
+    ".cfi_endproc\n");
+#else
+#error "native stack diagnostics require an audited target register helper"
+#endif
+
 
 // Host-only unregistered diagnostics. Counters are fixed TLS storage; the GC
 // forwarding path allocates nothing and invokes only the original visitor.
@@ -409,7 +539,7 @@ void ScanNativeUsedSegments(void* stack, void* raw, const void* marker) {
 }
 
 extern "C" void SnapiStackScanner(void*, void*)
-    asm("_ZNK4heap4base5Stack26IteratePointersUntilMarkerEPNS0_12StackVisitorE");
+    asm(SNAPI_NATIVE_SYMBOL("_ZNK4heap4base5Stack26IteratePointersUntilMarkerEPNS0_12StackVisitorE"));
 extern "C" void SnapiStackScanner(void* stack, void* visitor) {
   // Unowned ordinary OS V8 calls and background stack iteration keep the
   // original implementation. This adapts only positively owned bridge frames,
@@ -522,13 +652,13 @@ bool CurrentPhysicalOrigin(uintptr_t* origin) noexcept {
 }
 
 extern "C" uintptr_t SnapiGetStackStart() noexcept
-    asm("_ZN2v84base5Stack13GetStackStartEv");
+    asm(SNAPI_NATIVE_SYMBOL("_ZN2v84base5Stack13GetStackStartEv"));
 extern "C" uintptr_t SnapiGetStackStart() noexcept {
   uintptr_t origin = 0;
   return CurrentPhysicalOrigin(&origin) ? origin : SnapiOriginalGetStackStart();
 }
 extern "C" uintptr_t SnapiGetStackStartUnchecked() noexcept
-    asm("_ZN2v84base5Stack22GetStackStartUncheckedEv");
+    asm(SNAPI_NATIVE_SYMBOL("_ZN2v84base5Stack22GetStackStartUncheckedEv"));
 extern "C" uintptr_t SnapiGetStackStartUnchecked() noexcept {
   uintptr_t origin = 0;
   return CurrentPhysicalOrigin(&origin) ? origin : SnapiOriginalGetStackStartUnchecked();
@@ -539,7 +669,7 @@ extern "C" uintptr_t SnapiGetStackStartUnchecked() noexcept {
 // The caller holds recursive ExecutionAccess, as does upstream's own optional
 // stored-limit SetStackLimit call. Clamp before further isolate bootstrap.
 extern "C" void SnapiStackGuardInitThread(void*, const void*) noexcept
-    asm("_ZN2v88internal10StackGuard10InitThreadERKNS0_15ExecutionAccessE");
+    asm(SNAPI_NATIVE_SYMBOL("_ZN2v88internal10StackGuard10InitThreadERKNS0_15ExecutionAccessE"));
 extern "C" void SnapiStackGuardInitThread(void* guard, const void* access) noexcept {
   SnapiOriginalStackGuardInitThread(guard, access);
   auto* frame = current_native_frame;

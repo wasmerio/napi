@@ -1,10 +1,18 @@
 #![cfg(all(
-    not(target_arch = "wasm32"),
     feature = "experimental-async",
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_env = "gnu",
-    target_pointer_width = "64"
+    any(
+        all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_pointer_width = "64"
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_pointer_width = "64"
+        )
+    )
 ))]
 
 //! Native V8 JSPI promises must stay independent from parked Wasmer roots.
