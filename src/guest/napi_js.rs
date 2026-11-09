@@ -31,7 +31,8 @@ use super::{BridgeName, abi, compat, util::*};
 use crate::snapi_js::{
     host_js_create_realm, host_js_current_realm_data, host_js_define_binding,
     host_js_discard_realm, host_js_get_named_property, host_js_has_named_property,
-    host_js_has_secondary_realms, host_js_put_primitive, host_js_set_named_property, host_js_value,
+    host_js_has_secondary_realms, host_js_put_primitive, host_js_set_named_property,
+    host_js_stopped_snapshot_call, host_js_value,
 };
 
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
@@ -1641,8 +1642,8 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
 
 /// Deprecated (use create_realm), kept for older guests. Makes a realm over
 /// the sandbox, or with a fresh global for a symbol, and writes its global,
-/// which is also its realm id. A native Worker realm refuses it as it
-/// refuses create_realm.
+/// which is also its realm id. A native Worker realm keeps the legacy
+/// pending TypeError for this operation.
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_make_context(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1762,6 +1763,17 @@ fn guest_unofficial_napi_contextify_compile_function(
 
 // The host's JS engine exposes no compilation cache to a guest.
 // Snapshots need the V8 provider: the host's engine makes realms in JS.
+fn snapshot_call_env(env: &FunctionEnvMut<NapiEnv>, napi_env: u32) -> Result<SnapiEnv, i32> {
+    let handle = snapi_env(env, napi_env);
+    if handle.is_null() {
+        return Err(1);
+    }
+    if env.data().host_stopped() {
+        return Err(unsafe { host_js_stopped_snapshot_call(handle) });
+    }
+    Ok(handle)
+}
+
 fn guest_unofficial_napi_snapshot_commit(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1771,11 +1783,7 @@ fn guest_unofficial_napi_snapshot_commit(
     _length: u32,
     _index_out: u32,
 ) -> i32 {
-    if snapi_env(&env, napi_env).is_null() {
-        1
-    } else {
-        9
-    }
+    snapshot_call_env(&env, napi_env).map_or_else(|status| status, |_| 9)
 }
 
 fn guest_unofficial_napi_snapshot_guest_data(
@@ -1840,14 +1848,13 @@ fn guest_unofficial_napi_define_binding(
     function_out: u32,
     prototype_out: u32,
 ) -> i32 {
-    let handle = snapi_env(&env, napi_env);
-    if handle.is_null()
-        || !matches!(kind, 1 | 2)
-        || function_out == 0
-        || (kind == 1 && prototype_out == 0)
-    {
+    if !matches!(kind, 1 | 2) || function_out == 0 || (kind == 1 && prototype_out == 0) {
         return 1;
     }
+    let handle = match snapshot_call_env(&env, napi_env) {
+        Ok(handle) => handle,
+        Err(status) => return status,
+    };
     if function_length > 255 || (kind == 2 && prototype_out != 0) {
         return 1;
     }
@@ -1910,11 +1917,13 @@ fn guest_unofficial_napi_create_realm(
     global_out: u32,
     root_out: u32,
 ) -> i32 {
-    let handle = snapi_env(&env, napi_env);
-    if handle.is_null() || !matches!(mode, 1..=3) || realm_out == 0 || (mode == 3 && root_out == 0)
-    {
+    if !matches!(mode, 1..=3) || realm_out == 0 || (mode == 3 && root_out == 0) {
         return 1;
     }
+    let handle = match snapshot_call_env(&env, napi_env) {
+        Ok(handle) => handle,
+        Err(status) => return status,
+    };
     if mode != 1 || !host_js_has_secondary_realms() {
         return 9;
     }

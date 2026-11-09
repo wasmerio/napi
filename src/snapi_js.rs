@@ -380,6 +380,8 @@ export function wasmer_napi_console_error(message) {
 //   enterDeferredCallback(document) (optional): checks and activates a private
 //     token previously passed by invokeCallback to dispatch. Returns a frame
 //     with mapResult(result) and leave(); a throw rejects the deferred call.
+//     Without the hook the token is ignored, and deferred calls still run
+//     inside the enterCallback/leaveCallback bracket.
 //   release() (optional): the environment was released.
 //   checkpoint(allowHostTasks, hasRunnableWork) (optional): runs an event loop
 //     turn; returns a Promise. Without it, the default checkpoint runs. A
@@ -592,8 +594,6 @@ for (const key of [
     });
   }
 }
-// Cache by capture function: the embedding SDK may install a stack shim later.
-// A reusable native accessor avoids capturing a second stack on modern V8.
 const wasmerNapiDefineProperty = Object.defineProperty;
 const wasmerNapiCreate = Object.create;
 const wasmerNapiGetDescriptors = Object.getOwnPropertyDescriptors;
@@ -613,6 +613,11 @@ const wasmerNapiErrorConstructors = {
   __proto__: null, Error, EvalError, RangeError, ReferenceError, SyntaxError,
   TypeError, URIError, AggregateError: globalThis.AggregateError,
 };
+const wasmerNapiErrorNames = [
+  'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
+  'TypeError', 'URIError', 'AggregateError',
+];
+const wasmerNapiErrorProperties = wasmerNapiGetDescriptors(wasmerNapiErrorConstructors.Error);
 function wasmerNapiPlainDescriptor(descriptor) {
   if (!descriptor) return undefined;
   const { enumerable, configurable } = descriptor;
@@ -620,51 +625,54 @@ function wasmerNapiPlainDescriptor(descriptor) {
     ? {__proto__: null, enumerable, configurable, value: descriptor.value, writable: descriptor.writable}
     : {__proto__: null, enumerable, configurable, get: descriptor.get, set: descriptor.set};
 }
-const wasmerNapiStackSupportCache = new WeakMap();
-function wasmerNapiGetStackSupport() {
+// Probe once before any guest can change the host Error, including when
+// stack formatting is unavailable. Embedders can install shims before load.
+const wasmerNapiStackSupport = (() => {
   const rootError = wasmerNapiErrorConstructors.Error;
-  const captureStackTrace = rootError.captureStackTrace;
+  const capture = wasmerNapiErrorProperties.captureStackTrace;
+  const captureStackTrace = capture && wasmerNapiOwn(capture, 'value') ? capture.value : undefined;
   if (typeof captureStackTrace !== 'function') return undefined;
-  if (wasmerNapiLazyGet(wasmerNapiStackSupportCache, captureStackTrace) !== undefined) {
-    return wasmerNapiLazyGet(wasmerNapiStackSupportCache, captureStackTrace);
-  }
-  const saved = wasmerNapiLazyDescriptor(rootError,'prepareStackTrace');
+  const saved = wasmerNapiErrorProperties.prepareStackTrace;
   const marker = {};
-  let support;
   try {
     wasmerNapiDefineProperty(rootError,'prepareStackTrace',{
       __proto__: null, value:()=>marker,writable:true,configurable:true,
     });
     const holder = {};
     captureStackTrace(holder);
-    const {get} = wasmerNapiLazyDescriptor(holder,'stack');
-    if (holder.stack === marker) {
-      // Shim accessors can close over their target instead of using `this`.
-      rootError.prepareStackTrace = error => error;
-      const error = new rootError();
-      let nativeGet;
-      try { if (get && wasmerNapiApply(get,error,[]) === error) nativeGet = get; } catch {}
-      support = {get:nativeGet, captureStackTrace};
-    }
+    const descriptor = wasmerNapiLazyDescriptor(holder,'stack');
+    if (!descriptor || holder.stack !== marker) return undefined;
+    const get = wasmerNapiOwn(descriptor, 'get') ? descriptor.get : undefined;
+    // Shim accessors can close over their target instead of using `this`.
+    rootError.prepareStackTrace = error => error;
+    const error = new rootError();
+    let nativeGet;
+    try { if (get && wasmerNapiApply(get,error,[]) === error) nativeGet = get; } catch {}
+    return {get:nativeGet, captureStackTrace};
+  } catch {
+    return undefined;
   } finally {
-    if (saved) wasmerNapiDefineProperty(rootError,'prepareStackTrace',wasmerNapiPlainDescriptor(saved));
-    else delete rootError.prepareStackTrace;
+    try {
+      if (saved) wasmerNapiDefineProperty(rootError,'prepareStackTrace',wasmerNapiPlainDescriptor(saved));
+      else wasmerNapiDelete(rootError,'prepareStackTrace');
+    } catch {}
   }
-  wasmerNapiLazySet(wasmerNapiStackSupportCache,captureStackTrace,support);
-  return support;
-}
+})();
 // Give each N-API virtual context its own mutable Error constructors.
 // Native instances/prototypes still come from the host; this is focused on
 // bootstrap ownership and is not a replacement for a separate JS realm.
 function wasmerNapiInstallErrorConstructors(context) {
   const rootError = wasmerNapiErrorConstructors.Error;
-  const wasmerNapiStackSupport = wasmerNapiGetStackSupport();
   let localError;
   const stackKeys = ['prepareStackTrace', 'stackTraceLimit'];
   const withStackSettings = (callback, error, keys = stackKeys) => {
-    const saved = keys.map(key => wasmerNapiLazyDescriptor(rootError,key));
+    const saved = wasmerNapiCreate(null);
+    for (let i = 0; i < keys.length; i++) {
+      saved[i] = wasmerNapiLazyDescriptor(rootError,keys[i]);
+    }
     try {
-      for (const key of keys) {
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
         let value = localError[key];
         if (key === 'prepareStackTrace' && typeof value === 'function' && error) {
           const format = value;
@@ -674,8 +682,9 @@ function wasmerNapiInstallErrorConstructors(context) {
       }
       return callback();
     } finally {
-      for (const [index,key] of keys.entries()) {
-        if (saved[index]) wasmerNapiDefineProperty(rootError,key,wasmerNapiPlainDescriptor(saved[index]));
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (saved[i]) wasmerNapiDefineProperty(rootError,key,wasmerNapiPlainDescriptor(saved[i]));
         else delete rootError[key];
       }
     }
@@ -706,12 +715,12 @@ function wasmerNapiInstallErrorConstructors(context) {
       },
     });
   };
-  for (const name of [
-    'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
-    'TypeError', 'URIError', 'AggregateError',
-  ]) {
+  for (let i = 0; i < wasmerNapiErrorNames.length; i++) {
+    const name = wasmerNapiErrorNames[i];
     const NativeError = wasmerNapiErrorConstructors[name];
     if (typeof NativeError !== 'function') continue;
+    const descriptors = name === 'Error' ? wasmerNapiErrorProperties : wasmerNapiGetDescriptors(NativeError);
+    const arity = wasmerNapiOwn(descriptors, 'length') ? descriptors.length : undefined;
     const LocalError = function (...args) {
       const construct = () => wasmerNapiConstruct(NativeError, args, new.target ?? LocalError);
       const value = wasmerNapiStackSupport?.get
@@ -723,22 +732,25 @@ function wasmerNapiInstallErrorConstructors(context) {
     };
     wasmerNapiDefineProperty(LocalError, 'name', { __proto__: null, value: name, configurable: true });
     wasmerNapiDefineProperty(LocalError, 'length', {
-      __proto__: null, value: NativeError.length, configurable: true,
+      __proto__: null, value: arity && wasmerNapiOwn(arity, 'value') ? arity.value : 0, configurable: true,
     });
     wasmerNapiSetPrototypeOf(LocalError, localError ?? NativeError);
-    const descriptors = wasmerNapiGetDescriptors(NativeError);
-    for (const key of ['name', 'length', 'prototype', 'arguments', 'caller']) {
-      delete descriptors[key];
-    }
-    for (const key of wasmerNapiOwnKeys(descriptors))
+    const staticKeys = wasmerNapiOwnKeys(descriptors);
+    for (let i = 0; i < staticKeys.length; i++) {
+      const key = staticKeys[i];
+      if (key === 'name' || key === 'length' || key === 'prototype' || key === 'arguments' || key === 'caller') continue;
       wasmerNapiDefineProperty(LocalError, key, wasmerNapiPlainDescriptor(descriptors[key]));
+    }
     // Edge snapshots own prototype methods into its primordials. Inherited
     // methods alone would omit ErrorPrototypeToString from that snapshot.
     const prototype = wasmerNapiCreate(localError?.prototype ?? NativeError.prototype);
     const prototypeDescriptors = wasmerNapiGetDescriptors(NativeError.prototype);
-    for (const key of wasmerNapiOwnKeys(prototypeDescriptors))
+    const prototypeKeys = wasmerNapiOwnKeys(prototypeDescriptors);
+    for (let i = 0; i < prototypeKeys.length; i++) {
+      const key = prototypeKeys[i];
       if (key !== 'constructor')
         wasmerNapiDefineProperty(prototype, key, wasmerNapiPlainDescriptor(prototypeDescriptors[key]));
+    }
     wasmerNapiDefineProperty(prototype, 'constructor', {
       __proto__: null, value: LocalError, writable: true, configurable: true,
     });
@@ -773,7 +785,9 @@ function wasmerNapiSnapshotGlobal() {
 }
 function wasmerNapiSyncGlobalScope(context, snapshot) {
   const target = context.scopeTarget;
-  for (const key of wasmerNapiOwnKeys(target)) {
+  const targetKeys = wasmerNapiOwnKeys(target);
+  for (let i = 0; i < targetKeys.length; i++) {
+    const key = targetKeys[i];
     if (key === 'global' || key === 'globalThis') continue;
     // Host scheduling primitives intentionally stay local to each N-API
     // context. Edge replaces some of them (notably setTimeout and
@@ -784,7 +798,9 @@ function wasmerNapiSyncGlobalScope(context, snapshot) {
       try { delete target[key]; } catch {}
     }
   }
-  for (const key of wasmerNapiOwnKeys(snapshot)) {
+  const snapshotKeys = wasmerNapiOwnKeys(snapshot);
+  for (let i = 0; i < snapshotKeys.length; i++) {
+    const key = snapshotKeys[i];
     if (key === 'global' || key === 'globalThis') continue;
     if (wasmerNapiSetHas(wasmerNapiHostSchedulingGlobals, key) &&
         wasmerNapiOwn(target, key)) {
@@ -838,7 +854,8 @@ export function wasmer_napi_make_callback(context, dispatch, realm) {
   wasmerNapiLazyDefine(callbacks.dispatches, index, { __proto__: null, value: dispatch });
   const invoke = wasmerNapiCallbackInvoker(
     context.nativeRealm === true,
-    (receiver, args, target, owner) => callbacks.dispatches?.[index]?.(receiver, args, target, realm, owner),
+    (receiver, args, target, document) =>
+      callbacks.dispatches?.[index]?.(receiver, args, target, realm, document),
     () => callbacks.dispatches !== undefined,
   );
   return function (...args) {
@@ -866,18 +883,19 @@ export function wasmer_napi_set_binding_dispatch(context, dispatch) {
   context.callbacks.bindingDispatch = dispatch;
 }
 const wasmerNapiSliceArguments = Function.call.bind(Array.prototype.slice);
-function wasmerNapiBindingInvoker(context, reg, realm) {
+function wasmerNapiBindingInvoker(context, callback, data, realm) {
   const callbacks = context.callbacks;
   return wasmerNapiCallbackInvoker(
     context.nativeRealm === true,
-    (receiver, args, target, owner) => callbacks.bindingDispatch?.(reg, receiver, args, target, realm, owner),
+    (receiver, args, target, document) =>
+      callbacks.bindingDispatch?.(callback, data, receiver, args, target, realm, document),
     () => callbacks.bindingDispatch !== undefined,
   );
 }
 // This code is parsed once as a strict module. Guest names are keys, never
 // source, and descriptors cannot inherit author-defined get/set/value fields.
-export function wasmer_napi_binding_function(context, realm, kind, name, length, reg) {
-  const invoke = wasmerNapiBindingInvoker(context, reg, realm);
+export function wasmer_napi_binding_function(context, realm, kind, name, length, callback, data) {
+  const invoke = wasmerNapiBindingInvoker(context, callback, data, realm);
   const fn = kind === 1
     ? function (...args) { return invoke(this, args, new.target); }
     : ({[name](...args) { return invoke(this, args, undefined); }})[name];
@@ -902,21 +920,23 @@ export function wasmer_napi_binding_prototype(ctor, parent, parentPrototype) {
   }
   return prototype;
 }
-export function wasmer_napi_binding_member(context, realm, target, name, attributes, value, getter, setter) {
+export function wasmer_napi_binding_member(context, realm, target, name, attributes, value, method, length, getter, setter, data) {
   const descriptor = {__proto__: null, enumerable: (attributes & 2) !== 0, configurable: (attributes & 4) !== 0};
   if (getter || setter) {
     if (getter) {
-      const invoke = wasmerNapiBindingInvoker(context, getter, realm);
+      const invoke = wasmerNapiBindingInvoker(context, getter, data, realm);
       const holder = {get [name]() { return invoke(this, wasmerNapiSliceArguments(arguments), undefined); }};
       descriptor.get = wasmerNapiLazyDescriptor(holder, name).get;
     }
     if (setter) {
-      const invoke = wasmerNapiBindingInvoker(context, setter, realm);
+      const invoke = wasmerNapiBindingInvoker(context, setter, data, realm);
       const holder = {set [name](value) { return invoke(this, wasmerNapiSliceArguments(arguments), undefined); }};
       descriptor.set = wasmerNapiLazyDescriptor(holder, name).set;
     }
   } else {
-    descriptor.value = value;
+    descriptor.value = method
+      ? wasmer_napi_binding_function(context, realm, 2, name, length, method, data)
+      : value;
     descriptor.writable = (attributes & 1) !== 0;
   }
   wasmerNapiDefineProperty(target, name, descriptor);
@@ -1009,7 +1029,7 @@ export function wasmer_napi_native_realm_enter() {
   }
 }
 export function wasmer_napi_native_realm_enter_deferred(document) {
-  return document === undefined ? undefined : wasmerNapiNativeRealm.enterDeferredCallback(document);
+  return document === undefined ? undefined : wasmerNapiNativeRealm?.enterDeferredCallback?.(document);
 }
 export function wasmer_napi_native_realm_leave_deferred(frame, value, map) {
   if (frame === undefined) return value;
@@ -1048,7 +1068,7 @@ export function wasmer_napi_create_realm_registry() {
 export function wasmer_napi_create_realm_context(registry, sandbox, realmData = 0) {
   // A native Worker realm serves one env and makes no other realms.
   if (wasmerNapiNativeRealm !== undefined) {
-    throw new TypeError(
+    throw new wasmerNapiLazyTypeError(
       'Secondary contexts are unsupported in a native Worker realm; start a fresh Worker');
   }
   const base = wasmer_napi_create_global_context();
@@ -1736,7 +1756,8 @@ extern "C" {
         kind: u32,
         name: &str,
         length: u32,
-        reg: u32,
+        callback: u32,
+        data: u32,
     ) -> Result<JsValue, JsValue>;
     fn wasmer_napi_binding_parent(classes: &JsValue, ctor: &JsValue) -> JsValue;
     fn wasmer_napi_binding_register_class(classes: &JsValue, ctor: &JsValue, prototype: &JsValue);
@@ -1754,8 +1775,11 @@ extern "C" {
         name: &str,
         attrs: i32,
         value: &JsValue,
+        method: u32,
+        length: u32,
         getter: u32,
         setter: u32,
+        data: u32,
     ) -> Result<(), JsValue>;
     fn wasmer_napi_enqueue_microtask(callback: &Function);
     fn wasmer_napi_event_loop_checkpoint(
@@ -1998,7 +2022,7 @@ struct CallbackReg {
 /// returns the result or the exception to throw.
 type CallbackFn = dyn Fn(JsValue, Array, JsValue, JsValue, JsValue) -> Result<JsValue, JsValue>;
 type BindingDispatch =
-    dyn Fn(u32, JsValue, Array, JsValue, JsValue, JsValue) -> Result<JsValue, JsValue>;
+    dyn Fn(u32, u32, JsValue, Array, JsValue, JsValue, JsValue) -> Result<JsValue, JsValue>;
 type CallbackClosure = Closure<CallbackFn>;
 
 struct CallbackInfo {
@@ -2018,24 +2042,11 @@ struct PendingCallback {
     registration: CallbackReg,
     cbinfo: u32,
     inputs: CallbackInputs,
-    /// The function's realm and owner, even across repeated deferrals.
-    realm: CallbackRealm,
+    /// The function's realm, even across repeated deferrals.
+    realm: Option<JsValue>,
     document: JsValue,
     resolve: Function,
     reject: Function,
-}
-
-#[derive(Default)]
-struct CallbackRealm {
-    context: Option<JsValue>,
-    data: u32,
-}
-
-impl CallbackRealm {
-    fn from_context(context: Option<JsValue>) -> Self {
-        let data = context.as_ref().map_or(0, wasmer_napi_realm_data);
-        Self { context, data }
-    }
 }
 
 /// An entry of an env's realm stack: a scope opened with enter_realm, or a
@@ -2045,7 +2056,7 @@ struct RealmEntry {
     token: u64,
     /// The context of the realm current while this is the innermost entry,
     /// None for the env's own.
-    realm: CallbackRealm,
+    realm: Option<JsValue>,
 }
 
 struct ValueFrame {
@@ -2256,21 +2267,21 @@ impl HostJsEnv {
 
     /// The context of the current realm, None for the env's own.
     fn current_realm(&self) -> Option<&JsValue> {
-        self.realm_stack.last()?.realm.context.as_ref()
+        self.realm_stack.last()?.realm.as_ref()
     }
 
     /// Makes `realm` (None: the env's own) current for a native callback or
     /// finalizer about to run. Returns the depth to pass to `leave_callback`.
-    fn enter_callback(&mut self, realm: CallbackRealm) -> usize {
+    fn enter_callback(&mut self, realm: Option<JsValue>) -> usize {
         self.realm_stack.push(RealmEntry { token: 0, realm });
         self.realm_stack.len() - 1
     }
 
     /// Ends the callback `enter_callback` started at `depth`, closing the
     /// scopes it left open, and returns the realm it ran in.
-    fn leave_callback(&mut self, depth: usize) -> CallbackRealm {
+    fn leave_callback(&mut self, depth: usize) -> Option<JsValue> {
         if depth >= self.realm_stack.len() {
-            return CallbackRealm::default();
+            return None;
         }
         self.realm_stack.truncate(depth + 1);
         self.realm_stack.pop().unwrap().realm
@@ -4310,7 +4321,7 @@ unsafe fn drain_guest_finalizers(env: SnapiEnv, force: bool) -> i32 {
             };
             let value_frame = state.agent.open_value_frame();
             // Finalizers run in the env's own realm.
-            let realm_depth = state.enter_callback(CallbackRealm::default());
+            let realm_depth = state.enter_callback(None);
             (
                 record,
                 state.agent.active_callback_ctx,
@@ -4489,8 +4500,7 @@ fn dispatch_callback(
         let value_frame = state.agent.open_value_frame();
         let cb = state.agent.alloc_cbinfo();
         state.agent.set_cbinfo(cb, &inputs, registration.data);
-        let realm = CallbackRealm::from_context((!realm.is_undefined()).then_some(realm));
-        let realm_depth = state.enter_callback(realm);
+        let realm_depth = state.enter_callback((!realm.is_undefined()).then_some(realm));
         (
             value_frame,
             cb,
@@ -4602,56 +4612,15 @@ pub(crate) unsafe fn host_js_define_binding(
         .collect::<Result<Vec<_>, i32>>()?;
     let realm = state.current_realm().cloned().unwrap_or(JsValue::UNDEFINED);
     let context = &state.global_context;
-    let mut registrations = Vec::new();
-    let mut next = state.next_callback;
-    let mut register = |wasm_fn_ptr, data| {
-        if wasm_fn_ptr == 0 {
-            return 0;
-        }
-        while state.callback_regs.contains_key(&next) {
-            next = next.wrapping_add(1).max(1);
-        }
-        let id = next;
-        next = id.wrapping_add(1).max(1);
-        registrations.push((
-            id,
-            CallbackReg {
-                guest_env,
-                wasm_fn_ptr,
-                data: u64::from(data),
-            },
-        ));
-        id
-    };
     // All handles and fields have been validated. These helpers touch only new
     // functions/objects and never execute author code.
     let build = || -> Result<_, JsValue> {
-        let ctor = wasmer_napi_binding_function(
-            context,
-            &realm,
-            kind,
-            name,
-            length,
-            register(callback, data),
-        )?;
+        let ctor = wasmer_napi_binding_function(context, &realm, kind, name, length, callback, data)?;
         if kind == 2 {
             return Ok((ctor, JsValue::UNDEFINED));
         }
         let prototype = wasmer_napi_binding_prototype(&ctor, &parent, &parent_prototype)?;
         for (index, (member, value)) in members.iter().zip(values).enumerate() {
-            let name = member.name.to_string_lossy();
-            let value = if member.method != 0 {
-                wasmer_napi_binding_function(
-                    context,
-                    &realm,
-                    2,
-                    &name,
-                    lengths.map_or(0, |lengths| u32::from(lengths[index])),
-                    register(member.method, member.data),
-                )?
-            } else {
-                value
-            };
             let target = if member.attrs & 1024 == 0 {
                 &prototype
             } else {
@@ -4661,11 +4630,14 @@ pub(crate) unsafe fn host_js_define_binding(
                 context,
                 &realm,
                 target,
-                &name,
+                &member.name.to_string_lossy(),
                 member.attrs,
                 &value,
-                register(member.getter, member.data),
-                register(member.setter, member.data),
+                member.method,
+                lengths.map_or(0, |lengths| u32::from(lengths[index])),
+                member.getter,
+                member.setter,
+                member.data,
             )?;
         }
         Ok((ctor, prototype))
@@ -4673,17 +4645,17 @@ pub(crate) unsafe fn host_js_define_binding(
     let (function, prototype) = build().map_err(|_| NAPI_GENERIC_FAILURE)?;
     if state.binding_dispatch.is_none() {
         let live_env_addr = state.live_env_addr.clone();
+        // This dispatcher belongs to one guest env. The wrappers own their
+        // callback metadata, so it is collected with them.
         let dispatch = Closure::wrap(Box::new(
-            move |reg, this, args, new_target, realm, document| {
-                let Ok(state) = (unsafe { env_mut(live_env_addr.get() as SnapiEnv) }) else {
-                    return Ok(JsValue::UNDEFINED);
-                };
-                let Some(registration) = state.callback_regs.get(&reg).copied() else {
-                    return Ok(JsValue::UNDEFINED);
-                };
+            move |wasm_fn_ptr, data, this, args, new_target, realm, document| {
                 dispatch_callback(
                     &live_env_addr,
-                    registration,
+                    CallbackReg {
+                        guest_env,
+                        wasm_fn_ptr,
+                        data: u64::from(data),
+                    },
                     "binding",
                     this,
                     args,
@@ -4696,8 +4668,6 @@ pub(crate) unsafe fn host_js_define_binding(
         wasmer_napi_set_binding_dispatch(&state.global_context, dispatch.as_ref().unchecked_ref());
         state.binding_dispatch = Some(dispatch);
     }
-    state.next_callback = next;
-    state.callback_regs.extend(registrations);
     let prototype_id = if kind == 1 {
         wasmer_napi_binding_register_class(&state.binding_classes, &function, &prototype);
         state.agent.insert(prototype)
@@ -5811,15 +5781,22 @@ pub(crate) fn host_js_has_secondary_realms() -> bool {
     !has_native_realm()
 }
 
+pub(crate) unsafe fn host_js_stopped_snapshot_call(env: SnapiEnv) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    // The embedding engine has no interrupt API. Honor the host's sticky
+    // stop on entry and expose the same null pending marker as native hosts.
+    state.last_exception.get_or_insert(JsValue::NULL);
+    NAPI_PENDING_EXCEPTION
+}
+
 pub(crate) unsafe fn host_js_create_realm(
     env: SnapiEnv,
     sandbox_id: u32,
     owner: u32,
 ) -> Result<u32, i32> {
     let state = unsafe { env_mut(env) }?;
-    if !host_js_has_secondary_realms() {
-        return Err(NAPI_GENERIC_FAILURE);
-    }
     let sandbox = if sandbox_id == 0 {
         JsValue::NULL
     } else {
@@ -5862,10 +5839,9 @@ pub(crate) unsafe fn host_js_discard_realm(env: SnapiEnv, id: u32) {
 
 pub(crate) unsafe fn host_js_current_realm_data(env: SnapiEnv) -> Result<u64, i32> {
     let state = unsafe { env_mut(env) }?;
-    Ok(state
-        .realm_stack
-        .last()
-        .map_or(0, |entry| u64::from(entry.realm.data)))
+    // The realm already retains its owner. Only a guest that asks for it
+    // crosses into JS to read it.
+    Ok(u64::from(state.current_realm().map_or(0, wasmer_napi_realm_data)))
 }
 
 /// Writes `value_id` when that value is a realm's global or sandbox, else 0.
@@ -5918,7 +5894,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_enter_realm(
     state.next_realm_scope += 1;
     state.realm_stack.push(RealmEntry {
         token,
-        realm: CallbackRealm::from_context(realm),
+        realm,
     });
     unsafe { scope_out.write(token) };
     NAPI_OK

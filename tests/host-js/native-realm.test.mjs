@@ -19,7 +19,7 @@ const apiNames = [...inline.matchAll(/export function (wasmer_napi_\w+)\(/g)].ma
 
 // Loads the host JavaScript into a fresh realm, with or without a native realm
 // bridge, and records what the bridge is asked to do.
-function load(native, overrides = {}) {
+function load(native, overrides = {}, setup = '') {
   const context = vm.createContext({ setTimeout, queueMicrotask, console });
   const calls = { scripts: [], depth: 0, enters: 0, leaves: 0, released: 0, checkpoints: [] };
   if (native) {
@@ -36,7 +36,7 @@ function load(native, overrides = {}) {
       ...overrides,
     };
   }
-  vm.runInContext(`'use strict';\n${script}\nthis.providerAPI = {${apiNames.join(',')}};`, context);
+  vm.runInContext(`'use strict';\n${setup}\n${script}\nthis.providerAPI = {${apiNames.join(',')}};`, context);
   return { context, api: context.providerAPI, calls };
 }
 
@@ -211,6 +211,18 @@ test('guest code run from a drain is bracketed in a native realm only', () => {
   ordinary.api.wasmer_napi_native_realm_leave();
 });
 
+test('deferred callbacks do not require an activation hook', () => {
+  const { api } = load(true);
+  assert.equal(api.wasmer_napi_native_realm_enter_deferred({}), undefined);
+  const expected = {};
+  const native = load(true, { enterDeferredCallback(document) {
+    assert.equal(document, expected);
+    return { mapResult(value) { return value + 1; }, leave() {} };
+  }});
+  const frame = native.api.wasmer_napi_native_realm_enter_deferred(expected);
+  assert.equal(native.api.wasmer_napi_native_realm_leave_deferred(frame, 41, true), 42);
+});
+
 test('binding factories build native class and method shapes under poisoned intrinsics', () => {
   const { context, api } = load(false);
   const root = api.wasmer_napi_create_global_context();
@@ -219,8 +231,8 @@ test('binding factories build native class and method shapes under poisoned intr
   const realm = api.wasmer_napi_realm_context(registry, key);
   assert.equal(api.wasmer_napi_realm_data(realm), 27);
   const calls = [];
-  api.wasmer_napi_set_binding_dispatch(root, (reg, receiver, args, target, current) => {
-    calls.push({ reg, receiver, args: [...args], target, current });
+  api.wasmer_napi_set_binding_dispatch(root, (reg, data, receiver, args, target, current) => {
+    calls.push({ reg, data, receiver, args: [...args], target, current });
     return reg;
   });
   vm.runInContext(
@@ -228,13 +240,13 @@ test('binding factories build native class and method shapes under poisoned intr
     + "for (const key of ['get', 'set', 'value']) define(Object.prototype, key, {__proto__:null,get(){throw Error(key);}});",
     context,
   );
-  const base = api.wasmer_napi_binding_function(root, realm, 1, 'Base', 2, 1);
+  const base = api.wasmer_napi_binding_function(root, realm, 1, 'Base', 2, 1, 0);
   const basePrototype = api.wasmer_napi_binding_prototype(base, undefined, undefined);
-  const derived = api.wasmer_napi_binding_function(root, realm, 1, 'Derived', 3, 2);
+  const derived = api.wasmer_napi_binding_function(root, realm, 1, 'Derived', 3, 2, 19);
   const derivedPrototype = api.wasmer_napi_binding_prototype(derived, base, basePrototype);
-  const fn = api.wasmer_napi_binding_function(root, realm, 2, 'name with spaces', 4, 3);
-  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'm', 5, fn, 0, 0);
-  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'x', 6, undefined, 4, 5);
+  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'name with spaces', 5, undefined, 3, 4, 0, 0, 23);
+  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'x', 6, undefined, 0, 0, 4, 5, 29);
+  const fn = derivedPrototype['name with spaces'];
   const accessor = Object.getOwnPropertyDescriptor(derivedPrototype, 'x');
   assert.equal(Object.getPrototypeOf(derived), base);
   assert.equal(Object.getPrototypeOf(derivedPrototype), basePrototype);
@@ -247,6 +259,8 @@ test('binding factories build native class and method shapes under poisoned intr
   const obj = new derived();
   assert.equal(obj instanceof base, true);
   assert.equal(calls.at(-1).target, derived);
+  assert.equal(calls.at(-1).data, 19);
+  assert.equal(calls.at(-1).current, realm);
   assert.equal(derived.call(base), 2);
   assert.equal(calls.at(-1).receiver, base);
   assert.equal(calls.at(-1).target, undefined);
@@ -257,6 +271,7 @@ test('binding factories build native class and method shapes under poisoned intr
   assert.equal(Object.hasOwn(fn, 'prototype'), false);
   assert.throws(() => new fn(), { name: 'TypeError' });
   assert.equal(fn.call(null), 3);
+  assert.equal(calls.at(-1).data, 23);
   assert.equal(calls.at(-1).receiver, null);
   assert.equal(fn.call(17), 3);
   assert.equal(calls.at(-1).receiver, 17);
@@ -270,6 +285,7 @@ test('binding factories build native class and method shapes under poisoned intr
   assert.deepEqual(calls.at(-1).args, [42]);
   assert.equal(accessor.set.call(obj), 5);
   assert.equal(calls.at(-1).reg, 5);
+  assert.equal(calls.at(-1).data, 29);
   assert.equal(accessor.get, Object.getOwnPropertyDescriptor(derivedPrototype, 'x').get);
   assert.equal(accessor.set, Object.getOwnPropertyDescriptor(derivedPrototype, 'x').set);
   assert.throws(() => new accessor.get(), { name: 'TypeError' });
@@ -281,12 +297,52 @@ test('binding factories build native class and method shapes under poisoned intr
 test('fresh realm setup uses captured reflection and realm registry methods', () => {
   const { context, api } = load(false);
   const registry = api.wasmer_napi_create_realm_registry();
+  const key = api.wasmer_napi_create_realm_context(registry, null, 41);
+  const realm = api.wasmer_napi_realm_context(registry, key);
+  api.wasmer_napi_context_eval(realm, `
+    const rootError = Object.getPrototypeOf(Error);
+    rootError.captureStackTrace = () => { throw Error('poisoned captureStackTrace'); };
+    Object.getPrototypeOf([][Symbol.iterator]()).next = () => { throw Error('poisoned iterator'); };
+  `);
   vm.runInContext(
     "const poisoned = () => { throw Error('poison'); };"
     + "Object.defineProperty = Object.getOwnPropertyDescriptors = Object.setPrototypeOf = poisoned;"
     + "Reflect.ownKeys = Reflect.get = WeakMap.prototype.get = WeakMap.prototype.set = poisoned;",
     context,
   );
-  const key = api.wasmer_napi_create_realm_context(registry, null, 41);
-  assert.equal(api.wasmer_napi_realm_data(api.wasmer_napi_realm_context(registry, key)), 41);
+  for (const owner of [73, 97]) {
+    const fresh = api.wasmer_napi_create_realm_context(registry, null, owner);
+    const realm = api.wasmer_napi_realm_context(registry, fresh);
+    assert.equal(api.wasmer_napi_realm_data(realm), owner);
+    assert.match(api.wasmer_napi_context_eval(realm, 'new Error("intact").stack'), /intact/);
+  }
+});
+
+test('an unsupported stack probe is attempted only once', () => {
+  const { context, api } = load(false, {}, `
+    let probes = 0;
+    Error.captureStackTrace = () => { ++probes; };
+  `);
+  api.wasmer_napi_create_global_context();
+  api.wasmer_napi_create_global_context();
+  assert.equal(vm.runInContext('probes', context), 1);
+});
+
+test('an embedder can install a stack shim before loading the provider', () => {
+  const { api } = load(false, {}, `
+    Error.captureStackTrace = target => {
+      Object.defineProperty(target, 'stack', {
+        configurable: true, get() {
+          return Error.prepareStackTrace(target, [{getFileName: () => '/stack-shim.js'}]);
+        },
+      });
+    };
+  `);
+  const context = api.wasmer_napi_create_global_context();
+  const error = api.wasmer_napi_context_eval(context, `
+    Error.prepareStackTrace = (error, frames) => ({ error, frames });
+    new Error('shim');
+  `);
+  assert.equal(error.stack.error, error);
+  assert.equal(error.stack.frames[0].getFileName(), '/stack-shim.js');
 });

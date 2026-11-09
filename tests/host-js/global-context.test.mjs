@@ -159,7 +159,6 @@ test('callbacks receive new.target, so napi_get_new_target can tell construction
 });
 
 test('retained callback wrappers do not retain closed contexts or dispatch captures', async () => {
-  const gc=globalThis.gc ?? (globalThis.Bun ? ()=>Bun.gc(true) : undefined);
   const references=[], callbacks=[];
   for(let i=0;i<12;i++) {
     (() => {
@@ -170,9 +169,8 @@ test('retained callback wrappers do not retain closed contexts or dispatch captu
       references.push(new WeakRef(context),new WeakRef(buffer));
     })();
   }
-  for(let i=0;i<8;i++) { await setImmediate(); gc(); }
   assert.ok(callbacks.every(fn=>fn()===undefined));
-  assert.equal(references.filter(reference=>reference.deref()).length,0);
+  await assertCollected(references);
 });
 
 test('Error constructors, static hooks and prototype writes stay local', () => {
@@ -236,39 +234,6 @@ test('Error.captureStackTrace targets use the local formatter', {skip:!stackForm
   assert.ok(object.stack.frames.length>0);
   object.stack='overridden';
   assert.equal(object.stack,'overridden');
-});
-
-test('a stack shim installed after module loading keeps its target and local formatter', () => {
-  const saved=Object.getOwnPropertyDescriptor(Error,'captureStackTrace');
-  const frame={getFileName:()=>'/stack-shim.js'};
-  Object.defineProperty(Error,'captureStackTrace',{
-    configurable:true,writable:true,value(target) {
-      let formatted=false, value;
-      Object.defineProperty(target,'stack',{
-        configurable:true,get() {
-          if (!formatted) {
-            value=typeof Error.prepareStackTrace==='function'
-              ? Error.prepareStackTrace(target,[frame]) : 'shim stack';
-            formatted=true;
-          }
-          return value;
-        },
-      });
-    },
-  });
-  try {
-    const context=create();
-    context.scope.Error.prepareStackTrace=(error,frames)=>({error,frames});
-    const error=new context.scope.Error('shim');
-    assert.equal(error.stack.error,error);
-    assert.equal(error.stack.frames[0].getFileName(),'/stack-shim.js');
-    const target={}; context.scope.Error.captureStackTrace(target);
-    assert.equal(target.stack.error,target);
-    assert.equal(target.stack.frames[0].getFileName(),'/stack-shim.js');
-  } finally {
-    if(saved) Object.defineProperty(Error,'captureStackTrace',saved);
-    else delete Error.captureStackTrace;
-  }
 });
 
 test('delayed stacks keep their owner and capture its frame limit', {skip:!stackFormattingSupported}, () => {
