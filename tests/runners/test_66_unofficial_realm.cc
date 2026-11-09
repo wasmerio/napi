@@ -162,21 +162,23 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)
 #if !defined(__wasm__)
-TEST_F(Test66UnofficialRealm, QuickJSSnapshotEnvDeclinesExplicitBuilder) {
+TEST_F(Test66UnofficialRealm, QuickJSSnapshotEnvDeclinesExplicitRoles) {
   const char artifact_bytes[] = "snapshot";
   const char key[] = "key";
-  unofficial_napi_snapshot artifact = nullptr;
-  EXPECT_EQ(unofficial_napi_open_snapshot(artifact_bytes, sizeof(artifact_bytes),
-                                          key, sizeof(key), &artifact), napi_generic_failure);
-  EXPECT_EQ(artifact, nullptr);
   const char path[] = "snapshot.staged";
   const unofficial_napi_snapshot_env_options builder{
       sizeof(builder), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
-      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr,
+      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr, 0,
       key, sizeof(key), path, sizeof(path) - 1};
+  const unofficial_napi_snapshot_env_options restore{
+      sizeof(restore), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
+      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE, 0, artifact_bytes, sizeof(artifact_bytes),
+      key, sizeof(key), nullptr, 0};
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(unofficial_napi_create_env_with_snapshot(10, nullptr, &builder, &env, &owner),
+            napi_generic_failure);
+  EXPECT_EQ(unofficial_napi_create_env_with_snapshot(10, nullptr, &restore, &env, &owner),
             napi_generic_failure);
   EXPECT_EQ(env, nullptr);
   EXPECT_EQ(owner, nullptr);

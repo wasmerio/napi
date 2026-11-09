@@ -91,6 +91,7 @@ unsafe extern "C" {
         stack_limit: u32,
         guest_heap_ctx: *const c_void,
         snapshot_options: *const crate::snapshot::SnapshotEnvOptions,
+        retained_artifact: *mut crate::snapshot::SnapshotHandle,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;

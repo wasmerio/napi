@@ -1275,20 +1275,6 @@ extern "C"
     }
 
 #if !defined(__wasm__)
-    napi_status NAPI_CDECL unofficial_napi_open_snapshot(
-        const void *bytes, size_t length, const void *key, size_t key_length,
-        unofficial_napi_snapshot *snapshot_out)
-    {
-        if (bytes == nullptr || length == 0 || key == nullptr || key_length == 0 ||
-            snapshot_out == nullptr)
-            return napi_invalid_arg;
-        return napi_generic_failure;
-    }
-
-    void NAPI_CDECL unofficial_napi_close_snapshot(unofficial_napi_snapshot)
-    {
-    }
-
     napi_status NAPI_CDECL unofficial_napi_create_env_with_snapshot(
         int32_t module_api_version,
         const unofficial_napi_env_create_options *env_options,
@@ -1310,13 +1296,16 @@ extern "C"
             requested.reserved != 0)
             return napi_invalid_arg;
         if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER &&
-            requested.artifact == nullptr && requested.key != nullptr && requested.key_length != 0 &&
+            requested.artifact == nullptr && requested.artifact_length == 0 &&
+            requested.key != nullptr && requested.key_length != 0 &&
             requested.key_length <= UINT32_MAX &&
             requested.output_path != nullptr && requested.output_path_length != 0 &&
             std::memchr(requested.output_path, '\0', requested.output_path_length) == nullptr)
             return napi_generic_failure;
         if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE &&
-            requested.artifact != nullptr && requested.key == nullptr && requested.key_length == 0 &&
+            requested.artifact != nullptr && requested.artifact_length != 0 &&
+            requested.key != nullptr && requested.key_length != 0 &&
+            requested.key_length <= UINT32_MAX &&
             requested.output_path == nullptr && requested.output_path_length == 0)
             return napi_generic_failure;
         return napi_invalid_arg;

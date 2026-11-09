@@ -57,7 +57,7 @@ fn create_host_env(
     reservation: &HeapReservation,
 ) -> (i32, SnapiEnv) {
     let mut state = std::ptr::null_mut();
-    let mut create = |snapshot_options| {
+    let mut create = |snapshot_options, retained_artifact| {
         let guest_heap_ctx = env
             .data()
             .guest_heap
@@ -75,13 +75,14 @@ fn create_host_env(
                 stack_limit,
                 guest_heap_ctx,
                 snapshot_options,
+                retained_artifact,
                 &mut state,
             )
         }
     };
     let status = match &env.data().snapshot_environment {
         Some(snapshot) => snapshot.create_env(create),
-        None => create(std::ptr::null()),
+        None => create(std::ptr::null(), std::ptr::null_mut()),
     };
     (status, state)
 }

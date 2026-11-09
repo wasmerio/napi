@@ -47,7 +47,7 @@ struct NapiV8SnapshotArtifact {
 };
 
 #if !defined(__wasm__)
-struct unofficial_napi_snapshot__ {
+struct NapiV8SnapshotHandle {
   std::shared_ptr<const NapiV8SnapshotArtifact> artifact;
 };
 using SnapshotEnvOptions = unofficial_napi_snapshot_env_options;
@@ -1943,8 +1943,17 @@ void SnapshotAppendInteger(std::string* bytes, UInt value) {
   }
 }
 
-std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view bytes, std::string_view key) {
-  if (bytes.size() < kSnapshotHeaderSize || !bytes.starts_with(kSnapshotMagic)) return nullptr;
+#if !defined(__wasm__)
+napi_status LoadSnapshot(const void* artifact, size_t artifact_length,
+                         const void* expected_key, size_t key_length,
+                         std::shared_ptr<const NapiV8SnapshotArtifact>* out) try {
+  if (artifact == nullptr || artifact_length == 0 || expected_key == nullptr ||
+      key_length == 0 || key_length > UINT32_MAX) {
+    return napi_invalid_arg;
+  }
+  std::string_view bytes(static_cast<const char*>(artifact), artifact_length);
+  std::string_view key(static_cast<const char*>(expected_key), key_length);
+  if (bytes.size() < kSnapshotHeaderSize || !bytes.starts_with(kSnapshotMagic)) return napi_generic_failure;
   uint32_t lengths[4];
   uint64_t total = kSnapshotHeaderSize;
   for (size_t i = 0; i < 4; ++i) {
@@ -1957,9 +1966,9 @@ std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view byt
       bytes.substr(kSnapshotHeaderSize, lengths[0]) != key ||
       lengths[1] % kSnapshotManifestEntrySize != 0 || lengths[2] == 0 ||
       lengths[2] > kSnapshotGuestDataLimit || lengths[3] < kSnapshotMinBlobSize ||
-      lengths[3] > static_cast<uint32_t>(INT_MAX)) return nullptr;
+      lengths[3] > static_cast<uint32_t>(INT_MAX)) return napi_generic_failure;
   auto digest = SnapshotDigest(UINT64_C(14695981039346656037), bytes.substr(0, 28));
-  if (SnapshotDigest(digest, bytes.substr(kSnapshotHeaderSize)) != expected_digest) return nullptr;
+  if (SnapshotDigest(digest, bytes.substr(kSnapshotHeaderSize)) != expected_digest) return napi_generic_failure;
 
   auto result = std::make_shared<NapiV8SnapshotArtifact>();
   result->contexts = contexts;
@@ -1971,9 +1980,13 @@ std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view byt
   }
   result->startup.data = result->blob.data();
   result->startup.raw_size = static_cast<int>(result->blob.size());
-  if (!result->startup.IsValid()) return nullptr;
-  return result;
+  if (!result->startup.IsValid()) return napi_generic_failure;
+  *out = std::move(result);
+  return napi_ok;
+} catch (const std::bad_alloc&) {
+  return napi_generic_failure;
 }
+#endif
 
 void EnsureSnapshotAnchor(EdgeV8Platform* platform) {
   if (v8::IsolateGroup::CanCreateNewGroups()) return;
@@ -2037,26 +2050,20 @@ void NapiV8ExposeSharedArrayBufferForSnapshot(v8::Isolate* isolate, v8::Local<v8
 extern "C" {
 
 #if !defined(__wasm__)
-napi_status NAPI_CDECL unofficial_napi_open_snapshot(
+napi_status NapiV8OpenSnapshot(
     const void* bytes, size_t length, const void* key, size_t key_length,
-    unofficial_napi_snapshot* snapshot_out) try {
-  if (bytes == nullptr || length == 0 || key == nullptr || key_length == 0 ||
-      snapshot_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  auto artifact = ParseSnapshot(
-      std::string_view(static_cast<const char*>(bytes), length),
-      std::string_view(static_cast<const char*>(key), key_length));
-  if (!artifact) return napi_generic_failure;
-  auto* snapshot = new (std::nothrow) unofficial_napi_snapshot__{std::move(artifact)};
+    NapiV8SnapshotHandle** snapshot_out) {
+  if (snapshot_out == nullptr) return napi_invalid_arg;
+  std::shared_ptr<const NapiV8SnapshotArtifact> artifact;
+  auto status = LoadSnapshot(bytes, length, key, key_length, &artifact);
+  if (status != napi_ok) return status;
+  auto* snapshot = new (std::nothrow) NapiV8SnapshotHandle{std::move(artifact)};
   if (!snapshot) return napi_generic_failure;
   *snapshot_out = snapshot;
   return napi_ok;
-} catch (const std::bad_alloc&) {
-  return napi_generic_failure;
 }
 
-void NAPI_CDECL unofficial_napi_close_snapshot(unofficial_napi_snapshot snapshot) {
+void NapiV8CloseSnapshot(NapiV8SnapshotHandle* snapshot) {
   delete snapshot;
 }
 #endif
@@ -2220,6 +2227,7 @@ static napi_status CreateEnv(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     const SnapshotEnvOptions* snapshot_options,
+    std::shared_ptr<const NapiV8SnapshotArtifact> snapshot,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -2238,7 +2246,6 @@ static napi_status CreateEnv(
     return napi_invalid_arg;
   }
   std::optional<SnapshotBuildOptions> snapshot_build;
-  std::shared_ptr<const NapiV8SnapshotArtifact> snapshot;
 #if !defined(__wasm__)
   if (snapshot_options != nullptr) {
     const auto& requested = *snapshot_options;
@@ -2246,15 +2253,15 @@ static napi_status CreateEnv(
       if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
       return status;
     };
-    if (requested.size < sizeof(requested) ||
+    if (snapshot != nullptr || requested.size < sizeof(requested) ||
         requested.version != UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION ||
         requested.reserved != 0) {
       return fail_snapshot_options(napi_invalid_arg);
     }
     if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER) {
-      if (requested.artifact != nullptr || requested.key == nullptr ||
-          requested.key_length == 0 || requested.key_length > UINT32_MAX ||
-          requested.output_path == nullptr ||
+      if (requested.artifact != nullptr || requested.artifact_length != 0 ||
+          requested.key == nullptr || requested.key_length == 0 ||
+          requested.key_length > UINT32_MAX || requested.output_path == nullptr ||
           requested.output_path_length == 0) {
         return fail_snapshot_options(napi_invalid_arg);
       }
@@ -2276,12 +2283,12 @@ static napi_status CreateEnv(
         return fail_snapshot_options(napi_generic_failure);
       }
     } else if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE) {
-      if (requested.artifact == nullptr || requested.key != nullptr ||
-          requested.key_length != 0 || requested.output_path != nullptr ||
-          requested.output_path_length != 0) {
+      if (requested.output_path != nullptr || requested.output_path_length != 0) {
         return fail_snapshot_options(napi_invalid_arg);
       }
-      snapshot = requested.artifact->artifact;
+      auto status = LoadSnapshot(requested.artifact, requested.artifact_length,
+                                 requested.key, requested.key_length, &snapshot);
+      if (status != napi_ok) return fail_snapshot_options(status);
     } else {
       return fail_snapshot_options(napi_invalid_arg);
     }
@@ -2409,7 +2416,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
-  return CreateEnv(module_api_version, options, nullptr, env_out, owner_out);
+  return CreateEnv(module_api_version, options, nullptr, {}, env_out, owner_out);
 }
 
 #if !defined(__wasm__)
@@ -2419,7 +2426,18 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_snapshot(
     const unofficial_napi_snapshot_env_options* snapshot_options,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
-  return CreateEnv(module_api_version, options, snapshot_options, env_out, owner_out);
+  return CreateEnv(module_api_version, options, snapshot_options, {}, env_out, owner_out);
+}
+
+napi_status NapiV8CreateEnvWithSnapshot(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    const unofficial_napi_snapshot_env_options* snapshot_options,
+    NapiV8SnapshotHandle* retained_artifact,
+    napi_env* env_out, unofficial_napi_env_owner* owner_out) {
+  return CreateEnv(module_api_version, options, snapshot_options,
+                   retained_artifact != nullptr ? retained_artifact->artifact : nullptr,
+                   env_out, owner_out);
 }
 #endif
 

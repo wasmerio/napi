@@ -3,6 +3,7 @@
 
 #include <v8.h>
 
+#include "napi_snapshot.h"
 #include "unofficial_napi.h"
 
 bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,

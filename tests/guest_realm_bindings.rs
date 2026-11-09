@@ -1,12 +1,12 @@
 //! Exercise realm snapshots through the actual Wasmer imports and V8 bridge.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wasmer::{AsStoreMut, Instance, Memory, Module, Store};
-use wasmer_napi::{NapiCtx, SnapshotArtifact, SnapshotEnvironment};
+use wasmer_napi::{NapiCtx, SnapshotEnvironment};
 
 const OK: i32 = 0;
 const INVALID_ARG: i32 = 1;
@@ -250,15 +250,7 @@ impl Drop for Stage {
     }
 }
 
-fn restore(path: &Path, callbacks: bool) {
-    let bytes = std::fs::read(path).unwrap();
-    // SAFETY: the parent test baked this artifact with the same V8 build and
-    // key in a private staging directory.
-    let artifact = unsafe { SnapshotArtifact::open(&bytes, KEY) }.unwrap();
-    let mut guest = Guest::new(
-        NapiCtx::default().with_snapshot_environment(SnapshotEnvironment::Restore(artifact)),
-        callbacks,
-    );
+fn verify_restore(mut guest: Guest, callbacks: bool) {
     assert_eq!(
         call!(guest, "snapshot_data", guest.env, 0u32, 0u32, LENGTH),
         OK
@@ -288,8 +280,30 @@ fn restore(path: &Path, callbacks: bool) {
 fn snapshots_bake_and_restore_guest_callbacks_across_processes() {
     const PATH: &str = "WASMER_NAPI_TEST_REALM_ARTIFACT";
     if let Some(path) = std::env::var_os(PATH) {
-        restore(Path::new(&path), true);
-        restore(Path::new(&path), false);
+        let bytes = std::fs::read(path).unwrap();
+        // SAFETY: the parent test baked these bytes with the same V8 build in
+        // a private staging directory. A wrong key is rejected before use.
+        assert!(unsafe { SnapshotEnvironment::restore(&bytes, b"wrong key") }.is_err());
+        let snapshot = unsafe { SnapshotEnvironment::restore(&bytes, KEY) }.unwrap();
+        drop(bytes);
+        // Both environments retain the same validated artifact. Rejecting the
+        // manifest in the env without the callback table must stay local.
+        std::thread::scope(|threads| {
+            let (ready, both_live) = std::sync::mpsc::sync_channel(0);
+            let clone = snapshot.clone();
+            threads.spawn(move || {
+                let guest =
+                    Guest::new(NapiCtx::default().with_snapshot_environment(clone), true);
+                ready.send(()).unwrap();
+                verify_restore(guest, true);
+            });
+            let guest = Guest::new(
+                NapiCtx::default().with_snapshot_environment(snapshot),
+                false,
+            );
+            both_live.recv().unwrap();
+            verify_restore(guest, false);
+        });
         return;
     }
     let nonce = SystemTime::now()

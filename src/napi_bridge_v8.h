@@ -1,6 +1,7 @@
 #ifndef NAPI_BRIDGE_V8_H_
 #define NAPI_BRIDGE_V8_H_
 
+#include "internal/napi_snapshot.h"
 #include "unofficial_napi.h"
 
 using BridgeCallbackDataHook = void (*)(napi_env, void*, void*);

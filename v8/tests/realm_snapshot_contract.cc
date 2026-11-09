@@ -1,4 +1,5 @@
 #include "node_api.h"
+#include "internal/napi_snapshot.h"
 #include "napi_bridge_v8.h"
 #include "unofficial_napi.h"
 
@@ -71,7 +72,7 @@ static void bake(const char* path, const char* key, int answer,
                  const char* guest_data, bool write_error = false) {
   const unofficial_napi_snapshot_env_options request{
       sizeof(request), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
-      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr,
+      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr, 0,
       key, std::strlen(key), path, std::strlen(path)};
   napi_env env = nullptr;
   unofficial_napi_env_owner eowner = nullptr;
@@ -183,22 +184,50 @@ static void bake(const char* path, const char* key, int answer,
   assert(result == (write_error ? napi_generic_failure : napi_ok));
 }
 
-static unofficial_napi_snapshot open_artifact(const char* path, const char* key) {
+static std::string read_artifact(const char* path) {
   std::ifstream file(path, std::ios::binary);
   std::string bytes((std::istreambuf_iterator<char>(file)), {});
   assert(!bytes.empty());
-  unofficial_napi_snapshot artifact = nullptr;
+  return bytes;
+}
+
+extern "C" void napi_host_guest_heap_release(void* ctx) {
+  ++*static_cast<unsigned*>(ctx);
+}
+
+static void create_raw_restore(const char* path, const char* key,
+                               napi_env* env, unofficial_napi_env_owner* owner) {
+  auto bytes = read_artifact(path);
   const char wrong_key[] = "wrong-key";
-  assert(unofficial_napi_open_snapshot(bytes.data(), bytes.size(), wrong_key,
-                                      sizeof(wrong_key) - 1, &artifact) == napi_generic_failure);
-  assert(artifact == nullptr);
-  ok(unofficial_napi_open_snapshot(bytes.data(), bytes.size(), key, std::strlen(key), &artifact));
-  assert(artifact != nullptr);
+  unofficial_napi_snapshot_env_options request{
+      sizeof(request), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
+      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE, 0, bytes.data(), bytes.size(),
+      wrong_key, sizeof(wrong_key) - 1, nullptr, 0};
+  napi_env rejected_env = nullptr;
+  unofficial_napi_env_owner rejected_owner = nullptr;
+  unsigned releases = 0;
+  unofficial_napi_env_create_options env_options{};
+  env_options.size = sizeof(env_options);
+  env_options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  env_options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(&releases);
+  assert(unofficial_napi_create_env_with_snapshot(10, &env_options, &request,
+      &rejected_env, &rejected_owner) == napi_generic_failure);
+  assert(releases == 1);
+  request.key = key;
+  request.key_length = std::strlen(key);
+  ok(unofficial_napi_create_env_with_snapshot(10, nullptr, &request, env, owner));
+
+  // The valid env retains an immutable copy even if the caller changes its bytes.
   bytes.back() ^= 1;
-  unofficial_napi_snapshot rejected = nullptr;
-  assert(unofficial_napi_open_snapshot(bytes.data(), bytes.size(), key, std::strlen(key),
-                                      &rejected) == napi_generic_failure);
-  assert(rejected == nullptr);
+  assert(unofficial_napi_create_env_with_snapshot(10, nullptr, &request,
+      &rejected_env, &rejected_owner) == napi_generic_failure);
+  assert(rejected_env == nullptr && rejected_owner == nullptr);
+}
+
+static NapiV8SnapshotHandle* open_private_artifact(const char* path, const char* key) {
+  auto bytes = read_artifact(path);
+  NapiV8SnapshotHandle* artifact = nullptr;
+  ok(NapiV8OpenSnapshot(bytes.data(), bytes.size(), key, std::strlen(key), &artifact));
   return artifact;
 }
 
@@ -222,7 +251,7 @@ static void check_fresh() {
 static void check_manifest(const char* path) {
   const unofficial_napi_snapshot_env_options builder{
       sizeof(builder), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
-      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr,
+      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER, 0, nullptr, 0,
       kKey, sizeof(kKey) - 1, path, std::strlen(path)};
   napi_env env = nullptr;
   unofficial_napi_env_owner eowner = nullptr;
@@ -250,12 +279,7 @@ static void check_manifest(const char* path) {
   ok(napi_close_handle_scope(env, hs));
   ok(unofficial_napi_release_env(eowner, nullptr));
 
-  auto artifact = open_artifact(path, kKey);
-  const unofficial_napi_snapshot_env_options restore{
-      sizeof(restore), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
-      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE, 0, artifact, nullptr, 0, nullptr, 0};
-  ok(unofficial_napi_create_env_with_snapshot(10, nullptr, &restore, &env, &eowner));
-  unofficial_napi_close_snapshot(artifact);
+  create_raw_restore(path, kKey, &env, &eowner);
   ok(napi_open_handle_scope(env, &hs));
   size_t length = 1;
   ok(unofficial_napi_snapshot_guest_data(env, nullptr, 0, &length));
@@ -287,18 +311,8 @@ static void check_manifest(const char* path) {
   ok(unofficial_napi_release_env(eowner, nullptr));
 }
 
-static void restore(unofficial_napi_snapshot artifact, int expected_answer,
-                    const char* expected_guest_data, std::barrier<>* live = nullptr) {
-  const unofficial_napi_snapshot_env_options request{
-      sizeof(request), UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION,
-      UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE, 0, artifact,
-      nullptr, 0, nullptr, 0};
-  napi_env env = nullptr;
-  unofficial_napi_env_owner eowner = nullptr;
-  ok(unofficial_napi_create_env_with_snapshot(10, nullptr, &request, &env, &eowner));
-  unofficial_napi_close_snapshot(artifact);
-  if (live != nullptr) live->arrive_and_wait();
-
+static void verify_restore(napi_env env, unofficial_napi_env_owner eowner,
+                           int expected_answer, const char* expected_guest_data) {
   assert(owner(env) == 0);
   napi_handle_scope hs = nullptr;
   ok(napi_open_handle_scope(env, &hs));
@@ -342,7 +356,6 @@ static void restore(unofficial_napi_snapshot artifact, int expected_answer,
   assert(answer == 19);
   ok(unofficial_napi_leave_realm(env, scope));
   ok(napi_close_handle_scope(env, hs));
-  if (live != nullptr) live->arrive_and_wait();
   ok(unofficial_napi_release_env(eowner, nullptr));
 }
 
@@ -358,9 +371,11 @@ int main(int argc, char** argv) {
     bake(path, kKey, 42, "payload", arm == "write-error");
     check_fresh();
   } else if (arm == "restore") {
-    auto artifact = open_artifact(path, kKey);
     check_fresh();
-    restore(artifact, 42, "payload");
+    napi_env env = nullptr;
+    unofficial_napi_env_owner eowner = nullptr;
+    create_raw_restore(path, kKey, &env, &eowner);
+    verify_restore(env, eowner, 42, "payload");
   } else if (arm == "manifest") {
     check_manifest(path);
   } else if (arm == "multirestore") {
@@ -368,14 +383,28 @@ int main(int argc, char** argv) {
     constexpr char other_key[] = "plan-smoke-v8-other";
     bake(path, kKey, 42, "payload");
     bake(argv[3], other_key, 83, "other payload");
-    auto first = open_artifact(path, kKey);
-    auto second = open_artifact(argv[3], other_key);
+    auto* first = open_private_artifact(path, kKey);
+    auto* second = open_private_artifact(argv[3], other_key);
     check_fresh();
-    std::barrier live(2);
-    std::thread a(restore, first, 42, "payload", &live);
-    std::thread b(restore, second, 83, "other payload", &live);
+    std::barrier live(4);
+    auto worker = [&](NapiV8SnapshotHandle* artifact, int answer, const char* guest_data) {
+      napi_env env = nullptr;
+      unofficial_napi_env_owner eowner = nullptr;
+      ok(NapiV8CreateEnvWithSnapshot(10, nullptr, nullptr, artifact, &env, &eowner));
+      live.arrive_and_wait();
+      live.arrive_and_wait();
+      verify_restore(env, eowner, answer, guest_data);
+    };
+    std::thread a(worker, first, 42, "payload");
+    std::thread b(worker, second, 83, "other payload");
+    std::thread c(worker, first, 42, "payload");
+    live.arrive_and_wait();
+    NapiV8CloseSnapshot(first);
+    NapiV8CloseSnapshot(second);
+    live.arrive_and_wait();
     a.join();
     b.join();
+    c.join();
   } else {
     assert(arm == "shape");
     napi_env env = nullptr;

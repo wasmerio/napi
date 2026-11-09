@@ -3376,6 +3376,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_snapshot(
     uint32_t /*stack_limit*/,
     const void* guest_heap_ctx,
     const unofficial_napi_snapshot_env_options* snapshot_options,
+    NapiV8SnapshotHandle* retained_artifact,
     SnapiEnvState** env_out) {
   unofficial_napi_env_create_options options{};
   const bool has_options =
@@ -3401,9 +3402,9 @@ extern "C" int snapi_bridge_unofficial_create_env_with_snapshot(
       const_cast<void*>(guest_heap_ctx));
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
-  napi_status s = unofficial_napi_create_env_with_snapshot(
+  napi_status s = NapiV8CreateEnvWithSnapshot(
       module_api_version, has_options ? &options : nullptr, snapshot_options,
-      &env, &owner);
+      retained_artifact, &env, &owner);
   if (s != napi_ok) return s;
 
   SnapiEnvState* state = NewAgentWithPrincipalEnv(env, owner);
@@ -3426,14 +3427,16 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   return snapi_bridge_unofficial_create_env_with_snapshot(
       module_api_version, total_memory, constrained_memory,
       max_young_generation_size_in_bytes, max_old_generation_size_in_bytes,
-      code_range_size_in_bytes, stack_limit, guest_heap_ctx, nullptr, env_out);
+      code_range_size_in_bytes, stack_limit, guest_heap_ctx, nullptr, nullptr,
+      env_out);
 }
 
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   const void* guest_heap_ctx,
                                                   SnapiEnvState** env_out) {
   return snapi_bridge_unofficial_create_env_with_snapshot(
-      module_api_version, 0, 0, 0, 0, 0, 0, guest_heap_ctx, nullptr, env_out);
+      module_api_version, 0, 0, 0, 0, 0, 0, guest_heap_ctx, nullptr, nullptr,
+      env_out);
 }
 
 // Rust-exported grant callback (see budget.rs). Charges a grow-step against

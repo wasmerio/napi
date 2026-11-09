@@ -31,7 +31,7 @@ pub use ctx::{
     NapiRuntimeHooks, NapiSession,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use snapshot::{SnapshotArtifact, SnapshotEnvironment};
+pub use snapshot::SnapshotEnvironment;
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]

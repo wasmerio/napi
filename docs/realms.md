@@ -176,16 +176,20 @@ builders, and environments restoring different artifacts.
    commit, delete remaining references, close scopes, and release the env.
    Release writes the artifact and consumes the env even if the write
    fails. Publish the file after successful release and validation.
-4. In the consumer, open the artifact with `unofficial_napi_open_snapshot`
-   and the expected compatibility key. It validates and copies the bytes
-   once. Pass the resulting handle in the restore options when creating
-   each env. Keep the handle alive through the create call. Each env then
-   retains its own reference to the data, so the host can close its handle.
+4. In a C host, pass the artifact bytes, length, and expected compatibility
+   key in the restore options for `unofficial_napi_create_env_with_snapshot`.
+   The provider validates and copies the bytes during the call. The caller can
+   release its input buffer when creation returns.
 5. Query `unofficial_napi_snapshot_guest_data` to recover the metadata.
    Artifacts with a native callback manifest become usable once the Wasmer
-   bridge has validated and bound every entry. Create realms in restore mode with a template index and a fresh owner
-   datum. Each realm receives the template root from its own environment's
+   bridge has validated and bound every entry. Create realms in restore mode
+   with a template index and a fresh owner datum. Each realm receives the template root from its own environment's
    artifact. Owner data is never serialized.
+
+Wasmer hosts use `SnapshotEnvironment::restore(bytes, key)` and pass the
+result to `NapiCtx::with_snapshot_environment`. The restore configuration
+validates and copies the artifact once. Each environment retains a reference
+to the shared data through isolate disposal.
 
 V8 consumes the artifact at isolate creation. The host cache key must cover
 the running engine and provider build as well as the guest and its bootstrap

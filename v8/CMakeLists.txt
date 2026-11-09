@@ -97,7 +97,8 @@ if(NAPI_V8_BUILD_TESTS)
 
   add_executable(napi_v8_realm_snapshot_contract tests/realm_snapshot_contract.cc)
   target_link_libraries(napi_v8_realm_snapshot_contract PRIVATE napi_v8)
-  target_include_directories(napi_v8_realm_snapshot_contract PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+  target_include_directories(napi_v8_realm_snapshot_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/../src")
   set(_snapshot_fixture "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-contract.snap")
   add_test(NAME napi_v8.snapshot_binding_shape
            COMMAND napi_v8_realm_snapshot_contract shape "${_snapshot_fixture}")
