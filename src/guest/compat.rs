@@ -184,6 +184,16 @@ pub(crate) fn make_context(
         _ => return Err(NAPI_INVALID_ARG),
     };
     let (mut realm, mut global) = (0u32, 0u32);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    check(unsafe {
+        snapi_bridge_unofficial_create_realm(
+            env, 0, sandbox, name, origin_or_undefined, host_defined_option_id,
+            i32::from(allow_code_gen_strings != 0), i32::from(allow_code_gen_wasm != 0),
+            i32::from(own_microtask_queue != 0), 1, 0, 0, &mut realm, &mut global,
+            std::ptr::null_mut(),
+        )
+    })?;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     check(unsafe {
         snapi_bridge_unofficial_create_realm(
             env,
@@ -356,6 +366,7 @@ mod tests {
             status(unsafe {
                 snapi_bridge_unofficial_create_realm(
                     env,
+                    guest_env,
                     0,
                     name,
                     0,
@@ -363,8 +374,12 @@ mod tests {
                     1,
                     1,
                     0,
+                    1,
+                    0,
+                    0,
                     &mut realm,
                     &mut realm_global,
+                    std::ptr::null_mut(),
                 )
             }),
             Ok(())

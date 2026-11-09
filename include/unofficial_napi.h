@@ -362,7 +362,12 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
 // unofficial_napi_get_realm on it each time.
 typedef struct unofficial_napi_realm__* unofficial_napi_realm;
 
-enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
+enum {
+  UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1,
+  UNOFFICIAL_NAPI_REALM_MODE_FRESH = 1,
+  UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE = 2,
+  UNOFFICIAL_NAPI_REALM_MODE_RESTORE = 3,
+};
 
 // With a sandbox object, global property access in the new realm reads and
 // writes the sandbox, as with vm.createContext(sandbox). Otherwise the realm
@@ -372,7 +377,7 @@ enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
 // Each provider honors only some fields. It accepts the rest, ignores them
 // and still returns napi_ok:
 // - `sandbox_or_null`: every provider.
-// - `host_defined_option_id`: V8 and QuickJS.
+// - `host_defined_option_id`: V8 only.
 // - `allow_code_gen_strings`: V8 only. When false, eval and the Function
 //   constructors throw an EvalError in the realm.
 // - `own_microtask_queue`: V8 only.
@@ -408,11 +413,74 @@ static inline void unofficial_napi_realm_options_init(
 // sandbox when one was given, else the realm's global; it may be NULL. A NULL
 // `options` means the defaults of unofficial_napi_realm_options_init. A sandbox
 // belongs to at most one realm; the env's own global may still be one.
+// FRESH creates a realm. TEMPLATE is for snapshot builders. RESTORE uses the
+// given template index and requires root_out. Index is zero in other modes,
+// which return a null root when requested. TEMPLATE and RESTORE require a
+// null sandbox, and TEMPLATE cannot request its own microtask queue.
+// The provider holds realm_data without dereferencing or serializing it.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_realm(
     napi_env env,
     const unofficial_napi_realm_options* options_or_null,
+    uint32_t mode, uint32_t snapshot_index, void* realm_data,
     unofficial_napi_realm* realm_out,
-    napi_value* global_out);
+    napi_value* global_out, napi_value* root_out);
+
+// Reports the immutable owner of the current realm, or zero. The output
+// remains 64 bits even on wasm32.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_current_realm_data(
+    napi_env env, uint64_t* realm_data_out);
+
+enum {
+  UNOFFICIAL_NAPI_BINDING_CLASS = 1,
+  UNOFFICIAL_NAPI_BINDING_METHOD = 2,
+};
+// Define a native class or non-constructible method without invoking JS.
+// Names use explicit byte lengths. CLASS returns a constructor and its
+// prototype. Its optional parent must be a binding class in the same env.
+// Members use unique UTF-8 C-string keys per target and primitive values.
+// METHOD requires null parent, properties, member lengths and prototype
+// output, with a zero property count. All function lengths are at most 255.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_binding(
+    napi_env env, uint32_t kind, const char* utf8name, size_t name_length,
+    napi_callback callback, void* data, uint32_t function_length,
+    napi_value parent_or_null, size_t property_count,
+    const napi_property_descriptor* properties,
+    const uint8_t* member_lengths_or_null,
+    napi_value* function_out, napi_value* prototype_out);
+
+// Seal one template and optionally return its restore index. A nonempty
+// guest payload (at most 16 MiB) marks the final commit. After that only
+// reference deletion, scope closure and release are allowed. Release
+// consumes the env and writes the staged artifact.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_snapshot_commit(
+    napi_env env, unofficial_napi_realm realm, napi_value root,
+    const void* guest_data_or_null, size_t guest_data_length, uint32_t* index_out);
+// Query with NULL/zero or copy at most capacity bytes. The length is the
+// full payload length, zero when no usable artifact is available.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_snapshot_guest_data(
+    napi_env env, void* buffer, size_t capacity, size_t* length_out);
+
+#if !defined(__wasm__)
+// Host-only configuration for future environments. BUILDER applies once.
+// RESTORE pins one validated artifact generation for the process.
+enum {
+  UNOFFICIAL_NAPI_SNAPSHOT_ROLE_NONE = 0,
+  UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER = 1,
+  UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE = 2,
+};
+typedef struct {
+  uint32_t size, version;
+  uint32_t role, reserved;
+  const void* artifact;
+  size_t artifact_length;
+  const void* key;
+  size_t key_length;
+  const char* output_path;
+  size_t output_path_length;
+} unofficial_napi_snapshot_host_options;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_snapshot_host_options(
+    const unofficial_napi_snapshot_host_options* options);
+#endif
 
 // Returns the realm whose global is `value`: a realm's own global, or the
 // sandbox given to unofficial_napi_create_realm. `*realm_out` is NULL for any
@@ -1561,6 +1629,7 @@ static_assert(sizeof(unofficial_napi_module_create_options) ==
               sizeof(unofficial_napi_wasm32_module_create_options_v2));
 static_assert(sizeof(unofficial_napi_module_hooks) ==
               sizeof(unofficial_napi_wasm32_module_hooks_v1));
+static_assert(sizeof(napi_property_descriptor) == 32);
 static_assert(sizeof(unofficial_napi_realm_options) ==
               sizeof(unofficial_napi_wasm32_realm_options_v1));
 #else
@@ -1585,6 +1654,7 @@ _Static_assert(sizeof(unofficial_napi_module_create_options) ==
 _Static_assert(sizeof(unofficial_napi_module_hooks) ==
                    sizeof(unofficial_napi_wasm32_module_hooks_v1),
                "public module-hooks layout differs from its wasm32 wire ABI");
+_Static_assert(sizeof(napi_property_descriptor) == 32, "napi_property_descriptor wasm32 ABI");
 _Static_assert(sizeof(unofficial_napi_realm_options) ==
                    sizeof(unofficial_napi_wasm32_realm_options_v1),
                "public realm-options layout differs from its wasm32 wire ABI");

@@ -29,8 +29,9 @@ use crate::{
 
 use super::{BridgeName, abi, compat, util::*};
 use crate::snapi_js::{
-    host_js_get_named_property, host_js_has_named_property, host_js_put_primitive,
-    host_js_set_named_property, host_js_value,
+    host_js_create_realm, host_js_current_realm_data, host_js_define_binding,
+    host_js_discard_realm, host_js_get_named_property, host_js_has_named_property,
+    host_js_has_secondary_realms, host_js_put_primitive, host_js_set_named_property, host_js_value,
 };
 
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
@@ -1759,41 +1760,195 @@ fn guest_unofficial_napi_contextify_compile_function(
 // A guest realm id is the value id of the realm's global (its sandbox, when it
 // has one); 0 means the env's own realm.
 
+// The host's JS engine exposes no compilation cache to a guest.
+// Snapshots need the V8 provider: the host's engine makes realms in JS.
+fn guest_unofficial_napi_snapshot_commit(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    _realm: u32,
+    _root: u32,
+    _guest_data: u32,
+    _length: u32,
+    _index_out: u32,
+) -> i32 {
+    if snapi_env(&env, napi_env).is_null() {
+        1
+    } else {
+        9
+    }
+}
+
+fn guest_unofficial_napi_snapshot_guest_data(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    buffer: u32,
+    capacity: u32,
+    length_out: u32,
+) -> i32 {
+    if snapi_env(&env, napi_env).is_null() || (buffer == 0 && capacity != 0) {
+        return 1;
+    }
+    let mut outputs = vec![(length_out, 4)];
+    if capacity != 0 {
+        outputs.push((buffer, capacity as usize));
+    } else if u64::from(buffer) > guest_data_size(&mut env) {
+        return 1;
+    }
+    if let Err(status) = abi::guest_outputs(&mut env, &outputs) {
+        return status;
+    }
+    if write_guest_u32(&mut env, length_out, 0) {
+        0
+    } else {
+        1
+    }
+}
+
+fn guest_unofficial_napi_get_current_realm_data(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    data_out: u32,
+) -> i32 {
+    let handle = snapi_env(&env, napi_env);
+    if handle.is_null() {
+        return 1;
+    }
+    if let Err(status) = abi::guest_outputs(&mut env, &[(data_out, 8)]) {
+        return status;
+    }
+    match unsafe { host_js_current_realm_data(handle) } {
+        Ok(data) if write_guest_u64(&mut env, data_out, data) => 0,
+        Ok(_) => 1,
+        Err(status) => status,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_define_binding(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    kind: u32,
+    name: u32,
+    name_length: u32,
+    callback: u32,
+    data: u32,
+    function_length: u32,
+    parent: u32,
+    count: u32,
+    properties: u32,
+    member_lengths: u32,
+    function_out: u32,
+    prototype_out: u32,
+) -> i32 {
+    let handle = snapi_env(&env, napi_env);
+    if handle.is_null()
+        || !matches!(kind, 1 | 2)
+        || function_out == 0
+        || (kind == 1 && prototype_out == 0)
+    {
+        return 1;
+    }
+    if function_length > 255 || (kind == 2 && prototype_out != 0) {
+        return 1;
+    }
+    let outputs = [(function_out, 4), (prototype_out, 4)];
+    if let Err(status) = abi::guest_outputs(&mut env, &outputs[..if kind == 1 { 2 } else { 1 }]) {
+        return status;
+    }
+    let binding = match abi::read_binding(
+        &mut env,
+        kind,
+        name,
+        name_length,
+        callback,
+        parent,
+        count,
+        properties,
+        member_lengths,
+    ) {
+        Ok(binding) => binding,
+        Err(status) => return status,
+    };
+    let Ok(name) = std::str::from_utf8(&binding.name) else {
+        return 1;
+    };
+    let (function, prototype) = match unsafe {
+        host_js_define_binding(
+            handle,
+            napi_env,
+            kind,
+            name,
+            callback,
+            data,
+            function_length,
+            parent,
+            &binding.properties,
+            binding.member_lengths.as_deref(),
+        )
+    } {
+        Ok(result) => result,
+        Err(status) => return status,
+    };
+    // The factory runs no guest code or author JS and cannot replace guest memory.
+    if !write_guest_u32(&mut env, function_out, function)
+        || (kind == 1 && !write_guest_u32(&mut env, prototype_out, prototype))
+    {
+        return 1;
+    }
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_create_realm(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
-    realm_out_ptr: u32,
-    global_out_ptr: u32,
+    mode: u32,
+    snapshot_index: u32,
+    realm_data: u32,
+    realm_out: u32,
+    global_out: u32,
+    root_out: u32,
 ) -> i32 {
+    let handle = snapi_env(&env, napi_env);
+    if handle.is_null() || !matches!(mode, 1..=3) || realm_out == 0 || (mode == 3 && root_out == 0)
+    {
+        return 1;
+    }
+    if mode != 1 || !host_js_has_secondary_realms() {
+        return 9;
+    }
     let Some(options) = abi::read_realm_options(&mut env, options_ptr) else {
         return 1;
     };
-    if realm_out_ptr == 0 {
+    if snapshot_index != 0
+        || [options.name, options.origin, options.host_defined_option_id]
+            .into_iter()
+            .any(|id| id != 0 && unsafe { host_js_value(handle, id) }.is_err())
+    {
         return 1;
     }
-    let mut realm = 0u32;
-    let mut global = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_create_realm(
-            snapi_env(&env, napi_env),
-            options.sandbox_or_null,
-            options.name,
-            options.origin,
-            options.host_defined_option_id,
-            i32::from(options.allow_code_gen_strings),
-            i32::from(options.allow_code_gen_wasm),
-            i32::from(options.own_microtask_queue),
-            &mut realm,
-            &mut global,
-        )
-    };
-    if status != 0 {
+    let outputs: Vec<_> = [realm_out, global_out, root_out]
+        .into_iter()
+        .filter(|&out| out != 0)
+        .map(|out| (out, 4))
+        .collect();
+    if let Err(status) = abi::guest_outputs(&mut env, &outputs) {
         return status;
     }
-    write_guest_u32(&mut env, realm_out_ptr, realm);
-    if global_out_ptr != 0 {
-        write_guest_u32(&mut env, global_out_ptr, global);
+    let id = match with_cb_context(&mut env, napi_env, || unsafe {
+        host_js_create_realm(handle, options.sandbox_or_null, realm_data)
+    }) {
+        Ok(id) => id,
+        Err(status) => return status,
+    };
+    if abi::guest_outputs(&mut env, &outputs).is_err()
+        || !write_guest_u32(&mut env, realm_out, id)
+        || (global_out != 0 && !write_guest_u32(&mut env, global_out, id))
+        || (root_out != 0 && !write_guest_u32(&mut env, root_out, 0))
+    {
+        unsafe { host_js_discard_realm(handle, id) };
+        return 1;
     }
     0
 }
@@ -5923,6 +6078,10 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
+        "unofficial_napi_define_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_binding),
+        "unofficial_napi_snapshot_commit" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_commit),
+        "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
+        "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
         "unofficial_napi_event_loop_checkpoint" => event_loop_checkpoint_import(store, fe),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

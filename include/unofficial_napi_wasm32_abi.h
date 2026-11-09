@@ -89,6 +89,11 @@ typedef struct {
   uint32_t initialize_import_meta_object;
 } unofficial_napi_wasm32_module_hooks_v1;
 
+// create_realm takes mode, index, owner and the three output addresses as
+// separate i32 parameters. The owner getter writes a uint64_t. define_binding
+// uses the standard wasm32 32-byte napi_property_descriptor and one byte per
+// optional member length. snapshot_commit and snapshot_guest_data use u32
+// addresses and lengths.
 typedef struct {
   uint32_t size;
   uint32_t version;

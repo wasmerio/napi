@@ -11,16 +11,13 @@ import { pathToFileURL } from 'node:url';
 const source = await readFile(new URL('../../src/snapi_js.rs', import.meta.url), 'utf8');
 const inline = source.match(/#\[wasm_bindgen\(inline_js = r#"([\s\S]*?)"#\)\]/)?.[1];
 assert.ok(inline, 'host JavaScript implementation not found');
-const start = inline.indexOf('const wasmerNapiHostSchedulingGlobals =');
-const end = inline.indexOf('function wasmerNapiLowerDynamicImports(', start);
-assert.ok(start >= 0 && end > start, 'context implementation not found');
+const contextSource = inline.replace("import { parse as wasmerNapiParse } from 'acorn';",
+  'const wasmerNapiParse = () => { throw new Error("Unexpected Acorn source preparation"); };');
 const directory = await mkdtemp(join(tmpdir(), 'napi-context-test-'));
 let runtime;
 try {
   const modulePath = join(directory, 'context.mjs');
-  // Module-level state the extracted context code reads. Without a native
-  // Worker realm, contexts use the default isolated compatibility scopes.
-  await writeFile(modulePath, 'let wasmerNapiNativeRealm;\nlet wasmerNapiNativeRealmClaimed = false;\n' + inline.slice(start, end));
+  await writeFile(modulePath, contextSource);
   runtime = await import(pathToFileURL(modulePath));
 } finally {
   await rm(directory, {recursive:true,force:true});

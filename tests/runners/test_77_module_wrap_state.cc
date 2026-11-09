@@ -1071,7 +1071,7 @@ TEST_F(Test77ModuleWrapState, FacadeRunsInModulesRealmAndCrossRealmLinksAreRefus
   unofficial_napi_realm_options_init(&options);
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, global, "marker", Str(s.env, "module realm")), napi_ok);
   ASSERT_EQ(RunText(s.env, "globalThis.marker = 'env realm'"), "env realm");
   auto module = CreateSourceTextModule(s.env, "export default globalThis.marker;", realm);
@@ -1096,7 +1096,7 @@ TEST_F(Test77ModuleWrapState, SandboxModuleEvaluationSynchronizesGlobals) {
     options.sandbox_or_null = sandbox;
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     auto module = CreateSourceTextModule(s.env,
         "globalThis.written = seed + ' module'; export default globalThis.written;", realm);
     ASSERT_NE(module, nullptr);
@@ -1131,7 +1131,7 @@ TEST_F(Test77ModuleWrapState, SandboxModuleWritesSurviveRejectedEvaluation) {
     options.sandbox_or_null = sandbox;
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     auto module = CreateSourceTextModule(s.env,
         "globalThis.written = 1; throw new Error('expected module error');", realm);
     ASSERT_NE(module, nullptr);
@@ -1165,7 +1165,7 @@ TEST_F(Test77ModuleWrapState, SyntheticEvaluationPreservesHostSandboxWrites) {
       unofficial_napi_realm_options_init(&options);
       options.sandbox_or_null = sandbox;
       unofficial_napi_realm realm = nullptr;
-      ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+      ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
       std::string steps = "(function() {";
       if (source_root)
         steps += "if (sandbox.sourceValue !== 10) throw Error('source write was lost');";
@@ -1230,7 +1230,7 @@ TEST_F(Test77ModuleWrapState, ImportMetaHookPreservesHostSandboxWrites) {
     unofficial_napi_realm_options_init(&options);
     options.sandbox_or_null = sandbox;
     unofficial_napi_realm realm = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     const char* hook_source = rejects
         ? "(function(id, meta) { sandbox.value = 2; throw Error('expected meta error'); })"
         : "(function(id, meta) {"

@@ -158,7 +158,7 @@ napi_status CallAfter(napi_env env, int kind) {
       unofficial_napi_realm_options_init(&options);
       options.sandbox_or_null = sandbox;
       unofficial_napi_realm realm = nullptr;
-      return unofficial_napi_create_realm(env, &options, &realm, &out);
+      return unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &out, nullptr);
     }
     case 9: {
       bool result = false;
@@ -253,7 +253,7 @@ napi_status CallRunningJs(napi_env env, int kind, napi_value payload) {
       unofficial_napi_realm_options_init(&options);
       options.sandbox_or_null = payload;
       unofficial_napi_realm realm = nullptr;
-      return unofficial_napi_create_realm(env, &options, &realm, &out);
+      return unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &out, nullptr);
     }
     case 5:
       return unofficial_napi_structured_clone(env, payload, nullptr, &out);
@@ -673,7 +673,7 @@ TEST_F(Test78TerminationUntilCancelled, CallsTheTerminationStopsLeaveItPending) 
         unofficial_napi_realm_options_init(&options);
         options.sandbox_or_null = proxy;
         unofficial_napi_realm realm = nullptr;
-        status = unofficial_napi_create_realm(s.env, &options, &realm, &out);
+        status = unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &out, nullptr);
         break;
       }
     }
@@ -987,7 +987,7 @@ void TerminatingTokenHook(napi_env env, void* /*token*/, void* /*data*/) {
 napi_value CreateRealm(napi_env env, napi_callback_info /*info*/) {
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
-  g_status = unofficial_napi_create_realm(env, nullptr, &realm, &global);
+  g_status = unofficial_napi_create_realm(env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr);
   return global;
 }
 void AttachTokenHooks(napi_env env, bool assign) {
@@ -1012,7 +1012,7 @@ napi_value CreateSandboxRealm(napi_env env, napi_callback_info /*info*/) {
   options.sandbox_or_null = sandbox;
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
-  g_status = unofficial_napi_create_realm(env, &options, &realm, &global);
+  g_status = unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr);
   return global;
 }
 
@@ -1083,7 +1083,7 @@ void CleanupHookCancelledByAnUnassignHook(void* arg) {
     ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
   }
   ASSERT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
@@ -1127,7 +1127,7 @@ TEST_F(Test78TerminationUntilCancelled, CreateRealmAfterATerminatedUnassignHook)
       ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
       unofficial_napi_realm realm = nullptr;
       napi_value global = nullptr;
-      ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+      ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
       ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
     }
     DefineGlobalFunction(s.env, "createRealm", with_sandbox ? CreateSandboxRealm : CreateRealm);

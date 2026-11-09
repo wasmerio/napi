@@ -84,7 +84,7 @@ unofficial_napi_realm CreateRealm(napi_env env,
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = sandbox;
   unofficial_napi_realm realm = nullptr;
-  if (unofficial_napi_create_realm(env, &options, &realm, global_out) != napi_ok) return nullptr;
+  if (unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, global_out, nullptr) != napi_ok) return nullptr;
   return realm;
 }
 

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -52,6 +53,8 @@ inline v8::Local<v8::Value> V8LocalValueFromJsValue(napi_value value) {
   std::memcpy(static_cast<void*>(&local), &value, sizeof(value));
   return local;
 }
+
+namespace v8 { class SnapshotCreator; }
 
 // Frees an external backing store's memory. Runs in V8's deleter, on any
 // thread, so it must not use V8 or an env.
@@ -100,6 +103,11 @@ struct unofficial_napi_realm__ {
   // The record is the realm's context token. True while the realm has one,
   // until the unassign hook, which runs before the record is freed.
   bool token_assigned = false;
+  // Templates assign static IDs to functions for serialization. The opaque
+  // realm owner stays with this realm and is never serialized.
+  bool snapshot_template = false;
+  bool snapshot_added = false;
+  uint64_t embedder_data = 0;
 };
 
 // A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or
@@ -179,6 +187,26 @@ struct napi_env__ {
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
+  // Private bridge hooks release callback records for dynamic bindings when
+  // V8 collects their payloads. Static snapshot bindings live with the env.
+  using CallbackDataHook = void (*)(napi_env, void*, void*);
+  CallbackDataHook callback_data_retain = nullptr;
+  CallbackDataHook callback_data_release = nullptr;
+  void* callback_data_hooks_user = nullptr;
+  // A builder uses static callback IDs in place of External payloads so
+  // template functions can be serialized. Restore fills the table before
+  // those callbacks run.
+  bool snapshot_builder = false;
+  bool snapshot_restored = false;
+  bool snapshot_finalized = false;
+  bool snapshot_poisoned = false;
+  uint32_t snapshot_context_count = 0;
+  v8::SnapshotCreator* snapshot_creator = nullptr;
+  std::string snapshot_manifest;
+  std::string snapshot_guest_data;
+  using SnapshotCallback = std::tuple<napi_callback, void*, uint32_t>;
+  std::vector<SnapshotCallback> snapshot_static_table;
+  std::map<SnapshotCallback, uint32_t> snapshot_static_index;
   std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
   std::vector<napi_buffer_record__*> buffer_records;

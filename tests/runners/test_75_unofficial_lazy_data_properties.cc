@@ -605,7 +605,7 @@ TEST_F(Test75UnofficialLazyDataProperties, DefinitionDoesNotRetainTheCallingReal
     ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak_global), napi_ok);
     unofficial_napi_realm_scope entered = 0;
     ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &entered), napi_ok);
@@ -634,7 +634,7 @@ TEST_F(Test75UnofficialLazyDataProperties, InitializerRetainsItsRealmUntilNoLong
     ASSERT_EQ(napi_open_handle_scope(s.env, &handles), napi_ok);
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     ASSERT_EQ(napi_create_reference(s.env, global, 0, &weak_global), napi_ok);
     napi_value initializer = RunIn(s.env, realm,
         "globalThis.marker = 41; (function (name) { "
@@ -664,8 +664,8 @@ TEST_F(Test75UnofficialLazyDataProperties, InitializationErrorsBelongToTheInitia
   unofficial_napi_realm initializer_realm = nullptr;
   unofficial_napi_realm reader_realm = nullptr;
   napi_value reader_global = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &initializer_realm, nullptr), napi_ok);
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &reader_realm, &reader_global), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &initializer_realm, nullptr, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &reader_realm, &reader_global, nullptr), napi_ok);
   napi_value holder = RunScript(s.env, "({})");
   napi_value initializer = RunIn(s.env, initializer_realm, R"(
     (function (name) {
@@ -753,8 +753,8 @@ TEST_F(Test75UnofficialLazyDataProperties, NativeInitializerUsesItsCreationRealm
   napi_value reader_global = nullptr;
   NativeInitializerRecord record;
   record.env = s.env;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &initializer_realm, &record.global), napi_ok);
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &reader_realm, &reader_global), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &initializer_realm, &record.global, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &reader_realm, &reader_global, nullptr), napi_ok);
   record.prototype = RunIn(s.env, initializer_realm, "Object.prototype");
   record.holder = RunScript(s.env, "({})");
   napi_value initializer = nullptr;

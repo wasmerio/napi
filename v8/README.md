@@ -99,3 +99,12 @@ release (as can happen when a thread's envs are released out of order), the
 record says `stop_wrong_thread` or `stop_isolate_not_current`, no profile is
 written, and env teardown stops the session. Linux and macOS only; elsewhere
 each session reports `unsupported_host_platform` on stderr.
+
+### Native binding receivers
+
+`unofficial_napi_define_binding` uses V8's native function templates. V8's
+public `FunctionCallbackInfo::This()` returns an object. V8 supplies the
+global proxy for a nullish receiver and boxes a primitive before the native
+callback. The callback still runs with its defining realm current. Preserving
+the raw receiver would require V8 API support or a JavaScript forwarding
+function.

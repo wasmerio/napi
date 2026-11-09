@@ -79,7 +79,7 @@ unofficial_napi_realm CreateRealm(napi_env env,
   options.sandbox_or_null = sandbox;
   options.own_microtask_queue = own_microtask_queue;
   unofficial_napi_realm realm = nullptr;
-  if (unofficial_napi_create_realm(env, &options, &realm, global_out) != napi_ok) return nullptr;
+  if (unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, global_out, nullptr) != napi_ok) return nullptr;
   return realm;
 }
 
@@ -124,8 +124,8 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   EnvScope s(runtime_.get());
   unofficial_napi_realm realm = nullptr;
 
-  EXPECT_EQ(unofficial_napi_create_realm(nullptr, nullptr, &realm, nullptr), napi_invalid_arg);
-  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, nullptr, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(nullptr, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, nullptr, nullptr, nullptr), napi_invalid_arg);
 
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
@@ -134,17 +134,17 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   EXPECT_FALSE(options.own_microtask_queue);
 
   options.size = sizeof(options) - 1;
-  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
   unofficial_napi_realm_options_init(&options);
   options.version += 1;
-  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
   EXPECT_EQ(realm, nullptr);
 
   napi_value number = nullptr;
   ASSERT_EQ(napi_create_int32(s.env, 1, &number), napi_ok);
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = number;
-  EXPECT_NE(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  EXPECT_NE(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
 
   // A sandbox belongs to one realm.
   napi_value sandbox = nullptr;
@@ -152,9 +152,170 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   ASSERT_NE(CreateRealm(s.env, nullptr, sandbox), nullptr);
   options.sandbox_or_null = sandbox;
   realm = nullptr;
-  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
   EXPECT_EQ(realm, nullptr);
 }
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+TEST_F(Test66UnofficialRealm, QuickJSSnapshotModesDeclineWithoutChangingOutputs) {
+  EnvScope s(runtime_.get());
+  auto realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  auto global = Global(s.env), root = global;
+  auto original_realm = realm;
+  auto original_global = global;
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE,
+                                          0, nullptr, &realm, &global, &root), napi_generic_failure);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_RESTORE,
+                                          0, nullptr, &realm, &global, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_RESTORE,
+                                          0, nullptr, &realm, &global, &root), napi_generic_failure);
+  EXPECT_EQ(realm, original_realm);
+  EXPECT_EQ(global, original_global);
+  EXPECT_EQ(root, original_global);
+  uint32_t index = 7;
+  EXPECT_EQ(unofficial_napi_snapshot_commit(s.env, realm, root, nullptr, 0, &index), napi_generic_failure);
+  EXPECT_EQ(index, 7u);
+  size_t length = 7;
+  EXPECT_EQ(unofficial_napi_snapshot_guest_data(s.env, nullptr, 0, &length), napi_ok);
+  EXPECT_EQ(length, 0u);
+  bool pending = true;
+  EXPECT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+}
+
+namespace {
+struct OwnerProbe {
+  unofficial_napi_realm nested;
+  uint64_t before = 0;
+  uint64_t inside = 0;
+  uint64_t after = 0;
+};
+
+napi_value ProbeOwner(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) != napi_ok) return nullptr;
+  auto& probe = *static_cast<OwnerProbe*>(data);
+  EXPECT_EQ(unofficial_napi_get_current_realm_data(env, &probe.before), napi_ok);
+  unofficial_napi_realm_scope scope = 0;
+  if (unofficial_napi_enter_realm(env, probe.nested, &scope) == napi_ok) {
+    EXPECT_EQ(unofficial_napi_get_current_realm_data(env, &probe.inside), napi_ok);
+    EXPECT_EQ(unofficial_napi_leave_realm(env, scope), napi_ok);
+  }
+  EXPECT_EQ(unofficial_napi_get_current_realm_data(env, &probe.after), napi_ok);
+  return nullptr;
+}
+
+napi_value BindingReceiverOrPrimitive(napi_env env, napi_callback_info info) {
+  napi_value receiver = nullptr, new_target = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, &receiver, nullptr) != napi_ok ||
+      napi_get_new_target(env, info, &new_target) != napi_ok) return nullptr;
+  if (new_target == nullptr) return receiver;
+  napi_value result = nullptr;
+  napi_create_int32(env, 42, &result);
+  return result;
+}
+
+napi_value CountBindingSetter(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) == napi_ok)
+    ++*static_cast<int*>(data);
+  return nullptr;
+}
+}  // namespace
+
+TEST_F(Test66UnofficialRealm, QuickJSOwnerFollowsBindingCreationAndNestedRealmEntry) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm a = nullptr, b = nullptr;
+  napi_value a_global = nullptr, b_global = nullptr, root = Global(s.env);
+  constexpr uintptr_t a_data = 0x80000123;
+  constexpr uintptr_t b_data = 0x40000456;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0,
+                                          reinterpret_cast<void*>(a_data), &a, &a_global, &root), napi_ok);
+  ASSERT_EQ(root, nullptr);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0,
+                                          reinterpret_cast<void*>(b_data), &b, &b_global, nullptr), napi_ok);
+  unofficial_napi_realm_scope a_scope = 0, b_scope = 0;
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, a, &a_scope), napi_ok);
+  OwnerProbe probe { b };
+  napi_value callback = nullptr;
+  ASSERT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_METHOD, "owner", 5,
+                                            ProbeOwner, &probe, 0, nullptr, 0, nullptr, nullptr,
+                                            &callback, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_leave_realm(s.env, a_scope), napi_ok);
+  ASSERT_EQ(unofficial_napi_enter_realm(s.env, b, &b_scope), napi_ok);
+  ASSERT_EQ(napi_call_function(s.env, b_global, callback, 0, nullptr, nullptr), napi_ok);
+  EXPECT_EQ(probe.before, a_data);
+  EXPECT_EQ(probe.inside, b_data);
+  EXPECT_EQ(probe.after, a_data);
+  uint64_t owner = 0;
+  EXPECT_EQ(unofficial_napi_get_current_realm_data(s.env, &owner), napi_ok);
+  EXPECT_EQ(owner, b_data);
+  EXPECT_EQ(unofficial_napi_leave_realm(s.env, b_scope), napi_ok);
+  EXPECT_EQ(unofficial_napi_get_current_realm_data(s.env, &owner), napi_ok);
+  EXPECT_EQ(owner, 0u);
+}
+
+TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
+  EnvScope s(runtime_.get());
+  auto main_global = Global(s.env);
+  int setter_calls = 0;
+  napi_property_descriptor properties[] = {
+      {"method", nullptr, BindingReceiverOrPrimitive, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"prop", nullptr, nullptr, BindingReceiverOrPrimitive, CountBindingSetter, nullptr, napi_configurable, &setter_calls},
+  };
+  uint8_t lengths[] = {3, 0};
+  napi_value parent = nullptr, parent_proto = nullptr, binding = nullptr, proto = nullptr;
+  ASSERT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Parent", 6,
+                                            BindingReceiverOrPrimitive, nullptr, 0, nullptr, 0, nullptr, nullptr,
+                                            &parent, &parent_proto), napi_ok);
+  ASSERT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Binding", 7,
+                                            BindingReceiverOrPrimitive, nullptr, 2, parent, 2, properties, lengths,
+                                            &binding, &proto), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, main_global, "Binding", binding), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, main_global, "Parent", parent), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, main_global, "bindingProto", proto), napi_ok);
+  auto foreign_realm = CreateRealm(s.env);
+  ASSERT_NE(foreign_realm, nullptr);
+  ASSERT_EQ(napi_set_named_property(s.env, main_global, "Foreign", RunIn(s.env, foreign_realm,
+      "function Foreign() {}; Foreign.prototype = 1; Foreign")), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, main_global, "foreignObjectPrototype",
+                                  RunIn(s.env, foreign_realm, "Object.prototype")), napi_ok);
+
+  auto check = Eval(s.env, R"JS((() => {
+    const instance = new Binding();
+    const method = instance.method;
+    const {get, set} = Object.getOwnPropertyDescriptor(bindingProto, 'prop');
+    const desc = Object.getOwnPropertyDescriptor(Binding, 'prototype');
+    const marker = {};
+    let caught = false, rejectedNewMethod = false;
+    try { Reflect.construct(Binding, [], new Proxy(Foreign, {get() { throw marker; }})); }
+    catch (error) { caught = error === marker; }
+    try { new method(); } catch (error) { rejectedNewMethod = error instanceof TypeError; }
+    set.call(instance);
+    return Binding.length === 2 && Binding.name === 'Binding' &&
+      Object.getPrototypeOf(Binding) === Parent && Object.getPrototypeOf(bindingProto) === Parent.prototype &&
+      desc.value === bindingProto && !desc.writable && !desc.enumerable && !desc.configurable &&
+      instance instanceof Binding && Binding.call(Foreign) === Foreign && method.call(Foreign) === Foreign &&
+      method.name === 'method' && method.length === 3 && !Object.hasOwn(method, 'prototype') && rejectedNewMethod &&
+      get.name === 'get prop' && set.name === 'set prop' && get.length === 0 && set.length === 1 &&
+      get.call(instance, 1) === instance && Object.getOwnPropertyDescriptor(bindingProto, 'prop').get === get &&
+      Object.getPrototypeOf(Reflect.construct(Binding, [], Foreign)) === foreignObjectPrototype && caught;
+  })())JS");
+  bool matches = false;
+  ASSERT_NE(check, nullptr);
+  ASSERT_EQ(napi_get_value_bool(s.env, check, &matches), napi_ok);
+  EXPECT_TRUE(matches);
+  EXPECT_EQ(setter_calls, 1);
+
+  auto result = binding, result_proto = proto;
+  EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Bad", 3,
+                                            BindingReceiverOrPrimitive, nullptr, 0, Eval(s.env, "(function(){})"),
+                                            0, nullptr, nullptr, &result, &result_proto), napi_invalid_arg);
+  EXPECT_EQ(result, binding);
+  EXPECT_EQ(result_proto, proto);
+}
+#endif
 
 // As with vm.createContext(globalThis) in Node.
 TEST_F(Test66UnofficialRealm, TheEnvsGlobalCanBeASandbox) {

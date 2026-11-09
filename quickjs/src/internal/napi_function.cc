@@ -6,10 +6,20 @@
 #include "internal/napi_util.h"
 #include "internal/napi_value.h"
 
+#include <climits>
 #include <cstring>
+#include <string_view>
+#include <unordered_set>
+
+extern "C" bool napi_quickjs_is_construct_call(JSContext *ctx);
+extern "C" JSValue napi_quickjs_new_object_from_constructor(JSContext *ctx, JSValueConst constructor);
+extern "C" JSValue napi_quickjs_function_data(JSValueConst function, int magic);
 
 namespace
 {
+constexpr int binding_constructor = 0x4e41;
+constexpr int binding_method = 0x4e42;
+
 class quickjs_callback_handle_scope__
 {
 public:
@@ -127,15 +137,20 @@ JSValue invoke_callback(JSContext *caller_ctx,
 
   JSValue effective_this = this_val;
   JSValue new_target = JS_UNDEFINED;
-  bool called_as_constructor =
-      magic == JS_CFUNC_constructor_magic ||
-      (magic == 0 && JS_IsConstructor(ctx, this_val));
+  const bool is_binding_constructor = magic == binding_constructor;
+  bool called_as_constructor = is_binding_constructor ? napi_quickjs_is_construct_call(caller_ctx)
+      : magic == JS_CFUNC_constructor_magic || (magic == 0 && JS_IsConstructor(ctx, this_val));
 
   if (called_as_constructor)
   {
-    JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
-    effective_this = JS_NewObjectProto(ctx, proto);
-    JS_FreeValue(ctx, proto);
+    if (is_binding_constructor)
+      effective_this = napi_quickjs_new_object_from_constructor(ctx, this_val);
+    else
+    {
+      JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
+      effective_this = JS_NewObjectProto(ctx, proto);
+      JS_FreeValue(ctx, proto);
+    }
 
     if (JS_IsException(effective_this))
       return effective_this;
@@ -167,23 +182,20 @@ JSValue invoke_callback(JSContext *caller_ctx,
   }
 
   JSValue returned = JS_UNDEFINED;
-  if (called_as_constructor)
-  {
-    if (result != nullptr)
-    {
-      JS_FreeValue(ctx, effective_this);
-      returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
-      env->delete_value_from_current_scope(result);
-    }
-    else
-    {
-      returned = effective_this;
-    }
-  }
-  else if (result != nullptr)
+  if (result != nullptr)
   {
     returned = JS_DupValue(ctx, napi_quickjs_value_inner(env, result));
     env->delete_value_from_current_scope(result);
+  }
+  if (called_as_constructor)
+  {
+    if (result != nullptr && (!is_binding_constructor || JS_IsObject(returned)))
+      JS_FreeValue(ctx, effective_this);
+    else
+    {
+      JS_FreeValue(ctx, returned);
+      returned = effective_this;
+    }
   }
 
   return returned;
@@ -223,17 +235,11 @@ napi_status napi_function__::make_constructible(napi_env env, JSValue fn)
   return napi_ok;
 }
 
-napi_status napi_function__::create(napi_env env,
-                                    const char *utf8name,
-                                    size_t length,
-                                    napi_callback cb,
-                                    void *data,
-                                    int magic,
-                                    napi_value *result)
+namespace
 {
-  if (!napi_util__::check_env(env) || cb == nullptr || result == nullptr)
-    return napi_util__::invalid_arg(env);
-
+JSValue create_realm_function(napi_env env, const char *utf8name, size_t length,
+                              napi_callback cb, void *data, int arity, int magic)
+{
   // The function belongs to the current realm. One of another realm also
   // holds that realm's anchor, which keeps the realm alive exactly as long as
   // the function and lets the collector see the edge.
@@ -249,15 +255,13 @@ napi_status napi_function__::create(napi_env env,
   };
   data_values[0] = env->wrap_external_data(reinterpret_cast<void *>(cb));
   if (JS_IsException(data_values[0]))
-  {
-    return napi_util__::return_pending_if_caught(env, "Failed to create function data");
-  }
+    return JS_EXCEPTION;
   data_values[1] = env->wrap_external_data(data);
   if (JS_IsException(data_values[1]))
   {
     data_values[1] = JS_UNDEFINED;
     free_data();
-    return napi_util__::return_pending_if_caught(env, "Failed to create function data");
+    return JS_EXCEPTION;
   }
   if (!own_realm)
   {
@@ -267,25 +271,183 @@ napi_status napi_function__::create(napi_env env,
     {
       data_values[3] = JS_UNDEFINED;
       free_data();
-      return napi_util__::return_pending_if_caught(env, "Failed to create function data");
+      return JS_EXCEPTION;
     }
   }
 
-  JSValue fn = JS_NewCFunctionData(ctx, own_realm ? trampoline : realm_trampoline, 0, magic,
+  JSValue fn = JS_NewCFunctionData(ctx, own_realm ? napi_function__::trampoline : napi_function__::realm_trampoline, arity, magic,
                                    data_count, data_values);
   free_data();
+  if (JS_IsException(fn))
+    return fn;
+  if (utf8name != nullptr)
+  {
+    JSValue name = JS_NewStringLen(ctx, utf8name, length == NAPI_AUTO_LENGTH ? std::strlen(utf8name) : length);
+    if (JS_IsException(name) || JS_DefinePropertyValueStr(ctx, fn, "name", name, JS_PROP_CONFIGURABLE) < 0)
+    {
+      JS_FreeValue(ctx, fn);
+      return JS_EXCEPTION;
+    }
+  }
+  return fn;
+}
 
+bool owns_value(napi_env env, napi_value value)
+{
+  return value != nullptr && env->agent()->owns_scope(napi_scope__::ValuesAllocator::unsafe_owner(value));
+}
+
+class ScopedValue
+{
+public:
+  ScopedValue(JSContext *context, JSValue value) : context_(context), value_(value) {}
+  ~ScopedValue() { JS_FreeValue(context_, value_); }
+  ScopedValue(const ScopedValue &) = delete;
+  ScopedValue &operator=(const ScopedValue &) = delete;
+  JSValue get() const { return value_; }
+private:
+  JSContext *context_;
+  JSValue value_;
+};
+} // namespace
+
+napi_status napi_function__::create(napi_env env, const char *utf8name, size_t length,
+                                    napi_callback cb, void *data, int magic, napi_value *result)
+{
+  if (!napi_util__::check_env(env) || cb == nullptr || result == nullptr)
+    return napi_util__::invalid_arg(env);
+  JSValue fn = create_realm_function(env, utf8name, length, cb, data, 0, magic);
   if (JS_IsException(fn))
     return napi_util__::return_pending_if_caught(env, "Failed to create function");
 
-  if (utf8name != nullptr)
-  {
-    JS_DefinePropertyValueStr(env->context(), fn, "name",
-                              JS_NewStringLen(env->context(), utf8name,
-                                              (length == NAPI_AUTO_LENGTH) ? std::strlen(utf8name) : length),
-                              JS_PROP_CONFIGURABLE);
-  }
-
   *result = env->wrap_value_in_current_scope(fn, true);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
+    napi_env env, uint32_t kind, const char *utf8name, size_t name_length,
+    napi_callback callback, void *data, uint32_t function_length,
+    napi_value parent_or_null, size_t property_count, const napi_property_descriptor *properties,
+    const uint8_t *member_lengths_or_null, napi_value *function_out, napi_value *prototype_out)
+{
+  const bool is_class = kind == UNOFFICIAL_NAPI_BINDING_CLASS;
+  if (!napi_util__::check_env(env) || (kind != UNOFFICIAL_NAPI_BINDING_METHOD && !is_class) ||
+      function_out == nullptr || (is_class && prototype_out == nullptr))
+    return napi_invalid_arg;
+  JSContext *ctx = env->context();
+  if (env->termination_requested())
+    return napi_util__::fail_if_terminating(env, ctx);
+  if (utf8name == nullptr || name_length == 0 || name_length > INT_MAX || callback == nullptr ||
+      function_length > UINT8_MAX || (property_count != 0 && properties == nullptr) ||
+      (!is_class && (parent_or_null != nullptr || property_count != 0 || properties != nullptr ||
+                     member_lengths_or_null != nullptr || prototype_out != nullptr)))
+    return napi_invalid_arg;
+
+  JSValueConst parent = JS_UNDEFINED;
+  if (parent_or_null != nullptr)
+  {
+    if (!owns_value(env, parent_or_null))
+      return napi_invalid_arg;
+    parent = napi_quickjs_value_inner(env, parent_or_null);
+    auto registration = napi_quickjs_function_data(parent, binding_constructor);
+    if (JS_IsUndefined(registration) || napi_external__::get_env(registration) != env)
+      return napi_invalid_arg;
+  }
+
+  std::unordered_set<std::string_view> static_names, prototype_names;
+  for (size_t i = 0; i < property_count; ++i)
+  {
+    const auto &member = properties[i];
+    const bool accessor = member.getter != nullptr || member.setter != nullptr;
+    if (member.name != nullptr || member.utf8name == nullptr ||
+        (member.method != nullptr) + accessor + (member.value != nullptr) != 1 ||
+        (member.method == nullptr && member_lengths_or_null != nullptr && member_lengths_or_null[i] != 0) ||
+        (member.value != nullptr && (!owns_value(env, member.value) || JS_IsObject(napi_quickjs_value_inner(env, member.value)))))
+      return napi_invalid_arg;
+    const bool is_static = member.attributes & napi_static;
+    const std::string_view name(member.utf8name);
+    auto &names = is_static ? static_names : prototype_names;
+    if (name.size() >= 65536 || (is_static && (name == "length" || name == "name" || name == "prototype")) ||
+        (!is_static && name == "constructor") || !names.insert(name).second)
+      return napi_invalid_arg;
+  }
+
+  const auto failed = [&]() { return napi_util__::return_pending_if_caught(env, ctx, "Failed to define binding"); };
+  ScopedValue function(ctx, create_realm_function(env, utf8name, name_length, callback, data,
+                                                  function_length, is_class ? binding_constructor : binding_method));
+  if (JS_IsException(function.get()))
+    return failed();
+  if (!is_class)
+  {
+    napi_value result = env->wrap_value_in_current_scope(function.get(), false);
+    if (result == nullptr)
+      return napi_generic_failure;
+    *function_out = result;
+    return napi_ok;
+  }
+
+  ScopedValue prototype(ctx, JS_NewObject(ctx));
+  if (JS_IsException(prototype.get()) || JS_SetConstructor(ctx, function.get(), prototype.get()) < 0 ||
+      !JS_SetConstructorBit(ctx, function.get(), true))
+    return failed();
+  if (!JS_IsUndefined(parent))
+  {
+    // The parent is a binding constructor, whose prototype is an own, fixed
+    // data property. Neither this read nor the prototype writes run JS.
+    ScopedValue parent_prototype(ctx, JS_GetPropertyStr(ctx, parent, "prototype"));
+    if (JS_IsException(parent_prototype.get()) || JS_SetPrototype(ctx, function.get(), parent) < 0 ||
+        JS_SetPrototype(ctx, prototype.get(), parent_prototype.get()) < 0)
+      return failed();
+  }
+  for (size_t i = 0; i < property_count; ++i)
+  {
+    const auto &member = properties[i];
+    JSValueConst target = member.attributes & napi_static ? function.get() : prototype.get();
+    const auto *name = member.utf8name;
+    const size_t length = std::strlen(name);
+    int flags = JS_PROP_THROW;
+    if (member.attributes & napi_configurable) flags |= JS_PROP_CONFIGURABLE;
+    if (member.attributes & napi_enumerable) flags |= JS_PROP_ENUMERABLE;
+    if (member.attributes & napi_writable) flags |= JS_PROP_WRITABLE;
+    if (member.getter != nullptr || member.setter != nullptr)
+    {
+      std::string getter_name = std::string("get ") + name;
+      std::string setter_name = std::string("set ") + name;
+      ScopedValue getter(ctx, member.getter == nullptr ? JS_UNDEFINED : create_realm_function(
+          env, getter_name.data(), getter_name.size(), member.getter, member.data, 0, binding_method));
+      ScopedValue setter(ctx, member.setter == nullptr ? JS_UNDEFINED : create_realm_function(
+          env, setter_name.data(), setter_name.size(), member.setter, member.data, 1, binding_method));
+      if (JS_IsException(getter.get()) || JS_IsException(setter.get()))
+        return failed();
+      const auto atom = JS_NewAtomLen(ctx, name, length);
+      if (atom == JS_ATOM_NULL)
+        return failed();
+      int defined = JS_DefinePropertyGetSet(ctx, target, atom, JS_DupValue(ctx, getter.get()),
+                                           JS_DupValue(ctx, setter.get()), flags & ~JS_PROP_WRITABLE);
+      JS_FreeAtom(ctx, atom);
+      if (defined < 0)
+        return failed();
+    }
+    else
+    {
+      auto value = member.method == nullptr ? JS_DupValue(ctx, napi_quickjs_value_inner(env, member.value))
+          : create_realm_function(env, name, length, member.method, member.data,
+                                  member_lengths_or_null == nullptr ? 0 : member_lengths_or_null[i], binding_method);
+      if (JS_IsException(value) || JS_DefinePropertyValueStr(ctx, target, name, value, flags) < 0)
+        return failed();
+    }
+  }
+
+  napi_value result = env->wrap_value_in_current_scope(function.get(), false);
+  if (result == nullptr)
+    return napi_generic_failure;
+  napi_value proto_result = env->wrap_value_in_current_scope(prototype.get(), false);
+  if (proto_result == nullptr)
+  {
+    env->delete_value_from_current_scope(result);
+    return napi_generic_failure;
+  }
+  *function_out = result;
+  *prototype_out = proto_result;
+  return napi_ok;
 }

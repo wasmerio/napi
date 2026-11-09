@@ -39,7 +39,7 @@ napi_status CreateSandboxRealm(napi_env env,
   options.origin = Str(env, "test://origin");
   options.host_defined_option_id = Sym(env, "hdo");
   options.own_microtask_queue = own_microtask_queue;
-  return unofficial_napi_create_realm(env, &options, realm_out, nullptr);
+  return unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, realm_out, nullptr, nullptr);
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
@@ -1232,7 +1232,7 @@ TEST_F(Test65UnofficialContextify, DynamicImportWithModuleHooksButNoImportCallba
     ASSERT_EQ(CreateSandboxRealm(s.env, sandbox, false, &sandbox_realm), napi_ok);
     unofficial_napi_realm fresh_realm = nullptr;
     napi_value fresh_global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &fresh_realm, &fresh_global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &fresh_realm, &fresh_global, nullptr), napi_ok);
 
     napi_value env_box = nullptr;
     ASSERT_EQ(napi_run_script(s.env, Str(s.env, kImportBox), &env_box), napi_ok);

@@ -47,9 +47,11 @@
 typedef struct unofficial_napi_realm__* unofficial_napi_realm;
 
 napi_status unofficial_napi_create_realm(napi_env env,
-                                         const unofficial_napi_realm_options* options_or_null,
-                                         unofficial_napi_realm* realm_out,
-                                         napi_value* global_out);
+                                        const unofficial_napi_realm_options* options_or_null,
+                                        uint32_t mode, uint32_t snapshot_index, void* realm_data,
+                                        unofficial_napi_realm* realm_out,
+                                        napi_value* global_out, napi_value* root_out);
+napi_status unofficial_napi_get_current_realm_data(napi_env env, uint64_t* realm_data_out);
 napi_status unofficial_napi_get_realm(napi_env env, napi_value global_or_sandbox,
                                       unofficial_napi_realm* realm_out);
 
@@ -65,6 +67,16 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
 ```
 
 - **`create_realm`:**
+  - `FRESH` is the portable mode and takes index zero. `TEMPLATE` requires a
+    builder session. `RESTORE` takes a template index and requires `root_out`.
+    QuickJS and host-JS decline template and restore requests with
+    `napi_generic_failure`. If supplied on a successful fresh call, `root_out`
+    receives null.
+  - The provider keeps `realm_data` as an opaque value for the lifetime of
+    the realm. `get_current_realm_data` returns the current realm's value as
+    a `uint64_t`, or zero for an unbound realm. At entry to a native function
+    callback the current realm is its creation realm. Read the value before
+    entering another realm if the callback needs to retain its owner.
   - With a sandbox, global property access in the realm reads and writes the
     sandbox, as with `vm.createContext(sandbox)`.
   - A sandbox belongs to at most one realm. The env's own global may still be
@@ -214,7 +226,10 @@ calls take a realm's global or sandbox.
   before setting their fields. Source written against `main` that sets
   `size` to `sizeof`, `version` to the version macro and only the fields it
   knew sends version 2 with an indeterminate `realm_or_null`.
-- **Guest ABI.** The wasm32 layouts of version 1 are `main`'s, and version 2
+- **Guest ABI.** The `create_realm` options keep their version 1 wasm32 layout.
+  `create_realm` takes the mode, index, owner, and root output as separate words.
+  `get_current_realm_data` writes an eight-byte result. The wasm32 layouts of
+  version 1 script and module options are `main`'s, and version 2
   appends a u32 realm id. The guest imports
   `unofficial_napi_contextify_make_context`, `…_run_script` and
   `…_compile_function` keep `main`'s names and signatures, on the bridge's
@@ -312,7 +327,7 @@ and interrupt callbacks push the env's realm.
 
 ## How EdgeJS uses it
 
-- `vm.createContext` → `create_realm`.
+- `vm.createContext` → `create_realm` in `FRESH` mode with index zero.
 - `runInContext`, `compileFunction`, `moveMessagePortToContext` and
   `ModuleWrap` → `get_realm` on the contextified object, then the call with
   that realm.

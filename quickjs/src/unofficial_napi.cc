@@ -1217,25 +1217,80 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_create_realm(
         napi_env env,
         const unofficial_napi_realm_options *options_or_null,
+        uint32_t mode, uint32_t snapshot_index, void *realm_data,
         unofficial_napi_realm *realm_out,
-        napi_value *global_out)
+        napi_value *global_out, napi_value *root_out)
     {
+        if (!napi_util__::check_env(env) || realm_out == nullptr ||
+            (mode != UNOFFICIAL_NAPI_REALM_MODE_FRESH && mode != UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE &&
+             mode != UNOFFICIAL_NAPI_REALM_MODE_RESTORE) ||
+            (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && root_out == nullptr))
+            return napi_invalid_arg;
+        if (env->termination_requested())
+            return napi_util__::fail_if_terminating(env, env->context());
+        if (mode != UNOFFICIAL_NAPI_REALM_MODE_FRESH)
+            return napi_generic_failure;
+        if (snapshot_index != 0)
+            return napi_invalid_arg;
         unofficial_napi_realm_options options;
         unofficial_napi_realm_options_init(&options);
         if (options_or_null != nullptr)
         {
-            if (options_or_null->size < sizeof(options) ||
+            if (options_or_null->size != sizeof(options) ||
                 options_or_null->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION)
                 return napi_invalid_arg;
             options = *options_or_null;
         }
-        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
-        // a proxy trap).
-        if (napi_util__::check_env(env) && env->termination_requested())
-            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
-        return napi_util__::check_env(env) ? env->contextify().create_realm(options, realm_out, global_out)
-                                           : napi_invalid_arg;
+        auto status = env->contextify().create_realm(options, realm_data, realm_out, global_out);
+        if (status == napi_ok && root_out != nullptr)
+            *root_out = nullptr;
+        return status;
     }
+
+    napi_status NAPI_CDECL unofficial_napi_get_current_realm_data(napi_env env, uint64_t *realm_data_out)
+    {
+        if (!napi_util__::check_env(env) || realm_data_out == nullptr)
+            return napi_invalid_arg;
+        *realm_data_out = env->contextify().realm_data(env->context());
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_snapshot_commit(
+        napi_env env, unofficial_napi_realm, napi_value, const void *, size_t, uint32_t *)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        if (env->termination_requested())
+            return napi_util__::fail_if_terminating(env, env->context());
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_snapshot_guest_data(
+        napi_env env, void *buffer, size_t capacity, size_t *length_out)
+    {
+        if (!napi_util__::check_env(env) || length_out == nullptr || (buffer == nullptr && capacity != 0))
+            return napi_invalid_arg;
+        *length_out = 0;
+        return napi_ok;
+    }
+
+#if !defined(__wasm__)
+    napi_status NAPI_CDECL unofficial_napi_set_snapshot_host_options(const unofficial_napi_snapshot_host_options *options)
+    {
+        if (options == nullptr || options->size < sizeof(*options) || options->version != 1 ||
+            options->reserved != 0 || options->role > UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE)
+            return napi_invalid_arg;
+        if (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_NONE)
+            return napi_ok;
+        if (options->key == nullptr || options->key_length == 0 ||
+            (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER &&
+             (options->output_path == nullptr || options->output_path_length == 0)) ||
+            (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE &&
+             (options->artifact == nullptr || options->artifact_length == 0)))
+            return napi_invalid_arg;
+        return napi_generic_failure;
+    }
+#endif
 
     napi_status NAPI_CDECL unofficial_napi_get_realm(
         napi_env env,

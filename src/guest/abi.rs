@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+use std::ffi::CString;
+
 use wasmer::FunctionEnvMut;
 
 use crate::NapiEnv;
 
-use super::util::read_guest_bytes;
+use super::util::{guest_data_size, read_guest_bytes, read_guest_c_string_max};
 
 #[repr(C)]
 struct Wasm32VersionedHeader {
@@ -593,7 +596,10 @@ pub(crate) fn read_realm_options(
     if guest_ptr == 0 {
         return Some(RealmOptions::default());
     }
-    let bytes = read_versioned(env, guest_ptr, REALM_OPTIONS_SIZE, 1)?;
+    let bytes = read_guest_bytes(env, guest_ptr, REALM_OPTIONS_SIZE)?;
+    if u32_at(&bytes, 0)? != REALM_OPTIONS_SIZE as u32 || u32_at(&bytes, 4)? != 1 {
+        return None;
+    }
     let flag = |offset: usize| bytes.get(offset).map(|byte| *byte != 0);
     Some(RealmOptions {
         sandbox_or_null: u32_at(
@@ -619,6 +625,124 @@ pub(crate) fn read_realm_options(
             own_microtask_queue
         ))?,
     })
+}
+
+const INVALID_ARG: i32 = 1;
+pub(crate) const MAX_SNAPSHOT_GUEST_DATA: usize = 16 * 1024 * 1024;
+
+/// Check required result ranges before the provider can change engine state.
+pub(crate) fn guest_outputs(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    outputs: &[(u32, usize)],
+) -> Result<(), i32> {
+    let size = guest_data_size(env);
+    for (i, &(ptr, len)) in outputs.iter().enumerate() {
+        let start = u64::from(ptr);
+        let end = start.checked_add(len as u64).ok_or(INVALID_ARG)?;
+        if ptr == 0 || end > size {
+            return Err(INVALID_ARG);
+        }
+        if outputs[..i].iter().any(|&(other, len)| {
+            let other = u64::from(other);
+            start < other + len as u64 && other < end
+        }) {
+            return Err(INVALID_ARG);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct BindingDescriptor {
+    pub name: Vec<u8>,
+    pub properties: Vec<BindingProperty>,
+    pub member_lengths: Option<Vec<u8>>,
+}
+
+pub(crate) struct BindingProperty {
+    pub name: CString,
+    pub method: u32,
+    pub getter: u32,
+    pub setter: u32,
+    pub value: u32,
+    pub attrs: i32,
+    pub data: u32,
+    pub kind: u32,
+}
+
+/// Decode the wasm32 descriptor fully before allocating callbacks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_binding(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    kind: u32,
+    name_ptr: u32,
+    name_length: u32,
+    callback: u32,
+    parent: u32,
+    count: u32,
+    properties: u32,
+    lengths: u32,
+) -> Result<BindingDescriptor, i32> {
+    const PROPERTY_SIZE: usize = 32;
+    const MAX_MEMBER_NAME: usize = 64 * 1024;
+    if name_ptr == 0 || name_length == 0 || name_length == u32::MAX || callback == 0
+        || (kind == 2 && (parent != 0 || count != 0 || properties != 0 || lengths != 0))
+        || (count != 0 && properties == 0)
+    {
+        return Err(INVALID_ARG);
+    }
+    let name = read_guest_bytes(env, name_ptr, name_length as usize).ok_or(INVALID_ARG)?;
+    std::str::from_utf8(&name).map_err(|_| INVALID_ARG)?;
+    let count = count as usize;
+    let property_size = count.checked_mul(PROPERTY_SIZE).ok_or(INVALID_ARG)?;
+    let descriptors = if count == 0 {
+        Vec::new()
+    } else {
+        read_guest_bytes(env, properties, property_size).ok_or(INVALID_ARG)?
+    };
+    let member_lengths = if lengths == 0 {
+        None
+    } else {
+        Some(read_guest_bytes(env, lengths, count).ok_or(INVALID_ARG)?)
+    };
+    let mut keys = HashSet::new();
+    let mut properties = Vec::new();
+    for (index, bytes) in descriptors.chunks_exact(PROPERTY_SIZE).enumerate() {
+        let read = |offset| u32_at(bytes, offset).ok_or(INVALID_ARG);
+        let name_ptr = read(0)?;
+        let method = read(8)?;
+        let getter = read(12)?;
+        let setter = read(16)?;
+        let value = read(20)?;
+        let attrs = read(24)? as i32;
+        let data = read(28)?;
+        let property_kind = match (method != 0, getter != 0, setter != 0, value != 0) {
+            (false, false, false, true) => 0,
+            (true, false, false, false) => 1,
+            (false, true, false, false) => 2,
+            (false, false, true, false) => 3,
+            (false, true, true, false) => 4,
+            _ => return Err(INVALID_ARG),
+        };
+        if name_ptr == 0 || read(4)? != 0 || attrs & !0x407 != 0
+            || (property_kind != 1 && member_lengths.as_ref().is_some_and(|l| l[index] != 0))
+        {
+            return Err(INVALID_ARG);
+        }
+        let key = read_guest_c_string_max(env, name_ptr, MAX_MEMBER_NAME).ok_or(INVALID_ARG)?;
+        let key_text = std::str::from_utf8(&key).map_err(|_| INVALID_ARG)?;
+        let is_static = attrs & 0x400 != 0;
+        if (is_static && matches!(key_text, "length" | "name" | "prototype"))
+            || (!is_static && key_text == "constructor")
+            || !keys.insert((is_static, key.clone()))
+        {
+            return Err(INVALID_ARG);
+        }
+        properties.push(BindingProperty {
+            name: CString::new(key).map_err(|_| INVALID_ARG)?,
+            method, getter, setter, value, attrs, data, kind: property_kind,
+        });
+    }
+    Ok(BindingDescriptor { name, properties, member_lengths })
 }
 
 pub(crate) struct EnvHooks {

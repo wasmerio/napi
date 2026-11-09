@@ -316,6 +316,21 @@ unsafe extern "C" {
     // Realm ids are the value id of the realm's global (its sandbox, when it
     // has one); 0 means the env's own realm. Like any value id, a realm id is
     // valid only while its scope frame is open.
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_realm_preflight(env: SnapiEnv, guest_env: u32, mode: u32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_snapshot_cleanup_only(env: SnapiEnv) -> bool;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_snapshot_commit_preflight(env: SnapiEnv) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_snapshot_commit(env: SnapiEnv, realm_id: u32, root_id: u32, guest_data: *const u8, length: usize, index_out: *mut u32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_snapshot_guest_data(env: SnapiEnv, guest_env: u32, buffer: *mut u8, capacity: usize, length_out: *mut usize) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_get_current_realm_data(env: SnapiEnv, data_out: *mut u64) -> i32;
+
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_realm(
         env: SnapiEnv,
         sandbox_id: u32,
@@ -324,9 +339,27 @@ unsafe extern "C" {
         host_defined_option_id: u32,
         allow_code_gen_strings: i32,
         allow_code_gen_wasm: i32,
-        own_microtask_queue: i32,
+        realm_flags: i32,
         realm_out: *mut u32,
         global_out: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_create_realm(
+        env: SnapiEnv,
+        guest_env: u32,
+        sandbox_id: u32,
+        name_id: u32,
+        origin_id: u32,
+        host_defined_option_id: u32,
+        allow_code_gen_strings: i32,
+        allow_code_gen_wasm: i32,
+        realm_flags: i32,
+        mode: u32,
+        snapshot_index: u32,
+        realm_data: u32,
+        realm_out: *mut u32,
+        global_out: *mut u32,
+        root_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_get_realm(
         env: SnapiEnv,
@@ -1074,6 +1107,31 @@ unsafe extern "C" {
         prop_setter_reg_ids: *const u32,
         prop_attributes: *const i32,
         out_id: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_define_binding_preflight(env: SnapiEnv, kind: u32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unregister_callback(env: SnapiEnv, reg_id: u32);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_define_binding(
+        env: SnapiEnv,
+        kind: u32,
+        utf8name: *const c_char,
+        name_len: u32,
+        callback_reg_id: u32,
+        function_length: u32,
+        parent_id: u32,
+        prop_count: u32,
+        prop_names: *const *const c_char,
+        prop_types: *const u32,
+        prop_value_ids: *const u32,
+        prop_method_reg_ids: *const u32,
+        prop_getter_reg_ids: *const u32,
+        prop_setter_reg_ids: *const u32,
+        prop_attributes: *const i32,
+        member_lengths: *const u8,
+        function_out: *mut u32,
+        prototype_out: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_define_properties(
         env: SnapiEnv,

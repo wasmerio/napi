@@ -36,7 +36,7 @@ function load(native, overrides = {}) {
       ...overrides,
     };
   }
-  vm.runInContext(`${script}\nthis.providerAPI = {${apiNames.join(',')}};`, context);
+  vm.runInContext(`'use strict';\n${script}\nthis.providerAPI = {${apiNames.join(',')}};`, context);
   return { context, api: context.providerAPI, calls };
 }
 
@@ -209,4 +209,84 @@ test('guest code run from a drain is bracketed in a native realm only', () => {
   const ordinary = load(false);
   ordinary.api.wasmer_napi_native_realm_enter();
   ordinary.api.wasmer_napi_native_realm_leave();
+});
+
+test('binding factories build native class and method shapes under poisoned intrinsics', () => {
+  const { context, api } = load(false);
+  const root = api.wasmer_napi_create_global_context();
+  const registry = api.wasmer_napi_create_realm_registry();
+  const key = api.wasmer_napi_create_realm_context(registry, null, 27);
+  const realm = api.wasmer_napi_realm_context(registry, key);
+  assert.equal(api.wasmer_napi_realm_data(realm), 27);
+  const calls = [];
+  api.wasmer_napi_set_binding_dispatch(root, (reg, receiver, args, target, current) => {
+    calls.push({ reg, receiver, args: [...args], target, current });
+    return reg;
+  });
+  vm.runInContext(
+    "const define = Object.defineProperty; Object.defineProperty = Object.setPrototypeOf = () => { throw Error('poison'); };"
+    + "for (const key of ['get', 'set', 'value']) define(Object.prototype, key, {__proto__:null,get(){throw Error(key);}});",
+    context,
+  );
+  const base = api.wasmer_napi_binding_function(root, realm, 1, 'Base', 2, 1);
+  const basePrototype = api.wasmer_napi_binding_prototype(base, undefined, undefined);
+  const derived = api.wasmer_napi_binding_function(root, realm, 1, 'Derived', 3, 2);
+  const derivedPrototype = api.wasmer_napi_binding_prototype(derived, base, basePrototype);
+  const fn = api.wasmer_napi_binding_function(root, realm, 2, 'name with spaces', 4, 3);
+  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'm', 5, fn, 0, 0);
+  api.wasmer_napi_binding_member(root, realm, derivedPrototype, 'x', 6, undefined, 4, 5);
+  const accessor = Object.getOwnPropertyDescriptor(derivedPrototype, 'x');
+  assert.equal(Object.getPrototypeOf(derived), base);
+  assert.equal(Object.getPrototypeOf(derivedPrototype), basePrototype);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(derived, 'prototype'), {
+    value: derivedPrototype, writable: false, enumerable: false, configurable: false,
+  });
+  assert.deepEqual(Object.getOwnPropertyDescriptor(derivedPrototype, 'constructor'), {
+    value: derived, writable: true, enumerable: false, configurable: true,
+  });
+  const obj = new derived();
+  assert.equal(obj instanceof base, true);
+  assert.equal(calls.at(-1).target, derived);
+  assert.equal(derived.call(base), 2);
+  assert.equal(calls.at(-1).receiver, base);
+  assert.equal(calls.at(-1).target, undefined);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(fn, 'name'), {
+    value: 'name with spaces', writable: false, enumerable: false, configurable: true,
+  });
+  assert.equal(fn.length, 4);
+  assert.equal(Object.hasOwn(fn, 'prototype'), false);
+  assert.throws(() => new fn(), { name: 'TypeError' });
+  assert.equal(fn.call(null), 3);
+  assert.equal(calls.at(-1).receiver, null);
+  assert.equal(fn.call(17), 3);
+  assert.equal(calls.at(-1).receiver, 17);
+  assert.equal(fn(), 3);
+  assert.equal(calls.at(-1).receiver, undefined);
+  assert.equal(accessor.get.name, 'get x');
+  assert.equal(accessor.get.length, 0);
+  assert.equal(accessor.set.name, 'set x');
+  assert.equal(accessor.set.length, 1);
+  assert.equal(accessor.get.call(obj, 42), 4);
+  assert.deepEqual(calls.at(-1).args, [42]);
+  assert.equal(accessor.set.call(obj), 5);
+  assert.equal(calls.at(-1).reg, 5);
+  assert.equal(accessor.get, Object.getOwnPropertyDescriptor(derivedPrototype, 'x').get);
+  assert.equal(accessor.set, Object.getOwnPropertyDescriptor(derivedPrototype, 'x').set);
+  assert.throws(() => new accessor.get(), { name: 'TypeError' });
+  api.wasmer_napi_release_global_context(root);
+  assert.equal(fn(), undefined);
+});
+
+
+test('fresh realm setup uses captured reflection and realm registry methods', () => {
+  const { context, api } = load(false);
+  const registry = api.wasmer_napi_create_realm_registry();
+  vm.runInContext(
+    "const poisoned = () => { throw Error('poison'); };"
+    + "Object.defineProperty = Object.getOwnPropertyDescriptors = Object.setPrototypeOf = poisoned;"
+    + "Reflect.ownKeys = Reflect.get = WeakMap.prototype.get = WeakMap.prototype.set = poisoned;",
+    context,
+  );
+  const key = api.wasmer_napi_create_realm_context(registry, null, 41);
+  assert.equal(api.wasmer_napi_realm_data(api.wasmer_napi_realm_context(registry, key)), 41);
 });
