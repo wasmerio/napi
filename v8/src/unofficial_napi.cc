@@ -1905,6 +1905,8 @@ constexpr std::string_view kSnapshotMagic = "NAUTASN3";
 constexpr size_t kSnapshotHeaderSize = 8 + 5 * sizeof(uint32_t) + sizeof(uint64_t);
 constexpr size_t kSnapshotGuestDataLimit = 16 * 1024 * 1024;
 constexpr size_t kSnapshotManifestEntrySize = 12;
+// StartupData::IsValid expects enough bytes to read a V8 version string.
+constexpr uint32_t kSnapshotMinBlobSize = 128;
 
 struct SnapshotBuildOptions {
   std::string key;
@@ -1941,25 +1943,6 @@ void SnapshotAppendInteger(std::string* bytes, UInt value) {
   }
 }
 
-// The pinned V8 startup envelope starts with the number of contexts
-// (including the default), followed by fixed fields and the section offsets.
-bool HasValidStartupOffsets(std::string_view blob, uint32_t contexts) {
-  constexpr size_t kReadOnlyOffset = 80;
-  constexpr size_t kContextOffsets = 88;
-  const uint64_t engine_contexts = static_cast<uint64_t>(contexts) + 1;
-  const uint64_t table_end = kContextOffsets + engine_contexts * sizeof(uint32_t);
-  if (table_end >= blob.size() || SnapshotReadInteger<uint32_t>(blob, 0) != engine_contexts) {
-    return false;
-  }
-  uint64_t previous = table_end;
-  for (size_t offset = kReadOnlyOffset; offset < table_end; offset += sizeof(uint32_t)) {
-    const uint32_t section = SnapshotReadInteger<uint32_t>(blob, offset);
-    if (section <= previous || section >= blob.size()) return false;
-    previous = section;
-  }
-  return true;
-}
-
 std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view bytes, std::string_view key) {
   if (bytes.size() < kSnapshotHeaderSize || !bytes.starts_with(kSnapshotMagic)) return nullptr;
   uint32_t lengths[4];
@@ -1973,7 +1956,7 @@ std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view byt
   if (total != bytes.size() || contexts == 0 || lengths[0] != key.size() ||
       bytes.substr(kSnapshotHeaderSize, lengths[0]) != key ||
       lengths[1] % kSnapshotManifestEntrySize != 0 || lengths[2] == 0 ||
-      lengths[2] > kSnapshotGuestDataLimit || lengths[3] == 0 ||
+      lengths[2] > kSnapshotGuestDataLimit || lengths[3] < kSnapshotMinBlobSize ||
       lengths[3] > static_cast<uint32_t>(INT_MAX)) return nullptr;
   auto digest = SnapshotDigest(UINT64_C(14695981039346656037), bytes.substr(0, 28));
   if (SnapshotDigest(digest, bytes.substr(kSnapshotHeaderSize)) != expected_digest) return nullptr;
@@ -1986,7 +1969,6 @@ std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view byt
     parts[i]->assign(bytes.substr(at, lengths[i + 1]));
     at += lengths[i + 1];
   }
-  if (!HasValidStartupOffsets(result->blob, contexts)) return nullptr;
   result->startup.data = result->blob.data();
   result->startup.raw_size = static_cast<int>(result->blob.size());
   if (!result->startup.IsValid()) return nullptr;

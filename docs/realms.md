@@ -181,10 +181,12 @@ builders, and environments restoring different artifacts.
 V8 consumes the artifact at isolate creation. The host cache key must cover
 the running engine and provider build as well as the guest and its bootstrap
 inputs. The same Wasm can run against a different V8 build and get a new
-artifact. Treat artifacts as trusted engine data. Integrity validation
-detects corruption, and the host controls provenance. A zero metadata
-length means the env has no usable artifact. QuickJS and host-JS can run
-the same application with fresh realms and return zero metadata length.
+artifact. N-API checks the envelope and treats the engine blob as opaque,
+delegating its compatibility check to V8's public `StartupData::IsValid()`
+API. Treat artifacts as trusted engine data. The envelope's digest detects
+corruption, and the host controls provenance. A zero metadata length means
+the env has no usable artifact. QuickJS and host-JS can run the same
+application with fresh realms and return zero metadata length.
 
 
 ## Deprecated compatibility API
