@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 #if NAPI_QUICKJS_HAS_BINDING_CLASS
 extern "C" bool napi_quickjs_is_construct_call(JSContext *ctx);
@@ -307,7 +308,10 @@ JSValue create_realm_function(napi_env env, const char *utf8name, size_t length,
 #if NAPI_QUICKJS_HAS_BINDING_CLASS
 bool owns_value(napi_env env, napi_value value)
 {
-  return value != nullptr && env->agent()->owns_scope(napi_scope__::ValuesAllocator::unsafe_owner(value));
+  if (value == nullptr)
+    return false;
+  auto *scope = napi_scope__::ValuesAllocator::unsafe_owner(value);
+  return env->agent()->owns_scope(scope) && scope->env() == env;
 }
 #endif
 
@@ -351,6 +355,12 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
   JSContext *ctx = env->context();
   if (env->termination_requested())
     return napi_util__::fail_if_terminating(env, ctx);
+#if !NAPI_QUICKJS_HAS_BINDING_CLASS
+  // The public C-function-data ABI cannot distinguish an ordinary call
+  // with a constructor receiver from a construct call.
+  if (is_class)
+    return napi_generic_failure;
+#endif
   if (utf8name == nullptr || name_length == 0 || name_length > INT_MAX || callback == nullptr ||
       function_length > UINT8_MAX || (property_count != 0 && properties == nullptr) ||
       (!is_class && (parent_or_null != nullptr || property_count != 0 || properties != nullptr ||
@@ -358,7 +368,9 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
     return napi_invalid_arg;
 
   const auto failed = [&]() { return napi_util__::return_pending_if_caught(env, ctx, "Failed to define binding"); };
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
   if (!is_class)
+#endif
   {
     ScopedValue function(ctx, create_realm_function(env, utf8name, name_length, callback, data,
                                                     function_length, binding_method));
@@ -371,11 +383,7 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
     return napi_ok;
   }
 
-#if !NAPI_QUICKJS_HAS_BINDING_CLASS
-  // The public C-function-data ABI cannot distinguish an ordinary call
-  // with a constructor receiver from a construct call.
-  return napi_generic_failure;
-#else
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
   JSValueConst parent = JS_UNDEFINED;
   if (parent_or_null != nullptr)
   {
@@ -387,7 +395,18 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
       return napi_invalid_arg;
   }
 
-  std::unordered_set<std::string_view> static_names, prototype_names;
+  // Keep the atoms alive so validation and definition use the same decoded
+  // keys, including when different byte sequences decode to the same string.
+  struct MemberKeys {
+    JSContext *context;
+    std::vector<JSAtom> atoms;
+    ~MemberKeys() {
+      for (auto atom : atoms)
+        JS_FreeAtom(context, atom);
+    }
+  } keys{ctx, {}};
+  keys.atoms.reserve(property_count);
+  std::unordered_set<JSAtom> static_names, prototype_names;
   for (size_t i = 0; i < property_count; ++i)
   {
     const auto &member = properties[i];
@@ -401,7 +420,13 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
     const std::string_view name(member.utf8name);
     auto &names = is_static ? static_names : prototype_names;
     if (name.size() >= 65536 || (is_static && (name == "length" || name == "name" || name == "prototype")) ||
-        (!is_static && name == "constructor") || !names.insert(name).second)
+        (!is_static && name == "constructor"))
+      return napi_invalid_arg;
+    const auto atom = JS_NewAtomLen(ctx, name.data(), name.size());
+    if (atom == JS_ATOM_NULL)
+      return failed();
+    keys.atoms.push_back(atom);
+    if (!names.insert(atom).second)
       return napi_invalid_arg;
   }
 
@@ -443,12 +468,8 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
           env, setter_name.data(), setter_name.size(), member.setter, member.data, 1, binding_method));
       if (JS_IsException(getter.get()) || JS_IsException(setter.get()))
         return failed();
-      const auto atom = JS_NewAtomLen(ctx, name, length);
-      if (atom == JS_ATOM_NULL)
-        return failed();
-      int defined = JS_DefinePropertyGetSet(ctx, target, atom, JS_DupValue(ctx, getter.get()),
+      int defined = JS_DefinePropertyGetSet(ctx, target, keys.atoms[i], JS_DupValue(ctx, getter.get()),
                                            JS_DupValue(ctx, setter.get()), flags & ~JS_PROP_WRITABLE);
-      JS_FreeAtom(ctx, atom);
       if (defined < 0)
         return failed();
     }
@@ -457,7 +478,7 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
       auto value = member.method == nullptr ? JS_DupValue(ctx, napi_quickjs_value_inner(env, member.value))
           : create_realm_function(env, name, length, member.method, member.data,
                                   member_lengths_or_null == nullptr ? 0 : member_lengths_or_null[i], binding_method);
-      if (JS_IsException(value) || JS_DefinePropertyValueStr(ctx, target, name, value, flags) < 0)
+      if (JS_IsException(value) || JS_DefinePropertyValue(ctx, target, keys.atoms[i], value, flags) < 0)
         return failed();
     }
   }

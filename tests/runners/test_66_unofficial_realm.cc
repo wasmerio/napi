@@ -138,6 +138,10 @@ TEST_F(Test66UnofficialRealm, CreateRealmValidatesItsArguments) {
   unofficial_napi_realm_options_init(&options);
   options.version += 1;
   EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
+  unofficial_napi_realm_options_init(&options);
+  options.size += 8;
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 1, nullptr, &realm, nullptr, nullptr), napi_invalid_arg);
   EXPECT_EQ(realm, nullptr);
 
   napi_value number = nullptr;
@@ -183,7 +187,9 @@ TEST_F(Test66UnofficialRealm, QuickJSSnapshotEnvDeclinesExplicitBuilder) {
 }
 #endif
 
-TEST_F(Test66UnofficialRealm, QuickJSSnapshotModesDeclineWithoutChangingOutputs) {
+#endif
+
+TEST_F(Test66UnofficialRealm, FreshEnvSnapshotModesDeclineWithoutChangingOutputs) {
   EnvScope s(runtime_.get());
   auto realm = CreateRealm(s.env);
   ASSERT_NE(realm, nullptr);
@@ -232,6 +238,7 @@ napi_value ProbeOwner(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
 napi_value BindingReceiverOrPrimitive(napi_env env, napi_callback_info info) {
   napi_value receiver = nullptr, new_target = nullptr;
   if (napi_get_cb_info(env, info, nullptr, nullptr, &receiver, nullptr) != napi_ok ||
@@ -250,9 +257,10 @@ napi_value CountBindingSetter(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 #endif
+#endif
 }  // namespace
 
-TEST_F(Test66UnofficialRealm, QuickJSOwnerFollowsBindingCreationAndNestedRealmEntry) {
+TEST_F(Test66UnofficialRealm, OwnerFollowsBindingCreationAndNestedRealmEntry) {
   EnvScope s(runtime_.get());
   unofficial_napi_realm a = nullptr, b = nullptr;
   napi_value a_global = nullptr, b_global = nullptr, root = Global(s.env);
@@ -284,6 +292,74 @@ TEST_F(Test66UnofficialRealm, QuickJSOwnerFollowsBindingCreationAndNestedRealmEn
   EXPECT_EQ(owner, 0u);
 }
 
+TEST_F(Test66UnofficialRealm, EnterRejectsARealmFromAnotherEnvironment) {
+  EnvScope first(runtime_.get());
+  const auto foreign_realm = CreateRealm(first.env);
+  ASSERT_NE(foreign_realm, nullptr);
+
+  EnvScope second(runtime_.get());
+  unofficial_napi_realm_scope scope = 17;
+  EXPECT_EQ(unofficial_napi_enter_realm(second.env, foreign_realm, &scope), napi_invalid_arg);
+  EXPECT_EQ(scope, 0u);
+}
+
+TEST_F(Test66UnofficialRealm, TerminationPrecedesSnapshotAvailability) {
+  EnvScope s(runtime_.get());
+  auto realm = CreateRealm(s.env);
+  ASSERT_NE(realm, nullptr);
+  auto root = Global(s.env);
+  ASSERT_NE(root, nullptr);
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+
+  unofficial_napi_realm result = nullptr;
+  napi_value restored_root = nullptr, function = nullptr;
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE,
+                                        0, nullptr, &result, nullptr, nullptr), napi_pending_exception);
+  EXPECT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_RESTORE,
+                                        0, nullptr, &result, nullptr, &restored_root), napi_pending_exception);
+  EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_METHOD, "probe", 5,
+                                           ProbeOwner, nullptr, 0, nullptr, 0, nullptr, nullptr,
+                                           &function, nullptr), napi_pending_exception);
+  EXPECT_EQ(unofficial_napi_snapshot_commit(s.env, realm, root, nullptr, 0, nullptr),
+            napi_pending_exception);
+  EXPECT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+}
+
+#if defined(NAPI_TEST_ENGINE_V8) || NAPI_QUICKJS_HAS_BINDING_CLASS
+TEST_F(Test66UnofficialRealm, BindingClassRejectsInvalidMembers) {
+  EnvScope s(runtime_.get());
+  auto object = Global(s.env);
+  ASSERT_NE(object, nullptr);
+  napi_value function = object, prototype = object;
+  napi_property_descriptor members[] = {
+      {"method", nullptr, ProbeOwner, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"method", nullptr, ProbeOwner, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+  };
+  const auto define = [&](size_t count, uint32_t length = 0) {
+    return unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Binding", 7,
+                                          ProbeOwner, nullptr, length, nullptr, count, members,
+                                          nullptr, &function, &prototype);
+  };
+  EXPECT_EQ(define(2), napi_invalid_arg);
+  members[0].attributes = napi_static;
+  for (const char* key : {"length", "name", "prototype"}) {
+    members[0].utf8name = key;
+    EXPECT_EQ(define(1), napi_invalid_arg);
+  }
+  members[0].attributes = napi_default_method;
+  members[0].utf8name = "constructor";
+  EXPECT_EQ(define(1), napi_invalid_arg);
+  members[0].utf8name = "member";
+  members[0].method = nullptr;
+  members[0].value = object;
+  EXPECT_EQ(define(1), napi_invalid_arg);
+  EXPECT_EQ(define(0, 256), napi_invalid_arg);
+  EXPECT_EQ(function, object);
+  EXPECT_EQ(prototype, object);
+}
+#endif
+
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
 TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
   EnvScope s(runtime_.get());
   auto main_global = Global(s.env);
@@ -291,6 +367,9 @@ TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
   auto function = main_global, prototype = main_global;
   EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Binding", 7,
                                             BindingReceiverOrPrimitive, nullptr, 2, nullptr, 0, nullptr,
+                                            nullptr, &function, &prototype), napi_generic_failure);
+  EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, nullptr, 0,
+                                            nullptr, nullptr, 0, nullptr, 0, nullptr,
                                             nullptr, &function, &prototype), napi_generic_failure);
   EXPECT_EQ(function, main_global);
   EXPECT_EQ(prototype, main_global);
@@ -348,6 +427,15 @@ TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
   EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Bad", 3,
                                             BindingReceiverOrPrimitive, nullptr, 0, Eval(s.env, "(function(){})"),
                                             0, nullptr, nullptr, &result, &result_proto), napi_invalid_arg);
+  EXPECT_EQ(result, binding);
+  EXPECT_EQ(result_proto, proto);
+
+  // These byte sequences decode to the same property name in QuickJS.
+  properties[0].utf8name = "\x80";
+  properties[1].utf8name = "\x81";
+  EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Bad", 3,
+                                            BindingReceiverOrPrimitive, nullptr, 0, nullptr,
+                                            2, properties, lengths, &result, &result_proto), napi_invalid_arg);
   EXPECT_EQ(result, binding);
   EXPECT_EQ(result_proto, proto);
 #endif

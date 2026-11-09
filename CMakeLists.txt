@@ -30,7 +30,7 @@ if(NAPI_BUILD_QUICKJS)
     # Compile the pinned engine with the private binding-class hooks
     # in the same translation unit. Its checkout stays untouched.
     get_target_property(_qjs_sources qjs SOURCES)
-    list(REMOVE_ITEM _qjs_sources quickjs.c)
+    list(FILTER _qjs_sources EXCLUDE REGEX "(^|/)quickjs[.]c$")
     list(APPEND _qjs_sources "${CMAKE_CURRENT_SOURCE_DIR}/quickjs/engine/napi_quickjs_engine.c")
     set_property(TARGET qjs PROPERTY SOURCES "${_qjs_sources}")
     set(NAPI_QUICKJS_HAS_BINDING_CLASS ON)
