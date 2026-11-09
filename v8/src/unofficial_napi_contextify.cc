@@ -32,7 +32,6 @@
 #endif
 
 #include "internal/napi_v8_env.h"
-#include <v8-profiler.h>
 #include "internal/napi_module_wrap_record.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "napi_compat.h"
@@ -1388,10 +1387,11 @@ unofficial_napi_realm RealmForContext(v8::Local<v8::Context> context) {
 }
 
 // The context code for `realm` runs in: the env's own for a null realm.
-// Empty when the realm is not one of `env`'s or was collected.
+// Empty for sealed templates, finalized builders, or a realm outside the env.
 v8::Local<v8::Context> RealmContext(napi_env env, unofficial_napi_realm realm) {
+  if (!NapiV8AllowsEnvOperations(env)) return {};
   if (realm == nullptr) return env->main_context();
-  if (realm->env != env) return v8::Local<v8::Context>();
+  if (realm->env != env || realm->snapshot_added) return {};
   return realm->context.Get(env->isolate);
 }
 
@@ -1766,9 +1766,17 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return realm != nullptr && realm->env == env;
 }
 
+bool NapiV8IsSnapshotTemplateContext(napi_env env, v8::Local<v8::Context> context) {
+  if (!env->snapshot_builder || context.IsEmpty()) return false;
+  return std::any_of(env->realms.begin(), env->realms.end(), [&](const auto& realm) {
+    return realm->snapshot_template && realm->context == context;
+  });
+}
+
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   for (const auto& realm : env->realms) {
+    if (realm->snapshot_template) continue;
     v8::Local<v8::Context> context = realm->context.Get(env->isolate);
     if (!context.IsEmpty()) NapiV8ApplyPromiseHooksToContext(env, context);
   }
@@ -1800,7 +1808,9 @@ void NapiV8ExposeSharedArrayBufferForSnapshot(v8::Isolate* isolate, v8::Local<v8
 
 extern "C" {
 
-extern "C" bool SnapshotRestoreGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> holder);
+bool SnapshotRestoreGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> holder);
+
+bool NapiV8SnapshotReady(napi_env env);
 
 static_assert(sizeof(unofficial_napi_realm_options) == (sizeof(napi_value) == 4 ? 28 : 48));
 
@@ -1846,6 +1856,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
     return napi_invalid_arg;
   }
   if (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE) {
+    if (!NapiV8SnapshotReady(env)) return napi_generic_failure;
     return RestoreRealm(env, options, snapshot_index, realm_data, realm_out, global_out, root_out);
   }
   ReleaseCollectedRealms(env);
@@ -1922,7 +1933,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
 
   v8::Local<v8::Object> global = sandbox.IsEmpty() ? context->Global() : sandbox;
   if (!sandbox.IsEmpty() && !RestoreOwnProperties(isolate, context, sandbox, saved_properties)) {
-    if (realm->own_microtask_queue) context->DetachGlobal();
+    context->DetachGlobal();
     return napi_pending_exception;
   }
 
@@ -1931,18 +1942,18 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   if (!SetApiPrivate(property_context, global, "node:contextify:context", global) ||
       !SetApiPrivate(property_context, global, "node:host_defined_option_symbol",
                      host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>())) {
-    if (realm->own_microtask_queue) context->DetachGlobal();
+    context->DetachGlobal();
     return napi_generic_failure;
   }
   // The global stays in the caller's handle scope, which keeps the realm, and
   // so the handle, valid while that scope is open.
   napi_value global_napi = napi_v8_wrap_value(env, handle_scope.Escape(global));
   if (global_napi == nullptr) {
-    if (realm->own_microtask_queue) context->DetachGlobal();
+    context->DetachGlobal();
     return napi_generic_failure;
   }
   context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
-  NapiV8ApplyPromiseHooksToContext(env, context);
+  if (!snapshot_template) NapiV8ApplyPromiseHooksToContext(env, context);
   realm->context.Reset(isolate, context);
   realm->context.SetWeak();
   auto* handle = realm.get();
@@ -1954,126 +1965,15 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   return napi_ok;
 }
 
-// Snapshot prototype: a realm from the template context of the snapshot this
-// env was restored from (context index 0), with create_realm's post-steps.
-// `root_out` receives the per-context datum the builder stored.
-// Snapshot diagnostics (NAPI_V8_SNAPSHOT_DIAG=1): where a restore's time
-// goes, and what one restored realm allocates, by object kind.
-static bool SnapshotDiagEnabled() {
-  static const bool enabled = [] { const char* value = std::getenv("NAPI_V8_SNAPSHOT_DIAG"); return value && *value == '1'; }();
-  return enabled;
-}
-struct SnapshotRestoreTimes { double release = 0, from = 0, fixups = 0, data = 0, finish = 0; size_t count = 0; };
-static SnapshotRestoreTimes snapshot_restore_times;
-static double SnapshotDiagMicros(std::chrono::steady_clock::time_point& mark) {
-  auto now = std::chrono::steady_clock::now();
-  double micros = std::chrono::duration<double, std::micro>(now - mark).count();
-  mark = now;
-  return micros;
-}
-static std::string SnapshotDiagKey(v8::Isolate* isolate, const v8::HeapGraphNode* node) {
-  v8::String::Utf8Value name(isolate, node->GetName());
-  std::string text = *name ? std::string(*name).substr(0, 48) : std::string();
-  switch (node->GetType()) {
-    case v8::HeapGraphNode::kObject: return "object " + text;
-    case v8::HeapGraphNode::kClosure: return "closure";
-    case v8::HeapGraphNode::kString: case v8::HeapGraphNode::kConsString: case v8::HeapGraphNode::kSlicedString: return "string";
-    case v8::HeapGraphNode::kCode: return "code";
-    case v8::HeapGraphNode::kArray: return "array " + text;
-    case v8::HeapGraphNode::kHidden: return "hidden " + text;
-    case v8::HeapGraphNode::kHeapNumber: return "number";
-    case v8::HeapGraphNode::kRegExp: return "regexp";
-    case v8::HeapGraphNode::kSymbol: return "symbol";
-    case v8::HeapGraphNode::kBigInt: return "bigint";
-    case v8::HeapGraphNode::kObjectShape: return "shape " + text;
-    default: return "other " + std::to_string(int(node->GetType())) + " " + text;
-  }
-}
-static void SnapshotDiagHeapDiff(v8::Isolate* isolate, const v8::HeapSnapshot* before, const v8::HeapSnapshot* after) {
-  std::unordered_set<v8::SnapshotObjectId> old_ids;
-  for (int i = 0; i < before->GetNodesCount(); ++i) old_ids.insert(before->GetNode(i)->GetId());
-  std::map<std::string, std::pair<size_t, size_t>> kinds;
-  size_t total_count = 0, total_bytes = 0;
-  for (int i = 0; i < after->GetNodesCount(); ++i) {
-    const v8::HeapGraphNode* node = after->GetNode(i);
-    if (old_ids.count(node->GetId()) != 0) continue;
-    auto& entry = kinds[SnapshotDiagKey(isolate, node)];
-    entry.first += 1;
-    entry.second += node->GetShallowSize();
-    total_count += 1;
-    total_bytes += node->GetShallowSize();
-  }
-  // Closures by function name, and objects whose properties are a
-  // dictionary (by constructor name), among the new nodes.
-  std::map<std::string, size_t> closures, dictionaries, accessorOwners, scriptFunctions;
-  // NAPI_V8_SNAPSHOT_DIAG_SCRIPT=<substring>: that script's closures by name.
-  const char* diag_script = std::getenv("NAPI_V8_SNAPSHOT_DIAG_SCRIPT");
-  for (int i = 0; i < after->GetNodesCount(); ++i) {
-    const v8::HeapGraphNode* node = after->GetNode(i);
-    if (old_ids.count(node->GetId()) != 0) continue;
-    v8::String::Utf8Value name(isolate, node->GetName());
-    std::string text = *name ? std::string(*name).substr(0, 60) : std::string();
-    if (node->GetType() == v8::HeapGraphNode::kClosure) {
-      // By script: closure -[shared]-> function info -[script]-> script.
-      std::string script = "(no script)";
-      for (int e = 0; e < node->GetChildrenCount(); ++e) {
-        const v8::HeapGraphEdge* edge = node->GetChild(e);
-        v8::String::Utf8Value edge_name(isolate, edge->GetName());
-        if (!*edge_name || std::strcmp(*edge_name, "shared") != 0) continue;
-        const v8::HeapGraphNode* shared = edge->GetToNode();
-        for (int f = 0; f < shared->GetChildrenCount(); ++f) {
-          const v8::HeapGraphEdge* inner = shared->GetChild(f);
-          v8::String::Utf8Value inner_name(isolate, inner->GetName());
-          if (!*inner_name || std::strcmp(*inner_name, "script") != 0) continue;
-          v8::String::Utf8Value script_name(isolate, inner->GetToNode()->GetName());
-          script = *script_name ? std::string(*script_name).substr(0, 60) : "(unnamed)";
-        }
-        if (script == "(no script)") script = "(native)";
-      }
-      closures[script] += 1;
-      if (diag_script && *diag_script && script.find(diag_script) != std::string::npos) scriptFunctions[text.empty() ? "(anonymous)" : text] += 1;
-    } else if (node->GetType() == v8::HeapGraphNode::kObject) {
-      for (int e = 0; e < node->GetChildrenCount(); ++e) {
-        const v8::HeapGraphEdge* edge = node->GetChild(e);
-        v8::String::Utf8Value edge_name(isolate, edge->GetName());
-        const v8::HeapGraphNode* child = edge->GetToNode();
-        v8::String::Utf8Value child_name(isolate, child->GetName());
-        if (*edge_name && std::strcmp(*edge_name, "properties") == 0 && *child_name && std::strstr(*child_name, "object properties") && child->GetShallowSize() > 64) {
-          dictionaries[text] += 1;
-        }
-      }
-    }
-  }
-  auto print_top = [](const char* label, const std::map<std::string, size_t>& counts, size_t limit) {
-    std::vector<std::pair<std::string, size_t>> list(counts.begin(), counts.end());
-    std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-    size_t total = 0;
-    for (const auto& item : list) total += item.second;
-    std::fprintf(stderr, "NAPI snapshot diag: %s: %zu in %zu groups\n", label, total, list.size());
-    for (size_t i = 0; i < list.size() && i < limit; ++i) std::fprintf(stderr, "NAPI snapshot diag:   %6zu  %s\n", list[i].second, list[i].first.c_str());
-  };
-  print_top("closures by script", closures, 60);
-  if (diag_script && *diag_script) print_top("closures of the script by name", scriptFunctions, 200);
-  print_top("dictionary-mode objects by constructor", dictionaries, 30);
-  std::vector<std::pair<std::string, std::pair<size_t, size_t>>> sorted(kinds.begin(), kinds.end());
-  std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
-  std::fprintf(stderr, "NAPI snapshot diag: one restored realm: %zu objects, %zu bytes\n", total_count, total_bytes);
-  for (size_t i = 0; i < sorted.size() && i < 60; ++i) {
-    std::fprintf(stderr, "NAPI snapshot diag:   %8zu objects %9zu bytes  %s\n", sorted[i].second.first, sorted[i].second.second, sorted[i].first.c_str());
-  }
-}
-
+// Restore the per-context data and fix up the new realm before publishing it.
 extern "C" uint32_t NapiV8SnapshotContextCount(napi_env env);
 
 static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_options& options,
                                 uint32_t index, void* owner, unofficial_napi_realm* realm_out,
                                 napi_value* global_out, napi_value* root_out) {
   if (index >= NapiV8SnapshotContextCount(env)) return napi_invalid_arg;
-  const bool diag = SnapshotDiagEnabled();
-  auto mark = std::chrono::steady_clock::now();
   ReleaseCollectedRealms(env);
   NAPI_V8_RETURN_IF_TERMINATING(env);
-  if (diag) snapshot_restore_times.release += SnapshotDiagMicros(mark);
   v8::Isolate* isolate = env->isolate;
   // No inner scope: a scope escapes one value, and this returns two (the
   // global and the root); both live in the caller's handle scope.
@@ -2091,11 +1991,6 @@ static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_option
     realm->own_microtask_queue = v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
   }
   v8::Local<v8::Context> context;
-  const v8::HeapSnapshot* diag_before = nullptr;
-  if (diag && snapshot_restore_times.count == 3) {
-    diag_before = isolate->GetHeapProfiler()->TakeHeapSnapshot();
-    mark = std::chrono::steady_clock::now();
-  }
   {
     v8::TryCatch try_catch(isolate);
     if (!v8::Context::FromSnapshot(isolate, index, {}, nullptr, {},
@@ -2103,15 +1998,6 @@ static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_option
       if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
       return napi_generic_failure;
     }
-  }
-  if (diag) snapshot_restore_times.from += SnapshotDiagMicros(mark);
-  if (diag_before != nullptr) {
-    const v8::HeapSnapshot* diag_after = isolate->GetHeapProfiler()->TakeHeapSnapshot();
-    SnapshotDiagHeapDiff(isolate, diag_before, diag_after);
-    const_cast<v8::HeapSnapshot*>(diag_before)->Delete();
-    const_cast<v8::HeapSnapshot*>(diag_after)->Delete();
-    isolate->GetHeapProfiler()->ClearObjectIds();
-    mark = std::chrono::steady_clock::now();
   }
   v8::Local<v8::Object> global = context->Global();
   v8::Local<v8::Value> root;
@@ -2123,7 +2009,6 @@ static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_option
     bool fixed_up = SetApiPrivate(context, global, "node:contextify:context", global) &&
         SetApiPrivate(context, global, "node:host_defined_option_symbol",
                       host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
-    if (diag) snapshot_restore_times.fixups += SnapshotDiagMicros(mark);
     v8::Local<v8::Value> globals;
     if (!fixed_up || !context->GetDataFromSnapshotOnce<v8::Value>(0).ToLocal(&root) ||
         !root->IsObject() || !context->GetDataFromSnapshotOnce<v8::Value>(1).ToLocal(&globals) ||
@@ -2133,7 +2018,6 @@ static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_option
       return napi_generic_failure;
     }
   }
-  if (diag) snapshot_restore_times.data += SnapshotDiagMicros(mark);
   napi_value global_napi = napi_v8_wrap_value(env, global);
   napi_value root_napi = napi_v8_wrap_value(env, root);
   if (global_napi == nullptr || root_napi == nullptr) {
@@ -2150,14 +2034,6 @@ static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_option
   *root_out = root_napi;
   *realm_out = handle;
   AssignRealmToken(env, handle);
-  if (diag) {
-    snapshot_restore_times.finish += SnapshotDiagMicros(mark);
-    auto& t = snapshot_restore_times;
-    if (++t.count % 5 == 0) {
-      std::fprintf(stderr, "NAPI snapshot diag: %zu restores, mean us: release %.1f FromSnapshot %.1f fixups %.1f data %.1f finish %.1f\n",
-                   t.count, t.release / t.count, t.from / t.count, t.fixups / t.count, t.data / t.count, t.finish / t.count);
-    }
-  }
   return napi_ok;
 }
 
@@ -2198,9 +2074,6 @@ napi_status NAPI_CDECL unofficial_napi_enter_realm(napi_env env,
   if (realm_or_null != nullptr &&
       std::none_of(env->realms.begin(), env->realms.end(),
                    [&](const auto& realm) { return realm.get() == realm_or_null; })) {
-    return napi_invalid_arg;
-  }
-  if (env->snapshot_finalized || (realm_or_null != nullptr && realm_or_null->snapshot_added)) {
     return napi_invalid_arg;
   }
   v8::HandleScope handle_scope(env->isolate);
@@ -3090,6 +2963,14 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
   return napi_ok;
 }
 
+static bool CanUseModule(napi_env env, const ModuleWrapRecord* record) {
+  if (record->env != env) return false;
+  if (!env->snapshot_builder) return true;
+  return std::none_of(env->realms.begin(), env->realms.end(), [&](const auto& realm) {
+    return realm->snapshot_added && realm->context == record->context;
+  });
+}
+
 static napi_status MaterializeModuleRequests(
     napi_env env,
     unofficial_napi_module module,
@@ -3139,8 +3020,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     unofficial_napi_module module,
     size_t count,
     const unofficial_napi_module* linked_modules) {
-  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
@@ -3254,9 +3136,11 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
 napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
     napi_env env,
     unofficial_napi_module module_handle) {
-  if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
-  return InstantiateModuleRecord(env, ModuleRecord(module_handle));
+  auto* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
+  return InstantiateModuleRecord(env, record);
 }
 
 // Evaluating a module whose evaluation is under way (from its own body or a
@@ -3327,9 +3211,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
     int64_t /*timeout*/,
     bool /*break_on_sigint*/,
     napi_value* result_out) {
-  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
@@ -3357,11 +3242,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_value filename,
     napi_value parent_filename,
     napi_value* result_out) {
-  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   *result_out = nullptr;
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
@@ -3514,8 +3400,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
     unofficial_napi_module module,
     napi_value export_name,
     napi_value export_value) {
-  if (env == nullptr || module == nullptr || export_name == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr || export_name == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   v8::HandleScope handle_scope(env->isolate);
   // Only a synthetic module has exports to set. V8 aborts the process for
   // any other.
@@ -3626,9 +3513,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     napi_env env,
     unofficial_napi_module module,
     napi_value* result_out) {
-  if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   // The facade evaluates the module it wraps.
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   // Instantiating the facade instantiates that module too.

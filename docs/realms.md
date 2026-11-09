@@ -141,7 +141,8 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
 Use `unofficial_napi_define_binding` for native classes and non-constructible
 methods. The class form defines the constructor, prototype, and members in
 one operation. It accepts a parent created by the same operation in the
-same env. Member names use UTF-8 strings and must be unique on each target.
+same env. In a V8 template the parent must also belong to the template
+realm. Member names use UTF-8 strings and must be unique on each target.
 The optional length bytes apply to methods. Getter and setter functions
 have lengths zero and one and receive their respective callbacks even
 when invoked with an unusual argument count. The constructor's
@@ -160,21 +161,29 @@ configuration alongside the usual environment options. The configuration
 belongs to that call, so the same process can run fresh environments,
 builders, and environments restoring different artifacts.
 
-1. Pass the builder role with a cache key and a private staging path.
-   Create the template realms and install their bindings. Drain pending
-   work, leave the realm scopes, then commit each template with
-   `unofficial_napi_snapshot_commit` and a root object created in it.
-2. Attach the guest metadata to the last commit. After it succeeds, delete
-   remaining references, close scopes, and release the env. Release writes
-   the artifact and consumes the env even if the write fails. Publish
-   the file only after a successful release and validation.
-3. In the consumer, open the artifact with `unofficial_napi_open_snapshot`
+1. Pass the builder role with a cache key and a new path in a private
+   staging directory. Use an ASCII staging path on Windows.
+2. Create the template realms. Each V8 template has its own security token
+   while building, so use it through its realm scope. Use self-contained
+   JavaScript objects and functions in native C templates. Native callbacks
+   in a template require the Wasmer bridge's relocatable callback registry.
+   Keep wraps, externals, finalizers, and objects from other realms out of
+   the template. Drain pending work, leave the realm scopes, then commit
+   with `unofficial_napi_snapshot_commit` and a root created in that realm.
+3. Attach the guest metadata to the last commit. A committed template is
+   sealed. Native callers must also keep retained object aliases and raw
+   engine handles from mutating it through other realms. After the final
+   commit, delete remaining references, close scopes, and release the env.
+   Release writes the artifact and consumes the env even if the write
+   fails. Publish the file after successful release and validation.
+4. In the consumer, open the artifact with `unofficial_napi_open_snapshot`
    and the expected compatibility key. It validates and copies the bytes
    once. Pass the resulting handle in the restore options when creating
    each env. Keep the handle alive through the create call. Each env then
    retains its own reference to the data, so the host can close its handle.
-4. Query `unofficial_napi_snapshot_guest_data` to recover the metadata.
-   Create realms in restore mode with a template index and a fresh owner
+5. Query `unofficial_napi_snapshot_guest_data` to recover the metadata.
+   Artifacts with a native callback manifest become usable once the Wasmer
+   bridge has validated and bound every entry. Create realms in restore mode with a template index and a fresh owner
    datum. Each realm receives the template root from its own environment's
    artifact. Owner data is never serialized.
 
@@ -186,7 +195,9 @@ delegating its compatibility check to V8's public `StartupData::IsValid()`
 API. Treat artifacts as trusted engine data. The envelope's digest detects
 corruption, and the host controls provenance. A zero metadata length means
 the env has no usable artifact. QuickJS and host-JS can run the same
-application with fresh realms and return zero metadata length.
+application with fresh realms and return zero metadata length. Host-JS
+captures optional stack-trace hooks when its module loads. Install any
+embedder shim before loading the module.
 
 
 ## Deprecated compatibility API

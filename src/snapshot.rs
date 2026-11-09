@@ -128,14 +128,16 @@ impl std::fmt::Debug for SnapshotEnvironment {
 impl SnapshotEnvironment {
     /// Create a one-shot builder request for a private staging path.
     ///
-    /// Use a distinct path for each concurrent builder. To retry a build after
-    /// the builder environment has been created, create a new request.
+    /// Supply a new path in a private staging directory. On Windows the path
+    /// must be ASCII. To retry after the builder env was created, create a
+    /// new request.
     pub fn builder(key: &[u8], output_path: &Path) -> Result<Self, i32> {
         let output_path = output_path.as_os_str().as_encoded_bytes();
         if key.is_empty()
             || u32::try_from(key.len()).is_err()
             || output_path.is_empty()
             || output_path.contains(&0)
+            || (cfg!(windows) && !output_path.is_ascii())
         {
             return Err(NAPI_INVALID_ARG);
         }

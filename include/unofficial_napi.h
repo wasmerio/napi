@@ -425,8 +425,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_realm(
     unofficial_napi_realm* realm_out,
     napi_value* global_out, napi_value* root_out);
 
-// Reports the immutable owner of the current realm, or zero. The output
-// remains 64 bits even on wasm32.
+// Reports the immutable owner of the current realm as a uint64_t converted
+// through uintptr_t, or zero. JavaScript-invoked native callbacks start in
+// their creation realm. Explicit realm scopes override it while entered.
+// The wasm32 import writes eight bytes and zero-extends the creation datum.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_current_realm_data(
     napi_env env, uint64_t* realm_data_out);
 
@@ -436,7 +438,9 @@ enum {
 };
 // Define a native class or non-constructible method without invoking JS.
 // Names use explicit byte lengths. CLASS returns a constructor and its
-// prototype. Its optional parent must be a binding class in the same env.
+// prototype. Its optional parent must be a binding class in the same env
+// and, for a V8 template, in the same realm. An external QuickJS library
+// needs the binding-class engine hooks or CLASS returns napi_generic_failure.
 // Members use unique UTF-8 C-string keys per target and primitive values.
 // METHOD requires null parent, properties, member lengths and prototype
 // output, with a zero property count. All function lengths are at most 255.
@@ -448,10 +452,13 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_define_binding(
     const uint8_t* member_lengths_or_null,
     napi_value* function_out, napi_value* prototype_out);
 
-// Seal one template and optionally return its restore index. A nonempty
-// guest payload (at most 16 MiB) marks the final commit. After that only
-// reference deletion, scope closure and release are allowed. Release
-// consumes the env and writes the staged artifact.
+// Seal one template in a builder env and optionally return its restore index.
+// The template must have no active realm scope and root must be an object
+// created in that realm. Validation failures leave the builder usable.
+// A failure after template mutation poisons the session and prevents output.
+// A nonempty guest payload (at most 16 MiB) marks the final commit. The host
+// must then limit its calls to reference deletion, scope closure and release.
+// Release consumes the env and writes the staged artifact.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_snapshot_commit(
     napi_env env, unofficial_napi_realm realm, napi_value root,
     const void* guest_data_or_null, size_t guest_data_length, uint32_t* index_out);
@@ -486,8 +493,9 @@ typedef struct {
 #define UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION 1
 
 // Selects the snapshot for this environment. BUILDER requires a key and a
-// caller-reserved staging path, which are copied. RESTORE requires an open
-// artifact and retains its data through environment release. Close a handle
+// caller-reserved staging path, which are copied. Use a new staging path.
+// Its bytes use the native filesystem encoding on Unix and ASCII on Windows.
+// RESTORE requires an open artifact and retains its data through env release. Close a handle
 // after all create calls using it have returned. A null descriptor creates
 // a fresh env. The guest heap is transferred as in unofficial_napi_create_env.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env_with_snapshot(

@@ -97,6 +97,7 @@ if(NAPI_V8_BUILD_TESTS)
 
   add_executable(napi_v8_realm_snapshot_contract tests/realm_snapshot_contract.cc)
   target_link_libraries(napi_v8_realm_snapshot_contract PRIVATE napi_v8)
+  target_include_directories(napi_v8_realm_snapshot_contract PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
   set(_snapshot_fixture "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-contract.snap")
   add_test(NAME napi_v8.snapshot_binding_shape
            COMMAND napi_v8_realm_snapshot_contract shape "${_snapshot_fixture}")
@@ -106,6 +107,9 @@ if(NAPI_V8_BUILD_TESTS)
   add_test(NAME napi_v8.snapshot_restore
            COMMAND napi_v8_realm_snapshot_contract restore "${_snapshot_fixture}")
   set_tests_properties(napi_v8.snapshot_restore PROPERTIES FIXTURES_REQUIRED napi_v8_snapshot)
+  add_test(NAME napi_v8.snapshot_manifest
+           COMMAND napi_v8_realm_snapshot_contract manifest
+                   "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-manifest.snap")
   add_test(NAME napi_v8.snapshot_multirestore
            COMMAND napi_v8_realm_snapshot_contract multirestore
                    "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-live-a.snap"

@@ -260,6 +260,10 @@ struct napi_env__ {
   v8impl::detail::napi_factory__ factory_;
 };
 
+inline bool NapiV8AllowsEnvOperations(napi_env env) {
+  return env != nullptr && env->isolate != nullptr && !env->snapshot_finalized;
+}
+
 // Runs the enclosing code in a realm (null: the env's own) and closes any
 // scope it leaves open.
 class napi_realm_frame_scope__ {

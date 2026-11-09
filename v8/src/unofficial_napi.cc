@@ -1011,12 +1011,12 @@ void PromiseHookCallback(v8::PromiseHookType type,
   if (env == nullptr) return;
   const size_t index = PromiseHookIndex(type);
   if (index >= env->promise_hooks.size() || env->promise_hooks[index].IsEmpty()) return;
-  v8::Local<v8::Function> callback = env->promise_hooks[index].Get(isolate);
 
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context =
       isolate->InContext() ? isolate->GetCurrentContext() : env->context();
-  if (context.IsEmpty()) return;
+  if (context.IsEmpty() || NapiV8IsSnapshotTemplateContext(env, context)) return;
+  v8::Local<v8::Function> callback = env->promise_hooks[index].Get(isolate);
   std::optional<v8::Context::Scope> context_scope;
   if (!isolate->InContext()) {
     context_scope.emplace(context);
@@ -1901,7 +1901,7 @@ v8::FunctionCallback NapiV8SnapshotFunctionTrampoline();
 namespace {
 // All integer fields are little endian. The content digest detects accidental
 // damage; the launcher authenticates distributed snapshots separately.
-constexpr std::string_view kSnapshotMagic = "NAUTASN3";
+constexpr std::string_view kSnapshotMagic = "NAPISNP1";
 constexpr size_t kSnapshotHeaderSize = 8 + 5 * sizeof(uint32_t) + sizeof(uint64_t);
 constexpr size_t kSnapshotGuestDataLimit = 16 * 1024 * 1024;
 constexpr size_t kSnapshotManifestEntrySize = 12;
@@ -1976,6 +1976,7 @@ std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view byt
 }
 
 void EnsureSnapshotAnchor(EdgeV8Platform* platform) {
+  if (v8::IsolateGroup::CanCreateNewGroups()) return;
   std::lock_guard<std::mutex> lock(g_snapshot_anchor_mu);
   if (g_snapshot_anchor != nullptr) return;
   v8::Isolate::CreateParams params{};
@@ -2262,6 +2263,11 @@ static napi_status CreateEnv(
           output.find('\0') != std::string_view::npos) {
         return fail_snapshot_options(napi_invalid_arg);
       }
+#if defined(_WIN32)
+      if (std::any_of(output.begin(), output.end(), [](unsigned char c) { return c > 0x7f; })) {
+        return fail_snapshot_options(napi_invalid_arg);
+      }
+#endif
       try {
         snapshot_build = SnapshotBuildOptions{
             std::string(static_cast<const char*>(requested.key), requested.key_length),
@@ -2563,7 +2569,10 @@ static std::string SnapshotUtf8(v8::Isolate* isolate, v8::Local<v8::Value> value
   v8::String::Utf8Value text(isolate, value);
   return *text ? std::string(*text, text.length()) : std::string();
 }
-static bool SnapshotMoveGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Array>* holder_out) {
+static bool SnapshotPrepareGlobals(v8::Isolate* isolate,
+                                   v8::Local<v8::Context> context,
+                                   std::vector<v8::Local<v8::Name>>* remove,
+                                   v8::Local<v8::Array>* holder_out) {
   v8::Local<v8::Context> vanilla = v8::Context::New(isolate);
   v8::Local<v8::Array> vanilla_keys, keys;
   if (!vanilla->Global()->GetPropertyNames(vanilla, v8::KeyCollectionMode::kOwnOnly, v8::ALL_PROPERTIES,
@@ -2583,18 +2592,30 @@ static bool SnapshotMoveGlobals(v8::Isolate* isolate, v8::Local<v8::Context> con
   }
   v8::Local<v8::Value> lazy_definitions;
   if (!global->GetPrivate(context, LazyDefinitionsKey(isolate)).ToLocal(&lazy_definitions)) return false;
+  auto shared_array_buffer = v8::String::NewFromUtf8Literal(isolate, "SharedArrayBuffer");
+  auto get_key = v8::String::NewFromUtf8Literal(isolate, "get");
+  auto set_key = v8::String::NewFromUtf8Literal(isolate, "set");
+  auto value_key = v8::String::NewFromUtf8Literal(isolate, "value");
   std::vector<uint8_t> descriptors;
   std::vector<v8::Local<v8::Value>> values(2);
   values[0] = v8::Integer::New(isolate, kPackedSnapshotGlobals);
   for (uint32_t i = 0; i < keys->Length(); ++i) {
     v8::Local<v8::Value> raw;
     if (!keys->Get(context, i).ToLocal(&raw)) return false;
-    if (raw->IsString() && builtin.count(SnapshotUtf8(isolate, raw))) continue;
+    const bool is_shared_array_buffer = raw->StrictEquals(shared_array_buffer);
+    if (!is_shared_array_buffer && raw->IsString() && builtin.count(SnapshotUtf8(isolate, raw))) continue;
     // Array indices (a window's frames) come first in any order: kept.
-    if (raw->IsNumber()) continue;
-    v8::Local<v8::Name> key = raw->IsName() ? raw.As<v8::Name>() : raw->ToString(context).ToLocalChecked().As<v8::Name>();
+    if (!raw->IsName()) continue;
+    auto key = raw.As<v8::Name>();
     v8::PropertyAttribute attributes;
     if (!global->GetPropertyAttributes(context, key).To(&attributes)) return false;
+    if ((attributes & v8::DontDelete) != 0 ||
+        (attributes & ~kSnapshotGlobalAttributeMask) != 0) {
+      return false;
+    }
+    remove->push_back(key);
+    // Exposed for template construction. The consumer chooses whether to expose it.
+    if (is_shared_array_buffer) continue;
     bool callback = false;
     if (!global->HasRealNamedCallbackProperty(context, key).To(&callback)) return false;
     SnapshotGlobalKind kind;
@@ -2611,26 +2632,20 @@ static bool SnapshotMoveGlobals(v8::Isolate* isolate, v8::Local<v8::Context> con
       if (!global->GetOwnPropertyDescriptor(context, key).ToLocal(&descriptor) || !descriptor->IsObject()) return false;
       v8::Local<v8::Object> fields = descriptor.As<v8::Object>();
       bool accessor = false;
-      if (!fields->Has(context, v8::String::NewFromUtf8Literal(isolate, "get")).To(&accessor)) return false;
+      if (!fields->HasOwnProperty(context, get_key).To(&accessor)) return false;
       if (accessor) {
         kind = kSnapshotAccessorGlobal;
-        if (!fields->Get(context, v8::String::NewFromUtf8Literal(isolate, "get")).ToLocal(&first) ||
-            !fields->Get(context, v8::String::NewFromUtf8Literal(isolate, "set")).ToLocal(&second)) return false;
+        if (!fields->GetRealNamedProperty(context, get_key).ToLocal(&first) ||
+            !fields->GetRealNamedProperty(context, set_key).ToLocal(&second)) return false;
       } else {
         kind = kSnapshotDataGlobal;
-        if (!fields->Get(context, v8::String::NewFromUtf8Literal(isolate, "value")).ToLocal(&first)) return false;
+        if (!fields->GetRealNamedProperty(context, value_key).ToLocal(&first)) return false;
       }
     }
-    if ((attributes & v8::DontDelete) != 0) {
-      std::fprintf(stderr, "NAPI snapshot: global %s is not configurable and cannot be moved\n", SnapshotUtf8(isolate, key).c_str());
-      return false;
-    }
-    if ((attributes & ~kSnapshotGlobalAttributeMask) != 0) return false;
     descriptors.push_back(static_cast<uint8_t>((kind << kSnapshotGlobalKindShift) | attributes));
     values.push_back(key);
     if (kind != kSnapshotLazyGlobal) values.push_back(first);
     if (kind == kSnapshotAccessorGlobal) values.push_back(second);
-    if (!global->Delete(context, key).FromMaybe(false)) return false;
   }
   v8::Local<v8::String> metadata = v8::String::Empty(isolate);
   if (descriptors.size() > static_cast<size_t>(v8::String::kMaxLength) ||
@@ -2679,54 +2694,37 @@ static bool SnapshotDefineGlobal(v8::Local<v8::Context> context,
 
 // After V8 appended its late globals, restore the template's globals in order.
 bool SnapshotRestoreGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> raw_holder) {
+  v8::HandleScope handle_scope(isolate);
   if (!raw_holder->IsArray()) return false;
   v8::Local<v8::Array> holder = raw_holder.As<v8::Array>();
   const uint32_t length = holder->Length();
-  if (length == 0) return true;
-  v8::Local<v8::Value> format;
-  if (!holder->Get(context, 0).ToLocal(&format)) return false;
+  if (length < 2) return false;
+  v8::Local<v8::Value> format, raw_metadata;
+  if (!holder->Get(context, 0).ToLocal(&format) || !format->IsInt32() ||
+      format.As<v8::Int32>()->Value() != kPackedSnapshotGlobals ||
+      !holder->Get(context, 1).ToLocal(&raw_metadata) || !raw_metadata->IsString()) {
+    return false;
+  }
+  auto metadata = raw_metadata.As<v8::String>();
+  const auto count = static_cast<uint32_t>(metadata->Length());
+  if (!metadata->IsOneByte() || count > length - 2) return false;
+  std::vector<uint8_t> descriptors(count);
+  if (count != 0) metadata->WriteOneByteV2(isolate, 0, count, descriptors.data());
   v8::Local<v8::Object> global = context->Global();
   auto lazy_marker = v8::Integer::New(isolate, kLazyDefinitionOnHolderMarker);
-
-  if (format->IsInt32()) {
-    if (format.As<v8::Int32>()->Value() != kPackedSnapshotGlobals || length < 2) return false;
-    v8::Local<v8::Value> raw_metadata;
-    if (!holder->Get(context, 1).ToLocal(&raw_metadata) || !raw_metadata->IsString()) return false;
-    auto metadata = raw_metadata.As<v8::String>();
-    const auto count = static_cast<uint32_t>(metadata->Length());
-    if (!metadata->IsOneByte() || count > length - 2) return false;
-    std::vector<uint8_t> descriptors(count);
-    if (count != 0) metadata->WriteOneByteV2(isolate, 0, count, descriptors.data());
-    uint32_t at = 2;
-    for (uint8_t descriptor : descriptors) {
-      const int kind = descriptor >> kSnapshotGlobalKindShift;
-      const int bits = descriptor & kSnapshotGlobalAttributeMask;
-      const uint32_t fields = 1 + (kind != kSnapshotLazyGlobal) + (kind == kSnapshotAccessorGlobal);
-      if (kind > kSnapshotLazyGlobal || fields > length - at) return false;
-      v8::Local<v8::Value> key, first, second;
-      if (!holder->Get(context, at++).ToLocal(&key) || !key->IsName() ||
-          (kind != kSnapshotLazyGlobal && !holder->Get(context, at++).ToLocal(&first)) ||
-          (kind == kSnapshotAccessorGlobal && !holder->Get(context, at++).ToLocal(&second))) return false;
-      if (!SnapshotDefineGlobal(context, global, key.As<v8::Name>(), kind, bits, first, second, lazy_marker)) return false;
-    }
-    return at == length;
+  uint32_t at = 2;
+  for (uint8_t descriptor : descriptors) {
+    const int kind = descriptor >> kSnapshotGlobalKindShift;
+    const int bits = descriptor & kSnapshotGlobalAttributeMask;
+    const uint32_t fields = 1 + (kind != kSnapshotLazyGlobal) + (kind == kSnapshotAccessorGlobal);
+    if (kind > kSnapshotLazyGlobal || fields > length - at) return false;
+    v8::Local<v8::Value> key, first, second;
+    if (!holder->Get(context, at++).ToLocal(&key) || !key->IsName() ||
+        (kind != kSnapshotLazyGlobal && !holder->Get(context, at++).ToLocal(&first)) ||
+        (kind == kSnapshotAccessorGlobal && !holder->Get(context, at++).ToLocal(&second))) return false;
+    if (!SnapshotDefineGlobal(context, global, key.As<v8::Name>(), kind, bits, first, second, lazy_marker)) return false;
   }
-
-  // Older snapshots encode each property as five values.
-  if (length % 5 != 0) return false;
-  for (uint32_t at = 0; at < length; at += 5) {
-    v8::Local<v8::Value> key, raw_kind, attributes, first, second;
-    if (!holder->Get(context, at).ToLocal(&key) || !key->IsName() ||
-        !holder->Get(context, at + 1).ToLocal(&raw_kind) || !raw_kind->IsInt32() ||
-        !holder->Get(context, at + 4).ToLocal(&attributes) || !attributes->IsInt32()) return false;
-    const int kind = raw_kind.As<v8::Int32>()->Value();
-    if (kind < kSnapshotDataGlobal || kind > kSnapshotLazyGlobal ||
-        (kind != kSnapshotLazyGlobal && !holder->Get(context, at + 2).ToLocal(&first)) ||
-        (kind == kSnapshotAccessorGlobal && !holder->Get(context, at + 3).ToLocal(&second))) return false;
-    if (!SnapshotDefineGlobal(context, global, key.As<v8::Name>(), kind, attributes.As<v8::Int32>()->Value(),
-                              first, second, lazy_marker)) return false;
-  }
-  return true;
+  return at == length;
 }
 
 // ---- Snapshot API (include/unofficial_napi.h) ----
@@ -2746,6 +2744,12 @@ void NapiV8RejectSnapshotManifest(napi_env env) {
 }
 
 uint32_t NapiV8SnapshotContextCount(napi_env env) { return env->snapshot_context_count; }
+
+bool NapiV8SnapshotReady(napi_env env) {
+  return env->snapshot_artifact != nullptr &&
+         env->snapshot_static_table.size() ==
+             env->snapshot_artifact->manifest.size() / kSnapshotManifestEntrySize;
+}
 
 napi_status NapiV8SnapshotCommitWithManifest(
     napi_env env, unofficial_napi_realm realm, napi_value root,
@@ -2782,23 +2786,37 @@ napi_status NapiV8SnapshotCommitWithManifest(
       !SnapshotTemplateIsSelfContained(isolate, context, root_value)) {
     return napi_generic_failure;
   }
-  // From this point, a failure may have mutated the template. AddContext
-  // cannot be rolled back, so the session stays poisoned unless it succeeds.
-  env->snapshot_poisoned = true;
   v8::TryCatch try_catch(isolate);
-  {
-    // SharedArrayBuffer was exposed to build the bindings; a restored realm
-    // has it only where the embedder exposes it.
-    v8::Context::Scope context_scope(context);
-    if (!context->Global()->Delete(context, v8::String::NewFromUtf8Literal(isolate, "SharedArrayBuffer")).FromMaybe(false)) {
+  std::vector<v8::Local<v8::Name>> remove;
+  v8::Local<v8::Array> globals_holder;
+  if (!SnapshotPrepareGlobals(isolate, context, &remove, &globals_holder)) {
+    return try_catch.HasTerminated() ? napi_v8_fail_terminating(env) : napi_generic_failure;
+  }
+  std::string final_guest_data;
+  std::string final_manifest;
+  if (guest_data_length != 0) {
+    try {
+      final_guest_data.assign(static_cast<const char*>(guest_data), guest_data_length);
+      if (manifest_length != 0) final_manifest.assign(manifest, manifest_length);
+    } catch (const std::bad_alloc&) {
       return napi_generic_failure;
     }
   }
-  // Restore installs a fresh realm record and security token.
+  // AddContext and the changes to the template cannot be rolled back.
+  env->snapshot_poisoned = true;
+  {
+    v8::Context::Scope context_scope(context);
+    auto global = context->Global();
+    for (auto key : remove) {
+      if (!global->Delete(context, key).FromMaybe(false)) return napi_generic_failure;
+    }
+  }
+  // Restore installs a fresh realm record, token and hooks.
   context->SetAlignedPointerInEmbedderData(33, nullptr);
   context->UseDefaultSecurityToken();
-  v8::Local<v8::Array> globals_holder;
-  if (!SnapshotMoveGlobals(isolate, context, &globals_holder)) return napi_generic_failure;
+#ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
+  context->SetPromiseHooks({}, {}, {}, {});
+#endif
   auto* creator = env->snapshot_creator;
   if (env->snapshot_context_count == 0) creator->SetDefaultContext(v8::Context::New(isolate));
   size_t index = creator->AddContext(context);
@@ -2808,8 +2826,8 @@ napi_status NapiV8SnapshotCommitWithManifest(
   realm->snapshot_added = true;
   ++env->snapshot_context_count;
   if (guest_data_length != 0) {
-    env->snapshot_guest_data.assign(static_cast<const char*>(guest_data), guest_data_length);
-    if (manifest_length != 0) env->snapshot_manifest.assign(manifest, manifest_length);
+    env->snapshot_guest_data = std::move(final_guest_data);
+    env->snapshot_manifest = std::move(final_manifest);
     env->snapshot_finalized = true;
   }
   env->snapshot_poisoned = false;
@@ -2830,7 +2848,7 @@ napi_status NAPI_CDECL unofficial_napi_snapshot_guest_data(napi_env env,
                                                           size_t* length_out) {
   if (env == nullptr || length_out == nullptr) return napi_invalid_arg;
   if (env->snapshot_finalized || (buffer == nullptr && capacity != 0)) return napi_invalid_arg;
-  const auto* snapshot = env->snapshot_artifact;
+  const auto* snapshot = NapiV8SnapshotReady(env) ? env->snapshot_artifact : nullptr;
   *length_out = snapshot != nullptr ? snapshot->guest_data.size() : 0;
   if (buffer != nullptr && snapshot != nullptr && capacity != 0) {
     std::memcpy(buffer, snapshot->guest_data.data(), std::min(capacity, snapshot->guest_data.size()));
@@ -2853,13 +2871,23 @@ napi_status NAPI_CDECL unofficial_napi_snapshot_static_table(napi_env env,
   return napi_ok;
 }
 
+#if defined(__GNUC__)
+__attribute__((visibility("hidden")))
+#endif
 napi_status NAPI_CDECL unofficial_napi_snapshot_set_static(napi_env env,
                                                           uint32_t index,
                                                           napi_callback cb,
                                                           void* data, uint32_t role) {
-  if (env == nullptr) return napi_invalid_arg;
-  if (env->snapshot_static_table.size() <= index) env->snapshot_static_table.resize(index + 1);
-  env->snapshot_static_table[index] = {cb, data, role};
+  if (env == nullptr || env->snapshot_artifact == nullptr || cb == nullptr || role > 3 ||
+      index != env->snapshot_static_table.size() ||
+      index >= env->snapshot_artifact->manifest.size() / kSnapshotManifestEntrySize) {
+    return napi_invalid_arg;
+  }
+  try {
+    env->snapshot_static_table.emplace_back(cb, data, role);
+  } catch (const std::bad_alloc&) {
+    return napi_generic_failure;
+  }
   return napi_ok;
 }
 
@@ -3021,7 +3049,7 @@ napi_status NAPI_CDECL unofficial_napi_event_loop_checkpoint(
     bool has_runnable_work,
     uint32_t* state_out) {
   (void)has_runnable_work;
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env)) return napi_invalid_arg;
   // The checkpoint's own handles (the env's context for its microtask queue,
   // each pending dynamic import's promise) are freed here: an embedder that
   // runs checkpoints outside any handle scope of its own would otherwise
@@ -3226,7 +3254,7 @@ void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
 
 napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
     napi_env env, napi_value source, napi_value* result) {
-  if (env == nullptr || env->isolate == nullptr || source == nullptr || result == nullptr)
+  if (!NapiV8AllowsEnvOperations(env) || source == nullptr || result == nullptr)
     return napi_invalid_arg;
   *result = nullptr;
   NAPI_V8_RETURN_IF_TERMINATING(env);
@@ -3290,7 +3318,7 @@ napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* resul
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {
-  if (env == nullptr || env->isolate == nullptr || callback == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || callback == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(callback);
   if (!raw->IsFunction()) return napi_function_expected;
   env->context()->GetMicrotaskQueue()->EnqueueMicrotask(env->isolate, raw.As<v8::Function>());
@@ -3299,7 +3327,7 @@ napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_valu
 
 napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                    napi_value callback) {
-  if (env == nullptr || env->isolate == nullptr || callback == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || callback == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(callback);
   if (!raw->IsFunction()) return napi_function_expected;
   env->promise_reject_callback.Reset(env->isolate, raw.As<v8::Function>());
@@ -3312,7 +3340,7 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
                                                          napi_value before,
                                                          napi_value after,
                                                          napi_value resolve) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env)) return napi_invalid_arg;
 
   std::array<v8::Local<v8::Function>, 4> hooks;
   if (!GetPromiseHookFunction(env, init, &hooks[0]) ||
@@ -3320,6 +3348,15 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
       !GetPromiseHookFunction(env, after, &hooks[2]) ||
       !GetPromiseHookFunction(env, resolve, &hooks[3])) {
     return napi_function_expected;
+  }
+  if (env->snapshot_builder) {
+    for (auto hook : hooks) {
+      v8::Local<v8::Context> creation_context;
+      if (!hook.IsEmpty() && hook->GetCreationContext().ToLocal(&creation_context) &&
+          NapiV8IsSnapshotTemplateContext(env, creation_context)) {
+        return napi_invalid_arg;
+      }
+    }
   }
 
   for (size_t i = 0; i < hooks.size(); ++i) {
@@ -3855,7 +3892,7 @@ napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
     napi_value names,
     napi_value initializer,
     napi_property_attributes attributes) {
-  if (env == nullptr || env->isolate == nullptr || object == nullptr || names == nullptr ||
+  if (!NapiV8AllowsEnvOperations(env) || object == nullptr || names == nullptr ||
       initializer == nullptr) {
     return napi_invalid_arg;
   }
@@ -3917,7 +3954,7 @@ napi_status NAPI_CDECL unofficial_napi_define_lazy_data_properties(
   // define call. The initializer already keeps its own creation realm alive.
   v8::Local<v8::Value> definition;
   {
-    // Snapshot prototype: a builder keeps a template realm's definitions in
+    // A builder keeps a template realm's definitions in
     // that realm, so the template has no edge into the env's.
     v8::Local<v8::Context> definition_context = env->main_context();
     if (env->snapshot_builder) {
@@ -4358,7 +4395,7 @@ size_t open_value_count(napi_env env) {
 
 }  // namespace napi::testing
 
-// Snapshot prototype: every native callback a snapshot can reach.
+// Native callbacks a snapshot can reach.
 namespace {
 const intptr_t* SnapshotExternalReferences() {
   static const intptr_t references[] = {

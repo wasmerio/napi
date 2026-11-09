@@ -437,7 +437,8 @@ fn guest_unofficial_napi_snapshot_guest_data(
 fn guest_unofficial_napi_get_current_realm_data(
     mut env: FunctionEnvMut<NapiEnv>, napi_env: u32, data_out: u32,
 ) -> i32 {
-    if data_out == 0 {
+    // The guest ABI writes a u64 even though create_realm takes a wasm32 pointer.
+    if abi::guest_outputs(&mut env, &[(data_out, 8)]).is_err() {
         return 1;
     }
     let handle = snapi_env(&env, napi_env);

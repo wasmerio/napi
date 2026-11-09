@@ -168,8 +168,17 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   return handle_scope.Escape(promise);
 }
 
-inline bool CheckEnv(napi_env env) {
+inline bool HasLiveEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+inline bool CheckEnv(napi_env env) {
+  return NapiV8AllowsEnvOperations(env);
+}
+
+bool InSnapshotTemplate(napi_env env) {
+  const auto* realm = env->current_realm();
+  return realm != nullptr && realm->snapshot_template;
 }
 
 void ClearLastException(napi_env env);
@@ -178,7 +187,7 @@ void ClearLastException(napi_env env);
 // Node's CleanupQueue::Drain runs them, so a hook added meanwhile runs in the
 // next round.
 void RunEnvCleanupHooks(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
 
   struct CleanupHookSnapshot {
     napi_cleanup_hook hook = nullptr;
@@ -235,7 +244,7 @@ void RunEnvCleanupHooks(napi_env env) {
 }
 
 napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
-  if (!CheckEnv(env) || record == nullptr) return nullptr;
+  if (!HasLiveEnv(env) || record == nullptr) return nullptr;
   auto& records = env->buffer_records;
   for (auto it = records.begin(); it != records.end(); ++it) {
     if (*it == record) {
@@ -250,7 +259,7 @@ void FinalizeBufferRecord(napi_buffer_record* record) {
   if (record == nullptr || record->finalized) return;
   record->finalized = true;
   if (record->finalize_cb == nullptr) return;
-  if (CheckEnv(record->env)) {
+  if (HasLiveEnv(record->env)) {
     record->env->CallFinalizer(record->finalize_cb, record->external_data, record->finalize_hint);
   } else {
     record->finalize_cb(record->env, record->external_data, record->finalize_hint);
@@ -261,7 +270,7 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   napi_buffer_record* record = info.GetParameter();
   if (record == nullptr) return;
   napi_env env = record->env;
-  if (CheckEnv(env)) {
+  if (HasLiveEnv(env)) {
     napi_buffer_record* owned_record = TakeBufferRecord(env, record);
     if (owned_record == nullptr) return;
     owned_record->holder.Reset();
@@ -415,7 +424,7 @@ void FinalizeNewestExternalArrayBuffer(napi_env env) {
 }
 
 void FinalizeExternalBackingStoreHints(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
 
   // At the env's release. Runs the user finalizers of external stores most
   // recent first, by store id: those deleters queued (their buffers were
@@ -745,9 +754,8 @@ v8::Local<v8::Context> PromiseContext(napi_env env, v8::Local<v8::Promise::Resol
   return context;
 }
 
-// Snapshot prototype: a function a snapshot builder made in a template realm
-// carries a static id (a Smi), resolved through its env's static table. Its
-// realm is its creation context's (embedder slot 33, as in contextify).
+// Template functions carry a static ID resolved through their env's callback
+// table. V8 enters the creation context when it invokes an API callback.
 static unofficial_napi_realm__* SnapshotRealmForContext(v8::Local<v8::Context> context) {
   constexpr int kRealmSlot = 33;
   if (context.IsEmpty() || context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(kRealmSlot)) {
@@ -761,11 +769,7 @@ static void StaticFunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& 
   uint32_t id = info.Data().As<v8::Uint32>()->Value();
   unofficial_napi_realm__* realm = SnapshotRealmForContext(isolate->GetCurrentContext());
   napi_env env = realm != nullptr ? realm->env : nullptr;
-  if (realm != nullptr && realm->snapshot_added) {
-    isolate->ThrowException(v8::Exception::TypeError(
-        v8::String::NewFromUtf8Literal(isolate, "snapshot realm is sealed")));
-    return;
-  }
+  // Sealing a template clears its context's realm slot.
   if (env == nullptr || id >= env->snapshot_static_table.size() ||
       std::get<0>(env->snapshot_static_table[id]) == nullptr) {
     isolate->ThrowException(v8::Exception::TypeError(
@@ -951,7 +955,7 @@ napi_status CreateExternalBuffer(napi_env env,
 
 }  // namespace
 
-// Snapshot prototype: the native callbacks a snapshot can reach, for V8's
+// The native callbacks a snapshot can reach, for V8's
 // external reference table.
 v8::FunctionCallback NapiV8SnapshotFunctionTrampoline() { return FunctionTrampoline; }
 
@@ -1279,7 +1283,7 @@ napi_status napi_v8_clear_last_error(napi_env env) {
 }
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
-  if (!CheckEnv(env)) return nullptr;
+  if (!HasLiveEnv(env)) return nullptr;
   v8impl::detail::napi_lifetime_tracker__::record_value(env, value);
   return JsValueFromV8LocalValue(value);
 }
@@ -1303,7 +1307,7 @@ napi_status napi_v8_create_external_buffer_with_free(
 }
 
 void napi_v8_finalize_buffer_records(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
   for (auto* record : env->buffer_records) {
     if (record != nullptr) {
       FinalizeBufferRecord(record);
@@ -1475,6 +1479,7 @@ napi_status NAPI_CDECL napi_create_external(napi_env env,
                                             void* finalize_hint,
                                             napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  if (InSnapshotTemplate(env)) return napi_generic_failure;
   v8::Local<v8::External> external = napi_external_wrapper__::New(env, data);
   if (external.IsEmpty()) return napi_generic_failure;
   if (finalize_cb != nullptr) {
@@ -2311,7 +2316,7 @@ napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope* r
 }
 
 napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope) {
-  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  if (!HasLiveEnv(env) || scope == nullptr) return napi_invalid_arg;
   if (scope->env != env || env->open_handle_scope_stack.empty() ||
       env->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
@@ -2336,7 +2341,7 @@ napi_status NAPI_CDECL napi_open_escapable_handle_scope(
 
 napi_status NAPI_CDECL napi_close_escapable_handle_scope(
     napi_env env, napi_escapable_handle_scope scope) {
-  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  if (!HasLiveEnv(env) || scope == nullptr) return napi_invalid_arg;
   if (scope->env != env || env->open_handle_scope_stack.empty() ||
       env->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
@@ -2617,6 +2622,7 @@ napi_status NAPI_CDECL unofficial_napi_define_binding(
     parent = raw.As<v8::Function>();
     v8::Local<v8::Context> parent_context;
     if (!parent->GetCreationContext().ToLocal(&parent_context)) return napi_invalid_arg;
+    if (InSnapshotTemplate(env) && parent_context != context) return napi_invalid_arg;
     auto* parent_realm = SnapshotRealmForContext(parent_context);
     if (parent_context != env->main_context() && (parent_realm == nullptr || parent_realm->env != env)) {
       return napi_invalid_arg;
@@ -2731,6 +2737,8 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   if (property_count > 0 && properties == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // The standard class constructor carries an unserializable External.
+  if (InSnapshotTemplate(env)) return napi_generic_failure;
   // As in napi_create_function: V8 takes an int length.
   if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -3543,7 +3551,7 @@ napi_status NAPI_CDECL napi_create_reference(napi_env env,
 
 napi_status NAPI_CDECL napi_delete_reference(node_api_basic_env env, napi_ref ref) {
   auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv)) return napi_invalid_arg;
+  if (!HasLiveEnv(napiEnv)) return napi_invalid_arg;
   if (ref == nullptr) return napi_invalid_arg;
   ref->Destroy();
   return napi_ok;
@@ -3590,6 +3598,13 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
+  if (env->snapshot_builder) {
+    v8::Local<v8::Context> creation_context;
+    if (object->GetCreationContext().ToLocal(&creation_context) &&
+        NapiV8IsSnapshotTemplateContext(env, creation_context)) {
+      return napi_generic_failure;
+    }
+  }
   v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), wrapKey).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");

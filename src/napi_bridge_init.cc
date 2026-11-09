@@ -13,7 +13,6 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,8 +24,7 @@
 
 #include "node_api.h"
 #include "unofficial_napi.h"
-#include "edge_v8_platform.h"
-#include "internal/napi_v8_env.h"
+#include "napi_bridge_v8.h"
 
 namespace {
 
@@ -166,6 +164,7 @@ struct SnapiAgentState {
   std::vector<ValueSlot> value_slots;
   std::vector<uint32_t> value_free_slots;
   size_t live_value_count = 0;
+  size_t reserved_value_count = 0;
 
   // Open scope frames, innermost last. Initialized lazily with the root frame
   // on first use; new values are minted into the innermost frame.
@@ -387,12 +386,6 @@ void ReleaseCallbackBinding(napi_env, void* data, void* user) {
   delete binding;
 }
 
-void InstallCallbackBindingHooks(SnapiEnvState* state) {
-  state->env->callback_data_retain = RetainCallbackBinding;
-  state->env->callback_data_release = ReleaseCallbackBinding;
-  state->env->callback_data_hooks_user = state;
-}
-
 SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
   if (env_state == nullptr) return nullptr;
   // The pointer originates from the guest (via the Rust env-id layer); gate it
@@ -450,6 +443,40 @@ ScopeFrame& PushScopeFrame(SnapiEnvState& state, napi_handle_scope scope,
   return frame;
 }
 
+bool HasValueCapacity(const SnapiAgentState& agent, size_t count) {
+  const size_t needed = agent.live_value_count + agent.reserved_value_count + count;
+  return needed <= kValueIdMaxSlots &&
+         (agent.value_limit == 0 || needed <= agent.value_limit);
+}
+
+// Reserve the result ids before a provider call that may create objects or
+// reenter the bridge. Every nested value allocation observes the reservation.
+// Release it immediately before storing the outputs, with no intervening
+// calls into the provider or guest.
+class ValueSlotReservation {
+ public:
+  ValueSlotReservation(SnapiAgentState& agent, size_t count) : agent_(agent) {
+    if (HasValueCapacity(agent_, count)) {
+      count_ = count;
+      agent_.reserved_value_count += count;
+    }
+  }
+  ~ValueSlotReservation() { Release(); }
+  ValueSlotReservation(const ValueSlotReservation&) = delete;
+  ValueSlotReservation& operator=(const ValueSlotReservation&) = delete;
+
+  explicit operator bool() const { return count_ != 0; }
+
+  void Release() {
+    agent_.reserved_value_count -= count_;
+    count_ = 0;
+  }
+
+ private:
+  SnapiAgentState& agent_;
+  size_t count_ = 0;
+};
+
 // Mints an id for `val` owned by `frame`. The common path stores into the
 // innermost frame; escape_handle stores into the parent of the escaped scope.
 uint32_t StoreValueInFrame(SnapiEnvState& state, napi_value val, ScopeFrame& frame) {
@@ -459,15 +486,12 @@ uint32_t StoreValueInFrame(SnapiEnvState& state, napi_value val, ScopeFrame& fra
   // Refuse once the per-agent handle cap is reached: returning 0 surfaces as
   // an N-API failure the guest can handle, instead of leaking host RSS
   // unbounded.
-  if (agent.value_limit != 0 && agent.live_value_count >= agent.value_limit) {
-    return 0;
-  }
+  if (!HasValueCapacity(agent, 1)) return 0;
   uint32_t index;
   if (!agent.value_free_slots.empty()) {
     index = agent.value_free_slots.back();
     agent.value_free_slots.pop_back();
   } else {
-    if (agent.value_slots.size() >= kValueIdMaxSlots) return 0;
     index = static_cast<uint32_t>(agent.value_slots.size());
     agent.value_slots.emplace_back();
   }
@@ -540,32 +564,6 @@ void PopCurrentFrame(SnapiEnvState& state, bool close_napi_scope) {
       (void)napi_close_handle_scope(frame.env, frame.scope);
     }
   }
-}
-
-uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
-  return backing_store == nullptr
-             ? 0
-             : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(backing_store.get()));
-}
-
-uint64_t napi_v8_get_arraybuffer_backing_store_token(napi_env env, napi_value value) {
-  (void)env;
-  if (value == nullptr) return 0;
-
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (raw.IsEmpty() || !raw->IsArrayBuffer()) return 0;
-
-  return BackingStoreToken(raw.As<v8::ArrayBuffer>()->GetBackingStore());
-}
-
-uint64_t napi_v8_get_arraybuffer_view_backing_store_token(napi_env env, napi_value value) {
-  (void)env;
-  if (value == nullptr) return 0;
-
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (raw.IsEmpty() || !raw->IsArrayBufferView()) return 0;
-
-  return BackingStoreToken(raw.As<v8::ArrayBufferView>()->Buffer()->GetBackingStore());
 }
 
 size_t TypedArrayElementSize(napi_typedarray_type type) {
@@ -724,9 +722,7 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   for (SnapiEnvState* env_state : agent->envs) {
     env_state->cb_registry.clear();
     env_state->next_cb_reg_id = 1;
-    env_state->env->callback_data_retain = nullptr;
-    env_state->env->callback_data_release = nullptr;
-    env_state->env->callback_data_hooks_user = nullptr;
+    SetBridgeCallbackDataHooks(env_state->env, nullptr, nullptr, nullptr);
   }
   napi_status s = napi_ok;
   if (agent->owner != nullptr) {
@@ -778,7 +774,7 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
   agent->envs.push_back(state);
   state->agent = agent;
   state->env = env;
-  InstallCallbackBindingHooks(state);
+  SetBridgeCallbackDataHooks(env, RetainCallbackBinding, ReleaseCallbackBinding, state);
   { std::lock_guard<std::mutex> lock(g_mu); g_envs.insert(state); }
   AdoptOnThisThread(state);
   return state;
@@ -790,25 +786,11 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
 // Initialization
 // ============================================================
 
-// Host-only: sizes the process-wide V8 background worker pool. Not reachable
-// from guest code -- a guest must not get to choose how many threads the host
-// runs. Returns 0 once the platform exists, since the pool is fixed then.
-extern "C" int snapi_bridge_set_v8_worker_thread_count(uint32_t count) {
-  return EdgeV8Platform::SetWorkerThreadCount(static_cast<int>(count)) ? 1 : 0;
-}
-
 extern "C" int snapi_bridge_init() {
   // Intentionally do not create a N-API env here.
   // Env creation is deferred until the guest explicitly calls
   // `unofficial_napi_create_env`, so init happens on the execution thread.
   return 1;
-}
-
-// Host-only: the function to call, from any thread, after V8 queues a
-// foreground task that only an env's next event-loop checkpoint runs
-// (EdgeV8Platform::SetForegroundTaskWaker). NULL clears it.
-extern "C" void snapi_bridge_set_foreground_task_waker(void (*waker)()) {
-  EdgeV8Platform::SetForegroundTaskWaker(waker);
 }
 
 // ============================================================
@@ -2852,8 +2834,6 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  const auto* realm = env->snapshot_builder ? env->current_realm() : nullptr;
-  const bool recording_template = realm != nullptr && realm->snapshot_template;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
   std::vector<napi_property_descriptor> descs(prop_count);
@@ -2872,16 +2852,16 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
         descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
         break;
       case 2:
-        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
+        descs[i].getter = generic_wasm_binding_getter;
         descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
         break;
       case 3:
-        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
+        descs[i].setter = generic_wasm_binding_setter;
         descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
         break;
       case 4:
-        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
-        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
+        descs[i].getter = generic_wasm_binding_getter;
+        descs[i].setter = generic_wasm_binding_setter;
         descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
         break;
     }
@@ -2919,8 +2899,6 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  const auto* realm = env->snapshot_builder ? env->current_realm() : nullptr;
-  const bool recording_template = realm != nullptr && realm->snapshot_template;
 
   // Build property descriptors
   std::vector<napi_property_descriptor> descs(prop_count);
@@ -2939,16 +2917,16 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
         break;
       case 2: // getter only
-        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
+        descs[i].getter = generic_wasm_binding_getter;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
         break;
       case 3: // setter only
-        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
+        descs[i].setter = generic_wasm_binding_setter;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
         break;
       case 4: // getter + setter
-        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
-        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
+        descs[i].getter = generic_wasm_binding_getter;
+        descs[i].setter = generic_wasm_binding_setter;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
         // Note: N-API uses the same data pointer for both getter and setter.
         // The setter_reg_id is stored in the getter_reg_id for now.
@@ -2968,8 +2946,6 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
   *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
 }
-
-extern "C" napi_status NapiV8DefineBindingPreflight(napi_env env, uint32_t kind);
 
 extern "C" int snapi_bridge_define_binding_preflight(SnapiEnvState* env_state, uint32_t kind) {
   auto* state = RequireEnvState(env_state);
@@ -2999,6 +2975,8 @@ extern "C" int snapi_bridge_define_binding(
   if (parent_id != 0 && parent == nullptr) return napi_invalid_arg;
   if (kind == UNOFFICIAL_NAPI_BINDING_METHOD &&
       (parent_id || prop_count || prop_names || member_lengths || prototype_out)) return napi_invalid_arg;
+  ValueSlotReservation results(*state->agent, prototype_out != nullptr ? 2 : 1);
+  if (!results) return napi_generic_failure;
 
   struct PendingBindings {
     SnapiEnvState* state;
@@ -3067,7 +3045,11 @@ extern "C" int snapi_bridge_define_binding(
       descriptors.empty() ? nullptr : descriptors.data(), member_lengths, &function,
       prototype_out != nullptr ? &prototype : nullptr);
   if (status != napi_ok) return status;
+  if (function == nullptr || (prototype_out != nullptr && prototype == nullptr)) {
+    return napi_generic_failure;
+  }
   pending.committed = true;
+  results.Release();
   *function_out = StoreValue(*state, function);
   if (prototype_out != nullptr) *prototype_out = StoreValue(*state, prototype);
   return napi_ok;
@@ -3209,10 +3191,9 @@ void WasmInterruptCallback(napi_env env, void* raw) {
 // short-lived callback-info token.
 static napi_value DispatchWasmCallback(napi_env env, napi_callback_info info, int accessor_role) {
   void* raw_data = nullptr;
-  // Only the actual argument count and registration data select the guest
-  // callback. Guest napi_get_cb_info retrieves arguments/receiver on demand.
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &raw_data);
+  // The registered accessor role selects the guest callback. Guest
+  // napi_get_cb_info retrieves arguments and receiver on demand.
+  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &raw_data);
 
   auto* binding = static_cast<CallbackBinding*>(raw_data);
   if (binding == nullptr) {
@@ -3262,8 +3243,7 @@ static napi_value DispatchWasmCallback(napi_env env, napi_callback_info info, in
 
   // Call Rust trampoline → WASM callback
   const uint32_t wasm_fn_ptr =
-      (it->second.wasm_setter_fn_ptr != 0 &&
-       (accessor_role == 2 || (accessor_role == 0 && argc > 0)))
+      (accessor_role == 2 && it->second.wasm_setter_fn_ptr != 0)
           ? it->second.wasm_setter_fn_ptr
           : it->second.wasm_fn_ptr;
 
@@ -3749,7 +3729,6 @@ extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_st
   // membership pinned only for this non-reentrant engine control operation.
   std::lock_guard<std::mutex> lock(g_mu);
   if (!g_envs.count(env_state)) return napi_invalid_arg;
-  if (env_state->snapshot_cleanup_only) return napi_invalid_arg;
   SnapiAgentState* agent = env_state->agent;
   if (agent->closing) {
     // Releasing: stop any guest code teardown is running now (finalizers can
@@ -3757,6 +3736,8 @@ extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_st
     // isolate may already be going away, and no JavaScript can run anyway.
     agent->stop_requested = true;
     if (agent->teardown_guest_calls == 0) return napi_ok;
+  } else if (env_state->snapshot_cleanup_only) {
+    return napi_invalid_arg;
   }
   return unofficial_napi_terminate_execution(env_state->env);
 }
@@ -4259,18 +4240,6 @@ static bool ResolveRealm(SnapiEnvState& state, uint32_t realm_id, unofficial_nap
 }
 
 
-extern "C" {
-napi_status NapiV8RealmPreflight(napi_env, uint32_t);
-napi_status NapiV8SnapshotCommitPreflight(napi_env);
-napi_status NapiV8SnapshotCommitWithManifest(napi_env, unofficial_napi_realm, napi_value,
-    const void*, size_t, uint32_t*, const char*, size_t);
-napi_status unofficial_napi_snapshot_static_table(napi_env, uint32_t, napi_callback*, void**,
-                                                  uint32_t* role, uint32_t* count);
-napi_status unofficial_napi_snapshot_set_static(napi_env, uint32_t, napi_callback, void*, uint32_t);
-napi_status unofficial_napi_snapshot_loaded_manifest(napi_env, const char**, size_t*);
-void NapiV8RejectSnapshotManifest(napi_env);
-}
-
 // Snapshot manifest entries use one guest callback and one role per static
 // id. The setter no longer shares a registration with the getter.
 struct SnapshotManifestEntry {
@@ -4377,6 +4346,9 @@ extern "C" int snapi_bridge_unofficial_create_realm(
   options.allow_code_gen_strings = allow_code_gen_strings != 0;
   options.allow_code_gen_wasm = allow_code_gen_wasm != 0;
   options.own_microtask_queue = (realm_flags & 1) != 0;
+  const bool restoring = mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE;
+  ValueSlotReservation results(*state->agent, restoring ? 2 : 1);
+  if (!results) return napi_generic_failure;
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
   napi_value root = nullptr;
@@ -4384,6 +4356,8 @@ extern "C" int snapi_bridge_unofficial_create_realm(
       reinterpret_cast<void*>(static_cast<uintptr_t>(realm_data)), &realm, &global,
       root_out != nullptr ? &root : nullptr);
   if (status != napi_ok) return status;
+  if (global == nullptr || (restoring && root == nullptr)) return napi_generic_failure;
+  results.Release();
   const auto global_id = StoreValue(*state, global);
   const auto root_id = root != nullptr ? StoreValue(*state, root) : 0;
   *realm_out = global_id;
