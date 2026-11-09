@@ -26,6 +26,8 @@
 #include "internal/napi_v8_agent.h"
 #include "unofficial_napi.h"
 
+namespace v8 { class SnapshotCreator; }
+
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
 
 struct napi_buffer_record__;
@@ -53,8 +55,6 @@ inline v8::Local<v8::Value> V8LocalValueFromJsValue(napi_value value) {
   std::memcpy(static_cast<void*>(&local), &value, sizeof(value));
   return local;
 }
-
-namespace v8 { class SnapshotCreator; }
 
 // Frees an external backing store's memory. Runs in V8's deleter, on any
 // thread, so it must not use V8 or an env.

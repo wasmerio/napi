@@ -2763,13 +2763,8 @@ napi_status NapiV8SnapshotCommitWithManifest(
       return napi_generic_failure;
     }
   }
-  // The realm record, the code-generation check and the security token are
-  // per realm: a restore sets its own.
+  // Restore installs a fresh realm record and security token.
   context->SetAlignedPointerInEmbedderData(33, nullptr);
-  if (context->GetNumberOfEmbedderDataFields() > 49) {
-    context->SetEmbedderData(48, v8::Undefined(isolate));
-    context->SetEmbedderData(49, v8::Undefined(isolate));
-  }
   context->UseDefaultSecurityToken();
   v8::Local<v8::Array> globals_holder;
   if (!SnapshotMoveGlobals(isolate, context, &globals_holder)) return napi_generic_failure;

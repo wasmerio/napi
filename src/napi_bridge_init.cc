@@ -663,7 +663,10 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
 
 SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
   auto* bridge_state = LookupEnvState(env_state);
-  if (bridge_state == nullptr || bridge_state->snapshot_cleanup_only) return nullptr;
+  if (bridge_state == nullptr || bridge_state->env == nullptr ||
+      bridge_state->snapshot_cleanup_only) {
+    return nullptr;
+  }
   return bridge_state;
 }
 
@@ -2849,6 +2852,8 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  const auto* realm = env->snapshot_builder ? env->current_realm() : nullptr;
+  const bool recording_template = realm != nullptr && realm->snapshot_template;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
   std::vector<napi_property_descriptor> descs(prop_count);
@@ -2867,16 +2872,16 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
         descs[i].data = RegisterCallbackBinding(bridge_state, method_reg_ids[i]);
         break;
       case 2:
-        descs[i].getter = generic_wasm_binding_getter;
+        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
         break;
       case 3:
-        descs[i].setter = generic_wasm_binding_setter;
+        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, setter_reg_ids[i]);
         break;
       case 4:
-        descs[i].getter = generic_wasm_binding_getter;
-        descs[i].setter = generic_wasm_binding_setter;
+        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
+        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, getter_reg_ids[i]);
         break;
     }
@@ -2914,6 +2919,8 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  const auto* realm = env->snapshot_builder ? env->current_realm() : nullptr;
+  const bool recording_template = realm != nullptr && realm->snapshot_template;
 
   // Build property descriptors
   std::vector<napi_property_descriptor> descs(prop_count);
@@ -2932,16 +2939,16 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_method_reg_ids[i]);
         break;
       case 2: // getter only
-        descs[i].getter = generic_wasm_binding_getter;
+        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
         break;
       case 3: // setter only
-        descs[i].setter = generic_wasm_binding_setter;
+        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_setter_reg_ids[i]);
         break;
       case 4: // getter + setter
-        descs[i].getter = generic_wasm_binding_getter;
-        descs[i].setter = generic_wasm_binding_setter;
+        descs[i].getter = recording_template ? generic_wasm_binding_getter : generic_wasm_callback;
+        descs[i].setter = recording_template ? generic_wasm_binding_setter : generic_wasm_callback;
         descs[i].data = RegisterCallbackBinding(bridge_state, prop_getter_reg_ids[i]);
         // Note: N-API uses the same data pointer for both getter and setter.
         // The setter_reg_id is stored in the getter_reg_id for now.
