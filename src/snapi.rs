@@ -62,11 +62,13 @@ unsafe extern "C" {
         engine_flags: *const c_char,
         engine_flags_length: u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_env_with_options(
         module_api_version: i32,
         total_memory: u64,
@@ -76,6 +78,19 @@ unsafe extern "C" {
         code_range_size_in_bytes: u32,
         stack_limit: u32,
         guest_heap_ctx: *const core::ffi::c_void,
+        env_out: *mut SnapiEnv,
+    ) -> i32;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snapi_bridge_unofficial_create_env_with_snapshot(
+        module_api_version: i32,
+        total_memory: u64,
+        constrained_memory: u64,
+        max_young_generation_size_in_bytes: u32,
+        max_old_generation_size_in_bytes: u32,
+        code_range_size_in_bytes: u32,
+        stack_limit: u32,
+        guest_heap_ctx: *const c_void,
+        snapshot_options: *const crate::snapshot::SnapshotEnvOptions,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;

@@ -461,25 +461,40 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_snapshot_guest_data(
     napi_env env, void* buffer, size_t capacity, size_t* length_out);
 
 #if !defined(__wasm__)
-// Host-only configuration for future environments. BUILDER applies once.
-// RESTORE pins one validated artifact generation for the process.
+// Host-only, immutable snapshot data. Open validates and copies the bytes.
+// Supply only trusted artifacts from a compatible runtime and embedder build.
+typedef struct unofficial_napi_snapshot__* unofficial_napi_snapshot;
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_open_snapshot(
+    const void* bytes, size_t length, const void* key, size_t key_length,
+    unofficial_napi_snapshot* snapshot_out);
+NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_close_snapshot(
+    unofficial_napi_snapshot snapshot);
+
 enum {
-  UNOFFICIAL_NAPI_SNAPSHOT_ROLE_NONE = 0,
   UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER = 1,
   UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE = 2,
 };
 typedef struct {
   uint32_t size, version;
   uint32_t role, reserved;
-  const void* artifact;
-  size_t artifact_length;
+  unofficial_napi_snapshot artifact;
   const void* key;
   size_t key_length;
   const char* output_path;
   size_t output_path_length;
-} unofficial_napi_snapshot_host_options;
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_snapshot_host_options(
-    const unofficial_napi_snapshot_host_options* options);
+} unofficial_napi_snapshot_env_options;
+#define UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION 1
+
+// Selects the snapshot for this environment. BUILDER requires a key and a
+// caller-reserved staging path, which are copied. RESTORE requires an open
+// artifact and retains its data through environment release. Close a handle
+// after all create calls using it have returned. A null descriptor creates
+// a fresh env. The guest heap is transferred as in unofficial_napi_create_env.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_env_with_snapshot(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* env_options_or_null,
+    const unofficial_napi_snapshot_env_options* snapshot_options_or_null,
+    napi_env* env_out, unofficial_napi_env_owner* owner_out);
 #endif
 
 // Returns the realm whose global is `value`: a realm's own global, or the

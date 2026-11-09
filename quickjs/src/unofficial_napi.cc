@@ -1275,20 +1275,51 @@ extern "C"
     }
 
 #if !defined(__wasm__)
-    napi_status NAPI_CDECL unofficial_napi_set_snapshot_host_options(const unofficial_napi_snapshot_host_options *options)
+    napi_status NAPI_CDECL unofficial_napi_open_snapshot(
+        const void *bytes, size_t length, const void *key, size_t key_length,
+        unofficial_napi_snapshot *snapshot_out)
     {
-        if (options == nullptr || options->size < sizeof(*options) || options->version != 1 ||
-            options->reserved != 0 || options->role > UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE)
-            return napi_invalid_arg;
-        if (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_NONE)
-            return napi_ok;
-        if (options->key == nullptr || options->key_length == 0 ||
-            (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER &&
-             (options->output_path == nullptr || options->output_path_length == 0)) ||
-            (options->role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE &&
-             (options->artifact == nullptr || options->artifact_length == 0)))
+        if (bytes == nullptr || length == 0 || key == nullptr || key_length == 0 ||
+            snapshot_out == nullptr)
             return napi_invalid_arg;
         return napi_generic_failure;
+    }
+
+    void NAPI_CDECL unofficial_napi_close_snapshot(unofficial_napi_snapshot)
+    {
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_create_env_with_snapshot(
+        int32_t module_api_version,
+        const unofficial_napi_env_create_options *env_options,
+        const unofficial_napi_snapshot_env_options *snapshot_options,
+        napi_env *env_out, unofficial_napi_env_owner *owner_out)
+    {
+        if (snapshot_options == nullptr)
+            return unofficial_napi_create_env(module_api_version, env_options, env_out, owner_out);
+        if (env_options != nullptr &&
+            (env_options->size < sizeof(*env_options) ||
+             env_options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION))
+            return napi_invalid_arg;
+        if (env_options != nullptr && env_options->guest_heap != nullptr)
+            napi_host_guest_heap_release(env_options->guest_heap);
+
+        const auto &requested = *snapshot_options;
+        if (env_out == nullptr || owner_out == nullptr || requested.size < sizeof(requested) ||
+            requested.version != UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION ||
+            requested.reserved != 0)
+            return napi_invalid_arg;
+        if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER &&
+            requested.artifact == nullptr && requested.key != nullptr && requested.key_length != 0 &&
+            requested.key_length <= UINT32_MAX &&
+            requested.output_path != nullptr && requested.output_path_length != 0 &&
+            std::memchr(requested.output_path, '\0', requested.output_path_length) == nullptr)
+            return napi_generic_failure;
+        if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE &&
+            requested.artifact != nullptr && requested.key == nullptr && requested.key_length == 0 &&
+            requested.output_path == nullptr && requested.output_path_length == 0)
+            return napi_generic_failure;
+        return napi_invalid_arg;
     }
 #endif
 

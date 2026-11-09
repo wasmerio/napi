@@ -1815,7 +1815,7 @@ extern "C" napi_status NapiV8RealmPreflight(napi_env env, uint32_t mode) {
   }
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if ((mode == UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE && !env->snapshot_builder) ||
-      (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && !env->snapshot_restored)) {
+      (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && env->snapshot_artifact == nullptr)) {
     return napi_generic_failure;
   }
   return napi_ok;

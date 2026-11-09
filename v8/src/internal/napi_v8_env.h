@@ -124,6 +124,8 @@ struct napi_realm_frame__ {
   v8::Global<v8::Context> entered;
 };
 
+struct NapiV8SnapshotArtifact;
+
 struct napi_env__ {
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
@@ -197,7 +199,9 @@ struct napi_env__ {
   // template functions can be serialized. Restore fills the table before
   // those callbacks run.
   bool snapshot_builder = false;
-  bool snapshot_restored = false;
+  // The env owner retains these bytes through isolate disposal. A rejected
+  // callback manifest clears this pointer without releasing the bytes.
+  const NapiV8SnapshotArtifact* snapshot_artifact = nullptr;
   bool snapshot_finalized = false;
   bool snapshot_poisoned = false;
   uint32_t snapshot_context_count = 0;

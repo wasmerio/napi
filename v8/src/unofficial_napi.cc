@@ -38,6 +38,23 @@ struct unofficial_napi_profile__ {
   uint32_t provider_id = 0;
 };
 
+struct NapiV8SnapshotArtifact {
+  std::string manifest;
+  std::string guest_data;
+  std::string blob;
+  uint32_t contexts = 0;
+  v8::StartupData startup{};
+};
+
+#if !defined(__wasm__)
+struct unofficial_napi_snapshot__ {
+  std::shared_ptr<const NapiV8SnapshotArtifact> artifact;
+};
+using SnapshotEnvOptions = unofficial_napi_snapshot_env_options;
+#else
+using SnapshotEnvOptions = void;
+#endif
+
 namespace {
 
 // The brand and reusable template belong to the engine's agent. A private
@@ -104,7 +121,8 @@ struct UnofficialEnvScope {
   std::optional<v8::Global<v8::Context>> context;
   std::optional<v8::Context::Scope> context_scope;
   napi_env env = nullptr;
-  // Snapshot prototype: the creator of a builder env's isolate.
+  std::shared_ptr<const NapiV8SnapshotArtifact> snapshot_artifact;
+  // The creator of a builder env's isolate.
   v8::SnapshotCreator* creator = nullptr;
   std::string snapshot_key;
   std::string snapshot_output;
@@ -1888,26 +1906,14 @@ constexpr size_t kSnapshotHeaderSize = 8 + 5 * sizeof(uint32_t) + sizeof(uint64_
 constexpr size_t kSnapshotGuestDataLimit = 16 * 1024 * 1024;
 constexpr size_t kSnapshotManifestEntrySize = 12;
 
-struct LoadedSnapshot {
-  std::string key;
-  std::string manifest;
-  std::string guest_data;
-  std::string blob;
-  uint32_t contexts = 0;
-  v8::StartupData startup{};
-};
-
 struct SnapshotBuildOptions {
   std::string key;
   std::string output;
 };
 
 const intptr_t* SnapshotExternalReferences();
-std::mutex g_snapshot_mu;
-std::unique_ptr<LoadedSnapshot> g_snapshot_pin;
-bool g_snapshot_restore = false;
-std::optional<SnapshotBuildOptions> g_snapshot_next_builder;
 // Keep the isolate group's read-only heap rooted in the built-in snapshot.
+std::mutex g_snapshot_anchor_mu;
 v8::Isolate* g_snapshot_anchor = nullptr;
 
 uint64_t SnapshotDigest(uint64_t state, std::string_view bytes) {
@@ -1954,7 +1960,7 @@ bool HasValidStartupOffsets(std::string_view blob, uint32_t contexts) {
   return true;
 }
 
-std::unique_ptr<LoadedSnapshot> ParseSnapshot(std::string_view bytes, std::string_view key) {
+std::shared_ptr<const NapiV8SnapshotArtifact> ParseSnapshot(std::string_view bytes, std::string_view key) {
   if (bytes.size() < kSnapshotHeaderSize || !bytes.starts_with(kSnapshotMagic)) return nullptr;
   uint32_t lengths[4];
   uint64_t total = kSnapshotHeaderSize;
@@ -1972,13 +1978,13 @@ std::unique_ptr<LoadedSnapshot> ParseSnapshot(std::string_view bytes, std::strin
   auto digest = SnapshotDigest(UINT64_C(14695981039346656037), bytes.substr(0, 28));
   if (SnapshotDigest(digest, bytes.substr(kSnapshotHeaderSize)) != expected_digest) return nullptr;
 
-  auto result = std::make_unique<LoadedSnapshot>();
+  auto result = std::make_shared<NapiV8SnapshotArtifact>();
   result->contexts = contexts;
-  std::string* parts[] = {&result->key, &result->manifest, &result->guest_data, &result->blob};
-  size_t at = kSnapshotHeaderSize;
-  for (size_t i = 0; i < 4; ++i) {
-    parts[i]->assign(bytes.substr(at, lengths[i]));
-    at += lengths[i];
+  std::string* parts[] = {&result->manifest, &result->guest_data, &result->blob};
+  size_t at = kSnapshotHeaderSize + lengths[0];
+  for (size_t i = 0; i < 3; ++i) {
+    parts[i]->assign(bytes.substr(at, lengths[i + 1]));
+    at += lengths[i + 1];
   }
   if (!HasValidStartupOffsets(result->blob, contexts)) return nullptr;
   result->startup.data = result->blob.data();
@@ -1987,13 +1993,8 @@ std::unique_ptr<LoadedSnapshot> ParseSnapshot(std::string_view bytes, std::strin
   return result;
 }
 
-const LoadedSnapshot* SnapshotForEnv(napi_env env) {
-  // Once assigned, the pin and the data it owns stay live for the process.
-  return env->snapshot_restored ? g_snapshot_pin.get() : nullptr;
-}
-
 void EnsureSnapshotAnchor(EdgeV8Platform* platform) {
-  std::lock_guard<std::mutex> lock(g_snapshot_mu);
+  std::lock_guard<std::mutex> lock(g_snapshot_anchor_mu);
   if (g_snapshot_anchor != nullptr) return;
   v8::Isolate::CreateParams params{};
   params.array_buffer_allocator_shared =
@@ -2052,49 +2053,30 @@ void NapiV8ExposeSharedArrayBufferForSnapshot(v8::Isolate* isolate, v8::Local<v8
 
 extern "C" {
 
-napi_status NAPI_CDECL unofficial_napi_set_snapshot_host_options(
-    const unofficial_napi_snapshot_host_options* options) {
-  if (options == nullptr || options->size < sizeof(*options) || options->version != 1 ||
-      options->reserved != 0 || options->role > UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE ||
-      (options->artifact == nullptr) != (options->artifact_length == 0) ||
-      (options->key == nullptr) != (options->key_length == 0) ||
-      (options->output_path == nullptr) != (options->output_path_length == 0)) {
+#if !defined(__wasm__)
+napi_status NAPI_CDECL unofficial_napi_open_snapshot(
+    const void* bytes, size_t length, const void* key, size_t key_length,
+    unofficial_napi_snapshot* snapshot_out) try {
+  if (bytes == nullptr || length == 0 || key == nullptr || key_length == 0 ||
+      snapshot_out == nullptr) {
     return napi_invalid_arg;
   }
-  std::lock_guard<std::mutex> lock(g_snapshot_mu);
-  switch (options->role) {
-    case UNOFFICIAL_NAPI_SNAPSHOT_ROLE_NONE:
-      if (options->key || options->artifact || options->output_path) return napi_invalid_arg;
-      g_snapshot_next_builder.reset();
-      g_snapshot_restore = false;
-      return napi_ok;
-    case UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER: {
-      if (!options->key || !options->output_path || options->artifact) return napi_invalid_arg;
-      std::string_view output(options->output_path, options->output_path_length);
-      if (output.find('\0') != std::string_view::npos) return napi_invalid_arg;
-      g_snapshot_next_builder = SnapshotBuildOptions{
-          std::string(static_cast<const char*>(options->key), options->key_length), std::string(output)};
-      return napi_ok;
-    }
-    case UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE: {
-      if (!options->key || !options->artifact || options->output_path) return napi_invalid_arg;
-      auto snapshot = ParseSnapshot(
-          std::string_view(static_cast<const char*>(options->artifact), options->artifact_length),
-          std::string_view(static_cast<const char*>(options->key), options->key_length));
-      if (!snapshot) return napi_generic_failure;
-      if (g_snapshot_pin) {
-        if (g_snapshot_pin->key != snapshot->key || g_snapshot_pin->manifest != snapshot->manifest ||
-            g_snapshot_pin->guest_data != snapshot->guest_data || g_snapshot_pin->blob != snapshot->blob ||
-            g_snapshot_pin->contexts != snapshot->contexts) return napi_generic_failure;
-      } else {
-        g_snapshot_pin = std::move(snapshot);
-      }
-      g_snapshot_restore = true;
-      return napi_ok;
-    }
-  }
-  return napi_invalid_arg;
+  auto artifact = ParseSnapshot(
+      std::string_view(static_cast<const char*>(bytes), length),
+      std::string_view(static_cast<const char*>(key), key_length));
+  if (!artifact) return napi_generic_failure;
+  auto* snapshot = new (std::nothrow) unofficial_napi_snapshot__{std::move(artifact)};
+  if (!snapshot) return napi_generic_failure;
+  *snapshot_out = snapshot;
+  return napi_ok;
+} catch (const std::bad_alloc&) {
+  return napi_generic_failure;
 }
+
+void NAPI_CDECL unofficial_napi_close_snapshot(unofficial_napi_snapshot snapshot) {
+  delete snapshot;
+}
+#endif
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
     const unofficial_napi_runtime_options* options) {
@@ -2251,9 +2233,10 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(
+static napi_status CreateEnv(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
+    const SnapshotEnvOptions* snapshot_options,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -2271,6 +2254,53 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
   }
+  std::optional<SnapshotBuildOptions> snapshot_build;
+  std::shared_ptr<const NapiV8SnapshotArtifact> snapshot;
+#if !defined(__wasm__)
+  if (snapshot_options != nullptr) {
+    const auto& requested = *snapshot_options;
+    const auto fail_snapshot_options = [&](napi_status status) {
+      if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
+      return status;
+    };
+    if (requested.size < sizeof(requested) ||
+        requested.version != UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION ||
+        requested.reserved != 0) {
+      return fail_snapshot_options(napi_invalid_arg);
+    }
+    if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER) {
+      if (requested.artifact != nullptr || requested.key == nullptr ||
+          requested.key_length == 0 || requested.key_length > UINT32_MAX ||
+          requested.output_path == nullptr ||
+          requested.output_path_length == 0) {
+        return fail_snapshot_options(napi_invalid_arg);
+      }
+      std::string_view output(requested.output_path, requested.output_path_length);
+      if (output.size() > std::string{}.max_size() ||
+          output.find('\0') != std::string_view::npos) {
+        return fail_snapshot_options(napi_invalid_arg);
+      }
+      try {
+        snapshot_build = SnapshotBuildOptions{
+            std::string(static_cast<const char*>(requested.key), requested.key_length),
+            std::string(output)};
+      } catch (const std::bad_alloc&) {
+        return fail_snapshot_options(napi_generic_failure);
+      }
+    } else if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE) {
+      if (requested.artifact == nullptr || requested.key != nullptr ||
+          requested.key_length != 0 || requested.output_path != nullptr ||
+          requested.output_path_length != 0) {
+        return fail_snapshot_options(napi_invalid_arg);
+      }
+      snapshot = requested.artifact->artifact;
+    } else {
+      return fail_snapshot_options(napi_invalid_arg);
+    }
+  }
+#else
+  (void)snapshot_options;
+#endif
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
@@ -2319,15 +2349,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     }
   }
   ApplyNodeIsolateCreateParams(&params, options);
-  std::optional<SnapshotBuildOptions> snapshot_build;
-  const LoadedSnapshot* snapshot = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_snapshot_mu);
-    snapshot_build = std::exchange(g_snapshot_next_builder, std::nullopt);
-    if (!snapshot_build && g_snapshot_restore) snapshot = g_snapshot_pin.get();
-  }
   const bool snapshot_builder = snapshot_build.has_value();
-  v8::SnapshotCreator* creator = nullptr;
+  std::unique_ptr<v8::SnapshotCreator> creator;
   v8::Isolate* isolate = nullptr;
   if (snapshot_builder || snapshot != nullptr) {
     EnsureSnapshotAnchor(platform);
@@ -2340,7 +2363,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
       isolate->Dispose();
       isolate = nullptr;
     }
-    if (isolate != nullptr) creator = new v8::SnapshotCreator(isolate, params);
+    if (isolate != nullptr) creator = std::make_unique<v8::SnapshotCreator>(isolate, params);
   } else {
     if (snapshot != nullptr) params.snapshot_blob = &snapshot->startup;
     isolate = CreateIsolateForEnv(platform, params);
@@ -2351,13 +2374,13 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   }
   auto* scope = new (std::nothrow) UnofficialEnvScope(isolate, allocator);
   if (scope != nullptr) {
-    scope->creator = creator;
     if (snapshot_build) {
       scope->snapshot_key = std::move(snapshot_build->key);
       scope->snapshot_output = std::move(snapshot_build->output);
     }
   }
   if (scope == nullptr) {
+    creator.reset();
     DisposeIsolateAndWait(platform, isolate);
     ReleaseRuntime();
     return napi_generic_failure;
@@ -2373,20 +2396,44 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
   if (status != napi_ok || scope->env == nullptr) {
     delete scope;
+    creator.reset();
     DisposeIsolateAndWait(platform, isolate);
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
   scope->env->snapshot_builder = snapshot_builder;
-  scope->env->snapshot_restored = snapshot != nullptr;
-  scope->env->snapshot_creator = creator;
-  if (snapshot != nullptr) scope->env->snapshot_context_count = snapshot->contexts;
+  scope->creator = creator.release();
+  scope->env->snapshot_creator = scope->creator;
+  scope->snapshot_artifact = std::move(snapshot);
+  scope->env->snapshot_artifact = scope->snapshot_artifact.get();
+  if (scope->snapshot_artifact) {
+    scope->env->snapshot_context_count = scope->snapshot_artifact->contexts;
+  }
 
   scope->cpu_profile = StartEnvCPUProfile(scope->env);
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
 }
+
+napi_status NAPI_CDECL unofficial_napi_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out) {
+  return CreateEnv(module_api_version, options, nullptr, env_out, owner_out);
+}
+
+#if !defined(__wasm__)
+napi_status NAPI_CDECL unofficial_napi_create_env_with_snapshot(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    const unofficial_napi_snapshot_env_options* snapshot_options,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out) {
+  return CreateEnv(module_api_version, options, snapshot_options, env_out, owner_out);
+}
+#endif
 
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
                             void* shutdown_pump_handle) {
@@ -2415,6 +2462,8 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
 
   v8::Isolate* isolate = scope->isolate;
   std::shared_ptr<TrackingArrayBufferAllocator> allocator = scope->allocator;
+  // V8 may use the startup blob until the isolate has been disposed.
+  auto snapshot = std::move(scope->snapshot_artifact);
   v8::SnapshotCreator* creator = scope->creator;
   SnapshotBuildOptions snapshot_build{std::move(scope->snapshot_key), std::move(scope->snapshot_output)};
   delete scope;
@@ -2709,7 +2758,7 @@ napi_status NapiV8SnapshotCommitPreflight(napi_env env) {
 }
 
 void NapiV8RejectSnapshotManifest(napi_env env) {
-  env->snapshot_restored = false;
+  env->snapshot_artifact = nullptr;
   env->snapshot_static_table.clear();
   env->snapshot_static_index.clear();
 }
@@ -2799,7 +2848,7 @@ napi_status NAPI_CDECL unofficial_napi_snapshot_guest_data(napi_env env,
                                                           size_t* length_out) {
   if (env == nullptr || length_out == nullptr) return napi_invalid_arg;
   if (env->snapshot_finalized || (buffer == nullptr && capacity != 0)) return napi_invalid_arg;
-  const auto* snapshot = SnapshotForEnv(env);
+  const auto* snapshot = env->snapshot_artifact;
   *length_out = snapshot != nullptr ? snapshot->guest_data.size() : 0;
   if (buffer != nullptr && snapshot != nullptr && capacity != 0) {
     std::memcpy(buffer, snapshot->guest_data.data(), std::min(capacity, snapshot->guest_data.size()));
@@ -2834,7 +2883,7 @@ napi_status NAPI_CDECL unofficial_napi_snapshot_set_static(napi_env env,
 
 napi_status NAPI_CDECL unofficial_napi_snapshot_loaded_manifest(napi_env env, const char** data, size_t* length) {
   if (env == nullptr || data == nullptr || length == nullptr) return napi_invalid_arg;
-  const auto* snapshot = SnapshotForEnv(env);
+  const auto* snapshot = env->snapshot_artifact;
   if (snapshot == nullptr) return napi_generic_failure;
   *data = snapshot->manifest.data();
   *length = snapshot->manifest.size();

@@ -11,7 +11,7 @@ use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespa
 use wasmer_wasix::WasiError;
 
 use crate::{
-    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
+    HeapReservation, NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{take_pending_guest_exit, with_callback_state},
@@ -36,25 +36,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     };
 
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = if reservation.clamped {
-        unsafe {
-            snapi_bridge_unofficial_create_env_with_options(
-                8,
-                0,
-                0,
-                reservation.max_young,
-                reservation.max_old,
-                reservation.code_range,
-                0,
-                guest_heap_ctx,
-                &mut snapi_env_state,
-            )
-        }
-    } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
-    };
+    let (status, snapi_env_state) = create_host_env(&env, 8, 0, 0, 0, &reservation);
     if status != 0 || snapi_env_state.is_null() {
         env.data().abort_isolate(&reservation);
         return 0;
@@ -65,14 +47,43 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     env_id as i32
 }
 
-/// Boxed guest-heap context for env creation, or null when no heap exists.
-/// The bridge takes ownership in all cases (success or failure).
-fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_void {
-    env.data()
-        .guest_heap
-        .as_ref()
-        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
-        .unwrap_or(std::ptr::null())
+/// The bridge takes ownership of the guest-heap context on success or failure.
+fn create_host_env(
+    env: &FunctionEnvMut<NapiEnv>,
+    module_api_version: i32,
+    total_memory: u64,
+    constrained_memory: u64,
+    stack_limit: u32,
+    reservation: &HeapReservation,
+) -> (i32, SnapiEnv) {
+    let mut state = std::ptr::null_mut();
+    let mut create = |snapshot_options| {
+        let guest_heap_ctx = env
+            .data()
+            .guest_heap
+            .as_ref()
+            .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_snapshot(
+                module_api_version,
+                total_memory,
+                constrained_memory,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                stack_limit,
+                guest_heap_ctx,
+                snapshot_options,
+                &mut state,
+            )
+        }
+    };
+    let status = match &env.data().snapshot_environment {
+        Some(snapshot) => snapshot.create_env(create),
+        None => create(std::ptr::null()),
+    };
+    (status, state)
 }
 
 /// Run a bridge call that may re-enter the guest via host V8 callbacks, then
@@ -249,21 +260,14 @@ fn guest_unofficial_napi_create_env(
         Err(_) => return 1,
     };
 
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe {
-        snapi_bridge_unofficial_create_env_with_options(
-            module_api_version,
-            total_memory,
-            constrained_memory,
-            reservation.max_young,
-            reservation.max_old,
-            reservation.code_range,
-            stack_limit,
-            guest_heap_ctx,
-            &mut snapi_env_state,
-        )
-    };
+    let (status, snapi_env_state) = create_host_env(
+        &env,
+        module_api_version,
+        total_memory,
+        constrained_memory,
+        stack_limit,
+        &reservation,
+    );
     if status != 0 {
         env.data().abort_isolate(&reservation);
         return status;

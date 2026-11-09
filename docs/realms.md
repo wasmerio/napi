@@ -153,30 +153,39 @@ host-JS preserve the raw receiver for portable bindings. Bundled QuickJS
 supports both binding kinds. An external QuickJS library needs the native
 constructor hooks to support `CLASS`. See the [QuickJS build notes](../quickjs/README.md).
 
-A native host builds or loads V8 realm snapshots through
-`unofficial_napi_set_snapshot_host_options`. This host-only call copies its
-inputs. It configures environments created after the call.
+A native host selects snapshot behavior when it creates each environment.
+`unofficial_napi_create_env` creates a fresh environment.
+`unofficial_napi_create_env_with_snapshot` takes optional snapshot
+configuration alongside the usual environment options. The configuration
+belongs to that call, so the same process can run fresh environments,
+builders, and environments restoring different artifacts.
 
-1. Select the builder role with a cache key and a staging path. Create
-   each template realm and install its bindings. Drain pending work, leave
-   the realm scope, then call `unofficial_napi_snapshot_commit` with the
-   template and a root object created in it. The optional index output
-   identifies that template in the artifact.
+1. Pass the builder role with a cache key and a private staging path.
+   Create the template realms and install their bindings. Drain pending
+   work, leave the realm scopes, then commit each template with
+   `unofficial_napi_snapshot_commit` and a root object created in it.
 2. Attach the guest metadata to the last commit. After it succeeds, delete
    remaining references, close scopes, and release the env. Release writes
    the artifact and consumes the env even if the write fails. Publish
    the file only after a successful release and validation.
-3. In the consumer process, select the restore role with the artifact
-   bytes and the same key. Query `unofficial_napi_snapshot_guest_data` to
-   recover the metadata. Create a realm in restore mode with its template
-   index and a fresh owner datum. Restore returns the template's root
-   alongside the realm. Owner data is never serialized.
+3. In the consumer, open the artifact with `unofficial_napi_open_snapshot`
+   and the expected compatibility key. It validates and copies the bytes
+   once. Pass the resulting handle in the restore options when creating
+   each env. Keep the handle alive through the create call. Each env then
+   retains its own reference to the data, so the host can close its handle.
+4. Query `unofficial_napi_snapshot_guest_data` to recover the metadata.
+   Create realms in restore mode with a template index and a fresh owner
+   datum. Each realm receives the template root from its own environment's
+   artifact. Owner data is never serialized.
 
-Snapshot files are engine- and build-specific trusted artifacts. Their
-integrity check detects corruption. The host is responsible for controlling
-their provenance. A zero metadata length means the env has no usable
-artifact. QuickJS and host-JS can run the same application with fresh
-realms and return zero metadata length.
+V8 consumes the artifact at isolate creation. The host cache key must cover
+the running engine and provider build as well as the guest and its bootstrap
+inputs. The same Wasm can run against a different V8 build and get a new
+artifact. Treat artifacts as trusted engine data. Integrity validation
+detects corruption, and the host controls provenance. A zero metadata
+length means the env has no usable artifact. QuickJS and host-JS can run
+the same application with fresh realms and return zero metadata length.
+
 
 ## Deprecated compatibility API
 

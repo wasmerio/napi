@@ -10,6 +10,8 @@ mod id_hash;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;
+#[cfg(not(target_arch = "wasm32"))]
+mod snapshot;
 #[cfg(feature = "wasix")]
 mod wasix;
 use std::fmt::Display;
@@ -28,6 +30,8 @@ pub use ctx::{
     NapiCtx, NapiCtxBuilder, NapiInstantiationState, NapiLimits, NapiRuntimeControl,
     NapiRuntimeHooks, NapiSession,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use snapshot::{SnapshotArtifact, SnapshotEnvironment};
 use enum_iterator::Sequence;
 pub(crate) use env::NapiEnv;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
