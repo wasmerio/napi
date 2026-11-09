@@ -216,12 +216,14 @@ napi_value BindingReceiverOrPrimitive(napi_env env, napi_callback_info info) {
   return result;
 }
 
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
 napi_value CountBindingSetter(napi_env env, napi_callback_info info) {
   void* data = nullptr;
   if (napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data) == napi_ok)
     ++*static_cast<int*>(data);
   return nullptr;
 }
+#endif
 }  // namespace
 
 TEST_F(Test66UnofficialRealm, QuickJSOwnerFollowsBindingCreationAndNestedRealmEntry) {
@@ -259,6 +261,14 @@ TEST_F(Test66UnofficialRealm, QuickJSOwnerFollowsBindingCreationAndNestedRealmEn
 TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
   EnvScope s(runtime_.get());
   auto main_global = Global(s.env);
+#if !NAPI_QUICKJS_HAS_BINDING_CLASS
+  auto function = main_global, prototype = main_global;
+  EXPECT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_CLASS, "Binding", 7,
+                                            BindingReceiverOrPrimitive, nullptr, 2, nullptr, 0, nullptr,
+                                            nullptr, &function, &prototype), napi_generic_failure);
+  EXPECT_EQ(function, main_global);
+  EXPECT_EQ(prototype, main_global);
+#else
   int setter_calls = 0;
   napi_property_descriptor properties[] = {
       {"method", nullptr, BindingReceiverOrPrimitive, nullptr, nullptr, nullptr, napi_default_method, nullptr},
@@ -314,6 +324,28 @@ TEST_F(Test66UnofficialRealm, QuickJSBindingShapeAndConstructSemantics) {
                                             0, nullptr, nullptr, &result, &result_proto), napi_invalid_arg);
   EXPECT_EQ(result, binding);
   EXPECT_EQ(result_proto, proto);
+#endif
+}
+
+TEST_F(Test66UnofficialRealm, QuickJSMethodBindingHasTheSameShapeWithAnExternalEngine) {
+  EnvScope s(runtime_.get());
+  napi_value method = nullptr;
+  ASSERT_EQ(unofficial_napi_define_binding(s.env, UNOFFICIAL_NAPI_BINDING_METHOD, "method", 6,
+                                            BindingReceiverOrPrimitive, nullptr, 3, nullptr, 0, nullptr,
+                                            nullptr, &method, nullptr), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, Global(s.env), "method", method), napi_ok);
+  auto check = Eval(s.env, R"JS((() => {
+    function Other() {}
+    let rejected = false;
+    try { new method(); } catch (error) { rejected = error instanceof TypeError; }
+    return method.name === 'method' && method.length === 3 &&
+      !Object.hasOwn(method, 'prototype') && rejected &&
+      method.call(Other) === Other && method.call(42) === 42 && method() === undefined;
+  })())JS");
+  bool matches = false;
+  ASSERT_NE(check, nullptr);
+  ASSERT_EQ(napi_get_value_bool(s.env, check, &matches), napi_ok);
+  EXPECT_TRUE(matches);
 }
 #endif
 

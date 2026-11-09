@@ -88,7 +88,7 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
     | Option | V8 | QuickJS | host-JS |
     |---|---|---|---|
     | `sandbox_or_null` | yes | yes | yes |
-    | `host_defined_option_id` | yes | yes | no |
+    | `host_defined_option_id` | yes | no | no |
     | `allow_code_gen_strings` | yes | no | no |
     | `own_microtask_queue` | yes | no | no |
     | `allow_code_gen_wasm` | no | no | no |
@@ -135,6 +135,48 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
   realm_id, scope_out_ptr) -> status` and `unofficial_napi_leave_realm(env,
   scope: i64) -> status`; the token is the provider's, passed through as a
   u64.
+
+## Native bindings and snapshots
+
+Use `unofficial_napi_define_binding` for native classes and non-constructible
+methods. The class form defines the constructor, prototype, and members in
+one operation. It accepts a parent created by the same operation in the
+same env. Member names use UTF-8 strings and must be unique on each target.
+The optional length bytes apply to methods. Getter and setter functions
+have lengths zero and one and receive their respective callbacks even
+when invoked with an unusual argument count. The constructor's
+`prototype` property is read-only.
+
+V8 exposes an object receiver through its native callback API. Bare calls
+and primitive receivers retain the engine's existing coercion. QuickJS and
+host-JS preserve the raw receiver for portable bindings. Bundled QuickJS
+supports both binding kinds. An external QuickJS library needs the native
+constructor hooks to support `CLASS`. See the [QuickJS build notes](../quickjs/README.md).
+
+A native host builds or loads V8 realm snapshots through
+`unofficial_napi_set_snapshot_host_options`. This host-only call copies its
+inputs. It configures environments created after the call.
+
+1. Select the builder role with a cache key and a staging path. Create
+   each template realm and install its bindings. Drain pending work, leave
+   the realm scope, then call `unofficial_napi_snapshot_commit` with the
+   template and a root object created in it. The optional index output
+   identifies that template in the artifact.
+2. Attach the guest metadata to the last commit. After it succeeds, delete
+   remaining references, close scopes, and release the env. Release writes
+   the artifact and consumes the env even if the write fails. Publish
+   the file only after a successful release and validation.
+3. In the consumer process, select the restore role with the artifact
+   bytes and the same key. Query `unofficial_napi_snapshot_guest_data` to
+   recover the metadata. Create a realm in restore mode with its template
+   index and a fresh owner datum. Restore returns the template's root
+   alongside the realm. Owner data is never serialized.
+
+Snapshot files are engine- and build-specific trusted artifacts. Their
+integrity check detects corruption. The host is responsible for controlling
+their provenance. A zero metadata length means the env has no usable
+artifact. QuickJS and host-JS can run the same application with fresh
+realms and return zero metadata length.
 
 ## Deprecated compatibility API
 

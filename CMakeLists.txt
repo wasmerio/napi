@@ -27,12 +27,13 @@ if(NAPI_BUILD_QUICKJS)
     set(QJS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(QJS_BUILD_CLI_STATIC OFF CACHE BOOL "" FORCE)
     add_subdirectory("${NAPI_QUICKJS_ENGINE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/quickjs-engine" EXCLUDE_FROM_ALL)
-    # Compile the pinned engine with the two private binding-construction hooks
+    # Compile the pinned engine with the private binding-class hooks
     # in the same translation unit. Its checkout stays untouched.
     get_target_property(_qjs_sources qjs SOURCES)
     list(REMOVE_ITEM _qjs_sources quickjs.c)
     list(APPEND _qjs_sources "${CMAKE_CURRENT_SOURCE_DIR}/quickjs/engine/napi_quickjs_engine.c")
     set_property(TARGET qjs PROPERTY SOURCES "${_qjs_sources}")
+    set(NAPI_QUICKJS_HAS_BINDING_CLASS ON)
     set(NAPI_QUICKJS_INCLUDE_DIR "${NAPI_QUICKJS_ENGINE_SOURCE_DIR}" CACHE PATH
       "Path to QuickJS headers" FORCE)
   endif()

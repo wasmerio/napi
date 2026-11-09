@@ -4625,7 +4625,7 @@ pub(crate) unsafe fn host_js_define_binding(
     };
     // All handles and fields have been validated. These helpers touch only new
     // functions/objects and never execute author code.
-    let mut build = || -> Result<_, JsValue> {
+    let build = || -> Result<_, JsValue> {
         let ctor = wasmer_napi_binding_function(
             context,
             &realm,

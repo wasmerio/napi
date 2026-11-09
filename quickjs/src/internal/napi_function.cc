@@ -8,16 +8,21 @@
 
 #include <climits>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
 extern "C" bool napi_quickjs_is_construct_call(JSContext *ctx);
 extern "C" JSValue napi_quickjs_new_object_from_constructor(JSContext *ctx, JSValueConst constructor);
 extern "C" JSValue napi_quickjs_function_data(JSValueConst function, int magic);
+#endif
 
 namespace
 {
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
 constexpr int binding_constructor = 0x4e41;
+#endif
 constexpr int binding_method = 0x4e42;
 
 class quickjs_callback_handle_scope__
@@ -137,15 +142,22 @@ JSValue invoke_callback(JSContext *caller_ctx,
 
   JSValue effective_this = this_val;
   JSValue new_target = JS_UNDEFINED;
-  const bool is_binding_constructor = magic == binding_constructor;
-  bool called_as_constructor = is_binding_constructor ? napi_quickjs_is_construct_call(caller_ctx)
-      : magic == JS_CFUNC_constructor_magic || (magic == 0 && JS_IsConstructor(ctx, this_val));
+  bool is_binding_constructor = false;
+  bool called_as_constructor =
+      magic == JS_CFUNC_constructor_magic || (magic == 0 && JS_IsConstructor(ctx, this_val));
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
+  is_binding_constructor = magic == binding_constructor;
+  if (is_binding_constructor)
+    called_as_constructor = napi_quickjs_is_construct_call(caller_ctx);
+#endif
 
   if (called_as_constructor)
   {
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
     if (is_binding_constructor)
       effective_this = napi_quickjs_new_object_from_constructor(ctx, this_val);
     else
+#endif
     {
       JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
       effective_this = JS_NewObjectProto(ctx, proto);
@@ -292,10 +304,12 @@ JSValue create_realm_function(napi_env env, const char *utf8name, size_t length,
   return fn;
 }
 
+#if NAPI_QUICKJS_HAS_BINDING_CLASS
 bool owns_value(napi_env env, napi_value value)
 {
   return value != nullptr && env->agent()->owns_scope(napi_scope__::ValuesAllocator::unsafe_owner(value));
 }
+#endif
 
 class ScopedValue
 {
@@ -343,6 +357,25 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
                      member_lengths_or_null != nullptr || prototype_out != nullptr)))
     return napi_invalid_arg;
 
+  const auto failed = [&]() { return napi_util__::return_pending_if_caught(env, ctx, "Failed to define binding"); };
+  if (!is_class)
+  {
+    ScopedValue function(ctx, create_realm_function(env, utf8name, name_length, callback, data,
+                                                    function_length, binding_method));
+    if (JS_IsException(function.get()))
+      return failed();
+    napi_value result = env->wrap_value_in_current_scope(function.get(), false);
+    if (result == nullptr)
+      return napi_generic_failure;
+    *function_out = result;
+    return napi_ok;
+  }
+
+#if !NAPI_QUICKJS_HAS_BINDING_CLASS
+  // The public C-function-data ABI cannot distinguish an ordinary call
+  // with a constructor receiver from a construct call.
+  return napi_generic_failure;
+#else
   JSValueConst parent = JS_UNDEFINED;
   if (parent_or_null != nullptr)
   {
@@ -372,19 +405,10 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
       return napi_invalid_arg;
   }
 
-  const auto failed = [&]() { return napi_util__::return_pending_if_caught(env, ctx, "Failed to define binding"); };
   ScopedValue function(ctx, create_realm_function(env, utf8name, name_length, callback, data,
-                                                  function_length, is_class ? binding_constructor : binding_method));
+                                                  function_length, binding_constructor));
   if (JS_IsException(function.get()))
     return failed();
-  if (!is_class)
-  {
-    napi_value result = env->wrap_value_in_current_scope(function.get(), false);
-    if (result == nullptr)
-      return napi_generic_failure;
-    *function_out = result;
-    return napi_ok;
-  }
 
   ScopedValue prototype(ctx, JS_NewObject(ctx));
   if (JS_IsException(prototype.get()) || JS_SetConstructor(ctx, function.get(), prototype.get()) < 0 ||
@@ -450,4 +474,5 @@ extern "C" napi_status NAPI_CDECL unofficial_napi_define_binding(
   *function_out = result;
   *prototype_out = proto_result;
   return napi_ok;
+#endif
 }
