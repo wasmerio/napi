@@ -23,5 +23,15 @@ bool NapiV8HasRealmTokens(napi_env env);
 void NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);
+// The isolate's code generation callbacks: TrustedScript sources, and the
+// contexts unofficial_napi_set_realm_code_generation restricts.
+void NapiV8InstallCodeGenerationCallbacks(v8::Isolate* isolate);
+// Whether a restricted context's check lets this compile (false without one):
+// `kind` is "eval", "trusted-eval" (a TrustedScript's source) or "wasm".
+bool NapiV8CheckCodeGeneration(v8::Local<v8::Context> context, const char* kind,
+                               v8::Local<v8::String> source);
+// The isolate's AllowWasmCodeGenerationCallback.
+bool NapiV8AllowWasmCodeGeneration(v8::Local<v8::Context> context,
+                                   v8::Local<v8::String> source);
 
 #endif  // NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_

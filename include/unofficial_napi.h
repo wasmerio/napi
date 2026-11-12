@@ -903,6 +903,30 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
     napi_value transfer_list_or_null,
     napi_value* result_out);
 
+// What code `realm_or_null` (this env's own realm when null,
+// whatever context is entered) may generate at run time, as a browser's
+// Content-Security-Policy decides without 'unsafe-eval' and
+// 'wasm-unsafe-eval'. While strings (eval, the Function constructors) or
+// WebAssembly compilation are refused, an attempt first calls `check` (a
+// function, or null) with ("eval", source), ("trusted-eval", source) for a
+// TrustedScript (unofficial_napi_create_trusted_script) or ("wasm", ""), on
+// the owning thread before compiling; a true result lets it
+// compile, anything else (an exception too) refuses it: V8 then throws
+// EvalError(strings_message) or WebAssembly.CompileError(wasm_message). The
+// check may report the attempt; it must not run author code. Compiles through
+// the embedder API (run_script, compile_function) are never refused. A null
+// message keeps the previous one. Each call replaces the check and both
+// settings: allow both to lift the restriction. napi_invalid_arg if `key`
+// names no context of this env. Unsupported engines return generic_failure.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_realm_code_generation(
+    napi_env env,
+    unofficial_napi_realm realm_or_null,
+    bool allow_strings,
+    bool allow_wasm,
+    napi_value strings_message,
+    napi_value wasm_message,
+    napi_value check);
+
 // Opaque provider-owned message which may cross N-API environments. A message
 // is consumed by message_take on both success and failure, or explicitly
 // destroyed with message_drop while it is still queued.

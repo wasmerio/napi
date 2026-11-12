@@ -1804,6 +1804,48 @@ bool NapiV8HasRealmTokens(napi_env env) {
                      [](const auto& realm) { return realm->token_assigned; });
 }
 
+namespace {
+
+// unofficial_napi_set_realm_code_generation's check function and whether
+// WebAssembly compiles, kept in the restricted context's embedder data (which
+// no other provider code uses), so that they live and go with the context.
+constexpr int kCodeGenerationCheckSlot = 48;
+constexpr int kCodeGenerationWasmSlot = 49;
+
+v8::Local<v8::Value> CodeGenerationSlot(v8::Local<v8::Context> context, int slot) {
+  // GetEmbedderData does not check the index: read only slots that exist.
+  if (context.IsEmpty() || context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(slot))
+    return {};
+  return context->GetEmbedderData(slot);
+}
+
+}  // namespace
+
+bool NapiV8CheckCodeGeneration(v8::Local<v8::Context> context, const char* kind,
+                               v8::Local<v8::String> source) {
+  v8::Local<v8::Value> check = CodeGenerationSlot(context, kCodeGenerationCheckSlot);
+  if (check.IsEmpty() || !check->IsFunction()) return false;
+  v8::Isolate* isolate = context->GetIsolate();
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::String> kind_text;
+  if (!v8::String::NewFromUtf8(isolate, kind).ToLocal(&kind_text)) return false;
+  v8::Local<v8::Value> argv[] = {kind_text, source.IsEmpty() ? v8::String::Empty(isolate) : source};
+  v8::Local<v8::Value> result;
+  if (!check.As<v8::Function>()->Call(context, v8::Undefined(isolate), 2, argv).ToLocal(&result)) {
+    // A refusal, not the check's exception: but termination goes on.
+    if (try_catch.HasTerminated()) try_catch.ReThrow();
+    return false;
+  }
+  return result->IsTrue();
+}
+
+bool NapiV8AllowWasmCodeGeneration(v8::Local<v8::Context> context,
+                                   v8::Local<v8::String> source) {
+  v8::Local<v8::Value> allowed = CodeGenerationSlot(context, kCodeGenerationWasmSlot);
+  if (allowed.IsEmpty() || !allowed->IsFalse()) return true;
+  return NapiV8CheckCodeGeneration(context, "wasm", source);
+}
+
 void NapiV8ExposeSharedArrayBufferForSnapshot(v8::Isolate* isolate, v8::Local<v8::Context> context);
 
 extern "C" {
@@ -2062,6 +2104,56 @@ napi_status NAPI_CDECL unofficial_napi_get_realm(napi_env env,
   unofficial_napi_realm realm = RealmForContext(context);
   if (realm != nullptr && realm->env == env) *realm_out = realm;
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_realm_code_generation(
+    napi_env env,
+    unofficial_napi_realm realm,
+    bool allow_strings,
+    bool allow_wasm,
+    napi_value strings_message,
+    napi_value wasm_message,
+    napi_value check) {
+  if (!NapiV8AllowsEnvOperations(env)) return napi_invalid_arg;
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handles(isolate);
+  if (realm != nullptr && std::none_of(env->realms.begin(), env->realms.end(), [&](const auto& item) { return item.get() == realm; })) return napi_invalid_arg;
+  v8::Local<v8::Context> context = RealmContext(env, realm);
+  if (context.IsEmpty()) return napi_invalid_arg;
+  auto message = [&](napi_value value, v8::Local<v8::String>* out) {
+    if (IsNullish(env, value)) return true;
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+    if (raw.IsEmpty() || !raw->IsString()) return false;
+    *out = raw.As<v8::String>();
+    return true;
+  };
+  v8::Local<v8::String> strings_text, wasm_text;
+  if (!message(strings_message, &strings_text) || !message(wasm_message, &wasm_text))
+    return napi_string_expected;
+  v8::Local<v8::Value> check_function = v8::Undefined(isolate);
+  if (!IsNullish(env, check)) {
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(check);
+    if (raw.IsEmpty() || !raw->IsFunction()) return napi_function_expected;
+    check_function = raw;
+  }
+  NapiV8InstallCodeGenerationCallbacks(isolate);
+  if (!strings_text.IsEmpty()) context->SetErrorMessageForCodeGenerationFromStrings(strings_text);
+  if (!wasm_text.IsEmpty()) context->SetErrorMessageForWasmCodeGeneration(wasm_text);
+  // An unrestricted context that never was one keeps its embedder data as is.
+  if (!allow_strings || !allow_wasm || !CodeGenerationSlot(context, kCodeGenerationWasmSlot).IsEmpty()) {
+    // The env's own context has no kRealmContextSlot: these writes give it
+    // one, which V8 fills with undefined, and RealmForContext would take that
+    // for a realm's record (a rejection with no handler there then crashed
+    // PromiseRejectCallback). Say first that it has no realm.
+    if (realm == nullptr &&
+        context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(kRealmContextSlot)) {
+      context->SetAlignedPointerInEmbedderData(kRealmContextSlot, nullptr);
+    }
+    context->SetEmbedderData(kCodeGenerationCheckSlot, check_function);
+    context->SetEmbedderData(kCodeGenerationWasmSlot, v8::Boolean::New(isolate, allow_wasm));
+  }
+  context->AllowCodeGenerationFromStrings(allow_strings);
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL unofficial_napi_enter_realm(napi_env env,

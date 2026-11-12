@@ -4242,6 +4242,24 @@ static bool ResolveRealm(SnapiEnvState& state, uint32_t realm_id, unofficial_nap
          *realm_out != nullptr;
 }
 
+extern "C" int snapi_bridge_unofficial_contextify_set_code_generation(
+    SnapiEnvState* state, uint32_t key_id, int allow_strings, int allow_wasm,
+    uint32_t strings_message_id, uint32_t wasm_message_id, uint32_t check_id) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr) return napi_invalid_arg;
+  // Id 0 is null (the env's own context; keep the message; no check).
+  auto load = [&](uint32_t id, napi_value* out) {
+    *out = id ? LoadValue(*bridge, id) : nullptr;
+    return !id || *out != nullptr;
+  };
+  unofficial_napi_realm realm;
+  napi_value strings_message, wasm_message, check;
+  if (!ResolveRealm(*bridge, key_id, &realm) || !load(strings_message_id, &strings_message) ||
+      !load(wasm_message_id, &wasm_message) || !load(check_id, &check))
+    return napi_invalid_arg;
+  return unofficial_napi_set_realm_code_generation(bridge->env, realm, allow_strings != 0,
+      allow_wasm != 0, strings_message, wasm_message, check);
+}
 
 // Snapshot manifest entries use one guest callback and one role per static
 // id. The setter no longer shares a registration with the getter.

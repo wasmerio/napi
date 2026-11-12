@@ -345,6 +345,16 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_snapshot_guest_data(env: SnapiEnv, guest_env: u32, buffer: *mut u8, capacity: usize, length_out: *mut usize) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_get_current_realm_data(env: SnapiEnv, data_out: *mut u64) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_contextify_set_code_generation(
+        env: SnapiEnv,
+        key_id: u32,
+        allow_strings: i32,
+        allow_wasm: i32,
+        strings_message_id: u32,
+        wasm_message_id: u32,
+        check_id: u32,
+    ) -> i32;
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_realm(

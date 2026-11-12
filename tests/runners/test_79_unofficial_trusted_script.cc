@@ -309,6 +309,38 @@ TEST_F(Test79UnofficialTrustedScript, KeepsEmbedderHookInstalledLater) {
   EXPECT_GT(g_embedder_hook_calls, 0u);
 }
 
+TEST_F(Test79UnofficialTrustedScript, CodeGenerationPolicyIsScopedToTheRealm) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_realm_options options;
+  unofficial_napi_realm_options_init(&options);
+  unofficial_napi_realm realm = nullptr;
+  napi_value context = nullptr;
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options,
+      UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &context, nullptr), napi_ok);
+
+  napi_value check = nullptr;
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env,
+      "(kind, source) => kind === 'eval' && source === '6 * 7'"), &check), napi_ok);
+  ASSERT_EQ(unofficial_napi_set_realm_code_generation(s.env, realm, false, false,
+      Str(s.env, "blocked eval"), Str(s.env, "blocked wasm"), check), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, realm, "eval('6 * 7') === 42"));
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
+      "(() => { try { eval('1'); return false; } "
+      "catch (error) { return error instanceof EvalError && error.message === 'blocked eval'; } })()"));
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
+      "(() => { const value = { toString() { throw 1; } }; return eval(value) === value; })()"));
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
+      "(() => { try { new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])); return false; } "
+      "catch (error) { return error instanceof WebAssembly.CompileError && error.message.includes('blocked wasm'); } })()"));
+  EXPECT_TRUE(IsTrue(s.env, "eval('1') === 1"));
+
+  ASSERT_EQ(unofficial_napi_set_realm_code_generation(s.env, realm, true, true,
+      nullptr, nullptr, nullptr), napi_ok);
+  EXPECT_TRUE(IsTrueIn(s.env, realm, "eval('1') === 1"));
+  EXPECT_TRUE(IsTrueIn(s.env, realm,
+      "new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])) instanceof WebAssembly.Module"));
+}
+
 TEST_F(Test79UnofficialTrustedScript, CreateValidatesArguments) {
   EnvScope s(runtime_.get());
 
