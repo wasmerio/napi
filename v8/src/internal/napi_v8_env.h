@@ -186,6 +186,21 @@ struct napi_env__ {
   // Nothing threw it, so cancelling the termination drops it, as QuickJS
   // drops its uncatchable error then.
   bool last_exception_is_termination = false;
+  // A byte outside the env that mirrors "an exception is pending"
+  // (!last_exception.IsEmpty(), what napi_is_exception_pending reports), for
+  // a caller that reads it without a call: the Wasmer bridge points it into
+  // the guest's memory (unofficial_napi_register_guest_state). Every change
+  // of last_exception's emptiness is followed by SyncExceptionFlag before
+  // control can leave the provider. Withdrawal may run on another thread and
+  // waits for any write in progress before allowing the byte to be freed.
+  std::atomic<uint8_t*> exception_flag{nullptr};
+  std::mutex exception_flag_mu;
+  void SyncExceptionFlag() {
+    if (!exception_flag.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(exception_flag_mu);
+    uint8_t* flag = exception_flag.load(std::memory_order_relaxed);
+    if (flag != nullptr) *flag = last_exception.IsEmpty() ? 0 : 1;
+  }
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;

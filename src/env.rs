@@ -570,6 +570,14 @@ impl NapiEnv {
                  already releasing or inside its own guest call); its isolate and \
                  budget charge are kept"
             );
+            // The env may outlive the store, and with it the guest memory its
+            // guest state block is in (unofficial_napi_register_guest_state):
+            // the bridge must not write there again. A guest that is still
+            // running registers its block again.
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_withdraw_guest_state(env);
+            }
             return;
         }
         let registered = self
@@ -644,6 +652,15 @@ impl Drop for NapiEnv {
             // release refused, and the env stays charged.
             let status = unsafe { snapi_bridge_unofficial_release_env(env) };
             self.finish_unregister_napi_env(env_id, env, status);
+        }
+        // Every env that outlives this store (a release refused now or
+        // earlier) lets go of its guest state block: the memory goes with
+        // the store.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        for env in self.napi_envs.values() {
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_withdraw_guest_state(*env as SnapiEnv);
+            }
         }
         // Release any external memory the guest declared but did not take back.
         if self.external_declared > 0 {

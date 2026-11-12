@@ -558,6 +558,7 @@ inline bool CheckValue(napi_env env, napi_value value) {
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
   env->last_exception.Reset();
+  env->SyncExceptionFlag();
   env->last_exception_message.Reset();
   env->last_exception_source_line.clear();
   env->last_exception_thrown_at.clear();
@@ -572,6 +573,7 @@ void SetLastException(napi_env env,
   if (exception.IsEmpty()) return;
 
   env->last_exception.Reset(env->isolate, exception);
+  env->SyncExceptionFlag();
   if (!message.IsEmpty()) {
     env->last_exception_message.Reset(env->isolate, message);
   }
@@ -990,6 +992,7 @@ void napi_v8_keep_terminating_after_interrupt(napi_env env) {
 napi_status napi_v8_fail_terminating(napi_env env) {
   if (env->last_exception.IsEmpty()) {
     env->last_exception.Reset(env->isolate, v8::Null(env->isolate));
+    env->SyncExceptionFlag();
     env->last_exception_is_termination = true;
   }
   return napi_v8_set_last_error(env, napi_pending_exception, "Execution is terminating");

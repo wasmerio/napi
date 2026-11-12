@@ -22,6 +22,17 @@ fn guest_range(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, len: usize) ->
     })
 }
 
+/// Host address of a guest range the provider keeps writing to after the
+/// import returns (`unofficial_napi_register_guest_state`). The memory's base
+/// never moves (see `guest_heap`), and the guest keeps the range allocated.
+pub(crate) fn guest_host_range(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    len: usize,
+) -> Option<*mut u8> {
+    guest_range(env, guest_ptr, len)
+}
+
 // Copies that tolerate other guest threads writing the same bytes, like
 // Wasmer's own `MemoryBuffer` reads and writes: volatile on the guest side,
 // in steps of 8, 4, 2 and 1 bytes, so a `u32` is still one access.

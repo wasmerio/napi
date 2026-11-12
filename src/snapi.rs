@@ -222,6 +222,16 @@ unsafe extern "C" {
     ) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_is_executing_js(env: SnapiEnv, result_out: *mut i32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_register_guest_state(
+        env: SnapiEnv,
+        constants_out: *mut u32,
+        exception_flag: *mut u8,
+        callback_frame: *mut u8,
+    ) -> i32;
+    /// Any thread; see the bridge.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_withdraw_guest_state(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_enqueue_microtask(env: SnapiEnv, callback_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_set_promise_reject_callback(
         env: SnapiEnv,
