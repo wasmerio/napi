@@ -354,6 +354,16 @@ fn guest_unofficial_napi_memory_pressure(
     unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
 }
 
+fn guest_unofficial_napi_clear_script_caches(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_clear_script_caches(env_handle) }
+}
+
+fn guest_unofficial_napi_dispose_realm(env: FunctionEnvMut<NapiEnv>, napi_env: u32, key: u32) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_contextify_dispose(env_handle, key) }
+}
+
 // ---- Snapshots (include/unofficial_napi.h) ----
 fn guest_unofficial_napi_snapshot_commit(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -473,6 +483,11 @@ fn guest_unofficial_napi_set_realm_code_generation(
             check,
         )
     }
+}
+
+fn guest_unofficial_napi_retain_scripts(env: FunctionEnvMut<NapiEnv>, napi_env: u32, host: u32) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_contextify_retain_scripts(env_handle, host) }
 }
 
 #[allow(clippy::result_large_err)]
@@ -5420,11 +5435,14 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
+        "unofficial_napi_clear_script_caches" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_clear_script_caches),
+        "unofficial_napi_dispose_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_dispose_realm),
         "unofficial_napi_snapshot_commit" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_commit),
         "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
         "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
         "unofficial_napi_define_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_binding),
         "unofficial_napi_set_realm_code_generation" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_realm_code_generation),
+        "unofficial_napi_retain_scripts" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_retain_scripts),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

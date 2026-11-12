@@ -941,6 +941,13 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
                  static_cast<int>(event),
                  *text != nullptr ? *text : "<unprintable>");
   }
+  // An unhandled rejection of a promise made in a context the embedder
+  // retired: whatever runs now is not its (unofficial_napi_dispose_realm).
+  // The other events still go: a handler added later must still cancel a
+  // rejection reported before the disposal.
+  v8::Local<v8::Context> creation;
+  if (event == v8::kPromiseRejectWithNoHandler && promise->GetCreationContext(isolate).ToLocal(&creation)
+      && NapiV8IsDisposedRealm(env, creation)) return;
   v8::Local<v8::Value> args[] = {
       v8::Integer::New(isolate, static_cast<int>(event)),
       promise,
@@ -1908,6 +1915,16 @@ void NapiV8InstallCodeGenerationCallbacks(v8::Isolate* isolate) {
   isolate->SetAllowWasmCodeGenerationCallback(NapiV8AllowWasmCodeGeneration);
 }
 
+bool NapiV8DeferUntilFinalizationCleanup(napi_env env, std::function<void()> action) {
+  if (env == nullptr || env->isolate == nullptr) return false;
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  return platform != nullptr && platform->DeferUntilFinalizationCleanup(env->isolate, std::move(action));
+}
+
 v8::FunctionCallback NapiV8SnapshotFunctionTrampoline();
 
 namespace {
@@ -2795,7 +2812,7 @@ napi_status NapiV8SnapshotCommitWithManifest(
       manifest_length / kSnapshotManifestEntrySize != env->snapshot_static_table.size() ||
       std::none_of(env->realms.begin(), env->realms.end(),
                    [&](const auto& candidate) { return candidate.get() == realm; }) ||
-      !realm->snapshot_template || realm->snapshot_added ||
+      !realm->snapshot_template || realm->snapshot_added || realm->disposed ||
       std::any_of(env->realm_frames.begin(), env->realm_frames.end(),
                   [&](const auto& frame) { return frame.realm == realm; })) {
     return napi_invalid_arg;
@@ -2968,6 +2985,14 @@ napi_status NAPI_CDECL unofficial_napi_memory_pressure(napi_env env, int32_t lev
   // LowMemoryNotification (CollectAllAvailableGarbage) does, so later realms
   // still find their scripts compiled. V8 13.7 and later clear it here too.
   env->isolate->MemoryPressureNotification(static_cast<v8::MemoryPressureLevel>(level));
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_clear_script_caches(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  // The compilation cache (scripts, eval) and the RegExp cache, with no
+  // collection (unlike LowMemoryNotification, collect_garbage).
+  env->isolate->ClearCachesForTesting();
   return napi_ok;
 }
 

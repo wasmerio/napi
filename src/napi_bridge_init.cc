@@ -3516,6 +3516,12 @@ extern "C" int snapi_bridge_unofficial_memory_pressure(
   return unofficial_napi_memory_pressure(bridge_state->env, level);
 }
 
+extern "C" int snapi_bridge_unofficial_clear_script_caches(SnapiEnvState* env_state) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_clear_script_caches(bridge_state->env);
+}
+
 extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     SnapiEnvState* env_state,
     int mode,
@@ -4259,6 +4265,22 @@ extern "C" int snapi_bridge_unofficial_contextify_set_code_generation(
     return napi_invalid_arg;
   return unofficial_napi_set_realm_code_generation(bridge->env, realm, allow_strings != 0,
       allow_wasm != 0, strings_message, wasm_message, check);
+}
+
+extern "C" int snapi_bridge_unofficial_contextify_dispose(SnapiEnvState* state, uint32_t key_id) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr || key_id == 0) return napi_invalid_arg;
+  unofficial_napi_realm realm;
+  if (!ResolveRealm(*bridge, key_id, &realm)) return napi_invalid_arg;
+  return unofficial_napi_dispose_realm(bridge->env, realm);
+}
+
+extern "C" int snapi_bridge_unofficial_contextify_retain_scripts(SnapiEnvState* state, uint32_t host_id) {
+  auto* bridge = RequireEnvState(state);
+  if (bridge == nullptr || host_id == 0) return napi_invalid_arg;
+  napi_value host = LoadValue(*bridge, host_id);
+  if (host == nullptr) return napi_invalid_arg;
+  return unofficial_napi_retain_scripts(bridge->env, host);
 }
 
 // Snapshot manifest entries use one guest callback and one role per static

@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -107,6 +109,11 @@ struct EdgeV8Platform::IsolateState {
   bool shutdown_started = false;
   bool finished = false;
   std::vector<FinishedCallback> finished_callbacks;
+  // FinalizationRegistry cleanup tasks, which run before any other task
+  // (EdgeV8Platform::PumpPendingForegroundTasks), and what waits for them
+  // (EdgeV8Platform::DeferUntilFinalizationCleanup).
+  std::deque<std::unique_ptr<v8::Task>> cleanup_tasks;
+  std::vector<std::function<void()>> after_cleanup;
 };
 
 namespace {
@@ -258,6 +265,22 @@ class EdgeV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
         isolate_state->platform->AddPendingForegroundTask(isolate_state);
         counted_task =
             std::make_unique<CountedForegroundTask>(isolate_state, std::move(counted_task));
+      }
+      const char* poster = location.Function();
+      if (delay_ms == 0 && isolate_state != nullptr && poster != nullptr &&
+          std::strcmp(poster, "PostFinalizationRegistryCleanupTaskIfNeeded") == 0) {
+        bool queued = false;
+        {
+          std::lock_guard<std::mutex> lock(isolate_state->mutex);
+          if (!isolate_state->shutdown_started) {
+            isolate_state->cleanup_tasks.push_back(std::move(counted_task));
+            queued = true;
+          }
+        }
+        if (queued) {
+          WakeForForegroundTask();
+          return;
+        }
       }
       if (delay_ms == 0) {
         runner->PostTask(std::move(counted_task), location);
@@ -482,6 +505,16 @@ void EdgeV8Platform::NotifyIsolateShutdown(v8::Isolate* isolate) {
     v8::platform::NotifyIsolateShutdown(fallback_.get(), isolate);
   }
   BeginShutdown(state);
+  if (state) {
+    // Dropped unrun, outside the lock: each gives back its pending count.
+    std::deque<std::unique_ptr<v8::Task>> dropped;
+    std::vector<std::function<void()>> waiting;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      dropped.swap(state->cleanup_tasks);
+      waiting.swap(state->after_cleanup);
+    }
+  }
   MaybeFinishIsolate(state, false);
 }
 
@@ -540,7 +573,54 @@ bool EdgeV8Platform::PumpPendingForegroundTasks(v8::Isolate* isolate) {
   // otherwise be posted and never run. Admit one task per checkpoint so
   // self-rescheduling GC work cannot monopolize the guest's event-loop turn.
   // The caller reports progress to keep the loop runnable for the next task.
-  return v8::platform::PumpMessageLoop(fallback_.get(), isolate);
+  //
+  // FinalizationRegistry cleanup runs first, each task and the successor it
+  // posts, before any other task (or a collection one runs): V8's cleanup
+  // task (FinalizationRegistryCleanupTask::RunInternal, V8 13.6) returns
+  // without clearing its "task posted" flag when it finds no dirty registry,
+  // and the dirty list is weak. A registry that became garbage while its
+  // cleanup waited behind other tasks (a removed frame's, a finished one's)
+  // left the flag set, and no FinalizationRegistry callback ran again in the
+  // isolate. (V8 15 clears the flag first.) This narrows that window to the
+  // rest of the turn that posted the task; a collection there that frees
+  // every dirty registry still wedges it.
+  bool ran = false;
+  if (std::shared_ptr<IsolateState> state = GetState(isolate)) {
+    for (int count = 0; count < 64; ++count) {
+      std::unique_ptr<v8::Task> task;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->cleanup_tasks.empty()) break;
+        task = std::move(state->cleanup_tasks.front());
+        state->cleanup_tasks.pop_front();
+      }
+      task->Run();
+      ran = true;
+    }
+    // What waits for the cleanup (a context's disposal, which empties that
+    // context's part of the dirty list) runs only once no cleanup task is
+    // left: under a posted task it would wedge it as above. More than 64
+    // dirty registries take more than one pump; `ran` keeps the caller's
+    // loop turning until then.
+    std::vector<std::function<void()>> waiting;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (!state->cleanup_tasks.empty()) return true;
+      waiting.swap(state->after_cleanup);
+    }
+    for (auto& action : waiting) action();
+  }
+  return v8::platform::PumpMessageLoop(fallback_.get(), isolate) || ran;
+}
+
+bool EdgeV8Platform::DeferUntilFinalizationCleanup(v8::Isolate* isolate,
+                                                   std::function<void()> action) {
+  std::shared_ptr<IsolateState> state = GetState(isolate);
+  if (!state) return false;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->shutdown_started || state->cleanup_tasks.empty()) return false;
+  state->after_cleanup.push_back(std::move(action));
+  return true;
 }
 
 void EdgeV8Platform::WakeForQueuedForegroundTasks(v8::Isolate* isolate) {

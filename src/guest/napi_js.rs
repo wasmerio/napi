@@ -1762,6 +1762,14 @@ fn guest_unofficial_napi_contextify_compile_function(
 // has one); 0 means the env's own realm.
 
 // The host's JS engine exposes no compilation cache to a guest.
+fn guest_unofficial_napi_clear_script_caches(_env: FunctionEnvMut<NapiEnv>, _napi_env: u32) -> i32 {
+    9
+}
+
+fn guest_unofficial_napi_dispose_realm(_env: FunctionEnvMut<NapiEnv>, _napi_env: u32, _key: u32) -> i32 {
+    9
+}
+
 // Snapshots need the V8 provider: the host's engine makes realms in JS.
 fn snapshot_call_env(env: &FunctionEnvMut<NapiEnv>, napi_env: u32) -> Result<SnapiEnv, i32> {
     let handle = snapi_env(env, napi_env);
@@ -1917,6 +1925,10 @@ fn guest_unofficial_napi_set_realm_code_generation(
     _wasm_message: u32,
     _check: u32,
 ) -> i32 {
+    9
+}
+
+fn guest_unofficial_napi_retain_scripts(_env: FunctionEnvMut<NapiEnv>, _napi_env: u32, _host: u32) -> i32 {
     9
 }
 
@@ -6102,11 +6114,14 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
+        "unofficial_napi_clear_script_caches" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_clear_script_caches),
+        "unofficial_napi_dispose_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_dispose_realm),
         "unofficial_napi_define_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_binding),
         "unofficial_napi_snapshot_commit" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_commit),
         "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
         "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
         "unofficial_napi_set_realm_code_generation" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_realm_code_generation),
+        "unofficial_napi_retain_scripts" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_retain_scripts),
         "unofficial_napi_event_loop_checkpoint" => event_loop_checkpoint_import(store, fe),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

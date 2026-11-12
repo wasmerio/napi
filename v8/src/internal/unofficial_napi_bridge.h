@@ -1,6 +1,8 @@
 #ifndef NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_
 #define NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_
 
+#include <functional>
+
 #include <v8.h>
 
 #include "napi_snapshot.h"
@@ -10,6 +12,8 @@ bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
+// A contextify context unofficial_napi_dispose_realm retired.
+bool NapiV8IsDisposedRealm(napi_env env, v8::Local<v8::Context> context);
 bool NapiV8IsSnapshotTemplateContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
@@ -33,5 +37,9 @@ bool NapiV8CheckCodeGeneration(v8::Local<v8::Context> context, const char* kind,
 // The isolate's AllowWasmCodeGenerationCallback.
 bool NapiV8AllowWasmCodeGeneration(v8::Local<v8::Context> context,
                                    v8::Local<v8::String> source);
+
+// While a FinalizationRegistry cleanup task of env's isolate waits to run,
+// keeps `action` to run once none is left and returns true; otherwise false.
+bool NapiV8DeferUntilFinalizationCleanup(napi_env env, std::function<void()> action);
 
 #endif  // NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_

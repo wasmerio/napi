@@ -1,6 +1,7 @@
 #ifndef NAPI_V8_EDGE_V8_PLATFORM_H_
 #define NAPI_V8_EDGE_V8_PLATFORM_H_
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -80,6 +81,11 @@ class EdgeV8Platform final : public v8::Platform {
   // handed to a bound target: the embedder then finds nothing to run and
   // waits again.
   void WakeForQueuedForegroundTasks(v8::Isolate* isolate);
+
+  // While a FinalizationRegistry cleanup task waits to run, keeps `action`
+  // to run once none is left (PumpPendingForegroundTasks) and returns true;
+  // otherwise returns false and the caller runs it now.
+  bool DeferUntilFinalizationCleanup(v8::Isolate* isolate, std::function<void()> action);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
