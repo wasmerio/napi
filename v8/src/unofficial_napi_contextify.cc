@@ -1420,6 +1420,7 @@ void CallContextTokenHook(napi_env env,
   thrown_at.swap(env->last_exception_thrown_at);
   const bool is_termination = env->last_exception_is_termination;
   env->last_exception_is_termination = false;
+  env->SyncExceptionFlag();
   {
     v8::TryCatch try_catch(env->isolate);
     hook(env, realm, env->agent->context_token_data);
@@ -1429,6 +1430,7 @@ void CallContextTokenHook(napi_env env,
   env->last_exception_source_line.swap(source_line);
   env->last_exception_thrown_at.swap(thrown_at);
   env->last_exception_is_termination = is_termination;
+  env->SyncExceptionFlag();
   // The hook may have cancelled the termination, which drops what it left
   // pending: that was put aside, so drop it now.
   if (is_termination && !napi_v8_terminating(env)) napi_v8_drop_pending_termination(env);

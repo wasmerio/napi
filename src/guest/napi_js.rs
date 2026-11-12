@@ -2524,6 +2524,18 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
 
 // --- Singleton getters ---
 
+fn guest_unofficial_napi_register_guest_state(
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _state_ptr: u32,
+    size: u32,
+) -> i32 {
+    if size == 0 {
+        return 0; // A withdrawal: nothing of the guest's is ever kept.
+    }
+    9 // Host JS keeps no guest-memory state: the guest calls the imports.
+}
+
 fn guest_napi_get_undefined(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp: u32) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_get_undefined(snapi_env(&env, e), &mut out) };
@@ -6083,6 +6095,7 @@ pub fn register_napi_imports(
     let napi_extension_wasmer_namespace = namespace! {
         "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
+        "unofficial_napi_register_guest_state" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_register_guest_state),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),

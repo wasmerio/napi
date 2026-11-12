@@ -8,6 +8,11 @@ using BridgeCallbackDataHook = void (*)(napi_env, void*, void*);
 
 void SetBridgeCallbackDataHooks(napi_env env, BridgeCallbackDataHook retain,
                                 BridgeCallbackDataHook release, void* user);
+// The byte that mirrors napi_is_exception_pending for `env` (NULL: none). It
+// must stay writable until the env is freed or the byte is replaced. NULL
+// may be set from any thread that keeps the env alive meanwhile; a byte only
+// from the env's own thread.
+void SetBridgeExceptionFlag(napi_env env, uint8_t* flag);
 uint64_t napi_v8_get_arraybuffer_backing_store_token(napi_env env, napi_value value);
 uint64_t napi_v8_get_arraybuffer_view_backing_store_token(napi_env env, napi_value value);
 

@@ -165,6 +165,10 @@ struct SnapiAgentState {
   std::vector<uint32_t> value_free_slots;
   size_t live_value_count = 0;
   size_t reserved_value_count = 0;
+  // Ids of undefined, null, true and false that no scope frame owns
+  // (unofficial_napi_register_guest_state): 0 until first pinned. Their
+  // Locals are the isolate's roots, which live as long as the isolate.
+  uint32_t constant_ids[4] = {0, 0, 0, 0};
 
   // Open scope frames, innermost last. Initialized lazily with the root frame
   // on first use; new values are minted into the innermost frame.
@@ -231,6 +235,10 @@ struct SnapiEnvState {
   bool snapshot_manifest_rejected = false;
   std::atomic<bool> snapshot_cleanup_only{false};
   std::unordered_set<CallbackBinding*> callback_bindings;
+  // The 60-byte callback frame registered in guest memory. The mutex makes
+  // withdrawal wait for any copy already in progress before memory can go.
+  std::atomic<uint8_t*> guest_callback_frame{nullptr};
+  std::mutex guest_callback_frame_mu;
 };
 
 struct CallbackBinding {
@@ -399,8 +407,11 @@ SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
 uint32_t RegisterCallbackInvocation(SnapiEnvState* state, napi_callback_info info) {
   if (state == nullptr || info == nullptr) return 0;
   SnapiAgentState& agent = *state->agent;
+  // 0 is "none"; 1 is what a guest may use for a callback info that is not
+  // the provider's (Nauta's snapshot tape replays callbacks with it), so the
+  // guest's callback frame never names it.
+  if (agent.next_callback_invocation_id < 2) agent.next_callback_invocation_id = 2;
   uint32_t id = agent.next_callback_invocation_id++;
-  if (id == 0) id = agent.next_callback_invocation_id++;
   agent.callback_invocations.push_back(CallbackInvocation{id, info});
   return id;
 }
@@ -507,6 +518,26 @@ uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
   return StoreValueInFrame(state, val, CurrentFrame(state));
 }
 
+// Mints an id no scope frame owns: it stays valid until the agent's tables
+// are cleared. Only for values whose Local outlives every handle scope (the
+// isolate's roots).
+uint32_t PinValue(SnapiAgentState& agent, napi_value val) {
+  if (val == nullptr || !HasValueCapacity(agent, 1)) return 0;
+  uint32_t index;
+  if (!agent.value_free_slots.empty()) {
+    index = agent.value_free_slots.back();
+    agent.value_free_slots.pop_back();
+  } else {
+    index = static_cast<uint32_t>(agent.value_slots.size());
+    agent.value_slots.emplace_back();
+  }
+  ValueSlot& slot = agent.value_slots[index];
+  slot.value = val;
+  slot.in_use = true;
+  ++agent.live_value_count;
+  return ((index + 1) << kValueIdGenBits) | slot.generation;
+}
+
 napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
   if (id == 0) return nullptr;
   if (state.env == nullptr) return nullptr;
@@ -585,6 +616,26 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
       return 8;
   }
   return 0;
+}
+
+// Marks the guest's callback frame (WriteGuestCallbackFrame) as describing
+// no callback.
+void ClearGuestCallbackFrame(SnapiEnvState& state) {
+  if (!state.guest_callback_frame.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(state.guest_callback_frame_mu);
+  auto* frame = state.guest_callback_frame.load(std::memory_order_relaxed);
+  if (frame == nullptr) return;
+  const uint32_t none = 0;
+  std::memcpy(frame, &none, sizeof none);
+}
+
+void SetGuestCallbackFrame(SnapiEnvState& state, uint8_t* frame) {
+  std::lock_guard<std::mutex> lock(state.guest_callback_frame_mu);
+  state.guest_callback_frame.store(frame, std::memory_order_relaxed);
+  if (frame != nullptr) {
+    const uint32_t none = 0;
+    std::memcpy(frame, &none, sizeof none);
+  }
 }
 
 uint32_t StoreRef(SnapiEnvState& state, napi_ref ref) {
@@ -681,6 +732,11 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
     std::lock_guard<std::mutex> lock(g_mu);
     if (agent->closing) return napi_invalid_arg;
     agent->closing = true;
+    // A teardown callback cannot write through a guest state registration.
+    for (SnapiEnvState* env_state : agent->envs) {
+      SetBridgeExceptionFlag(env_state->env, nullptr);
+      SetGuestCallbackFrame(*env_state, nullptr);
+    }
   }
   // Owner callbacks/finalizers may use their env while it unwinds. Foreign
   // interrupts are now refused; a foreign terminate only reaches guest code
@@ -700,6 +756,7 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   agent->value_slots.clear();
   agent->value_free_slots.clear();
   agent->live_value_count = 0;
+  std::fill(std::begin(agent->constant_ids), std::end(agent->constant_ids), 0);
   agent->next_scope_id = 1;
   agent->refs.clear();
   agent->next_ref_id = 1;
@@ -796,6 +853,53 @@ extern "C" int snapi_bridge_init() {
 // ============================================================
 // Value creation
 // ============================================================
+
+// unofficial_napi_register_guest_state: the ids of undefined, null, true and
+// false the guest may use in any scope of this env, pinned on first use.
+// `exception_flag` (NULL: none) is the guest's byte that mirrors
+// napi_is_exception_pending from here on. `callback_frame` (NULL: none) is
+// the guest's 60-byte callback frame (WriteGuestCallbackFrame).
+extern "C" int snapi_bridge_unofficial_register_guest_state(SnapiEnvState* env_state,
+                                                            uint32_t* constants_out,
+                                                            uint8_t* exception_flag,
+                                                            uint8_t* callback_frame) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || constants_out == nullptr) return napi_invalid_arg;
+  SnapiAgentState& agent = *bridge_state->agent;
+  if (agent.constant_ids[0] == 0) {
+    napi_env env = bridge_state->env;
+    napi_value values[4] = {nullptr, nullptr, nullptr, nullptr};
+    if (napi_get_undefined(env, &values[0]) != napi_ok ||
+        napi_get_null(env, &values[1]) != napi_ok ||
+        napi_get_boolean(env, true, &values[2]) != napi_ok ||
+        napi_get_boolean(env, false, &values[3]) != napi_ok ||
+        !HasValueCapacity(agent, 4)) {
+      return napi_generic_failure;
+    }
+    for (size_t i = 0; i < 4; ++i) agent.constant_ids[i] = PinValue(agent, values[i]);
+  }
+  for (size_t i = 0; i < 4; ++i) constants_out[i] = agent.constant_ids[i];
+  SetBridgeExceptionFlag(bridge_state->env, exception_flag);
+  SetGuestCallbackFrame(*bridge_state, callback_frame);
+  return napi_ok;
+}
+
+// The provider lets go of the guest state block of `env_state`
+// (unofficial_napi_register_guest_state with size 0): it keeps no pointer
+// into the guest's memory and writes nothing more there. Any thread may call
+// it: the Rust layer does when a store is dropped while its env lives on (a
+// release refused on a thread that does not own the env), after which the
+// guest's memory is unmapped. An env whose release is under way is left
+// alone: the release dropped the pointers itself (DisposeBridgeState).
+extern "C" int snapi_bridge_unofficial_withdraw_guest_state(SnapiEnvState* env_state) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (env_state == nullptr || !g_envs.count(env_state)) return napi_invalid_arg;
+  if (!env_state->agent->closing && env_state->env != nullptr) {
+    SetBridgeExceptionFlag(env_state->env, nullptr);
+    SetGuestCallbackFrame(*env_state, nullptr);
+  }
+  return napi_ok;
+}
 
 extern "C" int snapi_bridge_get_undefined(SnapiEnvState* env_state, uint32_t* out_id) {
   auto* bridge_state = RequireEnvState(env_state);
@@ -3186,6 +3290,55 @@ void WasmInterruptCallback(napi_env env, void* raw) {
   delete request;
 }
 
+// The guest's callback frame (unofficial_napi_register_guest_state): what
+// napi_get_cb_info, napi_get_new_target and
+// unofficial_napi_get_current_realm_data would answer at the start of this
+// callback, written before the guest runs so it needs none of the three
+// calls. Layout (little-endian): u32 callback info (0: no frame), u32
+// argument count, u32 receiver, u32 new.target (0 unless constructing), u32
+// data, u32[8] arguments (undefined past the count), u64 realm data.
+constexpr size_t kGuestFrameArguments = 8;
+constexpr size_t kGuestFrameBytes = 60;
+
+static void WriteGuestCallbackFrame(SnapiEnvState& state, napi_callback_info info,
+                                    uint32_t cbinfo_id, const CallbackBinding& binding) {
+  if (!state.guest_callback_frame.load(std::memory_order_relaxed)) return;
+  napi_env env = state.env;
+  uint32_t words[5 + kGuestFrameArguments] = {};
+  uint64_t realm_data = 0;
+  napi_value argv[kGuestFrameArguments];
+  size_t argc = kGuestFrameArguments;
+  napi_value this_arg = nullptr;
+  napi_value new_target = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) == napi_ok &&
+      napi_get_new_target(env, info, &new_target) == napi_ok &&
+      unofficial_napi_get_current_realm_data(env, &realm_data) == napi_ok &&
+      HasValueCapacity(*state.agent, std::min(argc, kGuestFrameArguments) +
+                                     (this_arg != nullptr) + (new_target != nullptr))) {
+    words[0] = cbinfo_id;
+    words[1] = static_cast<uint32_t>(argc);
+    words[2] = this_arg != nullptr ? StoreValue(state, this_arg) : 0;
+    words[3] = new_target != nullptr ? StoreValue(state, new_target) : 0;
+    // As snapi_bridge_get_cb_info: the data of the binding's own registration.
+    auto registration = state.cb_registry.find(binding.reg_id);
+    words[4] = registration != state.cb_registry.end()
+                   ? static_cast<uint32_t>(registration->second.data_val)
+                   : 0;
+    const uint32_t undefined_id = state.agent->constant_ids[0];
+    for (size_t i = 0; i < kGuestFrameArguments; ++i) {
+      words[5 + i] = i < argc ? StoreValue(state, argv[i]) : undefined_id;
+    }
+  }
+  uint8_t frame[kGuestFrameBytes];
+  std::memcpy(frame, words, sizeof words);
+  std::memcpy(frame + sizeof words, &realm_data, sizeof realm_data);
+  static_assert(sizeof words + sizeof realm_data == kGuestFrameBytes);
+  std::lock_guard<std::mutex> lock(state.guest_callback_frame_mu);
+  if (auto* guest_frame = state.guest_callback_frame.load(std::memory_order_relaxed)) {
+    std::memcpy(guest_frame, frame, sizeof frame);
+  }
+}
+
 // Generic C++ callback invoked by V8 for all napi_create_function functions.
 // Passes the real callback frame explicitly to the Rust trampoline via a
 // short-lived callback-info token.
@@ -3247,9 +3400,14 @@ static napi_value DispatchWasmCallback(napi_env env, napi_callback_info info, in
           ? it->second.wasm_setter_fn_ptr
           : it->second.wasm_fn_ptr;
 
+  if (cb_scope != nullptr) {
+    WriteGuestCallbackFrame(*bridge_state, info, cbinfo_id, *binding);
+  }
   uint32_t result_id =
       snapi_host_invoke_wasm_callback(
           callback_ctx, it->second.guest_env, wasm_fn_ptr, cbinfo_id);
+  // The frame described this callback, or one it nested: neither is current.
+  ClearGuestCallbackFrame(*bridge_state);
   // Callbacks nest, so ours is normally on top.
   auto& invocations = agent.callback_invocations;
   auto invocation = std::find_if(invocations.rbegin(), invocations.rend(),

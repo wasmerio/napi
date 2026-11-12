@@ -13,6 +13,12 @@ void SetBridgeCallbackDataHooks(napi_env env, BridgeCallbackDataHook retain,
   env->callback_data_hooks_user = user;
 }
 
+void SetBridgeExceptionFlag(napi_env env, uint8_t* flag) {
+  std::lock_guard<std::mutex> lock(env->exception_flag_mu);
+  env->exception_flag.store(flag, std::memory_order_relaxed);
+  if (flag != nullptr) *flag = env->last_exception.IsEmpty() ? 0 : 1;
+}
+
 static uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
   return backing_store == nullptr
              ? 0

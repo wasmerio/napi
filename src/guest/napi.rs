@@ -855,6 +855,99 @@ fn guest_unofficial_napi_is_executing_js(
     status
 }
 
+/// `unofficial_napi_register_guest_state(env, state, size)`: guest fast paths.
+/// The guest lends the env a block of its linear memory, which must stay
+/// valid and at the same address until withdrawal, replacement or release.
+/// The provider fills the fields `size` covers and keeps them current, so the
+/// guest answers the matching calls from its own memory, with no import. The
+/// block is little-endian `u32` fields:
+/// - 0, 4, 8, 12: `undefined`, `null`, `true`, `false` as handles that are
+///   valid in every handle scope of the env for as long as it lives (no scope
+///   owns them; closing or escaping a scope leaves them alone). They refer to
+///   the same values as the corresponding N-API calls.
+/// - 16 (one byte, then three of padding): non-zero while an exception is
+///   pending, exactly what `napi_is_exception_pending` reports, at every
+///   point the guest runs.
+/// - 20..80, the callback frame: what `napi_get_cb_info`,
+///   `napi_get_new_target` and `unofficial_napi_get_current_realm_data`
+///   answer at the start of the guest callback in progress, written before
+///   each one runs: `u32` callback info (the callback's `napi_callback_info`;
+///   0 when the frame describes none: outside callbacks, and from the return
+///   of a callback, nested ones included, until the next one starts), `u32`
+///   argument count, `u32` receiver, `u32` new.target (0 unless
+///   constructing), `u32` data, `u32[8]` arguments (undefined past the
+///   count), `u64` realm data. The handles belong to the callback's scope.
+/// `size` is one of the layouts above (16, 20, 80); another size fails and
+/// changes nothing. Size 0 (`state` is ignored) withdraws the block: the
+/// provider keeps no pointer into the guest's memory and writes nothing
+/// more; the constants' handles stay valid. The guest may free the block
+/// only after the env's release, a withdrawal or a replacement returned
+/// `napi_ok`. The provider withdraws by itself when a release starts, and
+/// when the store goes while the env lives on (`finish_unregister_napi_env`,
+/// `impl Drop for NapiEnv`).
+/// Registering again replaces the block. A provider without the call, or one
+/// that returns a failure, writes nothing: the guest keeps calling the
+/// imports. See docs/guest-state.md for the guest ABI.
+fn guest_unofficial_napi_register_guest_state(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    state_ptr: u32,
+    size: u32,
+) -> i32 {
+    // undefined, null, true, false.
+    const CONSTANTS: u32 = 16;
+    const EXCEPTION: u32 = 20;
+    const CALLBACK_FRAME: u32 = 80;
+    if size == 0 {
+        // Withdraw: no pointer into the guest's memory is kept.
+        return unsafe { snapi_bridge_unofficial_withdraw_guest_state(snapi_env(&env, napi_env)) };
+    }
+    if state_ptr % 4 != 0 || abi::guest_outputs(&mut env, &[(state_ptr, size as usize)]).is_err() {
+        return 1;
+    }
+    if !matches!(size, CONSTANTS | EXCEPTION | CALLBACK_FRAME) {
+        return 9;
+    }
+    let exception_flag = if size >= EXCEPTION {
+        // Only a memory with a fixed base can be written to later on.
+        match guest_host_range(&mut env, state_ptr + CONSTANTS, 1) {
+            Some(flag) => flag,
+            None => return 9,
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    let callback_frame = if size >= CALLBACK_FRAME {
+        match guest_host_range(&mut env, state_ptr + EXCEPTION, (size - EXCEPTION) as usize) {
+            Some(frame) => frame,
+            None => return 9,
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    let handle = snapi_env(&env, napi_env);
+    let mut constants = [0u32; 4];
+    let status = unsafe {
+        snapi_bridge_unofficial_register_guest_state(
+            handle,
+            constants.as_mut_ptr(),
+            exception_flag,
+            callback_frame,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    for (index, id) in constants.iter().enumerate() {
+        if !write_guest_u32(&mut env, state_ptr + 4 * index as u32, *id) {
+            // A failed registration holds nothing of the guest's.
+            unsafe { snapi_bridge_unofficial_withdraw_guest_state(handle) };
+            return 1;
+        }
+    }
+    0
+}
+
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -5392,6 +5485,7 @@ pub fn register_napi_imports(
     let napi_extension_wasmer_namespace = namespace! {
         "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
+        "unofficial_napi_register_guest_state" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_register_guest_state),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),

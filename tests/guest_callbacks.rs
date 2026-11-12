@@ -17,6 +17,8 @@ const WAT: &str = r#"(module
     (func $create_env (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
     (func $release_env (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_register_guest_state"
+    (func $register_state (param i32 i32 i32) (result i32)))
   (import "napi" "napi_create_string_utf8"
     (func $create_string (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_run_script" (func $run_script (param i32 i32 i32) (result i32)))
@@ -37,6 +39,7 @@ const WAT: &str = r#"(module
     (func $open_esc (param i32 i32) (result i32)))
   (import "napi" "napi_escape_handle" (func $escape (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_typeof" (func $typeof (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_and_clear_last_exception" (func $clear_exception (param i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
   ;; 72 int out, 200..228 scratch. Callbacks take 64- or 256-byte frames from
@@ -48,6 +51,7 @@ const WAT: &str = r#"(module
   (global $sp (mut i32) (i32.const 32768))
   (global $err (mut i32) (i32.const 0))
   (global $stale_id (mut i32) (i32.const 0))
+  (global $state (mut i32) (i32.const 0))
   (data (i32.const 100) "rec\00")
   (data (i32.const 108) "leak\00")
   (data (i32.const 116) "many20\00")
@@ -89,6 +93,26 @@ const WAT: &str = r#"(module
     (call $release_env (global.get $scope) (i32.const 0)))
 
   (func (export "err") (result i32) (global.get $err))
+
+  (func (export "register_state") (param $ptr i32) (param $size i32) (result i32)
+    (local $status i32)
+    (local.set $status (call $register_state (global.get $env) (local.get $ptr) (local.get $size)))
+    (if (i32.eqz (local.get $status))
+      (then (global.set $state (select (local.get $ptr) (i32.const 0) (i32.eq (local.get $size) (i32.const 80))))))
+    (local.get $status))
+
+  (func (export "scope_begin") (result i32)
+    (call $open_scope (global.get $env) (i32.const 240)))
+
+  (func (export "scope_end") (result i32)
+    (call $close_scope (global.get $env) (i32.load (i32.const 240))))
+
+  (func (export "type_of") (param $value i32) (result i32)
+    (if (call $typeof (global.get $env) (local.get $value) (i32.const 244)) (then unreachable))
+    (i32.load (i32.const 244)))
+
+  (func (export "clear_exception") (result i32)
+    (call $clear_exception (global.get $env) (i32.const 248)))
 
   (func (export "eval") (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -230,6 +254,13 @@ const WAT: &str = r#"(module
   ;; probe(): napi_get_cb_info with every out pointer null, then all set;
   ;; returns the argument count.
   (func $probe (param $env i32) (param $info i32) (result i32)
+    (if (global.get $state)
+      (then
+        (if (i32.ne (i32.load offset=20 (global.get $state)) (local.get $info))
+          (then (call $fail (i32.const 54))))
+        (if (call $get_int32 (local.get $env) (i32.load offset=40 (global.get $state)) (i32.const 252))
+          (then (call $fail (i32.const 55))))
+        (i32.store (i32.const 256) (i32.load offset=24 (global.get $state)))))
     (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 0) (i32.const 0)
           (i32.const 0) (i32.const 0))
       (then (call $fail (i32.const 51))))
@@ -435,4 +466,54 @@ fn envs_created_one_after_another_on_one_thread() {
         let after = eval.call(&mut guest.store, SOURCE_PTR as i32, 1);
         assert!(after.is_err(), "released env still ran: {after:?}");
     }
+}
+
+#[test]
+fn registered_guest_state_follows_scope_callback_and_exception_lifetimes() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let register = guest.typed::<(i32, i32), i32>("register_state");
+    let scope_begin = guest.typed::<(), i32>("scope_begin");
+    let scope_end = guest.typed::<(), i32>("scope_end");
+    let type_of = guest.typed::<i32, i32>("type_of");
+    let clear = guest.typed::<(), i32>("clear_exception");
+    let read = |guest: &Guest, address| {
+        let mut bytes = [0; 4];
+        guest
+            .memory
+            .view(&guest.store)
+            .read(address, &mut bytes)
+            .unwrap();
+        u32::from_le_bytes(bytes) as i32
+    };
+
+    assert_eq!(scope_begin.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(register.call(&mut guest.store, 768, 80).unwrap(), 0);
+    assert_eq!(scope_end.call(&mut guest.store).unwrap(), 0);
+    for (offset, kind) in [(0, 0), (4, 1), (8, 2), (12, 2)] {
+        let handle = read(&guest, 768 + offset);
+        assert_ne!(handle, 0);
+        assert_eq!(type_of.call(&mut guest.store, handle).unwrap(), kind);
+    }
+
+    assert_eq!(register.call(&mut guest.store, 769, 80).unwrap(), 1);
+    assert_eq!(register.call(&mut guest.store, 896, 12).unwrap(), 9);
+    assert_eq!(guest.eval("probe(41, 42)"), (0, 2, 0));
+    assert_eq!(read(&guest, 252), 41);
+    assert_eq!(read(&guest, 256), 2);
+    assert_eq!(read(&guest, 768 + 20), 0);
+    assert_eq!(guest.eval("throw new Error('pending')").0, 10);
+    assert_eq!(read(&guest, 768 + 16) & 255, 1);
+    assert_eq!(clear.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(read(&guest, 768 + 16) & 255, 0);
+
+    assert_eq!(register.call(&mut guest.store, 896, 20).unwrap(), 0);
+    assert_eq!(guest.eval("throw new Error('replacement')").0, 10);
+    assert_eq!(read(&guest, 768 + 16) & 255, 0);
+    assert_eq!(read(&guest, 896 + 16) & 255, 1);
+    assert_eq!(register.call(&mut guest.store, 0, 0).unwrap(), 0);
+    assert_eq!(clear.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(read(&guest, 896 + 16) & 255, 1);
+    assert_eq!(guest.eval("probe(43, 44)"), (0, 2, 0));
+    assert_eq!(guest.release(), 0);
 }
