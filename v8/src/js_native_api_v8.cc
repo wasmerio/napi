@@ -3694,6 +3694,167 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   return napi_ok;
 }
 
+// Owned objects (unofficial_napi.h): what an embedder's wrapper creation and
+// regrouping did call by call, in one. Temporaries stay in a scope of this
+// call; only the new object reaches the caller's.
+napi_status NAPI_CDECL unofficial_napi_create_owned_object(
+    napi_env env,
+    napi_ref source,
+    void* native_object,
+    node_api_basic_finalize finalize_cb,
+    void* finalize_hint,
+    napi_value owner,
+    napi_ref owner_ref,
+    napi_ref owner_map,
+    napi_ref owner_map_set,
+    uint32_t flags,
+    napi_value* result,
+    napi_ref* weak_result) {
+  if (result != nullptr) *result = nullptr;
+  if (weak_result != nullptr) *weak_result = nullptr;
+  if (!CheckEnv(env) || source == nullptr || finalize_cb == nullptr ||
+      result == nullptr || weak_result == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (env->snapshot_finalized) return napi_invalid_arg;
+  // As the caller's own check before it made anything, and as
+  // napi_call_function refuses while the env terminates.
+  if (!env->last_exception.IsEmpty()) return napi_pending_exception;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  const bool construct = (flags & unofficial_napi_owned_object_construct) != 0;
+  const bool member = (flags & unofficial_napi_owned_object_no_member) == 0;
+  const bool has_owner = owner != nullptr || owner_ref != nullptr;
+  if (has_owner && (owner_map == nullptr || owner_map_set == nullptr)) {
+    return napi_invalid_arg;
+  }
+  v8::Isolate* isolate = env->isolate;
+  v8::Local<v8::Context> context = env->context();
+  v8::EscapableHandleScope scope(isolate);
+  v8::Local<v8::Value> owner_value;
+  v8::Local<v8::Value> map_value;
+  v8::Local<v8::Value> map_set_value;
+  if (has_owner) {
+    owner_value = owner != nullptr ? napi_v8_unwrap_value(owner) : owner_ref->Get();
+    if (owner_value.IsEmpty()) return napi_ok;
+    map_value = owner_map->Get();
+    map_set_value = owner_map_set->Get();
+    if (map_value.IsEmpty() || map_set_value.IsEmpty() ||
+        !map_set_value->IsFunction() || (member && !owner_value->IsSet())) {
+      return napi_invalid_arg;
+    }
+  }
+  v8::Local<v8::Value> source_value = source->Get();
+  if (source_value.IsEmpty()) return napi_invalid_arg;
+  if (construct ? !source_value->IsFunction()
+                : !source_value->IsObject() && !source_value->IsNull()) {
+    return construct ? napi_function_expected : napi_object_expected;
+  }
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Object> made;
+  if (construct) {
+    if (!source_value.As<v8::Function>()->NewInstance(context, 0, nullptr).ToLocal(&made)) {
+      (void)ReturnPendingIfCaught(env, try_catch, "Constructor threw");
+      return napi_cannot_run_js;
+    }
+  } else {
+    made = v8::Object::New(isolate);
+  }
+  v8::Local<v8::Object> object = scope.Escape(made);
+  napi_value wrapped = napi_v8_wrap_value(env, object);
+  if (wrapped == nullptr) return napi_generic_failure;
+  // The weak reference before the wrap: once the object is wrapped its
+  // finalizer owns native_object, and the caller must then get both outputs.
+  napi_ref weak = napi_ref__::New(env, object, 0, napi_ref_ownership__::kUserland);
+  if (weak == nullptr) return napi_generic_failure;
+  napi_status status =
+      napi_wrap(env, wrapped, native_object, finalize_cb, finalize_hint, nullptr);
+  if (status != napi_ok) {
+    weak->Destroy();
+    // (napi_wrap's own refusals are the provider's, never the engine's nor
+    // one of this call's documented outcomes.)
+    return napi_generic_failure;
+  }
+  // From here the finalizer owns native_object, whatever fails below.
+  *result = wrapped;
+  *weak_result = weak;
+  if (!construct && !object->SetPrototype(context, source_value).FromMaybe(false)) {
+    (void)ReturnPendingIfCaught(env, try_catch, "Prototype was not set");
+    return napi_cannot_run_js;
+  }
+  if (has_owner) {
+    if (member && owner_value.As<v8::Set>()->Add(context, object).IsEmpty()) {
+      (void)ReturnPendingIfCaught(env, try_catch, "Owner add threw");
+      return napi_cannot_run_js;
+    }
+    v8::Local<v8::Value> argv[] = {object, owner_value};
+    if (map_set_value.As<v8::Function>()->Call(context, map_value, 2, argv).IsEmpty()) {
+      (void)ReturnPendingIfCaught(env, try_catch, "Owner edge threw");
+      return napi_cannot_run_js;
+    }
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_move_owned_object(
+    napi_env env,
+    napi_ref object_ref,
+    napi_ref from_owner_ref,
+    napi_value to_owner,
+    napi_ref to_owner_ref,
+    napi_ref owner_map,
+    napi_ref owner_map_set,
+    uint32_t* state) {
+  if (!CheckEnv(env) || object_ref == nullptr || owner_map == nullptr ||
+      owner_map_set == nullptr || state == nullptr ||
+      (to_owner == nullptr && to_owner_ref == nullptr)) {
+    return napi_invalid_arg;
+  }
+  if (env->snapshot_finalized) return napi_invalid_arg;
+  // A failure leaves the env's pending exception as it was (the caller may
+  // be holding one while it regroups): what the engine threw is dropped, as
+  // the caller dropped it after each of its own calls.
+  if (napi_v8_terminating(env)) return napi_cannot_run_js;
+  v8::Isolate* isolate = env->isolate;
+  v8::Local<v8::Context> context = env->context();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Value> object = object_ref->Get();
+  if (object.IsEmpty()) {
+    *state = unofficial_napi_owned_object_gone;
+    return napi_ok;
+  }
+  v8::Local<v8::Value> owner_value =
+      to_owner != nullptr ? napi_v8_unwrap_value(to_owner) : to_owner_ref->Get();
+  if (owner_value.IsEmpty()) {
+    *state = unofficial_napi_owned_object_owner_gone;
+    return napi_ok;
+  }
+  v8::Local<v8::Value> map_value = owner_map->Get();
+  v8::Local<v8::Value> map_set_value = owner_map_set->Get();
+  if (map_value.IsEmpty() || map_set_value.IsEmpty() || !map_set_value->IsFunction() ||
+      !owner_value->IsSet()) {
+    return napi_invalid_arg;
+  }
+  v8::TryCatch try_catch(isolate);
+  if (from_owner_ref != nullptr) {
+    v8::Local<v8::Value> from_value = from_owner_ref->Get();
+    if (!from_value.IsEmpty()) {
+      if (!from_value->IsSet()) return napi_invalid_arg;
+      if (from_value.As<v8::Set>()->Delete(context, object).IsNothing()) {
+        return napi_cannot_run_js;
+      }
+    }
+  }
+  if (owner_value.As<v8::Set>()->Add(context, object).IsEmpty()) {
+    return napi_cannot_run_js;
+  }
+  v8::Local<v8::Value> argv[] = {object, owner_value};
+  if (map_set_value.As<v8::Function>()->Call(context, map_value, 2, argv).IsEmpty()) {
+    return napi_cannot_run_js;
+  }
+  *state = unofficial_napi_owned_object_moved;
+  return napi_ok;
+}
+
 // napi_throw_error and its siblings: makes the error, gives it `code` as Node
 // does, and throws it. Setting the code runs an inherited `code` setter, JS
 // that V8 may terminate: the termination is then what unwinds, and throwing

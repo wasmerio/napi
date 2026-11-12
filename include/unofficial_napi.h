@@ -680,6 +680,86 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uninitialized_ar
     size_t length,
     bool zero_fill,
     napi_value* result);
+// Owned objects: an embedder's native wrapper and the ownership edges that
+// keep it alive, made in one call. The embedder keeps, per group of wrappers,
+// an owner (a Set of its members) and a WeakMap from each member to its owner,
+// so a member keeps its whole group alive. These calls run the operations the
+// embedder would otherwise make one by one (napi_create_object or
+// napi_new_instance, napi_wrap, napi_create_reference, a prototype set,
+// Set.prototype.add, WeakMap.prototype.set), using the engine's own Set
+// operations. The caller must supply its captured WeakMap.prototype.set and,
+// in construct mode, a constructor it trusts to run during the call.
+//
+// unofficial_napi_create_owned_object:
+// - `source` holds the new object's prototype (an object or null). With
+//   unofficial_napi_owned_object_construct it holds a constructor instead,
+//   and the object is `new source()`.
+// - `native_object`, `finalize_cb`, `finalize_hint`: as napi_wrap (a finalizer
+//   is required). `*weak_result` is a separate reference of count 0.
+// - The owner is `owner`, or when that is NULL what `owner_ref` holds; with
+//   neither, no edge is made. The object is added to the owner (a Set) unless
+//   unofficial_napi_owned_object_no_member is given, then
+//   `owner_map_set.call(owner_map, object, owner)` runs.
+// Returns napi_ok with `*result` NULL, having made nothing, when `owner_ref`
+// no longer holds its value. Returns napi_pending_exception, having made
+// nothing, only when an exception was already pending or the env is
+// terminating. Returns napi_cannot_run_js when, and only when, an engine
+// operation of the call failed (it threw, near the stack limit say, or was
+// terminated): what it threw may be left pending (napi_is_exception_pending).
+// napi_object_expected or napi_function_expected: `source` holds neither.
+// Every other status is the caller's error or the provider's (an argument
+// that is not what it must be, a reference that does not exist or has
+// cleared, no room for the result): nothing was made, and no caller should
+// treat it as the engine's refusal. Whenever `*result` is not NULL the
+// object was wrapped, the finalizer owns `native_object` and `*weak_result`
+// is not NULL either, also when the call failed (napi_cannot_run_js then).
+//
+// unofficial_napi_move_owned_object: removes what `object_ref` holds from the
+// Set `from_owner_ref` holds (when given and still alive), adds it to the new
+// owner (`to_owner`, or what `to_owner_ref` holds) and runs
+// `owner_map_set.call(owner_map, object, owner)`. `*state` says what happened.
+// An engine operation that failed (or an env that is terminating) returns
+// napi_cannot_run_js and preserves any pre-existing pending exception.
+// Earlier Set operations may already have succeeded. The caller can retry
+// the move using the same source and target owners. Neither helper drains
+// the finalizer queue itself.
+//
+// A provider without these calls returns napi_generic_failure from both; one
+// that has them returns napi_invalid_arg for NULL references, which is how a
+// caller can tell them apart once.
+enum {
+  unofficial_napi_owned_object_construct = 1,
+  unofficial_napi_owned_object_no_member = 2,
+};
+enum {
+  unofficial_napi_owned_object_moved = 0,
+  // `object_ref` no longer holds its value: nothing was done.
+  unofficial_napi_owned_object_gone = 1,
+  // `to_owner_ref` no longer holds its value: nothing was done.
+  unofficial_napi_owned_object_owner_gone = 2,
+};
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_owned_object(
+    napi_env env,
+    napi_ref source,
+    void* native_object,
+    node_api_basic_finalize finalize_cb,
+    void* finalize_hint,
+    napi_value owner,
+    napi_ref owner_ref,
+    napi_ref owner_map,
+    napi_ref owner_map_set,
+    uint32_t flags,
+    napi_value* result,
+    napi_ref* weak_result);
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_move_owned_object(
+    napi_env env,
+    napi_ref object_ref,
+    napi_ref from_owner_ref,
+    napi_value to_owner,
+    napi_ref to_owner_ref,
+    napi_ref owner_map,
+    napi_ref owner_map_set,
+    uint32_t* state);
 
 // Unofficial helper. Terminates current JS execution in the env's engine.
 // This is used for worker-style shutdown semantics where the process must

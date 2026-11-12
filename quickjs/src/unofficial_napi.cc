@@ -435,6 +435,25 @@ extern "C"
         return napi_ok;
     }
 
+    // Owned objects: not provided here (the caller makes its calls one by one).
+    napi_status NAPI_CDECL unofficial_napi_create_owned_object(
+        napi_env, napi_ref, void *, node_api_basic_finalize, void *, napi_value, napi_ref,
+        napi_ref, napi_ref, uint32_t, napi_value *result, napi_ref *weak_result)
+    {
+        if (result != nullptr)
+            *result = nullptr;
+        if (weak_result != nullptr)
+            *weak_result = nullptr;
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_move_owned_object(
+        napi_env, napi_ref, napi_ref, napi_value, napi_ref, napi_ref, napi_ref,
+        uint32_t *)
+    {
+        return napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_uninitialized_arraybuffer(
         napi_env env,
         size_t length,

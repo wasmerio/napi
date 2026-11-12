@@ -4872,6 +4872,90 @@ fn guest_unofficial_napi_create_guest_backed_typedarray(
     0
 }
 
+// Owned objects (unofficial_napi.h). The Set and WeakMap operations run
+// engine code, so they get the callback context napi_call_function has.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn guest_unofficial_napi_create_owned_object(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    source_ref: u32,
+    native_data: u32,
+    finalize_cb: u32,
+    finalize_hint: u32,
+    owner: u32,
+    owner_ref: u32,
+    owner_map: u32,
+    owner_map_set: u32,
+    flags: u32,
+    result_out: u32,
+    weak_out: u32,
+) -> Result<i32, WasiError> {
+    // Validated first: once the object is wrapped its finalizer owns the
+    // guest's native data, and the guest learns that only from these outputs.
+    if finalize_cb == 0 || abi::guest_outputs(&mut env, &[(result_out, 4), (weak_out, 4)]).is_err()
+    {
+        return Ok(1);
+    }
+    let snapi = snapi_env(&env, e);
+    let mut value: u32 = 0;
+    let mut weak: u32 = 0;
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_unofficial_create_owned_object(
+            snapi,
+            source_ref,
+            native_data as u64,
+            e,
+            finalize_cb,
+            finalize_hint,
+            owner,
+            owner_ref,
+            owner_map,
+            owner_map_set,
+            flags,
+            &mut value,
+            &mut weak,
+        )
+    })?;
+    write_guest_u32(&mut env, result_out, value);
+    write_guest_u32(&mut env, weak_out, weak);
+    Ok(s)
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn guest_unofficial_napi_move_owned_object(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    object_ref: u32,
+    from_owner_ref: u32,
+    to_owner: u32,
+    to_owner_ref: u32,
+    owner_map: u32,
+    owner_map_set: u32,
+    state_out: u32,
+) -> Result<i32, WasiError> {
+    if abi::guest_outputs(&mut env, &[(state_out, 4)]).is_err() {
+        return Ok(1);
+    }
+    let snapi = snapi_env(&env, e);
+    let mut state: u32 = 0;
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_unofficial_move_owned_object(
+            snapi,
+            object_ref,
+            from_owner_ref,
+            to_owner,
+            to_owner_ref,
+            owner_map,
+            owner_map_set,
+            &mut state,
+        )
+    })?;
+    if s == 0 {
+        write_guest_u32(&mut env, state_out, state);
+    }
+    Ok(s)
+}
+
 // --- Node version ---
 
 fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp: u32) -> i32 {
@@ -5405,6 +5489,8 @@ pub fn register_napi_imports(
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
+        "unofficial_napi_create_owned_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_owned_object),
+        "unofficial_napi_move_owned_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_move_owned_object),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

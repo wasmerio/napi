@@ -97,4 +97,4 @@ jobs:
           ./cargo-standalone.sh test --locked --lib
           --test guest_callbacks --test guest_c_strings
           --test guest_memory --test guest_memory_pressure
-          --test guest_lazy_properties --test guest_realm_bindings
+          --test guest_lazy_properties --test guest_realm_bindings --test guest_owned_objects

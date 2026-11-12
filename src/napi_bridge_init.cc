@@ -2720,6 +2720,80 @@ extern "C" int snapi_bridge_wrap_finalized(SnapiEnvState* env_state, uint32_t ob
   return napi_ok;
 }
 
+// unofficial_napi_create_owned_object for a guest: the guest's finalizer runs
+// through the same trampoline as napi_wrap's. Both outputs are written
+// whatever the status: a non-zero value id means the object was wrapped and
+// the finalizer owns the guest's native data, and the reference id is then
+// non-zero too. The result's id is reserved before anything is made: a full
+// value table fails the call (napi_generic_failure) with nothing wrapped,
+// never an object whose finalizer owns data the guest was told nothing of.
+extern "C" int snapi_bridge_unofficial_create_owned_object(
+    SnapiEnvState* env_state, uint32_t source_ref_id, uint64_t native_data,
+    uint32_t guest_env, uint32_t wasm_fn_ptr, uint32_t finalize_hint,
+    uint32_t owner_id, uint32_t owner_ref_id, uint32_t owner_map_ref_id,
+    uint32_t owner_map_set_ref_id, uint32_t flags, uint32_t* out_id,
+    uint32_t* ref_out) {
+  if (out_id == nullptr || ref_out == nullptr) return napi_invalid_arg;
+  *out_id = 0;
+  *ref_out = 0;
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_ref source = LoadRef(*bridge_state, source_ref_id);
+  napi_value owner = owner_id != 0 ? LoadValue(*bridge_state, owner_id) : nullptr;
+  napi_ref owner_ref = LoadRef(*bridge_state, owner_ref_id);
+  napi_ref owner_map = LoadRef(*bridge_state, owner_map_ref_id);
+  napi_ref owner_map_set = LoadRef(*bridge_state, owner_map_set_ref_id);
+  if (source == nullptr || wasm_fn_ptr == 0 || (owner_id != 0 && owner == nullptr) ||
+      (owner_ref_id != 0 && owner_ref == nullptr) ||
+      (owner_map_ref_id != 0 && owner_map == nullptr) ||
+      (owner_map_set_ref_id != 0 && owner_map_set == nullptr)) {
+    return napi_invalid_arg;
+  }
+  ValueSlotReservation result_slot(*bridge_state->agent, 1);
+  if (!result_slot) return napi_generic_failure;
+  auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
+                                          static_cast<uint32_t>(native_data),
+                                          finalize_hint);
+  if (record == nullptr) return napi_generic_failure;
+  napi_value result = nullptr;
+  napi_ref weak = nullptr;
+  napi_status s = unofficial_napi_create_owned_object(
+      env, source, (void*)(uintptr_t)native_data, GuestFinalizerTrampoline, record,
+      owner, owner_ref, owner_map, owner_map_set, flags, &result, &weak);
+  if (result == nullptr) {
+    delete record;
+    return s;
+  }
+  result_slot.Release();
+  *out_id = StoreValue(*bridge_state, result);
+  *ref_out = StoreRef(*bridge_state, weak);
+  return s;
+}
+
+extern "C" int snapi_bridge_unofficial_move_owned_object(
+    SnapiEnvState* env_state, uint32_t object_ref_id, uint32_t from_owner_ref_id,
+    uint32_t to_owner_id, uint32_t to_owner_ref_id, uint32_t owner_map_ref_id,
+    uint32_t owner_map_set_ref_id, uint32_t* state_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || state_out == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_ref object_ref = LoadRef(*bridge_state, object_ref_id);
+  napi_ref from_owner_ref = LoadRef(*bridge_state, from_owner_ref_id);
+  napi_value to_owner = to_owner_id != 0 ? LoadValue(*bridge_state, to_owner_id) : nullptr;
+  napi_ref to_owner_ref = LoadRef(*bridge_state, to_owner_ref_id);
+  napi_ref owner_map = LoadRef(*bridge_state, owner_map_ref_id);
+  napi_ref owner_map_set = LoadRef(*bridge_state, owner_map_set_ref_id);
+  if ((from_owner_ref_id != 0 && from_owner_ref == nullptr) ||
+      (to_owner_id != 0 && to_owner == nullptr) ||
+      (to_owner_ref_id != 0 && to_owner_ref == nullptr)) {
+    return napi_invalid_arg;
+  }
+  return unofficial_napi_move_owned_object(env, object_ref, from_owner_ref, to_owner,
+                                           to_owner_ref, owner_map, owner_map_set,
+                                           state_out);
+}
+
 extern "C" int snapi_bridge_unwrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t* data_out) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
