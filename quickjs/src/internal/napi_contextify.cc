@@ -185,6 +185,7 @@ namespace quickjs::detail
         napi_env env = nullptr;
         JSContext *parent_ctx = nullptr;
         JSContext *ctx = nullptr;            // Borrowed; valid while live().
+        void *owner_data = nullptr;
         JSValueConst sandbox = JS_UNDEFINED; // Borrowed; undefined without one.
         JSValueConst global = JS_UNDEFINED;  // Borrowed; valid while live().
         // A function of the realm, which keeps its context alive. The key
@@ -832,6 +833,7 @@ namespace quickjs::detail
     }
 
     napi_status napi_contextify__::create_realm(const unofficial_napi_realm_options &options,
+                                                void *realm_data,
                                                 unofficial_napi_realm *realm_out,
                                                 napi_value *global_out)
     {
@@ -870,13 +872,38 @@ namespace quickjs::detail
                                                              "globalThis",
                                                              JS_DupValue(ctx_, sandbox));
             if (status != napi_ok)
+            {
+                JSContext *child = JS_DupContext(record->ctx);
+                records_by_global_.erase(JS_VALUE_GET_PTR(record->sandbox));
+                records_by_global_.erase(JS_VALUE_GET_PTR(record->global));
+                if (record->anchored)
+                {
+                    JS_DeleteProperty(ctx_, record->sandbox, context_link_atom_, 0);
+                    JS_DeleteProperty(child, record->global, sandbox_link_atom_, 0);
+                }
+                JS_SetContextOpaque(child, nullptr);
+                std::erase_if(contexts_, [record](const auto &entry) { return entry.get() == record; });
+                env_->delete_value_from_current_scope(key);
+                JS_FreeContext(child);
                 return status;
+            }
         }
         // The handle is valid while the current scope holds the key.
+        record->owner_data = realm_data;
         *realm_out = reinterpret_cast<unofficial_napi_realm>(record);
         if (global_out != nullptr)
             *global_out = key;
         return napi_ok;
+    }
+
+    uint64_t napi_contextify__::realm_data(JSContext *ctx) const
+    {
+        if (ctx == ctx_)
+            return 0;
+        JSValue global = JS_GetGlobalObject(ctx);
+        auto *record = find_live_record(global);
+        JS_FreeValue(ctx, global);
+        return record == nullptr ? 0 : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(record->owner_data));
     }
 
     napi_status napi_contextify__::get_realm(napi_value value, unofficial_napi_realm *realm_out) const

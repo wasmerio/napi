@@ -1217,25 +1217,100 @@ extern "C"
     napi_status NAPI_CDECL unofficial_napi_create_realm(
         napi_env env,
         const unofficial_napi_realm_options *options_or_null,
+        uint32_t mode, uint32_t snapshot_index, void *realm_data,
         unofficial_napi_realm *realm_out,
-        napi_value *global_out)
+        napi_value *global_out, napi_value *root_out)
     {
+        if (!napi_util__::check_env(env) || realm_out == nullptr ||
+            (mode != UNOFFICIAL_NAPI_REALM_MODE_FRESH && mode != UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE &&
+             mode != UNOFFICIAL_NAPI_REALM_MODE_RESTORE) ||
+            (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && root_out == nullptr))
+            return napi_invalid_arg;
+        if (env->termination_requested())
+            return napi_util__::fail_if_terminating(env, env->context());
+        if (mode != UNOFFICIAL_NAPI_REALM_MODE_FRESH)
+            return napi_generic_failure;
+        if (snapshot_index != 0)
+            return napi_invalid_arg;
         unofficial_napi_realm_options options;
         unofficial_napi_realm_options_init(&options);
         if (options_or_null != nullptr)
         {
-            if (options_or_null->size < sizeof(options) ||
+            if (options_or_null->size != sizeof(options) ||
                 options_or_null->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION)
                 return napi_invalid_arg;
             options = *options_or_null;
         }
-        // Like NAPI_QUICKJS_RETURN_IF_TERMINATING: this can run JS (a getter,
-        // a proxy trap).
-        if (napi_util__::check_env(env) && env->termination_requested())
-            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
-        return napi_util__::check_env(env) ? env->contextify().create_realm(options, realm_out, global_out)
-                                           : napi_invalid_arg;
+        auto status = env->contextify().create_realm(options, realm_data, realm_out, global_out);
+        if (status == napi_ok && root_out != nullptr)
+            *root_out = nullptr;
+        return status;
     }
+
+    napi_status NAPI_CDECL unofficial_napi_get_current_realm_data(napi_env env, uint64_t *realm_data_out)
+    {
+        if (!napi_util__::check_env(env) || realm_data_out == nullptr)
+            return napi_invalid_arg;
+        *realm_data_out = env->contextify().realm_data(env->context());
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_snapshot_commit(
+        napi_env env, unofficial_napi_realm, napi_value, const void *, size_t, uint32_t *)
+    {
+        if (!napi_util__::check_env(env))
+            return napi_invalid_arg;
+        if (env->termination_requested())
+            return napi_util__::fail_if_terminating(env, env->context());
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_snapshot_guest_data(
+        napi_env env, void *buffer, size_t capacity, size_t *length_out)
+    {
+        if (!napi_util__::check_env(env) || length_out == nullptr || (buffer == nullptr && capacity != 0))
+            return napi_invalid_arg;
+        *length_out = 0;
+        return napi_ok;
+    }
+
+#if !defined(__wasm__)
+    napi_status NAPI_CDECL unofficial_napi_create_env_with_snapshot(
+        int32_t module_api_version,
+        const unofficial_napi_env_create_options *env_options,
+        const unofficial_napi_snapshot_env_options *snapshot_options,
+        napi_env *env_out, unofficial_napi_env_owner *owner_out)
+    {
+        if (snapshot_options == nullptr)
+            return unofficial_napi_create_env(module_api_version, env_options, env_out, owner_out);
+        if (env_options != nullptr &&
+            (env_options->size < sizeof(*env_options) ||
+             env_options->version != UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION))
+            return napi_invalid_arg;
+        if (env_options != nullptr && env_options->guest_heap != nullptr)
+            napi_host_guest_heap_release(env_options->guest_heap);
+
+        const auto &requested = *snapshot_options;
+        if (env_out == nullptr || owner_out == nullptr || requested.size < sizeof(requested) ||
+            requested.version != UNOFFICIAL_NAPI_SNAPSHOT_ENV_OPTIONS_VERSION ||
+            requested.reserved != 0)
+            return napi_invalid_arg;
+        if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_BUILDER &&
+            requested.artifact == nullptr && requested.artifact_length == 0 &&
+            requested.key != nullptr && requested.key_length != 0 &&
+            requested.key_length <= UINT32_MAX &&
+            requested.output_path != nullptr && requested.output_path_length != 0 &&
+            std::memchr(requested.output_path, '\0', requested.output_path_length) == nullptr)
+            return napi_generic_failure;
+        if (requested.role == UNOFFICIAL_NAPI_SNAPSHOT_ROLE_RESTORE &&
+            requested.artifact != nullptr && requested.artifact_length != 0 &&
+            requested.key != nullptr && requested.key_length != 0 &&
+            requested.key_length <= UINT32_MAX &&
+            requested.output_path == nullptr && requested.output_path_length == 0)
+            return napi_generic_failure;
+        return napi_invalid_arg;
+    }
+#endif
 
     napi_status NAPI_CDECL unofficial_napi_get_realm(
         napi_env env,

@@ -3,12 +3,14 @@
 
 #include <v8.h>
 
+#include "napi_snapshot.h"
 #include "unofficial_napi.h"
 
 bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
+bool NapiV8IsSnapshotTemplateContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
 // Frees the records of collected realms, unassigning their context tokens.

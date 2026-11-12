@@ -7,7 +7,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../lib/cmake/NapiLifetimeOptions.cmake")
 
-xoption(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
+option(NAPI_QUICKJS_BUILD_TESTS "Build napi-quickjs tier1 tests" ON)
+if(DEFINED ENV{NAPI_QUICKJS_BUILD_TESTS})
+  set(NAPI_QUICKJS_BUILD_TESTS "$ENV{NAPI_QUICKJS_BUILD_TESTS}")
+endif()
+option(NAPI_QUICKJS_EXTERNAL_BINDING_HOOKS
+  "Enable binding classes when an external QuickJS build supplies the NAPI hooks" OFF)
+if(NAPI_QUICKJS_EXTERNAL_BINDING_HOOKS)
+  set(NAPI_QUICKJS_HAS_BINDING_CLASS ON)
+endif()
 napi_define_lifetime_options("QuickJS")
 
 set(NAPI_QUICKJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -104,6 +112,7 @@ target_compile_definitions(napi_quickjs
     NAPI_EXTERN=
     NAPI_BUNDLED_QUICKJS=1
   PRIVATE
+    NAPI_QUICKJS_HAS_BINDING_CLASS=$<BOOL:${NAPI_QUICKJS_HAS_BINDING_CLASS}>
     NAPI_QUICKJS_ENABLE_TRACE_DIAGNOSTICS=$<IF:$<CONFIG:Debug>,1,0>
     $<$<BOOL:${NAPI_ENABLE_LIFETIME_TRACKER}>:NAPI_ENABLE_LIFETIME_TRACKER=1>
     $<$<BOOL:${NAPI_ENABLE_LIFETIME_PERIODIC_STATS}>:NAPI_ENABLE_LIFETIME_PERIODIC_STATS=1>
@@ -128,4 +137,9 @@ if(NAPI_QUICKJS_BUILD_TESTS)
   enable_testing()
   set(NAPI_TEST_ENGINE quickjs)
   add_subdirectory("${NAPI_TESTS_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  if(TARGET napi_quickjs_test_66_unofficial_realm)
+    target_compile_definitions(napi_quickjs_test_66_unofficial_realm PRIVATE
+      NAPI_QUICKJS_HAS_BINDING_CLASS=$<BOOL:${NAPI_QUICKJS_HAS_BINDING_CLASS}>
+    )
+  endif()
 endif()

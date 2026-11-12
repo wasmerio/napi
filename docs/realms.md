@@ -47,9 +47,11 @@
 typedef struct unofficial_napi_realm__* unofficial_napi_realm;
 
 napi_status unofficial_napi_create_realm(napi_env env,
-                                         const unofficial_napi_realm_options* options_or_null,
-                                         unofficial_napi_realm* realm_out,
-                                         napi_value* global_out);
+                                        const unofficial_napi_realm_options* options_or_null,
+                                        uint32_t mode, uint32_t snapshot_index, void* realm_data,
+                                        unofficial_napi_realm* realm_out,
+                                        napi_value* global_out, napi_value* root_out);
+napi_status unofficial_napi_get_current_realm_data(napi_env env, uint64_t* realm_data_out);
 napi_status unofficial_napi_get_realm(napi_env env, napi_value global_or_sandbox,
                                       unofficial_napi_realm* realm_out);
 
@@ -65,6 +67,16 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
 ```
 
 - **`create_realm`:**
+  - `FRESH` is the portable mode and takes index zero. `TEMPLATE` requires a
+    builder session. `RESTORE` takes a template index and requires `root_out`.
+    QuickJS and host-JS decline template and restore requests with
+    `napi_generic_failure`. If supplied on a successful fresh call, `root_out`
+    receives null.
+  - The provider keeps `realm_data` as an opaque value for the lifetime of
+    the realm. `get_current_realm_data` returns the current realm's value as
+    a `uint64_t`, or zero for an unbound realm. At entry to a native function
+    callback the current realm is its creation realm. Read the value before
+    entering another realm if the callback needs to retain its owner.
   - With a sandbox, global property access in the realm reads and writes the
     sandbox, as with `vm.createContext(sandbox)`.
   - A sandbox belongs to at most one realm. The env's own global may still be
@@ -76,7 +88,7 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
     | Option | V8 | QuickJS | host-JS |
     |---|---|---|---|
     | `sandbox_or_null` | yes | yes | yes |
-    | `host_defined_option_id` | yes | yes | no |
+    | `host_defined_option_id` | yes | no | no |
     | `allow_code_gen_strings` | yes | no | no |
     | `own_microtask_queue` | yes | no | no |
     | `allow_code_gen_wasm` | no | no | no |
@@ -123,6 +135,74 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
   realm_id, scope_out_ptr) -> status` and `unofficial_napi_leave_realm(env,
   scope: i64) -> status`; the token is the provider's, passed through as a
   u64.
+
+## Native bindings and snapshots
+
+Use `unofficial_napi_define_binding` for native classes and non-constructible
+methods. The class form defines the constructor, prototype, and members in
+one operation. It accepts a parent created by the same operation in the
+same env. In a V8 template the parent must also belong to the template
+realm. Member names use UTF-8 strings and must be unique on each target.
+The optional length bytes apply to methods. Getter and setter functions
+have lengths zero and one and receive their respective callbacks even
+when invoked with an unusual argument count. The constructor's
+`prototype` property is read-only.
+
+V8 exposes an object receiver through its native callback API. Bare calls
+and primitive receivers retain the engine's existing coercion. QuickJS and
+host-JS preserve the raw receiver for portable bindings. Bundled QuickJS
+supports both binding kinds. An external QuickJS library needs the native
+constructor hooks to support `CLASS`. See the [QuickJS build notes](../quickjs/README.md).
+
+A native host selects snapshot behavior when it creates each environment.
+`unofficial_napi_create_env` creates a fresh environment.
+`unofficial_napi_create_env_with_snapshot` takes optional snapshot
+configuration alongside the usual environment options. The configuration
+belongs to that call, so the same process can run fresh environments,
+builders, and environments restoring different artifacts.
+
+1. Pass the builder role with a cache key and a new path in a private
+   staging directory. Use an ASCII staging path on Windows.
+2. Create the template realms. Each V8 template has its own security token
+   while building, so use it through its realm scope. Use self-contained
+   JavaScript objects and functions in native C templates. Native callbacks
+   in a template require the Wasmer bridge's relocatable callback registry.
+   Keep wraps, externals, finalizers, and objects from other realms out of
+   the template. Drain pending work, leave the realm scopes, then commit
+   with `unofficial_napi_snapshot_commit` and a root created in that realm.
+3. Attach the guest metadata to the last commit. A committed template is
+   sealed. Native callers must also keep retained object aliases and raw
+   engine handles from mutating it through other realms. After the final
+   commit, delete remaining references, close scopes, and release the env.
+   Release writes the artifact and consumes the env even if the write
+   fails. Publish the file after successful release and validation.
+4. In a C host, pass the artifact bytes, length, and expected compatibility
+   key in the restore options for `unofficial_napi_create_env_with_snapshot`.
+   The provider validates and copies the bytes during the call. The caller can
+   release its input buffer when creation returns.
+5. Query `unofficial_napi_snapshot_guest_data` to recover the metadata.
+   Artifacts with a native callback manifest become usable once the Wasmer
+   bridge has validated and bound every entry. Create realms in restore mode
+   with a template index and a fresh owner datum. Each realm receives the template root from its own environment's
+   artifact. Owner data is never serialized.
+
+Wasmer hosts use `SnapshotEnvironment::restore(bytes, key)` and pass the
+result to `NapiCtx::with_snapshot_environment`. The restore configuration
+validates and copies the artifact once. Each environment retains a reference
+to the shared data through isolate disposal.
+
+V8 consumes the artifact at isolate creation. The host cache key must cover
+the running engine and provider build as well as the guest and its bootstrap
+inputs. The same Wasm can run against a different V8 build and get a new
+artifact. N-API checks the envelope and treats the engine blob as opaque,
+delegating its compatibility check to V8's public `StartupData::IsValid()`
+API. Treat artifacts as trusted engine data. The envelope's digest detects
+corruption, and the host controls provenance. A zero metadata length means
+the env has no usable artifact. QuickJS and host-JS can run the same
+application with fresh realms and return zero metadata length. Host-JS
+captures optional stack-trace hooks when its module loads. Install any
+embedder shim before loading the module.
+
 
 ## Deprecated compatibility API
 
@@ -214,7 +294,10 @@ calls take a realm's global or sandbox.
   before setting their fields. Source written against `main` that sets
   `size` to `sizeof`, `version` to the version macro and only the fields it
   knew sends version 2 with an indeterminate `realm_or_null`.
-- **Guest ABI.** The wasm32 layouts of version 1 are `main`'s, and version 2
+- **Guest ABI.** The `create_realm` options keep their version 1 wasm32 layout.
+  `create_realm` takes the mode, index, owner, and root output as separate words.
+  `get_current_realm_data` writes an eight-byte result. The wasm32 layouts of
+  version 1 script and module options are `main`'s, and version 2
   appends a u32 realm id. The guest imports
   `unofficial_napi_contextify_make_context`, `…_run_script` and
   `…_compile_function` keep `main`'s names and signatures, on the bridge's
@@ -312,7 +395,7 @@ and interrupt callbacks push the env's realm.
 
 ## How EdgeJS uses it
 
-- `vm.createContext` → `create_realm`.
+- `vm.createContext` → `create_realm` in `FRESH` mode with index zero.
 - `runInContext`, `compileFunction`, `moveMessagePortToContext` and
   `ModuleWrap` → `get_realm` on the contextified object, then the call with
   that realm.

@@ -122,7 +122,7 @@ int main(void) {
   unofficial_napi_realm_options_init(&realm_options);
   unofficial_napi_realm a = NULL, restricted = NULL;
   napi_value a_global = NULL, restricted_global = NULL, trusted = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, &a, &a_global));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &a, &a_global, NULL));
   unofficial_napi_realm_scope realm_scope = 0;
   NAPI_CALL(env, unofficial_napi_enter_realm(env, a, &realm_scope));
   NAPI_CALL(env, unofficial_napi_is_executing_js(env, &active));
@@ -142,7 +142,7 @@ int main(void) {
       "(() => {let lexical = 21; return eval(fromOtherRealm) === 23;})()"),
       "a trusted source from another realm uses the receiving lexical scope");
   realm_options.allow_code_gen_strings = false;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, &restricted, &restricted_global));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &realm_options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &restricted, &restricted_global, NULL));
   NAPI_CALL(env, napi_set_named_property(env, restricted_global, "trusted", trusted));
   NAPI_CALL(env, unofficial_napi_enter_realm(env, restricted, &realm_scope));
   CHECK_OR_FAIL(ScriptIsTrue(env,

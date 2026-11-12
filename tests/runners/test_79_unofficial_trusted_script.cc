@@ -371,7 +371,7 @@ TEST_F(Test79UnofficialTrustedScript, RespectsDisabledCodeGeneration) {
   options.sandbox_or_null = sandbox;
   options.allow_code_gen_strings = false;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &context, nullptr), napi_ok);
   ASSERT_EQ(unofficial_napi_create_trusted_script(s.env, Str(s.env, "throw 1"), &trusted),
             napi_ok);
   ASSERT_EQ(napi_set_named_property(s.env, sandbox, "trusted", trusted), napi_ok);
@@ -482,7 +482,7 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsFromContextTokenCallback) {
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = sandbox;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &context, nullptr), napi_ok);
   EXPECT_EQ(record.calls, 1u);
   EXPECT_EQ(record.status, napi_ok);
   EXPECT_FALSE(record.active);
@@ -506,7 +506,7 @@ TEST_F(Test79UnofficialTrustedScript, IsExecutingJsSeesOtherContexts) {
   options.sandbox_or_null = sandbox;
   options.own_microtask_queue = true;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, &context), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &context, nullptr), napi_ok);
   ASSERT_EQ(napi_create_function(
                 s.env, "executing", NAPI_AUTO_LENGTH, Executing, nullptr, &executing),
             napi_ok);
@@ -555,7 +555,7 @@ unofficial_napi_realm MakeRealm(napi_env env, napi_value* global, bool allow_str
   unofficial_napi_realm_options_init(&options);
   options.allow_code_gen_strings = allow_strings;
   unofficial_napi_realm realm = nullptr;
-  EXPECT_EQ(unofficial_napi_create_realm(env, &options, &realm, global), napi_ok);
+  EXPECT_EQ(unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, global, nullptr), napi_ok);
   return realm;
 }
 }

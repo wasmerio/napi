@@ -48,6 +48,8 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
+    println!("cargo:rerun-if-changed=src/napi_bridge_v8.cc");
+    println!("cargo:rerun-if-changed=src/napi_bridge_v8.h");
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=lib/src");
     println!("cargo:rerun-if-changed=v8/src");
@@ -98,6 +100,7 @@ fn main() {
         .include(napi_lib_src.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
+        .file("src/napi_bridge_v8.cc")
         .file(napi_lib_src.join("napi_error_state.cc").to_str().unwrap())
         .file(
             napi_lib_src

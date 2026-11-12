@@ -4,6 +4,8 @@ project(napi_engines LANGUAGES C CXX)
 option(NAPI_BUILD_QUICKJS "Build the QuickJS-backed Node-API engine" OFF)
 option(NAPI_BUILD_V8 "Build the V8-backed Node-API engine" ON)
 option(NAPI_BUILD_BUNDLED_QUICKJS "Build the vendored QuickJS runtime for napi_quickjs" ON)
+set(NAPI_QUICKJS_ENGINE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/quickjs/deps/quickjs" CACHE PATH
+  "Path to the pinned QuickJS source tree")
 
 if(NAPI_BUILD_QUICKJS OR NAPI_BUILD_V8)
   enable_testing()
@@ -24,8 +26,15 @@ if(NAPI_BUILD_QUICKJS)
     set(QJS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(QJS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(QJS_BUILD_CLI_STATIC OFF CACHE BOOL "" FORCE)
-    add_subdirectory(quickjs/deps/quickjs "${CMAKE_CURRENT_BINARY_DIR}/quickjs-engine" EXCLUDE_FROM_ALL)
-    set(NAPI_QUICKJS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/quickjs/deps/quickjs" CACHE PATH
+    add_subdirectory("${NAPI_QUICKJS_ENGINE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/quickjs-engine" EXCLUDE_FROM_ALL)
+    # Compile the pinned engine with the private binding-class hooks
+    # in the same translation unit. Its checkout stays untouched.
+    get_target_property(_qjs_sources qjs SOURCES)
+    list(FILTER _qjs_sources EXCLUDE REGEX "(^|/)quickjs[.]c$")
+    list(APPEND _qjs_sources "${CMAKE_CURRENT_SOURCE_DIR}/quickjs/engine/napi_quickjs_engine.c")
+    set_property(TARGET qjs PROPERTY SOURCES "${_qjs_sources}")
+    set(NAPI_QUICKJS_HAS_BINDING_CLASS ON)
+    set(NAPI_QUICKJS_INCLUDE_DIR "${NAPI_QUICKJS_ENGINE_SOURCE_DIR}" CACHE PATH
       "Path to QuickJS headers" FORCE)
   endif()
   add_subdirectory(quickjs)

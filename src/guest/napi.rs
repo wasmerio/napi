@@ -11,7 +11,7 @@ use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespa
 use wasmer_wasix::WasiError;
 
 use crate::{
-    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
+    HeapReservation, NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{take_pending_guest_exit, with_callback_state},
@@ -36,25 +36,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     };
 
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = if reservation.clamped {
-        unsafe {
-            snapi_bridge_unofficial_create_env_with_options(
-                8,
-                0,
-                0,
-                reservation.max_young,
-                reservation.max_old,
-                reservation.code_range,
-                0,
-                guest_heap_ctx,
-                &mut snapi_env_state,
-            )
-        }
-    } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
-    };
+    let (status, snapi_env_state) = create_host_env(&env, 8, 0, 0, 0, &reservation);
     if status != 0 || snapi_env_state.is_null() {
         env.data().abort_isolate(&reservation);
         return 0;
@@ -65,14 +47,44 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     env_id as i32
 }
 
-/// Boxed guest-heap context for env creation, or null when no heap exists.
-/// The bridge takes ownership in all cases (success or failure).
-fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_void {
-    env.data()
-        .guest_heap
-        .as_ref()
-        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
-        .unwrap_or(std::ptr::null())
+/// The bridge takes ownership of the guest-heap context on success or failure.
+fn create_host_env(
+    env: &FunctionEnvMut<NapiEnv>,
+    module_api_version: i32,
+    total_memory: u64,
+    constrained_memory: u64,
+    stack_limit: u32,
+    reservation: &HeapReservation,
+) -> (i32, SnapiEnv) {
+    let mut state = std::ptr::null_mut();
+    let mut create = |snapshot_options, retained_artifact| {
+        let guest_heap_ctx = env
+            .data()
+            .guest_heap
+            .as_ref()
+            .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            snapi_bridge_unofficial_create_env_with_snapshot(
+                module_api_version,
+                total_memory,
+                constrained_memory,
+                reservation.max_young,
+                reservation.max_old,
+                reservation.code_range,
+                stack_limit,
+                guest_heap_ctx,
+                snapshot_options,
+                retained_artifact,
+                &mut state,
+            )
+        }
+    };
+    let status = match &env.data().snapshot_environment {
+        Some(snapshot) => snapshot.create_env(create),
+        None => create(std::ptr::null(), std::ptr::null_mut()),
+    };
+    (status, state)
 }
 
 /// Run a bridge call that may re-enter the guest via host V8 callbacks, then
@@ -249,21 +261,14 @@ fn guest_unofficial_napi_create_env(
         Err(_) => return 1,
     };
 
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe {
-        snapi_bridge_unofficial_create_env_with_options(
-            module_api_version,
-            total_memory,
-            constrained_memory,
-            reservation.max_young,
-            reservation.max_old,
-            reservation.code_range,
-            stack_limit,
-            guest_heap_ctx,
-            &mut snapi_env_state,
-        )
-    };
+    let (status, snapi_env_state) = create_host_env(
+        &env,
+        module_api_version,
+        total_memory,
+        constrained_memory,
+        stack_limit,
+        &reservation,
+    );
     if status != 0 {
         env.data().abort_isolate(&reservation);
         return status;
@@ -347,6 +352,103 @@ fn guest_unofficial_napi_memory_pressure(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
+}
+
+// ---- Snapshots (include/unofficial_napi.h) ----
+fn guest_unofficial_napi_snapshot_commit(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    realm: u32,
+    root: u32,
+    data_ptr: u32,
+    length: u32,
+    index_out: u32,
+) -> i32 {
+    let handle = snapi_env(&env, napi_env);
+    let status = unsafe { snapi_bridge_snapshot_commit_preflight(handle) };
+    if status != 0 {
+        return status;
+    }
+    if (data_ptr == 0) != (length == 0) || length as usize > abi::MAX_SNAPSHOT_GUEST_DATA
+        || (index_out != 0 && abi::guest_outputs(&mut env, &[(index_out, 4)]).is_err())
+    {
+        return 1;
+    }
+    let bytes = if length == 0 {
+        None
+    } else {
+        let Some(bytes) = read_guest_bytes(&mut env, data_ptr, length as usize) else {
+            return 1;
+        };
+        Some(bytes)
+    };
+    let mut index = 0;
+    let status = unsafe {
+        snapi_bridge_unofficial_snapshot_commit(
+            handle, realm, root, bytes.as_ref().map_or(std::ptr::null(), Vec::as_ptr),
+            length as usize, &mut index,
+        )
+    };
+    if status == 0 && index_out != 0 {
+        write_guest_u32(&mut env, index_out, index);
+    }
+    status
+}
+
+#[allow(clippy::result_large_err)]
+fn guest_unofficial_napi_snapshot_guest_data(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    buffer: u32,
+    capacity: u32,
+    length_out: u32,
+) -> Result<i32, WasiError> {
+    if (buffer == 0 && capacity != 0)
+        || (capacity == 0 && u64::from(buffer) > guest_data_size(&mut env))
+    {
+        return Ok(1);
+    }
+    let outputs = [(length_out, 4), (buffer, capacity as usize)];
+    if abi::guest_outputs(&mut env, &outputs[..if capacity == 0 { 1 } else { 2 }]).is_err() {
+        return Ok(1);
+    }
+    let handle = snapi_env(&env, napi_env);
+    let mut bytes = vec![0u8; (capacity as usize).min(abi::MAX_SNAPSHOT_GUEST_DATA)];
+    let mut length = 0;
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_snapshot_guest_data(
+            handle, napi_env, if buffer == 0 { std::ptr::null_mut() } else { bytes.as_mut_ptr() },
+            bytes.len(), &mut length,
+        )
+    })?;
+    if status != 0 {
+        return Ok(status);
+    }
+    let Ok(wire_length) = u32::try_from(length) else {
+        return Ok(9);
+    };
+    if buffer != 0 && length != 0 {
+        let length = length.min(bytes.len());
+        write_guest_bytes(&mut env, buffer, &bytes[..length]);
+    }
+    write_guest_u32(&mut env, length_out, wire_length);
+    Ok(0)
+}
+
+fn guest_unofficial_napi_get_current_realm_data(
+    mut env: FunctionEnvMut<NapiEnv>, napi_env: u32, data_out: u32,
+) -> i32 {
+    // The guest ABI writes a u64 even though create_realm takes a wasm32 pointer.
+    if abi::guest_outputs(&mut env, &[(data_out, 8)]).is_err() {
+        return 1;
+    }
+    let handle = snapi_env(&env, napi_env);
+    let mut data = 0;
+    let status = unsafe { snapi_bridge_unofficial_get_current_realm_data(handle, &mut data) };
+    if status == 0 && !write_guest_u64(&mut env, data_out, data) {
+        return 1;
+    }
+    status
 }
 
 #[allow(clippy::result_large_err)]
@@ -1341,43 +1443,61 @@ fn guest_unofficial_napi_contextify_compile_function(
 
 /// A guest realm id is the value id of the realm's global (or sandbox); 0 is
 /// the env's own realm. See `snapi_bridge_unofficial_create_realm`.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_create_realm(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
-    realm_out_ptr: u32,
-    global_out_ptr: u32,
-) -> i32 {
-    let Some(options) = abi::read_realm_options(&mut env, options_ptr) else {
-        return 1;
-    };
-    if realm_out_ptr == 0 {
-        return 1;
+    mode: u32,
+    snapshot_index: u32,
+    realm_data: u32,
+    realm_out: u32,
+    global_out: u32,
+    root_out: u32,
+) -> Result<i32, WasiError> {
+    if !matches!(mode, 1..=3) || realm_out == 0 || (mode == 3 && root_out == 0) {
+        return Ok(1);
     }
-    let env_handle = snapi_env(&env, napi_env);
-    let mut realm_id = 0u32;
-    let mut global_id = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_create_realm(
-            env_handle,
-            options.sandbox_or_null,
-            options.name,
-            options.origin,
-            options.host_defined_option_id,
-            i32::from(options.allow_code_gen_strings),
-            i32::from(options.allow_code_gen_wasm),
-            i32::from(options.own_microtask_queue),
-            &mut realm_id,
-            &mut global_id,
-        )
+    let handle = snapi_env(&env, napi_env);
+    let preflight = || unsafe { snapi_bridge_realm_preflight(handle, napi_env, mode) };
+    let status = if mode == 3 {
+        with_cb_context(&mut env, napi_env, preflight)?
+    } else {
+        preflight()
     };
+    if status != 0 {
+        return Ok(status);
+    }
+    let outputs = [(realm_out, 4), (global_out, 4), (root_out, 4)];
+    let mut required = [(0, 0); 3];
+    let mut count = 0;
+    for output in outputs.into_iter().filter(|&(ptr, _)| ptr != 0) {
+        required[count] = output;
+        count += 1;
+    }
+    if abi::guest_outputs(&mut env, &required[..count]).is_err() {
+        return Ok(1);
+    }
+    let Some(options) = abi::read_realm_options(&mut env, options_ptr) else {
+        return Ok(1);
+    };
+    let (mut realm, mut global, mut root) = (0, 0, 0);
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_create_realm(
+            handle, napi_env, options.sandbox_or_null, options.name, options.origin,
+            options.host_defined_option_id, i32::from(options.allow_code_gen_strings),
+            i32::from(options.allow_code_gen_wasm), i32::from(options.own_microtask_queue),
+            mode, snapshot_index, realm_data, &mut realm, &mut global, &mut root,
+        )
+    })?;
     if status == 0 {
-        write_guest_u32(&mut env, realm_out_ptr, realm_id);
-        if global_out_ptr != 0 {
-            write_guest_u32(&mut env, global_out_ptr, global_id);
+        for ((ptr, _), value) in outputs.into_iter().zip([realm, global, root]) {
+            if ptr != 0 {
+                write_guest_u32(&mut env, ptr, value);
+            }
         }
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_get_realm(
@@ -3939,6 +4059,100 @@ fn guest_napi_define_class(
     0
 }
 
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_define_binding(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    kind: u32,
+    name_ptr: u32,
+    name_length: u32,
+    callback: u32,
+    data: u32,
+    function_length: u32,
+    parent: u32,
+    count: u32,
+    properties: u32,
+    lengths: u32,
+    function_out: u32,
+    prototype_out: u32,
+) -> i32 {
+    if !matches!(kind, 1 | 2) || function_out == 0 || (kind == 1 && prototype_out == 0) {
+        return 1;
+    }
+    let handle = snapi_env(&env, napi_env);
+    let status = unsafe { snapi_bridge_define_binding_preflight(handle, kind) };
+    if status != 0 {
+        return status;
+    }
+    let outputs = [(function_out, 4), (prototype_out, 4)];
+    if function_length > u8::MAX as u32 || (kind == 2 && prototype_out != 0)
+        || abi::guest_outputs(&mut env, &outputs[..if kind == 1 { 2 } else { 1 }]).is_err()
+    {
+        return 1;
+    }
+    let descriptor = match abi::read_binding(
+        &mut env, kind, name_ptr, name_length, callback, parent, count, properties, lengths,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(status) => return status,
+    };
+    let mut registered = Vec::new();
+    let mut register = |function, data| {
+        if function == 0 {
+            return Ok(0);
+        }
+        let id = unsafe { snapi_bridge_alloc_cb_reg_id(handle) };
+        if id == 0 {
+            return Err(9);
+        }
+        unsafe { snapi_bridge_register_callback(handle, id, napi_env, function, u64::from(data)) };
+        registered.push(id);
+        Ok(id)
+    };
+    let mut function = 0;
+    let mut prototype = 0;
+    let status = (|| -> Result<i32, i32> {
+        let reg = register(callback, data)?;
+        let count_usize = count as usize;
+        let mut names = Vec::with_capacity(count_usize);
+        let mut kinds = Vec::with_capacity(count_usize);
+        let mut values = Vec::with_capacity(count_usize);
+        let mut methods = Vec::with_capacity(count_usize);
+        let mut getters = Vec::with_capacity(count_usize);
+        let mut setters = Vec::with_capacity(count_usize);
+        let mut attrs = Vec::with_capacity(count_usize);
+        for member in &descriptor.properties {
+            names.push(member.name.as_ptr());
+            kinds.push(member.kind);
+            values.push(member.value);
+            methods.push(register(member.method, member.data)?);
+            getters.push(register(member.getter, member.data)?);
+            setters.push(register(member.setter, member.data)?);
+            attrs.push(member.attrs);
+        }
+        Ok(unsafe {
+            snapi_bridge_define_binding(
+                handle, kind, descriptor.name.as_ptr().cast(), name_length, reg, function_length,
+                parent, count, if count == 0 { std::ptr::null() } else { names.as_ptr() },
+                kinds.as_ptr(), values.as_ptr(), methods.as_ptr(), getters.as_ptr(), setters.as_ptr(), attrs.as_ptr(),
+                descriptor.member_lengths.as_ref().map_or(std::ptr::null(), Vec::as_ptr),
+                &mut function, if kind == 1 { &mut prototype } else { std::ptr::null_mut() },
+            )
+        })
+    })().unwrap_or_else(|status| status);
+    if status != 0 {
+        for id in registered {
+            unsafe { snapi_bridge_unregister_callback(handle, id) };
+        }
+        return status;
+    }
+    write_guest_u32(&mut env, function_out, function);
+    if prototype_out != 0 {
+        write_guest_u32(&mut env, prototype_out, prototype);
+    }
+    0
+}
+
 fn guest_napi_define_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
@@ -4841,11 +5055,14 @@ fn guest_napi_add_finalizer(
 
 // --- Misc stubs ---
 
-fn guest_napi_get_last_error_info(_env: FunctionEnvMut<NapiEnv>, _e: u32, _rp: u32) -> i32 {
-    0
+fn guest_napi_get_last_error_info(env: FunctionEnvMut<NapiEnv>, e: u32, _rp: u32) -> i32 {
+    i32::from(unsafe { snapi_bridge_snapshot_cleanup_only(snapi_env(&env, e)) })
 }
 
-fn guest_napi_get_version(mut env: FunctionEnvMut<NapiEnv>, _e: u32, rp: u32) -> i32 {
+fn guest_napi_get_version(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp: u32) -> i32 {
+    if unsafe { snapi_bridge_snapshot_cleanup_only(snapi_env(&env, e)) } {
+        return 1;
+    }
     write_guest_u32(&mut env, rp, 8);
     0
 }
@@ -5205,6 +5422,10 @@ pub fn register_napi_imports(
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
+        "unofficial_napi_snapshot_commit" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_commit),
+        "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
+        "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
+        "unofficial_napi_define_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_binding),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

@@ -445,7 +445,7 @@ napi_ref MakeUnreachableRealm(napi_env env) {
   options.host_defined_option_id = host_id;
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
-  EXPECT_EQ(unofficial_napi_create_realm(env, &options, &realm, &global), napi_ok);
+  EXPECT_EQ(unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
   napi_ref weak = nullptr;
   EXPECT_EQ(napi_create_reference(env, global, 0, &weak), napi_ok);
   EXPECT_EQ(napi_close_handle_scope(env, scope), napi_ok);
@@ -485,7 +485,7 @@ TEST_F(Test72UnofficialMemoryPressure, QuickJSFreesACollectedRealmsRecordAtTheNe
     ASSERT_EQ(napi_open_handle_scope(s.env, &scope), napi_ok);
     unofficial_napi_realm realm = nullptr;
     napi_value global = nullptr;
-    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_create_realm(s.env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr), napi_ok);
     ASSERT_EQ(napi_close_handle_scope(s.env, scope), napi_ok);
   }
   EXPECT_EQ(g_host_id_finalized, 1) << "the next realm did not free the collected realm's record";

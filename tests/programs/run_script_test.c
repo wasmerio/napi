@@ -430,7 +430,7 @@ int main(void) {
   realm_options.own_microtask_queue = true;
   unofficial_napi_realm context_realm = NULL;
   NAPI_CALL(env, unofficial_napi_create_realm(
-                     env, &realm_options, &context_realm, NULL));
+                     env, &realm_options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &context_realm, NULL, NULL));
 
   napi_value context_source_text;
   NAPI_CALL(env, napi_create_string_utf8(

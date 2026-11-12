@@ -1081,7 +1081,7 @@ napi_status MakeContext(napi_env env, napi_value sandbox_or_symbol, napi_value* 
 
 unofficial_napi_realm FreshRealm(napi_env env, napi_value* global_out) {
   unofficial_napi_realm realm = nullptr;
-  if (unofficial_napi_create_realm(env, nullptr, &realm, global_out) != napi_ok) return nullptr;
+  if (unofficial_napi_create_realm(env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, global_out, nullptr) != napi_ok) return nullptr;
   return realm;
 }
 
@@ -1296,7 +1296,7 @@ TEST_F(Test71ContextifyCompat, MakeContextRefusesWhatMainRefused) {
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = realm_sandbox;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
   EXPECT_EQ(MakeContext(s.env, realm_sandbox, &again), napi_invalid_arg);
   EXPECT_EQ(again, nullptr);
 }
@@ -1326,7 +1326,7 @@ TEST_F(Test71ContextifyCompat, ContextifiedObjectsAreRealms) {
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = realm_sandbox;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
   napi_value seen = nullptr;
   ASSERT_EQ(RunInContext(s.env, realm_sandbox, "marker", &seen), napi_ok);
   EXPECT_TRUE(StrictEquals(s.env, seen, marker));
@@ -1416,7 +1416,7 @@ TEST_F(Test71ContextifyCompat, TheEnvsGlobalAsASandbox) {
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = env_global;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
   napi_value env_array = Prototype(s.env, RunIn(s.env, nullptr, "[]"));
   napi_value realm_array = Prototype(s.env, RunIn(s.env, realm, "[]"));
   ASSERT_NE(env_array, nullptr);
@@ -1451,7 +1451,7 @@ TEST_F(Test71ContextifyCompat, VersionOneOptionsInTheEnvsGlobalAsASandbox) {
   unofficial_napi_realm_options_init(&options);
   options.sandbox_or_null = env_global;
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
 
   MainBytecodeOpenOptionsV1 bytecode_v1 = MainBytecodeOptions(s.env, "(");
   unofficial_napi_bytecode_open_options bytecode_v2{};
@@ -2052,7 +2052,7 @@ void MakeReleaseRealm(ReleaseTokens* log) {
   }
   unofficial_napi_realm realm = nullptr;
   napi_value global = nullptr;
-  if (unofficial_napi_create_realm(log->env, nullptr, &realm, &global) == napi_ok &&
+  if (unofficial_napi_create_realm(log->env, nullptr, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, &global, nullptr) == napi_ok &&
       realm != nullptr) {
     log->made.push_back(realm);
   } else {

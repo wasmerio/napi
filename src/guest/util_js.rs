@@ -392,6 +392,20 @@ pub fn write_guest_number_value(
     wasmer_napi_guest_write_number(&memory, value, guest_ptr, kind as u32)
 }
 
+pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
+    guest_memory(env).map_or(0, |memory| wasmer_napi_guest_byte_length(&memory) as u64)
+}
+
+pub fn read_guest_c_string_max(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    max: usize,
+) -> Option<Vec<u8>> {
+    let memory = guest_memory(env)?;
+    let len = wasmer_napi_guest_c_string_length(&memory, guest_ptr, u32::try_from(max).ok()?);
+    read_guest_bytes(env, guest_ptr, usize::try_from(len).ok()?)
+}
+
 pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,

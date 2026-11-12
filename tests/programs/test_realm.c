@@ -102,7 +102,7 @@ int main(void) {
   // A realm has its own global.
   unofficial_napi_realm realm = NULL;
   napi_value realm_global = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, NULL, &realm, &realm_global));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, NULL, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &realm, &realm_global, NULL));
   CHECK_OR_FAIL(realm != NULL, "create_realm did not return a realm");
   napi_value env_global = NULL;
   napi_value realm_own_global = NULL;
@@ -166,7 +166,7 @@ int main(void) {
   options.sandbox_or_null = sandbox;
   unofficial_napi_realm sandbox_realm = NULL;
   napi_value sandbox_global = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &sandbox_realm, &sandbox_global));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &sandbox_realm, &sandbox_global, NULL));
   CHECK_OR_FAIL(StrictEquals(env, sandbox_global, sandbox),
                 "create_realm did not return the sandbox as the global");
   found = NULL;
@@ -190,7 +190,7 @@ int main(void) {
   NAPI_CALL(env, napi_set_named_property(env, context_sandbox, "x", three));
   options.sandbox_or_null = context_sandbox;
   unofficial_napi_realm context_realm = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &context_realm, NULL));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &context_realm, NULL, NULL));
   napi_value undefined = NULL;
   NAPI_CALL(env, napi_get_undefined(env, &undefined));
   int32_t ran = 0;
@@ -304,7 +304,7 @@ int main(void) {
     options.sandbox_or_null = dropped_sandbox;
     unofficial_napi_realm dropped_realm = NULL;
     napi_value dropped_global = NULL;
-    NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &dropped_realm, &dropped_global));
+    NAPI_CALL(env, unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &dropped_realm, &dropped_global, NULL));
     napi_value ignored = NULL;
     NAPI_CALL(env, RunIn(env, dropped_realm, "globalThis.payload = new Array(1024).fill(1)",
                          &ignored));
@@ -327,7 +327,7 @@ int main(void) {
   unofficial_napi_env_owner env2_scope = NULL;
   NAPI_CALL(env, unofficial_napi_create_env(8, NULL, &env2, &env2_scope));
   unofficial_napi_realm env2_realm = NULL;
-  NAPI_CALL(env2, unofficial_napi_create_realm(env2, NULL, &env2_realm, NULL));
+  NAPI_CALL(env2, unofficial_napi_create_realm(env2, NULL, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &env2_realm, NULL, NULL));
   int32_t realm_value = 0;
   NAPI_CALL(env2, RunInInt32(env2, env2_realm, "globalThis.v = 12", &realm_value));
   CHECK_OR_FAIL(realm_value == 12, "the second env's realm did not run");

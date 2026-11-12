@@ -168,8 +168,17 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   return handle_scope.Escape(promise);
 }
 
-inline bool CheckEnv(napi_env env) {
+inline bool HasLiveEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+inline bool CheckEnv(napi_env env) {
+  return NapiV8AllowsEnvOperations(env);
+}
+
+bool InSnapshotTemplate(napi_env env) {
+  const auto* realm = env->current_realm();
+  return realm != nullptr && realm->snapshot_template;
 }
 
 void ClearLastException(napi_env env);
@@ -178,7 +187,7 @@ void ClearLastException(napi_env env);
 // Node's CleanupQueue::Drain runs them, so a hook added meanwhile runs in the
 // next round.
 void RunEnvCleanupHooks(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
 
   struct CleanupHookSnapshot {
     napi_cleanup_hook hook = nullptr;
@@ -235,7 +244,7 @@ void RunEnvCleanupHooks(napi_env env) {
 }
 
 napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
-  if (!CheckEnv(env) || record == nullptr) return nullptr;
+  if (!HasLiveEnv(env) || record == nullptr) return nullptr;
   auto& records = env->buffer_records;
   for (auto it = records.begin(); it != records.end(); ++it) {
     if (*it == record) {
@@ -250,7 +259,7 @@ void FinalizeBufferRecord(napi_buffer_record* record) {
   if (record == nullptr || record->finalized) return;
   record->finalized = true;
   if (record->finalize_cb == nullptr) return;
-  if (CheckEnv(record->env)) {
+  if (HasLiveEnv(record->env)) {
     record->env->CallFinalizer(record->finalize_cb, record->external_data, record->finalize_hint);
   } else {
     record->finalize_cb(record->env, record->external_data, record->finalize_hint);
@@ -261,7 +270,7 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   napi_buffer_record* record = info.GetParameter();
   if (record == nullptr) return;
   napi_env env = record->env;
-  if (CheckEnv(env)) {
+  if (HasLiveEnv(env)) {
     napi_buffer_record* owned_record = TakeBufferRecord(env, record);
     if (owned_record == nullptr) return;
     owned_record->holder.Reset();
@@ -415,7 +424,7 @@ void FinalizeNewestExternalArrayBuffer(napi_env env) {
 }
 
 void FinalizeExternalBackingStoreHints(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
 
   // At the env's release. Runs the user finalizers of external stores most
   // recent first, by store id: those deleters queued (their buffers were
@@ -745,7 +754,46 @@ v8::Local<v8::Context> PromiseContext(napi_env env, v8::Local<v8::Promise::Resol
   return context;
 }
 
+// Template functions carry a static ID resolved through their env's callback
+// table. V8 enters the creation context when it invokes an API callback.
+static unofficial_napi_realm__* SnapshotRealmForContext(v8::Local<v8::Context> context) {
+  constexpr int kRealmSlot = 33;
+  if (context.IsEmpty() || context->GetNumberOfEmbedderDataFields() <= static_cast<uint32_t>(kRealmSlot)) {
+    return nullptr;
+  }
+  return static_cast<unofficial_napi_realm__*>(context->GetAlignedPointerFromEmbedderData(kRealmSlot));
+}
+
+static void StaticFunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  uint32_t id = info.Data().As<v8::Uint32>()->Value();
+  unofficial_napi_realm__* realm = SnapshotRealmForContext(isolate->GetCurrentContext());
+  napi_env env = realm != nullptr ? realm->env : nullptr;
+  // Sealing a template clears its context's realm slot.
+  if (env == nullptr || id >= env->snapshot_static_table.size() ||
+      std::get<0>(env->snapshot_static_table[id]) == nullptr) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        v8::String::NewFromUtf8Literal(isolate, "snapshot function has no binding")));
+    return;
+  }
+  napi_callback_payload__ payload;
+  payload.env = env;
+  payload.cb = std::get<0>(env->snapshot_static_table[id]);
+  payload.data = std::get<1>(env->snapshot_static_table[id]);
+  payload.realm = realm;
+  napi_realm_frame_scope__ realm_frame(env, realm);
+  napi_function_callback_info__ cbinfo(info, &payload);
+  napi_value ret = payload.cb(env, &cbinfo);
+  if (!HandleCallbackException(env) && ret != nullptr) {
+    info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
+  }
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  if (info.Data()->IsUint32()) {
+    StaticFunctionTrampoline(info);
+    return;
+  }
   auto* payload =
       static_cast<napi_callback_payload__*>(info.Data().As<v8::External>()->Value());
   if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
@@ -906,6 +954,10 @@ napi_status CreateExternalBuffer(napi_env env,
 }
 
 }  // namespace
+
+// The native callbacks a snapshot can reach, for V8's
+// external reference table.
+v8::FunctionCallback NapiV8SnapshotFunctionTrampoline() { return FunctionTrampoline; }
 
 void napi_v8_set_last_exception(napi_env env,
                                 v8::Local<v8::Value> exception,
@@ -1231,7 +1283,7 @@ napi_status napi_v8_clear_last_error(napi_env env) {
 }
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
-  if (!CheckEnv(env)) return nullptr;
+  if (!HasLiveEnv(env)) return nullptr;
   v8impl::detail::napi_lifetime_tracker__::record_value(env, value);
   return JsValueFromV8LocalValue(value);
 }
@@ -1255,7 +1307,7 @@ napi_status napi_v8_create_external_buffer_with_free(
 }
 
 void napi_v8_finalize_buffer_records(napi_env env) {
-  if (!CheckEnv(env)) return;
+  if (!HasLiveEnv(env)) return;
   for (auto* record : env->buffer_records) {
     if (record != nullptr) {
       FinalizeBufferRecord(record);
@@ -1427,6 +1479,7 @@ napi_status NAPI_CDECL napi_create_external(napi_env env,
                                             void* finalize_hint,
                                             napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  if (InSnapshotTemplate(env)) return napi_generic_failure;
   v8::Local<v8::External> external = napi_external_wrapper__::New(env, data);
   if (external.IsEmpty()) return napi_generic_failure;
   if (finalize_cb != nullptr) {
@@ -2263,7 +2316,7 @@ napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope* r
 }
 
 napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope) {
-  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  if (!HasLiveEnv(env) || scope == nullptr) return napi_invalid_arg;
   if (scope->env != env || env->open_handle_scope_stack.empty() ||
       env->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
@@ -2288,7 +2341,7 @@ napi_status NAPI_CDECL napi_open_escapable_handle_scope(
 
 napi_status NAPI_CDECL napi_close_escapable_handle_scope(
     napi_env env, napi_escapable_handle_scope scope) {
-  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  if (!HasLiveEnv(env) || scope == nullptr) return napi_invalid_arg;
   if (scope->env != env || env->open_handle_scope_stack.empty() ||
       env->open_handle_scope_stack.back() != scope) {
     return napi_v8_set_last_error(
@@ -2326,6 +2379,73 @@ napi_status NAPI_CDECL napi_escape_handle(napi_env env,
   return napi_v8_clear_last_error(env);
 }
 
+// Collect a dynamic binding's payload and its bridge records together. A
+// first-pass weak callback may only free memory and reset handles.
+static void CallbackPayloadCollected(
+    const v8::WeakCallbackInfo<napi_callback_payload__>& info) {
+  napi_callback_payload__* payload = info.GetParameter();
+  napi_env env = payload->env;
+  payload->self.Reset();
+  payload->realm = nullptr;
+  if (payload->retained && env->callback_data_release != nullptr) {
+    env->callback_data_release(env, payload->data, env->callback_data_hooks_user);
+  }
+  env->release(payload);
+}
+
+static void TrackCallbackPayload(napi_env env,
+                                 napi_callback_payload__* payload,
+                                 v8::Local<v8::External> external) {
+  if (payload->data != nullptr && env->callback_data_retain != nullptr) {
+    env->callback_data_retain(env, payload->data, env->callback_data_hooks_user);
+    payload->retained = true;
+  }
+  payload->self.Reset(env->isolate, external);
+  payload->self.SetWeak(payload, CallbackPayloadCollected,
+                        v8::WeakCallbackType::kParameter);
+}
+
+static uint32_t SnapshotCallbackId(napi_env env, napi_callback callback, void* data, uint32_t role) {
+  napi_env__::SnapshotCallback key{callback, data, role};
+  auto found = env->snapshot_static_index.find(key);
+  if (found != env->snapshot_static_index.end()) return found->second;
+  const auto id = static_cast<uint32_t>(env->snapshot_static_table.size());
+  env->snapshot_static_table.push_back(key);
+  env->snapshot_static_index.emplace(key, id);
+  return id;
+}
+
+static napi_status CreateStaticFunction(napi_env env, const char* utf8name, size_t length,
+                                        napi_callback callback, void* data, uint32_t role,
+                                        napi_value* result) {
+  v8::Local<v8::String> name;
+  if (utf8name != nullptr) {
+    const int v8_length = length == NAPI_AUTO_LENGTH ? -1 : static_cast<int>(length);
+    if (!v8::String::NewFromUtf8(env->isolate, utf8name, v8::NewStringType::kNormal,
+                               v8_length).ToLocal(&name)) return napi_generic_failure;
+  }
+  const uint32_t id = SnapshotCallbackId(env, callback, data, role);
+  v8::Local<v8::Function> function;
+  if (!v8::Function::New(env->context(), FunctionTrampoline,
+          v8::Integer::NewFromUnsigned(env->isolate, id)).ToLocal(&function)) {
+    return napi_generic_failure;
+  }
+  if (!name.IsEmpty()) function->SetName(name);
+  auto value = napi_v8_wrap_value(env, function);
+  if (value == nullptr) return napi_generic_failure;
+  *result = value;
+  return napi_v8_clear_last_error(env);
+}
+
+static napi_status CreatePropertyFunction(napi_env env, const char* name, napi_callback callback,
+                                          void* data, uint32_t role, napi_value* result) {
+  const auto* realm = env->current_realm();
+  if (env->snapshot_builder && realm != nullptr && realm->snapshot_template) {
+    return CreateStaticFunction(env, name, NAPI_AUTO_LENGTH, callback, data, role, result);
+  }
+  return napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, data, result);
+}
+
 napi_status NAPI_CDECL napi_create_function(napi_env env,
                                             const char* utf8name,
                                             size_t length,
@@ -2343,7 +2463,11 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
       length > static_cast<size_t>(INT_MAX)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
-  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data, env->current_realm());
+  unofficial_napi_realm__* creation_realm = env->current_realm();
+  if (env->snapshot_builder && creation_realm != nullptr && creation_realm->snapshot_template) {
+    return CreateStaticFunction(env, utf8name, length, cb, data, 0, result);
+  }
+  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data, creation_realm);
   if (payload == nullptr) return napi_generic_failure;
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
@@ -2369,6 +2493,232 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   return napi_v8_clear_last_error(env);
 }
 
+// Snapshots: the data a template's callback carries. In a snapshot
+// builder's template realm, a static id (StaticFunctionTrampoline), so the
+// template serializes; otherwise the callback's payload, as napi_create_function.
+static bool TemplateCallbackData(napi_env env, napi_callback cb, void* data,
+                                 v8::Local<v8::Value>* out, uint32_t role = 0) {
+  unofficial_napi_realm__* realm = env->current_realm();
+  if (env->snapshot_builder && realm != nullptr && realm->snapshot_template) {
+    *out = v8::Integer::NewFromUnsigned(env->isolate, SnapshotCallbackId(env, cb, data, role));
+    return true;
+  }
+  auto* payload = env->allocate<napi_callback_payload__>(env, cb, data, realm);
+  if (payload == nullptr) return false;
+  v8::Local<v8::External> value = v8::External::New(env->isolate, payload);
+  TrackCallbackPayload(env, payload, value);
+  *out = value;
+  return true;
+}
+
+// A function template for a member: not a constructor, no prototype, named
+// after its property (as napi_define_properties names them), an accessor's
+// "get x" / "set x" and a setter's length 1, as WebIDL makes them.
+static bool MemberTemplate(napi_env env, napi_callback cb, void* data, v8::Local<v8::Name> name,
+                           v8::Local<v8::FunctionTemplate>* out, const char* prefix = nullptr,
+                           int length = 0, uint32_t role = 0) {
+  v8::Local<v8::Value> callback_data;
+  if (!TemplateCallbackData(env, cb, data, &callback_data, role)) return false;
+  v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(
+      env->isolate, FunctionTrampoline, callback_data, v8::Local<v8::Signature>(), length,
+      v8::ConstructorBehavior::kThrow);
+  tmpl->RemovePrototype();
+  if (name->IsString()) {
+    v8::Local<v8::String> class_name = name.As<v8::String>();
+    if (prefix != nullptr) {
+      v8::Local<v8::String> head;
+      if (!v8::String::NewFromUtf8(env->isolate, prefix).ToLocal(&head)) return false;
+      class_name = v8::String::Concat(env->isolate, head, class_name);
+    }
+    tmpl->SetClassName(class_name);
+  }
+  *out = tmpl;
+  return true;
+}
+
+static napi_status TemplatePropertyName(napi_env env, const napi_property_descriptor& desc,
+                                        v8::Local<v8::Name>* name) {
+  if (desc.utf8name != nullptr) {
+    v8::Local<v8::String> key;
+    if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal).ToLocal(&key)) {
+      return napi_generic_failure;
+    }
+    *name = key;
+  } else if (desc.name != nullptr) {
+    v8::Local<v8::Value> key = napi_v8_unwrap_value(desc.name);
+    if (!key->IsName()) return napi_name_expected;
+    *name = key.As<v8::Name>();
+  } else {
+    return napi_name_expected;
+  }
+  return napi_ok;
+}
+
+napi_status NapiV8DefineBindingPreflight(napi_env env, uint32_t kind) {
+  if (!CheckEnv(env) || env->snapshot_finalized ||
+      (kind != UNOFFICIAL_NAPI_BINDING_CLASS && kind != UNOFFICIAL_NAPI_BINDING_METHOD)) {
+    return napi_invalid_arg;
+  }
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_define_binding(
+    napi_env env, uint32_t kind, const char* utf8name, size_t name_length,
+    napi_callback callback, void* data, uint32_t function_length, napi_value parent_or_null,
+    size_t property_count, const napi_property_descriptor* properties,
+    const uint8_t* member_lengths_or_null, napi_value* function_out, napi_value* prototype_out) {
+  const bool method_only = kind == UNOFFICIAL_NAPI_BINDING_METHOD;
+  if (function_out == nullptr || (!method_only && prototype_out == nullptr)) return napi_invalid_arg;
+  auto status = NapiV8DefineBindingPreflight(env, kind);
+  if (status != napi_ok) return status;
+  if (utf8name == nullptr || name_length == 0 || name_length > INT_MAX ||
+      callback == nullptr || function_length > UINT8_MAX ||
+      (property_count != 0 && properties == nullptr) ||
+      (method_only && (parent_or_null != nullptr || property_count != 0 || properties != nullptr ||
+                       member_lengths_or_null != nullptr || prototype_out != nullptr))) {
+    return napi_invalid_arg;
+  }
+
+  auto* isolate = env->isolate;
+  auto context = env->context();
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::String> name;
+  if (!v8::String::NewFromUtf8(isolate, utf8name, v8::NewStringType::kNormal,
+                              static_cast<int>(name_length)).ToLocal(&name)) return napi_generic_failure;
+
+  struct StaticRollback {
+    napi_env env;
+    size_t initial_count;
+    bool committed = false;
+    ~StaticRollback() {
+      if (committed) return;
+      while (env->snapshot_static_table.size() > initial_count) {
+        env->snapshot_static_index.erase(env->snapshot_static_table.back());
+        env->snapshot_static_table.pop_back();
+      }
+    }
+  } rollback{env, env->snapshot_static_table.size()};
+
+  if (method_only) {
+    v8::Local<v8::FunctionTemplate> method;
+    v8::Local<v8::Function> function;
+    if (!MemberTemplate(env, callback, data, name, &method, nullptr, function_length) ||
+        !method->GetFunction(context).ToLocal(&function)) return napi_generic_failure;
+    auto result = napi_v8_wrap_value(env, function);
+    if (result == nullptr) return napi_generic_failure;
+    *function_out = result;
+    rollback.committed = true;
+    return napi_ok;
+  }
+
+  auto marker = v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "napi:binding-class"));
+  auto prototype_key = v8::String::NewFromUtf8Literal(isolate, "prototype");
+  v8::Local<v8::Function> parent;
+  v8::Local<v8::Value> parent_prototype;
+  if (parent_or_null != nullptr) {
+    auto raw = napi_v8_unwrap_value(parent_or_null);
+    if (raw.IsEmpty() || !raw->IsFunction() || raw->IsProxy()) return napi_invalid_arg;
+    parent = raw.As<v8::Function>();
+    v8::Local<v8::Context> parent_context;
+    if (!parent->GetCreationContext().ToLocal(&parent_context)) return napi_invalid_arg;
+    if (InSnapshotTemplate(env) && parent_context != context) return napi_invalid_arg;
+    auto* parent_realm = SnapshotRealmForContext(parent_context);
+    if (parent_context != env->main_context() && (parent_realm == nullptr || parent_realm->env != env)) {
+      return napi_invalid_arg;
+    }
+    if (!parent->HasPrivate(parent_context, marker).FromMaybe(false) ||
+        !parent->Get(parent_context, prototype_key).ToLocal(&parent_prototype) ||
+        !parent_prototype->IsObject()) return napi_invalid_arg;
+  }
+
+  std::vector<v8::Local<v8::Name>> keys;
+  keys.reserve(property_count);
+  std::unordered_set<std::string> static_keys;
+  std::unordered_set<std::string> prototype_keys;
+  for (size_t i = 0; i < property_count; ++i) {
+    const auto& desc = properties[i];
+    if (desc.utf8name == nullptr || desc.name != nullptr) return napi_invalid_arg;
+    const bool accessor = desc.getter != nullptr || desc.setter != nullptr;
+    const bool method = desc.method != nullptr;
+    const bool value = desc.value != nullptr;
+    if (static_cast<int>(accessor) + static_cast<int>(method) + static_cast<int>(value) != 1 ||
+        (!method && member_lengths_or_null != nullptr && member_lengths_or_null[i] != 0)) {
+      return napi_invalid_arg;
+    }
+    if (value) {
+      auto raw = napi_v8_unwrap_value(desc.value);
+      if (raw.IsEmpty() || !raw->IsPrimitive()) return napi_invalid_arg;
+    }
+    v8::Local<v8::Name> key;
+    status = TemplatePropertyName(env, desc, &key);
+    if (status != napi_ok) return status;
+    v8::String::Utf8Value utf8_key(isolate, key);
+    if (*utf8_key == nullptr) return napi_generic_failure;
+    std::string canonical_key(*utf8_key, utf8_key.length());
+    if ((desc.attributes & napi_static) != 0) {
+      if (canonical_key == "length" || canonical_key == "name" || canonical_key == "prototype" ||
+          !static_keys.insert(canonical_key).second) return napi_invalid_arg;
+    } else if (canonical_key == "constructor" || !prototype_keys.insert(canonical_key).second) {
+      return napi_invalid_arg;
+    }
+    keys.push_back(key);
+  }
+
+  v8::Local<v8::Value> ctor_data;
+  if (!TemplateCallbackData(env, callback, data, &ctor_data, 3)) return napi_generic_failure;
+  auto ctor_template = v8::FunctionTemplate::New(
+      isolate, FunctionTrampoline, ctor_data, {}, static_cast<int>(function_length));
+  ctor_template->SetClassName(name);
+  ctor_template->ReadOnlyPrototype();
+  auto prototype_template = ctor_template->PrototypeTemplate();
+  for (size_t i = 0; i < property_count; ++i) {
+    const auto& desc = properties[i];
+    auto key = keys[i];
+    v8::Local<v8::Template> target = (desc.attributes & napi_static) != 0
+        ? v8::Local<v8::Template>(ctor_template) : v8::Local<v8::Template>(prototype_template);
+    if (desc.method != nullptr) {
+      v8::Local<v8::FunctionTemplate> method;
+      int length = member_lengths_or_null == nullptr ? 0 : member_lengths_or_null[i];
+      if (!MemberTemplate(env, desc.method, desc.data, key, &method, nullptr, length)) {
+        return napi_generic_failure;
+      }
+      target->Set(key, method, ToV8PropertyAttributes(desc.attributes, true));
+    } else if (desc.getter != nullptr || desc.setter != nullptr) {
+      v8::Local<v8::FunctionTemplate> getter, setter;
+      if (desc.getter != nullptr && !MemberTemplate(env, desc.getter, desc.data, key, &getter, "get ", 0, 1)) {
+        return napi_generic_failure;
+      }
+      if (desc.setter != nullptr && !MemberTemplate(env, desc.setter, desc.data, key, &setter, "set ", 1, 2)) {
+        return napi_generic_failure;
+      }
+      target->SetAccessorProperty(key, getter, setter, ToV8PropertyAttributes(desc.attributes, false));
+    } else {
+      target->Set(key, napi_v8_unwrap_value(desc.value).As<v8::Primitive>(),
+                  ToV8PropertyAttributes(desc.attributes, true));
+    }
+  }
+  v8::Local<v8::Function> ctor;
+  v8::Local<v8::Value> prototype;
+  if (!ctor_template->GetFunction(context).ToLocal(&ctor) ||
+      !ctor->Get(context, prototype_key).ToLocal(&prototype) || !prototype->IsObject()) {
+    return napi_generic_failure;
+  }
+  if (!parent.IsEmpty() &&
+      (!ctor->SetPrototypeV2(context, parent).FromMaybe(false) ||
+       !prototype.As<v8::Object>()->SetPrototypeV2(context, parent_prototype).FromMaybe(false))) {
+    return napi_generic_failure;
+  }
+  if (!ctor->SetPrivate(context, marker, v8::True(isolate)).FromMaybe(false)) return napi_generic_failure;
+  auto function = napi_v8_wrap_value(env, ctor);
+  auto result_prototype = napi_v8_wrap_value(env, prototype);
+  if (function == nullptr || result_prototype == nullptr) return napi_generic_failure;
+  *function_out = function;
+  *prototype_out = result_prototype;
+  rollback.committed = true;
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL napi_define_class(napi_env env,
                                          const char* utf8name,
                                          size_t length,
@@ -2387,6 +2737,8 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   if (property_count > 0 && properties == nullptr) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
+  // The standard class constructor carries an unserializable External.
+  if (InSnapshotTemplate(env)) return napi_generic_failure;
   // As in napi_create_function: V8 takes an int length.
   if (length != NAPI_AUTO_LENGTH && length > static_cast<size_t>(INT_MAX)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -2470,15 +2822,13 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
       v8::Local<v8::Function> setter_fn;
       if (desc.getter != nullptr) {
         napi_value getter_value = nullptr;
-        status = napi_create_function(
-            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, &getter_value);
+        status = CreatePropertyFunction(env, desc.utf8name, desc.getter, desc.data, 1, &getter_value);
         if (status != napi_ok) return status;
         getter_fn = napi_v8_unwrap_value(getter_value).As<v8::Function>();
       }
       if (desc.setter != nullptr) {
         napi_value setter_value = nullptr;
-        status = napi_create_function(
-            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, &setter_value);
+        status = CreatePropertyFunction(env, desc.utf8name, desc.setter, desc.data, 2, &setter_value);
         if (status != napi_ok) return status;
         setter_fn = napi_v8_unwrap_value(setter_value).As<v8::Function>();
       }
@@ -2512,6 +2862,7 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
                                          size_t argc,
                                          const napi_value* argv,
                                          napi_value* result) {
+  if (env != nullptr && env->snapshot_finalized) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, constructor) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> ctorValue = napi_v8_unwrap_value(constructor);
@@ -2540,6 +2891,7 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
                                           size_t argc,
                                           const napi_value* argv,
                                           napi_value* result) {
+  if (env != nullptr && env->snapshot_finalized) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, recv) || !CheckValue(env, func)) return napi_invalid_arg;
   auto context = env->context();
@@ -2625,15 +2977,13 @@ napi_status NAPI_CDECL napi_define_properties(
       v8::Local<v8::Function> setter_fn;
       if (desc.getter != nullptr) {
         napi_value getter_value = nullptr;
-        status = napi_create_function(
-            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, &getter_value);
+        status = CreatePropertyFunction(env, desc.utf8name, desc.getter, desc.data, 1, &getter_value);
         if (status != napi_ok) return status;
         getter_fn = napi_v8_unwrap_value(getter_value).As<v8::Function>();
       }
       if (desc.setter != nullptr) {
         napi_value setter_value = nullptr;
-        status = napi_create_function(
-            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, &setter_value);
+        status = CreatePropertyFunction(env, desc.utf8name, desc.setter, desc.data, 2, &setter_value);
         if (status != napi_ok) return status;
         setter_fn = napi_v8_unwrap_value(setter_value).As<v8::Function>();
       }
@@ -3201,7 +3551,7 @@ napi_status NAPI_CDECL napi_create_reference(napi_env env,
 
 napi_status NAPI_CDECL napi_delete_reference(node_api_basic_env env, napi_ref ref) {
   auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv)) return napi_invalid_arg;
+  if (!HasLiveEnv(napiEnv)) return napi_invalid_arg;
   if (ref == nullptr) return napi_invalid_arg;
   ref->Destroy();
   return napi_ok;
@@ -3248,6 +3598,13 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
   v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
+  if (env->snapshot_builder) {
+    v8::Local<v8::Context> creation_context;
+    if (object->GetCreationContext().ToLocal(&creation_context) &&
+        NapiV8IsSnapshotTemplateContext(env, creation_context)) {
+      return napi_generic_failure;
+    }
+  }
   v8::Local<v8::Private> wrapKey = env->agent->wrap_private_key.Get(env->isolate);
   if (object->HasPrivate(env->context(), wrapKey).FromMaybe(false)) {
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
@@ -3574,6 +3931,7 @@ napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
 napi_status NAPI_CDECL napi_run_script(napi_env env,
                                        napi_value script,
                                        napi_value* result) {
+  if (env != nullptr && env->snapshot_finalized) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, script) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> source = napi_v8_unwrap_value(script);

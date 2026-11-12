@@ -160,7 +160,8 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
   options.allow_code_gen_wasm = allow_code_gen_wasm;
   options.own_microtask_queue = own_microtask_queue;
   unofficial_napi_realm realm = nullptr;
-  return unofficial_napi_create_realm(env, &options, &realm, result_out);
+  return unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr,
+                                      &realm, result_out, nullptr);
 }
 
 napi_status NAPI_CDECL unofficial_napi_contextify_run_script(

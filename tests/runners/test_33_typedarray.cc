@@ -522,7 +522,7 @@ TEST_F(Test33TypedArray, ViewLayoutComesFromItsSlotsInAnyRealm) {
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
   unofficial_napi_realm realm = nullptr;
-  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, &realm, nullptr), napi_ok);
+  ASSERT_EQ(unofficial_napi_create_realm(s.env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, nullptr, &realm, nullptr, nullptr), napi_ok);
   unofficial_napi_realm_scope scope = 0;
   ASSERT_EQ(unofficial_napi_enter_realm(s.env, realm, &scope), napi_ok);
   ExpectLayoutFromTheViewsSlots(s.env, "a realm the env entered");

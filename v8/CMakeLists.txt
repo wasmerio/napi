@@ -94,4 +94,28 @@ if(NAPI_V8_BUILD_TESTS)
   enable_testing()
   set(NAPI_TEST_ENGINE v8)
   add_subdirectory("${NAPI_TESTS_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/tests")
+
+  add_executable(napi_v8_realm_snapshot_contract tests/realm_snapshot_contract.cc)
+  target_link_libraries(napi_v8_realm_snapshot_contract PRIVATE napi_v8)
+  target_include_directories(napi_v8_realm_snapshot_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+  set(_snapshot_fixture "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-contract.snap")
+  add_test(NAME napi_v8.snapshot_binding_shape
+           COMMAND napi_v8_realm_snapshot_contract shape "${_snapshot_fixture}")
+  add_test(NAME napi_v8.snapshot_bake
+           COMMAND napi_v8_realm_snapshot_contract bake "${_snapshot_fixture}")
+  set_tests_properties(napi_v8.snapshot_bake PROPERTIES FIXTURES_SETUP napi_v8_snapshot)
+  add_test(NAME napi_v8.snapshot_restore
+           COMMAND napi_v8_realm_snapshot_contract restore "${_snapshot_fixture}")
+  set_tests_properties(napi_v8.snapshot_restore PROPERTIES FIXTURES_REQUIRED napi_v8_snapshot)
+  add_test(NAME napi_v8.snapshot_manifest
+           COMMAND napi_v8_realm_snapshot_contract manifest
+                   "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-manifest.snap")
+  add_test(NAME napi_v8.snapshot_multirestore
+           COMMAND napi_v8_realm_snapshot_contract multirestore
+                   "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-live-a.snap"
+                   "${CMAKE_CURRENT_BINARY_DIR}/realm-snapshot-live-b.snap")
+  add_test(NAME napi_v8.snapshot_release_write_error
+           COMMAND napi_v8_realm_snapshot_contract write-error
+                   "${CMAKE_CURRENT_BINARY_DIR}/snapshot-contract-missing/artifact.snap")
 endif()

@@ -41,6 +41,8 @@ pub struct NapiCtxBuilder {
 #[derive(Clone, Debug)]
 pub struct NapiCtx {
     inner: Arc<NapiCtxInner>,
+    #[cfg(not(target_arch = "wasm32"))]
+    snapshot_environment: Option<crate::SnapshotEnvironment>,
 }
 
 #[derive(Clone)]
@@ -132,6 +134,8 @@ struct NapiCtxInner {
 
 struct NapiSessionInner {
     ctx: Arc<NapiCtxInner>,
+    #[cfg(not(target_arch = "wasm32"))]
+    snapshot_environment: Option<crate::SnapshotEnvironment>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
     func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
@@ -199,6 +203,8 @@ impl NapiCtxBuilder {
                 envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),
                 host_stopped: Arc::new(AtomicBool::new(false)),
             }),
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_environment: None,
         }
     }
 }
@@ -269,6 +275,14 @@ impl NapiCtx {
         NapiRuntimeHooks { ctx: self.clone() }
     }
 
+    /// Select snapshot configuration for sessions created from this context.
+    /// The provider receives it when a guest creates a native environment.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_snapshot_environment(mut self, config: crate::SnapshotEnvironment) -> Self {
+        self.snapshot_environment = Some(config);
+        self
+    }
+
     pub fn runtime_control(&self) -> NapiRuntimeControl {
         NapiRuntimeControl {
             envs: Arc::clone(&self.inner.envs),
@@ -308,6 +322,8 @@ impl NapiCtx {
         Ok(NapiSession {
             inner: Arc::new(NapiSessionInner {
                 ctx: Arc::clone(&self.inner),
+                #[cfg(not(target_arch = "wasm32"))]
+                snapshot_environment: self.snapshot_environment.clone(),
                 imported_memory_type,
                 imported_table_type,
                 func_env: Mutex::new(None),
@@ -407,6 +423,8 @@ impl NapiSession {
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        let napi_env = napi_env.with_snapshot_environment(self.inner.snapshot_environment.clone());
         let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self

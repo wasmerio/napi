@@ -35,8 +35,10 @@ namespace quickjs::detail
         // Realms: a JSContext on the env's runtime, with its sandbox when it
         // has one. An unofficial_napi_realm is a context_record.
         napi_status create_realm(const unofficial_napi_realm_options &options,
+                                 void *realm_data,
                                  unofficial_napi_realm *realm_out,
                                  napi_value *global_out);
+        uint64_t realm_data(JSContext *ctx) const;
         napi_status get_realm(napi_value value, unofficial_napi_realm *realm_out) const;
         // The context of a live realm of this env and, as a new reference, a
         // function of the realm that keeps it alive.

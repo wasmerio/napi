@@ -184,6 +184,26 @@ pub fn with_callback_state<R>(
     env.as_store_mut().parked(f)
 }
 
+/// A snapshot callback must still name a canonical Node-API function in this guest.
+#[unsafe(no_mangle)]
+pub extern "C" fn snapi_host_validate_wasm_callback(
+    callback_ctx: *mut c_void,
+    wasm_fn_ptr: u32,
+) -> bool {
+    if callback_ctx.is_null() || wasm_fn_ptr == 0 {
+        return false;
+    }
+    // SAFETY: the bridge passes the active context installed by with_callback_state.
+    let ctx = unsafe { &*callback_ctx.cast::<CallbackInvocationCtx>() };
+    Store::with_current(|store| {
+        let Some(table) = ctx.func_env.as_ref(store).table.clone() else {
+            return false;
+        };
+        matches!(table.get(store, wasm_fn_ptr),
+            Some(Value::FuncRef(Some(function))) if function.typed::<(i32, i32), i32>(store).is_ok())
+    }).unwrap_or(false)
+}
+
 /// Rust trampoline called from C++ when a V8 callback fires.
 /// Re-enters the active guest callback scope and dispatches into the WASM guest.
 #[unsafe(no_mangle)]

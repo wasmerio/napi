@@ -60,7 +60,7 @@ int main(void) {
   unofficial_napi_realm_options_init(&options);
   unofficial_napi_realm realm = NULL;
   napi_value realm_global = NULL;
-  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, &realm, &realm_global));
+  NAPI_CALL(env, unofficial_napi_create_realm(env, &options, UNOFFICIAL_NAPI_REALM_MODE_FRESH, 0, NULL, &realm, &realm_global, NULL));
   NAPI_CALL(env, napi_set_named_property(env, realm_global, "executing", callback));
   unofficial_napi_realm_scope scope = 0;
   NAPI_CALL(env, unofficial_napi_enter_realm(env, realm, &scope));

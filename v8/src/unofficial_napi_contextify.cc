@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1386,10 +1387,11 @@ unofficial_napi_realm RealmForContext(v8::Local<v8::Context> context) {
 }
 
 // The context code for `realm` runs in: the env's own for a null realm.
-// Empty when the realm is not one of `env`'s or was collected.
+// Empty for sealed templates, finalized builders, or a realm outside the env.
 v8::Local<v8::Context> RealmContext(napi_env env, unofficial_napi_realm realm) {
+  if (!NapiV8AllowsEnvOperations(env)) return {};
   if (realm == nullptr) return env->main_context();
-  if (realm->env != env) return v8::Local<v8::Context>();
+  if (realm->env != env || realm->snapshot_added) return {};
   return realm->context.Get(env->isolate);
 }
 
@@ -1764,9 +1766,17 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return realm != nullptr && realm->env == env;
 }
 
+bool NapiV8IsSnapshotTemplateContext(napi_env env, v8::Local<v8::Context> context) {
+  if (!env->snapshot_builder || context.IsEmpty()) return false;
+  return std::any_of(env->realms.begin(), env->realms.end(), [&](const auto& realm) {
+    return realm->snapshot_template && realm->context == context;
+  });
+}
+
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   for (const auto& realm : env->realms) {
+    if (realm->snapshot_template) continue;
     v8::Local<v8::Context> context = realm->context.Get(env->isolate);
     if (!context.IsEmpty()) NapiV8ApplyPromiseHooksToContext(env, context);
   }
@@ -1794,25 +1804,61 @@ bool NapiV8HasRealmTokens(napi_env env) {
                      [](const auto& realm) { return realm->token_assigned; });
 }
 
+void NapiV8ExposeSharedArrayBufferForSnapshot(v8::Isolate* isolate, v8::Local<v8::Context> context);
+
 extern "C" {
 
-napi_status NAPI_CDECL unofficial_napi_create_realm(
-    napi_env env,
-    const unofficial_napi_realm_options* options_or_null,
-    unofficial_napi_realm* realm_out,
-    napi_value* global_out) {
-  if (env == nullptr || realm_out == nullptr) return napi_invalid_arg;
+bool SnapshotRestoreGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> holder);
+
+bool NapiV8SnapshotReady(napi_env env);
+
+static_assert(sizeof(unofficial_napi_realm_options) == (sizeof(napi_value) == 4 ? 28 : 48));
+
+static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_options& options,
+                                uint32_t index, void* owner, unofficial_napi_realm* realm_out,
+                                napi_value* global_out, napi_value* root_out);
+
+extern "C" napi_status NapiV8RealmPreflight(napi_env env, uint32_t mode) {
+  if (env == nullptr || mode < UNOFFICIAL_NAPI_REALM_MODE_FRESH ||
+      mode > UNOFFICIAL_NAPI_REALM_MODE_RESTORE || env->snapshot_finalized) {
+    return napi_invalid_arg;
+  }
   NAPI_V8_RETURN_IF_TERMINATING(env);
+  if ((mode == UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE && !env->snapshot_builder) ||
+      (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && env->snapshot_artifact == nullptr)) {
+    return napi_generic_failure;
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_realm(
+    napi_env env, const unofficial_napi_realm_options* options_or_null,
+    uint32_t mode, uint32_t snapshot_index, void* realm_data,
+    unofficial_napi_realm* realm_out, napi_value* global_out, napi_value* root_out) {
+  if (realm_out == nullptr || (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE && root_out == nullptr)) {
+    return napi_invalid_arg;
+  }
+  auto status = NapiV8RealmPreflight(env, mode);
+  if (status != napi_ok) return status;
   unofficial_napi_realm_options options;
   unofficial_napi_realm_options_init(&options);
   if (options_or_null != nullptr) {
-    if (options_or_null->size < sizeof(options) ||
+    if (options_or_null->size != sizeof(options) ||
         options_or_null->version != UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION) {
       return napi_invalid_arg;
     }
     options = *options_or_null;
   }
-  *realm_out = nullptr;
+  const bool snapshot_template = mode == UNOFFICIAL_NAPI_REALM_MODE_TEMPLATE;
+  if ((mode != UNOFFICIAL_NAPI_REALM_MODE_FRESH && options.sandbox_or_null != nullptr) ||
+      (snapshot_template && options.own_microtask_queue) ||
+      (mode != UNOFFICIAL_NAPI_REALM_MODE_RESTORE && snapshot_index != 0)) {
+    return napi_invalid_arg;
+  }
+  if (mode == UNOFFICIAL_NAPI_REALM_MODE_RESTORE) {
+    if (!NapiV8SnapshotReady(env)) return napi_generic_failure;
+    return RestoreRealm(env, options, snapshot_index, realm_data, realm_out, global_out, root_out);
+  }
   ReleaseCollectedRealms(env);
   // An unassign hook's JS may have been terminated: making the realm would
   // enter V8 and clear the termination.
@@ -1847,6 +1893,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
 
   auto realm = std::make_unique<unofficial_napi_realm__>();
   realm->env = env;
+  realm->embedder_data = reinterpret_cast<uintptr_t>(realm_data);
   if (options.own_microtask_queue) {
     realm->own_microtask_queue = v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
   }
@@ -1877,38 +1924,123 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
                        realm->own_microtask_queue.get());
   if (context.IsEmpty()) return napi_pending_exception;
 
-  context->SetSecurityToken(current->GetSecurityToken());
-  // allow_code_gen_wasm is ignored: honoring it per realm needs an isolate
-  // AllowWasmCodeGenerationCallback, which this provider does not install.
-  // name and origin are ignored too.
+  // A snapshot template's token stays its own global (the default), so
+  // it holds no edge into the env's realm.
+  realm->snapshot_template = snapshot_template;
+  if (!snapshot_template) context->SetSecurityToken(current->GetSecurityToken());
+  else NapiV8ExposeSharedArrayBufferForSnapshot(isolate, context);
   context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
-  context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
-  NapiV8ApplyPromiseHooksToContext(env, context);
-  realm->context.Reset(isolate, context);
-  realm->context.SetWeak();
-  unofficial_napi_realm handle = realm.get();
-  env->realms.push_back(std::move(realm));
 
   v8::Local<v8::Object> global = sandbox.IsEmpty() ? context->Global() : sandbox;
   if (!sandbox.IsEmpty() && !RestoreOwnProperties(isolate, context, sandbox, saved_properties)) {
+    context->DetachGlobal();
     return napi_pending_exception;
   }
 
   // Align with lib internal/vm.js isContext() checks in Edge.
   v8::Local<v8::Context> property_context = sandbox.IsEmpty() ? context : current;
-  SetApiPrivate(property_context, global, "node:contextify:context", global);
-  SetApiPrivate(property_context,
-                global,
-                "node:host_defined_option_symbol",
-                host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
-
+  if (!SetApiPrivate(property_context, global, "node:contextify:context", global) ||
+      !SetApiPrivate(property_context, global, "node:host_defined_option_symbol",
+                     host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>())) {
+    context->DetachGlobal();
+    return napi_generic_failure;
+  }
   // The global stays in the caller's handle scope, which keeps the realm, and
   // so the handle, valid while that scope is open.
   napi_value global_napi = napi_v8_wrap_value(env, handle_scope.Escape(global));
-  if (global_napi == nullptr) return napi_generic_failure;
+  if (global_napi == nullptr) {
+    context->DetachGlobal();
+    return napi_generic_failure;
+  }
+  context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
+  if (!snapshot_template) NapiV8ApplyPromiseHooksToContext(env, context);
+  realm->context.Reset(isolate, context);
+  realm->context.SetWeak();
+  auto* handle = realm.get();
+  env->realms.push_back(std::move(realm));
   if (global_out != nullptr) *global_out = global_napi;
+  if (root_out != nullptr) *root_out = nullptr;
   *realm_out = handle;
   AssignRealmToken(env, handle);
+  return napi_ok;
+}
+
+// Restore the per-context data and fix up the new realm before publishing it.
+extern "C" uint32_t NapiV8SnapshotContextCount(napi_env env);
+
+static napi_status RestoreRealm(napi_env env, const unofficial_napi_realm_options& options,
+                                uint32_t index, void* owner, unofficial_napi_realm* realm_out,
+                                napi_value* global_out, napi_value* root_out) {
+  if (index >= NapiV8SnapshotContextCount(env)) return napi_invalid_arg;
+  ReleaseCollectedRealms(env);
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  v8::Isolate* isolate = env->isolate;
+  // No inner scope: a scope escapes one value, and this returns two (the
+  // global and the root); both live in the caller's handle scope.
+  v8::Local<v8::Context> current = env->context();
+  v8::Context::Scope current_scope(current);
+  v8::Local<v8::Symbol> host_id_symbol;
+  if (options.host_defined_option_id != nullptr) {
+    v8::Local<v8::Value> host_raw = napi_v8_unwrap_value(options.host_defined_option_id);
+    if (!host_raw.IsEmpty() && host_raw->IsSymbol()) host_id_symbol = host_raw.As<v8::Symbol>();
+  }
+  auto realm = std::make_unique<unofficial_napi_realm__>();
+  realm->env = env;
+  realm->embedder_data = reinterpret_cast<uintptr_t>(owner);
+  if (options.own_microtask_queue) {
+    realm->own_microtask_queue = v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
+  }
+  v8::Local<v8::Context> context;
+  {
+    v8::TryCatch try_catch(isolate);
+    if (!v8::Context::FromSnapshot(isolate, index, {}, nullptr, {},
+                                   realm->own_microtask_queue.get()).ToLocal(&context)) {
+      if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+      return napi_generic_failure;
+    }
+  }
+  v8::Local<v8::Object> global = context->Global();
+  v8::Local<v8::Value> root;
+  {
+    v8::TryCatch try_catch(isolate);
+    v8::Context::Scope realm_scope(context);
+    context->SetSecurityToken(current->GetSecurityToken());
+    context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
+    bool fixed_up = SetApiPrivate(context, global, "node:contextify:context", global) &&
+        SetApiPrivate(context, global, "node:host_defined_option_symbol",
+                      host_id_symbol.IsEmpty() ? v8::Undefined(isolate) : host_id_symbol.As<v8::Value>());
+    v8::Local<v8::Value> globals;
+    if (!fixed_up || !context->GetDataFromSnapshotOnce<v8::Value>(0).ToLocal(&root) ||
+        !root->IsObject() || !context->GetDataFromSnapshotOnce<v8::Value>(1).ToLocal(&globals) ||
+        !SnapshotRestoreGlobals(isolate, context, globals)) {
+      if (realm->own_microtask_queue) context->DetachGlobal();
+      if (try_catch.HasTerminated()) return napi_v8_fail_terminating(env);
+      return napi_generic_failure;
+    }
+  }
+  napi_value global_napi = napi_v8_wrap_value(env, global);
+  napi_value root_napi = napi_v8_wrap_value(env, root);
+  if (global_napi == nullptr || root_napi == nullptr) {
+    if (realm->own_microtask_queue) context->DetachGlobal();
+    return napi_generic_failure;
+  }
+  context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
+  NapiV8ApplyPromiseHooksToContext(env, context);
+  realm->context.Reset(isolate, context);
+  realm->context.SetWeak();
+  auto* handle = realm.get();
+  env->realms.push_back(std::move(realm));
+  if (global_out != nullptr) *global_out = global_napi;
+  *root_out = root_napi;
+  *realm_out = handle;
+  AssignRealmToken(env, handle);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_current_realm_data(napi_env env, uint64_t* data_out) {
+  if (env == nullptr || data_out == nullptr || env->snapshot_finalized) return napi_invalid_arg;
+  unofficial_napi_realm__* realm = env->current_realm();
+  *data_out = realm != nullptr ? realm->embedder_data : 0;
   return napi_ok;
 }
 
@@ -2198,6 +2330,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
       result_out == nullptr) {
     return napi_invalid_arg;
   }
+  if (env != nullptr && env->snapshot_finalized) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   (void)break_on_first_line;
 
@@ -2830,6 +2963,14 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_destroy(
   return napi_ok;
 }
 
+static bool CanUseModule(napi_env env, const ModuleWrapRecord* record) {
+  if (record->env != env) return false;
+  if (!env->snapshot_builder) return true;
+  return std::none_of(env->realms.begin(), env->realms.end(), [&](const auto& realm) {
+    return realm->snapshot_added && realm->context == record->context;
+  });
+}
+
 static napi_status MaterializeModuleRequests(
     napi_env env,
     unofficial_napi_module module,
@@ -2879,8 +3020,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_link(
     unofficial_napi_module module,
     size_t count,
     const unofficial_napi_module* linked_modules) {
-  if (env == nullptr || module == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (count != record->module_requests.size()) {
     ThrowCodeError(env, "ERR_VM_MODULE_LINK_FAILURE", "linked modules array length mismatch");
     return napi_pending_exception;
@@ -2994,9 +3136,11 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
 napi_status NAPI_CDECL unofficial_napi_module_wrap_instantiate(
     napi_env env,
     unofficial_napi_module module_handle) {
-  if (env == nullptr || module_handle == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
-  return InstantiateModuleRecord(env, ModuleRecord(module_handle));
+  auto* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
+  return InstantiateModuleRecord(env, record);
 }
 
 // Evaluating a module whose evaluation is under way (from its own body or a
@@ -3067,9 +3211,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
     int64_t /*timeout*/,
     bool /*break_on_sigint*/,
     napi_value* result_out) {
-  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
@@ -3097,11 +3242,12 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_value filename,
     napi_value parent_filename,
     napi_value* result_out) {
-  if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   *result_out = nullptr;
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
@@ -3254,8 +3400,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_set_export(
     unofficial_napi_module module,
     napi_value export_name,
     napi_value export_value) {
-  if (env == nullptr || module == nullptr || export_name == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr || export_name == nullptr) return napi_invalid_arg;
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   v8::HandleScope handle_scope(env->isolate);
   // Only a synthetic module has exports to set. V8 aborts the process for
   // any other.
@@ -3366,9 +3513,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     napi_env env,
     unofficial_napi_module module,
     napi_value* result_out) {
-  if (env == nullptr || module == nullptr || result_out == nullptr) return napi_invalid_arg;
+  if (!NapiV8AllowsEnvOperations(env) || module == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module);
+  if (!CanUseModule(env, record)) return napi_invalid_arg;
   // The facade evaluates the module it wraps.
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   // Instantiating the facade instantiates that module too.

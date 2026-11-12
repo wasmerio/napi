@@ -111,6 +111,8 @@ pub(crate) struct EnvRegistry {
 }
 
 pub(crate) struct NapiEnv {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) snapshot_environment: Option<crate::SnapshotEnvironment>,
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
     /// `Arc` so the app-wide budget stays honest across stores.
@@ -203,6 +205,8 @@ impl NapiEnv {
         host_stopped: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_environment: None,
             budget,
             max_envs,
             env_registry,
@@ -254,6 +258,15 @@ impl NapiEnv {
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_buffer_leases: HashMap::new(),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_snapshot_environment(
+        mut self,
+        config: Option<crate::SnapshotEnvironment>,
+    ) -> Self {
+        self.snapshot_environment = config;
+        self
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]

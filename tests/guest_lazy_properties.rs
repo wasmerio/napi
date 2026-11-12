@@ -33,7 +33,7 @@ const WAT: &str = r#"(module
   (import "napi_extension_wasmer_v0" "unofficial_napi_is_lazy_data_property"
     (func $is_lazy (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_create_realm"
-    (func $create_realm (param i32 i32 i32 i32) (result i32)))
+    (func $create_realm (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_get_realm"
     (func $get_realm (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_run_script"
@@ -154,7 +154,8 @@ const WAT: &str = r#"(module
     (local $f i32)
     (local.set $f (call $push))
     (if (call $create_realm (local.get $env) (i32.const 0)
-          (local.get $f) (i32.add (local.get $f) (i32.const 8)))
+          (i32.const 1) (i32.const 0) (i32.const 0)
+          (local.get $f) (i32.add (local.get $f) (i32.const 8)) (i32.const 0))
       (then unreachable))
     (global.set $sp (local.get $f))
     (i32.load offset=8 (local.get $f)))
