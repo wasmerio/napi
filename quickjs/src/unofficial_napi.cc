@@ -1220,6 +1220,21 @@ extern "C"
         return env == nullptr ? napi_invalid_arg : napi_generic_failure;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_clear_script_caches(napi_env env)
+    {
+        return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_dispose_realm(napi_env env, unofficial_napi_realm)
+    {
+        return env == nullptr ? napi_invalid_arg : napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_retain_scripts(napi_env env, napi_value)
+    {
+        return env == nullptr ? napi_invalid_arg : napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_realm(
         napi_env env,
         const unofficial_napi_realm_options *options_or_null,

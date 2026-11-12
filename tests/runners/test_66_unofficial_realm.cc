@@ -725,6 +725,53 @@ TEST_F(Test66UnofficialRealm, PromiseRejectCallbackFiresForRealms) {
   EXPECT_EQ(Int32(s.env, Eval(s.env, "rejections")), 2);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test66UnofficialRealm, DisposedRealmsSuppressNewUnhandledRejections) {
+  EnvScope s(runtime_.get());
+  auto retired = CreateRealm(s.env);
+  auto active = CreateRealm(s.env);
+  ASSERT_NE(retired, nullptr);
+  ASSERT_NE(active, nullptr);
+  EXPECT_EQ(unofficial_napi_dispose_realm(s.env, nullptr), napi_invalid_arg);
+
+  auto callback = Eval(s.env, "globalThis.events = []; event => { events.push(event); }");
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_set_promise_reject_callback(s.env, callback), napi_ok);
+  ASSERT_NE(RunIn(s.env, retired, "globalThis.pending = Promise.reject(1); 0"), nullptr);
+  ASSERT_EQ(unofficial_napi_dispose_realm(s.env, retired), napi_ok);
+  ASSERT_EQ(unofficial_napi_dispose_realm(s.env, retired), napi_ok);
+  ASSERT_NE(RunIn(s.env, retired, "pending.catch(() => {}); Promise.reject(2); 0"), nullptr);
+  ASSERT_NE(RunIn(s.env, active, "Promise.reject(3); 0"), nullptr);
+  EXPECT_EQ(Utf8(s.env, Eval(s.env, "events.join(',')")), "0,1,0");
+}
+
+TEST_F(Test66UnofficialRealm, DisposingRealmDoesNotWedgeFinalizationRegistry) {
+  EnvScope s(runtime_.get());
+  auto retired = CreateRealm(s.env);
+  auto active = CreateRealm(s.env);
+  ASSERT_NE(retired, nullptr);
+  ASSERT_NE(active, nullptr);
+  constexpr char queue_cleanup[] =
+      "globalThis.finalized = 0; "
+      "globalThis.registry = new FinalizationRegistry(() => { finalized++; }); "
+      "registry.register({}, 1); 0";
+  ASSERT_NE(RunIn(s.env, retired, queue_cleanup), nullptr);
+  ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+  ASSERT_EQ(unofficial_napi_dispose_realm(s.env, retired), napi_ok);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, nullptr), napi_ok);
+
+  ASSERT_NE(RunIn(s.env, active, queue_cleanup), nullptr);
+  for (int attempt = 0; attempt < 10 && Int32(s.env, RunIn(s.env, active, "finalized")) == 0;
+       ++attempt) {
+    ASSERT_EQ(unofficial_napi_collect_garbage(s.env), napi_ok);
+    ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                  s.env, unofficial_napi_event_loop_checkpoint_host_tasks, true, nullptr), napi_ok);
+  }
+  EXPECT_EQ(Int32(s.env, RunIn(s.env, active, "finalized")), 1);
+}
+#endif
+
 // A realm lives while its global, or anything made in it, is reachable, and
 // is collected with it.
 TEST_F(Test66UnofficialRealm, RealmIsCollectedWithItsGlobal) {

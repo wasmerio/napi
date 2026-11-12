@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+#endif
+
 class Test65UnofficialContextify : public FixtureTestBase {};
 
 namespace {
@@ -47,6 +51,42 @@ constexpr char kPreparedStack[] =
     "Error: sentinel\n"
     "    at process.processTicksAndRejections (node:internal/process/task_queues:85:11)\n"
     "    at triggerUncaughtException (node:internal/process/promises:251:13)";
+
+// The script id survives binding an unbound script in a different context.
+// Reading it lets these tests check reuse without a timing threshold.
+napi_value CaptureScriptId(napi_env env, napi_callback_info) {
+  auto stack = v8::StackTrace::CurrentStackTrace(v8::Isolate::GetCurrent(), 1);
+  if (stack->GetFrameCount() != 1) return nullptr;
+  auto script_id = stack->GetFrame(v8::Isolate::GetCurrent(), 0)->GetScriptId();
+  napi_value result = nullptr;
+  EXPECT_EQ(napi_create_int32(env, script_id, &result), napi_ok);
+  return result;
+}
+
+unofficial_napi_realm CreateScriptIdRealm(napi_env env) {
+  napi_value sandbox = nullptr;
+  napi_value capture = nullptr;
+  unofficial_napi_realm realm = nullptr;
+  EXPECT_EQ(napi_create_object(env, &sandbox), napi_ok);
+  EXPECT_EQ(napi_create_function(env, "scriptId", NAPI_AUTO_LENGTH, CaptureScriptId,
+                                 nullptr, &capture), napi_ok);
+  EXPECT_EQ(napi_set_named_property(env, sandbox, "scriptId", capture), napi_ok);
+  EXPECT_EQ(CreateSandboxRealm(env, sandbox, false, &realm), napi_ok);
+  return realm;
+}
+
+int32_t RunScriptId(napi_env env, unofficial_napi_realm realm,
+                    const unofficial_napi_js_source& source, const char* filename,
+                    napi_value host, int32_t line_offset = 0) {
+  napi_value result = nullptr;
+  EXPECT_EQ(unofficial_napi_run_script(env, realm, &source, Str(env, filename),
+                                      line_offset, 0, -1, true, false, false, host,
+                                      &result), napi_ok);
+  int32_t id = 0;
+  EXPECT_EQ(napi_get_value_int32(env, result, &id), napi_ok);
+  EXPECT_GT(id, 0);
+  return id;
+}
 
 napi_value ReturnPreparedStack(napi_env env, napi_callback_info /*info*/) {
   return Str(env, kPreparedStack);
@@ -117,6 +157,64 @@ napi_value ProbeRealm(napi_env env, napi_callback_info info) {
 }
 
 }  // namespace
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test65UnofficialContextify, RetainedScriptsSurviveCacheClearsForOneHost) {
+  EnvScope s(runtime_.get());
+  auto first = CreateScriptIdRealm(s.env);
+  auto second = CreateScriptIdRealm(s.env);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  auto host = Sym(s.env, "bootstrap");
+  auto other = Sym(s.env, "bootstrap");
+  ASSERT_EQ(unofficial_napi_retain_scripts(s.env, Str(s.env, "not a symbol")),
+            napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_retain_scripts(s.env, host), napi_ok);
+
+  const auto source = unofficial_napi_js_source_from_text(Str(s.env, "scriptId()"));
+  const auto matching_text = unofficial_napi_js_source_from_text(Str(s.env, "scriptId()"));
+  const auto changed_text = unofficial_napi_js_source_from_text(Str(s.env, "scriptId();"));
+  auto retained = RunScriptId(s.env, first, source, "bootstrap.js", host);
+  ASSERT_EQ(unofficial_napi_clear_script_caches(s.env), napi_ok);
+  EXPECT_EQ(RunScriptId(s.env, second, matching_text, "bootstrap.js", host), retained);
+  EXPECT_NE(RunScriptId(s.env, second, changed_text, "bootstrap.js", host), retained);
+  EXPECT_NE(RunScriptId(s.env, second, source, "other.js", host), retained);
+  EXPECT_NE(RunScriptId(s.env, second, source, "bootstrap.js", host, 1), retained);
+  EXPECT_NE(RunScriptId(s.env, second, source, "bootstrap.js", other), retained);
+
+  ASSERT_EQ(unofficial_napi_retain_scripts(s.env, other), napi_ok);
+  ASSERT_EQ(unofficial_napi_clear_script_caches(s.env), napi_ok);
+  EXPECT_NE(RunScriptId(s.env, second, source, "bootstrap.js", host), retained);
+}
+
+TEST_F(Test65UnofficialContextify, BytecodeReusesUnboundScriptForMatchingOrigin) {
+  EnvScope s(runtime_.get());
+  auto first = CreateScriptIdRealm(s.env);
+  auto second = CreateScriptIdRealm(s.env);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  auto host = Sym(s.env, "bytecode");
+  unofficial_napi_bytecode_open_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  options.shape = unofficial_napi_bytecode_shape_script;
+  options.source_text = Str(s.env, "scriptId()");
+  options.filename = Str(s.env, "bytecode.js");
+  options.host_defined_option_id = host;
+  unofficial_napi_bytecode_open_result opened{};
+  ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &options, &opened), napi_ok);
+  ASSERT_NE(opened.bytecode, nullptr);
+
+  const auto source = unofficial_napi_js_source_from_bytecode(opened.bytecode);
+  auto original = RunScriptId(s.env, first, source, "bytecode.js", host);
+  ASSERT_EQ(unofficial_napi_clear_script_caches(s.env), napi_ok);
+  EXPECT_EQ(RunScriptId(s.env, second, source, "bytecode.js", host), original);
+  EXPECT_NE(RunScriptId(s.env, second, source, "bytecode.js", host, 1), original);
+  EXPECT_NE(RunScriptId(s.env, second, source, "other.js", host), original);
+  EXPECT_NE(RunScriptId(s.env, second, source, "bytecode.js", Sym(s.env, "other")), original);
+  EXPECT_EQ(unofficial_napi_bytecode_release(s.env, opened.bytecode), napi_ok);
+}
+#endif
 
 // A native function keeps the realm it was created in, also when a script in
 // another context calls it (as in Node and V8).

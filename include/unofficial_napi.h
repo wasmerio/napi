@@ -306,6 +306,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_release_env(
     unofficial_napi_env_owner owner,
     struct uv_loop_s* loop_or_null);
 
+// Unofficial helper. Empties the engine's script caches (V8: the compilation
+// cache, that is scripts, eval and compiled RegExps) without a garbage
+// collection, on the env's thread, between scripts. For an embedder that
+// reuses one isolate across unrelated principals one after another: what one
+// compiled (eval, new Function) must not be found, by compile timing, by the
+// next. V8's RegExp results caches (String split and match results) stay
+// until a full collection. Code-cached scripts deserialize again on next use;
+// retained scripts (unofficial_napi_retain_scripts) stay compiled.
+// V8: Isolate::ClearCachesForTesting.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_clear_script_caches(
+    napi_env env);
+
 // Realms. An engine instance holds realms, each with its own global and
 // intrinsics: the env's own realm (the engine instance's main realm) and the
 // realms unofficial_napi_create_realm makes, such as vm contexts. A realm is
@@ -926,6 +938,27 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_realm_code_generati
     napi_value strings_message,
     napi_value wasm_message,
     napi_value check);
+
+// Notify V8 that the embedder retired `realm`. New unhandled rejections of
+// promises made in it stop reaching the reject callback. Adding a handler
+// still cancels a previously reported rejection. When the provider's own
+// checkpoint drives foreground work, already queued finalization cleanup
+// may run before V8 receives the disposal notification. The call does not
+// cancel scheduled work or free the realm handle. The realm must belong to
+// this env. Repeated calls for the same realm succeed without notifying V8 again.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_dispose_realm(
+    napi_env env, unofficial_napi_realm realm);
+
+// Scripts that unofficial_napi_run_script runs from text with the
+// host-defined-option symbol `host` (and no line or column offset) stay
+// compiled in the provider: a later run of the same text and filename with
+// it, in any context of this env, reuses that compile and the functions its
+// runs compiled, and unofficial_napi_clear_script_caches keeps them. For an
+// embedder's own bootstrap scripts, the same text in every context: never
+// give `host` to code a principal controls. One symbol per env (a second
+// call replaces it and drops what the first kept); at most 4096 scripts.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_retain_scripts(
+    napi_env env, napi_value host);
 
 // Opaque provider-owned message which may cross N-API environments. A message
 // is consumed by message_take on both success and failure, or explicitly

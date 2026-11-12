@@ -101,6 +101,8 @@ unsafe extern "C" {
     pub fn snapi_bridge_unofficial_env_release_refused(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_memory_pressure(env: SnapiEnv, level: i32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_clear_script_caches(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
         env: SnapiEnv,
         mode: i32,
@@ -334,6 +336,8 @@ unsafe extern "C" {
     // valid only while its scope frame is open.
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_contextify_dispose(env: SnapiEnv, key_id: u32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_realm_preflight(env: SnapiEnv, guest_env: u32, mode: u32) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_snapshot_cleanup_only(env: SnapiEnv) -> bool;
@@ -355,6 +359,8 @@ unsafe extern "C" {
         wasm_message_id: u32,
         check_id: u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_contextify_retain_scripts(env: SnapiEnv, host_id: u32) -> i32;
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_realm(

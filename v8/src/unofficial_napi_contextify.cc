@@ -98,6 +98,55 @@ std::mutex g_module_wrap_mu;
 std::unordered_map<napi_env, ModuleWrapBindingState> g_module_wrap_states;
 std::unordered_set<napi_env> g_module_wrap_cleanup_hooks;
 
+// unofficial_napi_retain_scripts: an env's scripts of one host
+// symbol, by their source's hash. Only the env's thread touches an entry;
+// the mutex guards the map.
+struct RetainedScript {
+  v8::Global<v8::String> source;
+  v8::Global<v8::String> filename;
+  v8::Global<v8::UnboundScript> script;
+};
+struct RetainedScripts {
+  v8::Global<v8::Symbol> host;
+  std::unordered_multimap<int, RetainedScript> scripts;
+};
+constexpr size_t kMaxRetainedScripts = 4096;
+std::mutex g_retained_mu;
+std::unordered_map<napi_env, RetainedScripts> g_retained_scripts;
+
+void CleanupRetainedScripts(void* arg) {
+  std::lock_guard<std::mutex> lock(g_retained_mu);
+  g_retained_scripts.erase(static_cast<napi_env>(arg));
+}
+
+// The env's table if `host` is its retained symbol and the script has no
+// offsets (a retained compile is reused only with the same origin).
+RetainedScripts* RetainedScriptsFor(napi_env env,
+                                    v8::Local<v8::Symbol> host,
+                                    int32_t line_offset,
+                                    int32_t column_offset) {
+  if (host.IsEmpty() || line_offset != 0 || column_offset != 0) return nullptr;
+  std::lock_guard<std::mutex> lock(g_retained_mu);
+  auto it = g_retained_scripts.find(env);
+  if (it == g_retained_scripts.end() || it->second.host.IsEmpty()) return nullptr;
+  return it->second.host.Get(env->isolate) == host ? &it->second : nullptr;
+}
+
+v8::Local<v8::UnboundScript> FindRetainedScript(v8::Isolate* isolate,
+                                                RetainedScripts& table,
+                                                int hash,
+                                                v8::Local<v8::String> source,
+                                                v8::Local<v8::String> filename) {
+  auto range = table.scripts.equal_range(hash);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second.source.Get(isolate)->StrictEquals(source) &&
+        it->second.filename.Get(isolate)->StrictEquals(filename)) {
+      return it->second.script.Get(isolate);
+    }
+  }
+  return v8::Local<v8::UnboundScript>();
+}
+
 ModuleWrapRecord* ModuleRecord(unofficial_napi_module module) {
   return reinterpret_cast<ModuleWrapRecord*>(module);
 }
@@ -1582,15 +1631,35 @@ struct BytecodeRecord {
   int32_t column_offset = 0;
   // Live artifact (one per shape). The function artifact is bound to the
   // context and host-defined-option symbol it was compiled with; consumers
-  // re-consume `bytes` when their compile inputs differ. (Script shape keeps
-  // no live artifact: run_script always re-consumes `bytes`, and V8's
-  // CompilationCache already deduplicates compiling identical source.)
+  // re-consume `bytes` when their compile inputs differ. An unbound script
+  // may be bound in any context in the isolate with the same script origin.
+  v8::Global<v8::UnboundScript> script;
+  v8::Global<v8::String> script_source;
   v8::Global<v8::Function> function;
   v8::Global<v8::Context> function_context;
   v8::Global<v8::Module> module;
   // Host-defined-option symbol baked into the artifact's origin; consumers
   // with a different symbol re-consume `bytes` instead of reusing it.
   v8::Global<v8::Symbol> host_symbol;
+
+  void SetSource(napi_env env, napi_value source) {
+    auto value = napi_v8_unwrap_value(source);
+    // One-byte strings round-trip through UTF-8 without replacement. Keep
+    // their original string, which may already be interned by the caller.
+    if (shape == unofficial_napi_bytecode_shape_script &&
+        !value.IsEmpty() && value->IsString() &&
+        value.As<v8::String>()->ContainsOnlyOneByte()) {
+      script_source.Reset(env->isolate, value.As<v8::String>());
+    } else {
+      source_utf8 = ToUtf8String(env, source, "");
+    }
+  }
+
+  v8::Local<v8::String> ScriptSource(v8::Isolate* isolate) const {
+    if (!script_source.IsEmpty()) return script_source.Get(isolate);
+    return v8::String::NewFromUtf8(isolate, source_utf8.c_str(), v8::NewStringType::kNormal,
+                                  static_cast<int>(source_utf8.size())).ToLocalChecked();
+  }
 };
 
 BytecodeRecord* BytecodeRecordFromSource(const unofficial_napi_js_source* source) {
@@ -1645,7 +1714,7 @@ v8::ScriptOrigin BytecodeOrigin(v8::Isolate* isolate,
                           HostDefinedOptions(isolate, host_id_symbol));
 }
 
-// Compiles record->source_utf8 per record->shape and stores the live artifact.
+// Compiles the source for record->shape and stores the live artifact.
 // consume == true offers record->bytes as a code cache (rejected_out gets
 // V8's verdict); consume == false compiles eagerly and fills record->bytes
 // from the produced code cache. Returns false on a compile error (exception
@@ -1660,10 +1729,7 @@ bool CompileBytecodeRecord(napi_env env,
 
   if (rejected_out != nullptr) *rejected_out = false;
 
-  v8::Local<v8::String> code_str =
-      v8::String::NewFromUtf8(isolate, record->source_utf8.c_str(), v8::NewStringType::kNormal,
-                              static_cast<int>(record->source_utf8.size()))
-          .ToLocalChecked();
+  v8::Local<v8::String> code_str = record->ScriptSource(isolate);
   v8::Local<v8::String> filename_str =
       v8::String::NewFromUtf8(isolate, record->filename_utf8.c_str(), v8::NewStringType::kNormal,
                               static_cast<int>(record->filename_utf8.size()))
@@ -1690,6 +1756,9 @@ bool CompileBytecodeRecord(napi_env env,
         return false;
       }
       if (!consume) produced.reset(v8::ScriptCompiler::CreateCodeCache(unbound));
+      record->script.Reset(isolate, unbound);
+      record->script_source.Reset(isolate, code_str);
+      std::string().swap(record->source_utf8);
       break;
     }
     case unofficial_napi_bytecode_shape_cjs_function: {
@@ -1764,6 +1833,11 @@ void ForgetModuleWrapState(napi_env env) {
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   unofficial_napi_realm realm = RealmForContext(context);
   return realm != nullptr && realm->env == env;
+}
+
+bool NapiV8IsDisposedRealm(napi_env env, v8::Local<v8::Context> context) {
+  auto realm = RealmForContext(context);
+  return realm && realm->env == env && realm->disposed;
 }
 
 bool NapiV8IsSnapshotTemplateContext(napi_env env, v8::Local<v8::Context> context) {
@@ -2156,6 +2230,63 @@ napi_status NAPI_CDECL unofficial_napi_set_realm_code_generation(
   return napi_v8_clear_last_error(env);
 }
 
+napi_status NAPI_CDECL unofficial_napi_dispose_realm(napi_env env, unofficial_napi_realm realm) {
+  if (env == nullptr || env->isolate == nullptr || realm == nullptr ||
+      std::none_of(env->realms.begin(), env->realms.end(),
+                   [&](const auto& item) { return item.get() == realm; })) {
+    return napi_invalid_arg;
+  }
+  if (realm->disposed) return napi_v8_clear_last_error(env);
+  v8::HandleScope handles(env->isolate);
+  auto context = RealmContext(env, realm);
+  realm->disposed = true;
+  // V8 drops the pending FinalizationRegistry cleanup of the context it is
+  // in: this one. Dependent (as a frame's), so the heap's allocation limits,
+  // which a page's disposal resets, stay as they are.
+  //
+  // Not while a FinalizationRegistry cleanup task waits to run: V8's task
+  // (FinalizationRegistryCleanupTask::RunInternal, V8 13.6) returns without
+  // clearing its "task posted" flag when it finds no dirty registry, so had
+  // the disposal emptied the list, no FinalizationRegistry callback would run
+  // again anywhere in the isolate. The disposal then waits for that task (and
+  // the successors it posts): what was due runs first, the context's own
+  // pending cleanup included.
+  if (!context.IsEmpty()) {
+    v8::Isolate* isolate = env->isolate;
+    auto retired = std::make_shared<v8::Global<v8::Context>>(isolate, context);
+    auto dispose = [isolate, retired] {
+      v8::HandleScope handles(isolate);
+      v8::Local<v8::Context> local = retired->Get(isolate);
+      retired->Reset();
+      if (local.IsEmpty()) return;
+      v8::Context::Scope scope(local);
+      isolate->ContextDisposedNotification(true);
+    };
+    if (!NapiV8DeferUntilFinalizationCleanup(env, dispose)) dispose();
+  }
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL unofficial_napi_retain_scripts(napi_env env, napi_value host) {
+  if (env == nullptr || env->isolate == nullptr || host == nullptr) return napi_invalid_arg;
+  v8::HandleScope handles(env->isolate);
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(host);
+  if (value.IsEmpty() || !value->IsSymbol()) return napi_invalid_arg;
+  bool hook = false;
+  {
+    std::lock_guard<std::mutex> lock(g_retained_mu);
+    auto inserted = g_retained_scripts.try_emplace(env);
+    hook = inserted.second;
+    inserted.first->second.scripts.clear();
+    inserted.first->second.host.Reset(env->isolate, value.As<v8::Symbol>());
+  }
+  if (hook && napi_add_env_cleanup_hook(env, CleanupRetainedScripts, env) != napi_ok) {
+    CleanupRetainedScripts(env);
+    return napi_generic_failure;
+  }
+  return napi_v8_clear_last_error(env);
+}
+
 napi_status NAPI_CDECL unofficial_napi_enter_realm(napi_env env,
                                                    unofficial_napi_realm realm_or_null,
                                                    unofficial_napi_realm_scope* scope_out) {
@@ -2219,9 +2350,9 @@ static napi_status BytecodeCompile(
   v8::Context::Scope context_scope(context);
 
   auto record = std::make_unique<BytecodeRecord>();
-  record->source_utf8 = ToUtf8String(env, source_text, "");
   record->filename_utf8 = ToUtf8String(env, filename, "[eval]");
   record->shape = shape;
+  record->SetSource(env, source_text);
   record->line_offset = line_offset;
   record->column_offset = column_offset;
   if (!ReadParamsArray(env, params_or_undefined, &record->params)) return napi_invalid_arg;
@@ -2238,10 +2369,7 @@ static napi_status BytecodeCompile(
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
       if (can_parse_as_module_out != nullptr && shape != unofficial_napi_bytecode_shape_module &&
           !try_catch.Message().IsEmpty()) {
-        v8::Local<v8::String> code_str =
-            v8::String::NewFromUtf8(isolate, record->source_utf8.c_str(), v8::NewStringType::kNormal,
-                                    static_cast<int>(record->source_utf8.size()))
-                .ToLocalChecked();
+        v8::Local<v8::String> code_str = record->ScriptSource(isolate);
         v8::Local<v8::String> filename_str =
             v8::String::NewFromUtf8(isolate, record->filename_utf8.c_str(), v8::NewStringType::kNormal,
                                     static_cast<int>(record->filename_utf8.size()))
@@ -2287,9 +2415,9 @@ static napi_status BytecodeDeserialize(
 
   auto record = std::make_unique<BytecodeRecord>();
   record->bytes.assign(bytes, bytes + byte_length);
-  record->source_utf8 = ToUtf8String(env, source_text, "");
   record->filename_utf8 = ToUtf8String(env, filename, "[eval]");
   record->shape = shape;
+  record->SetSource(env, source_text);
   if (!ReadParamsArray(env, params_or_undefined, &record->params)) return napi_invalid_arg;
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -2442,13 +2570,9 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
     return napi_invalid_arg;
   }
 
-  v8::Local<v8::String> code =
-      bytecode_record != nullptr
-          ? v8::String::NewFromUtf8(isolate, bytecode_record->source_utf8.c_str(),
-                                    v8::NewStringType::kNormal,
-                                    static_cast<int>(bytecode_record->source_utf8.size()))
-                .ToLocalChecked()
-          : ToV8String(env, source->text, "");
+  v8::Local<v8::String> code = bytecode_record != nullptr
+      ? bytecode_record->ScriptSource(isolate)
+      : ToV8String(env, source->text, "");
   v8::Local<v8::String> filename_str = ToV8String(env, filename, "[eval]");
 
   v8::Local<v8::Symbol> host_id_symbol;
@@ -2461,6 +2585,15 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
 
   v8::TryCatch try_catch(isolate);
   v8::Context::Scope scope(target_context);
+  v8::Local<v8::UnboundScript> unbound_script;
+  if (bytecode_record != nullptr && !bytecode_record->script.IsEmpty() &&
+      bytecode_record->line_offset == line_offset &&
+      bytecode_record->column_offset == column_offset &&
+      bytecode_record->host_symbol.Get(isolate) == host_id_symbol) {
+    auto candidate = bytecode_record->script.Get(isolate);
+    auto name = candidate->GetScriptName();
+    if (!name.IsEmpty() && name->StrictEquals(filename_str)) unbound_script = candidate;
+  }
   v8::ScriptOrigin origin(filename_str,
                           line_offset,
                           column_offset,
@@ -2472,14 +2605,25 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
                           false,
                           HostDefinedOptions(isolate, host_id_symbol));
   v8::ScriptCompiler::CachedData* run_cached_data = nullptr;
-  if (bytecode_record != nullptr && !bytecode_record->bytes.empty()) {
+  if (unbound_script.IsEmpty() && bytecode_record != nullptr && !bytecode_record->bytes.empty()) {
     run_cached_data = new v8::ScriptCompiler::CachedData(
         bytecode_record->bytes.data(), static_cast<int>(bytecode_record->bytes.size()),
         v8::ScriptCompiler::CachedData::BufferNotOwned);
   }
   v8::ScriptCompiler::Source source_obj(code, origin, run_cached_data);
-  v8::Local<v8::UnboundScript> unbound_script;
-  if (!v8::ScriptCompiler::CompileUnboundScript(isolate,
+  // A retained host's script compiles once per env (retain_scripts).
+  RetainedScripts* retained =
+      bytecode_record == nullptr
+          ? RetainedScriptsFor(env, host_id_symbol, line_offset, column_offset)
+          : nullptr;
+  const int retained_hash = retained != nullptr ? code->GetIdentityHash() : 0;
+  if (retained != nullptr) {
+    unbound_script = FindRetainedScript(isolate, *retained, retained_hash, code, filename_str);
+  }
+  const bool retain = retained != nullptr && unbound_script.IsEmpty() &&
+                      retained->scripts.size() < kMaxRetainedScripts;
+  if (unbound_script.IsEmpty() &&
+      !v8::ScriptCompiler::CompileUnboundScript(isolate,
                                                 &source_obj,
                                                 run_cached_data != nullptr
                                                     ? v8::ScriptCompiler::kConsumeCodeCache
@@ -2497,6 +2641,13 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
     return napi_generic_failure;
   }
 
+  if (retain) {
+    RetainedScript entry;
+    entry.source.Reset(isolate, code);
+    entry.filename.Reset(isolate, filename_str);
+    entry.script.Reset(isolate, unbound_script);
+    retained->scripts.emplace(retained_hash, std::move(entry));
+  }
   v8::Local<v8::Script> script = unbound_script->BindToCurrentContext();
   bool timed_out = false;
   bool received_signal = false;

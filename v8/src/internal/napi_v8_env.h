@@ -103,6 +103,7 @@ struct unofficial_napi_realm__ {
   // The record is the realm's context token. True while the realm has one,
   // until the unassign hook, which runs before the record is freed.
   bool token_assigned = false;
+  bool disposed = false;
   // Templates assign static IDs to functions for serialization. The opaque
   // realm owner stays with this realm and is never serialized.
   bool snapshot_template = false;
