@@ -2547,7 +2547,7 @@ static napi_status TemplatePropertyName(napi_env env, const napi_property_descri
                                         v8::Local<v8::Name>* name) {
   if (desc.utf8name != nullptr) {
     v8::Local<v8::String> key;
-    if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal).ToLocal(&key)) {
+    if (!PropertyKeyFromUtf8(env->isolate, desc.utf8name).ToLocal(&key)) {
       return napi_generic_failure;
     }
     *name = key;
