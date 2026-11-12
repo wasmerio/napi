@@ -451,6 +451,30 @@ fn guest_unofficial_napi_get_current_realm_data(
     status
 }
 
+fn guest_unofficial_napi_set_realm_code_generation(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    key_or_null: u32,
+    allow_strings: i32,
+    allow_wasm: i32,
+    strings_message: u32,
+    wasm_message: u32,
+    check: u32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe {
+        snapi_bridge_unofficial_contextify_set_code_generation(
+            env_handle,
+            key_or_null,
+            allow_strings,
+            allow_wasm,
+            strings_message,
+            wasm_message,
+            check,
+        )
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -5400,6 +5424,7 @@ pub fn register_napi_imports(
         "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
         "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
         "unofficial_napi_define_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_binding),
+        "unofficial_napi_set_realm_code_generation" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_realm_code_generation),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),

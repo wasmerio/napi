@@ -1214,6 +1214,12 @@ extern "C"
         return napi_ok;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_set_realm_code_generation(
+        napi_env env, unofficial_napi_realm, bool, bool, napi_value, napi_value, napi_value)
+    {
+        return env == nullptr ? napi_invalid_arg : napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_realm(
         napi_env env,
         const unofficial_napi_realm_options *options_or_null,

@@ -81,13 +81,19 @@ v8::ModifyCodeGenerationFromStringsResult TrustedCodeGeneration(
   v8::ModifyCodeGenerationFromStringsResult result;
   v8::Local<v8::String> trusted;
   if (TrustedScriptSource(context, source).ToLocal(&trusted)) {
-    result.codegen_allowed = context->IsCodeGenerationFromStringsAllowed();
+    result.codegen_allowed = context->IsCodeGenerationFromStringsAllowed() ||
+                             NapiV8CheckCodeGeneration(context, "trusted-eval", trusted);
     if (result.codegen_allowed) result.modified_source = trusted;
-  } else {
+  } else if (!source->IsString()) {
     // eval(non-string) must return its argument unchanged, including when
     // string codegen is disabled. Never stringify an unbranded object here.
-    result.codegen_allowed = !source->IsString() ||
-                             context->IsCodeGenerationFromStringsAllowed();
+    result.codegen_allowed = true;
+  } else {
+    // A restricted realm may allow this source through its browser CSP check
+    // (for example, a report-only policy). Preserve V8's native source path.
+    result.codegen_allowed = context->IsCodeGenerationFromStringsAllowed() ||
+                             NapiV8CheckCodeGeneration(context, "eval", source.As<v8::String>());
+    if (result.codegen_allowed) result.modified_source = source.As<v8::String>();
   }
   return result;
 }
@@ -1896,6 +1902,12 @@ void ForgetEnvState(napi_env env) {
 
 }  // namespace unofficial_napi_internal
 
+void NapiV8InstallCodeGenerationCallbacks(v8::Isolate* isolate) {
+  if (isolate == nullptr) return;
+  isolate->SetModifyCodeGenerationFromStringsCallback(TrustedCodeGeneration);
+  isolate->SetAllowWasmCodeGenerationCallback(NapiV8AllowWasmCodeGeneration);
+}
+
 v8::FunctionCallback NapiV8SnapshotFunctionTrampoline();
 
 namespace {
@@ -2829,8 +2841,12 @@ napi_status NapiV8SnapshotCommitWithManifest(
       if (!global->Delete(context, key).FromMaybe(false)) return napi_generic_failure;
     }
   }
-  // Restore installs a fresh realm record, token and hooks.
+  // Restore installs its own realm record, code-generation check, token and hooks.
   context->SetAlignedPointerInEmbedderData(33, nullptr);
+  if (context->GetNumberOfEmbedderDataFields() > 49) {
+    context->SetEmbedderData(48, v8::Undefined(isolate));
+    context->SetEmbedderData(49, v8::Undefined(isolate));
+  }
   context->UseDefaultSecurityToken();
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
   context->SetPromiseHooks({}, {}, {}, {});

@@ -1905,6 +1905,21 @@ fn guest_unofficial_napi_define_binding(
     0
 }
 
+// No per-context code generation gate for a guest of the host's JS engine.
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_set_realm_code_generation(
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _key_or_null: u32,
+    _allow_strings: i32,
+    _allow_wasm: i32,
+    _strings_message: u32,
+    _wasm_message: u32,
+    _check: u32,
+) -> i32 {
+    9
+}
+
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_create_realm(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -6091,6 +6106,7 @@ pub fn register_napi_imports(
         "unofficial_napi_snapshot_commit" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_commit),
         "unofficial_napi_snapshot_guest_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_snapshot_guest_data),
         "unofficial_napi_get_current_realm_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_current_realm_data),
+        "unofficial_napi_set_realm_code_generation" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_realm_code_generation),
         "unofficial_napi_event_loop_checkpoint" => event_loop_checkpoint_import(store, fe),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
