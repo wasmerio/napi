@@ -1178,6 +1178,15 @@ fn guest_unofficial_napi_is_executing_js(
     9 // Never infer VM stack emptiness from JS adapter bookkeeping.
 }
 
+fn guest_unofficial_napi_delete_references(
+    _env: FunctionEnvMut<NapiEnv>,
+    _napi_env: u32,
+    _refs_ptr: u32,
+    _count: u32,
+) -> i32 {
+    9 // Unsupported in the host JS backend. The guest deletes references individually.
+}
+
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -5948,6 +5957,7 @@ pub fn register_napi_imports(
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
         "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
         "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
+        "unofficial_napi_delete_references" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_delete_references),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),

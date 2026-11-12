@@ -2207,6 +2207,24 @@ extern "C" int snapi_bridge_delete_reference(SnapiEnvState* env_state, uint32_t 
   return s;
 }
 
+// unofficial_napi_delete_references: napi_delete_reference for each id, in
+// order. Every id is tried; the status is the first failure's.
+extern "C" int snapi_bridge_unofficial_delete_references(SnapiEnvState* env_state,
+                                                         const uint32_t* ref_ids,
+                                                         uint32_t count) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || (ref_ids == nullptr && count != 0)) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_status first = napi_ok;
+  for (uint32_t i = 0; i < count; ++i) {
+    napi_ref ref = LoadRef(*bridge_state, ref_ids[i]);
+    napi_status s = ref != nullptr ? napi_delete_reference(env, ref) : napi_invalid_arg;
+    if (s == napi_ok) RemoveRef(*bridge_state, ref_ids[i]);
+    else if (first == napi_ok) first = s;
+  }
+  return first;
+}
+
 extern "C" int snapi_bridge_reference_ref(SnapiEnvState* env_state, uint32_t ref_id, uint32_t* result) {
   auto* bridge_state = RequireEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;

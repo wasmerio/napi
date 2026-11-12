@@ -3369,6 +3369,28 @@ fn guest_napi_delete_reference(env: FunctionEnvMut<NapiEnv>, e: u32, r: u32) -> 
     unsafe { snapi_bridge_delete_reference(snapi_env(&env, e), r) }
 }
 
+/// `unofficial_napi_delete_references(env, refs, count)`: `napi_delete_reference`
+/// for each of the `count` references of the array, in order, in one call.
+/// Every reference is tried; the status is the first failure's, or `napi_ok`.
+fn guest_unofficial_napi_delete_references(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    refs_ptr: u32,
+    count: u32,
+) -> i32 {
+    if count == 0 {
+        return 0;
+    }
+    // A guest cannot hold more references than its memory has room to name.
+    if refs_ptr == 0 || u64::from(count) * 4 > guest_data_size(&mut env) {
+        return 1;
+    }
+    let Some(ids) = read_guest_u32_array(&mut env, refs_ptr, count as usize) else {
+        return 1;
+    };
+    unsafe { snapi_bridge_unofficial_delete_references(snapi_env(&env, e), ids.as_ptr(), count) }
+}
+
 fn guest_napi_reference_ref(mut env: FunctionEnvMut<NapiEnv>, e: u32, r: u32, rp: u32) -> i32 {
     let mut count: u32 = 0;
     let s = unsafe { snapi_bridge_reference_ref(snapi_env(&env, e), r, &mut count) };
@@ -5204,6 +5226,7 @@ pub fn register_napi_imports(
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
         "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
         "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
+        "unofficial_napi_delete_references" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_delete_references),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
