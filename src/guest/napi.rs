@@ -2460,25 +2460,51 @@ guest_is_check!(guest_napi_is_dataview, snapi_bridge_is_dataview);
 guest_is_check!(guest_napi_is_date, snapi_bridge_is_date);
 guest_is_check!(guest_napi_is_promise, snapi_bridge_is_promise);
 
+// Symbol.hasInstance and a proxy's getPrototypeOf trap can run author code,
+// which may call back into the guest: this lends the store.
+#[allow(clippy::result_large_err)]
 fn guest_napi_instanceof(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     obj: u32,
     ctor: u32,
     rp: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_instanceof(snapi_env(&env, e), obj, ctor, &mut r) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
+    })?;
     if s == 0 {
         write_guest_u8(&mut env, rp, r as u8);
     }
-    s
+    Ok(s)
 }
 
 // --- Coercion ---
 
 macro_rules! guest_coerce {
+    // ToNumber and ToString may call valueOf, toString or Symbol.toPrimitive,
+    // which may call back into the guest.
     ($name:ident, $bridge:ident) => {
+        #[allow(clippy::result_large_err)]
+        fn $name(
+            mut env: FunctionEnvMut<NapiEnv>,
+            e: u32,
+            vh: u32,
+            rp: u32,
+        ) -> Result<i32, WasiError> {
+            let mut out: u32 = 0;
+            let snapi = snapi_env(&env, e);
+            let s = with_cb_context(&mut env, e, || unsafe { $bridge(snapi, vh, &mut out) })?;
+            if s == 0 {
+                write_guest_u32(&mut env, rp, out);
+            }
+            Ok(s)
+        }
+    };
+    // ToBoolean and ToObject run no JS.
+    (no_js $name:ident, $bridge:ident) => {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: u32, vh: u32, rp: u32) -> i32 {
             let mut out: u32 = 0;
             let s = unsafe { $bridge(snapi_env(&env, e), vh, &mut out) };
@@ -2490,10 +2516,10 @@ macro_rules! guest_coerce {
     };
 }
 
-guest_coerce!(guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
+guest_coerce!(no_js guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
 guest_coerce!(guest_napi_coerce_to_number, snapi_bridge_coerce_to_number);
 guest_coerce!(guest_napi_coerce_to_string, snapi_bridge_coerce_to_string);
-guest_coerce!(guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
+guest_coerce!(no_js guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 
 // --- Object operations ---
 
