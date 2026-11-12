@@ -1,10 +1,10 @@
-# Host JavaScript context regressions
+# Host JavaScript regressions
 
 Run the context tests directly, without compiling Wasmer or installing npm dependencies:
 
 ```sh
-node --expose-gc --test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
-bun test tests/host-js/global-context.test.mjs tests/host-js/finalizer-queue.test.mjs tests/host-js/native-realm.test.mjs
+node --expose-gc --test tests/host-js/*.test.mjs
+bun test tests/host-js/*.test.mjs
 ```
 
 The tests extract the context implementation from the JavaScript embedded in
@@ -13,7 +13,8 @@ context-owned writes, Error constructor/prototype ownership, native error
 compatibility, causes/subclasses, stack formatting and collection of released
 contexts and their shared WebAssembly buffers. Retained callback wrappers must
 become inert on release and allow collection of their contexts and dispatch
-captures. The shared-object registry and
+captures. A callback wrapper passes the realm it was made in to its dispatch,
+and is all that keeps that realm alive. The shared-object registry and
 module loader are outside this isolated test.
 
 `finalizer-queue.test.mjs` extracts the finalizer queue the same way. It
@@ -34,6 +35,15 @@ functions, checkpoints, release and the bracketing hooks go to the
 bridge without letting its errors escape, and the bridge global is removed once
 captured; a bridge that can't be removed is refused. Without it, contexts stay
 isolated.
+
+`detached-arraybuffer.test.mjs` loads the whole embedded JavaScript into a
+`vm` realm, with and without ES2024's `ArrayBuffer.prototype.detached`, and
+checks the inspection behind `napi_is_detached_arraybuffer`: live, empty and
+resizable buffers, from that realm or another, are not detached; transferred
+ones are; a SharedArrayBuffer, a view, a proxy or a look-alike is not an
+ArrayBuffer. Page code that afterwards replaces the ArrayBuffer getters,
+`Function.prototype.call` or `Uint8Array`, with functions that throw or that
+accept anything, changes none of these answers.
 
 Custom `Error.prepareStackTrace` tests detect whether the engine honors the
 hook. Bun 1.3.14 does not honor it in the same way as V8, so those three tests skip
@@ -59,10 +69,39 @@ RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals' \
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   ./cargo-standalone.sh +nightly test --locked \
   --target wasm32-unknown-unknown --features js --lib \
-  -Z build-std=std,panic_abort snapi_js::tests
+  --test host_js_lazy_properties -Z build-std=std,panic_abort
 ```
 
 CI installs the runner version recorded in `Cargo.standalone.lock`. Its
 temporary directory contains the Acorn dependency so wasm-bindgen's generated
 host module can resolve the parser without adding npm dependencies to this
 crate.
+
+`lazy-properties.test.mjs` exercises the portable lazy-property helpers,
+including every attribute combination, strings/symbols and key order,
+pre-read writes/deletes, inherited reads/writes, retry/re-entry/mutation,
+validation, proxies, realm ownership, filtered enumeration and initializer
+collection. Configurable accessors become ordinary data properties after the
+first successful value read; otherwise a retained accessor caches the result.
+The Wasm Rust tests additionally check the actual bridge's value handles,
+status codes, pending exceptions, filtered keys and guest callback realms.
+`host_js_lazy_properties.rs` instantiates a real Wasm guest and verifies
+callback entry from both a names getter and the lazy initializer, one-time
+initialization, and valid/out-of-bounds one-byte boolean outputs.
+
+Portable JavaScript cannot reproduce native lazy data properties exactly:
+
+- Descriptor reads expose an accessor and do not initialize it. Redefinition
+  through `Object.defineProperty` also does not initialize it.
+- Non-configurable accessors, including properties sealed/frozen before their
+  first read, remain accessors after initialization. Freezing cannot disable
+  an accessor's existing setter, so writable ones remain writable.
+- Proxies cannot be detected portably. Defining on one, reading it, or querying
+  one previously passed to define can run traps; their exceptions propagate.
+  Queries on untracked objects/proxies return false without traps.
+- Failed inherited writes to primitive/non-extensible receivers throw even
+  from sloppy callers. Recursion/mutation guard errors use the provider realm;
+  the initializer itself runs in its own realm.
+
+No global reflection or integrity-level builtins are patched. Callers requiring
+native descriptor/freeze semantics should define their values eagerly instead.

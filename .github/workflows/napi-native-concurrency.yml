@@ -14,7 +14,9 @@ on:
       - "lib/**"
       - "rust-toolchain.toml"
       - "src/**"
+      - "tests/foreground_task_waker.rs"
       - "tests/concurrent_*.rs"
+      - "tests/guest_*.rs"
       - "tests/wat_guest/**"
       - "v8/**"
   pull_request:
@@ -28,7 +30,9 @@ on:
       - "lib/**"
       - "rust-toolchain.toml"
       - "src/**"
+      - "tests/foreground_task_waker.rs"
       - "tests/concurrent_*.rs"
+      - "tests/guest_*.rs"
       - "tests/wat_guest/**"
       - "v8/**"
   workflow_dispatch:
@@ -55,7 +59,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96"
+          toolchain: "1.99"
 
       - name: Install native build dependencies
         run: |
@@ -69,13 +73,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-napi-concurrency-rust-1.96-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-napi-concurrency-rust-1.99-${{ hashFiles('Cargo.standalone.toml', 'Cargo.standalone.lock', 'build.rs', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-napi-concurrency-rust-1.96-
+            ${{ runner.os }}-napi-concurrency-rust-1.99-
 
       # WAT guests, each in its own Wasmer store and thread, against the real
       # C++ bridge and V8. No WASIX C toolchain is needed.
-      - name: Test concurrent environments and stores
+      - name: Test concurrent environments and stores, and the foreground task waker
         run: >-
           ./cargo-standalone.sh test --locked
+          --test foreground_task_waker
           --test concurrent_envs --test concurrent_stores
+
+      # The library's unit tests, and WAT guests calling the N-API imports:
+      # callbacks, guest memory reads and writes, C strings, the memory
+      # pressure signal and lazy data properties. No WASIX C toolchain is
+      # needed either.
+      #
+      # Not run here: manifest_tests, v8_host_control and v8_worker_threads.
+      # They build guests from tests/programs with wasixcc.
+      - name: Test the library and the WAT guests
+        run: >-
+          ./cargo-standalone.sh test --locked --lib
+          --test guest_callbacks --test guest_c_strings
+          --test guest_memory --test guest_memory_pressure
+          --test guest_lazy_properties

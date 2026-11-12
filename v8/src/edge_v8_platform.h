@@ -23,9 +23,34 @@ class EdgeV8Platform final : public v8::Platform {
   // many, where those threads compete with every tenant's foreground JS and
   // their work is not attributed to anyone.
   //
+  // A job that nobody waits for uses at most count - 1 of these threads,
+  // leaving one for other worker tasks; a job that is kUserBlocking or joined
+  // uses all of them. With a count of 1, every job gets the one thread.
+  //
   // The pool is process-wide and built when the first isolate is created, so
   // this has no effect afterwards; it returns false in that case.
   static bool SetWorkerThreadCount(int count);
+
+  // Sets a function to call when an immediate foreground task is queued
+  // where only an event-loop checkpoint runs it. For an isolate with no
+  // foreground task target bound (see BindForegroundTaskTarget), a task waits
+  // in the default platform's queue until PumpPendingForegroundTasks runs it.
+  // V8 posts such tasks from any thread, for example to resolve an
+  // Atomics.waitAsync that another thread's Atomics.notify woke, or to finish
+  // a WebAssembly.compile. An embedder whose thread sleeps until its next
+  // event can wake that thread from this function.
+  //
+  // The function is process-wide: it is called for every isolate's tasks, on
+  // the thread that posted the task, after the task is queued. That thread
+  // can be the isolate's own, in the middle of running JS or a garbage
+  // collection, and V8 may hold its own locks then. So the function must be
+  // quick, must not call into V8, and must not take a lock that the
+  // isolate's thread may hold. A delayed task doesn't call it, and runs at
+  // the first checkpoint after its delay. nullptr clears it. A thread that
+  // read the previous function just before a change may still call it once
+  // afterwards. It takes no data pointer, so that one atomic store publishes
+  // it. WakeForQueuedForegroundTasks calls it too.
+  static void SetForegroundTaskWaker(void (*waker)());
 
   ~EdgeV8Platform() override;
 
@@ -46,6 +71,15 @@ class EdgeV8Platform final : public v8::Platform {
   // Run at most one ready fallback task. Returns true when a task ran so
   // the embedder can admit another loop turn before continuing provider work.
   bool PumpPendingForegroundTasks(v8::Isolate* isolate);
+  // Calls the function SetForegroundTaskWaker set, on this thread, when the
+  // isolate may have tasks waiting that only a checkpoint runs: it has used
+  // the default platform's queue and has tasks pending. Their posts called it
+  // once, but a checkpoint that refused to run them (while the env
+  // terminated) left them queued, and nothing calls it for them again. The
+  // pending tasks may also be delayed ones that aren't due yet, or ones
+  // handed to a bound target: the embedder then finds nothing to run and
+  // waits again.
+  void WakeForQueuedForegroundTasks(v8::Isolate* isolate);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(

@@ -42,6 +42,12 @@ napi_status GetErrorMetadata(napi_env env,
                              unofficial_napi_error_metadata_mode mode,
                              unofficial_napi_error_metadata* out);
 void ResetErrorFormattingState(napi_env env);
+// Drops the module loader's state for `env` (unofficial_napi_contextify.cc).
+void ForgetModuleWrapState(napi_env env);
+// Drops what the runtime keeps for `env` outside it, keyed by its address:
+// its error formatting, prepare-stack-trace and module loader state. The end
+// of the env's release calls it, once no hook or finalizer is left to run.
+void ForgetEnvState(napi_env env);
 
 }  // namespace unofficial_napi_internal
 

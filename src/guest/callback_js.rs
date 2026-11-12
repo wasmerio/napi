@@ -1,11 +1,12 @@
 use std::ffi::c_void;
 
-use wasmer::{FunctionEnvMut, Table, Value};
+use wasm_bindgen::{JsCast, JsValue};
+use wasmer::{AsStoreMut, AsStoreRef, FunctionEnv, FunctionEnvMut, Store, Table, Value, js::AsJs};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::future::Future;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::AsyncFunctionEnvMut;
+use wasmer::{AsStoreAsync, AsyncFunctionEnvMut, StoreAsync};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -18,6 +19,13 @@ type RawFunctionEnvMut = FunctionEnvMut<'static, NapiEnv>;
 /// and retries them from the next synchronous guest checkpoint.
 pub(crate) const CALLBACK_DEFERRED: u32 = u32::MAX;
 
+pub(crate) fn guest_memory_buffer(store: impl AsStoreRef, memory: &wasmer::Memory) -> JsValue {
+    memory
+        .as_jsvalue(&store)
+        .unchecked_into::<js_sys::WebAssembly::Memory>()
+        .buffer()
+}
+
 #[repr(C)]
 pub(crate) struct CallbackInvocationCtx {
     env: CallbackEnv,
@@ -28,10 +36,71 @@ pub(crate) struct CallbackInvocationCtx {
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 unsafe impl Send for CallbackInvocationCtx {}
 
+#[derive(Clone)]
 enum CallbackEnv {
-    Sync(*mut RawFunctionEnvMut),
+    Sync {
+        env: FunctionEnv<NapiEnv>,
+        store_id: usize,
+    },
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    Async(AsyncFunctionEnvMut<NapiEnv>),
+    Async(AsyncCallbackOwner),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+pub(crate) struct AsyncCallbackOwner {
+    env: FunctionEnv<NapiEnv>,
+    store: StoreAsync,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+impl Clone for AsyncCallbackOwner {
+    fn clone(&self) -> Self {
+        Self {
+            env: self.env.clone(),
+            store: self.store.store(),
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+fn async_callback_owner(env: &FunctionEnvMut<NapiEnv>) -> Option<AsyncCallbackOwner> {
+    Some(AsyncCallbackOwner {
+        env: env.as_ref(),
+        store: env.as_store_async()?.store(),
+    })
+}
+
+impl CallbackEnv {
+    fn with_env<R>(
+        &self,
+        mut callback: impl FnMut(&mut FunctionEnvMut<NapiEnv>) -> R,
+    ) -> Option<R> {
+        let (env, store_id) = match self {
+            Self::Sync { env, store_id } => (env, *store_id),
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            Self::Async(owner) => (&owner.env, owner.store.store_id().as_raw().get()),
+        };
+        // A synchronous bridge call explicitly lends its store. Never recover
+        // a different store merely because it happens to be current.
+        let current = Store::with_current(|store| {
+            if store.objects_mut().id().as_raw().get() != store_id {
+                return None;
+            }
+            Some(callback(&mut env.clone().into_mut(store)))
+        })
+        .flatten();
+        if current.is_some() {
+            return current;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        if let Self::Async(owner) = self {
+            // A busy JSPI store defers the callback to a guest checkpoint.
+            if let Some(mut store) = owner.store.try_write_lock() {
+                return Some(callback(&mut owner.env.clone().into_mut(&mut store)));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -39,7 +108,7 @@ pub(crate) fn install_persistent_callback_state(
     env: &mut FunctionEnvMut<NapiEnv>,
     env_id: u32,
     snapi_env: SnapiEnv,
-    async_env: AsyncFunctionEnvMut<NapiEnv>,
+    async_env: AsyncCallbackOwner,
 ) {
     let mut ctx = Box::new(CallbackInvocationCtx {
         env: CallbackEnv::Async(async_env),
@@ -54,7 +123,7 @@ pub(crate) fn install_persistent_callback_state(
 }
 
 /// Gives a new env its persistent callback context, owned by the store's JSPI
-/// `AsyncFunctionEnvMut`. A synchronous store has no such owner yet; some
+/// shared `StoreAsync` handle. A synchronous store has no such owner yet; some
 /// embedders promote it to an async store later. Until then the env waits:
 /// the next callback state installed once the store is async, synchronous or
 /// async (a checkpoint, a message wait), installs the context.
@@ -63,9 +132,8 @@ pub(crate) fn install_async_owner(
     env: &mut FunctionEnvMut<NapiEnv>,
     env_id: u32,
     snapi_env: SnapiEnv,
-    async_env: Option<AsyncFunctionEnvMut<NapiEnv>>,
 ) {
-    match async_env {
+    match async_callback_owner(env) {
         Some(async_env) => install_persistent_callback_state(env, env_id, snapi_env, async_env),
         None => env.data_mut().envs_awaiting_async_owner.push(env_id),
     }
@@ -78,7 +146,7 @@ pub(crate) fn install_async_owner(
 fn install_awaited_async_owner(
     env: &mut FunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
-    owner: Option<AsyncFunctionEnvMut<NapiEnv>>,
+    owner: Option<AsyncCallbackOwner>,
 ) {
     let Some(&env_id) = env
         .data()
@@ -90,7 +158,7 @@ fn install_awaited_async_owner(
     if !env.data().envs_awaiting_async_owner.contains(&env_id) {
         return;
     }
-    if let Some(async_env) = owner.or_else(|| env.as_async_mut()) {
+    if let Some(async_env) = owner.or_else(|| async_callback_owner(env)) {
         install_persistent_callback_state(env, env_id, snapi_env, async_env);
     }
 }
@@ -137,7 +205,10 @@ fn install_callback_state(
 
     let env_ptr = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>();
     let mut ctx = Box::new(CallbackInvocationCtx {
-        env: CallbackEnv::Sync(env_ptr),
+        env: CallbackEnv::Sync {
+            env: env.as_ref(),
+            store_id: env.objects_mut().id().as_raw().get(),
+        },
     });
     let owner_id = env.data_mut().next_host_buffer_owner();
     env.data_mut().host_buffer_copy_frames.push(owner_id);
@@ -296,7 +367,7 @@ pub fn flush_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi
         let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env);
         if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
             if let Some(memory) = env.data().memory.clone() {
-                let memory_buffer = memory.as_js().js_buffer();
+                let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
                 let _ = crate::snapi_js::copy_memory_bytes_to_reference(
                     mapping_snapi,
                     mapping.host_reference_id,
@@ -362,7 +433,7 @@ pub fn publish_pending_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, sna
     let Some(memory) = env.data().memory.clone() else {
         return;
     };
-    let memory_buffer = memory.as_js().js_buffer();
+    let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
     for index in 0..env.data().host_buffer_copies.len() {
         let (mapping_guest_env, host_reference_id, guest_ptr, byte_len, needs_flush) = {
             let mapping = &env.data().host_buffer_copies[index];
@@ -405,7 +476,7 @@ pub fn refresh_host_buffer_copies(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: 
     let Some(memory) = env.data().memory.clone() else {
         return;
     };
-    let memory_buffer = memory.as_js().js_buffer();
+    let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
     for index in 0..env.data().host_buffer_copies.len() {
         let (mapping_guest_env, host_reference_id, guest_ptr, byte_len, needs_flush) = {
             let mapping = &env.data().host_buffer_copies[index];
@@ -448,7 +519,7 @@ pub fn flush_host_buffer_copies_for_owner(env: &mut FunctionEnvMut<NapiEnv>, own
         let mapping_snapi = env.data().resolve_napi_env(mapping.guest_env);
         if mapping.needs_flush && mapping.byte_len > 0 && !mapping_snapi.is_null() {
             if let Some(memory) = env.data().memory.clone() {
-                let memory_buffer = memory.as_js().js_buffer();
+                let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
                 let _ = crate::snapi_js::copy_memory_bytes_to_reference(
                     mapping_snapi,
                     mapping.host_reference_id,
@@ -506,14 +577,18 @@ pub fn with_callback_state<R>(
     f: impl FnOnce() -> R,
 ) -> R {
     let guard = install_callback_state(env, snapi_env);
-    let result = f();
+    let result = if guard.is_some() {
+        env.as_store_mut().parked(f)
+    } else {
+        f()
+    };
     drop(guard);
     result
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub async fn with_callback_state_async<R, F>(
-    mut env: AsyncFunctionEnvMut<NapiEnv>,
+    env: AsyncFunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     future: F,
 ) -> R
@@ -527,11 +602,14 @@ where
     // An env created from a synchronous store gets its persistent context
     // here at the latest, before the import suspends and host jobs (Promise
     // jobs, message deliveries) call into the guest.
-    let owner = env.as_mut();
     let owner_id = {
         let mut locked = env.write().await;
         let mut sync_env = locked.as_function_env_mut();
         if !sync_env.data().envs_awaiting_async_owner.is_empty() {
+            let owner = AsyncCallbackOwner {
+                env: env.as_ref(),
+                store: env.as_store_async().store(),
+            };
             install_awaited_async_owner(&mut sync_env, snapi_env, Some(owner));
         }
         let owner_id = sync_env.data_mut().next_host_buffer_owner();
@@ -574,52 +652,19 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] no active callback scope available");
         return 0;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
-    match &mut ctx.env {
-        CallbackEnv::Sync(env) => {
-            if env.is_null() {
-                eprintln!("[callback trampoline] callback scope env cleared");
-                return 0;
-            }
-            let env = unsafe { &mut *env.cast::<FunctionEnvMut<'_, NapiEnv>>() };
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    // Guest reentry can release the env and its persistent callback context.
+    // Keep independent handles until dispatch finishes.
+    let callback = ctx.env.clone();
+    callback
+        .with_env(|env| {
             let Some(table) = env.data().table.clone() else {
                 eprintln!("[callback trampoline] guest function table is not installed");
                 return 0;
             };
             call_guest_callback_and_flush(env, &table, guest_env, wasm_fn_ptr, callback_arg)
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| {
-                let Some(table) = sync_env.data().table.clone() else {
-                    eprintln!("[callback trampoline] guest function table is not installed");
-                    return 0;
-                };
-                call_guest_callback_and_flush(
-                    &mut sync_env,
-                    &table,
-                    guest_env,
-                    wasm_fn_ptr,
-                    callback_arg,
-                )
-            }) {
-                return result;
-            }
-            if let Some(mut locked) = env.try_write() {
-                let mut sync_env = locked.as_function_env_mut();
-                if let Some(table) = sync_env.data().table.clone() {
-                    return call_guest_callback_and_flush(
-                        &mut sync_env,
-                        &table,
-                        guest_env,
-                        wasm_fn_ptr,
-                        callback_arg,
-                    );
-                }
-            }
-            CALLBACK_DEFERRED
-        }
-    }
+        })
+        .unwrap_or(CALLBACK_DEFERRED)
 }
 
 /// Dispatch a deferred host-JS finalizer while the provider is at an explicit
@@ -637,7 +682,8 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     if callback_ctx.is_null() {
         return CALLBACK_DEFERRED;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    let callback = ctx.env.clone();
     let invoke = |env: &mut FunctionEnvMut<NapiEnv>| {
         let Some(table) = env.data().table.clone() else {
             return 0;
@@ -655,23 +701,94 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         }
         result
     };
-    match &mut ctx.env {
-        CallbackEnv::Sync(env) => {
-            if env.is_null() {
-                return CALLBACK_DEFERRED;
-            }
-            invoke(unsafe { &mut *env.cast::<FunctionEnvMut<'_, NapiEnv>>() })
+    callback.with_env(invoke).unwrap_or(CALLBACK_DEFERRED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn callback_state() -> NapiEnv {
+        NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        )
+    }
+
+    #[wasm_bindgen_test]
+    fn guest_buffer_views_follow_memory_growth() {
+        for shared in [false, true] {
+            let mut store = Store::default();
+            let memory =
+                wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(2), shared))
+                    .unwrap();
+            let initial = guest_memory_buffer(store.as_store_ref(), &memory);
+            js_sys::Uint8Array::new(&initial).set_index(0, 42);
+            memory.grow(&mut store, 1).unwrap();
+            let current =
+                js_sys::Uint8Array::new(&guest_memory_buffer(store.as_store_ref(), &memory));
+            assert_eq!(current.length(), 2 * wasmer::WASM_PAGE_SIZE as u32);
+            assert_eq!(current.get_index(0), 42);
         }
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| invoke(&mut sync_env)) {
-                return result;
-            }
-            if let Some(mut locked) = env.try_write() {
-                let mut sync_env = locked.as_function_env_mut();
-                return invoke(&mut sync_env);
-            }
-            CALLBACK_DEFERRED
-        }
+    }
+
+    #[wasm_bindgen_test]
+    fn synchronous_callbacks_only_borrow_their_lent_store() {
+        let mut store = Store::default();
+        let function_env = FunctionEnv::new(&mut store, callback_state());
+        let callback = CallbackEnv::Sync {
+            env: function_env.clone(),
+            store_id: store.id().as_raw().get(),
+        };
+        assert!(callback.with_env(|_| ()).is_none());
+        let mut other_store = Store::default();
+        other_store.as_store_mut().parked(|| {
+            assert!(callback.with_env(|_| ()).is_none());
+        });
+
+        let mut env = function_env.clone().into_mut(&mut store);
+        env.as_store_mut().parked(|| {
+            assert_eq!(
+                callback.with_env(|env| {
+                    env.data_mut().default_napi_env_id = Some(42);
+                    // A nested callback needs the current borrow parked too.
+                    assert!(callback.with_env(|_| ()).is_none());
+                    env.as_store_mut().parked(|| callback.with_env(|_| 73))
+                }),
+                Some(Some(73))
+            );
+        });
+        assert_eq!(function_env.as_ref(&store).default_napi_env_id, Some(42));
+        assert!(callback.with_env(|_| ()).is_none());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn asynchronous_callbacks_defer_busy_stores_without_retaining_waiters() {
+        let mut store = Store::default();
+        let function_env = FunctionEnv::new(&mut store, callback_state());
+        let store = store.into_async();
+        let callback = CallbackEnv::Async(AsyncCallbackOwner {
+            env: function_env.clone(),
+            store: store.store(),
+        });
+        assert_eq!(
+            callback.with_env(|env| {
+                env.data_mut().default_napi_env_id = Some(17);
+                42
+            }),
+            Some(42)
+        );
+        let locked = store.write_lock().await;
+        assert!(callback.with_env(|_| ()).is_none());
+        drop(locked);
+        assert_eq!(
+            callback.with_env(|env| env.data().default_napi_env_id),
+            Some(Some(17))
+        );
+        drop(callback);
+        assert!(store.into_store().is_ok());
     }
 }

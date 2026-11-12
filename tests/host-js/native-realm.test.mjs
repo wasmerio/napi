@@ -47,16 +47,15 @@ test('a native realm runs scripts in the Worker global with their source positio
   const root = api.wasmer_napi_create_global_context();
   const scope = api.wasmer_napi_global_context_scope(root);
   assert.equal(scope, vm.runInContext('globalThis', context));
-  api.wasmer_napi_activate_global_context(root);
 
   const source = "'use strict'; let lexical = 19; const base = 23; var globalValue = 11;";
-  api.wasmer_napi_context_run_script(scope, source, 'https://fixture.test/original.js', 4, 2);
+  api.wasmer_napi_context_run_script(root, source, 'https://fixture.test/original.js', 4, 2);
   assert.deepEqual(calls.scripts, [
     { source, filename: 'https://fixture.test/original.js', lineOffset: 4, columnOffset: 2 },
   ]);
   // Global lexical declarations persist across scripts, as in a real Worker.
-  assert.equal(api.wasmer_napi_context_run_script(scope, 'lexical + base + globalValue', 'second.js', 0, 0), 53);
-  assert.equal(api.wasmer_napi_context_eval(scope, '(() => lexical + base)()'), 42);
+  assert.equal(api.wasmer_napi_context_run_script(root, 'lexical + base + globalValue', 'second.js', 0, 0), 53);
+  assert.equal(api.wasmer_napi_context_eval(root, '(() => lexical + base)()'), 42);
   assert.equal(Object.hasOwn(scope, 'lexical'), false);
   assert.equal(scope.globalValue, 11);
   assert.equal(api.wasmer_napi_compile_function(scope, [], ['value'], 'return value + lexical;', '')(4), 23);
@@ -68,8 +67,9 @@ test('a native realm serves one environment and no secondary contexts', () => {
   const scope = api.wasmer_napi_global_context_scope(root);
   assert.equal(api.wasmer_napi_can_create_global_context(), false);
   assert.throws(() => api.wasmer_napi_create_global_context(), /lease already consumed/);
-  assert.throws(() => api.wasmer_napi_context_eval({}, '42'), /Secondary contexts/);
-  assert.throws(() => api.wasmer_napi_context_run_script({}, '42', '', 0, 0), /Secondary contexts/);
+  const registry = api.wasmer_napi_create_realm_registry();
+  assert.throws(() => api.wasmer_napi_create_realm_context(registry, null), /Secondary contexts/);
+  assert.throws(() => api.wasmer_napi_create_realm_context(registry, {}), /Secondary contexts/);
   assert.throws(() => api.wasmer_napi_compile_function(scope, [{}], [], 'return 42;', ''), /Context extensions/);
   assert.throws(() => api.wasmer_napi_compile_module(scope, 'export default 42;', ''), /module/);
 });
@@ -128,8 +128,7 @@ test('without the bridge, contexts stay isolated from the global and each other'
   assert.equal(api.wasmer_napi_has_native_realm(), false);
   const first = api.wasmer_napi_create_global_context();
   const second = api.wasmer_napi_create_global_context();
-  api.wasmer_napi_activate_global_context(first);
-  api.wasmer_napi_context_eval(first.scope, 'globalThis.fixtureValue = 17');
+  api.wasmer_napi_context_eval(first, 'globalThis.fixtureValue = 17');
   assert.equal(first.scope.fixtureValue, 17);
   assert.equal(second.scope.fixtureValue, undefined);
   assert.equal(vm.runInContext('globalThis.fixtureValue', context), undefined);

@@ -68,6 +68,13 @@ struct Wasm32BytecodeOpenOptionsV1 {
     reserved: [u8; 2],
 }
 
+/// Version 2 appends the realm to version 1.
+#[repr(C)]
+struct Wasm32BytecodeOpenOptionsV2 {
+    v1: Wasm32BytecodeOpenOptionsV1,
+    realm_or_null: u32,
+}
+
 #[repr(C)]
 struct Wasm32ModuleCreateOptionsV1 {
     size: u32,
@@ -77,6 +84,13 @@ struct Wasm32ModuleCreateOptionsV1 {
     url: u32,
     context_or_undefined: u32,
     payload: [u8; 16],
+}
+
+/// Version 2 appends the realm to version 1.
+#[repr(C)]
+struct Wasm32ModuleCreateOptionsV2 {
+    v1: Wasm32ModuleCreateOptionsV1,
+    realm_or_null: u32,
 }
 
 #[repr(C)]
@@ -102,24 +116,44 @@ struct Wasm32ModuleHooksV1 {
     initialize_import_meta_object: u32,
 }
 
+#[repr(C)]
+struct Wasm32RealmOptionsV1 {
+    size: u32,
+    version: u32,
+    sandbox_or_null: u32,
+    name: u32,
+    origin: u32,
+    host_defined_option_id: u32,
+    allow_code_gen_strings: u8,
+    allow_code_gen_wasm: u8,
+    own_microtask_queue: u8,
+    reserved: u8,
+}
+
 const JS_SOURCE_SIZE: usize = std::mem::size_of::<Wasm32JsSource>();
 const RUNTIME_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RuntimeOptionsV1>();
 const ENV_CREATE_PREFIX_SIZE: usize = std::mem::size_of::<Wasm32EnvCreateOptionsV1>();
-const BYTECODE_OPEN_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV1>();
-const MODULE_CREATE_PREFIX_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV1>();
+const BYTECODE_OPEN_V1_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV1>();
+const BYTECODE_OPEN_V2_SIZE: usize = std::mem::size_of::<Wasm32BytecodeOpenOptionsV2>();
+const MODULE_CREATE_V1_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV1>();
+const MODULE_CREATE_V2_SIZE: usize = std::mem::size_of::<Wasm32ModuleCreateOptionsV2>();
 const MODULE_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32ModuleHooksV1>();
 const ENV_HOOKS_SIZE: usize = std::mem::size_of::<Wasm32EnvHooksV1>();
+const REALM_OPTIONS_SIZE: usize = std::mem::size_of::<Wasm32RealmOptionsV1>();
 
 const _: () = assert!(std::mem::size_of::<Wasm32VersionedHeader>() == 8);
 const _: () = assert!(JS_SOURCE_SIZE == 12);
 const _: () = assert!(RUNTIME_OPTIONS_SIZE == 16);
 const _: () = assert!(ENV_CREATE_PREFIX_SIZE == 48);
-const _: () = assert!(BYTECODE_OPEN_SIZE == 48);
-const _: () = assert!(MODULE_CREATE_PREFIX_SIZE == 40);
+const _: () = assert!(BYTECODE_OPEN_V1_SIZE == 48);
+const _: () = assert!(BYTECODE_OPEN_V2_SIZE == 52);
+const _: () = assert!(MODULE_CREATE_V1_SIZE == 40);
+const _: () = assert!(MODULE_CREATE_V2_SIZE == 44);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateJsPayload>() == 16);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateSyntheticPayload>() == 16);
 const _: () = assert!(MODULE_HOOKS_SIZE == 16);
 const _: () = assert!(ENV_HOOKS_SIZE == 32);
+const _: () = assert!(REALM_OPTIONS_SIZE == 28);
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -149,6 +183,29 @@ fn read_versioned(
         return None;
     }
     Some(bytes)
+}
+
+/// Reads a struct that grows at the end, whose version `n` is `sizes[n - 1]`
+/// bytes long. Returns the version and only that version's bytes.
+fn read_grown(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    sizes: &[usize],
+) -> Option<(u32, Vec<u8>)> {
+    if guest_ptr == 0 {
+        return None;
+    }
+    let header = read_guest_bytes(env, guest_ptr, std::mem::size_of::<Wasm32VersionedHeader>())?;
+    let size = u32_at(&header, std::mem::offset_of!(Wasm32VersionedHeader, size))?;
+    let version = u32_at(
+        &header,
+        std::mem::offset_of!(Wasm32VersionedHeader, version),
+    )?;
+    let prefix_size = *sizes.get(usize::try_from(version).ok()?.checked_sub(1)?)?;
+    if size < prefix_size as u32 {
+        return None;
+    }
+    Some((version, read_guest_bytes(env, guest_ptr, prefix_size)?))
 }
 
 pub(crate) fn read_output_header(
@@ -268,6 +325,11 @@ pub(crate) fn read_js_source(
 }
 
 pub(crate) struct BytecodeOpen {
+    /// 1 or 2. Version 1 compiles for the current realm.
+    pub version: u32,
+    /// The guest realm id of version 2 (0 for the env's own realm); 0 in
+    /// version 1.
+    pub realm_or_null: u32,
     pub source_text: u32,
     pub filename: u32,
     pub shape: i32,
@@ -284,7 +346,11 @@ pub(crate) fn read_bytecode_open(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
 ) -> Option<BytecodeOpen> {
-    let bytes = read_versioned(env, guest_ptr, BYTECODE_OPEN_SIZE, 1)?;
+    let (version, bytes) = read_grown(
+        env,
+        guest_ptr,
+        &[BYTECODE_OPEN_V1_SIZE, BYTECODE_OPEN_V2_SIZE],
+    )?;
     let cache_ptr = u32_at(
         &bytes,
         std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, cache_bytes),
@@ -307,6 +373,15 @@ pub(crate) fn read_bytecode_open(
         Vec::new()
     };
     Some(BytecodeOpen {
+        version,
+        realm_or_null: if version >= 2 {
+            u32_at(
+                &bytes,
+                std::mem::offset_of!(Wasm32BytecodeOpenOptionsV2, realm_or_null),
+            )?
+        } else {
+            0
+        },
         source_text: u32_at(
             &bytes,
             std::mem::offset_of!(Wasm32BytecodeOpenOptionsV1, source_text),
@@ -342,10 +417,15 @@ pub(crate) fn read_bytecode_open(
 }
 
 pub(crate) struct ModuleCreate {
+    /// 1 or 2.
+    pub version: u32,
     pub kind: i32,
     pub wrapper: u32,
     pub url: u32,
+    /// The deprecated context's value id (0 for NULL).
     pub context_or_undefined: u32,
+    /// The guest realm id of version 2 (0 for NULL); 0 in version 1.
+    pub realm_or_null: u32,
     pub source_text: u32,
     pub source_bytecode: u32,
     pub line_offset: i32,
@@ -359,7 +439,11 @@ pub(crate) fn read_module_create(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
 ) -> Option<ModuleCreate> {
-    let bytes = read_versioned(env, guest_ptr, MODULE_CREATE_PREFIX_SIZE, 1)?;
+    let (version, bytes) = read_grown(
+        env,
+        guest_ptr,
+        &[MODULE_CREATE_V1_SIZE, MODULE_CREATE_V2_SIZE],
+    )?;
     let kind = i32_at(
         &bytes,
         std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, kind),
@@ -422,6 +506,7 @@ pub(crate) fn read_module_create(
         _ => return None,
     };
     Some(ModuleCreate {
+        version,
         kind,
         wrapper: u32_at(
             &bytes,
@@ -435,6 +520,14 @@ pub(crate) fn read_module_create(
             &bytes,
             std::mem::offset_of!(Wasm32ModuleCreateOptionsV1, context_or_undefined),
         )?,
+        realm_or_null: if version >= 2 {
+            u32_at(
+                &bytes,
+                std::mem::offset_of!(Wasm32ModuleCreateOptionsV2, realm_or_null),
+            )?
+        } else {
+            0
+        },
         source_text,
         source_bytecode,
         line_offset,
@@ -462,6 +555,72 @@ pub(crate) fn read_module_hooks(
     ))
 }
 
+/// `unofficial_napi_realm_options` read from guest memory. Value fields are
+/// guest napi_value ids; 0 means NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RealmOptions {
+    pub sandbox_or_null: u32,
+    pub name: u32,
+    pub origin: u32,
+    pub host_defined_option_id: u32,
+    pub allow_code_gen_strings: bool,
+    pub allow_code_gen_wasm: bool,
+    pub own_microtask_queue: bool,
+}
+
+impl Default for RealmOptions {
+    /// The defaults of `unofficial_napi_realm_options_init`.
+    fn default() -> Self {
+        Self {
+            sandbox_or_null: 0,
+            name: 0,
+            origin: 0,
+            host_defined_option_id: 0,
+            allow_code_gen_strings: true,
+            allow_code_gen_wasm: true,
+            own_microtask_queue: false,
+        }
+    }
+}
+
+/// Reads realm options at `guest_ptr`. A null pointer means the defaults;
+/// `None` means the descriptor is out of bounds or has the wrong size or
+/// version.
+pub(crate) fn read_realm_options(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+) -> Option<RealmOptions> {
+    if guest_ptr == 0 {
+        return Some(RealmOptions::default());
+    }
+    let bytes = read_versioned(env, guest_ptr, REALM_OPTIONS_SIZE, 1)?;
+    let flag = |offset: usize| bytes.get(offset).map(|byte| *byte != 0);
+    Some(RealmOptions {
+        sandbox_or_null: u32_at(
+            &bytes,
+            std::mem::offset_of!(Wasm32RealmOptionsV1, sandbox_or_null),
+        )?,
+        name: u32_at(&bytes, std::mem::offset_of!(Wasm32RealmOptionsV1, name))?,
+        origin: u32_at(&bytes, std::mem::offset_of!(Wasm32RealmOptionsV1, origin))?,
+        host_defined_option_id: u32_at(
+            &bytes,
+            std::mem::offset_of!(Wasm32RealmOptionsV1, host_defined_option_id),
+        )?,
+        allow_code_gen_strings: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            allow_code_gen_strings
+        ))?,
+        allow_code_gen_wasm: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            allow_code_gen_wasm
+        ))?,
+        own_microtask_queue: flag(std::mem::offset_of!(
+            Wasm32RealmOptionsV1,
+            own_microtask_queue
+        ))?,
+    })
+}
+
 pub(crate) struct EnvHooks {
     pub fatal: u32,
     pub oom: u32,
@@ -475,19 +634,25 @@ pub(crate) fn read_env_hooks(
     let bytes = read_versioned(env, guest_ptr, ENV_HOOKS_SIZE, 1)?;
     let hook_fields = [
         (
-            Wasm32EnvHooksV1::context_token_assign_callback_offset(),
+            std::mem::offset_of!(Wasm32EnvHooksV1, context_token_assign_callback),
             1u64 << 0,
         ),
         (
-            Wasm32EnvHooksV1::context_token_unassign_callback_offset(),
+            std::mem::offset_of!(Wasm32EnvHooksV1, context_token_unassign_callback),
             1u64 << 1,
         ),
         (
-            Wasm32EnvHooksV1::enqueue_foreground_task_callback_offset(),
+            std::mem::offset_of!(Wasm32EnvHooksV1, enqueue_foreground_task_callback),
             1u64 << 2,
         ),
-        (Wasm32EnvHooksV1::fatal_error_callback_offset(), 1u64 << 3),
-        (Wasm32EnvHooksV1::oom_error_callback_offset(), 1u64 << 4),
+        (
+            std::mem::offset_of!(Wasm32EnvHooksV1, fatal_error_callback),
+            1u64 << 3,
+        ),
+        (
+            std::mem::offset_of!(Wasm32EnvHooksV1, oom_error_callback),
+            1u64 << 4,
+        ),
     ];
     let mut requested = 0;
     for (offset, bit) in hook_fields {
@@ -506,22 +671,4 @@ pub(crate) fn read_env_hooks(
         )?,
         requested,
     })
-}
-
-impl Wasm32EnvHooksV1 {
-    const fn context_token_assign_callback_offset() -> usize {
-        std::mem::offset_of!(Self, context_token_assign_callback)
-    }
-    const fn context_token_unassign_callback_offset() -> usize {
-        std::mem::offset_of!(Self, context_token_unassign_callback)
-    }
-    const fn enqueue_foreground_task_callback_offset() -> usize {
-        std::mem::offset_of!(Self, enqueue_foreground_task_callback)
-    }
-    const fn fatal_error_callback_offset() -> usize {
-        std::mem::offset_of!(Self, fatal_error_callback)
-    }
-    const fn oom_error_callback_offset() -> usize {
-        std::mem::offset_of!(Self, oom_error_callback)
-    }
 }

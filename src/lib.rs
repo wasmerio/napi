@@ -69,6 +69,12 @@ pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
 /// parallel jobs are cooperative and the posting thread participates, so the
 /// work migrates onto whichever thread asked for it.
 ///
+/// A V8 job that nobody waits for, such as concurrent marking or sweeping or
+/// an optimizing compile, uses at most `count - 1` of these threads, leaving
+/// one for other background work. A job that V8 waits for (priority
+/// `kUserBlocking`, or joined) uses all of them. With a count of 1, every job
+/// gets the one thread.
+///
 /// The pool is built with the process-wide platform, when the first V8 isolate
 /// is created, so this must be called before then. Afterwards, asking for the
 /// size already in place still succeeds — several components may configure the
@@ -136,6 +142,98 @@ impl Display for WorkerThreadsAlreadyFixed {
 }
 
 impl std::error::Error for WorkerThreadsAlreadyFixed {}
+
+/// What [`set_foreground_task_waker`] installed.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+type ForegroundTaskWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+static FOREGROUND_TASK_WAKER: std::sync::RwLock<Option<ForegroundTaskWaker>> =
+    std::sync::RwLock::new(None);
+
+/// What the V8 platform calls while a waker is installed.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+extern "C" fn wake_for_foreground_task() {
+    // A panic must not unwind into V8, so the clone and its drop run inside
+    // this guard. The call has a guard of its own: the clone can be the last
+    // reference to the waker, and if its drop ran while a panic in the waker
+    // unwound, a panicking destructor among its captures would abort the
+    // process.
+    let result = std::panic::catch_unwind(|| {
+        // The lock is released before the call, so the waker may replace
+        // itself.
+        let waker = match FOREGROUND_TASK_WAKER.read() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(waker) = waker {
+            let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker()));
+            // Dropping a payload could panic in turn: leak it instead.
+            if let Err(payload) = called {
+                std::mem::forget(payload);
+            }
+        }
+    });
+    if let Err(payload) = result {
+        std::mem::forget(payload);
+    }
+}
+
+/// Sets what is called, process-wide, when V8 queues a foreground task that
+/// only a guest's next event-loop checkpoint runs.
+///
+/// A guest's foreground tasks wait in a queue that
+/// `unofficial_napi_event_loop_checkpoint` runs, one task per checkpoint. A
+/// guest can't have them handed to a hook of its own instead: the bridge gives
+/// `unofficial_napi_attach_env` no native hooks. V8 posts these tasks from any
+/// thread: to resolve an `Atomics.waitAsync` that another thread's
+/// `Atomics.notify` woke, to finish a `WebAssembly.compile`, to run
+/// `FinalizationRegistry` callbacks. A guest that sleeps until its next host
+/// event is not told, so such a task waits until something else wakes the
+/// guest. A host passes a waker that ends that sleep; the guest's next turn
+/// takes the checkpoint that runs the task.
+///
+/// The waker is called after an immediate task is queued, on the thread that
+/// posted it: another guest's thread, a V8 worker thread, or the guest's own
+/// thread in the middle of a guest call or a garbage collection. V8 may hold
+/// its own locks then. So the waker must be quick, must not call into V8 or
+/// run guest code, and must not take a lock that the host holds around guest
+/// calls. It is called for every isolate's tasks, so a host running several
+/// guests wakes them all, and a guest with nothing to run waits again. Delayed
+/// tasks don't call it: each runs at the first checkpoint after its delay.
+/// While a guest's env terminates, its checkpoint refuses and runs no task, and
+/// calls no waker, so the guest does not spin;
+/// `unofficial_napi_cancel_terminate_execution` calls the waker again, on the
+/// guest's thread, when tasks still wait. A panic in the waker is caught, and
+/// its payload leaked, so that it never unwinds into V8.
+///
+/// `None` removes the waker. A waker may call this function itself. A call
+/// that was already under way may still run the waker it replaced after this
+/// returns, and then drop the last reference to it on the posting thread, so
+/// what a waker captures must not call into V8 when it is dropped either.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub fn set_foreground_task_waker(waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    let installed = waker.is_some();
+    let previous = {
+        let mut slot = match FOREGROUND_TASK_WAKER.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = std::mem::replace(&mut *slot, waker);
+        // Under the same lock, so that concurrent calls leave the slot and the
+        // platform's pointer in agreement. Without a waker, the platform gets
+        // no function at all and calls nothing.
+        // Safety: a plain function that lives as long as the process.
+        unsafe {
+            snapi::snapi_bridge_set_foreground_task_waker(
+                installed.then_some(wake_for_foreground_task as extern "C" fn()),
+            );
+        }
+        previous
+    };
+    // Dropped once unlocked: what it captured may call back in.
+    drop(previous);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum NapiVersion {

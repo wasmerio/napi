@@ -12,6 +12,7 @@ struct napi_ref_tracker__ {
   virtual void Finalize() {}
 
   static void FinalizeAll(RefList* list);
+  static bool IsEmpty(const RefList* list) { return list->next_ == nullptr; }
 
  private:
   napi_ref_tracker__* next_ = nullptr;

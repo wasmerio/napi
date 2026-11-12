@@ -19,7 +19,7 @@ use crate::{
     snapi::*,
 };
 
-use super::{abi, util::*};
+use super::{BridgeName, abi, compat, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let _ = unsafe { snapi_bridge_init() };
@@ -340,6 +340,15 @@ fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env:
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+fn guest_unofficial_napi_memory_pressure(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    level: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_memory_pressure(env_handle, level) }
+}
+
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -538,7 +547,7 @@ fn guest_unofficial_napi_create_private_symbol(
     let wl = length;
     let desc = if desc_ptr != 0 {
         if wl == 0xFFFFFFFFu32 {
-            read_guest_c_string(&mut env, desc_ptr)
+            read_guest_c_string_max(&mut env, desc_ptr, V8_MAX_STRING_BYTES)
         } else {
             read_guest_bytes(&mut env, desc_ptr, wl as usize)
         }
@@ -548,10 +557,15 @@ fn guest_unofficial_napi_create_private_symbol(
     let Some(desc) = desc else {
         return 1;
     };
-    let cs = CString::new(desc).unwrap_or_default();
+    let desc = BridgeName::new(desc_ptr, wl, desc);
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
+        snapi_bridge_unofficial_create_private_symbol(
+            env_handle,
+            desc.as_ptr(),
+            desc.len(),
+            &mut out,
+        )
     };
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
@@ -737,6 +751,42 @@ fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u3
     unsafe { snapi_bridge_unofficial_message_drop(payload) };
 }
 
+fn guest_unofficial_napi_create_trusted_script(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u32(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let mut result = 0;
+    let handle = snapi_env(&env, napi_env);
+    let status =
+        unsafe { snapi_bridge_unofficial_create_trusted_script(handle, source, &mut result) };
+    if status == 0 && !write_guest_u32(&mut env, result_ptr, result) {
+        return 1;
+    }
+    status
+}
+
+fn guest_unofficial_napi_is_executing_js(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let mut result = 0;
+    let handle = snapi_env(&env, napi_env);
+    let status = unsafe { snapi_bridge_unofficial_is_executing_js(handle, &mut result) };
+    if status == 0 && !write_guest_u8(&mut env, result_ptr, (result != 0) as u8) {
+        return 1;
+    }
+    status
+}
+
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -779,6 +829,55 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     };
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, out);
+    }
+    status
+}
+
+// Reading `names` can run its elements' getters (author code if an embedder
+// hands it an author array), so this runs in the callback context.
+//
+// An initializer that is a guest function, or calls one, can only reach the
+// guest from an import that lends the store. A first read from one that does
+// not (napi_coerce_to_string, for one) gets undefined from the guest function,
+// as any getter would, and V8 keeps that as the property's value.
+#[allow(clippy::result_large_err)]
+fn guest_unofficial_napi_define_lazy_data_properties(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    names: u32,
+    initializer: u32,
+    attributes: i32,
+) -> Result<i32, WasiError> {
+    let env_handle = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_define_lazy_data_properties(
+            env_handle,
+            object,
+            names,
+            initializer,
+            attributes,
+        )
+    })
+}
+
+fn guest_unofficial_napi_is_lazy_data_property(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    object: u32,
+    key: u32,
+    result_ptr: u32,
+) -> i32 {
+    if result_ptr == 0 || !write_guest_u8(&mut env, result_ptr, 0) {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0;
+    let status = unsafe {
+        snapi_bridge_unofficial_is_lazy_data_property(env_handle, object, key, &mut result)
+    };
+    if status == 0 && !write_guest_u8(&mut env, result_ptr, (result != 0) as u8) {
+        return 1;
     }
     status
 }
@@ -1157,6 +1256,9 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
     status
 }
 
+/// Deprecated (use create_realm), kept for older guests. Makes a realm over
+/// the sandbox, or with a fresh global for a symbol, and writes its global,
+/// which is also its realm id.
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_make_context(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1171,32 +1273,201 @@ fn guest_unofficial_napi_contextify_make_context(
     result_ptr: u32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    let mut result_id = 0u32;
+    match compat::make_context(
+        env_handle,
+        sandbox_or_symbol,
+        name,
+        origin_or_undefined,
+        allow_code_gen_strings,
+        allow_code_gen_wasm,
+        own_microtask_queue,
+        host_defined_option_id,
+    ) {
+        Ok(global) => {
+            if result_ptr != 0 {
+                write_guest_u32(&mut env, result_ptr, global);
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Deprecated (use unofficial_napi_run_script), kept for older guests. The
+/// sandbox names the realm; 0, undefined or null is the current realm.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn guest_unofficial_napi_contextify_run_script(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    sandbox_or_null: u32,
+    source: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    timeout: i64,
+    display_errors: i32,
+    break_on_sigint: i32,
+    break_on_first_line: i32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> Result<i32, WasiError> {
+    let realm = match compat::realm_from_context(snapi_env(&env, napi_env), sandbox_or_null, true) {
+        Ok(realm) => realm,
+        Err(status) => return Ok(status),
+    };
+    guest_unofficial_napi_run_script(
+        env,
+        napi_env,
+        realm,
+        source,
+        filename,
+        line_offset,
+        column_offset,
+        timeout,
+        display_errors,
+        break_on_sigint,
+        break_on_first_line,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
+/// Deprecated (use unofficial_napi_compile_function), kept for older
+/// guests. The parsing context names the realm; 0, undefined or null is the
+/// current realm.
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_contextify_compile_function(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    source: u32,
+    filename: u32,
+    line_offset: i32,
+    column_offset: i32,
+    parsing_context_or_undefined: u32,
+    context_extensions_or_undefined: u32,
+    params_or_undefined: u32,
+    host_defined_option_id: u32,
+    result_ptr: u32,
+) -> i32 {
+    let realm = match compat::realm_from_context(
+        snapi_env(&env, napi_env),
+        parsing_context_or_undefined,
+        true,
+    ) {
+        Ok(realm) => realm,
+        Err(status) => return status,
+    };
+    guest_unofficial_napi_compile_function(
+        env,
+        napi_env,
+        realm,
+        source,
+        filename,
+        line_offset,
+        column_offset,
+        context_extensions_or_undefined,
+        params_or_undefined,
+        host_defined_option_id,
+        result_ptr,
+    )
+}
+
+/// A guest realm id is the value id of the realm's global (or sandbox); 0 is
+/// the env's own realm. See `snapi_bridge_unofficial_create_realm`.
+fn guest_unofficial_napi_create_realm(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    options_ptr: u32,
+    realm_out_ptr: u32,
+    global_out_ptr: u32,
+) -> i32 {
+    let Some(options) = abi::read_realm_options(&mut env, options_ptr) else {
+        return 1;
+    };
+    if realm_out_ptr == 0 {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut realm_id = 0u32;
+    let mut global_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_make_context(
+        snapi_bridge_unofficial_create_realm(
             env_handle,
-            sandbox_or_symbol,
-            name,
-            origin_or_undefined,
-            allow_code_gen_strings,
-            allow_code_gen_wasm,
-            own_microtask_queue,
-            host_defined_option_id,
-            &mut result_id,
+            options.sandbox_or_null,
+            options.name,
+            options.origin,
+            options.host_defined_option_id,
+            i32::from(options.allow_code_gen_strings),
+            i32::from(options.allow_code_gen_wasm),
+            i32::from(options.own_microtask_queue),
+            &mut realm_id,
+            &mut global_id,
         )
     };
-    if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+    if status == 0 {
+        write_guest_u32(&mut env, realm_out_ptr, realm_id);
+        if global_out_ptr != 0 {
+            write_guest_u32(&mut env, global_out_ptr, global_id);
+        }
     }
     status
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_contextify_run_script(
+fn guest_unofficial_napi_get_realm(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
-    sandbox_or_null: u32,
+    value: u32,
+    realm_out_ptr: u32,
+) -> i32 {
+    if realm_out_ptr == 0 {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut realm_id = 0u32;
+    let status = unsafe { snapi_bridge_unofficial_get_realm(env_handle, value, &mut realm_id) };
+    if status == 0 {
+        write_guest_u32(&mut env, realm_out_ptr, realm_id);
+    }
+    status
+}
+
+/// `realm` is a guest realm id (0 for the env's own realm). The scope token is
+/// the provider's, written as a u64.
+fn guest_unofficial_napi_enter_realm(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    realm: u32,
+    scope_out_ptr: u32,
+) -> i32 {
+    if scope_out_ptr == 0 {
+        return 1;
+    }
+    let env_handle = snapi_env(&env, napi_env);
+    let mut scope = 0u64;
+    let status = unsafe { snapi_bridge_unofficial_enter_realm(env_handle, realm, &mut scope) };
+    if status == 0 && !write_guest_u64(&mut env, scope_out_ptr, scope) {
+        // The guest never learns the token, so close the scope again.
+        unsafe { snapi_bridge_unofficial_leave_realm(env_handle, scope) };
+        return 1;
+    }
+    status
+}
+
+fn guest_unofficial_napi_leave_realm(
+    env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    scope: i64,
+) -> i32 {
+    unsafe { snapi_bridge_unofficial_leave_realm(snapi_env(&env, napi_env), scope as u64) }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn guest_unofficial_napi_run_script(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    realm: u32,
     source: u32,
     filename: u32,
     line_offset: i32,
@@ -1214,9 +1485,9 @@ fn guest_unofficial_napi_contextify_run_script(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
-        snapi_bridge_unofficial_contextify_run_script(
+        snapi_bridge_unofficial_run_script(
             env_handle,
-            sandbox_or_null,
+            realm,
             source_text,
             source_bytecode,
             filename,
@@ -1237,14 +1508,14 @@ fn guest_unofficial_napi_contextify_run_script(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn guest_unofficial_napi_contextify_compile_function(
+fn guest_unofficial_napi_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
+    realm: u32,
     source: u32,
     filename: u32,
     line_offset: i32,
     column_offset: i32,
-    parsing_context_or_undefined: u32,
     context_extensions_or_undefined: u32,
     params_or_undefined: u32,
     host_defined_option_id: u32,
@@ -1256,14 +1527,14 @@ fn guest_unofficial_napi_contextify_compile_function(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_compile_function(
+        snapi_bridge_unofficial_compile_function(
             env_handle,
+            realm,
             source_text,
             source_bytecode,
             filename,
             line_offset,
             column_offset,
-            parsing_context_or_undefined,
             context_extensions_or_undefined,
             params_or_undefined,
             host_defined_option_id,
@@ -1291,12 +1562,18 @@ fn guest_unofficial_napi_bytecode_open(
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    let realm =
+        match compat::bytecode_open_realm(env_handle, options.version, options.realm_or_null) {
+            Ok(realm) => realm,
+            Err(status) => return status,
+        };
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
     let status = unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
+            realm,
             options.source_text,
             options.filename,
             options.shape,
@@ -1323,20 +1600,23 @@ fn guest_unofficial_napi_bytecode_open(
     status
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_bytecode_serialize(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     bytecode: u32,
     buffer_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut buffer_id = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id) };
+    // Packaging cache bytes can call the guest's Buffer.from.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id)
+    })?;
     if status == 0 && buffer_ptr != 0 {
         write_guest_u32(&mut env, buffer_ptr, buffer_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_bytecode_release(
@@ -1363,6 +1643,15 @@ fn guest_unofficial_napi_module_wrap_create(
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    let realm = match compat::module_create_realm(
+        env_handle,
+        options.version,
+        options.context_or_undefined,
+        options.realm_or_null,
+    ) {
+        Ok(realm) => realm,
+        Err(status) => return status,
+    };
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
@@ -1372,7 +1661,7 @@ fn guest_unofficial_napi_module_wrap_create(
             options.kind,
             options.wrapper,
             options.url,
-            options.context_or_undefined,
+            realm,
             options.source_text,
             options.source_bytecode,
             options.line_offset,
@@ -1633,21 +1922,23 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
     status
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_create_cached_data(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    // Packaging cache bytes can call the guest's Buffer.from.
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create_cached_data(env_handle, handle, &mut result_id)
-    };
+    })?;
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, result_id);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_set_hooks(
@@ -2338,7 +2629,7 @@ fn guest_napi_set_named_property(
     np: u32,
     v: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2356,7 +2647,7 @@ fn guest_napi_get_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2379,7 +2670,7 @@ fn guest_napi_has_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string(&mut env, np) else {
+    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
         return Ok(1);
     };
     let cn = CString::new(nb).unwrap_or_default();
@@ -2562,11 +2853,11 @@ fn guest_napi_throw_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2587,11 +2878,11 @@ fn guest_napi_throw_type_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -2612,11 +2903,11 @@ fn guest_napi_throw_range_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string(&mut env, code_ptr)
+        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
     } else {
         None
     };
-    let Some(msg_bytes) = read_guest_c_string(&mut env, msg_ptr) else {
+    let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
@@ -3282,7 +3573,7 @@ fn guest_napi_create_function(
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
         // NAPI_AUTO_LENGTH: read null-terminated string
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3302,9 +3593,10 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
+    let s =
+        unsafe { snapi_bridge_create_function(snapi, name.as_ptr(), name.len(), reg_id, &mut out) };
     if s != 0 {
         return s;
     }
@@ -3448,7 +3740,7 @@ fn guest_napi_define_class(
     // Read class name
     let wl = name_len;
     let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
@@ -3464,7 +3756,7 @@ fn guest_napi_define_class(
     unsafe { snapi_bridge_register_callback(snapi, ctor_reg_id, e, constructor, ctor_data as u64) };
 
     let pc = prop_count;
-    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let name = BridgeName::new(name_ptr, wl, name_bytes);
 
     if pc == 0 {
         // No properties — simple case
@@ -3472,8 +3764,8 @@ fn guest_napi_define_class(
         let s = unsafe {
             snapi_bridge_define_class(
                 snapi_env(&env, e),
-                c_name.as_ptr(),
-                wl,
+                name.as_ptr(),
+                name.len(),
                 ctor_reg_id,
                 0,
                 std::ptr::null(),
@@ -3551,7 +3843,8 @@ fn guest_napi_define_class(
 
         // Read property name
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -3632,8 +3925,8 @@ fn guest_napi_define_class(
     let s = unsafe {
         snapi_bridge_define_class(
             snapi_env(&env, e),
-            c_name.as_ptr(),
-            wl,
+            name.as_ptr(),
+            name.len(),
             ctor_reg_id,
             pc,
             prop_names_ptrs.as_ptr(),
@@ -3736,7 +4029,8 @@ fn guest_napi_define_properties(
         ]);
 
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string(&mut env, utf8name_guest).unwrap_or_default()
+            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -4918,6 +5212,7 @@ pub fn register_napi_imports(
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
+        "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
         "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
@@ -4943,9 +5238,13 @@ pub fn register_napi_imports(
         "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
         "unofficial_napi_message_take" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take),
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
+        "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
+        "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
         "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
+        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_lazy_data_properties),
+        "unofficial_napi_is_lazy_data_property" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_lazy_data_property),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
         "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
@@ -4964,6 +5263,12 @@ pub fn register_napi_imports(
         "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
         "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
         "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
+        "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
+        "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
+        "unofficial_napi_enter_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enter_realm),
+        "unofficial_napi_leave_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_leave_realm),
+        "unofficial_napi_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_run_script),
+        "unofficial_napi_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_compile_function),
         "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),
         "unofficial_napi_bytecode_serialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_serialize),
         "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),

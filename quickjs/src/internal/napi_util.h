@@ -68,6 +68,11 @@ public:
 
   static void *realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size);
 
+  // True for a detached ArrayBuffer, which QuickJS's accessors throw for
+  // (Node reports it as having no data and a length of 0). Leaves any
+  // pending exception as it was.
+  static bool is_detached_array_buffer(JSContext *ctx, JSValueConst value);
+
   static int key_filter_to_gpn(napi_key_filter key_filter);
   static napi_status get_property_names(napi_env env,
                                         napi_value object,
@@ -76,11 +81,9 @@ public:
                                         napi_key_conversion key_conversion,
                                         napi_value *result);
 
+  // Errors from the realm's intrinsics. On failure the error is JS_EXCEPTION
+  // and the exception is pending.
   static JSValue create_plain_error(JSContext *ctx, const char *msg);
-  static napi_status create_plain_error_common(napi_env env,
-                                               napi_value code,
-                                               napi_value msg,
-                                               napi_value *result);
   static JSValue create_error_object(JSContext *ctx,
                                      JSValue (*factory)(JSContext *, const char *, ...),
                                      const char *code,

@@ -33,6 +33,10 @@ const WAT: &str = r#"(module
     (func $create_env (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_release_env"
     (func $release_env (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_run_script"
+    (func $realm_run_script
+      (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
+  ;; Deprecated, kept for guests built against older headers.
   (import "napi_extension_wasmer_v0" "unofficial_napi_contextify_run_script"
     (func $contextify_run_script
       (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32) (result i32)))
@@ -40,6 +44,8 @@ const WAT: &str = r#"(module
     (func $checkpoint (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_collect_garbage"
     (func $collect_garbage (param i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_memory_pressure"
+    (func $memory_pressure (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_create"
     (func $message_create (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_take"
@@ -146,6 +152,15 @@ const WAT: &str = r#"(module
   (func (export "eval") (param $ptr i32) (param $len i32) (result i32)
     (call $run_script (global.get $env) (call $string (local.get $ptr) (local.get $len))
       (i32.const 32)))
+  (func (export "run_script_in_realm") (param $ptr i32) (param $len i32) (result i32)
+    (i32.store (i32.const 16) (i32.const 0))
+    (i32.store (i32.const 20) (call $string (local.get $ptr) (local.get $len)))
+    (i32.store (i32.const 24) (i32.const 0))
+    (i32.store (i32.const 56) (call $string (i32.const 116) (i32.const 7)))
+    (call $realm_run_script (global.get $env) (i32.const 0) (i32.const 16)
+      (i32.load (i32.const 56)) (i32.const 0) (i32.const 0) (i64.const -1)
+      (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 32)))
+  ;; The deprecated import with no sandbox: the current realm.
   (func (export "eval_contextify") (param $ptr i32) (param $len i32) (result i32)
     (i32.store (i32.const 16) (i32.const 0))
     (i32.store (i32.const 20) (call $string (local.get $ptr) (local.get $len)))
@@ -156,6 +171,8 @@ const WAT: &str = r#"(module
       (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 32)))
   ;; Creates, links, instantiates, evaluates and destroys a source text
   ;; module. Returns 0, or 1000 * step + status for the first failing step.
+  ;; The options are version 1, as a guest built against older headers
+  ;; sends them, with no context: the current realm.
   (func (export "eval_module") (param $ptr i32) (param $len i32) (result i32)
     (local $status i32) (local $module i32)
     (i32.store (i32.const 16) (i32.const 0))
@@ -221,6 +238,8 @@ const WAT: &str = r#"(module
     (call $request_interrupt (local.get $env) (i32.const 5) (i32.const 0)))
   (func (export "release_status") (result i32) (global.get $release_status))
   (func (export "collect") (result i32) (call $collect_garbage (global.get $env)))
+  (func (export "memory_pressure") (param $level i32) (result i32)
+    (call $memory_pressure (global.get $env) (local.get $level)))
 
   ;; Interrupt callback: record `data` if it runs for this guest's own env.
   (func $on_interrupt (param $env i32) (param $data i32) (result i32)
@@ -375,8 +394,13 @@ impl Guest {
         self.call_with_source("eval", source)
     }
 
-    /// `unofficial_napi_contextify_run_script` in the main context; returns
-    /// its status.
+    /// `unofficial_napi_run_script` in the env's realm; returns its status.
+    pub fn run_script_in_realm(&mut self, source: &str) -> i32 {
+        self.call_with_source("run_script_in_realm", source)
+    }
+
+    /// The deprecated `unofficial_napi_contextify_run_script` with no
+    /// sandbox, which is the current realm; returns its status.
     pub fn eval_contextify(&mut self, source: &str) -> i32 {
         self.call_with_source("eval_contextify", source)
     }
@@ -507,5 +531,11 @@ impl Guest {
     /// status.
     pub fn collect(&mut self) -> i32 {
         self.call0("collect")
+    }
+
+    /// `unofficial_napi_memory_pressure` on this guest's env; returns the
+    /// status.
+    pub fn memory_pressure(&mut self, level: i32) -> i32 {
+        self.call1("memory_pressure", level)
     }
 }
