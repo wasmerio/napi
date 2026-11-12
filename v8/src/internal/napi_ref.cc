@@ -119,7 +119,7 @@ void napi_ref__::ForgetWrap() {
   v8::Local<v8::Private> key = env_->agent->wrap_private_key.Get(isolate);
   v8::Local<v8::Value> wrapped;
   if (object->GetPrivate(context, key).ToLocal(&wrapped) && wrapped->IsExternal() &&
-      wrapped.As<v8::External>()->Value() == this) {
+      wrapped.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault) == this) {
     (void)object->DeletePrivate(context, key);
   }
 }
