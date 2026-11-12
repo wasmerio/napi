@@ -56,6 +56,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
+    println!("cargo:rerun-if-env-changed=NM");
     println!("cargo:rerun-if-env-changed=NAPI_V8_BUILD_METHOD");
     println!("cargo:rerun-if-env-changed=NAPI_V8_DEFINES");
     println!("cargo:rerun-if-env-changed=NAPI_V8_EXTRA_LIBS");
@@ -89,6 +90,10 @@ fn main() {
         .unwrap_or_else(|| "V8_COMPRESS_POINTERS".to_string());
 
     let mut build = cc::Build::new();
+    println!("cargo:rerun-if-changed={}", v8.library_path.display());
+    if supports_realm_collection(&v8.library_path) {
+        build.define("NAPI_V8_REALM_COLLECTION", None);
+    }
     build
         .cpp(true)
         .flag_if_supported("-std=c++20")
@@ -564,6 +569,27 @@ fn link_name_from_path(path: &Path) -> String {
         .or_else(|| without_prefix.strip_suffix(".dylib"))
         .unwrap_or(without_prefix);
     without_suffix.to_string()
+}
+
+fn supports_realm_collection(library: &Path) -> bool {
+    let nm = env::var_os("NM").unwrap_or_else(|| "nm".into());
+    let Ok(output) = std::process::Command::new(nm)
+        .args(["-g", "-P"])
+        .arg(library)
+        .output()
+    else {
+        return false;
+    };
+    // Require a definition. An archive member's undefined reference does not
+    // provide the hook. Mach-O prefixes external C symbols with an underscore.
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            matches!(
+                fields.next(),
+                Some("wasmer_v8_schedule_realm_collection" | "_wasmer_v8_schedule_realm_collection")
+            ) && fields.next() == Some("T")
+        })
 }
 
 fn read_env_value(name: &str, aliases: &[&str]) -> Option<String> {

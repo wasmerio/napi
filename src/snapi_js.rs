@@ -4991,9 +4991,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_memory_pressure(env: SnapiEnv, level: i32) -> i32 {
     let _ = env;
-    // A level outside unofficial_napi_memory_pressure_level (0 to 2) is
-    // napi_invalid_arg, as on the native providers.
-    if !(0..=2).contains(&level) {
+    // Recognize every declared level even though the host-JS provider does
+    // not implement explicit memory pressure or scheduled collection.
+    if !(0..=3).contains(&level) {
         return NAPI_INVALID_ARG;
     }
     NAPI_GENERIC_FAILURE

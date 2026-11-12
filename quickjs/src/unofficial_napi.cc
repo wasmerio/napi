@@ -395,12 +395,20 @@ extern "C"
     {
         if (!napi_util__::check_env(env))
             return napi_invalid_arg;
+        if (level == unofficial_napi_memory_pressure_preserve_code)
+            return napi_generic_failure;
         if (level < unofficial_napi_memory_pressure_none ||
             level > unofficial_napi_memory_pressure_critical)
             return napi_invalid_arg;
         if (level != unofficial_napi_memory_pressure_none)
             JS_RunGC(napi_util__::runtime(env));
         return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_callback_payload_count(napi_env env, size_t* count)
+    {
+        if (count != nullptr) *count = 0;
+        return env == nullptr || count == nullptr ? napi_invalid_arg : napi_generic_failure;
     }
 
     napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(

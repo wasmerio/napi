@@ -544,6 +544,11 @@ typedef enum unofficial_napi_memory_pressure_level {
   unofficial_napi_memory_pressure_none = 0,
   unofficial_napi_memory_pressure_moderate = 1,
   unofficial_napi_memory_pressure_critical = 2,
+  // With a V8 archive that provides realm collection, start or join a
+  // normal incremental major GC without clearing caches or forcing code
+  // flushing. napi_queue_full means retry later and napi_generic_failure
+  // means unsupported. Ordinary GC code aging still applies.
+  unofficial_napi_memory_pressure_preserve_code = 3,
 } unofficial_napi_memory_pressure_level;
 
 // Unofficial helper. Tells the engine the embedder is short of memory. Call
@@ -778,6 +783,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_request_interrupt(
     napi_env env,
     unofficial_napi_interrupt_callback callback,
     void* data);
+
+// Host-only diagnostic: how many function callback payloads `env` holds.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_callback_payload_count(
+    napi_env env, size_t* count);
 
 // Unofficial helper. Enqueues a JS function into V8 microtask queue.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);

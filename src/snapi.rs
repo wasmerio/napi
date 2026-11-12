@@ -1070,6 +1070,8 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     // Callback system
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_callback_record_counts(out: *mut u64);
     pub fn snapi_bridge_create_function(
         env: SnapiEnv,
         utf8name: *const c_char,

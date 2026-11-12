@@ -108,6 +108,42 @@ impl Display for WorkerThreadsAlreadyFixed {
 
 impl std::error::Error for WorkerThreadsAlreadyFixed {}
 
+/// The callback records of the V8 envs this thread owns, summed: a
+/// diagnostic for tests and traces. Each function a guest makes through
+/// N-API holds a registration and a binding for its callback, and a payload
+/// in the engine; all three go when V8 collects the function.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallbackRecordCounts {
+    /// Callback registrations (guest function pointer and data).
+    pub registrations: u64,
+    /// Bindings: the data of live functions.
+    pub bindings: u64,
+    /// The engine's function callback payloads.
+    pub payloads: u64,
+    /// Bindings made over the envs' lives.
+    pub made: u64,
+    /// Bindings freed while these envs were live.
+    pub freed: u64,
+    /// Envs counted.
+    pub envs: u64,
+}
+
+/// See [`CallbackRecordCounts`].
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub fn callback_record_counts() -> CallbackRecordCounts {
+    let mut out = [0u64; 6];
+    // Safety: the callee writes six u64s into `out`.
+    unsafe { snapi::snapi_bridge_callback_record_counts(out.as_mut_ptr()) };
+    CallbackRecordCounts {
+        registrations: out[0],
+        bindings: out[1],
+        payloads: out[2],
+        made: out[3],
+        freed: out[4],
+        envs: out[5],
+    }
+}
+
 /// What [`set_foreground_task_waker`] installed.
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 type ForegroundTaskWaker = std::sync::Arc<dyn Fn() + Send + Sync>;

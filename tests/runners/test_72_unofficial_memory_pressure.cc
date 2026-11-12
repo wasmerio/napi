@@ -175,7 +175,11 @@ TEST_F(Test72UnofficialMemoryPressure, RejectsNullEnvAndUnknownLevels) {
 
   EnvScope s(runtime_.get());
   EXPECT_EQ(unofficial_napi_memory_pressure(s.env, -1), napi_invalid_arg);
-  EXPECT_EQ(unofficial_napi_memory_pressure(s.env, kCritical + 1), napi_invalid_arg);
+  constexpr int32_t preserve = unofficial_napi_memory_pressure_preserve_code;
+  const auto preserve_status = unofficial_napi_memory_pressure(s.env, preserve);
+  EXPECT_TRUE(preserve_status == napi_ok || preserve_status == napi_queue_full ||
+              preserve_status == napi_generic_failure);
+  EXPECT_EQ(unofficial_napi_memory_pressure(s.env, preserve + 1), napi_invalid_arg);
   EXPECT_EQ(RunScriptToString(s.env, "1 + 1"), "2");
 }
 

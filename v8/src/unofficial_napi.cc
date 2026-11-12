@@ -2939,8 +2939,24 @@ static_assert(static_cast<int>(v8::MemoryPressureLevel::kCritical) ==
                   unofficial_napi_memory_pressure_critical,
               "memory pressure levels must match V8's");
 
+#if defined(NAPI_V8_REALM_COLLECTION)
+extern "C" int wasmer_v8_schedule_realm_collection(v8::Isolate*);
+#endif
+
 napi_status NAPI_CDECL unofficial_napi_memory_pressure(napi_env env, int32_t level) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (level == unofficial_napi_memory_pressure_preserve_code) {
+#if defined(NAPI_V8_REALM_COLLECTION)
+    if (!IsEnvThreadEntered(env)) return napi_invalid_arg;
+    switch (wasmer_v8_schedule_realm_collection(env->isolate)) {
+      case 1: return napi_ok;
+      case 2: return napi_queue_full;
+      default: return napi_generic_failure;
+    }
+#else
+    return napi_generic_failure;
+#endif
+  }
   if (level < unofficial_napi_memory_pressure_none ||
       level > unofficial_napi_memory_pressure_critical) {
     return napi_invalid_arg;
@@ -3332,6 +3348,12 @@ napi_status NAPI_CDECL unofficial_napi_is_executing_js(napi_env env, bool* resul
             (queue != nullptr && queue->IsRunningMicrotasks()) ||
             v8::MicrotasksScope::IsRunningMicrotasks(isolate) ||
             env->agent->microtask_checkpoints != 0;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_callback_payload_count(napi_env env, size_t* count) {
+  if (env == nullptr || count == nullptr) return napi_invalid_arg;
+  *count = env->callback_payloads;
   return napi_ok;
 }
 

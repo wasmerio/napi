@@ -2390,12 +2390,14 @@ static void CallbackPayloadCollected(
   if (payload->retained && env->callback_data_release != nullptr) {
     env->callback_data_release(env, payload->data, env->callback_data_hooks_user);
   }
+  --env->callback_payloads;
   env->release(payload);
 }
 
 static void TrackCallbackPayload(napi_env env,
                                  napi_callback_payload__* payload,
                                  v8::Local<v8::External> external) {
+  ++env->callback_payloads;
   if (payload->data != nullptr && env->callback_data_retain != nullptr) {
     env->callback_data_retain(env, payload->data, env->callback_data_hooks_user);
     payload->retained = true;
@@ -2471,6 +2473,7 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (payload == nullptr) return napi_generic_failure;
 
   v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
+  TrackCallbackPayload(env, payload, payloadValue);
   v8::Local<v8::Context> context = env->context();
 
   v8::Local<v8::String> name;
@@ -2762,10 +2765,12 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
   // Use a FunctionTemplate so instances created through napi_define_class()
   // are V8 API objects, matching Node's host-object behavior for wrapped
   // internal classes such as JSStream.
+  v8::Local<v8::External> payloadValue = v8::External::New(env->isolate, payload);
+  TrackCallbackPayload(env, payload, payloadValue);
   v8::Local<v8::FunctionTemplate> ctor_template =
       v8::FunctionTemplate::New(env->isolate,
                                 FunctionTrampoline,
-                                v8::External::New(env->isolate, payload));
+                                payloadValue);
   ctor_template->SetClassName(name);
   ctor_template->InstanceTemplate()->SetInternalFieldCount(1);
 

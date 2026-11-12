@@ -195,6 +195,7 @@ struct napi_env__ {
   CallbackDataHook callback_data_retain = nullptr;
   CallbackDataHook callback_data_release = nullptr;
   void* callback_data_hooks_user = nullptr;
+  size_t callback_payloads = 0;
   // A builder uses static callback IDs in place of External payloads so
   // template functions can be serialized. Restore fills the table before
   // those callbacks run.
