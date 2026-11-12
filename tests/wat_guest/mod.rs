@@ -68,6 +68,10 @@ const WAT: &str = r#"(module
     (func $set_named_property (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_create_function"
     (func $create_function (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_open_handle_scope"
+    (func $open_scope (param i32 i32) (result i32)))
+  (import "napi" "napi_close_handle_scope"
+    (func $close_scope (param i32 i32) (result i32)))
   (import "napi" "napi_create_object" (func $create_object (param i32 i32) (result i32)))
   (import "napi" "napi_add_finalizer"
     (func $add_finalizer (param i32 i32 i32 i32 i32 i32) (result i32)))
@@ -142,6 +146,11 @@ const WAT: &str = r#"(module
   (func (export "scope") (result i32) (global.get $scope))
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
+  (func (export "transient_callback") (result i32)
+    (if (call $open_scope (global.get $env) (i32.const 80)) (then unreachable))
+    (if (call $create_function (global.get $env) (i32.const 0) (i32.const 0)
+          (i32.const 2) (i32.const 0) (i32.const 84)) (then unreachable))
+    (call $close_scope (global.get $env) (i32.load (i32.const 80))))
   (func (export "release_scope") (param $scope i32) (result i32)
     (call $release_env (local.get $scope) (i32.const 0)))
 
@@ -494,6 +503,10 @@ impl Guest {
     /// status.
     pub fn collect(&mut self) -> i32 {
         self.call0("collect")
+    }
+
+    pub fn transient_callback(&mut self) -> i32 {
+        self.call0("transient_callback")
     }
 
     /// `unofficial_napi_memory_pressure` on this guest's env; returns the

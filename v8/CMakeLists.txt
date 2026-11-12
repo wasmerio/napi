@@ -86,6 +86,20 @@ if(NAPI_V8_DEFINES)
 endif()
 if(NAPI_V8_LIBRARY)
   target_link_libraries(napi_v8 PUBLIC "${NAPI_V8_LIBRARY}")
+  if(CMAKE_NM)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NAPI_V8_LIBRARY}")
+    execute_process(
+      COMMAND "${CMAKE_NM}" -g -P "${NAPI_V8_LIBRARY}"
+      RESULT_VARIABLE _napi_v8_nm_status
+      OUTPUT_VARIABLE _napi_v8_symbols
+      ERROR_QUIET
+    )
+    if(_napi_v8_nm_status STREQUAL "0" AND
+       _napi_v8_symbols MATCHES "(^|\n)_?wasmer_v8_schedule_realm_collection[ \t]+T[ \t]")
+      target_compile_definitions(napi_v8 PRIVATE NAPI_V8_REALM_COLLECTION=1)
+    endif()
+    unset(_napi_v8_symbols)
+  endif()
 endif()
 if(NAPI_V8_EXTRA_LIBS)
   target_link_libraries(napi_v8 PUBLIC ${NAPI_V8_EXTRA_LIBS})

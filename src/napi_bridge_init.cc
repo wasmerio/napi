@@ -226,6 +226,8 @@ struct SnapiEnvState {
   // env id the callback is invoked with, so they belong to the env.
   std::unordered_map<uint32_t, CbRegistration> cb_registry;
   uint32_t next_cb_reg_id = 1;
+  uint64_t callback_bindings_made = 0;
+  uint64_t callback_bindings_freed = 0;
   // A restored env binds its static callbacks once.
   bool snapshot_manifest_installed = false;
   bool snapshot_manifest_rejected = false;
@@ -361,6 +363,7 @@ CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) 
   auto* binding = new (std::nothrow) CallbackBinding{state, reg_id, 0};
   if (!binding) return nullptr;
   state->callback_bindings.insert(binding);
+  ++state->callback_bindings_made;
   return binding;
 }
 
@@ -383,6 +386,7 @@ void ReleaseCallbackBinding(napi_env, void* data, void* user) {
   state->cb_registry.erase(binding->reg_id);
   if (binding->setter_reg_id != 0) state->cb_registry.erase(binding->setter_reg_id);
   state->callback_bindings.erase(it);
+  ++state->callback_bindings_freed;
   delete binding;
 }
 
@@ -785,6 +789,26 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
 // ============================================================
 // Initialization
 // ============================================================
+
+// Host-only diagnostic: the callback records of this thread's live envs,
+// summed: out[0] registrations, out[1] bindings, out[2] function payloads,
+// out[3] bindings made, out[4] bindings freed, out[5] envs.
+extern "C" void snapi_bridge_callback_record_counts(uint64_t* out) {
+  if (out == nullptr) return;
+  for (int i = 0; i < 6; ++i) out[i] = 0;
+  if (t_owned_envs == nullptr) return;
+  for (SnapiEnvState* state : *t_owned_envs) {
+    if (state->env == nullptr) continue;
+    size_t payloads = 0;
+    (void)unofficial_napi_get_callback_payload_count(state->env, &payloads);
+    out[0] += state->cb_registry.size();
+    out[1] += state->callback_bindings.size();
+    out[2] += payloads;
+    out[3] += state->callback_bindings_made;
+    out[4] += state->callback_bindings_freed;
+    out[5] += 1;
+  }
+}
 
 extern "C" int snapi_bridge_init() {
   // Intentionally do not create a N-API env here.
@@ -2987,6 +3011,7 @@ extern "C" int snapi_bridge_define_binding(
       for (auto* value : values) {
         if (value->functions == 0) {
           state->callback_bindings.erase(value);
+          ++state->callback_bindings_freed;
           delete value;
         }
       }
@@ -4304,6 +4329,7 @@ static bool InstallSnapshotManifest(SnapiEnvState& state, uint32_t guest_env) {
     for (auto* binding : installed) {
       state.cb_registry.erase(binding->reg_id);
       state.callback_bindings.erase(binding);
+      ++state.callback_bindings_freed;
       delete binding;
     }
     state.snapshot_manifest_rejected = true;
