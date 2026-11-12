@@ -2580,25 +2580,51 @@ guest_is_check!(guest_napi_is_dataview, snapi_bridge_is_dataview);
 guest_is_check!(guest_napi_is_date, snapi_bridge_is_date);
 guest_is_check!(guest_napi_is_promise, snapi_bridge_is_promise);
 
+// Symbol.hasInstance and a proxy's getPrototypeOf trap can run author code,
+// which may call back into the guest: this lends the store.
+#[allow(clippy::result_large_err)]
 fn guest_napi_instanceof(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     obj: u32,
     ctor: u32,
     rp: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_instanceof(snapi_env(&env, e), obj, ctor, &mut r) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
+    })?;
     if s == 0 {
         write_guest_u8(&mut env, rp, r as u8);
     }
-    s
+    Ok(s)
 }
 
 // --- Coercion ---
 
 macro_rules! guest_coerce {
+    // ToNumber and ToString may call valueOf, toString or Symbol.toPrimitive,
+    // which may call back into the guest.
     ($name:ident, $bridge:ident) => {
+        #[allow(clippy::result_large_err)]
+        fn $name(
+            mut env: FunctionEnvMut<NapiEnv>,
+            e: u32,
+            vh: u32,
+            rp: u32,
+        ) -> Result<i32, WasiError> {
+            let mut out: u32 = 0;
+            let snapi = snapi_env(&env, e);
+            let s = with_cb_context(&mut env, e, || unsafe { $bridge(snapi, vh, &mut out) })?;
+            if s == 0 {
+                write_guest_u32(&mut env, rp, out);
+            }
+            Ok(s)
+        }
+    };
+    // ToBoolean and ToObject run no JS.
+    (no_js $name:ident, $bridge:ident) => {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: u32, vh: u32, rp: u32) -> i32 {
             let mut out: u32 = 0;
             let s = unsafe { $bridge(snapi_env(&env, e), vh, &mut out) };
@@ -2610,10 +2636,10 @@ macro_rules! guest_coerce {
     };
 }
 
-guest_coerce!(guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
+guest_coerce!(no_js guest_napi_coerce_to_bool, snapi_bridge_coerce_to_bool);
 guest_coerce!(guest_napi_coerce_to_number, snapi_bridge_coerce_to_number);
 guest_coerce!(guest_napi_coerce_to_string, snapi_bridge_coerce_to_string);
-guest_coerce!(guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
+guest_coerce!(no_js guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 
 // --- Object operations ---
 
@@ -2715,10 +2741,9 @@ fn guest_napi_set_named_property(
     np: u32,
     v: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
+    let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_named_property(snapi, o, cn.as_ptr(), v)
@@ -2733,10 +2758,9 @@ fn guest_napi_get_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
+    let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2756,10 +2780,9 @@ fn guest_napi_has_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, WasiError> {
-    let Some(nb) = read_guest_c_string_max(&mut env, np, V8_MAX_STRING_BYTES) else {
+    let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
-    let cn = CString::new(nb).unwrap_or_default();
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2821,6 +2844,40 @@ fn guest_napi_has_element(
         write_guest_u8(&mut env, rp, r as u8);
     }
     Ok(s)
+}
+
+/// A property name for the bridge: the guest's `NAPI_AUTO_LENGTH` string,
+/// NUL-terminated on the host. A short name (nearly all of them) is copied
+/// into this value; a longer one, or one at the very end of guest memory,
+/// goes through `read_guest_c_string_max` and a `CString` as before.
+struct GuestName {
+    inline: [u8; GUEST_NAME_INLINE],
+    long: Option<CString>,
+}
+
+impl GuestName {
+    /// `None` where `read_guest_c_string_max(.., V8_MAX_STRING_BYTES)` is.
+    #[inline]
+    fn read(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<Self> {
+        let mut name = Self {
+            inline: [0; GUEST_NAME_INLINE],
+            long: None,
+        };
+        if read_guest_name_inline(env, guest_ptr, &mut name.inline).is_none() {
+            let bytes = read_guest_c_string_max(env, guest_ptr, V8_MAX_STRING_BYTES)?;
+            name.long = Some(CString::new(bytes).unwrap_or_default());
+        }
+        Some(name)
+    }
+
+    /// Valid while `self` is neither moved nor dropped.
+    #[inline]
+    fn as_ptr(&self) -> *const c_char {
+        match &self.long {
+            Some(long) => long.as_ptr(),
+            None => self.inline.as_ptr().cast(),
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]

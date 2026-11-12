@@ -62,6 +62,13 @@ struct napi_env_drain_token__ {
 
 namespace {
 
+// A property lookup internalizes its name anyway. Building the key directly
+// from the string table avoids allocating a temporary string for a known key.
+v8::MaybeLocal<v8::String> PropertyKeyFromUtf8(v8::Isolate* isolate,
+                                             const char* name) {
+  return v8::String::NewFromUtf8(isolate, name, v8::NewStringType::kInternalized);
+}
+
 void ReleaseDrainToken(napi_env /*env*/, void* data) {
   auto* token = static_cast<napi_env_drain_token__*>(data);
   if (token->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete token;
@@ -2786,8 +2793,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
     v8::Local<v8::Name> key;
     if (desc.utf8name != nullptr) {
       v8::Local<v8::String> key_str;
-      if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal)
-               .ToLocal(&key_str)) {
+      if (!PropertyKeyFromUtf8(env->isolate, desc.utf8name).ToLocal(&key_str)) {
         return napi_generic_failure;
       }
       key = key_str;
@@ -2941,9 +2947,7 @@ napi_status NAPI_CDECL napi_define_properties(
     v8::Local<v8::Name> key;
     if (desc.utf8name != nullptr) {
       v8::Local<v8::String> key_str;
-      if (!v8::String::NewFromUtf8(
-               env->isolate, desc.utf8name, v8::NewStringType::kNormal)
-               .ToLocal(&key_str)) {
+      if (!PropertyKeyFromUtf8(env->isolate, desc.utf8name).ToLocal(&key_str)) {
         return napi_generic_failure;
       }
       key = key_str;
@@ -3089,9 +3093,7 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
   v8::Local<v8::String> key;
-  if (!v8::String::NewFromUtf8(
-           env->isolate, utf8name, v8::NewStringType::kNormal)
-           .ToLocal(&key)) {
+  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
     return napi_generic_failure;
   }
   v8::TryCatch tc(env->isolate);
@@ -3278,9 +3280,7 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
   v8::Local<v8::String> key;
-  if (!v8::String::NewFromUtf8(
-           env->isolate, utf8name, v8::NewStringType::kNormal)
-           .ToLocal(&key)) {
+  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
     return napi_generic_failure;
   }
   v8::TryCatch tc(env->isolate);
@@ -3304,9 +3304,7 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
   v8::Local<v8::String> key;
-  if (!v8::String::NewFromUtf8(
-           env->isolate, utf8name, v8::NewStringType::kNormal)
-           .ToLocal(&key)) {
+  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
     return napi_generic_failure;
   }
   v8::TryCatch tc(env->isolate);

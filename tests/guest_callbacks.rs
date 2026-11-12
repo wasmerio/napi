@@ -25,6 +25,11 @@ const WAT: &str = r#"(module
   (import "napi" "napi_get_global" (func $get_global (param i32 i32) (result i32)))
   (import "napi" "napi_set_named_property"
     (func $set_named_property (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_named_property"
+    (func $get_named_property (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_coerce_to_number" (func $to_number (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_coerce_to_string" (func $to_string (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_instanceof" (func $instanceof (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_create_function"
     (func $create_function (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_get_cb_info"
@@ -39,8 +44,9 @@ const WAT: &str = r#"(module
   (import "napi" "napi_typeof" (func $typeof (param i32 i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
-  ;; 72 int out, 200..228 scratch. Callbacks take 64- or 256-byte frames from
-  ;; a stack starting at 32768 so nested calls keep their own out-slots.
+  ;; 72 int out, 200..228 callback scratch, 432..439 coercion scratch.
+  ;; Callbacks take 64- or 256-byte frames from a stack starting at 32768
+  ;; so nested calls keep their own out-slots.
   (memory (export "memory") 2)
   (table (export "__indirect_function_table") 16 funcref)
   (global $env (mut i32) (i32.const 0))
@@ -56,6 +62,9 @@ const WAT: &str = r#"(module
   (data (i32.const 156) "many16\00")
   (data (i32.const 164) "undef\00")
   (data (i32.const 172) "badret\00")
+  (data (i32.const 480) "coercionInput\00")
+  (data (i32.const 496) "coercionResult\00")
+  (data (i32.const 512) "InstanceCheck\00")
 
   ;; Records the first failing step; the host reads it through `err`.
   (func $fail (param $code i32)
@@ -99,6 +108,28 @@ const WAT: &str = r#"(module
     (if (call $get_int32 (global.get $env) (i32.load (i32.const 32)) (i32.const 72))
       (then (return (i32.const -999999))))
     (i32.load (i32.const 72)))
+
+  (func $global_value (param $name i32) (result i32)
+    (if (call $get_named_property (global.get $env) (i32.load (i32.const 48))
+          (local.get $name) (i32.const 432))
+      (then unreachable))
+    (i32.load (i32.const 432)))
+
+  (func (export "coerce") (param $as_string i32) (result i32)
+    (local $input i32) (local $status i32)
+    (local.set $input (call $global_value (i32.const 480)))
+    (local.set $status (if (result i32) (local.get $as_string)
+      (then (call $to_string (global.get $env) (local.get $input) (i32.const 436)))
+      (else (call $to_number (global.get $env) (local.get $input) (i32.const 436)))))
+    (if (local.get $status) (then (return (local.get $status))))
+    (call $set_named_property (global.get $env) (i32.load (i32.const 48))
+      (i32.const 496) (i32.load (i32.const 436))))
+
+  (func (export "instanceof") (result i32)
+    (if (call $instanceof (global.get $env) (call $global_value (i32.const 480))
+          (call $global_value (i32.const 512)) (i32.const 436))
+      (then (return (i32.const -1))))
+    (i32.load8_u (i32.const 436)))
 
   ;; rec(n, step): inside its own scope, calls step(n - 1), which calls rec
   ;; again; then re-reads its own callback info after the inner callbacks
@@ -396,6 +427,49 @@ fn nested_callbacks_scopes_and_arguments() {
     let (ctx, engine, module) = setup();
     let mut guest = Guest::new(&ctx, &engine, &module);
     assert_eq!(guest.eval(ROUNDS), (0, 300, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+#[test]
+fn coercion_and_instanceof_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let coerce: TypedFunction<i32, i32> = guest.typed("coerce");
+    assert_eq!(
+        guest.eval("globalThis.coercionInput = { valueOf() { return rec(1, () => 40); } }; 0"),
+        (0, 0, 0)
+    );
+    assert_eq!(coerce.call(&mut guest.store, 0).unwrap(), 0);
+    assert_eq!(guest.eval("Number(coercionResult === 41)"), (0, 1, 0));
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.coercionInput = { [Symbol.toPrimitive]() { return rec(1, () => 40); } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(coerce.call(&mut guest.store, 1).unwrap(), 0);
+    assert_eq!(guest.eval("Number(coercionResult === '41')"), (0, 1, 0));
+
+    let instanceof: TypedFunction<(), i32> = guest.typed("instanceof");
+    assert_eq!(
+        guest.eval(
+            "globalThis.InstanceCheck = class { static [Symbol.hasInstance]() { \
+             return rec(1, () => 40) === 41; } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(instanceof.call(&mut guest.store).unwrap(), 1);
+    assert_eq!(
+        guest.eval(
+            "globalThis.InstanceCheck = class {}; \
+             globalThis.coercionInput = new Proxy({}, { getPrototypeOf() { \
+             return rec(1, () => 40) === 41 ? InstanceCheck.prototype : null; } }); 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(instanceof.call(&mut guest.store).unwrap(), 1);
+    assert_eq!(guest.eval("0"), (0, 0, 0));
     assert_eq!(guest.release(), 0);
 }
 

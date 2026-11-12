@@ -309,6 +309,35 @@ pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) ->
     read_guest_c_string_max(env, guest_ptr, usize::MAX)
 }
 
+/// Room for a short guest name and its NUL (`read_guest_name_inline`).
+pub const GUEST_NAME_INLINE: usize = 128;
+
+/// The guest's NUL-terminated string at `guest_ptr`, copied with its NUL into
+/// `out`, for property names: they are short, and this costs no allocation.
+/// Returns the length without the NUL. `None` if the string and its NUL do not
+/// fit `out`, if the full inline window extends past guest memory, or with
+/// no guest heap: the caller then reads it with `read_guest_c_string_max`.
+/// A copy that holds a NUL the scan did not see (another guest thread wrote
+/// it meanwhile) gives the empty string, as `CString::new(..).unwrap_or_default()`
+/// does on that path.
+pub fn read_guest_name_inline(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    out: &mut [u8; GUEST_NAME_INLINE],
+) -> Option<usize> {
+    let src = guest_range(env, guest_ptr, GUEST_NAME_INLINE)?;
+    // SAFETY: the range is mapped guest memory.
+    let len = unsafe { guest_nul_offset(src, GUEST_NAME_INLINE) }?;
+    // SAFETY: `len` < `GUEST_NAME_INLINE` bytes of that range, into `out`.
+    unsafe { copy_from_guest(src, out.as_mut_ptr(), len) };
+    if out[..len].contains(&0) {
+        out[0] = 0;
+        return Some(0);
+    }
+    out[len] = 0;
+    Some(len)
+}
+
 /// As `read_guest_c_string`, but also `None` for a string longer than `max`
 /// bytes, without a scan past them. Strings the bridge hands to V8 with no
 /// length (names, error codes and messages, symbol descriptions) are read with
@@ -374,8 +403,9 @@ mod tests {
     use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Memory, MemoryType, Pages, Store};
 
     use super::{
-        V8_MAX_STRING_BYTES, c_string_search_len, copy_from_guest, copy_to_guest, guest_data_size,
-        guest_nul_offset, read_guest_c_string_max,
+        GUEST_NAME_INLINE, V8_MAX_STRING_BYTES, c_string_search_len, copy_from_guest,
+        copy_to_guest, guest_data_size, guest_nul_offset, read_guest_c_string_max,
+        read_guest_name_inline,
     };
     use crate::NapiEnv;
     use crate::budget::ResourceBudget;
@@ -587,6 +617,93 @@ mod tests {
                     "{case}"
                 );
             }
+        }
+    }
+
+    /// `read_guest_name_inline` copies a name of up to `GUEST_NAME_INLINE - 1`
+    /// bytes with its NUL and leaves everything else to the caller's other
+    /// path: a longer name, one whose buffer-sized window runs past the end
+    /// of guest memory, and a memory with no guest heap.
+    #[test]
+    fn inline_names_are_short_names_only() {
+        let mut store = Store::default();
+        let ty = MemoryType::new(Pages(64), Some(Pages(2048)), false);
+        let memory = Memory::new(&mut store, ty).expect("create owned memory");
+        let heap = GuestHeap::new(
+            &mut store.as_store_mut(),
+            &memory,
+            ResourceBudget::unlimited(),
+        )
+        .expect("guest heap");
+        for heap in [Some(heap), None] {
+            let inline = heap.is_some();
+            let mut state = NapiEnv::new(
+                ResourceBudget::unlimited(),
+                None,
+                Arc::new(Mutex::new(EnvRegistry::default())),
+                Arc::new(AtomicBool::new(false)),
+            );
+            state.memory = Some(memory.clone());
+            state.guest_heap = heap;
+            let mut env = FunctionEnv::new(&mut store, state).into_mut(&mut store);
+            let size = u32::try_from(guest_data_size(&mut env)).unwrap();
+            let put = |env: &mut FunctionEnvMut<NapiEnv>, ptr: u32, bytes: &[u8]| {
+                let (state, store) = env.data_and_store_mut();
+                let view = state.memory.as_ref().unwrap().view(&store);
+                view.write(u64::from(ptr), bytes).unwrap();
+            };
+            let window = GUEST_NAME_INLINE as u32;
+            for len in [
+                0,
+                1,
+                7,
+                8,
+                9,
+                100,
+                GUEST_NAME_INLINE - 1,
+                GUEST_NAME_INLINE,
+                300,
+            ] {
+                let name: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+                // What follows the NUL is not part of the name.
+                put(
+                    &mut env,
+                    4096,
+                    &[name.clone(), vec![0], vec![b'#'; 8]].concat(),
+                );
+                let mut out = [0xffu8; GUEST_NAME_INLINE];
+                let read = read_guest_name_inline(&mut env, 4096, &mut out);
+                if inline && len < GUEST_NAME_INLINE {
+                    assert_eq!(read, Some(len), "length {len}");
+                    assert_eq!(&out[..len], &name[..], "length {len}");
+                    assert_eq!(out[len], 0, "length {len}");
+                } else {
+                    assert_eq!(read, None, "length {len}, heap {inline}");
+                }
+                assert_eq!(
+                    read_guest_c_string_max(&mut env, 4096, V8_MAX_STRING_BYTES),
+                    Some(name),
+                    "length {len}"
+                );
+            }
+            // The window is the memory's last bytes: read. One byte later, it
+            // runs past the end: the other path's.
+            put(&mut env, size - window, b"last\0");
+            let mut out = [0xffu8; GUEST_NAME_INLINE];
+            assert_eq!(
+                read_guest_name_inline(&mut env, size - window, &mut out),
+                inline.then_some(4)
+            );
+            put(&mut env, size - window + 1, b"past\0");
+            assert_eq!(
+                read_guest_name_inline(&mut env, size - window + 1, &mut out),
+                None
+            );
+            assert_eq!(
+                read_guest_c_string_max(&mut env, size - window + 1, V8_MAX_STRING_BYTES),
+                Some(b"past".to_vec())
+            );
+            assert_eq!(read_guest_name_inline(&mut env, size, &mut out), None);
         }
     }
 }
