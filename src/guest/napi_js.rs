@@ -5503,6 +5503,42 @@ fn guest_unofficial_napi_release_buffer_lease(
     if status != 0 { status } else { delete_status }
 }
 
+// Owned objects (unofficial_napi.h): not provided by the host-JavaScript
+// backend. napi_generic_failure tells the caller to make its calls one by one.
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_create_owned_object(
+    _env: FunctionEnvMut<NapiEnv>,
+    _e: u32,
+    _source_ref: u32,
+    _native_data: u32,
+    _finalize_cb: u32,
+    _finalize_hint: u32,
+    _owner: u32,
+    _owner_ref: u32,
+    _owner_map: u32,
+    _owner_map_set: u32,
+    _flags: u32,
+    _result_out: u32,
+    _weak_out: u32,
+) -> i32 {
+    9
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guest_unofficial_napi_move_owned_object(
+    _env: FunctionEnvMut<NapiEnv>,
+    _e: u32,
+    _object_ref: u32,
+    _from_owner_ref: u32,
+    _to_owner: u32,
+    _to_owner_ref: u32,
+    _owner_map: u32,
+    _owner_map_set: u32,
+    _state_out: u32,
+) -> i32 {
+    9
+}
+
 fn guest_unofficial_napi_create_guest_backed_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
@@ -6096,6 +6132,8 @@ pub fn register_napi_imports(
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
+        "unofficial_napi_create_owned_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_owned_object),
+        "unofficial_napi_move_owned_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_move_owned_object),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

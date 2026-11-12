@@ -1002,6 +1002,35 @@ unsafe extern "C" {
         data_out: *mut u64,
         value_out: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapi_bridge_unofficial_create_owned_object(
+        env: SnapiEnv,
+        source_ref: u32,
+        native_data: u64,
+        guest_env: u32,
+        wasm_fn_ptr: u32,
+        finalize_hint: u32,
+        owner: u32,
+        owner_ref: u32,
+        owner_map_ref: u32,
+        owner_map_set_ref: u32,
+        flags: u32,
+        value_out: *mut u32,
+        ref_out: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapi_bridge_unofficial_move_owned_object(
+        env: SnapiEnv,
+        object_ref: u32,
+        from_owner_ref: u32,
+        to_owner: u32,
+        to_owner_ref: u32,
+        owner_map_ref: u32,
+        owner_map_set_ref: u32,
+        state_out: *mut u32,
+    ) -> i32;
     #[allow(unused)]
     pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
     -> i32;
