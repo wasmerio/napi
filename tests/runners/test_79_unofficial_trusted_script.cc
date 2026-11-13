@@ -234,13 +234,13 @@ TEST_F(Test79UnofficialTrustedScript, SourceIgnoresAuthorStringConversion) {
                             "return error instanceof TypeError; } return false; })()"));
 }
 
-// Function converts arguments before V8's code-generation hook. Pin the
-// limitation so a direct-eval guarantee is not mistaken for full Trusted Types.
-TEST_F(Test79UnofficialTrustedScript, FunctionConstructorUsesOrdinaryAuthorCoercion) {
+// V8 uses the code-generation hook for each Function constructor argument.
+TEST_F(Test79UnofficialTrustedScript, FunctionConstructorUsesTrustedSource) {
   EnvScope s(runtime_.get());
   InstallGlobal(s.env, "makeTrusted", MakeTrusted, nullptr);
-  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t.toString = () => 'return 2'; return Function(t)() === 2;})()"));
-  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t[Symbol.toPrimitive] = () => 'return 3'; return Function(t)() === 3;})()"));
+  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t.toString = () => 'return 2'; return Function(t)() === 1;})()"));
+  EXPECT_TRUE(IsTrue(s.env, "(() => {const t = makeTrusted('return 1'); t[Symbol.toPrimitive] = () => 'return 3'; return Function(t)() === 1;})()"));
+  EXPECT_TRUE(IsTrue(s.env, "Function({toString: () => 'return 4'})() === 4"));
 }
 
 TEST_F(Test79UnofficialTrustedScript, BrandCannotBeCopiedOrInherited) {

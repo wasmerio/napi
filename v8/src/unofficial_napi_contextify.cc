@@ -201,7 +201,7 @@ bool SetNamed(v8::Local<v8::Context> context,
               v8::Local<v8::Object> target,
               const char* key,
               v8::Local<v8::Value> value) {
-  return target->Set(context, OneByteString(context->GetIsolate(), key), value).FromMaybe(false);
+  return target->Set(context, OneByteString(v8::Isolate::GetCurrent(), key), value).FromMaybe(false);
 }
 
 bool SetSymbol(v8::Local<v8::Context> context,
@@ -221,7 +221,7 @@ bool SetApiPrivate(v8::Local<v8::Context> context,
                    const char* description,
                    v8::Local<v8::Value> value) {
   if (target.IsEmpty() || description == nullptr) return false;
-  return target->SetPrivate(context, ApiPrivate(context->GetIsolate(), description), value).FromMaybe(false);
+  return target->SetPrivate(context, ApiPrivate(v8::Isolate::GetCurrent(), description), value).FromMaybe(false);
 }
 
 void ResetRef(napi_env env, napi_ref* ref_ptr) {
@@ -914,16 +914,16 @@ std::string RequireAsyncModuleMessage(const std::string& filename,
 }
 
 void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const std::string& message) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) {
-    context->GetIsolate()->ThrowException(v8::Exception::Error(
-        v8::String::NewFromUtf8(context->GetIsolate(), message.c_str(), v8::NewStringType::kNormal).ToLocalChecked()));
+    v8::Isolate::GetCurrent()->ThrowException(v8::Exception::Error(
+        v8::String::NewFromUtf8(v8::Isolate::GetCurrent(), message.c_str(), v8::NewStringType::kNormal).ToLocalChecked()));
     return;
   }
   napi_value error = nullptr;
   if (!CreateCodeError(env, code, message, &error) || error == nullptr) return;
   // Setting the error's code runs an inherited `code` setter.
-  napi_v8_throw_unless_terminating(context->GetIsolate(), napi_v8_unwrap_value(error));
+  napi_v8_throw_unless_terminating(v8::Isolate::GetCurrent(), napi_v8_unwrap_value(error));
 }
 
 ModuleWrapRecord* FindModuleRecordForModule(napi_env env, v8::Local<v8::Module> module) {
@@ -1031,7 +1031,7 @@ bool PopulateModuleRequests(napi_env env,
   v8::Local<v8::FixedArray> raw_requests = module->GetModuleRequests();
   record->module_requests.reserve(raw_requests->Length());
   for (int i = 0; i < raw_requests->Length(); ++i) {
-    v8::Local<v8::Value> request_value = raw_requests->Get(context, i).As<v8::Value>();
+    v8::Local<v8::Data> request_value = raw_requests->Get(i);
     if (request_value.IsEmpty() || !request_value->IsModuleRequest()) {
       return false;
     }
@@ -1042,8 +1042,8 @@ bool PopulateModuleRequests(napi_env env,
 
     v8::Local<v8::FixedArray> raw_attributes = request->GetImportAttributes();
     for (int j = 0; j < raw_attributes->Length(); j += 3) {
-      v8::Local<v8::Value> key_value = raw_attributes->Get(context, j).As<v8::Value>();
-      v8::Local<v8::Value> value_value = raw_attributes->Get(context, j + 1).As<v8::Value>();
+      v8::Local<v8::Value> key_value = raw_attributes->Get(j).As<v8::Value>();
+      v8::Local<v8::Value> value_value = raw_attributes->Get(j + 1).As<v8::Value>();
       if (key_value.IsEmpty() || value_value.IsEmpty()) {
         return false;
       }
@@ -1064,7 +1064,7 @@ v8::MaybeLocal<v8::Module> ModuleResolveCallback(v8::Local<v8::Context> context,
                                                  v8::Local<v8::String> specifier,
                                                  v8::Local<v8::FixedArray> import_attributes,
                                                  v8::Local<v8::Module> referrer) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) return v8::MaybeLocal<v8::Module>();
   ModuleWrapRecord* dependent = FindModuleRecordForModule(env, referrer);
   if (dependent == nullptr || dependent->linked_requests.empty()) {
@@ -1074,8 +1074,8 @@ v8::MaybeLocal<v8::Module> ModuleResolveCallback(v8::Local<v8::Context> context,
 
   std::vector<ModuleImportAttributeRecord> attributes;
   for (int i = 0; i < import_attributes->Length(); i += 3) {
-    v8::Local<v8::Value> key_value = import_attributes->Get(context, i).As<v8::Value>();
-    v8::Local<v8::Value> value_value = import_attributes->Get(context, i + 1).As<v8::Value>();
+    v8::Local<v8::Value> key_value = import_attributes->Get(i).As<v8::Value>();
+    v8::Local<v8::Value> value_value = import_attributes->Get(i + 1).As<v8::Value>();
     if (key_value.IsEmpty() || value_value.IsEmpty()) {
       return v8::MaybeLocal<v8::Module>();
     }
@@ -1089,14 +1089,19 @@ v8::MaybeLocal<v8::Module> ModuleResolveCallback(v8::Local<v8::Context> context,
     ThrowV8CodeError(context, "ERR_VM_MODULE_LINK_FAILURE", "Module request is not cached");
     return v8::MaybeLocal<v8::Module>();
   }
-  return dependent->linked_requests[it->second]->module.Get(env->isolate);
+  auto requested = dependent->linked_requests[it->second]->module.Get(env->isolate);
+  if (requested->GetStatus() == v8::Module::kEvaluating) {
+    ThrowV8CodeError(context, "ERR_VM_MODULE_STATUS", "A module it imports is evaluating");
+    return {};
+  }
+  return requested;
 }
 
 v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> context,
                                                        v8::Local<v8::String> specifier,
                                                        v8::Local<v8::FixedArray> import_attributes,
                                                        v8::Local<v8::Module> referrer) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) return v8::MaybeLocal<v8::Object>();
   ModuleWrapRecord* dependent = FindModuleRecordForModule(env, referrer);
   if (dependent == nullptr || dependent->linked_requests.empty()) {
@@ -1106,8 +1111,8 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
 
   std::vector<ModuleImportAttributeRecord> attributes;
   for (int i = 0; i < import_attributes->Length(); i += 3) {
-    v8::Local<v8::Value> key_value = import_attributes->Get(context, i).As<v8::Value>();
-    v8::Local<v8::Value> value_value = import_attributes->Get(context, i + 1).As<v8::Value>();
+    v8::Local<v8::Value> key_value = import_attributes->Get(i).As<v8::Value>();
+    v8::Local<v8::Value> value_value = import_attributes->Get(i + 1).As<v8::Value>();
     if (key_value.IsEmpty() || value_value.IsEmpty()) {
       return v8::MaybeLocal<v8::Object>();
     }
@@ -1143,7 +1148,7 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
 
 v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> context,
                                                          v8::Local<v8::Module> module) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   napi_env env = GetModuleWrapEnvForIsolate(isolate);
   ModuleWrapRecord* record = env != nullptr ? FindModuleRecordForModule(env, module) : nullptr;
   napi_value wrapper = record != nullptr ? GetRefValue(env, record->wrapper_ref) : nullptr;
@@ -1191,8 +1196,8 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
   names.reserve(import_attributes->Length() / 2);
   values.reserve(import_attributes->Length() / 2);
   for (int i = 0; i < import_attributes->Length(); i += 2) {
-    v8::Local<v8::Value> key = import_attributes->Get(context, i).As<v8::Value>();
-    v8::Local<v8::Value> value = import_attributes->Get(context, i + 1).As<v8::Value>();
+    v8::Local<v8::Value> key = import_attributes->Get(i).As<v8::Value>();
+    v8::Local<v8::Value> value = import_attributes->Get(i + 1).As<v8::Value>();
     if (key.IsEmpty() || value.IsEmpty() || !key->IsName()) continue;
     names.push_back(key.As<v8::Name>());
     values.push_back(value);
@@ -1206,7 +1211,7 @@ v8::Local<v8::Object> CreateDynamicImportAttributesObject(
 // process when none was, so the import callback returns one only after
 // throwing.
 v8::MaybeLocal<v8::Promise> RejectImport(v8::Local<v8::Context> context) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Promise::Resolver> resolver;
@@ -1231,7 +1236,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   // The hooks stay the isolate's import callback after the module loader lets
   // go of them (its cleanup hook, at the env's release), and they may have
   // had no import callback at all: then nothing can load the module.
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) return RejectImport(context);
 
   auto* state = GetModuleWrapState(env);
@@ -1239,7 +1244,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   napi_value callback = GetRefValue(env, state->import_module_dynamically_ref);
   if (callback == nullptr) return RejectImport(context);
 
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(context);
 
@@ -1248,7 +1253,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamicallyWithPhase(
   if (!host_defined_options.IsEmpty() && host_defined_options->IsFixedArray()) {
     v8::Local<v8::FixedArray> options = host_defined_options.As<v8::FixedArray>();
     if (options->Length() == kHostDefinedOptionsLength) {
-      id = options->Get(context, kHostDefinedOptionsId).As<v8::Value>();
+      id = options->Get(kHostDefinedOptionsId).As<v8::Value>();
       have_host_defined_options = true;
     }
   }
@@ -1319,7 +1324,7 @@ v8::MaybeLocal<v8::Promise> ImportModuleDynamically(
 void HostInitializeImportMetaObject(v8::Local<v8::Context> context,
                                     v8::Local<v8::Module> module,
                                     v8::Local<v8::Object> meta) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) return;
   ModuleWrapBindingState* state = nullptr;
   {
@@ -1356,7 +1361,7 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
                                                       v8::Local<v8::String> specifier,
                                                       v8::Local<v8::FixedArray> import_attributes,
                                                       v8::Local<v8::Module> referrer) {
-  napi_env env = GetModuleWrapEnvForIsolate(context->GetIsolate());
+  napi_env env = GetModuleWrapEnvForIsolate(v8::Isolate::GetCurrent());
   if (env == nullptr) return v8::MaybeLocal<v8::Module>();
   // Instantiating the facade instantiates the module it wraps, if that is not
   // done yet, and the modules it requests: those resolve to what they were
@@ -1369,10 +1374,10 @@ v8::MaybeLocal<v8::Module> LinkRequiredFacadeOriginal(v8::Local<v8::Context> con
       state->temporary_required_module_facade_original->module.IsEmpty()) {
     return v8::MaybeLocal<v8::Module>();
   }
-  if (V8ValueToUtf8(context->GetIsolate(), specifier) != "original") {
+  if (V8ValueToUtf8(v8::Isolate::GetCurrent(), specifier) != "original") {
     return v8::MaybeLocal<v8::Module>();
   }
-  return state->temporary_required_module_facade_original->module.Get(context->GetIsolate());
+  return state->temporary_required_module_facade_original->module.Get(v8::Isolate::GetCurrent());
 }
 
 // The realm whose context is `context`, or null for any other context.
@@ -1382,7 +1387,8 @@ unofficial_napi_realm RealmForContext(v8::Local<v8::Context> context) {
     return nullptr;
   }
   return static_cast<unofficial_napi_realm>(
-      context->GetAlignedPointerFromEmbedderData(kRealmContextSlot));
+      context->GetAlignedPointerFromEmbedderData(
+          v8::Isolate::GetCurrent(), kRealmContextSlot, v8::kEmbedderDataTypeTagDefault));
 }
 
 // The context code for `realm` runs in: the env's own for a null realm.
@@ -1535,7 +1541,7 @@ v8::MaybeLocal<v8::Function> CompileCjsFunction(v8::Local<v8::Context> context,
                                                 v8::Local<v8::String> filename,
                                                 bool is_cjs_scope,
                                                 v8::Local<v8::Symbol> host_id_symbol = v8::Local<v8::Symbol>()) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
 
   v8::ScriptOrigin origin(filename,
                           0,
@@ -1874,7 +1880,7 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
                        v8::MaybeLocal<v8::ObjectTemplate>(),
                        maybe_global_object,
                        v8::DeserializeInternalFieldsCallback(),
-                       realm->own_microtask_queue.get());
+                       realm->own_microtask_queue.Get());
   if (context.IsEmpty()) return napi_pending_exception;
 
   context->SetSecurityToken(current->GetSecurityToken());
@@ -1882,7 +1888,11 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   // AllowWasmCodeGenerationCallback, which this provider does not install.
   // name and origin are ignored too.
   context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
-  context->SetAlignedPointerInEmbedderData(kRealmContextSlot, realm.get());
+  // The realm slot can be beyond the context's initial embedder data.
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
+  context->SetAlignedPointerInEmbedderData(
+      kRealmContextSlot, realm.get(), v8::kEmbedderDataTypeTagDefault);
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
   NapiV8ApplyPromiseHooksToContext(env, context);
   realm->context.Reset(isolate, context);
   realm->context.SetWeak();
@@ -2209,7 +2219,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
   v8::Local<v8::Context> target_context = RealmContext(env, realm_or_null);
   if (target_context.IsEmpty()) return napi_invalid_arg;
   v8::MicrotaskQueue* target_queue =
-      realm_or_null != nullptr ? realm_or_null->own_microtask_queue.get() : nullptr;
+      realm_or_null != nullptr ? realm_or_null->own_microtask_queue.Get() : nullptr;
 
   BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
@@ -2979,6 +2989,9 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
+  // The module is already linked while its evaluation is running. V8's
+  // InstantiateModule rejects this status even for an already linked module.
+  if (module->GetStatus() == v8::Module::kEvaluating) return napi_ok;
 
   v8::TryCatch try_catch(isolate);
   InstantiationScope instantiating(env);
@@ -3017,8 +3030,7 @@ static bool ThrowIfEvaluating(napi_env env, ModuleWrapRecord* record) {
 // evaluation steps are running (a CHECK). Script reaches that from those
 // steps, for example a CommonJS module that requires an ES module importing
 // it, a cycle Node refuses too. So evaluating `record` is refused when what it
-// would evaluate (the instantiated source text modules it reaches through the
-// modules they were linked to) imports such a module.
+// would instantiate or evaluate imports such a module.
 static bool ThrowIfImportingAnEvaluatingSyntheticModule(napi_env env, ModuleWrapRecord* record) {
   auto* state = GetModuleWrapState(env);
   if (state == nullptr || state->synthetic_steps_running == 0) return false;
@@ -3033,10 +3045,13 @@ static bool ThrowIfImportingAnEvaluatingSyntheticModule(napi_env env, ModuleWrap
     pending.pop_back();
     v8::Local<v8::Module> module = current->module.Get(isolate);
     if (module.IsEmpty() || !module->IsSourceTextModule() ||
-        module->GetStatus() != v8::Module::kInstantiated) {
+        (module->GetStatus() != v8::Module::kUninstantiated &&
+         module->GetStatus() != v8::Module::kInstantiated)) {
       continue;
     }
-    for (ModuleWrapRecord* linked : current->linked_requests) {
+    for (size_t i = 0; i < current->linked_requests.size(); ++i) {
+      if (current->module_requests[i].phase == 1) continue;  // Source-phase import.
+      ModuleWrapRecord* linked = current->linked_requests[i];
       if (live.count(linked) == 0 || !seen.insert(linked).second) continue;
       v8::Local<v8::Module> requested = linked->module.Get(isolate);
       if (requested.IsEmpty()) continue;
@@ -3071,9 +3086,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3103,9 +3118,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3373,6 +3388,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   // Instantiating the facade instantiates that module too.
   if (InstantiationScope::ThrowIfRunning(env)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3415,7 +3431,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;
   }
   if (!instantiated) return ThrowTryCatchException(env, try_catch);
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
 
   v8::Local<v8::Value> evaluated;
   if (!facade->Evaluate(context).ToLocal(&evaluated)) return ThrowTryCatchException(env, try_catch);

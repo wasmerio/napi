@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <v8.h>
+#include <cppgc/persistent.h>
 
 #include "js_native_api.h"
 #include "napi_error_state.h"
@@ -91,12 +92,11 @@ struct napi_callback_info__ {
 // A realm made with unofficial_napi_create_realm (a vm context). Its context
 // is held weakly: the realm lives while its global, or anything made in it,
 // is reachable. The env frees the record once the context is gone, and only
-// then the realm's own microtask queue, which V8 holds by raw pointer for the
-// context's lifetime.
+// then releases its root for the realm's garbage-collected microtask queue.
 struct unofficial_napi_realm__ {
   napi_env env = nullptr;
   v8::Global<v8::Context> context;
-  std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+  cppgc::Persistent<v8::MicrotaskQueue> own_microtask_queue;
   // The record is the realm's context token. True while the realm has one,
   // until the unassign hook, which runs before the record is freed.
   bool token_assigned = false;

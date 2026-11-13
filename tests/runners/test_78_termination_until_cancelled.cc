@@ -1032,29 +1032,29 @@ TEST_F(Test78TerminationUntilCancelled, NativeCallsAfterTheTerminationInsideTheT
   napi_delete_reference(s.env, g_token_fn);
 }
 
-// A native function that terminates, called by the embedder from C++ with JS
-// execution disallowed (v8::Isolate::DisallowJavascriptExecutionScope, which
-// QuickJS has no counterpart of). No JS called it, so there is none to stop,
-// and V8 aborts on any JS run there: the provider must run none. The
-// termination stays in effect.
-TEST_F(Test78TerminationUntilCancelled, NativeFunctionCalledFromCppWithJsDisallowed) {
+// V8 allows a native constructor marked as side-effect-free to run inside a
+// DisallowJavascriptExecutionScope. The provider must preserve termination
+// from the callback without entering JavaScript to deliver it.
+TEST_F(Test78TerminationUntilCancelled, NativeConstructorCalledFromCppWithJsDisallowed) {
   EnvScope s(runtime_.get());
   InstallHelpers(s.env);
-  napi_value terminate = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, Global(s.env), "terminate", &terminate), napi_ok);
+  napi_value constructor = nullptr;
+  ASSERT_EQ(napi_define_class(s.env, "Terminate", NAPI_AUTO_LENGTH, Terminate, nullptr,
+                              0, nullptr, &constructor), napi_ok);
   v8::Isolate* isolate = v8::Isolate::GetCurrent();
   ASSERT_NE(isolate, nullptr);
   {
     v8::HandleScope handle_scope(isolate);
     // This provider's napi_value is a v8::Local.
     v8::Local<v8::Value> value;
-    std::memcpy(static_cast<void*>(&value), &terminate, sizeof(terminate));
+    std::memcpy(static_cast<void*>(&value), &constructor, sizeof(constructor));
     v8::Local<v8::Function> fn = value.As<v8::Function>();
     v8::Local<v8::Context> context = fn->GetCreationContextChecked();
     v8::Isolate::DisallowJavascriptExecutionScope no_js(
         isolate, v8::Isolate::DisallowJavascriptExecutionScope::CRASH_ON_FAILURE);
     v8::TryCatch try_catch(isolate);
-    (void)fn->Call(context, v8::Undefined(isolate), 0, nullptr);
+    (void)fn->NewInstanceWithSideEffectType(context, 0, nullptr,
+                                           v8::SideEffectType::kHasNoSideEffect);
   }
   EXPECT_EQ(RunScript(s.env, "afterCall = 'yes';"), napi_pending_exception);
   FinishTermination(s.env);

@@ -24,7 +24,6 @@
 #include <v8.h>
 #include <v8-profiler.h>
 
-#include "internal/node_v8_default_flags.h"
 #include "internal/napi_env_cpu_profile.h"
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
@@ -49,7 +48,7 @@ v8::Local<v8::Private> TrustedScriptKey(v8::Isolate* isolate) {
 
 v8::MaybeLocal<v8::String> TrustedScriptSource(v8::Local<v8::Context> context,
                                              v8::Local<v8::Value> value) {
-  auto* isolate = context->GetIsolate();
+  auto* isolate = v8::Isolate::GetCurrent();
   if (!value->IsObject() || value->IsProxy()) return {};
   auto object = value.As<v8::Object>();
   auto key = TrustedScriptKey(isolate);
@@ -400,23 +399,23 @@ v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
       (context == principal_context || NapiV8IsContextifyContext(env, context));
 
   if (use_principal_callback) {
-    return state.principal_callback.Get(context->GetIsolate());
+    return state.principal_callback.Get(env->isolate);
   }
 
   for (const auto& entry : state.context_callbacks) {
-    v8::Local<v8::Context> candidate = entry.context.Get(context->GetIsolate());
+    v8::Local<v8::Context> candidate = entry.context.Get(env->isolate);
     if (!candidate.IsEmpty() && candidate == context) {
-      return entry.callback.Get(context->GetIsolate());
+      return entry.callback.Get(env->isolate);
     }
   }
 
-  return state.principal_callback.Get(context->GetIsolate());
+  return state.principal_callback.Get(env->isolate);
 }
 
 v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> context,
                                                         v8::Local<v8::Value> exception,
                                                         v8::Local<v8::Array> trace) {
-  napi_agent__* agent = napi_agent__::From(context->GetIsolate());
+  napi_agent__* agent = napi_agent__::From(v8::Isolate::GetCurrent());
   napi_env env = agent != nullptr ? agent->principal_env : nullptr;
   if (env == nullptr) {
     return exception->ToString(context);
@@ -432,14 +431,14 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
     return exception->ToString(context);
   }
 
-  v8::TryCatch try_catch(context->GetIsolate());
+  v8::TryCatch try_catch(v8::Isolate::GetCurrent());
   v8::Local<v8::Value> argv[3] = {
       context->Global(),
       exception,
       trace,
   };
   v8::MaybeLocal<v8::Value> result =
-      callback->Call(context, v8::Undefined(context->GetIsolate()), 3, argv);
+      callback->Call(context, v8::Undefined(v8::Isolate::GetCurrent()), 3, argv);
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     try_catch.ReThrow();
   }
@@ -802,12 +801,6 @@ void DisposeIsolateAndWait(EdgeV8Platform* platform,
   WaitForPlatformShutdown(&waiter, shutdown_pump_handle);
 }
 
-void ApplyDefaultV8Flags() {
-  v8::V8::SetFlagsFromString(
-      kNodeDefaultShippingV8Flags,
-      static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
-}
-
 void FatalErrorCallback(const char* location, const char* message) {
   napi_agent__* agent = napi_agent__::From(v8::Isolate::TryGetCurrent());
   if (agent == nullptr || agent->fatal_error_callback == nullptr) return;
@@ -837,7 +830,6 @@ napi_status ConfigureRuntime(const char* engine_flags,
                : napi_invalid_arg;
   }
 
-  ApplyDefaultV8Flags();
   if (engine_flags_length > 0) {
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
@@ -874,7 +866,7 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
   v8::Local<v8::Promise> promise = message.GetPromise();
   if (promise.IsEmpty()) return;
 
-  v8::Isolate* isolate = promise->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   napi_agent__* agent = napi_agent__::From(isolate);
   napi_env env = agent != nullptr ? agent->principal_env : nullptr;
   if (env == nullptr || env->promise_reject_callback.IsEmpty()) return;
@@ -884,8 +876,8 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
   v8::Local<v8::Value> value;
   switch (event) {
     case v8::kPromiseRejectWithNoHandler:
-    case v8::kPromiseResolveAfterResolved:
-    case v8::kPromiseRejectAfterResolved:
+    case v8::kDeprecatedPromiseResolveAfterResolved:
+    case v8::kDeprecatedPromiseRejectAfterResolved:
       value = message.GetValue();
       if (value.IsEmpty()) value = v8::Undefined(isolate);
       break;
@@ -983,7 +975,7 @@ size_t PromiseHookIndex(v8::PromiseHookType type) {
 void PromiseHookCallback(v8::PromiseHookType type,
                          v8::Local<v8::Promise> promise,
                          v8::Local<v8::Value> parent) {
-  v8::Isolate* isolate = promise->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   napi_agent__* agent = napi_agent__::From(isolate);
   napi_env env = agent != nullptr ? agent->principal_env : nullptr;
   if (env == nullptr) return;
@@ -1049,7 +1041,7 @@ v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
                                          v8::Local<v8::ArrayBuffer> array_buffer,
                                          size_t offset,
                                          size_t length) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::Local<v8::Object> global = context->Global();
 
   v8::Local<v8::Value> buffer_ctor_value;
@@ -1180,13 +1172,14 @@ void SerializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
                              "Class constructor Serializer cannot be invoked without 'new'");
       return;
     }
-    if (!args.Data()->IsExternal()) {
+    if (!args.DataV2()->IsValue() || !args.DataV2().As<v8::Value>()->IsExternal()) {
       isolate->ThrowException(v8::Exception::Error(
           OneByteString(isolate, "Internal serializer constructor state missing")));
       return;
     }
 
-    auto* env = static_cast<napi_env>(v8::Local<v8::External>::Cast(args.Data())->Value());
+    auto* env = static_cast<napi_env>(args.DataV2().As<v8::External>()->Value(
+        v8::kExternalPointerTypeTagDefault));
     if (env == nullptr) {
       isolate->ThrowException(v8::Exception::Error(
           OneByteString(isolate, "Internal serializer environment missing")));
@@ -1194,7 +1187,7 @@ void SerializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     }
 
     auto* ctx = env->allocate<SerializerContext>(env, args.This());
-    args.This()->SetAlignedPointerInInternalField(0, ctx);
+    args.This()->SetAlignedPointerInInternalField(0, ctx, v8::kEmbedderDataTypeTagDefault);
 }
 
 void SerializerContext::WriteHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1310,7 +1303,8 @@ void SerializerContext::WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>&
 SerializerContext* SerializerContext::Unwrap(
     const v8::FunctionCallbackInfo<v8::Value>& args) {
     if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
-    return static_cast<SerializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+    return static_cast<SerializerContext*>(args.This()->GetAlignedPointerFromInternalField(
+        0, v8::kEmbedderDataTypeTagDefault));
 }
 
 void SerializerContext::WeakCallback(const v8::WeakCallbackInfo<SerializerContext>& info) {
@@ -1380,7 +1374,7 @@ void DeserializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
                              "Class constructor Deserializer cannot be invoked without 'new'");
       return;
     }
-    if (!args.Data()->IsExternal()) {
+    if (!args.DataV2()->IsValue() || !args.DataV2().As<v8::Value>()->IsExternal()) {
       isolate->ThrowException(v8::Exception::Error(
           OneByteString(isolate, "Internal deserializer constructor state missing")));
       return;
@@ -1393,14 +1387,15 @@ void DeserializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
       return;
     }
 
-    auto* env = static_cast<napi_env>(v8::Local<v8::External>::Cast(args.Data())->Value());
+    auto* env = static_cast<napi_env>(args.DataV2().As<v8::External>()->Value(
+        v8::kExternalPointerTypeTagDefault));
     if (env == nullptr) {
       isolate->ThrowException(v8::Exception::Error(
           OneByteString(isolate, "Internal deserializer environment missing")));
       return;
     }
     auto* ctx = env->allocate<DeserializerContext>(env, args.This(), args[0]);
-    args.This()->SetAlignedPointerInInternalField(0, ctx);
+    args.This()->SetAlignedPointerInInternalField(0, ctx, v8::kEmbedderDataTypeTagDefault);
 }
 
 void DeserializerContext::ReadHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1521,7 +1516,8 @@ void DeserializerContext::ReadRawBytes(const v8::FunctionCallbackInfo<v8::Value>
 DeserializerContext* DeserializerContext::Unwrap(
     const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
-  return static_cast<DeserializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+  return static_cast<DeserializerContext*>(args.This()->GetAlignedPointerFromInternalField(
+      0, v8::kEmbedderDataTypeTagDefault));
 }
 
 void DeserializerContext::WeakCallback(
@@ -1564,7 +1560,7 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
                             v8::Local<v8::FunctionTemplate> tmpl) {
   v8::Local<v8::Function> ctor;
   if (!tmpl->GetFunction(context).ToLocal(&ctor)) return false;
-  return target->Set(context, OneByteString(context->GetIsolate(), name), ctor).FromMaybe(false);
+  return target->Set(context, OneByteString(v8::Isolate::GetCurrent(), name), ctor).FromMaybe(false);
 }
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
@@ -1874,6 +1870,10 @@ void ForgetEnvState(napi_env env) {
 
 }  // namespace unofficial_napi_internal
 
+void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner) {
+  reinterpret_cast<UnofficialEnvScope*>(owner)->isolate_scope.reset();
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
@@ -2058,13 +2058,6 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     return status != napi_ok ? status : napi_generic_failure;
   }
 
-  // An env lives on the thread that creates it, and that thread may predate
-  // the memory protection key V8 uses for thread-isolated JIT memory (Linux
-  // x64 pkeys), so it would lack even read access. Restore V8's default
-  // permissions before this thread builds and enters an isolate. This is a
-  // no-op where pkeys are unsupported.
-  v8::ThreadIsolatedAllocator::SetDefaultPermissionsForSignalHandler();
-
   auto allocator = std::make_shared<TrackingArrayBufferAllocator>();
   if (!allocator) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
@@ -2139,6 +2132,9 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
   // again: that call is refused, and the release under way goes on.
   if (scope->releasing) return napi_invalid_arg;
   scope->releasing = true;
+  if (!scope->isolate_scope.has_value()) {
+    scope->isolate_scope.emplace(scope->isolate);
+  }
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
@@ -2432,6 +2428,8 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         if (context.IsEmpty()) return;
         v8::Context::Scope context_scope(context);
         napi_realm_frame_scope__ realm_frame(request->env, nullptr);
+        // The N-API interrupt callback may call back into JavaScript.
+        v8::Isolate::AllowJavascriptExecutionScope allow_js(isolate);
         request->callback(request->env, request->data);
         napi_v8_keep_terminating_after_interrupt(request->env);
       },
@@ -3029,10 +3027,10 @@ LazyDataCheck CheckLazyDataProperty(v8::Isolate* isolate,
 void LazyDataPropertyGetter(v8::Local<v8::Name> name,
                             const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
-  v8::Local<v8::Value> definition = info.Data();
+  v8::Local<v8::Value> definition = info.DataV2().As<v8::Value>();
   // The holder, not the receiver (a read through a prototype); the global
   // proxy for a property of a global object.
-  v8::Local<v8::Object> holder = info.HolderV2();
+  v8::Local<v8::Object> holder = info.Holder();
   for (LazyDataProbe* probe = g_lazy_data_probes; probe != nullptr; probe = probe->outer) {
     if (probe->isolate != isolate) continue;
     if (holder == probe->holder && name->StrictEquals(probe->name) &&
@@ -3500,7 +3498,7 @@ napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(
     napi_env env,
     napi_value* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> value = env->isolate->GetContinuationPreservedEmbedderData();
+  v8::Local<v8::Value> value = env->isolate->GetContinuationPreservedEmbedderData().As<v8::Value>();
   if (value.IsEmpty()) value = v8::Undefined(env->isolate);
   *result_out = napi_v8_wrap_value(env, value);
   return *result_out == nullptr ? napi_generic_failure : napi_ok;
@@ -3541,7 +3539,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Object> target = v8::Object::New(isolate);
-  v8::Local<v8::External> env_data = v8::External::New(isolate, env);
+  v8::Local<v8::External> env_data = v8::External::New(isolate, env, v8::kExternalPointerTypeTagDefault);
 
   v8::Local<v8::FunctionTemplate> serializer_tmpl =
       v8::FunctionTemplate::New(isolate, SerializerContext::New, env_data);

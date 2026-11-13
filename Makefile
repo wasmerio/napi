@@ -19,7 +19,7 @@ NAPI_NATIVE_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/native)
 NAPI_WASIX_TEST_OUT_DIR ?= $(abspath $(BUILD_WASIX_NAPI_DIR)/wasm32-wasix/release)
 NAPI_V8_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
 NAPI_QUICKJS_CTEST_ARGS ?= -E 'SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze'
-NAPI_V8_PREBUILT_VERSION ?= 11.9.9
+NAPI_V8_PREBUILT_VERSION ?= 15.9.111.1
 NAPI_V8_PLATFORM :=
 NAPI_V8_DIST_ROOT ?=
 NAPI_V8_CARGO_DIST_ROOT ?=
@@ -57,7 +57,7 @@ NAPI_V8_CMAKE_ARGS += -DNAPI_V8_INCLUDE_DIR=$(NAPI_V8_DIST_ROOT)/include
 NAPI_V8_CMAKE_ARGS += -DNAPI_V8_LIBRARY=$(NAPI_V8_DIST_ROOT)/lib/libv8.a
 NAPI_V8_CMAKE_ARGS += -DNAPI_V8_DEFINES=V8_COMPRESS_POINTERS
 ifeq ($(UNAME_S),Darwin)
-NAPI_V8_CMAKE_ARGS += -DNAPI_V8_EXTRA_LIBS=/System/Library/Frameworks/CoreFoundation.framework
+NAPI_V8_CMAKE_ARGS += -DNAPI_V8_EXTRA_LIBS='/System/Library/Frameworks/CoreFoundation.framework;/System/Library/Frameworks/Security.framework'
 endif
 endif
 endif

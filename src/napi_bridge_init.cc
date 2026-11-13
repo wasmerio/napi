@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "unofficial_napi.h"
 #include "edge_v8_platform.h"
 #include "internal/napi_v8_env.h"
+#include "internal/unofficial_napi_bridge.h"
 
 namespace {
 
@@ -625,13 +627,23 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
   state.agent->bytecode_handles.Remove(id);
 }
 
-SnapiEnvState* RequireEnvState(SnapiEnvState* env_state) {
-  auto* bridge_state = LookupEnvState(env_state);
-  if (bridge_state == nullptr || bridge_state->env == nullptr) {
-    return nullptr;
+// Several stores can share an OS thread. V8 consults the current isolate
+// even in APIs that take a context, so enter the isolate of the requested env
+// for each bridge call and restore the caller's isolate on return.
+class BridgeEnvScope {
+ public:
+  explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
+    if (state_ != nullptr && v8::Isolate::TryGetCurrent() != state_->env->isolate) {
+      isolate_scope_.emplace(state_->env->isolate);
+    }
   }
-  return bridge_state;
-}
+
+  SnapiEnvState* get() const { return state_; }
+
+ private:
+  SnapiEnvState* state_;
+  std::optional<v8::Isolate::Scope> isolate_scope_;
+};
 
 // Tears down the agent `state` belongs to, with every env on it: release_env
 // takes the provider owner, which disposes the whole isolate.
@@ -651,42 +663,45 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   // interrupts are now refused; a foreign terminate only reaches guest code
   // that teardown runs (GuestCallScope). No registry lock spans reference
   // deletion, finalizers, V8 shutdown or background-task draining.
-  napi_env env = state->env;
-  for (const auto& entry : agent->buffer_lease_handles.handles) {
-    (void)unofficial_napi_release_buffer_lease(
-        env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
-  }
-  agent->buffer_lease_handles.Reset();
-  // Slots hold raw Locals; they die with the env's scopes when release_env
-  // tears everything down, so draining the frames is pure bookkeeping.
-  while (!agent->scope_frames.empty()) {
-    PopCurrentFrame(*state, /*close_napi_scope=*/true);
-  }
-  agent->value_slots.clear();
-  agent->value_free_slots.clear();
-  agent->live_value_count = 0;
-  agent->next_scope_id = 1;
-  agent->refs.clear();
-  agent->next_ref_id = 1;
-  agent->deferreds.clear();
-  agent->next_deferred_id = 1;
-  agent->module_wrap_handles.Reset();
-  // Bytecode handles own engine resources outside any napi scope (V8
-  // Globals / QuickJS JSValue refcounts), so they must be released
-  // explicitly — env teardown does not reclaim them.
-  for (auto& entry : agent->bytecode_handles.handles) {
-    if (entry.second != nullptr) {
-      (void)unofficial_napi_bytecode_release(
-          env, reinterpret_cast<unofficial_napi_bytecode>(entry.second));
+  {
+    BridgeEnvScope env_scope(state);
+    napi_env env = state->env;
+    for (const auto& entry : agent->buffer_lease_handles.handles) {
+      (void)unofficial_napi_release_buffer_lease(
+          env, static_cast<unofficial_napi_buffer_lease>(entry.second), false);
     }
-  }
-  agent->bytecode_handles.Reset();
-  agent->profile_handles.Reset();
-  agent->callback_invocations.clear();
-  agent->next_callback_invocation_id = 1;
-  for (SnapiEnvState* env_state : agent->envs) {
-    env_state->cb_registry.clear();
-    env_state->next_cb_reg_id = 1;
+    agent->buffer_lease_handles.Reset();
+    // Slots hold raw Locals; they die with the env's scopes when release_env
+    // tears everything down, so draining the frames is pure bookkeeping.
+    while (!agent->scope_frames.empty()) {
+      PopCurrentFrame(*state, /*close_napi_scope=*/true);
+    }
+    agent->value_slots.clear();
+    agent->value_free_slots.clear();
+    agent->live_value_count = 0;
+    agent->next_scope_id = 1;
+    agent->refs.clear();
+    agent->next_ref_id = 1;
+    agent->deferreds.clear();
+    agent->next_deferred_id = 1;
+    agent->module_wrap_handles.Reset();
+    // Bytecode handles own engine resources outside any napi scope (V8
+    // Globals / QuickJS JSValue refcounts), so they must be released
+    // explicitly — env teardown does not reclaim them.
+    for (auto& entry : agent->bytecode_handles.handles) {
+      if (entry.second != nullptr) {
+        (void)unofficial_napi_bytecode_release(
+            env, reinterpret_cast<unofficial_napi_bytecode>(entry.second));
+      }
+    }
+    agent->bytecode_handles.Reset();
+    agent->profile_handles.Reset();
+    agent->callback_invocations.clear();
+    agent->next_callback_invocation_id = 1;
+    for (SnapiEnvState* env_state : agent->envs) {
+      env_state->cb_registry.clear();
+      env_state->next_cb_reg_id = 1;
+    }
   }
   napi_status s = napi_ok;
   if (agent->owner != nullptr) {
@@ -731,6 +746,7 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
     (void)unofficial_napi_release_env(owner, nullptr);
     return nullptr;
   }
+  NapiV8DetachEnvOwner(owner);
   agent->owner = owner;
   agent->envs.push_back(state);
   state->agent = agent;
@@ -772,7 +788,8 @@ extern "C" void snapi_bridge_set_foreground_task_waker(void (*waker)()) {
 // ============================================================
 
 extern "C" int snapi_bridge_get_undefined(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -783,7 +800,8 @@ extern "C" int snapi_bridge_get_undefined(SnapiEnvState* env_state, uint32_t* ou
 }
 
 extern "C" int snapi_bridge_get_null(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -794,7 +812,8 @@ extern "C" int snapi_bridge_get_null(SnapiEnvState* env_state, uint32_t* out_id)
 }
 
 extern "C" int snapi_bridge_get_boolean(SnapiEnvState* env_state, int value, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -805,7 +824,8 @@ extern "C" int snapi_bridge_get_boolean(SnapiEnvState* env_state, int value, uin
 }
 
 extern "C" int snapi_bridge_get_global(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -818,7 +838,8 @@ extern "C" int snapi_bridge_get_global(SnapiEnvState* env_state, uint32_t* out_i
 extern "C" int snapi_bridge_create_string_utf8(SnapiEnvState* env_state, const char* str,
                                                uint32_t wasm_length,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   size_t length =
@@ -833,7 +854,8 @@ extern "C" int snapi_bridge_create_string_utf8(SnapiEnvState* env_state, const c
 extern "C" int snapi_bridge_create_string_latin1(SnapiEnvState* env_state, const char* str,
                                                  uint32_t wasm_length,
                                                  uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   size_t length =
@@ -846,7 +868,8 @@ extern "C" int snapi_bridge_create_string_latin1(SnapiEnvState* env_state, const
 }
 
 extern "C" int snapi_bridge_create_int32(SnapiEnvState* env_state, int32_t value, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -857,7 +880,8 @@ extern "C" int snapi_bridge_create_int32(SnapiEnvState* env_state, int32_t value
 }
 
 extern "C" int snapi_bridge_create_uint32(SnapiEnvState* env_state, uint32_t value, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -868,7 +892,8 @@ extern "C" int snapi_bridge_create_uint32(SnapiEnvState* env_state, uint32_t val
 }
 
 extern "C" int snapi_bridge_create_double(SnapiEnvState* env_state, double value, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -879,7 +904,8 @@ extern "C" int snapi_bridge_create_double(SnapiEnvState* env_state, double value
 }
 
 extern "C" int snapi_bridge_create_int64(SnapiEnvState* env_state, int64_t value, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -890,7 +916,8 @@ extern "C" int snapi_bridge_create_int64(SnapiEnvState* env_state, int64_t value
 }
 
 extern "C" int snapi_bridge_create_object(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -901,7 +928,8 @@ extern "C" int snapi_bridge_create_object(SnapiEnvState* env_state, uint32_t* ou
 }
 
 extern "C" int snapi_bridge_create_array(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -913,7 +941,8 @@ extern "C" int snapi_bridge_create_array(SnapiEnvState* env_state, uint32_t* out
 
 extern "C" int snapi_bridge_create_array_with_length(SnapiEnvState* env_state, uint32_t length,
                                                      uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -930,7 +959,8 @@ extern "C" int snapi_bridge_create_array_with_length(SnapiEnvState* env_state, u
 extern "C" int snapi_bridge_get_value_string_utf8(SnapiEnvState* env_state, uint32_t id, char* buf,
                                                   size_t bufsize,
                                                   size_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -941,7 +971,8 @@ extern "C" int snapi_bridge_get_value_string_utf8(SnapiEnvState* env_state, uint
 extern "C" int snapi_bridge_get_value_string_latin1(SnapiEnvState* env_state, uint32_t id, char* buf,
                                                     size_t bufsize,
                                                     size_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -950,7 +981,8 @@ extern "C" int snapi_bridge_get_value_string_latin1(SnapiEnvState* env_state, ui
 }
 
 extern "C" int snapi_bridge_get_value_int32(SnapiEnvState* env_state, uint32_t id, int32_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -959,7 +991,8 @@ extern "C" int snapi_bridge_get_value_int32(SnapiEnvState* env_state, uint32_t i
 }
 
 extern "C" int snapi_bridge_get_value_uint32(SnapiEnvState* env_state, uint32_t id, uint32_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -968,7 +1001,8 @@ extern "C" int snapi_bridge_get_value_uint32(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_get_value_double(SnapiEnvState* env_state, uint32_t id, double* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -977,7 +1011,8 @@ extern "C" int snapi_bridge_get_value_double(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_get_value_int64(SnapiEnvState* env_state, uint32_t id, int64_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -986,7 +1021,8 @@ extern "C" int snapi_bridge_get_value_int64(SnapiEnvState* env_state, uint32_t i
 }
 
 extern "C" int snapi_bridge_get_value_bool(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1003,7 +1039,8 @@ extern "C" int snapi_bridge_get_value_bool(SnapiEnvState* env_state, uint32_t id
 // ============================================================
 
 extern "C" int snapi_bridge_typeof(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1016,7 +1053,8 @@ extern "C" int snapi_bridge_typeof(SnapiEnvState* env_state, uint32_t id, int* r
 }
 
 extern "C" int snapi_bridge_is_array(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1029,7 +1067,8 @@ extern "C" int snapi_bridge_is_array(SnapiEnvState* env_state, uint32_t id, int*
 }
 
 extern "C" int snapi_bridge_is_error(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1042,7 +1081,8 @@ extern "C" int snapi_bridge_is_error(SnapiEnvState* env_state, uint32_t id, int*
 }
 
 extern "C" int snapi_bridge_is_arraybuffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1055,7 +1095,8 @@ extern "C" int snapi_bridge_is_arraybuffer(SnapiEnvState* env_state, uint32_t id
 }
 
 extern "C" int snapi_bridge_is_typedarray(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1068,7 +1109,8 @@ extern "C" int snapi_bridge_is_typedarray(SnapiEnvState* env_state, uint32_t id,
 }
 
 extern "C" int snapi_bridge_is_dataview(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1081,7 +1123,8 @@ extern "C" int snapi_bridge_is_dataview(SnapiEnvState* env_state, uint32_t id, i
 }
 
 extern "C" int snapi_bridge_is_date(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1094,7 +1137,8 @@ extern "C" int snapi_bridge_is_date(SnapiEnvState* env_state, uint32_t id, int* 
 }
 
 extern "C" int snapi_bridge_is_promise(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1108,7 +1152,8 @@ extern "C" int snapi_bridge_is_promise(SnapiEnvState* env_state, uint32_t id, in
 
 extern "C" int snapi_bridge_instanceof(SnapiEnvState* env_state, uint32_t obj_id, uint32_t ctor_id,
                                        int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1126,7 +1171,8 @@ extern "C" int snapi_bridge_instanceof(SnapiEnvState* env_state, uint32_t obj_id
 // ============================================================
 
 extern "C" int snapi_bridge_coerce_to_bool(SnapiEnvState* env_state, uint32_t id, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1139,7 +1185,8 @@ extern "C" int snapi_bridge_coerce_to_bool(SnapiEnvState* env_state, uint32_t id
 }
 
 extern "C" int snapi_bridge_coerce_to_number(SnapiEnvState* env_state, uint32_t id, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1152,7 +1199,8 @@ extern "C" int snapi_bridge_coerce_to_number(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_coerce_to_string(SnapiEnvState* env_state, uint32_t id, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1165,7 +1213,8 @@ extern "C" int snapi_bridge_coerce_to_string(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_coerce_to_object(SnapiEnvState* env_state, uint32_t id, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1183,7 +1232,8 @@ extern "C" int snapi_bridge_coerce_to_object(SnapiEnvState* env_state, uint32_t 
 
 extern "C" int snapi_bridge_set_property(SnapiEnvState* env_state, uint32_t obj_id, uint32_t key_id,
                                          uint32_t val_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1195,7 +1245,8 @@ extern "C" int snapi_bridge_set_property(SnapiEnvState* env_state, uint32_t obj_
 
 extern "C" int snapi_bridge_get_property(SnapiEnvState* env_state, uint32_t obj_id, uint32_t key_id,
                                          uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1210,7 +1261,8 @@ extern "C" int snapi_bridge_get_property(SnapiEnvState* env_state, uint32_t obj_
 
 extern "C" int snapi_bridge_has_property(SnapiEnvState* env_state, uint32_t obj_id, uint32_t key_id,
                                          int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1225,7 +1277,8 @@ extern "C" int snapi_bridge_has_property(SnapiEnvState* env_state, uint32_t obj_
 
 extern "C" int snapi_bridge_has_own_property(SnapiEnvState* env_state, uint32_t obj_id, uint32_t key_id,
                                              int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1240,7 +1293,8 @@ extern "C" int snapi_bridge_has_own_property(SnapiEnvState* env_state, uint32_t 
 
 extern "C" int snapi_bridge_delete_property(SnapiEnvState* env_state, uint32_t obj_id, uint32_t key_id,
                                             int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1256,7 +1310,8 @@ extern "C" int snapi_bridge_delete_property(SnapiEnvState* env_state, uint32_t o
 extern "C" int snapi_bridge_set_named_property(SnapiEnvState* env_state, uint32_t obj_id,
                                                const char* name,
                                                uint32_t val_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1268,7 +1323,8 @@ extern "C" int snapi_bridge_set_named_property(SnapiEnvState* env_state, uint32_
 extern "C" int snapi_bridge_get_named_property(SnapiEnvState* env_state, uint32_t obj_id,
                                                const char* name,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1283,7 +1339,8 @@ extern "C" int snapi_bridge_get_named_property(SnapiEnvState* env_state, uint32_
 extern "C" int snapi_bridge_has_named_property(SnapiEnvState* env_state, uint32_t obj_id,
                                                const char* name,
                                                int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1297,7 +1354,8 @@ extern "C" int snapi_bridge_has_named_property(SnapiEnvState* env_state, uint32_
 
 extern "C" int snapi_bridge_set_element(SnapiEnvState* env_state, uint32_t obj_id, uint32_t index,
                                         uint32_t val_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1308,7 +1366,8 @@ extern "C" int snapi_bridge_set_element(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_get_element(SnapiEnvState* env_state, uint32_t obj_id, uint32_t index,
                                         uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1322,7 +1381,8 @@ extern "C" int snapi_bridge_get_element(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_has_element(SnapiEnvState* env_state, uint32_t obj_id, uint32_t index,
                                         int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1336,7 +1396,8 @@ extern "C" int snapi_bridge_has_element(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_delete_element(SnapiEnvState* env_state, uint32_t obj_id, uint32_t index,
                                            int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1350,7 +1411,8 @@ extern "C" int snapi_bridge_delete_element(SnapiEnvState* env_state, uint32_t ob
 
 extern "C" int snapi_bridge_get_array_length(SnapiEnvState* env_state, uint32_t arr_id,
                                              uint32_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value arr = LoadValue(*bridge_state, arr_id);
@@ -1360,7 +1422,8 @@ extern "C" int snapi_bridge_get_array_length(SnapiEnvState* env_state, uint32_t 
 
 extern "C" int snapi_bridge_get_property_names(SnapiEnvState* env_state, uint32_t obj_id,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1376,7 +1439,8 @@ extern "C" int snapi_bridge_get_all_property_names(SnapiEnvState* env_state, uin
                                                    int mode, int filter,
                                                    int conversion,
                                                    uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1391,7 +1455,8 @@ extern "C" int snapi_bridge_get_all_property_names(SnapiEnvState* env_state, uin
 }
 
 extern "C" int snapi_bridge_get_prototype(SnapiEnvState* env_state, uint32_t obj_id, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1404,7 +1469,8 @@ extern "C" int snapi_bridge_get_prototype(SnapiEnvState* env_state, uint32_t obj
 }
 
 extern "C" int snapi_bridge_object_freeze(SnapiEnvState* env_state, uint32_t obj_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1413,7 +1479,8 @@ extern "C" int snapi_bridge_object_freeze(SnapiEnvState* env_state, uint32_t obj
 }
 
 extern "C" int snapi_bridge_object_seal(SnapiEnvState* env_state, uint32_t obj_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -1427,7 +1494,8 @@ extern "C" int snapi_bridge_object_seal(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_strict_equals(SnapiEnvState* env_state, uint32_t a_id, uint32_t b_id,
                                           int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value a = LoadValue(*bridge_state, a_id);
@@ -1446,7 +1514,8 @@ extern "C" int snapi_bridge_strict_equals(SnapiEnvState* env_state, uint32_t a_i
 
 extern "C" int snapi_bridge_create_error(SnapiEnvState* env_state, uint32_t code_id, uint32_t msg_id,
                                          uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value code = LoadValue(*bridge_state, code_id);  // can be null (0)
@@ -1462,7 +1531,8 @@ extern "C" int snapi_bridge_create_error(SnapiEnvState* env_state, uint32_t code
 extern "C" int snapi_bridge_create_type_error(SnapiEnvState* env_state, uint32_t code_id,
                                               uint32_t msg_id,
                                               uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value code = LoadValue(*bridge_state, code_id);
@@ -1478,7 +1548,8 @@ extern "C" int snapi_bridge_create_type_error(SnapiEnvState* env_state, uint32_t
 extern "C" int snapi_bridge_create_range_error(SnapiEnvState* env_state, uint32_t code_id,
                                                uint32_t msg_id,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value code = LoadValue(*bridge_state, code_id);
@@ -1492,7 +1563,8 @@ extern "C" int snapi_bridge_create_range_error(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_throw(SnapiEnvState* env_state, uint32_t error_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value error = LoadValue(*bridge_state, error_id);
@@ -1501,7 +1573,8 @@ extern "C" int snapi_bridge_throw(SnapiEnvState* env_state, uint32_t error_id) {
 }
 
 extern "C" int snapi_bridge_throw_error(SnapiEnvState* env_state, const char* code, const char* msg) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return napi_throw_error(env, code, msg);
@@ -1509,7 +1582,8 @@ extern "C" int snapi_bridge_throw_error(SnapiEnvState* env_state, const char* co
 
 extern "C" int snapi_bridge_throw_type_error(SnapiEnvState* env_state, const char* code,
                                              const char* msg) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return napi_throw_type_error(env, code, msg);
@@ -1517,14 +1591,16 @@ extern "C" int snapi_bridge_throw_type_error(SnapiEnvState* env_state, const cha
 
 extern "C" int snapi_bridge_throw_range_error(SnapiEnvState* env_state, const char* code,
                                               const char* msg) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return napi_throw_range_error(env, code, msg);
 }
 
 extern "C" int snapi_bridge_is_exception_pending(SnapiEnvState* env_state, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   bool pending;
@@ -1535,7 +1611,8 @@ extern "C" int snapi_bridge_is_exception_pending(SnapiEnvState* env_state, int* 
 }
 
 extern "C" int snapi_bridge_get_and_clear_last_exception(SnapiEnvState* env_state, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -1551,7 +1628,8 @@ extern "C" int snapi_bridge_get_and_clear_last_exception(SnapiEnvState* env_stat
 
 extern "C" int snapi_bridge_create_symbol(SnapiEnvState* env_state, uint32_t description_id,
                                           uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value description = LoadValue(*bridge_state, description_id);  // can be null (0)
@@ -1568,7 +1646,8 @@ extern "C" int snapi_bridge_create_symbol(SnapiEnvState* env_state, uint32_t des
 
 extern "C" int snapi_bridge_create_bigint_int64(SnapiEnvState* env_state, int64_t value,
                                                 uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -1580,7 +1659,8 @@ extern "C" int snapi_bridge_create_bigint_int64(SnapiEnvState* env_state, int64_
 
 extern "C" int snapi_bridge_create_bigint_uint64(SnapiEnvState* env_state, uint64_t value,
                                                  uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -1592,7 +1672,8 @@ extern "C" int snapi_bridge_create_bigint_uint64(SnapiEnvState* env_state, uint6
 
 extern "C" int snapi_bridge_get_value_bigint_int64(SnapiEnvState* env_state, uint32_t id, int64_t* value,
                                                    int* lossless) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1607,7 +1688,8 @@ extern "C" int snapi_bridge_get_value_bigint_int64(SnapiEnvState* env_state, uin
 extern "C" int snapi_bridge_get_value_bigint_uint64(SnapiEnvState* env_state, uint32_t id,
                                                     uint64_t* value,
                                                     int* lossless) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1624,7 +1706,8 @@ extern "C" int snapi_bridge_get_value_bigint_uint64(SnapiEnvState* env_state, ui
 // ============================================================
 
 extern "C" int snapi_bridge_create_date(SnapiEnvState* env_state, double time, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -1635,7 +1718,8 @@ extern "C" int snapi_bridge_create_date(SnapiEnvState* env_state, double time, u
 }
 
 extern "C" int snapi_bridge_get_date_value(SnapiEnvState* env_state, uint32_t id, double* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1649,7 +1733,8 @@ extern "C" int snapi_bridge_get_date_value(SnapiEnvState* env_state, uint32_t id
 
 extern "C" int snapi_bridge_create_promise(SnapiEnvState* env_state, uint32_t* deferred_out,
                                            uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_deferred deferred;
@@ -1663,7 +1748,8 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState* env_state, uint32_t* d
 
 extern "C" int snapi_bridge_resolve_deferred(SnapiEnvState* env_state, uint32_t deferred_id,
                                              uint32_t value_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_deferred d = LoadDeferred(*bridge_state, deferred_id);
@@ -1676,7 +1762,8 @@ extern "C" int snapi_bridge_resolve_deferred(SnapiEnvState* env_state, uint32_t 
 
 extern "C" int snapi_bridge_reject_deferred(SnapiEnvState* env_state, uint32_t deferred_id,
                                             uint32_t value_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_deferred d = LoadDeferred(*bridge_state, deferred_id);
@@ -1693,7 +1780,8 @@ extern "C" int snapi_bridge_reject_deferred(SnapiEnvState* env_state, uint32_t d
 
 extern "C" int snapi_bridge_create_arraybuffer(SnapiEnvState* env_state, uint32_t byte_length,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data;
@@ -1813,7 +1901,8 @@ extern "C" int snapi_bridge_create_external_arraybuffer_guest_finalized(
     uint32_t guest_env, uint32_t wasm_fn_ptr, uint32_t finalize_data,
     uint32_t finalize_hint, uint64_t* backing_store_token_out,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1843,7 +1932,8 @@ extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
     uint32_t guest_env, uint32_t wasm_fn_ptr, uint32_t finalize_data,
     uint32_t finalize_hint, uint64_t* backing_store_token_out,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1874,7 +1964,8 @@ extern "C" int snapi_bridge_create_external_buffer_guest_finalized(
 extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
     SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
     void* finalize_hint, uint64_t* backing_store_token_out, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1893,7 +1984,8 @@ extern "C" int snapi_bridge_create_external_arraybuffer_finalized(
 extern "C" int snapi_bridge_create_external_buffer_finalized(
     SnapiEnvState* env_state, uint64_t data_addr, uint32_t byte_length,
     void* finalize_hint, uint64_t* backing_store_token_out, uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1912,7 +2004,8 @@ extern "C" int snapi_bridge_create_external_arraybuffer(SnapiEnvState* env_state
                                                         uint32_t byte_length,
                                                         uint64_t* backing_store_token_out,
                                                         uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1931,7 +2024,8 @@ extern "C" int snapi_bridge_create_external_buffer(SnapiEnvState* env_state, uin
                                                    uint32_t byte_length,
                                                    uint64_t* backing_store_token_out,
                                                    uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = (void*)(uintptr_t)data_addr;
@@ -1947,7 +2041,8 @@ extern "C" int snapi_bridge_create_external_buffer(SnapiEnvState* env_state, uin
 }
 
 extern "C" int snapi_bridge_is_sharedarraybuffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -1962,7 +2057,8 @@ extern "C" int snapi_bridge_is_sharedarraybuffer(SnapiEnvState* env_state, uint3
 extern "C" int snapi_bridge_create_sharedarraybuffer(SnapiEnvState* env_state, uint32_t byte_length,
                                                      uint64_t* data_out,
                                                      uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = nullptr;
@@ -1977,7 +2073,8 @@ extern "C" int snapi_bridge_create_sharedarraybuffer(SnapiEnvState* env_state, u
 
 extern "C" int snapi_bridge_node_api_set_prototype(SnapiEnvState* env_state, uint32_t object_id,
                                                    uint32_t prototype_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value object = LoadValue(*bridge_state, object_id);
@@ -1990,7 +2087,8 @@ extern "C" int snapi_bridge_get_arraybuffer_info(SnapiEnvState* env_state, uint3
                                                  uint64_t* data_out,
                                                  uint32_t* byte_length,
                                                  uint64_t* backing_store_token_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2008,7 +2106,8 @@ extern "C" int snapi_bridge_get_arraybuffer_info(SnapiEnvState* env_state, uint3
 }
 
 extern "C" int snapi_bridge_detach_arraybuffer(SnapiEnvState* env_state, uint32_t id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2017,7 +2116,8 @@ extern "C" int snapi_bridge_detach_arraybuffer(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_is_detached_arraybuffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2037,7 +2137,8 @@ extern "C" int snapi_bridge_create_typedarray(SnapiEnvState* env_state, int type
                                               uint32_t arraybuffer_id,
                                               uint32_t byte_offset,
                                               uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value arraybuffer = LoadValue(*bridge_state, arraybuffer_id);
@@ -2057,7 +2158,8 @@ extern "C" int snapi_bridge_get_typedarray_info(SnapiEnvState* env_state, uint32
                                                 uint32_t* arraybuffer_out,
                                                 uint32_t* byte_offset_out,
                                                 uint64_t* backing_store_token_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2089,7 +2191,8 @@ extern "C" int snapi_bridge_create_dataview(SnapiEnvState* env_state, uint32_t b
                                             uint32_t arraybuffer_id,
                                             uint32_t byte_offset,
                                             uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value arraybuffer = LoadValue(*bridge_state, arraybuffer_id);
@@ -2108,7 +2211,8 @@ extern "C" int snapi_bridge_get_dataview_info(SnapiEnvState* env_state, uint32_t
                                               uint32_t* arraybuffer_out,
                                               uint32_t* byte_offset_out,
                                               uint64_t* backing_store_token_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2136,7 +2240,8 @@ extern "C" int snapi_bridge_get_dataview_info(SnapiEnvState* env_state, uint32_t
 extern "C" int snapi_bridge_attach_guest_heap_finalizer(SnapiEnvState* env_state,
                                                         uint32_t id,
                                                         void* finalize_hint) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_value val = LoadValue(*bridge_state, id);
   if (!val) return napi_invalid_arg;
@@ -2151,7 +2256,8 @@ extern "C" int snapi_bridge_attach_guest_heap_finalizer(SnapiEnvState* env_state
 
 extern "C" int snapi_bridge_create_external(SnapiEnvState* env_state, uint64_t data_val,
                                             uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   // Store arbitrary u64 data value as a void*. No finalizer.
@@ -2165,7 +2271,8 @@ extern "C" int snapi_bridge_create_external(SnapiEnvState* env_state, uint64_t d
 
 extern "C" int snapi_bridge_get_value_external(SnapiEnvState* env_state, uint32_t id,
                                                uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2184,7 +2291,8 @@ extern "C" int snapi_bridge_get_value_external(SnapiEnvState* env_state, uint32_
 extern "C" int snapi_bridge_create_reference(SnapiEnvState* env_state, uint32_t value_id,
                                              uint32_t initial_refcount,
                                              uint32_t* ref_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, value_id);
@@ -2197,7 +2305,8 @@ extern "C" int snapi_bridge_create_reference(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_delete_reference(SnapiEnvState* env_state, uint32_t ref_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_ref ref = LoadRef(*bridge_state, ref_id);
@@ -2208,7 +2317,8 @@ extern "C" int snapi_bridge_delete_reference(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_reference_ref(SnapiEnvState* env_state, uint32_t ref_id, uint32_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_ref ref = LoadRef(*bridge_state, ref_id);
@@ -2217,7 +2327,8 @@ extern "C" int snapi_bridge_reference_ref(SnapiEnvState* env_state, uint32_t ref
 }
 
 extern "C" int snapi_bridge_reference_unref(SnapiEnvState* env_state, uint32_t ref_id, uint32_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_ref ref = LoadRef(*bridge_state, ref_id);
@@ -2227,7 +2338,8 @@ extern "C" int snapi_bridge_reference_unref(SnapiEnvState* env_state, uint32_t r
 
 extern "C" int snapi_bridge_get_reference_value(SnapiEnvState* env_state, uint32_t ref_id,
                                                 uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_ref ref = LoadRef(*bridge_state, ref_id);
@@ -2244,7 +2356,8 @@ extern "C" int snapi_bridge_get_reference_value(SnapiEnvState* env_state, uint32
 // ============================================================
 
 extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_handle_scope scope = nullptr;
@@ -2259,7 +2372,8 @@ extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState* env_state, uint32_t
 }
 
 extern "C" int snapi_bridge_close_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   const int idx = FindFrameById(*bridge_state, scope_id);
   const std::vector<ScopeFrame>& frames = bridge_state->agent->scope_frames;
@@ -2276,7 +2390,8 @@ extern "C" int snapi_bridge_close_handle_scope(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_open_escapable_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_escapable_handle_scope scope = nullptr;
@@ -2291,7 +2406,8 @@ extern "C" int snapi_bridge_open_escapable_handle_scope(SnapiEnvState* env_state
 }
 
 extern "C" int snapi_bridge_close_escapable_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   const int idx = FindFrameById(*bridge_state, scope_id);
   const std::vector<ScopeFrame>& frames = bridge_state->agent->scope_frames;
@@ -2308,7 +2424,8 @@ extern "C" int snapi_bridge_close_escapable_handle_scope(SnapiEnvState* env_stat
 extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t scope_id,
                                           uint32_t escapee_id,
                                           uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   const int idx = FindFrameById(*bridge_state, scope_id);
@@ -2335,7 +2452,8 @@ extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t sco
 extern "C" int snapi_bridge_type_tag_object(SnapiEnvState* env_state, uint32_t obj_id,
                                             uint64_t tag_lower,
                                             uint64_t tag_upper) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2350,7 +2468,8 @@ extern "C" int snapi_bridge_check_object_type_tag(SnapiEnvState* env_state, uint
                                                   uint64_t tag_lower,
                                                   uint64_t tag_upper,
                                                   int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2373,7 +2492,8 @@ extern "C" int snapi_bridge_call_function(SnapiEnvState* env_state, uint32_t rec
                                           uint32_t argc,
                                           const uint32_t* argv_ids,
                                           uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value recv = LoadValue(*bridge_state, recv_id);
@@ -2398,7 +2518,8 @@ extern "C" int snapi_bridge_call_function(SnapiEnvState* env_state, uint32_t rec
 
 extern "C" int snapi_bridge_run_script(SnapiEnvState* env_state, uint32_t script_id,
                                        uint32_t* out_value_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value script_val = LoadValue(*bridge_state, script_id);
@@ -2417,7 +2538,8 @@ extern "C" int snapi_bridge_run_script(SnapiEnvState* env_state, uint32_t script
 extern "C" int snapi_bridge_create_string_utf16(SnapiEnvState* env_state, const uint16_t* str,
                                                 uint32_t wasm_length,
                                                 uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   size_t length =
@@ -2434,7 +2556,8 @@ extern "C" int snapi_bridge_get_value_string_utf16(SnapiEnvState* env_state, uin
                                                    uint16_t* buf,
                                                    size_t bufsize,
                                                    size_t* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2451,7 +2574,8 @@ extern "C" int snapi_bridge_create_bigint_words(SnapiEnvState* env_state, int si
                                                 uint32_t word_count,
                                                 const uint64_t* words,
                                                 uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
@@ -2466,7 +2590,8 @@ extern "C" int snapi_bridge_get_value_bigint_words(SnapiEnvState* env_state, uin
                                                    int* sign_bit,
                                                    size_t* word_count,
                                                    uint64_t* words) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2479,7 +2604,8 @@ extern "C" int snapi_bridge_get_value_bigint_words(SnapiEnvState* env_state, uin
 // ============================================================
 
 extern "C" int snapi_bridge_set_instance_data(SnapiEnvState* env_state, uint64_t data_val) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return napi_set_instance_data(env, (void*)(uintptr_t)data_val,
@@ -2487,7 +2613,8 @@ extern "C" int snapi_bridge_set_instance_data(SnapiEnvState* env_state, uint64_t
 }
 
 extern "C" int snapi_bridge_get_instance_data(SnapiEnvState* env_state, uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   void* data = nullptr;
@@ -2499,7 +2626,8 @@ extern "C" int snapi_bridge_get_instance_data(SnapiEnvState* env_state, uint64_t
 
 extern "C" int snapi_bridge_adjust_external_memory(SnapiEnvState* env_state, int64_t change,
                                                    int64_t* adjusted) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return napi_adjust_external_memory(env, change, adjusted);
@@ -2512,7 +2640,8 @@ extern "C" int snapi_bridge_adjust_external_memory(SnapiEnvState* env_state, int
 extern "C" int snapi_bridge_create_buffer(SnapiEnvState* env_state, uint32_t length,
                                           uint64_t* data_out,
                                           uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value buffer;
@@ -2528,7 +2657,8 @@ extern "C" int snapi_bridge_create_buffer_copy(SnapiEnvState* env_state, uint32_
                                                const void* src_data,
                                                uint64_t* result_data_out,
                                                uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value buffer;
@@ -2542,7 +2672,8 @@ extern "C" int snapi_bridge_create_buffer_copy(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_is_buffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2558,7 +2689,8 @@ extern "C" int snapi_bridge_get_buffer_info(SnapiEnvState* env_state, uint32_t i
                                             uint64_t* data_out,
                                             uint32_t* length_out,
                                             uint64_t* backing_store_token_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, id);
@@ -2578,7 +2710,8 @@ extern "C" int snapi_bridge_get_buffer_info(SnapiEnvState* env_state, uint32_t i
 extern "C" int snapi_bridge_unofficial_acquire_buffer_lease(
     SnapiEnvState* env_state, uint32_t value_id, uint32_t byte_offset,
     uint32_t byte_length, int mode, uint32_t* lease_out, uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || lease_out == nullptr || data_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2602,7 +2735,8 @@ extern "C" int snapi_bridge_unofficial_acquire_buffer_lease(
 
 extern "C" int snapi_bridge_unofficial_release_buffer_lease(
     SnapiEnvState* env_state, uint32_t lease_id, int modified) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   auto lease = static_cast<unofficial_napi_buffer_lease>(
       bridge_state->agent->buffer_lease_handles.Load(lease_id));
@@ -2616,7 +2750,8 @@ extern "C" int snapi_bridge_unofficial_release_buffer_lease(
 extern "C" int snapi_bridge_unofficial_create_guest_backed_typedarray(
     SnapiEnvState* env_state, int type, uint32_t length, uint64_t* data_out,
     uint32_t* value_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || data_out == nullptr || value_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2638,7 +2773,8 @@ extern "C" int snapi_bridge_unofficial_create_guest_backed_typedarray(
 extern "C" int snapi_bridge_get_node_version(SnapiEnvState* env_state, uint32_t* major,
                                              uint32_t* minor,
                                              uint32_t* patch) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   // Return a reasonable fake version since we're running on pure V8
@@ -2654,7 +2790,8 @@ extern "C" int snapi_bridge_get_node_version(SnapiEnvState* env_state, uint32_t*
 
 extern "C" int snapi_bridge_wrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t native_data,
                                  uint32_t* ref_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2674,7 +2811,8 @@ extern "C" int snapi_bridge_wrap_finalized(SnapiEnvState* env_state, uint32_t ob
                                            uint64_t native_data, uint32_t guest_env,
                                            uint32_t wasm_fn_ptr, uint32_t finalize_data,
                                            uint32_t finalize_hint, uint32_t* ref_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2695,7 +2833,8 @@ extern "C" int snapi_bridge_wrap_finalized(SnapiEnvState* env_state, uint32_t ob
 }
 
 extern "C" int snapi_bridge_unwrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2708,7 +2847,8 @@ extern "C" int snapi_bridge_unwrap(SnapiEnvState* env_state, uint32_t obj_id, ui
 }
 
 extern "C" int snapi_bridge_remove_wrap(SnapiEnvState* env_state, uint32_t obj_id, uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2722,7 +2862,8 @@ extern "C" int snapi_bridge_remove_wrap(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_add_finalizer(SnapiEnvState* env_state, uint32_t obj_id, uint64_t data_val,
                                           uint32_t* ref_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2742,7 +2883,8 @@ extern "C" int snapi_bridge_add_finalizer_cb(SnapiEnvState* env_state, uint32_t 
                                              uint64_t data_val, uint32_t guest_env,
                                              uint32_t wasm_fn_ptr, uint32_t finalize_data,
                                              uint32_t finalize_hint, uint32_t* ref_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2769,7 +2911,8 @@ extern "C" int snapi_bridge_add_finalizer_cb(SnapiEnvState* env_state, uint32_t 
 extern "C" int snapi_bridge_new_instance(SnapiEnvState* env_state, uint32_t ctor_id, uint32_t argc,
                                          const uint32_t* argv_ids,
                                          uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value ctor = LoadValue(*bridge_state, ctor_id);
@@ -2803,7 +2946,8 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
                                               const uint32_t* getter_reg_ids,
                                               const uint32_t* setter_reg_ids,
                                               const int32_t* attributes) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
@@ -2868,7 +3012,8 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
     const uint32_t* prop_setter_reg_ids,
     const int32_t* prop_attributes,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
 
@@ -2934,7 +3079,8 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
                                         uint32_t* argc_ptr, uint32_t* argv_out,
                                         uint32_t max_argv,
                                         uint32_t* this_out, uint64_t* data_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_callback_info info = FindCallbackInvocation(*bridge_state, cbinfo_id);
@@ -2989,7 +3135,8 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
 // napi_get_new_target — only valid inside a constructor callback
 extern "C" int snapi_bridge_get_new_target(SnapiEnvState* env_state, uint32_t cbinfo_id,
                                            uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_callback_info info = FindCallbackInvocation(*bridge_state, cbinfo_id);
@@ -3148,7 +3295,7 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState* env_state) {
-  env_state = RequireEnvState(env_state);
+  env_state = LookupEnvState(env_state);
   if (env_state == nullptr) return 0;
   // Cap callback registrations alongside value handles: 0 signals failure so
   // the registration chain aborts instead of growing cb_registry unbounded.
@@ -3166,7 +3313,7 @@ extern "C" void snapi_bridge_register_callback(SnapiEnvState* env_state,
                                                uint32_t guest_env,
                                                uint32_t wasm_fn_ptr,
                                                uint64_t data_val) {
-  env_state = RequireEnvState(env_state);
+  env_state = LookupEnvState(env_state);
   if (env_state == nullptr || reg_id == 0) return;
   env_state->cb_registry[reg_id] = { guest_env, wasm_fn_ptr, 0, data_val };
 }
@@ -3177,7 +3324,7 @@ extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState* env_state,
                                                     uint32_t wasm_getter_fn_ptr,
                                                     uint32_t wasm_setter_fn_ptr,
                                                     uint64_t data_val) {
-  env_state = RequireEnvState(env_state);
+  env_state = LookupEnvState(env_state);
   if (env_state == nullptr || reg_id == 0) return;
   env_state->cb_registry[reg_id] = { guest_env, wasm_getter_fn_ptr, wasm_setter_fn_ptr, data_val };
 }
@@ -3188,7 +3335,8 @@ extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char* utf8name, uint32_t name_len,
                                             uint32_t reg_id,
                                             uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   CallbackBinding* binding = RegisterCallbackBinding(bridge_state, reg_id);
@@ -3302,7 +3450,8 @@ size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void* data,
 
 extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
     SnapiEnvState* env_state, const void* data) {
-  auto* state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* state = env_scope.get();
   if (state == nullptr) return napi_invalid_arg;
   return unofficial_napi_configure_near_heap_limit_callback(
       state->env,
@@ -3329,7 +3478,7 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
 
 extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState* env_state,
                                                        uint64_t limit) {
-  auto* state = RequireEnvState(env_state);
+  auto* state = LookupEnvState(env_state);
   if (state == nullptr) return napi_invalid_arg;
   state->agent->value_limit = static_cast<size_t>(limit);
   return napi_ok;
@@ -3347,7 +3496,8 @@ extern "C" int snapi_bridge_unofficial_release_env_with_loop(SnapiEnvState* env_
 
 extern "C" int snapi_bridge_unofficial_collect_garbage(
     SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return unofficial_napi_collect_garbage(env);
@@ -3356,7 +3506,8 @@ extern "C" int snapi_bridge_unofficial_collect_garbage(
 extern "C" int snapi_bridge_unofficial_memory_pressure(
     SnapiEnvState* env_state,
     int32_t level) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   return unofficial_napi_memory_pressure(bridge_state->env, level);
 }
@@ -3366,7 +3517,8 @@ extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
     int mode,
     int has_runnable_work,
     uint32_t* checkpoint_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   uint32_t state = unofficial_napi_event_loop_checkpoint_state_none;
@@ -3384,7 +3536,8 @@ extern "C" int snapi_bridge_unofficial_event_loop_checkpoint(
 extern "C" int snapi_bridge_unofficial_set_prepare_stack_trace_callback(
     SnapiEnvState* env_state,
     uint32_t callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
@@ -3397,7 +3550,8 @@ extern "C" int snapi_bridge_unofficial_get_promise_details(SnapiEnvState* env_st
                                                            int32_t* state_out,
                                                            uint32_t* result_out,
                                                            int* has_result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value promise = LoadValue(*bridge_state, promise_id);
@@ -3416,7 +3570,8 @@ extern "C" int snapi_bridge_unofficial_get_proxy_details(SnapiEnvState* env_stat
                                                          uint32_t proxy_id,
                                                          uint32_t* target_out,
                                                          uint32_t* handler_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value proxy = LoadValue(*bridge_state, proxy_id);
@@ -3434,7 +3589,8 @@ extern "C" int snapi_bridge_unofficial_preview_entries(SnapiEnvState* env_state,
                                                        uint32_t value_id,
                                                        uint32_t* entries_out,
                                                        int* is_key_value_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = LoadValue(*bridge_state, value_id);
@@ -3451,7 +3607,8 @@ extern "C" int snapi_bridge_unofficial_preview_entries(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
                                                       uint32_t frames,
                                                       uint32_t* callsites_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value callsites = nullptr;
@@ -3464,7 +3621,8 @@ extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_unofficial_arraybuffer_view_has_buffer(SnapiEnvState* env_state,
                                                                    uint32_t value_id,
                                                                    int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = LoadValue(*bridge_state, value_id);
@@ -3479,7 +3637,8 @@ extern "C" int snapi_bridge_unofficial_arraybuffer_view_has_buffer(SnapiEnvState
 extern "C" int snapi_bridge_unofficial_get_constructor_name(SnapiEnvState* env_state,
                                                             uint32_t value_id,
                                                             uint32_t* name_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = LoadValue(*bridge_state, value_id);
@@ -3495,7 +3654,8 @@ extern "C" int snapi_bridge_unofficial_create_private_symbol(SnapiEnvState* env_
                                                              const char* utf8description,
                                                              uint32_t wasm_length,
                                                              uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   size_t length =
@@ -3511,7 +3671,8 @@ extern "C" int snapi_bridge_unofficial_create_private_symbol(SnapiEnvState* env_
 extern "C" int snapi_bridge_unofficial_get_continuation_preserved_embedder_data(
     SnapiEnvState* env_state,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result = nullptr;
@@ -3525,7 +3686,8 @@ extern "C" int snapi_bridge_unofficial_get_continuation_preserved_embedder_data(
 extern "C" int snapi_bridge_unofficial_set_continuation_preserved_embedder_data(
     SnapiEnvState* env_state,
     uint32_t value_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = value_id == 0 ? nullptr : LoadValue(*bridge_state, value_id);
@@ -3538,7 +3700,8 @@ extern "C" int snapi_bridge_unofficial_attach_env(
     uint32_t /*fatal_callback_id*/,
     uint32_t /*oom_callback_id*/,
     uint64_t* accepted_hooks_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || accepted_hooks_out == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   // Guest callbacks cannot be installed as native provider function pointers.
@@ -3590,7 +3753,8 @@ extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_st
 
 extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
     SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return unofficial_napi_cancel_terminate_execution(env);
@@ -3628,7 +3792,8 @@ extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_stat
 
 extern "C" int snapi_bridge_unofficial_create_trusted_script(
     SnapiEnvState* state, uint32_t source_id, uint32_t* result_out) {
-  auto* bridge = RequireEnvState(state);
+  BridgeEnvScope env_scope(state);
+  auto* bridge = env_scope.get();
   if (bridge == nullptr || result_out == nullptr) return napi_invalid_arg;
   *result_out = 0;
   napi_value source = LoadValue(*bridge, source_id), result = nullptr;
@@ -3640,7 +3805,8 @@ extern "C" int snapi_bridge_unofficial_create_trusted_script(
 }
 
 extern "C" int snapi_bridge_unofficial_is_executing_js(SnapiEnvState* state, int* result_out) {
-  auto* bridge = RequireEnvState(state);
+  BridgeEnvScope env_scope(state);
+  auto* bridge = env_scope.get();
   if (bridge == nullptr || result_out == nullptr) return napi_invalid_arg;
   *result_out = 0;
   bool result = false;
@@ -3651,7 +3817,8 @@ extern "C" int snapi_bridge_unofficial_is_executing_js(SnapiEnvState* state, int
 
 extern "C" int snapi_bridge_unofficial_enqueue_microtask(SnapiEnvState* env_state,
                                                          uint32_t callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value callback = LoadValue(*bridge_state, callback_id);
@@ -3661,7 +3828,8 @@ extern "C" int snapi_bridge_unofficial_enqueue_microtask(SnapiEnvState* env_stat
 
 extern "C" int snapi_bridge_unofficial_set_promise_reject_callback(SnapiEnvState* env_state,
                                                                    uint32_t callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
@@ -3674,7 +3842,8 @@ extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
     uint32_t value_id,
     uint32_t filter_bits,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || out_id == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = LoadValue(*bridge_state, value_id);
@@ -3693,7 +3862,8 @@ extern "C" int snapi_bridge_unofficial_define_lazy_data_properties(
     uint32_t names_id,
     uint32_t initializer_id,
     int32_t attributes) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || object_id == 0 || names_id == 0 || initializer_id == 0) {
     return napi_invalid_arg;
   }
@@ -3715,7 +3885,8 @@ extern "C" int snapi_bridge_unofficial_is_lazy_data_property(
     uint32_t object_id,
     uint32_t key_id,
     int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || result_out == nullptr || object_id == 0 || key_id == 0) {
     return napi_invalid_arg;
   }
@@ -3736,7 +3907,8 @@ extern "C" int snapi_bridge_unofficial_set_promise_hooks(
     uint32_t before_callback_id,
     uint32_t after_callback_id,
     uint32_t resolve_callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value init = init_callback_id == 0 ? nullptr : LoadValue(*bridge_state, init_callback_id);
@@ -3756,7 +3928,8 @@ extern "C" int snapi_bridge_unofficial_set_promise_hooks(
 
 extern "C" int snapi_bridge_unofficial_get_hash_seed(SnapiEnvState* env_state,
                                                       uint64_t* hash_seed_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (
@@ -3777,7 +3950,8 @@ extern "C" int snapi_bridge_unofficial_get_error_metadata(
     int32_t* line_number_out,
     int32_t* start_column_out,
     int32_t* end_column_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value error = LoadValue(*bridge_state, error_id);
@@ -3812,7 +3986,8 @@ extern "C" int snapi_bridge_unofficial_configure_source_maps(
     SnapiEnvState* env_state,
     int enabled,
     uint32_t callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value callback = callback_id == 0 ? nullptr : LoadValue(*bridge_state, callback_id);
@@ -3823,7 +3998,8 @@ extern "C" int snapi_bridge_unofficial_configure_source_maps(
 extern "C" int snapi_bridge_unofficial_preserve_error_source_message(
     SnapiEnvState* env_state,
     uint32_t error_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value error = LoadValue(*bridge_state, error_id);
@@ -3834,7 +4010,8 @@ extern "C" int snapi_bridge_unofficial_preserve_error_source_message(
 extern "C" int snapi_bridge_unofficial_mark_promise_as_handled(
     SnapiEnvState* env_state,
     uint32_t promise_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value promise = LoadValue(*bridge_state, promise_id);
@@ -3845,7 +4022,8 @@ extern "C" int snapi_bridge_unofficial_mark_promise_as_handled(
 extern "C" int snapi_bridge_unofficial_get_heap_statistics(
     SnapiEnvState* env_state,
     unofficial_napi_heap_statistics* stats_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (
@@ -3860,7 +4038,8 @@ extern "C" int snapi_bridge_unofficial_get_heap_space_statistics(
     unofficial_napi_heap_space_statistics* stats_out,
     uint32_t capacity,
     uint32_t* count_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (count_out == nullptr || (capacity > 0 && stats_out == nullptr)) {
@@ -3872,7 +4051,8 @@ extern "C" int snapi_bridge_unofficial_get_heap_space_statistics(
 extern "C" int snapi_bridge_unofficial_get_heap_code_statistics(
     SnapiEnvState* env_state,
     unofficial_napi_heap_code_statistics* stats_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (
@@ -3886,7 +4066,8 @@ extern "C" int snapi_bridge_unofficial_profile_start(SnapiEnvState* env_state,
                                                       int32_t kind,
                                                       int32_t* result_out,
                                                       uint32_t* profile_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (result_out == nullptr || profile_out == nullptr) {
@@ -3906,7 +4087,8 @@ extern "C" int snapi_bridge_unofficial_profile_start(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_unofficial_profile_stop(SnapiEnvState* env_state,
                                                      uint32_t profile_id,
                                                      uint32_t* json_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (json_out == nullptr) return napi_invalid_arg;
@@ -3928,7 +4110,8 @@ extern "C" int snapi_bridge_unofficial_take_heap_snapshot(
     int expose_internals,
     int expose_numeric_values,
     uint32_t* json_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (json_out == nullptr) {
@@ -3953,7 +4136,8 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
     uint32_t value_id,
     uint32_t transfer_list_id,
     uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value value = LoadValue(*bridge_state, value_id);
@@ -3974,7 +4158,8 @@ extern "C" int snapi_bridge_unofficial_message_create(
     SnapiEnvState* env_state,
     uint32_t value_id,
     uint32_t* message_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || message_out == nullptr) return napi_invalid_arg;
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
@@ -4005,7 +4190,8 @@ extern "C" int snapi_bridge_unofficial_message_take(
     message = reinterpret_cast<unofficial_napi_message>(g_message_handles.Take(message_id));
   }
   if (message == nullptr) return napi_invalid_arg;
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || value_out == nullptr) {
     unofficial_napi_message_drop(message);
     return napi_invalid_arg;
@@ -4031,7 +4217,8 @@ extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id) {
 
 extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
     SnapiEnvState* env_state) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   return unofficial_napi_notify_datetime_configuration_change(env);
@@ -4039,7 +4226,8 @@ extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
 
 extern "C" int snapi_bridge_unofficial_create_serdes_binding(SnapiEnvState* env_state,
                                                              uint32_t* out_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result = nullptr;
@@ -4056,7 +4244,8 @@ extern "C" int snapi_bridge_unofficial_contextify_contains_module_syntax(
     uint32_t resource_name_id,
     int cjs_var_in_scope,
     int* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value code = LoadValue(*bridge_state, code_id);
@@ -4094,7 +4283,8 @@ extern "C" int snapi_bridge_unofficial_create_realm(SnapiEnvState* env_state,
                                                     int32_t own_microtask_queue,
                                                     uint32_t* realm_out,
                                                     uint32_t* global_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || realm_out == nullptr) return napi_invalid_arg;
   // A nonzero id must resolve; 0 means the field is NULL.
   auto load_optional = [bridge_state](uint32_t id, napi_value* out) {
@@ -4125,7 +4315,8 @@ extern "C" int snapi_bridge_unofficial_create_realm(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
                                                  uint32_t value_id,
                                                  uint32_t* realm_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || realm_out == nullptr) return napi_invalid_arg;
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
@@ -4140,7 +4331,8 @@ extern "C" int snapi_bridge_unofficial_get_realm(SnapiEnvState* env_state,
 extern "C" int snapi_bridge_unofficial_enter_realm(SnapiEnvState* env_state,
                                                    uint32_t realm_id,
                                                    uint64_t* scope_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr || scope_out == nullptr) return napi_invalid_arg;
   unofficial_napi_realm realm = nullptr;
   if (!ResolveRealm(*bridge_state, realm_id, &realm)) return napi_invalid_arg;
@@ -4152,7 +4344,8 @@ extern "C" int snapi_bridge_unofficial_enter_realm(SnapiEnvState* env_state,
 }
 
 extern "C" int snapi_bridge_unofficial_leave_realm(SnapiEnvState* env_state, uint64_t scope) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   return unofficial_napi_leave_realm(bridge_state->env, scope);
 }
@@ -4171,7 +4364,8 @@ extern "C" int snapi_bridge_unofficial_run_script(
     int break_on_first_line,
     uint32_t host_defined_option_id,
     uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_realm realm = nullptr;
@@ -4218,7 +4412,8 @@ extern "C" int snapi_bridge_unofficial_compile_function(
     uint32_t params_id,
     uint32_t host_defined_option_id,
     uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value source_text = source_text_id == 0 ? nullptr : LoadValue(*bridge_state, source_text_id);
@@ -4273,7 +4468,8 @@ extern "C" int snapi_bridge_unofficial_bytecode_open(
     uint32_t* bytecode_out,
     uint8_t* cache_rejected_out,
     uint8_t* can_parse_as_module_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value source_text = LoadValue(*bridge_state, source_text_id);
@@ -4316,7 +4512,8 @@ extern "C" int snapi_bridge_unofficial_bytecode_serialize(
     SnapiEnvState* env_state,
     uint32_t bytecode_id,
     uint32_t* buffer_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
@@ -4331,7 +4528,8 @@ extern "C" int snapi_bridge_unofficial_bytecode_serialize(
 extern "C" int snapi_bridge_unofficial_bytecode_release(
     SnapiEnvState* env_state,
     uint32_t bytecode_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_bytecode bytecode = LoadBytecodeHandle(*bridge_state, bytecode_id);
@@ -4357,7 +4555,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
     uint32_t* handle_out,
     uint32_t* requests_out,
     uint8_t* has_top_level_await_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value wrapper = LoadValue(*bridge_state, wrapper_id);
@@ -4434,7 +4633,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
 
 extern "C" int snapi_bridge_unofficial_module_wrap_destroy(SnapiEnvState* env_state,
                                                            uint32_t handle_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4448,7 +4648,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_link(SnapiEnvState* env_state
                                                         uint32_t handle_id,
                                                         uint32_t count,
                                                         const uint32_t* linked_handle_ids) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4468,7 +4669,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_link(SnapiEnvState* env_state
 
 extern "C" int snapi_bridge_unofficial_module_wrap_instantiate(SnapiEnvState* env_state,
                                                                uint32_t handle_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4481,7 +4683,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_evaluate(SnapiEnvState* env_s
                                                             int64_t timeout,
                                                             int break_on_sigint,
                                                             uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4499,7 +4702,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_evaluate_sync(SnapiEnvState* 
                                                                  uint32_t filename_id,
                                                                  uint32_t parent_filename_id,
                                                                  uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4522,7 +4726,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_evaluate_sync(SnapiEnvState* 
 extern "C" int snapi_bridge_unofficial_module_wrap_get_namespace(SnapiEnvState* env_state,
                                                                  uint32_t handle_id,
                                                                  uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4540,7 +4745,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_state(
     int32_t* status_out,
     uint32_t* error_out,
     int* has_async_graph_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4570,7 +4776,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_awa
     uint32_t handle_id,
     int warnings,
     int* settled_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   if (settled_out == nullptr) return napi_invalid_arg;
@@ -4589,7 +4796,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_export(SnapiEnvState* env
                                                               uint32_t handle_id,
                                                               uint32_t export_name_id,
                                                               uint32_t export_value_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4604,7 +4812,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_module_source_object(
     SnapiEnvState* env_state,
     uint32_t handle_id,
     uint32_t source_object_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4618,7 +4827,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_get_module_source_object(
     SnapiEnvState* env_state,
     uint32_t handle_id,
     uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4634,7 +4844,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_cached_data(
     SnapiEnvState* env_state,
     uint32_t handle_id,
     uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);
@@ -4650,7 +4861,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_set_hooks(
     SnapiEnvState* env_state,
     uint32_t import_callback_id,
     uint32_t import_meta_callback_id) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value import_callback = import_callback_id == 0
@@ -4676,7 +4888,8 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create_required_module_facade
     SnapiEnvState* env_state,
     uint32_t handle_id,
     uint32_t* result_out) {
-  auto* bridge_state = RequireEnvState(env_state);
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   unofficial_napi_module module = LoadModuleWrapHandle(*bridge_state, handle_id);

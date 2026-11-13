@@ -2,6 +2,10 @@
 #define UNOFFICIAL_NAPI_NO_DEPRECATION_WARNINGS
 #include "napi_compat.h"
 
+#ifdef EDGE_BUNDLED_NAPI_V8
+#include "internal/napi_v8_env.h"
+#endif
+
 namespace napi::compat {
 namespace {
 
@@ -50,6 +54,7 @@ napi_status is_env_global(napi_env env, napi_value value, bool* result_out) {
   return napi_strict_equals(env, value, global, result_out);
 }
 
+#ifndef EDGE_BUNDLED_NAPI_V8
 // current_realm, making values in the caller's scope.
 napi_status find_current_realm(napi_env env, unofficial_napi_realm* realm_out) {
   napi_value global = nullptr;
@@ -64,12 +69,22 @@ napi_status find_current_realm(napi_env env, unofficial_napi_realm* realm_out) {
   if (!env_own) *realm_out = realm;
   return napi_ok;
 }
+#endif
 
 }  // namespace
 
 napi_status current_realm(napi_env env, unofficial_napi_realm* realm_out) {
+#ifdef EDGE_BUNDLED_NAPI_V8
+  *realm_out = nullptr;
+  if (env == nullptr) return napi_invalid_arg;
+  // The principal global can also be a sandbox. Use the realm stack to
+  // distinguish the two contexts even when they share the global object.
+  *realm_out = env->current_realm();
+  return napi_ok;
+#else
   *realm_out = nullptr;
   return in_lookup_scope(env, [&] { return find_current_realm(env, realm_out); });
+#endif
 }
 
 napi_status realm_from_context(napi_env env,

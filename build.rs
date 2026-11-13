@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PREBUILT_V8_VERSION: &str = "11.9.9";
+const PREBUILT_V8_VERSION: &str = "15.9.111.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V8Method {
@@ -93,6 +93,7 @@ fn main() {
         .flag_if_supported("-fno-rtti")
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
+        .define("EDGE_BUNDLED_NAPI_V8", Some("1"))
         .include(&v8.include_dir)
         .include(napi_include.to_str().unwrap())
         .include(napi_lib_src.to_str().unwrap())
@@ -484,9 +485,12 @@ fn default_local_extra_links(library_path: &Path) -> Vec<ExtraLink> {
 fn default_prebuilt_extra_links() -> Vec<ExtraLink> {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" || target_os == "ios" {
-        vec![ExtraLink::Framework(PathBuf::from(
-            "/System/Library/Frameworks/CoreFoundation.framework",
-        ))]
+        vec![
+            ExtraLink::Framework(PathBuf::from(
+                "/System/Library/Frameworks/CoreFoundation.framework",
+            )),
+            ExtraLink::Framework(PathBuf::from("/System/Library/Frameworks/Security.framework")),
+        ]
     } else {
         Vec::new()
     }
