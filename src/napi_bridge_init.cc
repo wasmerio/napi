@@ -4224,6 +4224,23 @@ extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(
   return unofficial_napi_notify_datetime_configuration_change(env);
 }
 
+// Host-only: set the process time zone, or restore the host zone for length 0.
+extern "C" int snapi_bridge_set_process_time_zone(const char* zone, size_t length) {
+  return unofficial_napi_set_process_time_zone(zone, length);
+}
+
+extern "C" int snapi_bridge_unofficial_refresh_intl_defaults(SnapiEnvState* env_state) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_refresh_intl_defaults(bridge_state->env);
+}
+
+extern "C" int snapi_bridge_unofficial_set_default_locale(SnapiEnvState* env_state, const char* tag, size_t length) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  return unofficial_napi_set_default_locale(bridge_state->env, tag, length);
+}
+
 extern "C" int snapi_bridge_unofficial_create_serdes_binding(SnapiEnvState* env_state,
                                                              uint32_t* out_id) {
   BridgeEnvScope env_scope(env_state);

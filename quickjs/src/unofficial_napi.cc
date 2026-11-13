@@ -1147,6 +1147,29 @@ extern "C"
         return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
     }
 
+    // QuickJS has no ICU: its Date follows the C library's TZ, and its Intl
+    // defaults cannot be overridden. A zone change is never pending.
+    napi_status NAPI_CDECL unofficial_napi_set_process_time_zone(const char *zone, size_t length)
+    {
+        if (zone == nullptr && length != 0)
+            return napi_invalid_arg;
+        return napi_generic_failure;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_refresh_intl_defaults(napi_env env)
+    {
+        return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_set_default_locale(napi_env env,
+                                                              const char *tag,
+                                                              size_t length)
+    {
+        if (!napi_util__::check_env(env) || (tag == nullptr && length != 0) || length > 256)
+            return napi_invalid_arg;
+        return napi_generic_failure;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
                                                                  napi_value *result_out)
     {

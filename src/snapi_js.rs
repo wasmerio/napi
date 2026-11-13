@@ -5290,6 +5290,22 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_notify_datetime_configuration_c
     let _ = env;
     NAPI_GENERIC_FAILURE
 }
+// The host's JavaScript engine keeps its own Intl defaults: no time zone or
+// locale override reaches it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_refresh_intl_defaults(env: SnapiEnv) -> i32 {
+    let _ = env;
+    NAPI_GENERIC_FAILURE
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_set_default_locale(
+    env: SnapiEnv,
+    tag: *const std::ffi::c_char,
+    length: usize,
+) -> i32 {
+    let _ = (env, tag, length);
+    NAPI_GENERIC_FAILURE
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_create_serdes_binding(
     env: SnapiEnv,

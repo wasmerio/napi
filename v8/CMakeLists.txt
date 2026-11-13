@@ -84,6 +84,34 @@ endif()
 if(NAPI_V8_DEFINES)
   target_compile_definitions(napi_v8 PRIVATE ${NAPI_V8_DEFINES})
 endif()
+# ICU's C API in the V8 library carries V8's ICU major version as a suffix
+# (ucal_setDefaultTimeZone_74), and no ICU headers ship with a prebuilt V8:
+# unofficial_napi.cc declares the prototypes with the suffix found here, as
+# build.rs does. 0 (no nm, or the library defines none) builds the time zone
+# and locale overrides as napi_generic_failure.
+set(_napi_icu_suffix 0)
+if(CMAKE_NM AND EXISTS "${NAPI_V8_LIBRARY}")
+  execute_process(
+    COMMAND "${CMAKE_NM}" -g "${NAPI_V8_LIBRARY}"
+    OUTPUT_VARIABLE _napi_v8_symbols
+    ERROR_QUIET
+  )
+  # All digits up to the end of the line, as build.rs takes them: not the 74
+  # of ucal_setDefaultTimeZone_74_<suffix> (ICU built with a library suffix).
+  string(APPEND _napi_v8_symbols "\n")
+  if(_napi_v8_symbols MATCHES "[ \t]T _?ucal_setDefaultTimeZone_([0-9]+)[\r\n]")
+    set(_napi_icu_suffix "${CMAKE_MATCH_1}")
+  endif()
+  unset(_napi_v8_symbols)
+endif()
+if(_napi_icu_suffix STREQUAL "0")
+  message(WARNING
+    "${NAPI_V8_LIBRARY} defines no ucal_setDefaultTimeZone_<version>: "
+    "building without the ICU time zone and locale overrides")
+endif()
+target_compile_definitions(napi_v8 PRIVATE NAPI_ICU_SUFFIX=${_napi_icu_suffix})
+# Also for test_71, which sets ICU's default locale itself.
+set_target_properties(napi_v8 PROPERTIES NAPI_ICU_SUFFIX "${_napi_icu_suffix}")
 if(NAPI_V8_LIBRARY)
   target_link_libraries(napi_v8 PUBLIC "${NAPI_V8_LIBRARY}")
 endif()

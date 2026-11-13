@@ -1012,6 +1012,40 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
     unsafe { snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle) }
 }
 
+fn guest_unofficial_napi_refresh_intl_defaults(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_refresh_intl_defaults(env_handle) }
+}
+
+fn guest_unofficial_napi_set_default_locale(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    tag_ptr: u32,
+    length: u32,
+) -> i32 {
+    // A tag is short; a larger length is a malformed call (napi_invalid_arg).
+    // So is NULL with a length, as in the C API.
+    if length > 256 || (tag_ptr == 0 && length != 0) {
+        return 1;
+    }
+    let tag = if length == 0 {
+        Some(Vec::new())
+    } else {
+        read_guest_bytes(&mut env, tag_ptr, length as usize)
+    };
+    let Some(tag) = tag else {
+        return 1;
+    };
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe {
+        snapi_bridge_unofficial_set_default_locale(
+            env_handle,
+            tag.as_ptr() as *const std::ffi::c_char,
+            tag.len(),
+        )
+    }
+}
+
 fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
@@ -5939,6 +5973,8 @@ pub fn register_napi_imports(
         "unofficial_napi_get_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_continuation_preserved_embedder_data),
         "unofficial_napi_set_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_continuation_preserved_embedder_data),
         "unofficial_napi_notify_datetime_configuration_change" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_notify_datetime_configuration_change),
+        "unofficial_napi_refresh_intl_defaults" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_refresh_intl_defaults),
+        "unofficial_napi_set_default_locale" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_default_locale),
         "unofficial_napi_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_terminate_execution),
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
         "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
