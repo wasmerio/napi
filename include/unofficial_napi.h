@@ -684,6 +684,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_trusted_script(
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_is_executing_js(
     napi_env env, bool* result);
 
+#if defined(__wasm__)
+// Deletes an array of references in one guest import. Each reference is
+// attempted in order, returning the first failure or napi_ok. An invalid
+// array is rejected before deletion. Host JS returns napi_generic_failure
+// without deleting anything, so callers can use napi_delete_reference there.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_delete_references(
+    napi_env env, const napi_ref* refs, size_t count);
+#endif
+
 typedef void (*unofficial_napi_interrupt_callback)(napi_env env, void* data);
 
 // Unofficial helper. Requests execution of a callback on the target env's

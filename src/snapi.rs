@@ -835,6 +835,12 @@ unsafe extern "C" {
     pub fn snapi_bridge_reference_ref(env: SnapiEnv, ref_id: u32, result: *mut u32) -> i32;
     pub fn snapi_bridge_reference_unref(env: SnapiEnv, ref_id: u32, result: *mut u32) -> i32;
     pub fn snapi_bridge_get_reference_value(env: SnapiEnv, ref_id: u32, out_id: *mut u32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_unofficial_delete_references(
+        env: SnapiEnv,
+        ref_ids: *const u32,
+        count: u32,
+    ) -> i32;
     // Handle scopes
     pub fn snapi_bridge_open_handle_scope(env: SnapiEnv, scope_out: *mut u32) -> i32;
     pub fn snapi_bridge_close_handle_scope(env: SnapiEnv, scope_id: u32) -> i32;
