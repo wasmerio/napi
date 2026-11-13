@@ -14,7 +14,7 @@
 class NapiTestRuntime {
  public:
   NapiTestRuntime() {
-    static constexpr char kDefaultFlags[] = "--expose-gc --js-float16array";
+    static constexpr char kDefaultFlags[] = "--expose-gc";
     unofficial_napi_runtime_options options{};
     options.size = sizeof(options);
     options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;

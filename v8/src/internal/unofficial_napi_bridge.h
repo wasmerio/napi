@@ -5,6 +5,10 @@
 
 #include "unofficial_napi.h"
 
+// Detach a freshly created owner from the current isolate stack. The WASM
+// bridge enters its isolate separately for each call.
+void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner);
+
 bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);

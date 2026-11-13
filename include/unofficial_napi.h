@@ -655,9 +655,8 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_cancel_terminate_execut
 // default toString belong to that realm. No explicit realm argument is needed.
 // Eval uses its caller's lexical scope and the receiving realm's codegen
 // restriction, even when the trusted source was made in another realm.
-// Function(trusted) uses ordinary string coercion; only eval's source lookup
-// bypasses author toString/@@toPrimitive. The default native toString enables
-// Function(trusted) but is not a hardened Function-constructor integration.
+// V8's Function constructor also uses the hook to get the source of each
+// trusted argument. Other arguments still use ordinary string coercion.
 // Source must be a primitive string. While terminating, V8 refuses creation
 // with napi_pending_exception. Creation and the query below remain usable
 // during cleanup hooks while the env and its agent are still live.

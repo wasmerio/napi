@@ -203,7 +203,9 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
 
   if(extra_override STREQUAL "")
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-      set(_extra "/System/Library/Frameworks/CoreFoundation.framework")
+      set(_extra
+        "/System/Library/Frameworks/CoreFoundation.framework"
+        "/System/Library/Frameworks/Security.framework")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       set(_extra "pthread;dl;m;rt")
       if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR
@@ -336,7 +338,9 @@ function(_napi_v8_source_strategy out_ok out_include out_library out_extra out_d
   endif()
 
   if(extra_override STREQUAL "" AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(_extra "/System/Library/Frameworks/CoreFoundation.framework")
+    set(_extra
+      "/System/Library/Frameworks/CoreFoundation.framework"
+      "/System/Library/Frameworks/Security.framework")
   else()
     set(_extra "${extra_override}")
   endif()

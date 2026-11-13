@@ -1089,7 +1089,12 @@ v8::MaybeLocal<v8::Module> ModuleResolveCallback(v8::Local<v8::Context> context,
     ThrowV8CodeError(context, "ERR_VM_MODULE_LINK_FAILURE", "Module request is not cached");
     return v8::MaybeLocal<v8::Module>();
   }
-  return dependent->linked_requests[it->second]->module.Get(env->isolate);
+  auto requested = dependent->linked_requests[it->second]->module.Get(env->isolate);
+  if (requested->GetStatus() == v8::Module::kEvaluating) {
+    ThrowV8CodeError(context, "ERR_VM_MODULE_STATUS", "A module it imports is evaluating");
+    return {};
+  }
+  return requested;
 }
 
 v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> context,
@@ -1883,8 +1888,11 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
   // AllowWasmCodeGenerationCallback, which this provider does not install.
   // name and origin are ignored too.
   context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
-  context->SetAlignedPointerInEmbedderDataV2(
+  // The realm slot can be beyond the context's initial embedder data.
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
+  context->SetAlignedPointerInEmbedderData(
       kRealmContextSlot, realm.get(), v8::kEmbedderDataTypeTagDefault);
+  UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
   NapiV8ApplyPromiseHooksToContext(env, context);
   realm->context.Reset(isolate, context);
   realm->context.SetWeak();
@@ -2981,6 +2989,9 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
+  // The module is already linked while its evaluation is running. V8's
+  // InstantiateModule rejects this status even for an already linked module.
+  if (module->GetStatus() == v8::Module::kEvaluating) return napi_ok;
 
   v8::TryCatch try_catch(isolate);
   InstantiationScope instantiating(env);
@@ -3019,8 +3030,7 @@ static bool ThrowIfEvaluating(napi_env env, ModuleWrapRecord* record) {
 // evaluation steps are running (a CHECK). Script reaches that from those
 // steps, for example a CommonJS module that requires an ES module importing
 // it, a cycle Node refuses too. So evaluating `record` is refused when what it
-// would evaluate (the instantiated source text modules it reaches through the
-// modules they were linked to) imports such a module.
+// would instantiate or evaluate imports such a module.
 static bool ThrowIfImportingAnEvaluatingSyntheticModule(napi_env env, ModuleWrapRecord* record) {
   auto* state = GetModuleWrapState(env);
   if (state == nullptr || state->synthetic_steps_running == 0) return false;
@@ -3035,10 +3045,13 @@ static bool ThrowIfImportingAnEvaluatingSyntheticModule(napi_env env, ModuleWrap
     pending.pop_back();
     v8::Local<v8::Module> module = current->module.Get(isolate);
     if (module.IsEmpty() || !module->IsSourceTextModule() ||
-        module->GetStatus() != v8::Module::kInstantiated) {
+        (module->GetStatus() != v8::Module::kUninstantiated &&
+         module->GetStatus() != v8::Module::kInstantiated)) {
       continue;
     }
-    for (ModuleWrapRecord* linked : current->linked_requests) {
+    for (size_t i = 0; i < current->linked_requests.size(); ++i) {
+      if (current->module_requests[i].phase == 1) continue;  // Source-phase import.
+      ModuleWrapRecord* linked = current->linked_requests[i];
       if (live.count(linked) == 0 || !seen.insert(linked).second) continue;
       v8::Local<v8::Module> requested = linked->module.Get(isolate);
       if (requested.IsEmpty()) continue;
@@ -3073,9 +3086,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   NAPI_V8_RETURN_IF_TERMINATING(env);
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3105,9 +3118,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   const napi_status instantiated = InstantiateForEvaluation(env, record);
   if (instantiated != napi_ok) return instantiated;
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3375,6 +3388,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
   if (ThrowIfEvaluating(env, record)) return napi_pending_exception;
   // Instantiating the facade instantiates that module too.
   if (InstantiationScope::ThrowIfRunning(env)) return napi_pending_exception;
+  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
@@ -3417,7 +3431,6 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_required_module_facade
     GetModuleWrapStateLocked(env)->temporary_required_module_facade_original = nullptr;
   }
   if (!instantiated) return ThrowTryCatchException(env, try_catch);
-  if (ThrowIfImportingAnEvaluatingSyntheticModule(env, record)) return napi_pending_exception;
 
   v8::Local<v8::Value> evaluated;
   if (!facade->Evaluate(context).ToLocal(&evaluated)) return ThrowTryCatchException(env, try_catch);

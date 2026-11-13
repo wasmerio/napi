@@ -19,7 +19,7 @@
 class Test77ModuleWrapState : public FixtureTestBase {
  protected:
   static void SetUpTestSuite() {
-    static constexpr char kFlags[] = "--expose-gc --js-float16array --js-source-phase-imports";
+    static constexpr char kFlags[] = "--expose-gc --js-source-phase-imports";
     unofficial_napi_runtime_options options{};
     options.size = sizeof(options);
     options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
@@ -908,11 +908,9 @@ napi_value InstantiateDuringEvaluation(napi_env env, napi_callback_info info) {
 // synthetic module's steps) does nothing, as on V8: the module is linked
 // already and goes on evaluating. QuickJS linked it again and took it from
 // "evaluating" back to "linked" (its linker asserts against such a module).
-// Instantiating a module that imports one being evaluated is engine-specific:
-// V8 takes the evaluating module as linked and instantiates it; QuickJS's
-// linker cannot link through one (it took it to "linked" too), so the
-// QuickJS provider refuses it with ERR_VM_MODULE_STATUS. Either way it
-// instantiates once the evaluation is done.
+// Both linkers reject a dependency that is still evaluating. The provider
+// reports ERR_VM_MODULE_STATUS and the importer can be linked once its
+// dependency finishes evaluating.
 TEST_F(Test77ModuleWrapState, InstantiatingAModuleWhileItEvaluates) {
   for (bool synthetic : {true, false}) {
     SCOPED_TRACE(synthetic ? "synthetic" : "source text");
@@ -944,12 +942,8 @@ TEST_F(Test77ModuleWrapState, InstantiatingAModuleWhileItEvaluates) {
     ASSERT_TRUE(probe.entered);
     ASSERT_EQ(probe.outcomes.size(), 2u);
     EXPECT_EQ(probe.outcomes[0], "self 0, status 3");
-#if defined(NAPI_TEST_ENGINE_V8)
-    EXPECT_EQ(probe.outcomes[1], "importer 0, status 2");
-#else
     EXPECT_EQ(probe.outcomes[1],
               "importer 10 ERR_VM_MODULE_STATUS: A module it imports is evaluating, status 0");
-#endif
     EXPECT_EQ(Status(s.env, probe.module), kEvaluated);
 
     ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, probe.other), napi_ok);

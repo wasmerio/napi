@@ -15,6 +15,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       CC: clang
       CXX: clang++
+      # The prebuilt V8 archive uses ELF compact relocations (CREL).
+      LDFLAGS: -fuse-ld=lld-20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,6 +24,11 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lld-20
 
       - name: Build native V8 N-API
         run: make build-napi CMAKE_BUILD_TYPE=Release JOBS=4

@@ -24,7 +24,6 @@
 #include <v8.h>
 #include <v8-profiler.h>
 
-#include "internal/node_v8_default_flags.h"
 #include "internal/napi_env_cpu_profile.h"
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
@@ -802,12 +801,6 @@ void DisposeIsolateAndWait(EdgeV8Platform* platform,
   WaitForPlatformShutdown(&waiter, shutdown_pump_handle);
 }
 
-void ApplyDefaultV8Flags() {
-  v8::V8::SetFlagsFromString(
-      kNodeDefaultShippingV8Flags,
-      static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
-}
-
 void FatalErrorCallback(const char* location, const char* message) {
   napi_agent__* agent = napi_agent__::From(v8::Isolate::TryGetCurrent());
   if (agent == nullptr || agent->fatal_error_callback == nullptr) return;
@@ -837,7 +830,6 @@ napi_status ConfigureRuntime(const char* engine_flags,
                : napi_invalid_arg;
   }
 
-  ApplyDefaultV8Flags();
   if (engine_flags_length > 0) {
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
@@ -1878,6 +1870,10 @@ void ForgetEnvState(napi_env env) {
 
 }  // namespace unofficial_napi_internal
 
+void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner) {
+  reinterpret_cast<UnofficialEnvScope*>(owner)->isolate_scope.reset();
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
@@ -2136,6 +2132,9 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
   // again: that call is refused, and the release under way goes on.
   if (scope->releasing) return napi_invalid_arg;
   scope->releasing = true;
+  if (!scope->isolate_scope.has_value()) {
+    scope->isolate_scope.emplace(scope->isolate);
+  }
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
@@ -2429,6 +2428,8 @@ napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         if (context.IsEmpty()) return;
         v8::Context::Scope context_scope(context);
         napi_realm_frame_scope__ realm_frame(request->env, nullptr);
+        // The N-API interrupt callback may call back into JavaScript.
+        v8::Isolate::AllowJavascriptExecutionScope allow_js(isolate);
         request->callback(request->env, request->data);
         napi_v8_keep_terminating_after_interrupt(request->env);
       },
