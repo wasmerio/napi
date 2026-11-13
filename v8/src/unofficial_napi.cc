@@ -2795,7 +2795,7 @@ napi_status GetCallSitesImpl(napi_env env,
 
   auto set_named = [&](v8::Local<v8::Object> obj, const char* key, v8::Local<v8::Value> value) -> bool {
     v8::Local<v8::String> k;
-    if (!v8::String::NewFromUtf8(isolate, key, v8::NewStringType::kNormal).ToLocal(&k)) return false;
+    if (!v8::String::NewFromUtf8(isolate, key, v8::NewStringType::kInternalized).ToLocal(&k)) return false;
     return obj->Set(context, k, value).FromMaybe(false);
   };
 
