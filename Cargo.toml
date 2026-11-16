@@ -42,12 +42,12 @@ cli = [
 anyhow = "1"
 # This manifest is consumed as `wasmer/lib/napi`, so Wasmer dependencies must
 # stay relative to that checkout. Standalone builds use Cargo.standalone.toml.
-wasmer = { version = "=7.5.0", path = "../api", default-features = false }
+wasmer = { workspace = true, default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
 wasmer-cache = { version = "=7.5.0", path = "../cache", optional = true }
 wasmer-c-api-imports = { version = "=7.5.0", path = "../c-api-imports", optional = true, default-features = false }
-wasmer-types = { version = "=7.5.0", path = "../types", optional = true }
+wasmer-types = { workspace = true, default-features = true, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
 wasixv2 = { path = "../wasix/api", optional = true }
 wasixv2-dylink = { path = "../wasix/dylink", default-features = false, features = ["sys"], optional = true }
@@ -64,7 +64,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true, features = ["sys"] }
-wasmer = { version = "=7.5.0", path = "../api", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "sys-default",
 ] }
 

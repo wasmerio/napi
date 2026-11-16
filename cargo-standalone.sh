@@ -9,7 +9,7 @@ vendored_manifest="$repo_root/Cargo.toml"
 standalone_manifest="$repo_root/Cargo.standalone.toml"
 
 need_standalone=0
-for dep in api cache compiler-llvm types wasix/api wasix/exec wasix/dylink c-api-imports; do
+for dep in cache wasix/api wasix/exec wasix/dylink c-api-imports; do
   if [[ ! -f "$repo_root/../$dep/Cargo.toml" ]]; then
     need_standalone=1
     break

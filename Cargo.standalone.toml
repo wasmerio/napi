@@ -40,14 +40,14 @@ cli = [
 
 [dependencies]
 anyhow = "1"
-# Exported source uses the published private runtime main branch; Cargo.standalone.lock
-# fixes every runtime and WLK package to its exact published revision.
-wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false }
+# Engine uses runtime/next; product packages use wasmer-next/main.
+# Refresh Cargo.standalone.lock after the product split is pushed to main.
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
 wasmer-cache = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 wasmer-c-api-imports = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true, default-features = false }
-wasmer-types = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasmer-types = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
 wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["sys"], optional = true }
@@ -64,7 +64,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true, features = ["sys"] }
-wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = [
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", default-features = false, features = [
   "sys-default",
 ] }
 
