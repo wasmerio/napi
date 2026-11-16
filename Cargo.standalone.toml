@@ -52,8 +52,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true
 wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["sys"], optional = true }
 wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true }
-wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", optional = true }
-wasixv2-syscalls = { git = "https://github.com/wasmerio/wlk", branch = "main", optional = true }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasixv2-syscalls = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
 
@@ -82,12 +82,12 @@ wat = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main" }
-wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", features = ["tokio"] }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["js", "web", "wasix1"] }
-wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main", features = ["web"] }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", features = ["web"] }
 wasm-bindgen-test = "0.3.70"
 
 [package.metadata.docs.rs]
