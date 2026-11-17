@@ -699,6 +699,76 @@ pub unsafe extern "C" fn napi_host_budget_release(budget: *const c_void) {
     }
 }
 
+/// The budget pool a provider charge names (`NapiHostMemory::Pool` in
+/// v8/src/internal/napi_v8_agent.h).
+fn provider_pool(pool: u32) -> Option<Pool> {
+    match pool {
+        0 => Some(Pool::HostBookkeeping),
+        1 => Some(Pool::HostTransient),
+        2 => Some(Pool::SerializedMessage),
+        _ => None,
+    }
+}
+
+/// Charges `bytes` of host memory the provider is about to allocate to
+/// `pool`; a soft charge reaches the accountant's `try_charge_soft`. Nonzero
+/// on success.
+///
+/// # Safety
+/// As [`napi_host_bookkeeping_charge`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_memory_charge(
+    budget: *const c_void,
+    pool: u32,
+    bytes: u64,
+    soft: i32,
+) -> i32 {
+    let Some(pool) = provider_pool(pool) else {
+        return 0;
+    };
+    if budget.is_null() {
+        return 0;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    let charged = if soft != 0 {
+        budget.try_charge_soft(pool, bytes)
+    } else {
+        budget.try_charge(pool, bytes)
+    };
+    i32::from(charged.is_ok())
+}
+
+/// Returns `bytes` the provider charged to `pool`.
+///
+/// # Safety
+/// As [`napi_host_bookkeeping_charge`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_memory_uncharge(budget: *const c_void, pool: u32, bytes: u64) {
+    let Some(pool) = provider_pool(pool) else {
+        return;
+    };
+    if budget.is_null() {
+        return;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    budget.uncharge(pool, bytes);
+}
+
+/// Takes one more reference to a budget the bridge holds, which
+/// [`napi_host_budget_release`] returns.
+///
+/// # Safety
+/// `budget` must be a live reference from [`ResourceBudget::bridge_reference`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_budget_retain(budget: *const c_void) {
+    if !budget.is_null() {
+        // SAFETY: see the function's safety contract.
+        unsafe { Arc::increment_strong_count(budget as *const ResourceBudget) };
+    }
+}
+
 impl ResourceBudget {
     /// A reference to `budget` for the native bridge, which returns it with
     /// [`napi_host_budget_release`] (or the caller with

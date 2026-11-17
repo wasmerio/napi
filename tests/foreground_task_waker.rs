@@ -99,8 +99,10 @@ fn waker_runs_when_another_thread_queues_a_task_for_a_waiting_guest() {
     // dropping this guest while the test fails would then wait on it forever.
     let mut page = ManuallyDrop::new(Guest::new(&ctx, &engine, &module, signal_tx.clone()));
     page.create();
+    // Growable, so V8 keeps its bytes in its own pages: a plain one lives in
+    // this guest's memory, which a guest on another memory cannot receive.
     assert_eq!(
-        page.eval("globalThis.shared = new SharedArrayBuffer(8); shared"),
+        page.eval("globalThis.shared = new SharedArrayBuffer(8, { maxByteLength: 8 }); shared"),
         0
     );
     assert_eq!(page.message(), 0);

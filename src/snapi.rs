@@ -300,15 +300,16 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
-    /// Serializes a message of at most about `max_bytes` (see
-    /// `unofficial_napi_message_create_bounded`), reporting the host memory it
-    /// holds in `retained_bytes_out`.
+    /// Serializes a message, charged to the env's budget by the provider
+    /// until it is taken or dropped. `in_range_out` says whether one of its
+    /// `SharedArrayBuffer`s has bytes in `[range_begin, range_end)`.
     pub fn snapi_bridge_unofficial_message_create(
         env: SnapiEnv,
         value_id: u32,
-        max_bytes: u64,
+        range_begin: u64,
+        range_end: u64,
         payload_out: *mut u32,
-        retained_bytes_out: *mut u64,
+        in_range_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,

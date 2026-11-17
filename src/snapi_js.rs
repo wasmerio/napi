@@ -5248,14 +5248,15 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_structured_clone(
 pub unsafe extern "C" fn snapi_bridge_unofficial_message_create(
     env: SnapiEnv,
     value_id: u32,
-    _max_bytes: u64,
+    _range_begin: u64,
+    _range_end: u64,
     payload_out: *mut u32,
-    retained_bytes_out: *mut u64,
+    in_range_out: *mut i32,
 ) -> i32 {
-    // The host shares the value itself; this bridge cannot measure it, so the
-    // message is not charged.
-    if !retained_bytes_out.is_null() {
-        unsafe { retained_bytes_out.write(0) };
+    // The host shares the value itself: nothing is charged, and its shared
+    // buffers are host JavaScript memory, never a guest heap.
+    if !in_range_out.is_null() {
+        unsafe { in_range_out.write(0) };
     }
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;

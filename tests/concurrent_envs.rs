@@ -49,8 +49,10 @@ fn wait_in_one_env_and_notify_from_another(engine: &Engine, module: &Module, ent
     let (signal_tx, _signal_rx) = mpsc::channel();
     let mut notifier = Guest::new(&ctx, engine, module, signal_tx.clone());
     notifier.create();
+    // Growable, so V8 keeps its bytes in its own pages: a plain one lives in
+    // this guest's memory, which a guest on another memory cannot receive.
     assert_eq!(
-        notifier.eval("globalThis.shared = new SharedArrayBuffer(8); shared"),
+        notifier.eval("globalThis.shared = new SharedArrayBuffer(8, { maxByteLength: 8 }); shared"),
         0
     );
     assert_eq!(notifier.message(), 0);

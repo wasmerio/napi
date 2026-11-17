@@ -12,7 +12,8 @@
 use std::sync::mpsc::Sender;
 
 use wasmer::{
-    AsStoreMut, Engine, Function, Instance, Memory, Module, Store, TypedFunction, WasmTypeList,
+    AsStoreMut, Engine, Function, Imports, Instance, Memory, MemoryType, Module, Pages,
+    SharedMemory, Store, TypedFunction, WasmTypeList,
 };
 use wasmer_napi::NapiCtx;
 
@@ -281,6 +282,22 @@ const WAT: &str = r#"(module
 )"#;
 
 /// Compiles the guest once; every [`Guest`] instantiates it in its own store.
+/// The same guest with a shared memory it imports (`env.memory`), as a WASIX
+/// instance and its threads share one: guests that pass `SharedArrayBuffer`s,
+/// whose bytes live in the sender's guest memory, must run on one memory
+/// (see [`Guest::new_sharing`]).
+pub fn compile_shared() -> (Engine, Module) {
+    let wat = WAT.replace(
+        "(memory (export \"memory\") 2)",
+        "(import \"env\" \"memory\" (memory $memory 2 64 shared))\n  \
+         (export \"memory\" (memory $memory))",
+    );
+    let store = Store::default();
+    let module = Module::new(&store, wat::parse_str(&wat).expect("invalid test WAT"))
+        .expect("failed to compile the shared-memory test guest");
+    (store.engine().clone(), module)
+}
+
 pub fn compile() -> (Engine, Module) {
     let store = Store::default();
     let module = Module::new(&store, wat::parse_str(WAT).expect("invalid test WAT"))
@@ -298,10 +315,49 @@ impl Guest {
     /// Instantiates the guest in a new store. `signal` receives a message
     /// whenever a script running in this guest calls `signal()`.
     pub fn new(ctx: &NapiCtx, engine: &Engine, module: &Module, signal: Sender<()>) -> Self {
+        Self::instantiate(ctx, engine, module, signal, None)
+    }
+
+    /// Instantiates a [`compile_shared`] guest on `memory` (another guest's
+    /// [`Guest::shared_memory`]), or on a new shared memory for `None`.
+    pub fn new_sharing(
+        ctx: &NapiCtx,
+        engine: &Engine,
+        module: &Module,
+        signal: Sender<()>,
+        memory: Option<SharedMemory>,
+    ) -> Self {
+        Self::instantiate(ctx, engine, module, signal, Some(memory))
+    }
+
+    /// This guest's memory, to attach to another store
+    /// ([`Guest::new_sharing`]). Only for a [`compile_shared`] guest.
+    pub fn shared_memory(&self) -> SharedMemory {
+        self.memory
+            .as_shared(&self.store)
+            .expect("the guest's memory is not shared")
+    }
+
+    fn instantiate(
+        ctx: &NapiCtx,
+        engine: &Engine,
+        module: &Module,
+        signal: Sender<()>,
+        shared: Option<Option<SharedMemory>>,
+    ) -> Self {
         let mut store = Store::new(engine.clone());
         let hooks = ctx.runtime_hooks();
-        let (mut imports, state) = hooks
-            .additional_imports(module, &mut store.as_store_mut())
+        let mut imports = Imports::new();
+        if let Some(shared) = shared {
+            let memory = match shared {
+                Some(memory) => memory.attach(&mut store),
+                None => Memory::new(&mut store, MemoryType::new(Pages(2), Some(Pages(64)), true))
+                    .expect("failed to create the shared memory"),
+            };
+            imports.define("env", "memory", memory);
+        }
+        let state = hooks
+            .add_imports(module, &mut store.as_store_mut(), &mut imports)
             .expect("failed to create N-API imports");
         let signal = Function::new_typed(&mut store, move || {
             let _ = signal.send(());

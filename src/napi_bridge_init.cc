@@ -75,6 +75,17 @@ struct CallbackBinding;
 extern "C" int napi_host_bookkeeping_charge(const void* budget, uint64_t bytes);
 extern "C" void napi_host_bookkeeping_uncharge(const void* budget, uint64_t bytes);
 extern "C" void napi_host_budget_release(const void* budget);
+extern "C" void napi_host_budget_retain(const void* budget);
+extern "C" int napi_host_memory_charge(void* budget, uint32_t pool, uint64_t bytes, int soft);
+extern "C" void napi_host_memory_uncharge(void* budget, uint32_t pool, uint64_t bytes);
+extern "C" napi_status NAPI_CDECL snapi_private_set_host_memory(
+    napi_env env,
+    void* context,
+    int (*charge)(void*, uint32_t, uint64_t, int),
+    void (*uncharge)(void*, uint32_t, uint64_t),
+    void (*release)(void*));
+
+void HostBudgetRelease(void* budget) { napi_host_budget_release(budget); }
 
 // Host memory an agent's handle tables hold for the guest, charged to the
 // context's budget (Pool::HostBookkeeping). Each entry is estimated at
@@ -156,6 +167,16 @@ struct HandleTable {
   uint32_t Store(void* handle) {
     if (handle == nullptr) return 0;
     if (account != nullptr && !account->Charge()) return 0;
+    return Commit(handle);
+  }
+  // Reserves the entry for a handle about to be made, so a refusal comes
+  // before the provider object exists. Pair with Commit or Unreserve.
+  bool Reserve() { return account == nullptr || account->Charge(); }
+  void Unreserve() {
+    if (account != nullptr) account->Release();
+  }
+  // Inserts `handle` (non-null) into a reserved entry.
+  uint32_t Commit(void* handle) {
     const uint32_t id = next_id++;
     handles[id] = handle;
     return id;
@@ -447,8 +468,8 @@ HandleTable& g_message_handles = *new HandleTable();
 
 CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) {
   if (state == nullptr || reg_id == 0) return nullptr;
-  // Bindings live until the agent is released, which returns the charge.
-  if (!state->agent->bookkeeping.Charge()) return nullptr;
+  // The caller reserved the binding (ReserveBindings); bindings live until the
+  // agent is released, which returns the charge.
   state->callback_bindings.push_back(
       std::make_unique<CallbackBinding>(CallbackBinding{state, reg_id}));
   return state->callback_bindings.back().get();
@@ -648,17 +669,66 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   return 0;
 }
 
-// 0 if the bookkeeping account refused the entry; `ref` is deleted then.
-uint32_t StoreRef(SnapiEnvState& state, napi_ref ref) {
-  if (ref == nullptr) return 0;
-  SnapiAgentState& agent = *state.agent;
-  if (!agent.bookkeeping.Charge()) {
-    (void)napi_delete_reference(state.env, ref);
-    return 0;
+// Callback bindings a property descriptor array registers: one per method,
+// getter, setter or accessor pair (the pair shares one).
+uint64_t CountCallbackBindings(const uint32_t* prop_types, uint32_t prop_count) {
+  uint64_t count = 0;
+  for (uint32_t i = 0; i < prop_count; i++) {
+    if (prop_types != nullptr && prop_types[i] >= 1 && prop_types[i] <= 4) ++count;
   }
+  return count;
+}
+
+// Bookkeeping is reserved before the provider object it accounts for is
+// made: a refusal then leaves nothing to undo (a wrap V8 already installed
+// cannot be taken back safely), and an intentionally absent provider result
+// just returns its reservation. Reserve*, make the object, then Commit* on
+// success or Unreserve on failure.
+bool ReserveEntries(SnapiEnvState& state, uint64_t entries = 1) {
+  return state.agent->bookkeeping.Charge(entries);
+}
+
+void UnreserveEntries(SnapiEnvState& state, uint64_t entries = 1) {
+  state.agent->bookkeeping.Release(entries);
+}
+
+// Makes sure `count` free value slots exist, charging any it creates, so the
+// next `count` StoreValue calls cannot be refused. False if refused.
+bool ReserveValueSlots(SnapiEnvState& state, size_t count) {
+  SnapiAgentState& agent = *state.agent;
+  while (agent.value_free_slots.size() < count) {
+    if (agent.value_slots.size() >= kValueIdMaxSlots) return false;
+    if (!agent.bookkeeping.Charge()) return false;
+    agent.value_free_slots.push_back(static_cast<uint32_t>(agent.value_slots.size()));
+    agent.value_slots.emplace_back();
+  }
+  return true;
+}
+
+// Callback bindings for `count` callbacks about to be registered; on
+// refusal the caller fails before any provider call.
+bool ReserveBindings(SnapiEnvState& state, uint64_t count) {
+  return count == 0 || state.agent->bookkeeping.Charge(count);
+}
+
+// Inserts `ref` (non-null) into an entry reserved with ReserveEntries.
+uint32_t CommitRef(SnapiEnvState& state, napi_ref ref) {
+  SnapiAgentState& agent = *state.agent;
   uint32_t id = agent.next_ref_id++;
   agent.refs[id] = ref;
   return id;
+}
+
+// 0 if the bookkeeping account refused the entry; `ref` is deleted then.
+// Only for refs whose deletion undoes everything (napi_create_reference);
+// a wrap's ref must be reserved before napi_wrap.
+uint32_t StoreRef(SnapiEnvState& state, napi_ref ref) {
+  if (ref == nullptr) return 0;
+  if (!ReserveEntries(state)) {
+    (void)napi_delete_reference(state.env, ref);
+    return 0;
+  }
+  return CommitRef(state, ref);
 }
 
 napi_ref LoadRef(SnapiEnvState& state, uint32_t id) {
@@ -672,12 +742,9 @@ void RemoveRef(SnapiEnvState& state, uint32_t id) {
   if (state.agent->refs.erase(id) != 0) state.agent->bookkeeping.Release();
 }
 
-// 0 if the bookkeeping account refused the entry. The engine reclaims the
-// deferred's handle with the isolate.
-uint32_t StoreDeferred(SnapiEnvState& state, napi_deferred d) {
-  if (d == nullptr) return 0;
+// Inserts `d` (non-null) into an entry reserved with ReserveEntries.
+uint32_t CommitDeferred(SnapiEnvState& state, napi_deferred d) {
   SnapiAgentState& agent = *state.agent;
-  if (!agent.bookkeeping.Charge()) return 0;
   uint32_t id = agent.next_deferred_id++;
   agent.deferreds[id] = d;
   return id;
@@ -704,20 +771,12 @@ int FindFrameById(SnapiEnvState& state, uint32_t scope_id) {
   return -1;
 }
 
-uint32_t StoreModuleWrapHandle(SnapiEnvState& state, unofficial_napi_module module) {
-  return state.agent->module_wrap_handles.Store(reinterpret_cast<void*>(module));
-}
-
 unofficial_napi_module LoadModuleWrapHandle(SnapiEnvState& state, uint32_t id) {
   return reinterpret_cast<unofficial_napi_module>(state.agent->module_wrap_handles.Load(id));
 }
 
 void RemoveModuleWrapHandle(SnapiEnvState& state, uint32_t id) {
   state.agent->module_wrap_handles.Remove(id);
-}
-
-uint32_t StoreBytecodeHandle(SnapiEnvState& state, unofficial_napi_bytecode handle) {
-  return state.agent->bytecode_handles.Store(reinterpret_cast<void*>(handle));
 }
 
 unofficial_napi_bytecode LoadBytecodeHandle(SnapiEnvState& state, uint32_t id) {
@@ -1865,12 +1924,18 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState* env_state, uint32_t* d
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  // The deferred's entry and the promise's value slot, before the deferred
+  // roots its resolver: a refusal leaves no promise the guest cannot settle.
+  if (!ReserveValueSlots(*bridge_state, 1)) return napi_generic_failure;
+  if (!ReserveEntries(*bridge_state)) return napi_generic_failure;
   napi_deferred deferred;
   napi_value promise;
   napi_status s = napi_create_promise(env, &deferred, &promise);
-  if (s != napi_ok) return s;
-  *deferred_out = StoreDeferred(*bridge_state, deferred);
-  if (*deferred_out == 0) return napi_generic_failure;
+  if (s != napi_ok) {
+    UnreserveEntries(*bridge_state);
+    return s;
+  }
+  *deferred_out = CommitDeferred(*bridge_state, deferred);
   *out_id = StoreValue(*bridge_state, promise);
   return napi_ok;
 }
@@ -2426,11 +2491,15 @@ extern "C" int snapi_bridge_create_reference(SnapiEnvState* env_state, uint32_t 
   napi_env env = bridge_state->env;
   napi_value val = LoadValue(*bridge_state, value_id);
   if (!val) return napi_invalid_arg;
+  if (!ReserveEntries(*bridge_state)) return napi_generic_failure;
   napi_ref ref;
   napi_status s = napi_create_reference(env, val, initial_refcount, &ref);
-  if (s != napi_ok) return s;
-  *ref_out = StoreRef(*bridge_state, ref);
-  return *ref_out == 0 ? napi_generic_failure : napi_ok;
+  if (s != napi_ok) {
+    UnreserveEntries(*bridge_state);
+    return s;
+  }
+  *ref_out = CommitRef(*bridge_state, ref);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_delete_reference(SnapiEnvState* env_state, uint32_t ref_id) {
@@ -2852,9 +2921,12 @@ extern "C" int snapi_bridge_unofficial_acquire_buffer_lease(
       bridge_state->env, value, byte_offset, byte_length,
       static_cast<unofficial_napi_buffer_access_mode>(mode), &lease, &data);
   if (status != napi_ok) return status;
-  const uint32_t lease_id = bridge_state->agent->buffer_lease_handles.Store(lease);
+  const uint32_t lease_id =
+      lease == nullptr ? 0 : bridge_state->agent->buffer_lease_handles.Store(lease);
   if (lease_id == 0) {
-    (void)unofficial_napi_release_buffer_lease(bridge_state->env, lease, false);
+    if (lease != nullptr) {
+      (void)unofficial_napi_release_buffer_lease(bridge_state->env, lease, false);
+    }
     return napi_generic_failure;
   }
   *lease_out = lease_id;
@@ -2925,14 +2997,16 @@ extern "C" int snapi_bridge_wrap(SnapiEnvState* env_state, uint32_t obj_id, uint
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
+  // V8 installs the wrap together with its ref: reserve the ref's entry first.
+  if (ref_out != nullptr && !ReserveEntries(*bridge_state)) return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void*)(uintptr_t)native_data,
                             nullptr, nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok) return s;
-  if (ref_out) {
-    *ref_out = StoreRef(*bridge_state, ref);
-    if (*ref_out == 0) return napi_generic_failure;
+  if (s != napi_ok) {
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
+    return s;
   }
+  if (ref_out) *ref_out = CommitRef(*bridge_state, ref);
   return napi_ok;
 }
 
@@ -2949,21 +3023,23 @@ extern "C" int snapi_bridge_wrap_finalized(SnapiEnvState* env_state, uint32_t ob
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveEntries(*bridge_state)) return napi_generic_failure;
   auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr) return napi_generic_failure;
+  if (record == nullptr) {
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
+    return napi_generic_failure;
+  }
   napi_ref ref = nullptr;
   napi_status s = napi_wrap(env, obj, (void*)(uintptr_t)native_data,
                             GuestFinalizerTrampoline, record,
                             ref_out ? &ref : nullptr);
   if (s != napi_ok) {
     delete record;
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
     return s;
   }
-  if (ref_out) {
-    *ref_out = StoreRef(*bridge_state, ref);
-    if (*ref_out == 0) return napi_generic_failure;
-  }
+  if (ref_out) *ref_out = CommitRef(*bridge_state, ref);
   return napi_ok;
 }
 
@@ -3004,14 +3080,15 @@ extern "C" int snapi_bridge_add_finalizer(SnapiEnvState* env_state, uint32_t obj
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
   // No actual WASM callback for finalizer; just register with nullptr callback
+  if (ref_out != nullptr && !ReserveEntries(*bridge_state)) return napi_generic_failure;
   napi_ref ref = nullptr;
   napi_status s = napi_add_finalizer(env, obj, (void*)(uintptr_t)data_val,
                                      nullptr, nullptr, ref_out ? &ref : nullptr);
-  if (s != napi_ok) return s;
-  if (ref_out) {
-    *ref_out = StoreRef(*bridge_state, ref);
-    if (*ref_out == 0) return napi_generic_failure;
+  if (s != napi_ok) {
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
+    return s;
   }
+  if (ref_out) *ref_out = CommitRef(*bridge_state, ref);
   return napi_ok;
 }
 
@@ -3027,21 +3104,23 @@ extern "C" int snapi_bridge_add_finalizer_cb(SnapiEnvState* env_state, uint32_t 
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
+  if (ref_out != nullptr && !ReserveEntries(*bridge_state)) return napi_generic_failure;
   auto* record = MakeGuestFinalizerRecord(env_state, guest_env, wasm_fn_ptr,
                                           finalize_data, finalize_hint);
-  if (record == nullptr) return napi_generic_failure;
+  if (record == nullptr) {
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
+    return napi_generic_failure;
+  }
   napi_ref ref = nullptr;
   napi_status s = napi_add_finalizer(env, obj, (void*)(uintptr_t)data_val,
                                      GuestFinalizerTrampoline, record,
                                      ref_out ? &ref : nullptr);
   if (s != napi_ok) {
     delete record;
+    if (ref_out != nullptr) UnreserveEntries(*bridge_state);
     return s;
   }
-  if (ref_out) {
-    *ref_out = StoreRef(*bridge_state, ref);
-    if (*ref_out == 0) return napi_generic_failure;
-  }
+  if (ref_out) *ref_out = CommitRef(*bridge_state, ref);
   return napi_ok;
 }
 
@@ -3093,6 +3172,9 @@ extern "C" int snapi_bridge_define_properties(SnapiEnvState* env_state, uint32_t
   napi_env env = bridge_state->env;
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj) return napi_invalid_arg;
+  if (!ReserveBindings(*bridge_state, CountCallbackBindings(prop_types, prop_count))) {
+    return napi_generic_failure;
+  }
   std::vector<napi_property_descriptor> descs(prop_count);
   for (uint32_t i = 0; i < prop_count; i++) {
     memset(&descs[i], 0, sizeof(napi_property_descriptor));
@@ -3157,6 +3239,13 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
+
+  // The constructor's and every accessor's or method's binding, and the
+  // class's value slot, before anything is defined.
+  if (!ReserveValueSlots(*bridge_state, 1) ||
+      !ReserveBindings(*bridge_state, 1 + CountCallbackBindings(prop_types, prop_count))) {
+    return napi_generic_failure;
+  }
 
   // Build property descriptors
   std::vector<napi_property_descriptor> descs(prop_count);
@@ -3476,6 +3565,9 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
+  if (!ReserveValueSlots(*bridge_state, 1) || !ReserveBindings(*bridge_state, 1)) {
+    return napi_generic_failure;
+  }
   CallbackBinding* binding = RegisterCallbackBinding(bridge_state, reg_id);
   napi_value result;
   napi_status s = napi_create_function(env, utf8name,
@@ -3625,7 +3717,16 @@ extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState* env_state,
                                                        const void* budget) {
   auto* state = LookupEnvState(env_state);
   if (state == nullptr) return napi_invalid_arg;
-  return state->agent->bookkeeping.Attach(budget) ? napi_ok : napi_generic_failure;
+  if (!state->agent->bookkeeping.Attach(budget)) return napi_generic_failure;
+  // The provider's host memory (messages) holds a reference of its own: its
+  // charges can outlive the agent.
+  napi_host_budget_retain(budget);
+  if (snapi_private_set_host_memory(state->env, const_cast<void*>(budget),
+                                    napi_host_memory_charge, napi_host_memory_uncharge,
+                                    HostBudgetRelease) != napi_ok) {
+    napi_host_budget_release(budget);
+  }
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
@@ -4217,17 +4318,21 @@ extern "C" int snapi_bridge_unofficial_profile_start(SnapiEnvState* env_state,
   if (result_out == nullptr || profile_out == nullptr) {
     return napi_invalid_arg;
   }
+  HandleTable& profiles = bridge_state->agent->profile_handles;
+  if (!profiles.Reserve()) return napi_generic_failure;
   unofficial_napi_profile_start_result result = unofficial_napi_profile_start_ok;
   unofficial_napi_profile profile = nullptr;
   napi_status s = unofficial_napi_profile_start(
       env, static_cast<unofficial_napi_profile_kind>(kind), &result, &profile);
-  if (s != napi_ok) return s;
   *result_out = static_cast<int32_t>(result);
-  *profile_out = bridge_state->agent->profile_handles.Store(
-      reinterpret_cast<void*>(profile));
-  // A refused handle leaves the session to the provider, which stops it with
-  // the env.
-  return *profile_out == 0 ? napi_generic_failure : napi_ok;
+  // A busy profiler succeeds with no session: handle 0.
+  if (s != napi_ok || profile == nullptr) {
+    profiles.Unreserve();
+    *profile_out = 0;
+    return s;
+  }
+  *profile_out = profiles.Commit(reinterpret_cast<void*>(profile));
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_profile_stop(SnapiEnvState* env_state,
@@ -4300,30 +4405,37 @@ extern "C" int snapi_bridge_unofficial_structured_clone(
   return napi_ok;
 }
 
-// The caller (Rust) records the id as its context's and charges
-// `*retained_bytes_out` until the message is taken or dropped.
+// The caller (Rust) records the id as its context's. The provider charges
+// the message to the sender's budget (snapi_private_set_host_memory) until it
+// is taken or dropped. `*in_range_out` says whether a SharedArrayBuffer it
+// holds has bytes in [range_begin, range_end) (the sender's guest heap), so
+// the caller can keep that memory mapped and refuse other memories.
 extern "C" int snapi_bridge_unofficial_message_create(
     SnapiEnvState* env_state,
     uint32_t value_id,
-    uint64_t max_bytes,
+    uint64_t range_begin,
+    uint64_t range_end,
     uint32_t* message_out,
-    uint64_t* retained_bytes_out) {
+    int32_t* in_range_out) {
   BridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
-  if (bridge_state == nullptr || message_out == nullptr ||
-      retained_bytes_out == nullptr) {
+  if (bridge_state == nullptr || message_out == nullptr || in_range_out == nullptr) {
     return napi_invalid_arg;
   }
   napi_value value = LoadValue(*bridge_state, value_id);
   if (value == nullptr) return napi_invalid_arg;
   unofficial_napi_message message = nullptr;
-  size_t retained = 0;
-  napi_status status = unofficial_napi_message_create_bounded(
-      bridge_state->env, value,
-      static_cast<size_t>(std::min<uint64_t>(max_bytes, SIZE_MAX)), &message,
-      &retained);
+  napi_status status = unofficial_napi_message_create(bridge_state->env, value, &message);
   if (status != napi_ok) return status;
-  *retained_bytes_out = retained;
+  bool in_range = false;
+  if (range_begin < range_end &&
+      unofficial_napi_message_shares_range(message, static_cast<uintptr_t>(range_begin),
+                                           static_cast<uintptr_t>(range_end),
+                                           &in_range) != napi_ok) {
+    unofficial_napi_message_drop(message);
+    return napi_generic_failure;
+  }
+  *in_range_out = in_range ? 1 : 0;
   uint32_t message_id;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -4652,20 +4764,27 @@ extern "C" int snapi_bridge_unofficial_bytecode_open(
   options.cache_byte_length = cache_byte_length;
   options.has_cache = has_cache;
   options.cache_policy = cache_policy;
+  HandleTable& bytecodes = bridge_state->agent->bytecode_handles;
+  if (!bytecodes.Reserve()) return napi_generic_failure;
   unofficial_napi_bytecode_open_result result{};
   napi_status s = unofficial_napi_bytecode_open(env, &options, &result);
   if (cache_rejected_out != nullptr) *cache_rejected_out = result.cache_rejected;
   if (can_parse_as_module_out != nullptr) {
     *can_parse_as_module_out = result.can_parse_as_module;
   }
-  if (s != napi_ok) return s;
-  if (bytecode_out != nullptr) {
-    *bytecode_out = StoreBytecodeHandle(*bridge_state, result.bytecode);
-    if (*bytecode_out == 0) {
-      (void)unofficial_napi_bytecode_release(bridge_state->env, result.bytecode);
-      return napi_generic_failure;
-    }
+  if (bytecode_out != nullptr) *bytecode_out = 0;
+  // A validate-only open whose cache was rejected succeeds with no artifact:
+  // handle 0.
+  if (s != napi_ok || result.bytecode == nullptr) {
+    bytecodes.Unreserve();
+    return s;
   }
+  if (bytecode_out == nullptr) {
+    bytecodes.Unreserve();
+    (void)unofficial_napi_bytecode_release(env, result.bytecode);
+    return napi_ok;
+  }
+  *bytecode_out = bytecodes.Commit(reinterpret_cast<void*>(result.bytecode));
   return napi_ok;
 }
 
@@ -4771,19 +4890,22 @@ extern "C" int snapi_bridge_unofficial_module_wrap_create(
       return napi_invalid_arg;
   }
 
+  // The module's handle and its requests' value slot, before the module
+  // exists: a refusal leaves no record behind.
+  HandleTable& modules = bridge_state->agent->module_wrap_handles;
+  if (!ReserveValueSlots(*bridge_state, 1)) return napi_generic_failure;
+  if (handle_out != nullptr && !modules.Reserve()) return napi_generic_failure;
   unofficial_napi_module_create_result result{};
   napi_status s = unofficial_napi_module_wrap_create(env, &options, &result);
-  if (s != napi_ok) return s;
-  if (result.module == nullptr || result.module_requests == nullptr) {
-    if (result.module != nullptr) {
+  if (s != napi_ok || result.module == nullptr || result.module_requests == nullptr) {
+    if (handle_out != nullptr) modules.Unreserve();
+    if (s == napi_ok && result.module != nullptr) {
       (void)unofficial_napi_module_wrap_destroy(env, result.module);
     }
-    return napi_generic_failure;
+    return s != napi_ok ? s : napi_generic_failure;
   }
   if (handle_out != nullptr) {
-    // A refused module stays with the env, which releases it.
-    *handle_out = StoreModuleWrapHandle(*bridge_state, result.module);
-    if (*handle_out == 0) return napi_generic_failure;
+    *handle_out = modules.Commit(reinterpret_cast<void*>(result.module));
   }
   if (requests_out != nullptr) {
     *requests_out = StoreValue(*bridge_state, result.module_requests);

@@ -140,3 +140,47 @@ fn host_copies_of_guest_memory_are_charged() {
     assert!(stdout.contains("TRANSIENT_COPY_OK"), "{stdout}\n{stderr}");
     assert_eq!(budget.snapshot().host_transient, 0);
 }
+
+/// Calls the bookkeeping budget refuses leave nothing behind: a refused wrap
+/// does not stay installed, a refused promise or function is reported as a
+/// failure rather than a success without a handle.
+#[test]
+fn bookkeeping_refusals_roll_back_provider_objects() {
+    let ctx = NapiCtx::builder().total_memory_bytes(160 * MIB).build();
+    let (exit_code, stdout, stderr) = run(&ctx, "test_bookkeeping_rollback", &[]);
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("BOOKKEEPING_ROLLBACK_OK"),
+        "{stdout}\n{stderr}"
+    );
+    let usage = usage_after_teardown(&ctx);
+    assert_eq!(usage.mem_charged, 0, "{usage:?}");
+}
+
+/// A name the budget cannot copy fails the definition instead of becoming
+/// "".
+#[test]
+fn a_refused_name_copy_fails_the_definition() {
+    // Room for the isolate and the guest's 48 MiB name, not for a copy.
+    let ctx = NapiCtx::builder().total_memory_bytes(210 * MIB).build();
+    let (exit_code, stdout, stderr) = run(&ctx, "test_name_copy_refused", &["48".to_string()]);
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("NAME_COPY_REFUSED_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+/// A provider call that succeeds without an object (a busy profiler, a
+/// validate-only open whose cache is rejected) is not a bookkeeping failure.
+#[test]
+fn provider_results_without_an_object_still_succeed() {
+    // Standalone: a budgeted application may not profile at all.
+    let ctx = NapiCtx::default();
+    let (exit_code, stdout, stderr) = run(&ctx, "test_null_provider_results", &[]);
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("NULL_PROVIDER_RESULTS_OK"),
+        "{stdout}\n{stderr}"
+    );
+}

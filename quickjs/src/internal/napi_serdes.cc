@@ -743,15 +743,6 @@ namespace quickjs::detail
         return napi_util__::wrap_owned(env, value, result_out);
     }
 
-    size_t napi_serdes__::serialized_value_retained_bytes(void *payload)
-    {
-        auto *serialized = static_cast<serialized_value *>(payload);
-        if (serialized == nullptr)
-            return 0;
-        return sizeof(serialized_value) + serialized->length +
-               serialized->sab_tab_len * sizeof(serialized->sab_tab[0]);
-    }
-
     void napi_serdes__::release_serialized_value(void *payload)
     {
         auto *serialized = static_cast<serialized_value *>(payload);

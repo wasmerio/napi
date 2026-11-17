@@ -490,6 +490,24 @@ pub fn read_guest_c_string_max(
     guest_ptr: u32,
     max: usize,
 ) -> Option<HostCopy> {
+    try_read_guest_c_string_max(env, guest_ptr, max)
+        .ok()
+        .flatten()
+}
+
+/// The budget refused a host copy of guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyRefused;
+
+/// As [`read_guest_c_string_max`], telling a copy the budget refused
+/// (`Err`) from a string that is not there (`Ok(None)`: a bad pointer, no
+/// NUL, or longer than `max`). An import that used to take a missing string
+/// as empty must still fail on a refusal, or it acts on a different string.
+pub fn try_read_guest_c_string_max(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    max: usize,
+) -> Result<Option<HostCopy>, CopyRefused> {
     // Names are short: scan a first chunk in place, which needs no lookup of
     // the memory's size while it lies within the length already seen.
     const CHUNK: usize = 256;
@@ -499,42 +517,62 @@ pub fn read_guest_c_string_max(
         // SAFETY: the chunk is mapped guest memory.
         if let Some(len) = unsafe { guest_nul_offset(src, chunk) } {
             // SAFETY: the string's bytes are in the chunk.
-            return unsafe { guest_bytes_at(env, src, len) };
+            return unsafe { guest_bytes_at(env, src, len) }
+                .map(Some)
+                .ok_or(CopyRefused);
         }
         scanned = chunk;
     }
     // A longer string (script sources can reach megabytes), or one that starts
     // within a chunk of the memory's end: the rest of the memory, in place.
     let start = u64::from(guest_ptr);
-    let search = c_string_search_len(guest_data_size(env), start, max)?;
+    let Some(search) = c_string_search_len(guest_data_size(env), start, max) else {
+        return Ok(None);
+    };
     if let Some(src) = guest_range(env, guest_ptr, search) {
         // The chunk lay within the memory and `max + 1` bytes, so within
         // `search`. That length comes from this env's view, the chunk's from
         // the heap: check anyway.
-        let tail = search.checked_sub(scanned)?;
+        let Some(tail) = search.checked_sub(scanned) else {
+            return Ok(None);
+        };
         // SAFETY: the range is mapped guest memory, and `scanned` <= `search`.
-        let len = scanned + unsafe { guest_nul_offset(src.add(scanned), tail) }?;
+        let Some(nul) = (unsafe { guest_nul_offset(src.add(scanned), tail) }) else {
+            return Ok(None);
+        };
+        let len = scanned + nul;
         // SAFETY: the string's bytes are in the range.
-        return unsafe { guest_bytes_at(env, src, len) };
+        return unsafe { guest_bytes_at(env, src, len) }
+            .map(Some)
+            .ok_or(CopyRefused);
     }
     // No guest heap: through the `MemoryView`. Find the NUL a block at a
     // time, then read the string once.
     let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
+    let Some(memory) = state.memory.clone() else {
+        return Ok(None);
+    };
     let view = memory.view(&store);
     let end = start + search as u64;
     let mut block = [0u8; 4096];
     let mut offset = start;
     while offset < end {
         let len = (end - offset).min(block.len() as u64) as usize;
-        view.read(offset, &mut block[..len]).ok()?;
+        if view.read(offset, &mut block[..len]).is_err() {
+            return Ok(None);
+        }
         if let Some(nul) = block[..len].iter().position(|&byte| byte == 0) {
-            let len = usize::try_from(offset - start).ok()? + nul;
-            return read_guest_bytes(env, guest_ptr, len);
+            let Ok(prefix) = usize::try_from(offset - start) else {
+                return Ok(None);
+            };
+            // The bytes were just read, so only the budget can refuse them.
+            return read_guest_bytes(env, guest_ptr, prefix + nul)
+                .map(Some)
+                .ok_or(CopyRefused);
         }
         offset += len as u64;
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

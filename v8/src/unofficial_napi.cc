@@ -1706,21 +1706,27 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  explicit StructuredCloneSerializerDelegate(
-      v8::Isolate* isolate,
-      size_t max_buffer_bytes = std::numeric_limits<size_t>::max())
-      : isolate_(isolate), max_buffer_bytes_(max_buffer_bytes) {}
+  // `charge` (may be null) pays for the serializer's buffer as it grows.
+  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate,
+                                             NapiHostCharge* charge = nullptr)
+      : isolate_(isolate), charge_(charge) {}
 
   // The serializer's buffer, released to the caller with
-  // ValueSerializer::Release and freed with std::free like the default. A
-  // growth past max_buffer_bytes_ fails, which the serializer reports as its
-  // out-of-memory clone error.
+  // ValueSerializer::Release and freed with std::free like the default. Each
+  // growth is charged before it is allocated; a refused one fails, which the
+  // serializer reports as its out-of-memory clone error.
   void* ReallocateBufferMemory(void* old_buffer,
                                size_t size,
                                size_t* actual_size) override {
-    if (size > max_buffer_bytes_) return nullptr;
+    const size_t growth = size > buffer_bytes_ ? size - buffer_bytes_ : 0;
+    if (charge_ != nullptr && !charge_->Grow(growth, /*soft=*/true)) return nullptr;
     void* buffer = std::realloc(old_buffer, size);
-    if (buffer != nullptr) *actual_size = size;
+    if (buffer == nullptr) {
+      if (charge_ != nullptr) charge_->Shrink(growth);
+      return nullptr;
+    }
+    buffer_bytes_ = size;
+    *actual_size = size;
     return buffer;
   }
 
@@ -1765,7 +1771,8 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
 
  private:
   v8::Isolate* isolate_ = nullptr;
-  size_t max_buffer_bytes_;
+  NapiHostCharge* charge_ = nullptr;
+  size_t buffer_bytes_ = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
   std::vector<v8::CompiledWasmModule> wasm_modules_;
 };
@@ -1800,8 +1807,18 @@ class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::
   const std::vector<v8::CompiledWasmModule>& wasm_modules_;
 };
 
+struct FreeDeleter {
+  void operator()(uint8_t* data) const { std::free(data); }
+};
+
 struct SerializedClonePayload {
-  std::vector<uint8_t> bytes;
+  // What the message holds, charged to the sender's budget (if it has one)
+  // until the message is taken or dropped. Declared first, so it is returned
+  // after everything below is freed.
+  NapiHostCharge charge;
+  // The serializer's buffer, adopted without a copy.
+  std::unique_ptr<uint8_t, FreeDeleter> data;
+  size_t size = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> array_buffers;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
   std::vector<v8::CompiledWasmModule> wasm_modules;
@@ -1888,7 +1905,8 @@ napi_status DetachTransferredArrayBuffers(
 
 napi_status DeserializeTransferredClone(
     napi_env env,
-    const std::vector<uint8_t>& bytes,
+    const uint8_t* bytes,
+    size_t byte_length,
     const std::vector<std::shared_ptr<v8::BackingStore>>& array_buffers,
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
@@ -1935,8 +1953,8 @@ napi_status DeserializeTransferredClone(
       isolate, shared_array_buffers, wasm_modules);
   v8::ValueDeserializer deserializer(
       isolate,
-      bytes.data(),
-      bytes.size(),
+      bytes,
+      byte_length,
       &deserializer_delegate);
 
   for (uint32_t i = 0; i < array_buffers.size(); ++i) {
@@ -1975,7 +1993,13 @@ napi_status StructuredCloneImpl(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  // The serializer's buffer lives until the clone is read back; charged
+  // (softly) to the budget, if any, before it grows.
+  NapiHostCharge charge;
+  if (env->agent != nullptr && env->agent->host_memory != nullptr) {
+    charge = NapiHostCharge(env->agent->host_memory, NapiHostMemory::kTransient);
+  }
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, &charge);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
   std::vector<v8::Local<v8::ArrayBuffer>> array_buffers;
@@ -2000,11 +2024,11 @@ napi_status StructuredCloneImpl(
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
 
-  std::vector<uint8_t> bytes(buffer.get(), buffer.get() + released.second);
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      bytes,
+      buffer.get(),
+      released.second,
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
@@ -2238,6 +2262,29 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   if (env == nullptr || value.IsEmpty() || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, value);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+// Charges host memory the provider allocates for `env`'s isolate (messages
+// today) to the embedder's budget through `charge`/`uncharge`, which take
+// `context`. The isolate's charge holders share it; `release(context)` runs
+// when the last one is gone. Set once, right after the env is created.
+extern "C" napi_status NAPI_CDECL snapi_private_set_host_memory(
+    napi_env env,
+    void* context,
+    int (*charge)(void*, uint32_t, uint64_t, int),
+    void (*uncharge)(void*, uint32_t, uint64_t),
+    void (*release)(void*)) {
+  if (env == nullptr || env->agent == nullptr || charge == nullptr || uncharge == nullptr ||
+      env->agent->host_memory != nullptr) {
+    return napi_invalid_arg;
+  }
+  auto memory = std::make_shared<NapiHostMemory>();
+  memory->context = context;
+  memory->charge = charge;
+  memory->uncharge = uncharge;
+  memory->release = release;
+  env->agent->host_memory = std::move(memory);
+  return napi_ok;
 }
 
 // Provider-private, never imported by guests: unofficial_napi_create_env with
@@ -2687,11 +2734,24 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
 
 namespace {
 
-napi_status MessageCreateImpl(napi_env env,
-                              napi_value value,
-                              size_t max_bytes,
-                              unofficial_napi_message* message_out,
-                              size_t* retained_bytes_out) {
+napi_status ThrowCloneOutOfMemory(napi_env env, v8::TryCatch& try_catch) {
+  env->isolate->ThrowException(v8::Exception::Error(
+      v8::String::NewFromUtf8Literal(env->isolate,
+                                     "Data cannot be cloned, out of memory.")));
+  napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+  return napi_pending_exception;
+}
+
+}  // namespace
+
+// When the isolate has host memory (a budgeted embedder), every byte the
+// message holds is charged before it is allocated, softly: a message that
+// does not fit is the engine's out-of-memory clone error, which the sender can
+// catch. The message returns the bytes when it is taken or dropped.
+napi_status NAPI_CDECL unofficial_napi_message_create(
+    napi_env env,
+    napi_value value,
+    unofficial_napi_message* message_out) {
   if (env == nullptr || env->isolate == nullptr || value == nullptr || message_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2703,13 +2763,17 @@ napi_status MessageCreateImpl(napi_env env,
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
+  NapiHostCharge charge;
+  if (env->agent != nullptr && env->agent->host_memory != nullptr) {
+    charge = NapiHostCharge(env->agent->host_memory, NapiHostMemory::kSerializedMessage);
+  }
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate, max_bytes);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, &charge);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
-  // A clone error (an uncloneable value, or a message over max_bytes) is the
-  // env's last exception, as N-API reports exceptions; a termination stays
-  // with V8.
+  // A clone error (an uncloneable value, or a message the budget refused) is
+  // the env's last exception, as N-API reports exceptions; a termination
+  // stays with V8.
   v8::TryCatch try_catch(isolate);
   serializer.WriteHeader();
   if (serializer.WriteValue(context, input).IsNothing()) {
@@ -2721,48 +2785,27 @@ napi_status MessageCreateImpl(napi_env env,
 
   std::pair<uint8_t*, size_t> released = serializer.Release();
   if (released.first == nullptr) return napi_generic_failure;
-
+  std::unique_ptr<uint8_t, FreeDeleter> data(released.first);
+  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers =
+      serializer_delegate.shared_array_buffers();
+  std::vector<v8::CompiledWasmModule> wasm_modules = serializer_delegate.TakeWasmModules();
+  // The payload itself and its side tables; the buffer is already charged.
+  const uint64_t overhead =
+      sizeof(SerializedClonePayload) +
+      shared_array_buffers.capacity() * sizeof(std::shared_ptr<v8::BackingStore>) +
+      wasm_modules.capacity() * sizeof(v8::CompiledWasmModule);
+  if (!charge.Grow(overhead, /*soft=*/true)) return ThrowCloneOutOfMemory(env, try_catch);
   auto* payload = new (std::nothrow) SerializedClonePayload();
-  if (payload == nullptr) {
-    std::free(released.first);
-    return napi_generic_failure;
-  }
-  payload->bytes.assign(released.first, released.first + released.second);
-  std::free(released.first);
-  payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
-  payload->wasm_modules = serializer_delegate.TakeWasmModules();
+  if (payload == nullptr) return napi_generic_failure;
+  payload->charge = std::move(charge);
+  payload->data = std::move(data);
+  payload->size = released.second;
+  payload->shared_array_buffers = std::move(shared_array_buffers);
+  payload->wasm_modules = std::move(wasm_modules);
   payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
   payload->sender_lane = EnvLaneId(env);
-  if (retained_bytes_out != nullptr) {
-    *retained_bytes_out =
-        sizeof(SerializedClonePayload) + payload->bytes.capacity() +
-        payload->shared_array_buffers.capacity() *
-            sizeof(std::shared_ptr<v8::BackingStore>) +
-        payload->wasm_modules.capacity() * sizeof(v8::CompiledWasmModule);
-  }
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
-}
-
-}  // namespace
-
-napi_status NAPI_CDECL unofficial_napi_message_create(
-    napi_env env,
-    napi_value value,
-    unofficial_napi_message* message_out) {
-  return MessageCreateImpl(env, value, std::numeric_limits<size_t>::max(),
-                           message_out, nullptr);
-}
-
-napi_status NAPI_CDECL unofficial_napi_message_create_bounded(
-    napi_env env,
-    napi_value value,
-    size_t max_bytes,
-    unofficial_napi_message* message_out,
-    size_t* retained_bytes_out) {
-  if (retained_bytes_out == nullptr) return napi_invalid_arg;
-  *retained_bytes_out = 0;
-  return MessageCreateImpl(env, value, max_bytes, message_out, retained_bytes_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_message_take(
@@ -2789,7 +2832,8 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
   v8::Local<v8::Value> output;
   napi_status deserialize_status = DeserializeTransferredClone(
       env,
-      payload->bytes,
+      payload->data.get(),
+      payload->size,
       payload->array_buffers,
       payload->shared_array_buffers,
       payload->wasm_modules,
@@ -2804,6 +2848,26 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
   delete reinterpret_cast<SerializedClonePayload*>(message);
+}
+
+napi_status NAPI_CDECL unofficial_napi_message_shares_range(
+    unofficial_napi_message message,
+    uintptr_t begin,
+    uintptr_t end,
+    bool* result) {
+  if (message == nullptr || result == nullptr) return napi_invalid_arg;
+  const auto* payload = reinterpret_cast<const SerializedClonePayload*>(message);
+  *result = false;
+  for (const std::shared_ptr<v8::BackingStore>& store : payload->shared_array_buffers) {
+    if (store == nullptr || store->Data() == nullptr || store->ByteLength() == 0) continue;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(store->Data());
+    const uintptr_t last = first + store->ByteLength();
+    if (first < end && begin < last) {
+      *result = true;
+      break;
+    }
+  }
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_trusted_script(

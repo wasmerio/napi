@@ -74,8 +74,10 @@ fn another_store_can_terminate_but_not_interrupt_or_use_an_env() {
     let (signal_tx, _signal_rx) = mpsc::channel();
     let mut main = Guest::new(&ctx, &engine, &module, signal_tx.clone());
     let main_id = main.create();
+    // Growable, so V8 keeps its bytes in its own pages: a plain one lives in
+    // this guest's memory, which a guest on another memory cannot receive.
     assert_eq!(
-        main.eval("globalThis.shared = new SharedArrayBuffer(8); shared"),
+        main.eval("globalThis.shared = new SharedArrayBuffer(8, { maxByteLength: 8 }); shared"),
         0
     );
     assert_eq!(main.message(), 0);

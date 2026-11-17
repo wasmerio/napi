@@ -31,8 +31,6 @@ namespace quickjs::detail
         static napi_status serialize_value(napi_env env, napi_value value, void **payload_out);
         static napi_status deserialize_value(napi_env env, void *payload, napi_value *result_out);
         static void release_serialized_value(void *payload);
-        // Host memory a payload from serialize_value holds.
-        static size_t serialized_value_retained_bytes(void *payload);
 
     private:
         struct serializer;

@@ -24,6 +24,87 @@ class CpuProfiler;
 // enqueue hook, which backing-store deleters read on any thread under
 // NapiV8ExternalHintsMutex(), and `termination_requested`, which any thread
 // may set.
+// Host memory the provider allocates for an isolate's guest, charged to the
+// embedder's budget. The bridge installs it with the budget
+// (snapi_private_set_host_memory); without it nothing is charged. Every charge
+// holder shares it, so a charge that outlives the isolate (a queued message)
+// can still return its bytes; the last holder releases the embedder's budget.
+struct NapiHostMemory {
+  // Budget pools, as `Pool` in src/budget.rs counts them.
+  enum Pool : uint32_t {
+    kBookkeeping = 0,
+    kTransient = 1,
+    kSerializedMessage = 2,
+  };
+
+  void* context = nullptr;
+  // Nonzero if granted. A soft charge refuses without stopping the
+  // application: the caller reports a catchable error.
+  int (*charge)(void* context, uint32_t pool, uint64_t bytes, int soft) = nullptr;
+  void (*uncharge)(void* context, uint32_t pool, uint64_t bytes) = nullptr;
+  void (*release)(void* context) = nullptr;
+
+  NapiHostMemory() = default;
+  NapiHostMemory(const NapiHostMemory&) = delete;
+  NapiHostMemory& operator=(const NapiHostMemory&) = delete;
+  ~NapiHostMemory() {
+    if (release != nullptr) release(context);
+  }
+};
+
+// Bytes one provider object holds, charged to a pool of the isolate's host
+// memory (if any) and returned when the holder is destroyed. Move-only.
+class NapiHostCharge {
+ public:
+  NapiHostCharge() = default;
+  NapiHostCharge(std::shared_ptr<NapiHostMemory> memory, NapiHostMemory::Pool pool)
+      : memory_(std::move(memory)), pool_(pool) {}
+  NapiHostCharge(const NapiHostCharge&) = delete;
+  NapiHostCharge& operator=(const NapiHostCharge&) = delete;
+  NapiHostCharge(NapiHostCharge&& other) noexcept
+      : memory_(std::move(other.memory_)), pool_(other.pool_), bytes_(other.bytes_) {
+    other.bytes_ = 0;
+  }
+  NapiHostCharge& operator=(NapiHostCharge&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      memory_ = std::move(other.memory_);
+      pool_ = other.pool_;
+      bytes_ = other.bytes_;
+      other.bytes_ = 0;
+    }
+    return *this;
+  }
+  ~NapiHostCharge() { Reset(); }
+
+  // Charges `bytes` more before they are allocated. False (nothing charged)
+  // if the budget refused them; always true without host memory.
+  bool Grow(uint64_t bytes, bool soft) {
+    if (memory_ == nullptr || bytes == 0) return true;
+    if (memory_->charge(memory_->context, pool_, bytes, soft ? 1 : 0) == 0) return false;
+    bytes_ += bytes;
+    return true;
+  }
+  // Returns `bytes` the holder no longer has.
+  void Shrink(uint64_t bytes) {
+    if (memory_ == nullptr || bytes == 0) return;
+    if (bytes > bytes_) bytes = bytes_;
+    memory_->uncharge(memory_->context, pool_, bytes);
+    bytes_ -= bytes;
+  }
+  void Reset() {
+    if (memory_ != nullptr && bytes_ != 0) memory_->uncharge(memory_->context, pool_, bytes_);
+    bytes_ = 0;
+  }
+  uint64_t bytes() const { return bytes_; }
+  bool metered() const { return memory_ != nullptr; }
+
+ private:
+  std::shared_ptr<NapiHostMemory> memory_;
+  NapiHostMemory::Pool pool_ = NapiHostMemory::kTransient;
+  uint64_t bytes_ = 0;
+};
+
 struct napi_agent__ {
   explicit napi_agent__(v8::Isolate* isolate);
   ~napi_agent__();
@@ -49,6 +130,9 @@ struct napi_agent__ {
   // NapiWebAssemblyPolicy::kRestricted: no context of the isolate has the
   // WebAssembly global or compiles wasm. Fixed once the agent is set up.
   bool webassembly_restricted = false;
+  // The embedder's budget for host memory the provider allocates for this
+  // isolate (NapiHostMemory), or null when nothing is charged.
+  std::shared_ptr<NapiHostMemory> host_memory;
   // The instance lane bound when the isolate was created
   // (snapi_v8_lane_current_id), or 0 for a standalone isolate. Fixed once the
   // agent is set up.
