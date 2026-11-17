@@ -1096,6 +1096,9 @@ fn run_in_native_test_child(test_name: &str, child_key: &str) -> bool {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture"])
         .env(child_key, "1")
+        // The debug facade future plus V8 entry exceeds libtest's small default.
+        // This sizes the host harness thread; guest stacks keep their own limits.
+        .env("RUST_MIN_STACK", "16777216")
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
@@ -1286,4 +1289,78 @@ async fn facade_native_napi_context_switches_preserve_refilled_provider() {
             }
         })
         .await;
+}
+
+// Mirrors Edge napi_metering::START_SECTION_MEMORY_WAT: start must read the
+// data segment through the same imported memory used by the configured hook.
+const START_SECTION_GUEST: &str = r#"
+(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "env" "memory" (memory 1 65536 shared))
+  (import "napi" "napi_wasm_init_env" (func $napi_init_env (result i32)))
+  (import "napi" "napi_create_string_utf8"
+    (func $napi_create_string_utf8 (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_run_script"
+    (func $napi_run_script (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_value_int32"
+    (func $napi_get_value_int32 (param i32 i32 i32) (result i32)))
+
+  (data (i32.const 16) "\40\00\00\00\05\00\00\00")
+  (data (i32.const 64) "done\0a")
+  (data (i32.const 512) "41+1\00")
+
+  (func $init (local $env i32)
+    (local.set $env (call $napi_init_env))
+    (if (i32.eqz (local.get $env)) (then unreachable))
+    (if (call $napi_create_string_utf8
+          (local.get $env) (i32.const 512) (i32.const 4) (i32.const 0))
+      (then unreachable))
+    (if (call $napi_run_script
+          (local.get $env) (i32.load (i32.const 0)) (i32.const 8))
+      (then unreachable))
+    (if (call $napi_get_value_int32
+          (local.get $env) (i32.load (i32.const 8)) (i32.const 12))
+      (then unreachable))
+    (if (i32.ne (i32.load (i32.const 12)) (i32.const 42))
+      (then unreachable)))
+  (start $init)
+
+  (func (export "_start")
+    (drop (call $fd_write (i32.const 1) (i32.const 16) (i32.const 1) (i32.const 40)))))
+"#;
+
+#[tokio::test]
+async fn facade_native_start_evaluates_js_with_protected_leases() {
+    if !run_in_native_test_child(
+        "facade_native_start_evaluates_js_with_protected_leases",
+        "WASIXV2_NAPI_START_CHILD",
+    ) {
+        return;
+    }
+    tokio::task::LocalSet::new().run_until(async {
+        let context = NapiCtx::builder().max_sessions(1).max_envs(1).build();
+        let refill = START_SECTION_GUEST
+            .replace("41+1", "globalThis.keep = new Uint8Array(33554432); keep[0] = 41; keep[33554431] = 1; keep[0] + keep[33554431]")
+            .replace("(i32.const 4)", "(i32.const -1)");
+        for source in [START_SECTION_GUEST.to_owned(), refill] {
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
+                .build();
+            let stdout = Arc::new(Mutex::new(Vec::new()));
+            let captured = stdout.clone();
+            let status = machine.run(
+                &wat::parse_str(&source).unwrap(),
+                Stdio::from_fns(move |bytes| captured.lock().unwrap().extend_from_slice(bytes), |_| {}),
+            ).await.unwrap();
+            assert_eq!(status, 0);
+            assert_eq!(&*stdout.lock().unwrap(), b"done\n");
+            assert_eq!(context.active_sessions(), 0);
+            let budget = context.budget().snapshot();
+            assert_eq!(budget.live_isolates, 0);
+            assert_eq!(budget.v8_heap_reserved, 0);
+            assert_eq!(budget.wasm_linear, 0);
+            machine.shutdown().await;
+        }
+    }).await;
 }

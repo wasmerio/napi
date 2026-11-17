@@ -21,11 +21,14 @@ lease accounting identifies already-funded engine memory to avoid double billing
 The native bridge retains Edge's frozen legacy imports and native policy/code
 budget controls alongside the v2 frame/GC and callback error custody.
 
-`TODO(wasixv2): NAPI-START` marks the temporary preconfiguration activation
-rejection for direct unconfigured instantiation. The coordinated exec change
-defers start until after this same configure hook; it needs no new NAPI trait
-method. Do not fall back to raw memory.grow or fabricate ABI layout to enable
-start. Validate the composed product revision once that change is published.
+The v2 facade configures the attachment before invoking the deferred Wasm start
+section. NAPI activation during start therefore uses the same protected heap and
+refill as ordinary entry. No extra NAPI hook phase or opt-in is needed. Source
+must pass through exec/facade loading or instrumentation. The CLI's permitted
+instrumentation fallback uses `InstrumentError::fallback_source`, preserving
+start deferral and its admission metadata in the cached compiler input.
+Direct unconfigured instantiation still rejects NAPI activation; it bypasses this
+facade lifecycle. Old compiled caches must be invalidated when adopting deferral.
 
 The native engine no longer has the private v1 `do_wait_interruptible` method.
 WASIX v2 execution rewrites guest atomic waits through the kernel's cancellable
@@ -39,7 +42,7 @@ A check proves compilation, not native linking, runtime metering, or browser
 execution. Platform/frame-provider behavior needs the retained native/JSPI and
 browser suites in CI.
 
-## Validation
+## Initial port validation
 
 Checked in the isolated `wasmer-next-napi-check` clone of product
 `95918f0bd0b5db60451a9adff1dfb76bf879656e`, whose lock pins runtime
@@ -55,3 +58,26 @@ The build downloaded V8 and compiled the native bridge. No executable linking,
 runtime tests, browser execution or cross-platform execution was performed.
 The standalone lock was generated and pinned to this same product/engine pair.
 The later exec start-deferral work is not part of this validation snapshot.
+
+## Deferred-start validation
+
+Updated against wasmer-next main `a49d8ddce79278d944c3214e31241e8a9dbcadf7`
+and its locked runtime `93ebbc98e695c0727f9107c444edfb166bf22ac6` in the
+same isolated scratch checkout. The scratch product lock required only the
+NAPI `parking_lot` dependency entry; no product source was changed. The standalone
+lock now selects this product/engine pair.
+
+The combined CLI/C API/SDK/NAPI check, native NAPI all-targets check, and wasm32
+`js,wasix` library check above all passed again with `--locked`.
+
+`cargo test --locked --offline -p wasmer-napi --features cli --test wasix_facade
+facade_native_start_evaluates_js_with_protected_leases -- --exact --nocapture`
+passed without an external stack override. It executes the Edge-style start
+section reading `41+1` from imported guest memory, then a variant allocating a
+32 MiB Uint8Array during start to require protected lease refill. Both verify
+`done` output and retired session/isolate/memory accounting.
+
+The first execution exhausted libtest's default host thread stack. The native
+subprocess harness now explicitly uses a 16 MiB host test-thread stack; guest
+stack limits are unchanged. The focused test passed after that harness fix.
+Broader runtime suites and browser execution were not run.
