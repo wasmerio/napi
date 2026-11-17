@@ -1,4 +1,4 @@
-set(NAPI_V8_PREBUILT_VERSION "11.9.2")
+set(NAPI_V8_PREBUILT_VERSION "11.9.7")
 set(NAPI_V8_PREBUILT_BASE_URL
   "https://github.com/wasmerio/v8-custom-builds/releases/download/${NAPI_V8_PREBUILT_VERSION}")
 

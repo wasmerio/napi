@@ -560,10 +560,10 @@ bool napi_util__::from_quickjs_array_type(int type, napi_typedarray_type *out)
   }
 }
 
-void napi_util__::free_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr)
+void *napi_util__::realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr, size_t size)
 {
   (void)opaque;
-  js_free_rt(rt, ptr);
+  return js_realloc_rt(rt, ptr, size);
 }
 
 int napi_util__::key_filter_to_gpn(napi_key_filter key_filter)

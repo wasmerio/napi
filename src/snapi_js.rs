@@ -496,6 +496,9 @@ export function wasmer_napi_validate_script(source, filename) {
   });
 }
 export function wasmer_napi_compile_module(scope, source, filename) {
+  // Module bodies execute through Function below, which rejects hashbangs.
+  // Keep offsets intact for Acorn's replacements and diagnostics.
+  if (source.startsWith('#!')) source = '//' + source.slice(2);
   const program = wasmerNapiParse(source, {
     ecmaVersion: 'latest',
     sourceType: 'module',
@@ -617,7 +620,8 @@ export function wasmer_napi_compile_module(scope, source, filename) {
     if (node == null || typeof node !== 'object') continue;
     const isFunction = /Function(?:Declaration|Expression)$/.test(node.type) || node.type === 'ArrowFunctionExpression';
     const childDepth = functionDepth + (isFunction ? 1 : 0);
-    if (node.type === 'AwaitExpression' && functionDepth === 0) hasTopLevelAwait = true;
+    if (functionDepth === 0 && (node.type === 'AwaitExpression' ||
+        (node.type === 'ForOfStatement' && node.await))) hasTopLevelAwait = true;
     if (node.type === 'ImportExpression') {
       const options = node.options == null ? '' : `, ${text(node.options)}`;
       syntaxReplacements.push({
@@ -706,11 +710,11 @@ export function wasmer_napi_prepare_synthetic_module(exportNames) {
   return [0, names, namespace, []];
 }
 export function wasmer_napi_create_module_evaluation() {
-  let resolve;
-  let reject;
-  const promise = new wasmerNapiHostPromise((resolveValue, rejectValue) => {
-    resolve = resolveValue;
-    reject = rejectValue;
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new wasmerNapiHostPromise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
   });
   const details = { state: 0, result: undefined, hasResult: false };
   wasmer_napi_metadata_set(wasmerNapiPromiseDetails, promise, details);
@@ -720,13 +724,13 @@ export function wasmer_napi_create_module_evaluation() {
       details.state = 1;
       details.result = undefined;
       details.hasResult = true;
-      resolve(undefined);
+      resolvePromise(undefined);
     },
     reject(error) {
       details.state = 2;
       details.result = error;
       details.hasResult = true;
-      reject(error);
+      rejectPromise(error);
     },
   };
 }
@@ -779,6 +783,19 @@ export function wasmer_napi_finish_module_evaluation(
   wasmerNapiReflectApply(wasmerNapiHostPromiseThen, execution, [
     () => evaluation.resolve(undefined), evaluation.reject,
   ]);
+}
+export function wasmer_napi_create_module_facade(namespace) {
+  const facade = Object.create(null);
+  for (const name of Object.keys(namespace)) {
+    if (name === '__esModule') continue;
+    Object.defineProperty(facade, name, { enumerable: true, get: () => namespace[name] });
+  }
+  Object.defineProperty(facade, '__esModule', { enumerable: true, value: true });
+  Object.defineProperty(facade, Symbol.toStringTag, { value: 'Module' });
+  return Object.preventExtensions(facade);
+}
+export function wasmer_napi_resolve_module_evaluation(evaluation) {
+  evaluation.resolve();
 }
 export function wasmer_napi_reject_module_evaluation(evaluation, error) {
   evaluation.reject(error);
@@ -1137,6 +1154,8 @@ extern "C" {
         url: &str,
         has_top_level_await: bool,
     ) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_resolve_module_evaluation(evaluation: &Object) -> Result<(), JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_reject_module_evaluation(
         evaluation: &Object,
@@ -5212,6 +5231,32 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_link(
         .linked_handles = linked;
     NAPI_OK
 }
+fn collect_module_graph(
+    state: &HostJsEnv,
+    handle_id: u32,
+    graph: &mut Vec<u32>,
+) -> Result<(), i32> {
+    if graph.contains(&handle_id) {
+        return Ok(());
+    }
+    if state.synthetic_modules.contains_key(&handle_id) {
+        graph.push(handle_id);
+        return Ok(());
+    }
+    let module = state
+        .source_text_modules
+        .get(&handle_id)
+        .ok_or(NAPI_INVALID_ARG)?;
+    if module.linked_handles.len() != module.request_count as usize {
+        return Err(NAPI_INVALID_ARG);
+    }
+    graph.push(handle_id);
+    for linked_handle in &module.linked_handles {
+        collect_module_graph(state, *linked_handle, graph)?;
+    }
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_instantiate(
     env: SnapiEnv,
@@ -5221,20 +5266,20 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_instantiate(
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if let Some(module) = state.synthetic_modules.get_mut(&handle_id) {
-        if module.status < 2 {
-            module.status = 2;
+    let mut graph = Vec::new();
+    if let Err(status) = collect_module_graph(&state, handle_id, &mut graph) {
+        return status;
+    }
+    for handle in graph {
+        if let Some(module) = state.synthetic_modules.get_mut(&handle) {
+            if module.status < 2 {
+                module.status = 2;
+            }
+        } else if let Some(module) = state.source_text_modules.get_mut(&handle) {
+            if module.status < 2 {
+                module.status = 2;
+            }
         }
-        return NAPI_OK;
-    }
-    let Some(module) = state.source_text_modules.get_mut(&handle_id) else {
-        return NAPI_INVALID_ARG;
-    };
-    if module.linked_handles.len() != module.request_count as usize {
-        return NAPI_INVALID_ARG;
-    }
-    if module.status < 2 {
-        module.status = 2;
     }
     NAPI_OK
 }
@@ -5310,6 +5355,23 @@ fn update_module(
 }
 
 fn start_module_evaluation(access: &LiveEnv, handle: u32) -> Result<JsValue, JsValue> {
+    let synchronous = access
+        .with(|state| module_graph_has_top_level_await(state, handle, &mut Vec::new()))?
+        .ok_or_else(missing_module)?
+        == false;
+    if synchronous {
+        if let Some(promise) = access.with(|state| module_evaluation(state, handle))? {
+            return Ok(promise);
+        }
+        let evaluation = wasmer_napi_create_module_evaluation()?;
+        let promise = wasmer_napi_module_evaluation_promise(&evaluation);
+        update_module(access, handle, |_, _, saved| *saved = Some(promise.clone()))?;
+        match evaluate_module_sync(access, handle, &mut Vec::new()) {
+            Ok(_) => wasmer_napi_resolve_module_evaluation(&evaluation)?,
+            Err(error) => wasmer_napi_reject_module_evaluation(&evaluation, &error)?,
+        }
+        return Ok(promise);
+    }
     let input = access.with(|state| {
         if let Some(evaluation) = module_evaluation(state, handle) {
             return Ok(ModuleStart::Cached(evaluation));
@@ -5891,6 +5953,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_module_wrap_create_required_mod
         )
     }
 }
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_instanceof(
     env: SnapiEnv,

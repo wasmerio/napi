@@ -181,14 +181,26 @@ TEST_F(Test35Promise, ForAwaitBreakAwaitsAsyncIteratorReturn) {
                 s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
             napi_ok);
 
-#if defined(NAPI_TEST_ENGINE_QUICKJS)
-  // QuickJS currently resumes after `for await...of` break before the async
-  // iterator return() promise has finished. This is fixed on the
-  // emit_async_iterator_return_close branch.
-  EXPECT_EQ(JsonStringify(s.env, "globalThis.asyncIteratorCloseObserved"), "[false,true]");
-#else
   EXPECT_EQ(JsonStringify(s.env, "globalThis.asyncIteratorCloseObserved"), "[true,true]");
-#endif
+}
+
+TEST_F(Test35Promise, MarkRejectedPromiseHandledNotifiesRejectCallback) {
+  EnvScope s(runtime_.get());
+  napi_value callback = RunScript(s.env,
+      "globalThis.handledPromiseEvents = [];"
+      "(event, promise, reason) => handledPromiseEvents.push(event)");
+  ASSERT_NE(callback, nullptr);
+  ASSERT_EQ(unofficial_napi_set_promise_reject_callback(s.env, callback), napi_ok);
+  napi_value promise = RunScript(s.env, "Promise.reject('handled natively')");
+  ASSERT_NE(promise, nullptr);
+  ASSERT_EQ(unofficial_napi_event_loop_checkpoint(
+                s.env, unofficial_napi_event_loop_checkpoint_microtasks, true, nullptr),
+            napi_ok);
+  ASSERT_EQ(unofficial_napi_mark_promise_as_handled(s.env, promise), napi_ok);
+  EXPECT_EQ(JsonStringify(s.env, "handledPromiseEvents"), "[0,1]");
+  napi_value ordinary = RunScript(s.env, "({})");
+  EXPECT_EQ(unofficial_napi_mark_promise_as_handled(s.env, ordinary), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_mark_promise_as_handled(s.env, nullptr), napi_invalid_arg);
 }
 
 TEST_F(Test35Promise, PromiseReactionRestoresContinuationPreservedEmbedderData) {

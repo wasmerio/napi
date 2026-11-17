@@ -81,3 +81,25 @@ The first execution exhausted libtest's default host thread stack. The native
 subprocess harness now explicitly uses a 16 MiB host test-thread stack; guest
 stack limits are unchanged. The focused test passed after that harness fix.
 Broader runtime suites and browser execution were not run.
+
+## Independent review repairs: upstream providers
+
+The recursive merge had two merge bases and silently interpreted PRs #67–#77
+as reversions. Restore their provider delta from `82b328f50..a65e9cb86`:
+QuickJS 0.17 (`89fb17a8`), external-value/liveness fixes, handled synchronous
+module rejections, browser synchronous module graph traversal/evaluation, and
+typed-array/promise/module-evaluation regression coverage. Browser changes use
+next's short `LiveEnv` loans rather than restoring long Rust state borrows.
+
+V8 stays at **11.9.7** consistently across Cargo, Make, fixture scripts and
+CMake. next's native stack and GC adapters certify exactly that archive on
+Linux x64 and Darwin arm64. Updating to 11.9.9 requires separately certifying
+those adapters. Product `.github/workflows/build.yml` explicitly disables
+`enable_napi_v8` for Linux arm64; its enabled native jobs use other platforms.
+Linux arm64 can use an explicitly supplied local provider (including upstream's
+`libatomic` link), but there is no certified 11.9.7 Linux arm64 prebuilt/managed
+coroutine provider. Do not substitute an unverified 11.9.9 archive.
+
+Actual native CTest runs: V8 **113 passed, 0 failed**, QuickJS **102 passed,
+0 failed**. These use Make's existing deep-freeze test exclusion. V8's invalid
+policy test now uses 3: policy 2 is the valid Edge metered policy.
