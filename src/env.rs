@@ -308,13 +308,26 @@ impl NapiEnv {
     }
 
     /// Whether this store's application shares the process under an
-    /// embedder's limits: it has a memory budget, or its context is managed.
-    /// Its isolates are then put under resource limits (see
-    /// `snapi_bridge_unofficial_enable_resource_limits`); a standalone,
-    /// unbudgeted application is not restricted.
+    /// embedder's limits: an embedder budgets it ([`ResourceBudget::is_budgeted`],
+    /// the same test the WebAssembly default uses), or its context is
+    /// managed. Its isolates are then created under resource limits; a
+    /// standalone, unbudgeted application is not restricted.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn enforces_resource_limits(&self) -> bool {
-        !self.budget.is_unlimited() || self.is_managed()
+        self.budget.is_budgeted() || self.is_managed()
+    }
+
+    /// The flag `snapi_bridge_unofficial_create_env*` takes: nonzero to
+    /// create the isolate under resource limits.
+    pub(crate) fn resource_limits_flag(&self) -> u32 {
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            u32::from(self.enforces_resource_limits())
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        {
+            0
+        }
     }
 
     /// Binds the instance's V8 lane to this thread for an env creation, so
@@ -391,15 +404,6 @@ impl NapiEnv {
                     crate::snapi::snapi_bridge_unofficial_stop_execution(env);
                 }
             }
-        }
-
-        // Before the guest can run anything in the isolate.
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        if self.enforces_resource_limits() {
-            // SAFETY: `env` is the isolate just created and is still live.
-            let status =
-                unsafe { crate::snapi::snapi_bridge_unofficial_enable_resource_limits(env) };
-            debug_assert_eq!(status, 0, "a new env refused resource limits");
         }
 
         let tracker = if reservation.clamped {

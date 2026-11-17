@@ -515,8 +515,11 @@ std::unique_ptr<v8impl::detail::env_cpu_profile::State> StartEnvCPUProfile(napi_
   using namespace v8impl::detail::env_cpu_profile;
   // A managed process runs applications of many tenants: an operator's
   // variable must not profile whichever env comes first, write its function
-  // names and URLs to a shared directory, or start a sampling thread.
+  // names and URLs to a shared directory, or start a sampling thread. Nor
+  // may it profile a budgeted application in any process: explicit
+  // profiling is refused for it too.
   if (g_managed_runtime_requested.load(std::memory_order_acquire)) return nullptr;
+  if (env->agent != nullptr && env->agent->resource_limits) return nullptr;
   const char* directory = std::getenv(kDirectoryVariable);
   if (directory == nullptr || directory[0] == '\0') return nullptr;
   static std::atomic<uint64_t> attempted{0};
@@ -1238,13 +1241,49 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
 namespace v8impl::detail {
 
 SerializerContext::SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
-    : env_(env), isolate_(env->isolate), serializer_(isolate_, this) {
+    : env_(env),
+      isolate_(env->isolate),
+      charge_(env->agent != nullptr ? env->agent->host_memory : nullptr,
+              NapiHostMemory::kTransient),
+      serializer_(isolate_, this) {
   wrap_.Reset(isolate_, wrap);
   wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
 }
 
 SerializerContext::~SerializerContext() {
   wrap_.Reset();
+}
+
+void* SerializerContext::ReallocateBufferMemory(void* old_buffer,
+                                                size_t size,
+                                                size_t* actual_size) {
+  const size_t growth = size > buffer_bytes_ ? size - buffer_bytes_ : 0;
+  if (!charge_.Grow(growth, /*soft=*/true)) {
+    refused_ = true;
+    return nullptr;
+  }
+  void* buffer = std::realloc(old_buffer, size);
+  if (buffer == nullptr) {
+    charge_.Shrink(growth);
+    refused_ = true;
+    return nullptr;
+  }
+  buffer_bytes_ = size;
+  *actual_size = size;
+  return buffer;
+}
+
+void SerializerContext::FreeBufferMemory(void* buffer) {
+  std::free(buffer);
+  charge_.Shrink(buffer_bytes_);
+  buffer_bytes_ = 0;
+}
+
+bool SerializerContext::ThrowIfRefused() {
+  if (!refused_) return false;
+  isolate_->ThrowException(v8::Exception::Error(
+      OneByteString(isolate_, "Data cannot be cloned, out of memory.")));
+  return true;
 }
 
 void SerializerContext::ThrowDataCloneError(v8::Local<v8::String> message) {
@@ -1366,20 +1405,46 @@ void SerializerContext::ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>&
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
 
+    // A raw write the budget refused left a hole: no buffer at all.
+    if (ctx->ThrowIfRefused()) return;
     std::pair<uint8_t*, size_t> serialized = ctx->serializer_.Release();
     v8::Isolate* isolate = ctx->isolate_;
     v8::HandleScope handle_scope(isolate);
     v8::Local<v8::Context> context = ctx->env_->context();
     v8::Context::Scope context_scope(context);
 
-    auto backing_store = v8::ArrayBuffer::NewBackingStore(
-        serialized.first,
-        serialized.second,
-        [](void* data, size_t, void*) { std::free(data); },
-        nullptr);
-    if (!backing_store) {
+    std::shared_ptr<v8::BackingStore> backing_store;
+    if (ctx->charge_.metered()) {
+      // Budgeted: the buffer becomes an ordinary ArrayBuffer of the isolate
+      // (its allocator charges it like any other), and the serializer's
+      // malloc block and its charge go.
+      std::unique_ptr<v8::BackingStore> copy =
+          v8::ArrayBuffer::NewBackingStore(isolate, serialized.second,
+                                           v8::BackingStoreInitializationMode::kUninitialized,
+                                           v8::BackingStoreOnFailureMode::kReturnNull);
+      if (copy != nullptr && serialized.second != 0) {
+        std::memcpy(copy->Data(), serialized.first, serialized.second);
+      }
       std::free(serialized.first);
-      return;
+      ctx->charge_.Shrink(ctx->buffer_bytes_);
+      ctx->buffer_bytes_ = 0;
+      if (copy == nullptr) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            OneByteString(isolate, "Array buffer allocation failed")));
+        return;
+      }
+      backing_store = std::move(copy);
+    } else {
+      backing_store = v8::ArrayBuffer::NewBackingStore(
+          serialized.first,
+          serialized.second,
+          [](void* data, size_t, void*) { std::free(data); },
+          nullptr);
+      ctx->buffer_bytes_ = 0;
+      if (!backing_store) {
+        std::free(serialized.first);
+        return;
+      }
     }
     v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
     args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
@@ -1410,6 +1475,7 @@ void SerializerContext::WriteUint32(const v8::FunctionCallbackInfo<v8::Value>& a
     if (args[0]->Uint32Value(ctx->env_->context()).To(&value)) {
       ctx->serializer_.WriteUint32(value);
     }
+    ctx->ThrowIfRefused();
 }
 
 void SerializerContext::WriteUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1422,6 +1488,7 @@ void SerializerContext::WriteUint64(const v8::FunctionCallbackInfo<v8::Value>& a
       return;
     }
     ctx->serializer_.WriteUint64((static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
+    ctx->ThrowIfRefused();
 }
 
 void SerializerContext::WriteDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1431,6 +1498,7 @@ void SerializerContext::WriteDouble(const v8::FunctionCallbackInfo<v8::Value>& a
     if (args[0]->NumberValue(ctx->env_->context()).To(&value)) {
       ctx->serializer_.WriteDouble(value);
     }
+    ctx->ThrowIfRefused();
 }
 
 void SerializerContext::WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1446,6 +1514,7 @@ void SerializerContext::WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>&
       return;
     }
     ctx->serializer_.WriteRawBytes(data, size);
+    ctx->ThrowIfRefused();
 }
 
 SerializerContext* SerializerContext::Unwrap(
@@ -1465,11 +1534,17 @@ void SerializerContext::WeakCallback(const v8::WeakCallbackInfo<SerializerContex
 DeserializerContext::DeserializerContext(napi_env env,
                                          v8::Local<v8::Object> wrap,
                                          v8::Local<v8::Value> buffer)
-    : env_(env), isolate_(env->isolate) {
+    : env_(env),
+      isolate_(env->isolate),
+      charge_(env->agent != nullptr ? env->agent->host_memory : nullptr,
+              NapiHostMemory::kTransient) {
     const uint8_t* data = nullptr;
     size_t size = 0;
     if (!ReadArrayBufferViewBytes(buffer, &data, &size)) return;
     if (data != nullptr && size > 0) {
+      // The budget refusing the copy leaves an empty deserializer: New
+      // throws.
+      if (!charge_.Grow(size, /*soft=*/true)) return;
       data_.assign(data, data + size);
     }
     deserializer_ = std::make_unique<v8::ValueDeserializer>(
@@ -1544,6 +1619,17 @@ void DeserializerContext::New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     }
     auto* ctx = env->allocate<DeserializerContext>(env, args.This(), args[0]);
     args.This()->SetAlignedPointerInInternalField(0, ctx, v8::kEmbedderDataTypeTagDefault);
+    const uint8_t* input = nullptr;
+    size_t input_size = 0;
+    if (ReadArrayBufferViewBytes(args[0], &input, &input_size) && input_size != 0 &&
+        ctx->data_size() == 0) {
+      // The budget refused the copy: the context is not usable (and never
+      // became weak), so it goes now and the object keeps no pointer to it.
+      args.This()->SetAlignedPointerInInternalField(0, nullptr, v8::kEmbedderDataTypeTagDefault);
+      env->release(ctx);
+      isolate->ThrowException(v8::Exception::Error(
+          OneByteString(isolate, "Data cannot be cloned, out of memory.")));
+    }
 }
 
 void DeserializerContext::ReadHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -2423,22 +2509,17 @@ extern "C" napi_status NAPI_CDECL snapi_private_set_host_memory(
   return napi_ok;
 }
 
-// Puts the isolate of a freshly created env under resource limits
-// (napi_agent__::resource_limits). Called by the bridge before the guest runs
-// anything in it; there is no way back.
-extern "C" napi_status NAPI_CDECL snapi_private_enable_resource_limits(napi_env env) {
-  if (env == nullptr || env->agent == nullptr) return napi_invalid_arg;
-  env->agent->resource_limits = true;
-  return napi_ok;
-}
-
 // Provider-private, never imported by guests: unofficial_napi_create_env with
 // the embedder's NapiWebAssemblyPolicy. The policy is an argument rather than
 // an env-create option because that descriptor is also the guest's wire ABI.
+// `resource_limits` nonzero: the embedder budgets or manages the isolate's
+// application (napi_agent__::resource_limits), set before anything runs in it,
+// including the automatic CPU profile.
 extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -2516,6 +2597,7 @@ extern "C" napi_status NAPI_CDECL snapi_private_create_env(
   scope->agent->allocator = allocator;
   scope->agent->hash_seed = GenerateHashSeed();
   scope->agent->webassembly_restricted = restrict_webassembly;
+  scope->agent->resource_limits = resource_limits != 0;
   scope->agent->lane_id = snapi_v8_lane_current_id();
   // Installed under every policy: it refuses all wasm code of a restricted
   // isolate and otherwise honors each realm's allow_code_gen_wasm.
@@ -2552,7 +2634,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
     unofficial_napi_env_owner* owner_out) {
   return snapi_private_create_env(
       module_api_version, options,
-      static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered), env_out,
+      static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered), 0, env_out,
       owner_out);
 }
 
@@ -4032,9 +4114,6 @@ napi_status NAPI_CDECL unofficial_napi_notify_datetime_configuration_change(napi
 napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
                                                              napi_value* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
-  // node:v8's Serializer/Deserializer keep their buffers in host memory the
-  // budget does not see (messages go through message_create_bounded).
-  if (env->agent != nullptr && env->agent->resource_limits) return napi_generic_failure;
 
   v8::Isolate* isolate = env->isolate;
   // The binding is returned past this scope: escaped, it lives in the

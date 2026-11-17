@@ -29,11 +29,13 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
 #include <v8.h>
 
 // Provider-private env creation with the embedder's WebAssembly policy
-// (NapiWebAssemblyPolicy: 0 restricted, 1 unmetered).
+// (NapiWebAssemblyPolicy: 0 restricted, 1 unmetered) and resource limits
+// (nonzero: a budgeted or managed application).
 extern "C" napi_status snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out);
 #endif
@@ -226,7 +228,7 @@ TEST_F(Test21General, UnknownWebAssemblyPolicyIsRefusedAfterTakingTheGuestHeap) 
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
-                                     kWebAssemblyAllowUnmetered + 1, &env, &owner),
+                                     kWebAssemblyAllowUnmetered + 1, 0, &env, &owner),
             napi_invalid_arg);
   EXPECT_EQ(env, nullptr);
   EXPECT_EQ(owner, nullptr);
@@ -259,7 +261,7 @@ TEST_F(Test21General, WebAssemblyPolicyDecidesWebAssemblyInTheEnv) {
         test_case.use_public_entry
             ? unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner)
             : snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
-                                       test_case.policy, &env, &owner);
+                                       test_case.policy, 0, &env, &owner);
     ASSERT_EQ(status, napi_ok);
     ASSERT_NE(env, nullptr);
 
@@ -299,7 +301,7 @@ unofficial_napi_message MessageFrom(uint32_t policy, const char* script) {
   unofficial_napi_env_owner owner = nullptr;
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
-  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, 0, &env,
                                      &owner),
             napi_ok);
   if (env == nullptr) return nullptr;
@@ -321,7 +323,7 @@ std::string TakeIn(uint32_t policy, unofficial_napi_message message) {
   unofficial_napi_env_owner owner = nullptr;
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
-  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, 0, &env,
                                      &owner),
             napi_ok);
   if (env == nullptr) return "<no env>";
@@ -391,7 +393,7 @@ TEST_F(Test21General, RefusedMessageKeepsTheTermination) {
   unofficial_napi_env_create_options options{};
   InitializeTestEnvCreateOptions(&options);
   ASSERT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
-                                     kWebAssemblyRestricted, &env, &owner),
+                                     kWebAssemblyRestricted, 0, &env, &owner),
             napi_ok);
 
   ASSERT_EQ(unofficial_napi_terminate_execution(env), napi_ok);

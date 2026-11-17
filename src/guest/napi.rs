@@ -43,6 +43,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
 
     let guest_heap_ctx = guest_heap_alloc_ctx(&env);
     let webassembly_policy = env.data().webassembly.bridge_code();
+    let resource_limits = env.data().resource_limits_flag();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = if reservation.clamped {
         unsafe {
@@ -56,6 +57,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
                 0,
                 guest_heap_ctx,
                 webassembly_policy,
+                resource_limits,
                 &mut snapi_env_state,
             )
         }
@@ -65,6 +67,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
                 8,
                 guest_heap_ctx,
                 webassembly_policy,
+                resource_limits,
                 &mut snapi_env_state,
             )
         }
@@ -292,6 +295,7 @@ fn guest_unofficial_napi_create_env(
 
     let guest_heap_ctx = guest_heap_alloc_ctx(&env);
     let webassembly_policy = env.data().webassembly.bridge_code();
+    let resource_limits = env.data().resource_limits_flag();
     let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
     let status = unsafe {
         snapi_bridge_unofficial_create_env_with_options(
@@ -304,6 +308,7 @@ fn guest_unofficial_napi_create_env(
             stack_limit,
             guest_heap_ctx,
             webassembly_policy,
+            resource_limits,
             &mut snapi_env_state,
         )
     };

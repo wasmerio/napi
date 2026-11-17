@@ -838,7 +838,7 @@ mod tests {
         let mut env: crate::snapi::SnapiEnv = std::ptr::null_mut();
         // napi_invalid_arg, refused before the process-wide runtime is used.
         let status = unsafe {
-            crate::snapi::snapi_bridge_unofficial_create_env(8, ctx, unknown_policy, &mut env)
+            crate::snapi::snapi_bridge_unofficial_create_env(8, ctx, unknown_policy, 0, &mut env)
         };
         assert_eq!(status, 1);
         assert!(env.is_null());

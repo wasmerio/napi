@@ -33,10 +33,13 @@
 
 // Provider-private (v8/src/unofficial_napi.cc): unofficial_napi_create_env
 // with the embedder's WebAssembly policy. Never imported by guests.
+// `resource_limits` nonzero: the isolate is created under resource limits
+// (napi_agent__::resource_limits), before anything runs in it.
 extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out);
 
@@ -3609,6 +3612,7 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   const void* guest_heap_ctx,
                                                   uint32_t webassembly_policy,
+                                                  uint32_t resource_limits,
                                                   SnapiEnvState** env_out) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
@@ -3620,10 +3624,10 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
     options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
         const_cast<void*>(guest_heap_ctx));
     s = snapi_private_create_env(module_api_version, &options,
-                                 webassembly_policy, &env, &owner);
+                                 webassembly_policy, resource_limits, &env, &owner);
   } else {
     s = snapi_private_create_env(module_api_version, nullptr,
-                                 webassembly_policy, &env, &owner);
+                                 webassembly_policy, resource_limits, &env, &owner);
   }
   if (s != napi_ok) return s;
 
@@ -3652,6 +3656,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t /*stack_limit*/,
     const void* guest_heap_ctx,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     SnapiEnvState** env_out) {
   unofficial_napi_env_create_options options{};
   const bool has_options =
@@ -3678,7 +3683,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   napi_status s = snapi_private_create_env(
-      module_api_version, has_options ? &options : nullptr, webassembly_policy,
+      module_api_version, has_options ? &options : nullptr, webassembly_policy, resource_limits,
       &env, &owner);
   if (s != napi_ok) return s;
 
@@ -3816,16 +3821,6 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
   auto* bridge_state = LookupEnvState(env_state);
   if (bridge_state == nullptr) return 0;
   return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
-}
-
-extern "C" napi_status NAPI_CDECL snapi_private_enable_resource_limits(napi_env env);
-
-// Host-only: puts the env's isolate under resource limits, for an embedder
-// that budgets or manages the application (NapiEnv::enforces_resource_limits).
-extern "C" int snapi_bridge_unofficial_enable_resource_limits(SnapiEnvState* env_state) {
-  auto* state = LookupEnvState(env_state);
-  if (state == nullptr) return napi_invalid_arg;
-  return snapi_private_enable_resource_limits(state->env);
 }
 
 // Host-only: charges the env's agent's handle tables to `budget`, a reference

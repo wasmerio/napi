@@ -2856,6 +2856,7 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
     _version: i32,
     _guest_heap_ctx: *const c_void,
     webassembly_policy: u32,
+    _resource_limits: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
     let runtime_configured = RUNTIME_ENGINE_FLAGS
@@ -2899,9 +2900,18 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env_with_options(
     _stack: u32,
     guest_heap_ctx: *const c_void,
     webassembly_policy: u32,
+    resource_limits: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
-    unsafe { snapi_bridge_unofficial_create_env(version, guest_heap_ctx, webassembly_policy, out) }
+    unsafe {
+        snapi_bridge_unofficial_create_env(
+            version,
+            guest_heap_ctx,
+            webassembly_policy,
+            resource_limits,
+            out,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]

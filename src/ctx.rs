@@ -351,7 +351,7 @@ impl NapiCtxBuilder {
         let managed = false;
         let restrictable = cfg!(not(all(target_arch = "wasm32", feature = "js")));
         let webassembly = self.webassembly.unwrap_or_else(|| {
-            if !restrictable || (budget.is_unlimited() && !managed) {
+            if !restrictable || (!budget.is_budgeted() && !managed) {
                 WasmPolicy::EnabledUnmetered
             } else {
                 WasmPolicy::Restricted

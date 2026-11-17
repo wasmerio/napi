@@ -406,6 +406,14 @@ impl ResourceBudget {
         }
     }
 
+    /// Whether an embedder budgets the application: it installed an
+    /// accountant, or set a memory limit. Unlike [`Self::is_unlimited`],
+    /// which reads the accountant's current limit, this cannot change over
+    /// the context's life, so policy chosen from it stays consistent.
+    pub fn is_budgeted(&self) -> bool {
+        self.accountant.is_some() || self.mem_total != UNLIMITED
+    }
+
     /// Whether this budget enforces a limit.
     pub fn is_unlimited(&self) -> bool {
         self.memory_limit() == UNLIMITED

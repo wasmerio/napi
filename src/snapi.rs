@@ -62,15 +62,18 @@ unsafe extern "C" {
         engine_flags: *const c_char,
         engine_flags_length: u32,
     ) -> i32;
-    /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`]. The bridge
-    /// owns `guest_heap_ctx` from here on, also when it refuses the call.
+    /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`];
+    /// `resource_limits` is [`crate::env::NapiEnv::resource_limits_flag`]. The
+    /// bridge owns `guest_heap_ctx` from here on, also when it refuses the
+    /// call.
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
         webassembly_policy: u32,
+        resource_limits: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
-    /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
+    /// As [`snapi_bridge_unofficial_create_env`], with heap constraints.
     pub fn snapi_bridge_unofficial_create_env_with_options(
         module_api_version: i32,
         total_memory: u64,
@@ -81,6 +84,7 @@ unsafe extern "C" {
         stack_limit: u32,
         guest_heap_ctx: *const core::ffi::c_void,
         webassembly_policy: u32,
+        resource_limits: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
@@ -147,10 +151,6 @@ unsafe extern "C" {
     /// Charge the host bookkeeping of this env's handle tables to `budget`, a
     /// reference from `ResourceBudget::bridge_reference` that the bridge owns
     /// on success. Nonzero (the caller keeps the reference) on failure.
-    /// Puts the env's isolate under resource limits (profilers, heap
-    /// snapshots, serdes and guest code caches are refused). Nonzero on
-    /// failure.
-    pub fn snapi_bridge_unofficial_enable_resource_limits(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_host_budget(
         env: SnapiEnv,
         budget: *const std::ffi::c_void,
