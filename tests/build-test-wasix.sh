@@ -72,6 +72,11 @@ case "$TEST_SRC" in
     ;;
 esac
 
+# Build into a file of this process and rename it into place, so a concurrent
+# build or a reader never sees a partial module.
+TMP_FILE="$OUT_DIR/.${TEST_NAME}.$$.tmp.wasm"
+trap 'rm -f "$TMP_FILE"' EXIT
+
 "$WASIX_DRIVER" \
   --target=wasm32-wasix \
   -O2 \
@@ -85,6 +90,7 @@ esac
   -Wl,--export=malloc \
   -Wl,--export=free \
   "$TEST_SRC" \
-  -o "$OUT_FILE"
+  -o "$TMP_FILE"
+mv -f "$TMP_FILE" "$OUT_FILE"
 
 echo "Built: $OUT_FILE"

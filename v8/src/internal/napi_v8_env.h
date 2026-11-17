@@ -100,6 +100,8 @@ struct unofficial_napi_realm__ {
   // The record is the realm's context token. True while the realm has one,
   // until the unassign hook, which runs before the record is freed.
   bool token_assigned = false;
+  // The realm option. A restricted agent refuses wasm code in every realm.
+  bool allow_code_gen_wasm = true;
 };
 
 // A realm N-API acts in: a scope opened with unofficial_napi_enter_realm, or

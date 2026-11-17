@@ -79,12 +79,15 @@ napi_status unofficial_napi_compile_function(napi_env env, unofficial_napi_realm
     | `host_defined_option_id` | yes | yes | no |
     | `allow_code_gen_strings` | yes | no | no |
     | `own_microtask_queue` | yes | no | no |
-    | `allow_code_gen_wasm` | no | no | no |
+    | `allow_code_gen_wasm` | yes | no | no |
     | `name`, `origin` | no | no | no |
 
     With `allow_code_gen_strings` false, V8 makes `eval` and the `Function`
-    constructors throw an `EvalError` in the realm. WebAssembly code
-    generation stays allowed on V8 (QuickJS has no WebAssembly).
+    constructors throw an `EvalError` in the realm. With `allow_code_gen_wasm`
+    false, compiling WebAssembly there throws a `WebAssembly.CompileError`
+    (QuickJS has no WebAssembly). An env whose embedder chose
+    `WasmPolicy::Restricted` has no `WebAssembly` global in any realm and
+    refuses wasm code generation in all of them, whatever the option says.
 - **`get_realm`** returns NULL for any object that isn't a realm's global or
   sandbox, the env's own global included.
 - **`enter_realm` / `leave_realm`:**
@@ -370,12 +373,11 @@ between the engines:
     last copy, and a script it starts in the realm copies the sandbox in
     again, over the running script's global writes to the same names.
   - host-JS evaluates against the sandbox with `with`.
-- **Code generation per realm.** No provider enforces
-  `allow_code_gen_wasm`. V8 would need an isolate-wide
-  `AllowWasmCodeGenerationCallback` that reads a per-realm flag, as Node
-  does. There is also no call to change a realm's code-generation policy
-  after it is created, which a browser needs because CSP arrives with the
-  response.
+- **Code generation per realm.** Only V8 enforces `allow_code_gen_wasm`,
+  through an isolate-wide `AllowWasmCodeGenerationCallback` that reads it
+  from the realm's record, as Node does. There is no call to change a
+  realm's code-generation policy after it is created, which a browser needs
+  because CSP arrives with the response.
 
 ## History
 

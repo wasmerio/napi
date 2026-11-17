@@ -2851,12 +2851,25 @@ pub unsafe extern "C" fn snapi_bridge_init() -> i32 {
 pub unsafe extern "C" fn snapi_bridge_unofficial_create_env(
     _version: i32,
     _guest_heap_ctx: *const c_void,
+    webassembly_policy: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
     let runtime_configured = RUNTIME_ENGINE_FLAGS
         .lock()
         .is_ok_and(|flags| flags.is_some());
     if out.is_null() || !runtime_configured {
+        return NAPI_INVALID_ARG;
+    }
+    // Guest JavaScript runs in a host realm here, with the host's own
+    // WebAssembly, which this backend cannot take away: refuse a restricted
+    // env rather than create one that is not restricted.
+    if webassembly_policy == crate::WasmPolicy::Restricted.bridge_code() {
+        wasmer_napi_console_error(
+            "the host-JS N-API backend cannot restrict WebAssembly (WasmPolicy::Restricted)",
+        );
+        return NAPI_GENERIC_FAILURE;
+    }
+    if webassembly_policy != crate::WasmPolicy::EnabledUnmetered.bridge_code() {
         return NAPI_INVALID_ARG;
     }
     if !wasmer_napi_can_create_global_context() {
@@ -2881,9 +2894,10 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_create_env_with_options(
     _code: u32,
     _stack: u32,
     guest_heap_ctx: *const c_void,
+    webassembly_policy: u32,
     out: *mut SnapiEnv,
 ) -> i32 {
-    unsafe { snapi_bridge_unofficial_create_env(version, guest_heap_ctx, out) }
+    unsafe { snapi_bridge_unofficial_create_env(version, guest_heap_ctx, webassembly_policy, out) }
 }
 
 #[unsafe(no_mangle)]

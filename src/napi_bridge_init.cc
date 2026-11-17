@@ -28,7 +28,21 @@
 #include "unofficial_napi.h"
 #include "edge_v8_platform.h"
 #include "internal/napi_v8_env.h"
+#include "internal/napi_wasm_policy.h"
 #include "internal/unofficial_napi_bridge.h"
+
+// Provider-private (v8/src/unofficial_napi.cc): unofficial_napi_create_env
+// with the embedder's WebAssembly policy. Never imported by guests.
+extern "C" napi_status NAPI_CDECL snapi_private_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out);
+
+// The Rust side encodes `WasmPolicy` with these values (src/ctx.rs).
+static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kRestricted) == 0);
+static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered) == 1);
 
 namespace {
 
@@ -3351,8 +3365,11 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
   return napi_ok;
 }
 
+// `webassembly_policy` is a NapiWebAssemblyPolicy. The guest-heap context is
+// the provider's from here on, also when the policy is refused.
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   const void* guest_heap_ctx,
+                                                  uint32_t webassembly_policy,
                                                   SnapiEnvState** env_out) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
@@ -3363,9 +3380,11 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
     options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
     options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
         const_cast<void*>(guest_heap_ctx));
-    s = unofficial_napi_create_env(module_api_version, &options, &env, &owner);
+    s = snapi_private_create_env(module_api_version, &options,
+                                 webassembly_policy, &env, &owner);
   } else {
-    s = unofficial_napi_create_env(module_api_version, nullptr, &env, &owner);
+    s = snapi_private_create_env(module_api_version, nullptr,
+                                 webassembly_policy, &env, &owner);
   }
   if (s != napi_ok) return s;
 
@@ -3396,6 +3415,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t code_range_size_in_bytes,
     uint32_t /*stack_limit*/,
     const void* guest_heap_ctx,
+    uint32_t webassembly_policy,
     SnapiEnvState** env_out) {
   unofficial_napi_env_create_options options{};
   const bool has_options =
@@ -3421,8 +3441,9 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
       const_cast<void*>(guest_heap_ctx));
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
-  napi_status s = unofficial_napi_create_env(
-      module_api_version, has_options ? &options : nullptr, &env, &owner);
+  napi_status s = snapi_private_create_env(
+      module_api_version, has_options ? &options : nullptr, webassembly_policy,
+      &env, &owner);
   if (s != napi_ok) return s;
 
   SnapiEnvState* state = NewAgentWithPrincipalEnv(env, owner);

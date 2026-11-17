@@ -117,6 +117,9 @@ pub(crate) struct NapiEnv {
     pub(crate) budget: Arc<ResourceBudget>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
     pub(crate) max_envs: Option<usize>,
+    /// The embedder's policy for V8 `WebAssembly` in the envs this store
+    /// creates.
+    pub(crate) webassembly: crate::WasmPolicy,
     env_registry: Arc<std::sync::Mutex<EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
@@ -205,6 +208,7 @@ impl NapiEnv {
         Self {
             budget,
             max_envs,
+            webassembly: crate::WasmPolicy::default(),
             env_registry,
             host_stopped,
             env_heap_charges: HashMap::new(),
