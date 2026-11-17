@@ -211,6 +211,7 @@ struct napi_env__
 private:
   void clear_refs_for_teardown();
   void run_cleanup_hooks();
+  bool run_embedder_cleanup();
   void finalize_pending_values();
   void finalize_instance_data();
   void call_instance_data_finalizer(void *data, napi_finalize finalize_cb, void *finalize_hint);

@@ -399,10 +399,12 @@ extern "C"
             hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
             !env->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
-        // QuickJS currently drives none of the remaining provider-owned hook
-        // classes. Attaching the transaction is valid, but no capability is
-        // advertised until the corresponding engine callback exists.
-        *accepted_hooks_out = 0;
+        // Of the provider-owned hook classes QuickJS drives only the env
+        // cleanup callback (run_cleanup_hooks); the others are attached but
+        // not advertised until the corresponding engine callback exists.
+        *accepted_hooks_out = hooks->env_cleanup_callback != nullptr
+                                  ? static_cast<uint64_t>(unofficial_napi_env_hook_env_cleanup)
+                                  : 0;
         return napi_ok;
     }
 

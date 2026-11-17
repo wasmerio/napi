@@ -1135,7 +1135,11 @@ static_assert(offsetof(unofficial_napi_module_create_options, context_or_undefin
               offsetof(MainModuleCreateOptionsV1, context_or_undefined));
 static_assert(offsetof(unofficial_napi_module_create_options, payload) ==
               offsetof(MainModuleCreateOptionsV1, payload));
-static_assert(sizeof(MainEnvHooksV1) == sizeof(unofficial_napi_env_hooks));
+// main's layout is a prefix: env_cleanup_callback was appended without a new
+// version, since no released embedder attached hooks, so a main-sized struct
+// is now refused (size check) rather than read short.
+static_assert(sizeof(MainEnvHooksV1) ==
+              offsetof(unofficial_napi_env_hooks, env_cleanup_callback));
 static_assert(offsetof(unofficial_napi_env_hooks, context_token_unassign_callback) ==
               offsetof(MainEnvHooksV1, context_token_unassign_callback));
 static_assert(offsetof(unofficial_napi_env_hooks, oom_error_callback) ==

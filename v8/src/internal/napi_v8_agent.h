@@ -67,6 +67,9 @@ struct napi_agent__ {
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback =
       nullptr;
   void* enqueue_foreground_task_target = nullptr;
+  // Runs at the release of the agent's env, with the hooks' `data`.
+  unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
+  void* env_cleanup_data = nullptr;
   // The deprecated context-token hooks, called for the realms of the agent's
   // env. `context_token_data` is the hooks' `data`.
   unofficial_napi_context_token_callback context_token_assign_callback = nullptr;

@@ -1939,6 +1939,8 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   agent->context_token_data = hooks->data;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
+  agent->env_cleanup_callback = hooks->env_cleanup_callback;
+  agent->env_cleanup_data = hooks->data;
   {
     // Backing-store deleters read the hook on other threads.
     std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());

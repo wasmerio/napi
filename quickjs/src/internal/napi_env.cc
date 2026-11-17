@@ -305,20 +305,44 @@ void napi_env__::clear_refs_for_teardown()
   clearing_refs_for_teardown_ = false;
 }
 
+// The embedder's env_cleanup_callback (unofficial_napi_env_hooks), as a
+// cleanup hook runs. Returns whether it ran anything.
+bool napi_env__::run_embedder_cleanup()
+{
+  const unofficial_napi_env_hooks &hooks = agent_->embedder_hooks();
+  if (hooks.env_cleanup_callback == nullptr)
+    return false;
+  bool ran = false;
+  {
+    napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+    ran = hooks.env_cleanup_callback(this, hooks.data);
+  }
+  drop_finalizer_exception();
+  return ran;
+}
+
+// The embedder's cleanup, then the env's hooks, most recent first, until
+// neither has anything left (either may give the other more).
 void napi_env__::run_cleanup_hooks()
 {
-  while (!env_cleanup_hooks_.empty())
+  bool more = true;
+  while (more)
   {
-    auto *entry = env_cleanup_hooks_.back();
-    env_cleanup_hooks_.pop_back();
-    if (entry != nullptr)
+    more = run_embedder_cleanup();
+    while (!env_cleanup_hooks_.empty())
     {
+      more = true;
+      auto *entry = env_cleanup_hooks_.back();
+      env_cleanup_hooks_.pop_back();
+      if (entry != nullptr)
       {
-        napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
-        entry->run();
+        {
+          napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
+          entry->run();
+        }
+        drop_finalizer_exception();
+        napi_env_cleanup_hook__::destroy(entry);
       }
-      drop_finalizer_exception();
-      napi_env_cleanup_hook__::destroy(entry);
     }
   }
 }

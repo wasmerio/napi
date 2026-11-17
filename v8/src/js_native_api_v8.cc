@@ -241,6 +241,35 @@ void RunEnvCleanupHooks(napi_env env) {
   }
 }
 
+// The embedder's env_cleanup_callback (unofficial_napi_env_hooks), as a
+// cleanup hook runs: in the env's realm, what it leaves pending dropped.
+// Returns whether it ran anything.
+bool RunEmbedderEnvCleanup(napi_env env) {
+  if (!CheckEnv(env) || env->agent == nullptr) return false;
+  unofficial_napi_env_cleanup_callback callback = env->agent->env_cleanup_callback;
+  if (callback == nullptr) return false;
+  v8::HandleScope handle_scope(env->isolate);
+  v8::Context::Scope context_scope(env->main_context());
+  napi_realm_frame_scope__ realm_frame(env, nullptr);
+  v8::TryCatch try_catch(env->isolate);
+  const bool ran = callback(env, env->agent->env_cleanup_data);
+  ClearLastException(env);
+  return ran;
+}
+
+// Step 1 of the release: the embedder's cleanup, then the env's hooks, until
+// neither has anything left (either may give the other more).
+void RunReleaseCleanup(napi_env env) {
+  bool more = true;
+  while (more) {
+    more = RunEmbedderEnvCleanup(env);
+    if (!env->env_cleanup_hooks.empty()) {
+      RunEnvCleanupHooks(env);
+      more = true;
+    }
+  }
+}
+
 napi_buffer_record* TakeBufferRecord(napi_env env, napi_buffer_record* record) {
   if (!CheckEnv(env) || record == nullptr) return nullptr;
   auto& records = env->buffer_records;
@@ -1143,14 +1172,15 @@ napi_env__::~napi_env__() {
   for (;;) {
     do {
       NapiV8UnassignRealmTokens(this);
-      RunEnvCleanupHooks(this);
+      RunReleaseCleanup(this);
       NapiV8UnassignRealmTokens(this);
       napi_ref_tracker__::FinalizeAll(&finalizing_reflist);
       pending_finalizers.clear();
       pending_buffer_finalizers.clear();
       FinalizeExternalBackingStoreHints(this);
+      // Last, what finalizers gave the embedder: another pass if it ran any.
     } while (!env_cleanup_hooks.empty() || !napi_ref_tracker__::IsEmpty(&finalizing_reflist) ||
-             NapiV8HasRealmTokens(this));
+             NapiV8HasRealmTokens(this) || RunEmbedderEnvCleanup(this));
     if (instance_data_finalize_cb == nullptr) break;
     napi_finalize finalize_cb = instance_data_finalize_cb;
     instance_data_finalize_cb = nullptr;

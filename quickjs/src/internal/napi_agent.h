@@ -62,6 +62,7 @@ struct napi_agent__
 
   int64_t adjust_external_memory(int64_t change_in_bytes);
   bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
+  const unofficial_napi_env_hooks &embedder_hooks() const { return embedder_hooks_; }
 
   // Runtime-wide engine hooks. They dispatch to the env of the realm the
   // engine reports.
