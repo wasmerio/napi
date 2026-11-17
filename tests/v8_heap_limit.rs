@@ -17,6 +17,8 @@ use std::{
 };
 
 use wasmer::{AsStoreMut, Imports, Instance, Module, Store};
+
+mod wat_guest;
 use wasmer_napi::NapiCtx;
 use wasmer_napi::budget::{DEFAULT_HEAP_EMERGENCY_HEADROOM, ResourceUsage, heap_emergency_stats};
 
@@ -65,6 +67,8 @@ struct Statuses {
     after: i32,
     /// `1+1` in the other env (worker runs only), or 0.
     after_main: i32,
+    /// The budget right after the script under test returned.
+    after_script: ResourceUsage,
     /// The budget while the envs were alive.
     in_flight: ResourceUsage,
     /// The budget after the store, with its envs, was dropped.
@@ -135,6 +139,7 @@ fn run(ctx: &NapiCtx, js: &str, worker: bool) -> Statuses {
         wat_string(js)
     );
     let in_flight;
+    let after_script;
     let (script, after, after_main);
     {
         let mut store = Store::default();
@@ -160,6 +165,7 @@ fn run(ctx: &NapiCtx, js: &str, worker: bool) -> Statuses {
             .unwrap()
             .call(&mut store, i32::from(worker))
             .unwrap();
+        after_script = ctx.budget().snapshot();
         let call = |name: &str, store: &mut Store| {
             instance
                 .exports
@@ -180,6 +186,7 @@ fn run(ctx: &NapiCtx, js: &str, worker: bool) -> Statuses {
         script,
         after,
         after_main,
+        after_script,
         in_flight,
         released: ctx.budget().snapshot(),
     }
@@ -414,4 +421,70 @@ fn simultaneous_heap_bombs_each_terminate_and_a_benign_tenant_is_unaffected() {
         benign.iter().all(Statuses::completed),
         "the benign tenant was disturbed: {benign:?}"
     );
+}
+
+/// A heap that keeps growing within its budget reaches V8's last-resort path
+/// with an allocation pending: the callback pays a step and lends headroom
+/// for the allocation, which the next interrupt (or return) charges for real
+/// and takes back. The script completes, nothing stays lent, and the budget
+/// covers what the heap holds.
+#[test]
+fn a_heap_growing_within_its_budget_borrows_and_returns_headroom() {
+    let ctx = NapiCtx::builder().total_memory_bytes(1024 * MIB).build();
+    let statuses = run_script(
+        &ctx,
+        "var r=globalThis.r=[];for(var i=0;i<3000000;i++){r.push({a:i,b:[i,i]});}",
+    );
+    assert!(statuses.completed(), "{statuses:?}");
+    let usage = &statuses.in_flight;
+    assert_eq!(usage.v8_heap_lease, 0, "headroom stayed lent: {usage:?}");
+    assert_eq!(usage.v8_heap_emergency, 0, "{usage:?}");
+    // Grown well past the initial 64 MiB ceiling (plus overhead and slack).
+    assert!(
+        usage.v8_heap_reserved > 160 * MIB,
+        "the growth was not charged: {usage:?}"
+    );
+    statuses.assert_released("growth");
+}
+
+/// A large young object, which V8 admits without a limit check, is charged
+/// on the very return that brought it, not on a later sampled one.
+#[test]
+fn a_young_large_object_is_charged_when_its_script_returns() {
+    let ctx = NapiCtx::builder().total_memory_bytes(768 * MIB).build();
+    // One 240 MB FixedDoubleArray, retained.
+    let statuses = run_script(&ctx, "globalThis.a=new Array(30000000).fill(1.5);");
+    assert!(statuses.completed(), "{statuses:?}");
+    let usage = &statuses.after_script;
+    assert!(
+        usage.v8_heap_reserved > 240 * MIB,
+        "the young large object was not charged on return: {usage:?}"
+    );
+    assert_eq!(usage.v8_heap_lease, 0, "{usage:?}");
+    statuses.assert_released("young");
+}
+
+/// The env's release runs its finalizers, whose JavaScript can still exhaust
+/// the heap: the near-heap-limit callback stays installed until they are
+/// done, so the budget refuses the growth and stops them instead of V8
+/// aborting the process.
+#[test]
+fn a_heap_bomb_in_a_finalizer_during_release_is_stopped() {
+    let (engine, module) = wat_guest::compile();
+    let ctx = NapiCtx::builder().total_memory_bytes(BUDGET).build();
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    let mut guest = wat_guest::Guest::new(&ctx, &engine, &module, signal_tx);
+    guest.create();
+    guest.set_finalizer_script("globalThis.a=new Array(30000000).fill(1.5)");
+    assert_eq!(guest.arm_spinning_finalizer(), 0);
+    let grants_before = heap_emergency_stats().grants;
+    assert_eq!(guest.release(), 0);
+    signal_rx
+        .try_recv()
+        .expect("the finalizer did not run during the release");
+    assert!(heap_emergency_stats().grants > grants_before);
+    drop(guest);
+    let released = ctx.budget().snapshot();
+    assert_eq!(released.v8_heap_emergency, 0, "{released:?}");
+    assert_eq!(released.live_isolates, 0, "{released:?}");
 }

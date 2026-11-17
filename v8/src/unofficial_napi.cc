@@ -2043,14 +2043,20 @@ napi_status StructuredCloneImpl(
 
 }  // namespace
 
-void napi_agent__::Shutdown() {
-  DisposeProfilers(this);
+void napi_agent__::RemoveNearHeapLimitCallback() {
   if (near_heap_limit_installed) {
     near_heap_limit_installed = false;
     isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, 0);
   }
   near_heap_limit_callback = nullptr;
   near_heap_limit_data = nullptr;
+}
+
+void napi_agent__::Shutdown() {
+  DisposeProfilers(this);
+  // The near-heap-limit callback stays until the release has run the env's
+  // hooks and finalizers (ReleaseEnvScope): their JavaScript can still
+  // exhaust the heap, and without the callback V8 would abort the process.
   fatal_error_callback = nullptr;
   oom_error_callback = nullptr;
   // The release runs its hooks and finalizers with JS usable. As a cancel,
@@ -2256,33 +2262,87 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
-    napi_env env, size_t* result) {
-  if (env == nullptr || env->isolate == nullptr || result == nullptr) {
-    return napi_invalid_arg;
-  }
-  // Heap::OldGenerationCapacity() is what V8 compares against the hard limit
-  // (Heap::CanExpandOldGeneration): the paged old-generation spaces plus the
-  // old large-object spaces. It is not exported, so sum the committed memory
-  // of every space except the young generation and the read-only space; the
-  // committed figure bounds the capacity from above, so a limit raised to
-  // cover it satisfies V8. Reading space statistics neither allocates nor
-  // collects, so this is safe inside a near-heap-limit callback.
-  v8::Isolate* isolate = env->isolate;
-  size_t total = 0;
-  const size_t spaces = isolate->NumberOfHeapSpaces();
-  for (size_t index = 0; index < spaces; ++index) {
+namespace {
+
+struct HeapSpaces {
+  int young_large_objects = -1;
+  std::vector<size_t> old_generation;
+};
+
+// Which heap spaces are which, by name: Heap::OldGenerationCapacity() (what
+// V8 compares with the hard limit) covers the paged old-generation spaces and
+// the old large-object spaces, i.e. everything but the young generation and
+// the read-only space.
+HeapSpaces ResolveHeapSpaces(v8::Isolate* isolate) {
+  HeapSpaces spaces;
+  const size_t count = isolate->NumberOfHeapSpaces();
+  for (size_t index = 0; index < count; ++index) {
     v8::HeapSpaceStatistics stats;
     if (!isolate->GetHeapSpaceStatistics(&stats, index)) continue;
     const char* name = stats.space_name();
     if (name == nullptr || std::strcmp(name, "read_only_space") == 0 ||
-        std::strcmp(name, "new_space") == 0 ||
-        std::strcmp(name, "new_large_object_space") == 0) {
+        std::strcmp(name, "new_space") == 0) {
       continue;
     }
-    total += stats.space_size();
+    if (std::strcmp(name, "new_large_object_space") == 0) {
+      spaces.young_large_objects = static_cast<int>(index);
+      continue;
+    }
+    spaces.old_generation.push_back(index);
   }
-  *result = total;
+  return spaces;
+}
+
+// The isolate's young large-object space (or -1) and old-generation spaces,
+// cached on its agent when there is one (`scratch` otherwise): read on every
+// return from JavaScript, so nothing is copied.
+int YoungLargeObjectSpace(v8::Isolate* isolate, napi_agent__* agent, HeapSpaces* scratch) {
+  if (agent == nullptr) {
+    *scratch = ResolveHeapSpaces(isolate);
+    return scratch->young_large_objects;
+  }
+  if (!agent->heap_spaces_resolved) {
+    HeapSpaces resolved = ResolveHeapSpaces(isolate);
+    agent->young_large_object_space = resolved.young_large_objects;
+    agent->old_generation_spaces = std::move(resolved.old_generation);
+    agent->heap_spaces_resolved = true;
+  }
+  return agent->young_large_object_space;
+}
+
+const std::vector<size_t>& OldGenerationSpaces(napi_agent__* agent, const HeapSpaces& scratch) {
+  return agent != nullptr ? agent->old_generation_spaces : scratch.old_generation;
+}
+
+size_t SpaceSize(v8::Isolate* isolate, size_t index) {
+  v8::HeapSpaceStatistics stats;
+  return isolate->GetHeapSpaceStatistics(&stats, index) ? stats.space_size() : 0;
+}
+
+}  // namespace
+
+// Reading space statistics neither allocates nor collects, so this is safe
+// inside a near-heap-limit callback. The committed figure bounds V8's
+// capacity from above, so a limit raised to cover it satisfies V8.
+napi_status NAPI_CDECL unofficial_napi_get_heap_usage(napi_env env,
+                                                      unofficial_napi_heap_usage* result) {
+  if (result == nullptr) return napi_invalid_arg;
+  *result = {};
+  v8::Isolate* isolate =
+      env != nullptr ? env->isolate : v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return napi_invalid_arg;
+  HeapSpaces scratch;
+  napi_agent__* agent = env != nullptr ? env->agent : nullptr;
+  const int young_large = YoungLargeObjectSpace(isolate, agent, &scratch);
+  for (size_t index : OldGenerationSpaces(agent, scratch)) {
+    result->committed_old_generation += SpaceSize(isolate, index);
+  }
+  if (young_large >= 0) {
+    result->young_large_objects = SpaceSize(isolate, static_cast<size_t>(young_large));
+  }
+  v8::HeapStatistics heap;
+  isolate->GetHeapStatistics(&heap);
+  result->used = heap.used_heap_size();
   return napi_ok;
 }
 
@@ -2293,19 +2353,19 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
   }
   *collected = false;
   v8::Isolate* isolate = env->isolate;
-  // The old generation can hold committed memory past the hard limit that no
-  // limit check examined: NewLargeObjectSpace::AllocateRaw admits its first
-  // large object unconditionally, and a large object allocated on the retry
-  // of a failed allocation takes pages without consulting the limit. If the
-  // old generation exceeds the limit, collect: Heap::CollectGarbage promotes
-  // and frees, then compares the live old generation with the limit and calls
-  // the near-heap-limit callback if it is still exceeded, which charges the
-  // growth or stops the env. So this stops only an env that *retains* memory
-  // past its budget, never one whose overshoot was garbage.
+  // The old generation is limit-checked on every allocation, also on the
+  // retry of a failed one. What V8 admits without a check is the first large
+  // object of the young generation (NewLargeObjectSpace::AllocateRaw): only
+  // then can the heap hold more than its limit with no callback having run.
+  // Its counter is the one read on every return.
+  HeapSpaces scratch;
+  const int young_large_space = YoungLargeObjectSpace(isolate, env->agent, &scratch);
+  if (young_large_space < 0) return napi_ok;
+  const size_t young_large = SpaceSize(isolate, static_cast<size_t>(young_large_space));
+  if (young_large == 0) return napi_ok;
   size_t committed_old = 0;
-  if (unofficial_napi_get_heap_committed_old_generation(env, &committed_old) !=
-      napi_ok) {
-    return napi_ok;
+  for (size_t index : OldGenerationSpaces(env->agent, scratch)) {
+    committed_old += SpaceSize(isolate, index);
   }
   size_t limit = old_generation_limit;
   if (limit == 0) {
@@ -2313,8 +2373,12 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
     isolate->GetHeapStatistics(&heap);
     limit = heap.heap_size_limit();
   }
-  if (committed_old <= limit) return napi_ok;
-  // The callback run during the collection may create handles.
+  if (committed_old + young_large <= limit) return napi_ok;
+  // A full collection promotes the young large objects (or frees them, if
+  // they are garbage), then compares the live old generation with the limit
+  // and calls the near-heap-limit callback if it is still exceeded, which
+  // charges the growth or stops the env. So this stops only an env that
+  // *retains* memory past its budget. The callback may create handles.
   v8::HandleScope handle_scope(isolate);
   isolate->LowMemoryNotification();
   *collected = true;
@@ -2494,6 +2558,8 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
     status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }
+  // The env's hooks and finalizers ran; no more JavaScript.
+  if (scope->agent != nullptr) scope->agent->RemoveNearHeapLimitCallback();
 
   v8::Isolate* isolate = scope->isolate;
   // Keeps the allocator alive until the isolate is disposed.

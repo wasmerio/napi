@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -378,7 +378,7 @@ impl NapiEnv {
             if self.host_stopped.load(Ordering::Acquire) {
                 // SAFETY: `env` is the isolate just created and is still live.
                 unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
+                    crate::snapi::snapi_bridge_unofficial_stop_execution(env);
                 }
             }
         }
@@ -651,8 +651,7 @@ impl NapiEnv {
                 // release has returned: its isolate, and with it the
                 // near-heap-limit callback holding this pointer, are gone.
                 let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
-                self.budget
-                    .release_heap_emergency(boxed.emergency_exposed.load(Ordering::Acquire));
+                boxed.release_exposure();
                 boxed.granted.load(Ordering::Acquire)
             } else {
                 0

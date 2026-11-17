@@ -568,13 +568,14 @@ extern "C"
     }
 
     // QuickJS has no generational heap limit to overshoot.
-    napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
+    napi_status NAPI_CDECL unofficial_napi_get_heap_usage(
         napi_env env,
-        size_t *result)
+        unofficial_napi_heap_usage *result)
     {
-        if (env == nullptr || result == nullptr)
+        (void)env;
+        if (result == nullptr)
             return napi_invalid_arg;
-        *result = 0;
+        *result = {};
         return napi_ok;
     }
 

@@ -169,8 +169,9 @@ impl NapiRuntimeControl {
         {
             let envs = self.envs.lock().expect("poisoned N-API env registry");
             for env in envs.envs.values().copied() {
+                // Sticky: the env's release runs no guest code either.
                 unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                    crate::snapi::snapi_bridge_unofficial_stop_execution(
                         env as crate::snapi::SnapiEnv,
                     );
                 }

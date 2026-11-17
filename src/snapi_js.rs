@@ -4801,6 +4801,11 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     NAPI_OK
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_stop_execution(env: SnapiEnv) -> i32 {
+    unsafe { snapi_bridge_unofficial_terminate_execution(env) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32 {
     let _ = env;
     NAPI_GENERIC_FAILURE
