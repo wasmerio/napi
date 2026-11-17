@@ -2761,6 +2761,48 @@ extern "C" int snapi_bridge_unofficial_release_buffer_lease(
   return status;
 }
 
+extern "C" int snapi_bridge_unofficial_create_uint8array(
+    SnapiEnvState* env_state, uint32_t length, uint32_t prototype_id, uint64_t* data_out,
+    uint32_t* value_out) {
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
+  if (bridge_state == nullptr || data_out == nullptr || value_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  napi_value prototype = nullptr;
+  if (prototype_id != 0) {
+    prototype = LoadValue(*bridge_state, prototype_id);
+    if (prototype == nullptr) return napi_invalid_arg;
+  }
+  void* data = nullptr;
+  napi_value value = nullptr;
+  napi_status status =
+      unofficial_napi_create_uint8array(bridge_state->env, length, prototype, &data, &value);
+  if (status != napi_ok) return status;
+  *data_out = reinterpret_cast<uint64_t>(data);
+  *value_out = StoreValue(*bridge_state, value);
+  return *value_out == 0 ? napi_generic_failure : napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_create_uint8array_copy(
+    SnapiEnvState* env_state, const void* data, uint32_t length, uint32_t prototype_id,
+    uint32_t* value_out) {
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
+  if (bridge_state == nullptr || value_out == nullptr) return napi_invalid_arg;
+  napi_value prototype = nullptr;
+  if (prototype_id != 0) {
+    prototype = LoadValue(*bridge_state, prototype_id);
+    if (prototype == nullptr) return napi_invalid_arg;
+  }
+  napi_value value = nullptr;
+  napi_status status = unofficial_napi_create_uint8array_copy(
+      bridge_state->env, data, length, prototype, &value);
+  if (status != napi_ok) return status;
+  *value_out = StoreValue(*bridge_state, value);
+  return *value_out == 0 ? napi_generic_failure : napi_ok;
+}
+
 extern "C" int snapi_bridge_unofficial_create_guest_backed_typedarray(
     SnapiEnvState* env_state, int type, uint32_t length, uint64_t* data_out,
     uint32_t* value_out) {
@@ -3732,6 +3774,20 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   hooks.size = sizeof(hooks);
   hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
   return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
+}
+
+extern "C" int snapi_bridge_unofficial_get_env_hooks(
+    SnapiEnvState* env_state, int* attached_out, uint64_t* accepted_hooks_out) {
+  BridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
+  if (bridge_state == nullptr || attached_out == nullptr || accepted_hooks_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  bool attached = false;
+  napi_status status =
+      unofficial_napi_get_env_hooks(bridge_state->env, &attached, accepted_hooks_out);
+  if (status == napi_ok) *attached_out = attached ? 1 : 0;
+  return status;
 }
 
 // Keeps `env_state` allocated (not alive) until the matching unretain, so a

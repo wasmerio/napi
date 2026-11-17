@@ -119,7 +119,7 @@ _Static_assert(sizeof(unofficial_napi_wasm32_runtime_options_v1) == 16,
                "wasm32 runtime-options wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_env_create_options_v1) == 48,
                "wasm32 env-create wire layout changed");
-_Static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 32,
+_Static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 36,
                "wasm32 env-hooks wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_js_source) == 12,
                "wasm32 JS-source wire layout changed");

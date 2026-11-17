@@ -249,6 +249,15 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks,
     uint64_t* accepted_hooks_out);
+// Whether hooks are attached to `env` (unofficial_napi_attach_env), and the
+// ones the provider accepted then (0 when none are attached). An embedder
+// asks before relying on one: whether the env's release will call its
+// env_cleanup_callback, say, which neither the WASIX host nor an env no one
+// attached will.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_env_hooks(
+    napi_env env,
+    bool* attached_out,
+    uint64_t* accepted_hooks_out);
 // Releases an env made by unofficial_napi_create_env and the engine instance
 // it owns. Before anything is freed, the release runs what the env still
 // holds, in this order (the providers' contract; Node up to 20 also finalized
@@ -625,6 +634,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uint8array(
     size_t length,
     napi_value prototype_or_null,
     void** data,
+    napi_value* result);
+// Like unofficial_napi_create_uint8array, but holding a copy of the `length`
+// bytes at `data` (NULL when `length` is 0), and returning no pointer into
+// it: the array's memory is its own, and on the host-JavaScript provider
+// JavaScript owns it (no guest memory backs or mirrors it). For copies native
+// code does not touch afterwards, such as a Buffer napi_create_buffer_copy
+// makes without result_data. Reads no global and runs no JS.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uint8array_copy(
+    napi_env env,
+    const void* data,
+    size_t length,
+    napi_value prototype_or_null,
     napi_value* result);
 // Creates an ArrayBuffer using the provider's native ownership policy without
 // exposing a raw pointer to Edge. Embedded providers may adopt an uninitialized

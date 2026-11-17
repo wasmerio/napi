@@ -1317,13 +1317,30 @@ export function wasmer_napi_resolve_module_evaluation(evaluation) {
 export function wasmer_napi_reject_module_evaluation(evaluation, error) {
   evaluation.reject(error);
 }
+// The intrinsic typed-array constructors, taken when this module loads, in
+// napi_typedarray_type order. Looking them up on the global at each call
+// would let a script that replaced one (or made it a getter) run inside
+// napi_create_typedarray and hand back its own object.
+const wasmerNapiTypedArrayConstructors = Object.freeze([
+  Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+  Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array,
+  BigUint64Array, typeof Float16Array === 'function' ? Float16Array : undefined,
+]);
 export function wasmer_napi_typed_array(kind, buffer, offset, length) {
-  const names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
-    'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
-    'BigInt64Array', 'BigUint64Array', 'Float16Array'];
-  const Ctor = globalThis[names[kind]];
+  const Ctor = wasmerNapiTypedArrayConstructors[kind];
   if (typeof Ctor !== 'function') throw new TypeError('unsupported typed array kind');
   return new Ctor(buffer, offset, length);
+}
+// A Uint8Array that owns a copy of `length` bytes at `offset` in `buffer`
+// (the guest's memory), made and filled with intrinsics only.
+const wasmerNapiTypedArraySet = Object.getPrototypeOf(Uint8Array.prototype).set;
+const wasmerNapiApply = Reflect.apply;
+export function wasmer_napi_uint8array_copy(buffer, offset, length) {
+  const IntrinsicUint8Array = wasmerNapiTypedArrayConstructors[1];
+  const copy = new IntrinsicUint8Array(length);
+  wasmerNapiApply(wasmerNapiTypedArraySet, copy,
+    [new IntrinsicUint8Array(buffer, offset, length)]);
+  return copy;
 }
 export function wasmer_napi_typed_array_kind(value) {
   const names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
@@ -1712,6 +1729,12 @@ extern "C" {
     #[wasm_bindgen(catch)]
     fn wasmer_napi_typed_array(
         kind: i32,
+        buffer: &JsValue,
+        offset: u32,
+        length: u32,
+    ) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn wasmer_napi_uint8array_copy(
         buffer: &JsValue,
         offset: u32,
         length: u32,
@@ -3771,6 +3794,27 @@ pub(crate) fn create_guest_buffer_view(
     unsafe { write(out, id) }.map_or_else(|e| e, |_| NAPI_OK)
 }
 
+/// A JS-owned Uint8Array holding a copy of guest bytes (no guest memory
+/// backs or mirrors it): unofficial_napi_create_uint8array_copy.
+pub(crate) fn create_uint8array_copy(
+    env: SnapiEnv,
+    memory_buffer: &JsValue,
+    byte_offset: u32,
+    length: u32,
+    out: *mut u32,
+) -> i32 {
+    match wasmer_napi_uint8array_copy(memory_buffer, byte_offset, length) {
+        Ok(value) => unsafe { put_value(env, out, value) },
+        Err(error) => {
+            let Ok(state) = (unsafe { env_mut(env) }) else {
+                return NAPI_INVALID_ARG;
+            };
+            state.last_exception = Some(error);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
+}
+
 pub(crate) fn create_guest_typedarray_view(
     env: SnapiEnv,
     memory_buffer: &JsValue,
@@ -4774,6 +4818,26 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_continuation_preserved_embe
     let _ = (env, value_id);
     NAPI_GENERIC_FAILURE
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapi_bridge_unofficial_get_env_hooks(
+    env: SnapiEnv,
+    attached_out: *mut i32,
+    accepted_hooks_out: *mut u64,
+) -> i32 {
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if attached_out.is_null() || accepted_hooks_out.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    // This backend accepts no hooks (see snapi_bridge_unofficial_attach_env).
+    unsafe {
+        attached_out.write(i32::from(state.agent.embedder_hooks_attached));
+        accepted_hooks_out.write(0);
+    }
+    NAPI_OK
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_unofficial_attach_env(
     env: SnapiEnv,

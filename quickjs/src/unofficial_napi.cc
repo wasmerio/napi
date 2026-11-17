@@ -251,6 +251,22 @@ extern "C"
         return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
     }
 
+    napi_status NAPI_CDECL unofficial_napi_create_uint8array_copy(
+        napi_env env, const void *data, size_t length, napi_value prototype_or_null,
+        napi_value *result)
+    {
+        if (env == nullptr || result == nullptr || (length > 0 && data == nullptr))
+            return napi_invalid_arg;
+        void *bytes = nullptr;
+        napi_status status =
+            unofficial_napi_create_uint8array(env, length, prototype_or_null, &bytes, result);
+        if (status != napi_ok)
+            return status;
+        if (length > 0)
+            std::memcpy(bytes, data, length);
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_create_uint8array(
         napi_env env, size_t length, napi_value prototype_or_null, void **data, napi_value *result)
     {
@@ -405,6 +421,17 @@ extern "C"
         *accepted_hooks_out = hooks->env_cleanup_callback != nullptr
                                   ? static_cast<uint64_t>(unofficial_napi_env_hook_env_cleanup)
                                   : 0;
+        env->agent()->set_accepted_embedder_hooks(*accepted_hooks_out);
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_get_env_hooks(
+        napi_env env, bool *attached_out, uint64_t *accepted_hooks_out)
+    {
+        if (!napi_util__::check_env(env) || attached_out == nullptr || accepted_hooks_out == nullptr)
+            return napi_invalid_arg;
+        *attached_out = env->agent()->embedder_hooks_attached();
+        *accepted_hooks_out = env->agent()->accepted_embedder_hooks();
         return napi_ok;
     }
 

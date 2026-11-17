@@ -23,7 +23,9 @@ rest in its own `src/node_api.cc`. The calls napi still defines are
 CMake option `NAPI_PROVIDE_NODE_API` (default `ON`) compiles these calls
 (`v8/src/node_api_v8.cc`, `quickjs/src/node_api_quickjs.cc`). An embedder
 that defines them turns it off; otherwise a native link has two definitions
-of each. napi's own code never calls the public names (it uses the
+of each. With it off, the same files build as `napi_v8_node_api` /
+`napi_quickjs_node_api`, which only napi's own tests link. napi's own code
+never calls the public names (it uses the
 provider's internal `napi_v8_*` / `napi_quickjs_*` functions), so it does
 not end up in the embedder's.
 
@@ -37,7 +39,13 @@ them still runs. A guest whose embedder defines them no longer imports them.
 &result)` makes a zero-filled Uint8Array of the current realm over its own
 ArrayBuffer and gives it a prototype. With the embedder's `Buffer.prototype`
 that is a Node Buffer, made in one call (one import on WASIX) without running
-JS. The other Buffer calls compose from `js_native_api.h`:
+JS. It allocates fallibly: at the memory's limit it fails with
+`napi_generic_failure` instead of aborting. `unofficial_napi_create_uint8array_copy`
+makes one holding a copy of given bytes, with no pointer back (on host JS a
+JavaScript-owned copy; `napi_create_buffer_copy` without `result_data`).
+`unofficial_napi_get_env_hooks` tells whether an env's release will call the
+embedder's `env_cleanup_callback`. The other Buffer calls compose from
+`js_native_api.h`:
 
 - `napi_create_external_buffer`: `napi_create_external_arraybuffer`, then
   `napi_create_typedarray` and `node_api_set_prototype`.

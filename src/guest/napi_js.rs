@@ -638,6 +638,31 @@ fn guest_unofficial_napi_attach_env(
     status
 }
 
+fn guest_unofficial_napi_get_env_hooks(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    attached_ptr: u32,
+    accepted_hooks_ptr: u32,
+) -> i32 {
+    if napi_env == 0 || attached_ptr == 0 || accepted_hooks_ptr == 0 {
+        return 1;
+    }
+    let mut attached = 0i32;
+    let mut accepted_hooks = 0u64;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_env_hooks(
+            snapi_env(&env, napi_env),
+            &mut attached,
+            &mut accepted_hooks,
+        )
+    };
+    if status == 0 {
+        write_guest_u8(&mut env, attached_ptr, u8::from(attached != 0));
+        write_guest_u64(&mut env, accepted_hooks_ptr, accepted_hooks);
+    }
+    status
+}
+
 fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
@@ -5377,6 +5402,44 @@ fn guest_unofficial_napi_create_uint8array(
     guest_node_api_set_prototype(env, e, value, prototype)
 }
 
+// A JS-owned Uint8Array holding a copy of guest bytes, with no pointer back
+// and no guest allocation kept for it.
+fn guest_unofficial_napi_create_uint8array_copy(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    data_ptr: u32,
+    length: u32,
+    prototype: u32,
+    result_out: u32,
+) -> i32 {
+    if result_out == 0 || (length > 0 && data_ptr == 0) {
+        return 1;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return 9;
+    };
+    let memory_buffer = guest_memory_buffer(env.as_store_ref(), &memory);
+    let mut out = 0u32;
+    let status = crate::snapi_js::create_uint8array_copy(
+        snapi_env(&env, e),
+        &memory_buffer,
+        data_ptr,
+        length,
+        &mut out,
+    );
+    if status != 0 {
+        return status;
+    }
+    if prototype != 0 {
+        let status = guest_node_api_set_prototype(env.as_mut(), e, out, prototype);
+        if status != 0 {
+            return status;
+        }
+    }
+    write_guest_u32(&mut env, result_out, out);
+    0
+}
+
 fn guest_unofficial_napi_create_guest_backed_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
@@ -5958,6 +6021,7 @@ pub fn register_napi_imports(
         "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
+        "unofficial_napi_get_env_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_env_hooks),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
@@ -5967,6 +6031,7 @@ pub fn register_napi_imports(
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
         "unofficial_napi_create_uint8array" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array),
+        "unofficial_napi_create_uint8array_copy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array_copy),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

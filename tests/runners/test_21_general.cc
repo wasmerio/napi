@@ -493,9 +493,20 @@ TEST_F(Test21General, EnvCleanupCallbackRunsWithTheReleaseUntilDone) {
   hooks.data = &probe;
   hooks.env_cleanup_callback = RunEmbedderCleanupProbe;
   uint64_t accepted_hooks = 0;
+  bool attached = true;
+  uint64_t reported = 1;
+  ASSERT_EQ(unofficial_napi_get_env_hooks(env, &attached, &reported), napi_ok);
+  EXPECT_FALSE(attached);
+  EXPECT_EQ(reported, 0u);
+  EXPECT_EQ(unofficial_napi_get_env_hooks(env, nullptr, &reported), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_get_env_hooks(env, &attached, nullptr), napi_invalid_arg);
   ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_ok);
   EXPECT_EQ(accepted_hooks & unofficial_napi_env_hook_env_cleanup,
             static_cast<uint64_t>(unofficial_napi_env_hook_env_cleanup));
+  // An embedder can ask whether the release will call it back.
+  ASSERT_EQ(unofficial_napi_get_env_hooks(env, &attached, &reported), napi_ok);
+  EXPECT_TRUE(attached);
+  EXPECT_EQ(reported, accepted_hooks);
 
   probe.pending.push_back(1);
   ASSERT_EQ(napi_add_env_cleanup_hook(env, GiveEmbedderCleanupFromHook, &probe), napi_ok);

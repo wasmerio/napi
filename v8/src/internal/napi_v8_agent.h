@@ -65,6 +65,8 @@ struct napi_agent__ {
 
   // Embedder hooks from unofficial_napi_attach_env, attached once.
   bool embedder_hooks_attached = false;
+  // What unofficial_napi_attach_env accepted.
+  uint64_t accepted_embedder_hooks = 0;
   unofficial_napi_fatal_error_callback fatal_error_callback = nullptr;
   unofficial_napi_oom_error_callback oom_error_callback = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback =

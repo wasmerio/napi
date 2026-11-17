@@ -1,11 +1,4 @@
 #include "unofficial_napi.h"
-#ifndef NODE_API_EXPERIMENTAL_HAS_SET_PROTOTYPE
-// js_native_api.h declares it only under NAPI_EXPERIMENTAL, which changes
-// other declarations this file relies on; both providers define it.
-extern "C" napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
-                                                       napi_value object,
-                                                       napi_value value);
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1925,16 +1918,46 @@ napi_status NAPI_CDECL unofficial_napi_create_uint8array(
     napi_value* result) {
   if (env == nullptr || data == nullptr || result == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
-  napi_value array = nullptr;
-  napi_status status = unofficial_napi_create_guest_backed_typedarray(
-      env, napi_uint8_array, length, data, &array);
-  if (status != napi_ok) return status;
+  v8::Isolate* isolate = env->isolate;
+  v8::Local<v8::Value> prototype;
   if (prototype_or_null != nullptr) {
-    // A fresh typed array's [[SetPrototypeOf]] is ordinary: no JS runs.
-    status = node_api_set_prototype(env, array, prototype_or_null);
-    if (status != napi_ok) return status;
+    prototype = napi_v8_unwrap_value(prototype_or_null);
+    if (!prototype->IsObject() && !prototype->IsNull()) return napi_invalid_arg;
   }
-  *result = array;
+  // Beyond what V8 can make, NewBackingStore aborts instead of failing.
+  if (length > v8::Uint8Array::kMaxLength) return napi_generic_failure;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  // Fallible: the allocator may decline (on WASIX, at the guest heap's
+  // limit), and the infallible ArrayBuffer::New would abort the process.
+  std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(
+      isolate, length, v8::BackingStoreInitializationMode::kZeroInitialized,
+      v8::BackingStoreOnFailureMode::kReturnNull);
+  if (!store) return napi_generic_failure;
+  void* bytes = store->Data();
+  v8::Local<v8::ArrayBuffer> arraybuffer = v8::ArrayBuffer::New(isolate, std::move(store));
+  v8::Local<v8::Uint8Array> array = v8::Uint8Array::New(arraybuffer, 0, length);
+  // A fresh typed array's [[SetPrototypeOf]] is ordinary: no JS runs.
+  if (!prototype.IsEmpty() && array->SetPrototype(context, prototype).IsNothing()) {
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, array);
+  if (*result == nullptr) return napi_generic_failure;
+  *data = bytes;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_uint8array_copy(
+    napi_env env, const void* data, size_t length, napi_value prototype_or_null,
+    napi_value* result) {
+  if (env == nullptr || result == nullptr || (length > 0 && data == nullptr)) {
+    return napi_invalid_arg;
+  }
+  void* bytes = nullptr;
+  napi_status status =
+      unofficial_napi_create_uint8array(env, length, prototype_or_null, &bytes, result);
+  if (status != napi_ok) return status;
+  if (length > 0) std::memcpy(bytes, data, length);
   return napi_ok;
 }
 
@@ -1984,6 +2007,18 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   env->isolate->SetOOMErrorHandler(
       hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
   *accepted_hooks_out = unofficial_napi_env_hooks_requested(hooks);
+  agent->accepted_embedder_hooks = *accepted_hooks_out;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_env_hooks(
+    napi_env env, bool* attached_out, uint64_t* accepted_hooks_out) {
+  if (env == nullptr || env->agent == nullptr || attached_out == nullptr ||
+      accepted_hooks_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *attached_out = env->agent->embedder_hooks_attached;
+  *accepted_hooks_out = env->agent->accepted_embedder_hooks;
   return napi_ok;
 }
 

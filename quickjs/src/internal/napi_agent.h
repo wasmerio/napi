@@ -62,6 +62,9 @@ struct napi_agent__
 
   int64_t adjust_external_memory(int64_t change_in_bytes);
   bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
+  bool embedder_hooks_attached() const { return embedder_hooks_attached_; }
+  uint64_t accepted_embedder_hooks() const { return accepted_embedder_hooks_; }
+  void set_accepted_embedder_hooks(uint64_t accepted) { accepted_embedder_hooks_ = accepted; }
   const unofficial_napi_env_hooks &embedder_hooks() const { return embedder_hooks_; }
 
   // Runtime-wide engine hooks. They dispatch to the env of the realm the
@@ -125,6 +128,7 @@ private:
 
   // Embedder hooks, attached once.
   bool embedder_hooks_attached_ = false;
+  uint64_t accepted_embedder_hooks_ = 0;
   unofficial_napi_env_hooks embedder_hooks_{};
 
   // Async context tracking.

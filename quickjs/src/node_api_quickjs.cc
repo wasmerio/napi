@@ -2,8 +2,9 @@
 // calls. Deprecated: these are Node's runtime, not the engine's. Buffer's
 // prototype is made by Node's lib/, so an embedder such as Edge.js defines
 // these calls itself (building Buffers with unofficial_napi_create_uint8array)
-// and builds napi with NAPI_PROVIDE_NODE_API=OFF, which leaves this file out.
-// See docs/node-api.md.
+// and builds napi with NAPI_PROVIDE_NODE_API=OFF, which leaves this file out
+// of the provider library (napi's own tests then link it as a library of its
+// own). See docs/node-api.md.
 
 #include <cstdio>
 #include <cstdlib>

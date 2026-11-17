@@ -7,6 +7,7 @@
 #include "test_env.h"
 #include "upstream_js_test.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <utility>
@@ -841,6 +842,20 @@ TEST_F(Test33TypedArray, CreateUint8ArrayIsZeroedAndTakesItsPrototype) {
   EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
   EXPECT_EQ(GlobalInt(s.env, "bufferReads"), 0) << "the provider read the global Buffer";
 
+  // A length past what the engine can make fails, with no abort, and the env
+  // stays usable. (An allocator that declines is covered on WASIX, where the
+  // guest heap's allocator returns null: tests/guest_create_uint8array.rs.
+  // V8's default allocator aborts on its own.)
+  {
+    napi_value refused = nullptr;
+    data = nullptr;
+    EXPECT_NE(unofficial_napi_create_uint8array(s.env, SIZE_MAX, proto, &data, &refused), napi_ok);
+    EXPECT_EQ(refused, nullptr);
+    napi_value ignored = nullptr;
+    (void)napi_get_and_clear_last_exception(s.env, &ignored);
+  }
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 8, proto, &data, &made), napi_ok);
+
   EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, nullptr, &made), napi_invalid_arg);
   EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, &data, nullptr), napi_invalid_arg);
 
@@ -852,6 +867,43 @@ TEST_F(Test33TypedArray, CreateUint8ArrayIsZeroedAndTakesItsPrototype) {
   ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
   napi_value pending = nullptr;
   (void)napi_get_and_clear_last_exception(s.env, &pending);
+}
+
+// The copy variant: a Uint8Array over an ArrayBuffer of its own holding the
+// bytes, given its prototype, independent of the source.
+TEST_F(Test33TypedArray, CreateUint8ArrayCopyOwnsItsBytes) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.bufferReads = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { configurable: true,"
+                  "  get() { bufferReads++; throw new Error('Buffer read'); } });"
+                  "globalThis.proto = Object.create(Uint8Array.prototype);"
+                  "0");
+  napi_value proto = NamedGlobal(s.env, "proto");
+  uint8_t source[6] = {1, 2, 3, 4, 5, 6};
+  napi_value copy = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(s.env, source + 1, 4, proto, &copy), napi_ok);
+  source[2] = 99;  // the copy is its own
+  SetGlobal(s.env, "copy", copy);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(copy) === proto &&"
+                  " copy.length === 4 && copy.byteOffset === 0 &&"
+                  " copy.buffer.byteLength === 4 && copy.join() === '2,3,4,5' ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+
+  napi_value empty = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(s.env, nullptr, 0, nullptr, &empty), napi_ok);
+  SetGlobal(s.env, "empty", empty);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(empty) === Uint8Array.prototype &&"
+                  " empty.length === 0 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "bufferReads"), 0);
+
+  EXPECT_EQ(unofficial_napi_create_uint8array_copy(s.env, nullptr, 4, nullptr, &copy),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_uint8array_copy(s.env, source, 4, nullptr, nullptr),
+            napi_invalid_arg);
 }
 
 TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {

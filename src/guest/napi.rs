@@ -346,6 +346,31 @@ fn guest_unofficial_napi_attach_env(
     status
 }
 
+fn guest_unofficial_napi_get_env_hooks(
+    mut env: FunctionEnvMut<NapiEnv>,
+    napi_env: u32,
+    attached_ptr: u32,
+    accepted_hooks_ptr: u32,
+) -> i32 {
+    if napi_env == 0 || attached_ptr == 0 || accepted_hooks_ptr == 0 {
+        return 1;
+    }
+    let mut attached = 0i32;
+    let mut accepted_hooks = 0u64;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_env_hooks(
+            snapi_env(&env, napi_env),
+            &mut attached,
+            &mut accepted_hooks,
+        )
+    };
+    if status == 0 {
+        write_guest_u8(&mut env, attached_ptr, u8::from(attached != 0));
+        write_guest_u64(&mut env, accepted_hooks_ptr, accepted_hooks);
+    }
+    status
+}
+
 fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
@@ -4699,23 +4724,77 @@ fn guest_unofficial_napi_create_uint8array(
     prototype: u32,
     data_out: u32,
     result_out: u32,
-) -> i32 {
-    const NAPI_UINT8_ARRAY: i32 = 1;
-    let status = guest_unofficial_napi_create_guest_backed_typedarray(
-        env.as_mut(),
-        e,
-        NAPI_UINT8_ARRAY,
-        length,
-        data_out,
-        result_out,
-    );
-    if status != 0 || prototype == 0 {
-        return status;
+) -> Result<i32, WasiError> {
+    if data_out == 0 || result_out == 0 {
+        return Ok(1);
     }
-    let Some(value) = read_guest_u32(&mut env, result_out) else {
-        return 9;
+    let mut host_ptr = 0u64;
+    let mut value_id = 0u32;
+    let snapi = snapi_env(&env, e);
+    // The array's memory comes from the guest heap, which can grow the
+    // guest's memory only with the store this lends. The provider allocates
+    // fallibly: at the memory's limit this is napi_generic_failure, not a
+    // process abort.
+    let status = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_unofficial_create_uint8array(
+            snapi,
+            length,
+            prototype,
+            &mut host_ptr,
+            &mut value_id,
+        )
+    })?;
+    if status != 0 {
+        return Ok(status);
+    }
+    let guest_ptr = if length == 0 {
+        0
+    } else if let Some(ptr) = host_ptr_to_guest_ptr(&mut env, host_ptr) {
+        ptr
+    } else {
+        return Ok(9);
     };
-    guest_node_api_set_prototype(env, e, value, prototype)
+    write_guest_u32(&mut env, data_out, guest_ptr);
+    write_guest_u32(&mut env, result_out, value_id);
+    Ok(0)
+}
+
+// A Uint8Array holding a copy of guest bytes, with no pointer back.
+fn guest_unofficial_napi_create_uint8array_copy(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    data_ptr: u32,
+    length: u32,
+    prototype: u32,
+    result_out: u32,
+) -> Result<i32, WasiError> {
+    if result_out == 0 || (length > 0 && data_ptr == 0) {
+        return Ok(1);
+    }
+    let Some(bytes) = read_guest_bytes(&mut env, data_ptr, length as usize) else {
+        return Ok(1);
+    };
+    let mut value_id = 0u32;
+    let snapi = snapi_env(&env, e);
+    // As unofficial_napi_create_uint8array: lend the store so the guest heap
+    // can grow, and fail rather than abort at its limit.
+    let status = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_unofficial_create_uint8array_copy(
+            snapi,
+            if bytes.is_empty() {
+                std::ptr::null()
+            } else {
+                bytes.as_ptr()
+            },
+            length,
+            prototype,
+            &mut value_id,
+        )
+    })?;
+    if status == 0 {
+        write_guest_u32(&mut env, result_out, value_id);
+    }
+    Ok(status)
 }
 
 fn guest_unofficial_napi_create_guest_backed_typedarray(
@@ -5273,6 +5352,7 @@ pub fn register_napi_imports(
         "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
+        "unofficial_napi_get_env_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_env_hooks),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
@@ -5282,6 +5362,7 @@ pub fn register_napi_imports(
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
         "unofficial_napi_create_uint8array" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array),
+        "unofficial_napi_create_uint8array_copy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array_copy),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

@@ -951,6 +951,25 @@ unsafe extern "C" {
         lease_id: u32,
         modified: i32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_get_env_hooks(
+        env: SnapiEnv,
+        attached_out: *mut i32,
+        accepted_hooks_out: *mut u64,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_create_uint8array(
+        env: SnapiEnv,
+        length: u32,
+        prototype_id: u32,
+        data_out: *mut u64,
+        value_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_create_uint8array_copy(
+        env: SnapiEnv,
+        data: *const u8,
+        length: u32,
+        prototype_id: u32,
+        value_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_create_guest_backed_typedarray(
         env: SnapiEnv,
         type_: i32,

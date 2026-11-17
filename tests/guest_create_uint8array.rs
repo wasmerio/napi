@@ -20,6 +20,8 @@ const WAT: &str = r#"(module
     (func $release_env (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_create_uint8array"
     (func $create_uint8array (param i32 i32 i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_create_uint8array_copy"
+    (func $create_uint8array_copy (param i32 i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_create_string_utf8"
     (func $create_string (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_run_script" (func $run_script (param i32 i32 i32) (result i32)))
@@ -49,6 +51,9 @@ const WAT: &str = r#"(module
     (call $create_uint8array (global.get $env) (local.get $len)
       (select (global.get $proto) (i32.const 0) (local.get $with_proto))
       (i32.const 40) (i32.const 44)))
+  (func (export "copy") (param $ptr i32) (param $len i32) (result i32)
+    (call $create_uint8array_copy (global.get $env) (local.get $ptr) (local.get $len)
+      (global.get $proto) (i32.const 44)))
   (func (export "publish") (result i32)
     (if (call $get_global (global.get $env) (i32.const 48)) (then unreachable))
     (call $set_property (global.get $env) (i32.load (i32.const 48)) (i32.const 400)
@@ -69,8 +74,22 @@ struct Guest {
 
 impl Guest {
     fn new() -> Self {
+        Self::with_wat(WAT)
+    }
+
+    /// A guest whose memory cannot grow past `max_pages`.
+    fn with_max_pages(max_pages: u32) -> Self {
+        let declaration = r#"(memory (export "memory") 2)"#;
+        assert!(WAT.contains(declaration));
+        Self::with_wat(&WAT.replace(
+            declaration,
+            &format!(r#"(memory (export "memory") 2 {max_pages})"#),
+        ))
+    }
+
+    fn with_wat(wat: &str) -> Self {
         let mut store = Store::default();
-        let module = Module::new(&store, wat::parse_str(WAT).unwrap()).unwrap();
+        let module = Module::new(&store, wat::parse_str(wat).unwrap()).unwrap();
         let ctx = NapiCtx::default();
         let hooks = ctx.runtime_hooks();
         let (imports, state) = hooks
@@ -195,5 +214,83 @@ fn create_uint8array_is_zeroed_guest_memory_with_its_prototype() {
         1
     );
     assert_eq!(guest.eval_int("bufferReads"), 0);
+    assert_eq!(guest.call0("release"), 0);
+}
+
+const LARGE: u32 = 64 << 20;
+
+#[test]
+fn create_uint8array_grows_guest_memory_for_a_large_array() {
+    // More than the guest heap holds when the env starts: the import lends
+    // the store, so the heap grows the guest's memory.
+    let mut guest = Guest::new();
+    assert_eq!(guest.make(LARGE, false), 0);
+    let data = guest.read_u32(DATA_OUT);
+    assert_ne!(data, 0);
+    let end = u64::from(data) + u64::from(LARGE);
+    assert!(guest.memory.view(&guest.store).data_size() >= end);
+    guest
+        .memory
+        .view(&guest.store)
+        .write(end - 1, &[9])
+        .unwrap();
+    assert_eq!(guest.call0("publish"), 0);
+    assert_eq!(
+        guest.eval_int("made.length === 64 * 1024 * 1024 && made[made.length - 1] === 9 ? 1 : 0"),
+        1
+    );
+    assert_eq!(guest.call0("release"), 0);
+}
+
+#[test]
+fn create_uint8array_fails_without_aborting_at_the_memory_limit() {
+    // 300 pages hold the env's starting heap but not 64 MiB more: the
+    // allocation is refused (napi_generic_failure), the process lives on and
+    // so does the env.
+    let mut guest = Guest::with_max_pages(300);
+    assert_eq!(guest.make(LARGE, false), 9);
+    assert_eq!(guest.make(16, false), 0);
+    assert_ne!(guest.read_u32(DATA_OUT), 0);
+    assert_eq!(guest.call0("release"), 0);
+}
+
+#[test]
+fn create_uint8array_copy_owns_a_copy_of_guest_bytes() {
+    const SOURCE: u32 = 8192;
+    let mut guest = Guest::new();
+    assert_eq!(
+        guest.eval("globalThis.proto = Object.create(Uint8Array.prototype)"),
+        0
+    );
+    guest
+        .typed::<(), ()>("keep_proto")
+        .call(&mut guest.store)
+        .unwrap();
+    guest
+        .memory
+        .view(&guest.store)
+        .write(u64::from(SOURCE), &[1, 2, 3, 4])
+        .unwrap();
+    assert_eq!(
+        guest
+            .typed::<(i32, i32), i32>("copy")
+            .call(&mut guest.store, SOURCE as i32, 4)
+            .unwrap(),
+        0
+    );
+    // The copy is its own: changing the guest's bytes leaves it as it was.
+    guest
+        .memory
+        .view(&guest.store)
+        .write(u64::from(SOURCE), &[9])
+        .unwrap();
+    assert_eq!(guest.call0("publish"), 0);
+    assert_eq!(
+        guest.eval_int(
+            "Object.getPrototypeOf(made) === proto && made.buffer.byteLength === 4 &&\
+             made.join() === '1,2,3,4' ? 1 : 0"
+        ),
+        1
+    );
     assert_eq!(guest.call0("release"), 0);
 }
