@@ -33,6 +33,19 @@ unsafe extern "C" {
     fn snapi_v8_lane_delete(handle: *mut c_void);
     fn snapi_v8_lane_swap_current(handle: *mut c_void) -> *mut c_void;
     fn snapi_v8_use_managed_runtime() -> bool;
+    fn snapi_v8_managed_runtime_requested() -> bool;
+    fn snapi_v8_managed_runtime_usable() -> bool;
+}
+
+/// Whether this process has declared managed instances.
+pub(crate) fn managed_runtime_requested() -> bool {
+    unsafe { snapi_v8_managed_runtime_requested() }
+}
+
+/// Whether a managed environment can be created: V8 has not started, or
+/// started in managed mode.
+pub(crate) fn managed_runtime_usable() -> bool {
+    unsafe { snapi_v8_managed_runtime_usable() }
 }
 
 /// Declares that this process runs instances on lanes, so that V8 starts
@@ -193,16 +206,15 @@ impl ManagedV8LaneScope {
             .map_or(std::ptr::null_mut(), |lane| lane.handle.as_ptr());
         let id = CURRENT_LANES.with(|scopes| {
             let mut scopes = scopes.borrow_mut();
+            // What was bound may come from a native bridge call this scope
+            // runs inside, not from an outer scope of this stack.
             let previous = unsafe { snapi_v8_lane_swap_current(handle) };
-            if scopes.entries.is_empty() {
-                scopes.base = previous;
-            }
             let id = scopes.next_id;
             scopes.next_id = scopes
                 .next_id
                 .checked_add(1)
                 .expect("V8 lane scope ID overflow");
-            scopes.entries.push((id, lane));
+            scopes.entries.push(ScopeEntry { id, lane, previous });
             id
         });
         Self {
@@ -212,16 +224,23 @@ impl ManagedV8LaneScope {
     }
 }
 
+struct ScopeEntry {
+    id: u64,
+    // Keeps the bound lane alive while it may be bound or restored.
+    lane: Option<Arc<ManagedV8Lane>>,
+    // The binding this scope replaced, restored when it ends.
+    previous: *mut c_void,
+}
+
 #[derive(Default)]
 struct ThreadLaneScopes {
     next_id: u64,
-    base: *mut c_void,
-    entries: Vec<(u64, Option<Arc<ManagedV8Lane>>)>,
+    entries: Vec<ScopeEntry>,
 }
 
 thread_local! {
-    // The entries keep every lane a scope may restore alive. Dropping a scope
-    // that is not the innermost one leaves the binding as it is.
+    // Scopes of this thread, innermost last. Native bridge calls bind lanes
+    // too, lexically, between them.
     static CURRENT_LANES: RefCell<ThreadLaneScopes> = RefCell::new(ThreadLaneScopes::default());
 }
 
@@ -229,20 +248,16 @@ impl Drop for ManagedV8LaneScope {
     fn drop(&mut self) {
         let _ = CURRENT_LANES.try_with(|scopes| {
             let mut scopes = scopes.borrow_mut();
-            let Some(index) = scopes.entries.iter().position(|(id, _)| *id == self.id) else {
+            let Some(index) = scopes.entries.iter().position(|entry| entry.id == self.id) else {
                 return;
             };
-            let was_top = index + 1 == scopes.entries.len();
             let removed = scopes.entries.remove(index);
-            if was_top {
-                let previous = scopes.entries.last().map_or(scopes.base, |(_, lane)| {
-                    lane.as_ref()
-                        .map_or(std::ptr::null_mut(), |lane| lane.handle.as_ptr())
-                });
-                unsafe { snapi_v8_lane_swap_current(previous) };
-            }
-            if scopes.entries.is_empty() {
-                scopes.base = std::ptr::null_mut();
+            if let Some(above) = scopes.entries.get_mut(index) {
+                // Dropped out of order: the binding stays, and the scope above
+                // now restores what this one replaced, never this lane.
+                above.previous = removed.previous;
+            } else {
+                unsafe { snapi_v8_lane_swap_current(removed.previous) };
             }
             drop(removed);
         });
@@ -328,6 +343,26 @@ mod tests {
         let active = unsafe { snapi_v8_lane_swap_current(std::ptr::null_mut()) };
         unsafe { snapi_v8_lane_swap_current(active) };
         active
+    }
+
+    /// A native bridge call binds its env's lane between Rust scopes; a Rust
+    /// scope inside it must give that binding back, not the outer Rust one.
+    #[test]
+    fn a_scope_restores_a_binding_made_outside_this_stack() {
+        let outer = ManagedV8Lane::new(1, Arc::new(|| Box::new(())), Arc::new(|| {})).unwrap();
+        let bridge = ManagedV8Lane::new(1, Arc::new(|| Box::new(())), Arc::new(|| {})).unwrap();
+        let inner = ManagedV8Lane::new(1, Arc::new(|| Box::new(())), Arc::new(|| {})).unwrap();
+        let outer_scope = outer.enter();
+        // What a bridge call does natively.
+        let before_bridge = unsafe { snapi_v8_lane_swap_current(bridge.handle.as_ptr()) };
+        let inner_scope = inner.enter();
+        assert_eq!(current(), inner.handle.as_ptr());
+        drop(inner_scope);
+        assert_eq!(current(), bridge.handle.as_ptr());
+        unsafe { snapi_v8_lane_swap_current(before_bridge) };
+        assert_eq!(current(), outer.handle.as_ptr());
+        drop(outer_scope);
+        assert!(current().is_null());
     }
 
     #[test]

@@ -108,19 +108,46 @@ std::atomic<bool> g_managed_runtime_requested{false};
 //   both compile on the isolate's own thread, during its JS. The stress and
 //   builtin-generation flags would start the shared job again.
 // - The page pool: pages one isolate frees are kept for any other, and a
-//   group-wide release task reposts itself on whichever lane ran it.
+//   group-wide release task reposts itself on whichever lane ran it. This
+//   build creates the pool whatever --memory-pool says (pointer compression
+//   without the sandbox), so: no release task (a zero timeout; V8 then frees
+//   an isolate's pooled pages at each of its full GCs, on its own thread), no
+//   pages handed to another isolate at teardown, and no pooled zone memory
+//   (--no-memory-pool turns off --managed-zone-memory).
 // - Compiled wasm modules (the process-wide native module cache): instances
 //   compiling the same bytes share one module and its compile jobs, whose
 //   workers would run on whichever instance's lane tiered it up last, and
 //   one compile can block another instance's.
-// They are applied after the embedder's flags; guests of a managed process
-// cannot set flags (guest_unofficial_napi_configure_runtime). V8 applies flag
-// implications at initialization, so the embedder must not pass flags that
-// imply any of these back on.
+// It also applies EdgeJS's fixed defaults (kGuestDefaultV8Flags): guests of a
+// managed process cannot set flags (snapi_private_configure_guest_runtime),
+// and EdgeJS relies on these. They are applied after the embedder's flags. V8
+// applies flag implications at initialization, so the embedder must not pass
+// flags that imply any of these back on.
 constexpr char kManagedV8Flags[] =
+    "--js-source-phase-imports --harmony-import-attributes "
     "--no-concurrent-recompilation --no-stress-concurrent-inlining "
-    "--no-concurrent-builtin-generation --no-memory-pool "
-    "--no-wasm-native-module-cache";
+    "--no-concurrent-builtin-generation --no-memory-pool --memory-pool-timeout=0 "
+    "--no-memory-pool-share-memory-on-teardown --no-wasm-native-module-cache";
+
+// The flags EdgeJS passes by default before it creates an env, in the forms
+// it builds them. A guest of a managed process may request these, and only
+// these: managed V8 starts with them.
+bool IsGuestDefaultV8Flags(const char* flags, size_t length) {
+  static constexpr const char* kAccepted[] = {
+      "",
+      "--js-source-phase-imports",
+      "--harmony-import-attributes",
+      "--js-source-phase-imports --harmony-import-attributes",
+  };
+  if (length > 0 && flags == nullptr) return false;
+  for (const char* accepted : kAccepted) {
+    if (std::strlen(accepted) == length &&
+        (length == 0 || std::memcmp(accepted, flags, length) == 0)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 class TrackingArrayBufferAllocator;
 
@@ -846,13 +873,13 @@ void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
       agent->principal_env, location, details.is_heap_oom, details.detail);
 }
 
-napi_status ConfigureRuntime(const char* engine_flags,
-                             size_t engine_flags_length) {
+// ConfigureRuntime with g_runtime_mu held.
+napi_status ConfigureRuntimeLocked(const char* engine_flags,
+                                   size_t engine_flags_length) {
   if ((engine_flags_length > 0 && engine_flags == nullptr) ||
       engine_flags_length > static_cast<size_t>(std::numeric_limits<int>::max())) {
     return napi_invalid_arg;
   }
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform != nullptr) {
     return g_runtime.engine_flags.size() == engine_flags_length &&
                    (engine_flags_length == 0 ||
@@ -886,14 +913,51 @@ napi_status ConfigureRuntime(const char* engine_flags,
   return napi_ok;
 }
 
+napi_status ConfigureRuntime(const char* engine_flags,
+                             size_t engine_flags_length) {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  return ConfigureRuntimeLocked(engine_flags, engine_flags_length);
+}
+
 }  // namespace
+
+// Provider-private, the guest path to unofficial_napi_configure_runtime (the
+// bridge's snapi_bridge_unofficial_configure_runtime). V8 flags are
+// process-wide: once the process runs managed instances, no guest of any
+// store may set them. A guest's request for EdgeJS's defaults then starts V8,
+// if it hasn't started, with the embedder's flags and kManagedV8Flags, and
+// succeeds; any other request is refused. The decision is made under the
+// runtime lock, so a guest cannot set flags while the process turns managed.
+extern "C" napi_status snapi_private_configure_guest_runtime(const char* engine_flags,
+                                                            size_t engine_flags_length) {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (!g_managed_runtime_requested.load(std::memory_order_acquire)) {
+    return ConfigureRuntimeLocked(engine_flags, engine_flags_length);
+  }
+  if (!IsGuestDefaultV8Flags(engine_flags, engine_flags_length)) return napi_invalid_arg;
+  if (g_runtime.platform != nullptr) return napi_ok;
+  return ConfigureRuntimeLocked(nullptr, 0);
+}
+
+// Whether this process has declared managed instances
+// (snapi_v8_use_managed_runtime).
+extern "C" bool snapi_v8_managed_runtime_requested() {
+  return g_managed_runtime_requested.load(std::memory_order_acquire);
+}
+
+// Whether a managed env can still be created: V8 has not started, or started
+// in managed mode.
+extern "C" bool snapi_v8_managed_runtime_usable() {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  return g_runtime.platform == nullptr || g_runtime.managed;
+}
 
 // Declares that this process runs instances on embedder lanes. V8 then starts
 // with kManagedV8Flags. False if it already started without them: managed envs
 // are refused then.
 extern "C" bool snapi_v8_use_managed_runtime() {
-  g_managed_runtime_requested.store(true, std::memory_order_release);
   std::lock_guard<std::mutex> lock(g_runtime_mu);
+  g_managed_runtime_requested.store(true, std::memory_order_release);
   return g_runtime.platform == nullptr || g_runtime.managed;
 }
 
@@ -1725,7 +1789,14 @@ struct SerializedClonePayload {
   std::vector<v8::CompiledWasmModule> wasm_modules;
   // Whether the env that made the message could hold WebAssembly objects.
   bool sender_allows_webassembly = true;
+  // The instance lane of the env that made it (EnvLaneId).
+  uint64_t sender_lane = 0;
 };
+
+// The instance lane of `env`'s isolate (napi_agent__::lane_id).
+uint64_t EnvLaneId(napi_env env) {
+  return env != nullptr && env->agent != nullptr ? env->agent->lane_id : 0;
+}
 
 // Whether `env` can hold WebAssembly objects: false under
 // NapiWebAssemblyPolicy::kRestricted.
@@ -1804,6 +1875,7 @@ napi_status DeserializeTransferredClone(
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
     bool sender_allows_webassembly,
+    uint64_t sender_lane,
     v8::Local<v8::Value>* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
@@ -1827,6 +1899,18 @@ napi_status DeserializeTransferredClone(
             isolate,
             "This environment cannot receive WebAssembly modules or the shared "
             "memory of an environment that has WebAssembly")));
+    return napi_pending_exception;
+  }
+  // A transferred WebAssembly.Module shares its compiled module, and its
+  // compile and tier-up jobs, with the sender's. Those jobs post workers on
+  // whichever lane is bound where they are triggered, so a module may only
+  // move within one instance's lane (or between standalone envs).
+  if (!wasm_modules.empty() && sender_lane != EnvLaneId(env)) {
+    napi_v8_set_last_exception(
+        env,
+        v8::Exception::Error(v8::String::NewFromUtf8Literal(
+            isolate,
+            "A WebAssembly.Module cannot be transferred to another instance")));
     return napi_pending_exception;
   }
   StructuredCloneDeserializerDelegate deserializer_delegate(
@@ -1907,6 +1991,7 @@ napi_status StructuredCloneImpl(
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
       EnvAllowsWebAssembly(env),
+      EnvLaneId(env),
       &output);
   if (deserialize_status != napi_ok) return deserialize_status;
 
@@ -2221,6 +2306,7 @@ extern "C" napi_status NAPI_CDECL snapi_private_create_env(
   scope->agent->allocator = allocator;
   scope->agent->hash_seed = GenerateHashSeed();
   scope->agent->webassembly_restricted = restrict_webassembly;
+  scope->agent->lane_id = snapi_v8_lane_current_id();
   // Installed under every policy: it refuses all wasm code of a restricted
   // isolate and otherwise honors each realm's allow_code_gen_wasm.
   isolate->SetAllowWasmCodeGenerationCallback(NapiV8AllowWasmCodeGeneration);
@@ -2618,6 +2704,7 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
   payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
+  payload->sender_lane = EnvLaneId(env);
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
 }
@@ -2651,6 +2738,7 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
       payload->shared_array_buffers,
       payload->wasm_modules,
       payload->sender_allows_webassembly,
+      payload->sender_lane,
       &output);
   if (deserialize_status != napi_ok) return deserialize_status;
 

@@ -38,11 +38,15 @@ class BackgroundLane {
                  void* (*enter_scope)(void*),
                  bool (*leave_scope)(void*, void*),
                  void (*on_overload)(void*))
-      : max_queued_tasks_(max_queued_tasks),
+      : id_(next_id_.fetch_add(1, std::memory_order_relaxed)),
+        max_queued_tasks_(max_queued_tasks),
         scope_context_(scope_context),
         enter_scope_(enter_scope),
         leave_scope_(leave_scope),
         on_overload_(on_overload) {}
+
+  // Unique for the process, never 0.
+  uint64_t id() const { return id_; }
 
   bool Post(std::unique_ptr<v8::Task> task, double delay_seconds) {
     if (!task) return true;
@@ -148,6 +152,9 @@ class BackgroundLane {
     if (notify && on_overload_ != nullptr) on_overload_(scope_context_);
   }
 
+  static inline std::atomic<uint64_t> next_id_{1};
+
+  const uint64_t id_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<Item> queue_;
@@ -162,6 +169,8 @@ class BackgroundLane {
 };
 
 thread_local BackgroundLane* current_background_lane = nullptr;
+// Tasks V8 posted to lanes through PostDelayedTaskOnWorkerThread (a test hook).
+std::atomic<uint64_t> lane_delayed_worker_posts{0};
 // Worker tasks run by the standalone pool, and those dropped because no lane
 // was bound in a process without one.
 std::atomic<uint64_t> standalone_worker_posts{0};
@@ -284,6 +293,15 @@ extern "C" void* snapi_v8_lane_swap_current(void* handle) {
 }
 
 extern "C" void* snapi_v8_lane_current() { return current_background_lane; }
+
+extern "C" uint64_t snapi_v8_lane_current_id() {
+  return current_background_lane != nullptr ? current_background_lane->id() : 0;
+}
+
+// Test hook: tasks V8 posted to lanes as delayed worker tasks (any delay).
+extern "C" uint64_t snapi_v8_lane_delayed_posts() {
+  return lane_delayed_worker_posts.load(std::memory_order_acquire);
+}
 
 extern "C" bool snapi_v8_lane_is_running(void* handle) {
   return handle != nullptr && static_cast<BackgroundLane*>(handle)->IsRunning();
@@ -1049,6 +1067,7 @@ void EdgeV8Platform::PostDelayedTaskOnWorkerThreadImpl(
     double delay_in_seconds,
     const v8::SourceLocation& location) {
   if (current_background_lane != nullptr) {
+    lane_delayed_worker_posts.fetch_add(1, std::memory_order_relaxed);
     current_background_lane->Post(std::move(task), delay_in_seconds);
     return;
   }

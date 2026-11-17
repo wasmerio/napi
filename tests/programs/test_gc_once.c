@@ -12,11 +12,14 @@ int main(void) {
   napi_value result = NULL;
   NAPI_CALL(env, napi_create_string_utf8(
                      env,
-                     "let keep = []; for (let i = 0; i < 2000; i++) "
-                     "keep.push({ i, text: 'x'.repeat(64), list: new Array(64).fill(i) }); "
-                     "keep = null; 0",
+                     "for (let round = 0; round < 4; round++) { "
+                     "let keep = []; for (let i = 0; i < 400; i++) "
+                     "keep.push({ i, text: 'x'.repeat(64), list: new Array(4096).fill(i) }); "
+                     "keep = null; } 0",
                      NAPI_AUTO_LENGTH, &source));
   NAPI_CALL(env, napi_run_script(env, source, &result));
+  NAPI_CALL(env, unofficial_napi_collect_garbage(env));
+  // A second full collection frees the pages the first one emptied.
   NAPI_CALL(env, unofficial_napi_collect_garbage(env));
   puts("GC_DONE");
   return 0;

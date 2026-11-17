@@ -5,8 +5,8 @@
 #include "unofficial_napi.h"
 
 // Runs in a managed instance, whose guests may not set process-wide V8 flags:
-// EdgeJS's fixed defaults are accepted as no-ops, anything else is refused,
-// and the env is then created without the guest having started V8.
+// EdgeJS's fixed defaults are accepted (managed V8 starts with them) and
+// anything else is refused.
 
 static napi_status Configure(const char* flags, uint32_t length) {
   unofficial_napi_runtime_options options = {
@@ -53,6 +53,16 @@ int main(void) {
   size_t length = 0;
   NAPI_CALL(env, napi_get_value_string_utf8(env, result, text, sizeof(text), &length));
   CHECK_OR_FAIL(length == 5 && text[0] == 'p', "the refused flag took effect");
+
+  // EdgeJS's default --js-source-phase-imports is in effect.
+  NAPI_CALL(env, napi_create_string_utf8(
+                     env,
+                     "(function () { try { new Function(\"return import.source('x')\"); "
+                     "return 'parsed'; } catch (e) { return 'rejected'; } })()",
+                     NAPI_AUTO_LENGTH, &source));
+  NAPI_CALL(env, napi_run_script(env, source, &result));
+  NAPI_CALL(env, napi_get_value_string_utf8(env, result, text, sizeof(text), &length));
+  CHECK_OR_FAIL(length == 6 && text[0] == 'p', "source phase import syntax was rejected");
 
   puts("MANAGED_RUNTIME_FLAGS_OK");
   return 0;

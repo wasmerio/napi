@@ -57,6 +57,7 @@ fn managed_envs_are_refused_once_v8_started_unmanaged() {
         );
         assert!(!stdout.contains("GC_DONE"), "{stdout}");
     }
-    assert_eq!(activations.load(Ordering::SeqCst), 1);
+    // Refused before the embedder was asked to start a lane.
+    assert_eq!(activations.load(Ordering::SeqCst), 0);
     assert!(!unsafe { snapi_v8_runtime_is_managed() });
 }

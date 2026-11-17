@@ -40,6 +40,11 @@ extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out);
 
+// Provider-private (v8/src/unofficial_napi.cc): a guest's runtime
+// configuration, under the process's guest flag policy.
+extern "C" napi_status snapi_private_configure_guest_runtime(const char* engine_flags,
+                                                            size_t engine_flags_length);
+
 // The Rust side encodes `WasmPolicy` with these values (src/ctx.rs).
 static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kRestricted) == 0);
 static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered) == 1);
@@ -3425,15 +3430,12 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   return napi_ok;
 }
 
+// Guests configure the runtime through this; in a process with managed
+// instances they cannot set V8 flags (snapi_private_configure_guest_runtime).
 extern "C" int snapi_bridge_unofficial_configure_runtime(
     const char* engine_flags,
     uint32_t engine_flags_length) {
-  unofficial_napi_runtime_options options{};
-  options.size = sizeof(options);
-  options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
-  options.engine_flags = engine_flags;
-  options.engine_flags_length = engine_flags_length;
-  return unofficial_napi_configure_runtime(&options);
+  return snapi_private_configure_guest_runtime(engine_flags, engine_flags_length);
 }
 
 extern "C" int snapi_bridge_unofficial_create_env_with_options(

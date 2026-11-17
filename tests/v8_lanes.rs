@@ -26,6 +26,7 @@ use common::build_wasix_test;
 
 unsafe extern "C" {
     fn snapi_v8_runtime_is_managed() -> bool;
+    fn snapi_v8_lane_delayed_posts() -> u64;
     fn snapi_v8_standalone_pool_created() -> bool;
     fn snapi_v8_unattributed_worker_posts() -> u64;
 }
@@ -184,6 +185,9 @@ fn a_lane_starts_with_the_first_env_and_runs_the_instances_v8_work() {
     }
     assert!(lane.started());
     assert_eq!(lane.activations.load(Ordering::SeqCst), 2);
+    // No GC work V8 shares between isolates (the page pool's release task)
+    // reached a lane. No test here compiles wasm, the other source.
+    assert_eq!(unsafe { snapi_v8_lane_delayed_posts() }, 0);
     // V8 runs without the work its isolates would share across lanes.
     assert!(unsafe { snapi_v8_runtime_is_managed() });
 
@@ -275,12 +279,22 @@ fn killing_an_instance_stops_its_js_with_the_lane_already_stopped() {
     finished_rx
         .recv_timeout(Duration::from_secs(60))
         .expect("the killed instance did not stop");
-    if let Ok((_exit_code, stdout, stderr)) = guest.join().expect("the guest thread panicked") {
-        assert!(
-            stdout.contains("JS_LOOP_ENTERED") && !stdout.contains("RESUME_STATUS=0"),
-            "{stdout}\n{stderr}"
-        );
-    }
+    let (exit_code, stdout, stderr) = guest
+        .join()
+        .expect("the guest thread panicked")
+        .expect("the guest did not run");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("JS_LOOP_ENTERED"), "{stdout}\n{stderr}");
+    // napi_pending_exception: the loop ended terminated.
+    assert!(
+        stdout.contains("JS_LOOP_LEFT status=10"),
+        "{stdout}\n{stderr}"
+    );
+    // The stop is sticky: the guest cannot run JS again.
+    assert!(
+        stdout.contains("RESUME_STATUS=") && !stdout.contains("RESUME_STATUS=0"),
+        "{stdout}\n{stderr}"
+    );
     assert_all_v8_work_had_a_lane(unattributed_before);
 }
 

@@ -265,18 +265,8 @@ pub(crate) fn read_runtime_options_up_to(
     read_guest_bytes(env, flags_ptr, flags_length)
 }
 
-/// The engine flags EdgeJS passes by default before it creates an env. A
-/// managed instance accepts these, and only these, as no-ops.
-pub(crate) fn is_default_engine_flags(flags: &[u8]) -> bool {
-    matches!(
-        flags,
-        b"" | b"--js-source-phase-imports"
-            | b"--harmony-import-attributes"
-            | b"--js-source-phase-imports --harmony-import-attributes"
-    )
-}
-
-/// Longer than every flag string [`is_default_engine_flags`] accepts.
+/// Longer than every flag string a guest of a managed process may pass
+/// (EdgeJS's defaults; `IsGuestDefaultV8Flags` in v8/src/unofficial_napi.cc).
 pub(crate) const MAX_DEFAULT_ENGINE_FLAGS_LENGTH: usize = 64;
 
 pub(crate) fn read_env_create(

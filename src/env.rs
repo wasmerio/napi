@@ -320,6 +320,10 @@ impl NapiEnv {
         if self.host_stopped.load(Ordering::Acquire) {
             anyhow::bail!("the N-API instance has stopped");
         }
+        // Before the embedder starts a lane for an env that can't be made.
+        if !crate::lane::managed_runtime_usable() {
+            anyhow::bail!("V8 started without managed mode; managed environments are refused");
+        }
         if self.managed_lane.is_none() {
             let lane = activate()?;
             // Activation can race a stop, which wins.
@@ -328,10 +332,7 @@ impl NapiEnv {
             }
             self.managed_lane = Some(lane);
         }
-        let lane = self
-            .managed_lane
-            .as_ref()
-            .expect("the lane was set above");
+        let lane = self.managed_lane.as_ref().expect("the lane was set above");
         Ok(lane.enter())
     }
 

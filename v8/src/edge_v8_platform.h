@@ -48,6 +48,9 @@ extern "C" void snapi_v8_lane_delete(void* handle);
 // previous binding.
 extern "C" void* snapi_v8_lane_swap_current(void* handle);
 extern "C" void* snapi_v8_lane_current();
+// The id of the lane bound to the calling thread, unique for the process, or
+// 0 when none is.
+extern "C" uint64_t snapi_v8_lane_current_id();
 extern "C" bool snapi_v8_lane_is_running(void* handle);
 extern "C" bool snapi_v8_lane_overloaded(void* handle);
 
