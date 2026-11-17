@@ -136,6 +136,13 @@ unsafe extern "C" {
     /// Register a host-owned near-heap-limit callback that charges V8 heap
     /// growth against the resource budget. `data` is an
     /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
+    /// After JavaScript ran on this thread: runs a collection if the heap
+    /// holds memory past `old_generation_limit` that no collection examined,
+    /// so the near-heap-limit callback sees it. Nonzero when one ran.
+    pub fn snapi_bridge_unofficial_settle_heap_overshoot(
+        env: SnapiEnv,
+        old_generation_limit: u64,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
         env: SnapiEnv,
         data: *const c_void,

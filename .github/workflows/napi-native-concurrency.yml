@@ -98,3 +98,8 @@ jobs:
           --test guest_callbacks --test guest_c_strings
           --test guest_memory --test guest_memory_pressure
           --test guest_lazy_properties --test message_memory
+
+      # V8 heap exhaustion in budgeted WAT guests: each must stop its own
+      # context, never abort the process.
+      - name: Test heap limits
+        run: ./cargo-standalone.sh test --locked --test v8_heap_limit

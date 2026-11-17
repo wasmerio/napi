@@ -723,6 +723,30 @@ typedef size_t (*unofficial_napi_near_heap_limit_callback)(
 // `restored_heap_limit` to be zero. A null callback removes the slot, requires
 // `data` to be null, and restores the provider heap limit to the supplied
 // value.
+// Committed bytes of the env's old generation: every heap space the engine's
+// hard heap limit governs (all but the young generation and read-only space).
+// For near-heap-limit callbacks, which must return a limit covering it: the
+// engine admits the first large young object without consulting the limit
+// and aborts the process after the next collection if the limit still does
+// not cover the promoted object. Engines without the figure report zero.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_heap_committed_old_generation(
+    napi_env env,
+    size_t* result);
+
+// Runs a full collection if the env's heap holds committed memory past its
+// hard limit that no collection examined yet (see above): after a script
+// returns, the heap may be over its limit with no near-heap-limit callback
+// having run, and an idle env would keep that memory unaccounted for. Call
+// from the env's thread after running JavaScript. `old_generation_limit` is
+// the engine's current hard old-generation limit as the embedder last set or
+// answered it; zero uses the engine's total heap limit, which under-triggers
+// by the young generation. `*collected` reports whether a collection ran.
+// Engines without the behaviour report `false`.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_collect_garbage_if_over_heap_limit(
+    napi_env env,
+    size_t old_generation_limit,
+    bool* collected);
+
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_configure_near_heap_limit_callback(
     napi_env env,
     unofficial_napi_near_heap_limit_callback callback_or_null,

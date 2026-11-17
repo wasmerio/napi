@@ -567,6 +567,28 @@ extern "C"
         return napi_ok;
     }
 
+    // QuickJS has no generational heap limit to overshoot.
+    napi_status NAPI_CDECL unofficial_napi_get_heap_committed_old_generation(
+        napi_env env,
+        size_t *result)
+    {
+        if (env == nullptr || result == nullptr)
+            return napi_invalid_arg;
+        *result = 0;
+        return napi_ok;
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+        napi_env env,
+        size_t /*old_generation_limit*/,
+        bool *collected)
+    {
+        if (env == nullptr || collected == nullptr)
+            return napi_invalid_arg;
+        *collected = false;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
         napi_env env,
         unofficial_napi_near_heap_limit_callback callback_or_null,
