@@ -145,3 +145,108 @@ Their harnesses now exercise the same intended lifecycle cases under Edge's
 accounting and context ownership. The bounded facade denial fixture leaves room
 for the restored V8 heap/slack and bookkeeping charges before denying a 32 MiB
 buffer. Explicit-release finalizers were verified through the SDK.
+
+
+## Final review validation
+
+Validation uses the isolated product checkout
+`/home/theduke/dev/github.com/wasmerio/wasmer-next-napi-check` at GitHub main
+`9c23b0c2c3591021a5b11ce69a91bd384aa0d387`, with locked runtime
+`93ebbc98e695c0727f9107c444edfb166bf22ac6`. No source in the main product
+checkout or runtime repository was changed. The product lock's only local
+change adds `parking_lot 0.12.5` to wasmer-napi's dependency list.
+
+The full native command was:
+
+```sh
+RUST_MIN_STACK=16777216 cargo test --locked --offline --no-fail-fast \
+  -p wasmer-napi --features cli -- --test-threads=1
+```
+
+It executed every native target, including the original manifest fixtures. Its
+one remaining library failure exposed an Edge exact-memory check against next's
+source-retaining shared-memory transfer test. The fix permits an owned, pinned
+shared mapping across this app's worker memories, keeping app ownership and
+nonshared exact-memory checks. After that change this command passed:
+
+```sh
+RUST_MIN_STACK=16777216 cargo test --locked --offline --no-fail-fast \
+  -p wasmer-napi --features cli --lib --test message_memory \
+  --test legacy_manifest -- --test-threads=1
+```
+
+The table reports the last successful run of each target; it does not claim
+that the earlier full invocation exited successfully. Consolidated native
+results: **282 passed, 0 remaining failures, 3 ignored**.
+
+| Target | Passed | Failed | Ignored |
+| --- | ---: | ---: | ---: |
+| wasmer_napi | 137 | 0 | 0 |
+| napi_wasmer | 4 | 0 | 0 |
+| callback_control | 38 | 0 | 0 |
+| callback_control_js | 0 | 0 | 0 |
+| cli_facade_mounts | 2 | 0 | 0 |
+| core_callbacks | 2 | 0 | 0 |
+| external_transfer | 1 | 0 | 0 |
+| fatal_hook_lookup | 1 | 0 | 0 |
+| guest_boundary_accounting | 6 | 0 | 0 |
+| guest_error_callbacks | 1 | 0 | 0 |
+| legacy_manifest | 12 | 0 | 1 |
+| manifest_tests | 1 | 0 | 0 |
+| message_memory | 3 | 0 | 0 |
+| native_jspi | 1 | 0 | 0 |
+| review_memory | 6 | 0 | 0 |
+| v8_heap_limit | 6 | 0 | 0 |
+| v8_host_control | 21 | 0 | 0 |
+| v8_lazy_lane | 1 | 0 | 0 |
+| v8_page_accounting | 9 | 0 | 1 |
+| v8_wasm_guest | 3 | 0 | 0 |
+| v8_wasm_metering | 11 | 0 | 1 |
+| v8_wasm_process_budget | 1 | 0 | 0 |
+| v8_wasm_tiering | 1 | 0 | 0 |
+| v8_worker_threads | 1 | 0 | 0 |
+| wasix_facade | 10 | 0 | 0 |
+| wasix_facade_js | 0 | 0 | 0 |
+| wasix_leases | 1 | 0 | 0 |
+| wasix_pending | 2 | 0 | 0 |
+| doctests | 0 | 0 | 0 |
+
+`manifest_tests` is one Rust test covering **34 original native fixtures and
+34 corresponding WASIX guests**, all executed and compared. Native fixtures
+were linked from their original sources and `tests/napi_native_init.cc` against
+the CTest-verified CMake V8 provider archive, avoiding 34 recompilations of that
+same provider. The normal fixture script then verified their freshness. The
+WASIX fixtures were produced with the installed wasixcc 0.4.2/sysroot; none were
+substituted with synthetic success fixtures.
+
+The public SDK NAPI test passed: **1 test, 0 failures**, executing eight runs of
+its three original fixtures across independent sandboxes. The facade's ten
+native tests include configure-before-start guest-memory JS evaluation and a
+32 MiB start-time protected-lease refill scenario.
+
+Native CTest: V8 **113/113**, QuickJS **102/102**; Make's existing
+`SandboxGlobalThisAndMarkerAreNotEnumerableForDeepFreeze` exclusion remains.
+
+The combined CLI/C API/SDK/NAPI `cargo check --locked --offline` with
+`wasmer-cli/cranelift,wasmer-sdk/napi-v8,wasmer-napi/cli` passed. The browser
+`wasm32-unknown-unknown` library check with `--no-default-features --features
+js,wasix` passed. The native NAPI `--features cli --all-targets` check also passed.
+
+Browser runtime execution was attempted by building `wasix_facade_js`; it
+could not link `__wasixv2_thread_cleanup` with the installed stable std.
+The browser host's documented prerequisite is its separately patched nightly
+std (`wlk/crates/host/tests/browser/prepare-std.py` and build guide), which is not
+installed here. Therefore **0 browser runtime tests executed**; this is not
+reported as a passing browser suite. No product/runtime API or fake cleanup
+stub was added to manufacture a result.
+
+The first broad test build exhausted local disk during simultaneous debug
+linking. Task-owned debug sections/incremental outputs were removed and build
+concurrency reduced to two; the completed runs above follow that recovery.
+Existing dependency/deprecation warnings remain.
+
+Manager integration: set `lib/napi`'s tracked branch to `edge-wasixv2`, bump its
+gitlink to this branch's final head, and include the lock dependency entry for
+`parking_lot 0.12.5`. No product submodule pointer was changed in its main
+checkout. No further blocking facade API GAP was found. Remaining TODOs are M3
+(copy contention/read guard) and L9 (direct nonshared registration retirement).
