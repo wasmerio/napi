@@ -1,6 +1,9 @@
 #ifndef NAPI_V8_EDGE_V8_PLATFORM_H_
 #define NAPI_V8_EDGE_V8_PLATFORM_H_
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -10,12 +13,66 @@
 
 #include "unofficial_napi.h"
 
+// An embedder-owned background execution lane for the V8 work of one
+// instance: a bounded queue that only the embedder's dedicated thread runs
+// (snapi_v8_lane_run). The embedder owns the handle until it has called
+// snapi_v8_lane_stop, snapi_v8_lane_run has returned, and every env created
+// while the lane was bound has been released.
+//
+// While a lane is bound to a thread (snapi_v8_lane_swap_current), V8 worker
+// tasks, delayed worker tasks and job workers that thread posts go to the
+// lane. With no lane bound, they go to a process-wide worker pool, which
+// exists only once an env was created with no lane bound (a standalone
+// env). In a process without one, a worker task posted with no lane bound is
+// dropped and counted (snapi_v8_unattributed_worker_posts), never run
+// unattributed.
+//
+// `max_queued_tasks` bounds the queue. A post past it stops the lane and calls
+// `on_overload(scope_context)`, which must stop the instance's JS without
+// waiting on V8. `enter_scope(scope_context)` runs before each task, and
+// `leave_scope(scope_context, scope)` after it with what enter returned; a
+// null scope or a false leave stops the lane the same way. Null on a zero
+// capacity or allocation failure.
+extern "C" void* snapi_v8_lane_new(size_t max_queued_tasks,
+                                   void* scope_context,
+                                   void* (*enter_scope)(void*),
+                                   bool (*leave_scope)(void*, void*),
+                                   void (*on_overload)(void*));
+// Runs the lane's tasks on the calling thread until snapi_v8_lane_stop.
+extern "C" void snapi_v8_lane_run(void* handle);
+// Closes admission and wakes the lane's thread, which returns after its
+// current task. Idempotent; queued tasks are dropped.
+extern "C" void snapi_v8_lane_stop(void* handle);
+extern "C" void snapi_v8_lane_delete(void* handle);
+// Binds `handle` (or no lane, for null) to the calling thread and returns the
+// previous binding.
+extern "C" void* snapi_v8_lane_swap_current(void* handle);
+extern "C" void* snapi_v8_lane_current();
+// The id of the lane bound to the calling thread, unique for the process, or
+// 0 when none is.
+extern "C" uint64_t snapi_v8_lane_current_id();
+extern "C" bool snapi_v8_lane_is_running(void* handle);
+extern "C" bool snapi_v8_lane_overloaded(void* handle);
+
+// On Linux x64 with memory protection keys, V8 write-protects its JIT code
+// with the key of the platform's ThreadIsolatedAllocator. A key's rights are
+// per thread, and a thread that started before the key was allocated has no
+// access to it. Gives the calling thread V8's default rights for the key
+// (read-only) before it runs V8 work: embedder threads (an instance lane, a
+// WASIX thread) can predate the platform. Elsewhere it does nothing.
+void EdgeV8AllowJitKeyReads();
+
 class EdgeV8Platform final : public v8::Platform {
  public:
   struct FinishedCallback;
   struct IsolateState;
 
-  static std::unique_ptr<EdgeV8Platform> Create();
+  // With `standalone_workers`, the process-wide worker pool is built now;
+  // otherwise only when EnableStandaloneWorkers first runs.
+  static std::unique_ptr<EdgeV8Platform> Create(bool standalone_workers);
+  // Builds the process-wide worker pool for envs created with no lane bound.
+  // Idempotent. False if it could not be built.
+  bool EnableStandaloneWorkers();
 
   // Sets how many background worker threads the platform gets. Zero restores
   // V8's own default, which sizes the pool from the host's processor count --
@@ -27,8 +84,10 @@ class EdgeV8Platform final : public v8::Platform {
   // leaving one for other worker tasks; a job that is kUserBlocking or joined
   // uses all of them. With a count of 1, every job gets the one thread.
   //
-  // The pool is process-wide and built when the first isolate is created, so
-  // this has no effect afterwards; it returns false in that case.
+  // The pool is process-wide and serves only envs created with no lane bound.
+  // It is built with the first of them, but the setting freezes when the
+  // platform is created, also when its first env has a lane; it returns false
+  // for a different count afterwards. An instance lane is one thread.
   static bool SetWorkerThreadCount(int count);
 
   // Sets a function to call when an immediate foreground task is queued
@@ -115,6 +174,7 @@ class EdgeV8Platform final : public v8::Platform {
   class ForegroundTaskRunner;
 
   explicit EdgeV8Platform(std::unique_ptr<v8::Platform> fallback);
+  v8::Platform* StandaloneWorkers();
 
   std::shared_ptr<IsolateState> EnsureState(v8::Isolate* isolate);
   std::shared_ptr<ForegroundTaskRunner> EnsureRunner(v8::Isolate* isolate);
@@ -123,7 +183,13 @@ class EdgeV8Platform final : public v8::Platform {
   void MaybeFinishIsolate(const std::shared_ptr<IsolateState>& state,
                           bool begin_shutdown);
 
+  // Foreground runners, clocks and allocators. It has no worker threads: a
+  // worker task belongs to an instance lane or the standalone pool.
   std::unique_ptr<v8::Platform> fallback_;
+  // The process-wide pool for envs created with no lane bound.
+  std::mutex standalone_workers_mutex_;
+  std::unique_ptr<v8::Platform> standalone_workers_;
+  std::atomic<v8::Platform*> standalone_workers_ptr_{nullptr};
   std::mutex mutex_;
   std::unordered_map<v8::Isolate*, std::shared_ptr<IsolateState>> isolates_;
 };

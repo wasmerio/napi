@@ -120,6 +120,14 @@ pub(crate) struct NapiEnv {
     /// The embedder's policy for V8 `WebAssembly` in the envs this store
     /// creates.
     pub(crate) webassembly: crate::WasmPolicy,
+    /// A managed context's way to get the instance's V8 lane, called when
+    /// this store first creates an env (see [`Self::enter_background_lane`]).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) managed_lane_activator: Option<crate::ManagedV8LaneActivator>,
+    /// The lane the activator returned. The native envs this store created
+    /// keep a raw pointer to it, so it lives as long as they may.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    managed_lane: Option<Arc<crate::ManagedV8Lane>>,
     env_registry: Arc<std::sync::Mutex<EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
@@ -209,6 +217,10 @@ impl NapiEnv {
             budget,
             max_envs,
             webassembly: crate::WasmPolicy::default(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            managed_lane_activator: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            managed_lane: None,
             env_registry,
             host_stopped,
             env_heap_charges: HashMap::new(),
@@ -283,6 +295,45 @@ impl NapiEnv {
             .map(|(_, _, owner_id)| *owner_id)
             .or_else(|| self.host_buffer_copy_frames.last().copied())
             .unwrap_or(0)
+    }
+
+    /// Whether this store belongs to a managed context
+    /// ([`crate::NapiCtxBuilder::build_managed_imports`]).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn is_managed(&self) -> bool {
+        self.managed_lane_activator.is_some()
+    }
+
+    /// Binds the instance's V8 lane to this thread for an env creation, so
+    /// the isolate's V8 work goes to it. A managed context gets the lane from
+    /// its embedder the first time. A standalone context has none, and binds
+    /// none: its envs use the process-wide worker pool, also when created
+    /// from inside a call into a managed env, whose lane is bound then. Fails
+    /// once the instance is stopped, and when the embedder refuses the lane.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn enter_background_lane(
+        &mut self,
+    ) -> anyhow::Result<crate::lane::ManagedV8LaneScope> {
+        let Some(activate) = &self.managed_lane_activator else {
+            return Ok(crate::lane::ManagedV8LaneScope::no_lane());
+        };
+        if self.host_stopped.load(Ordering::Acquire) {
+            anyhow::bail!("the N-API instance has stopped");
+        }
+        // Before the embedder starts a lane for an env that can't be made.
+        if !crate::lane::managed_runtime_usable() {
+            anyhow::bail!("V8 started without managed mode; managed environments are refused");
+        }
+        if self.managed_lane.is_none() {
+            let lane = activate()?;
+            // Activation can race a stop, which wins.
+            if self.host_stopped.load(Ordering::Acquire) {
+                anyhow::bail!("the N-API instance stopped while its V8 lane started");
+            }
+            self.managed_lane = Some(lane);
+        }
+        let lane = self.managed_lane.as_ref().expect("the lane was set above");
+        Ok(lane.enter())
     }
 
     /// Reserve budget for a new V8 env before creating it: acquire an isolate
@@ -625,6 +676,8 @@ impl NapiEnv {
 impl Drop for NapiEnv {
     fn drop(&mut self) {
         let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let mut env_kept = false;
         for scope_id in scope_ids {
             let Some((env_id, env)) = self.begin_unregister_napi_scope(scope_id) else {
                 continue;
@@ -634,7 +687,16 @@ impl Drop for NapiEnv {
             // store dropped on a thread other than the env's owner gets the
             // release refused, and the env stays charged.
             let status = unsafe { snapi_bridge_unofficial_release_env(env) };
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            {
+                env_kept |= status == RELEASE_REFUSED;
+            }
             self.finish_unregister_napi_env(env_id, env, status);
+        }
+        // A kept env still posts V8 work to the lane through a raw pointer.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if env_kept && let Some(lane) = self.managed_lane.take() {
+            std::mem::forget(lane);
         }
         // Release any external memory the guest declared but did not take back.
         if self.external_declared > 0 {

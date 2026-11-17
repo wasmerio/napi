@@ -234,6 +234,16 @@ pub(crate) fn read_runtime_options(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
 ) -> Option<Vec<u8>> {
+    read_runtime_options_up_to(env, guest_ptr, usize::MAX)
+}
+
+/// Like [`read_runtime_options`], but `None` without copying when the flag
+/// string is longer than `max_length`.
+pub(crate) fn read_runtime_options_up_to(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    max_length: usize,
+) -> Option<Vec<u8>> {
     if guest_ptr == 0 {
         return Some(Vec::new());
     }
@@ -249,11 +259,15 @@ pub(crate) fn read_runtime_options(
     if flags_length == 0 {
         return Some(Vec::new());
     }
-    if flags_ptr == 0 {
+    if flags_ptr == 0 || flags_length > max_length {
         return None;
     }
     read_guest_bytes(env, flags_ptr, flags_length)
 }
+
+/// Longer than every flag string a guest of a managed process may pass
+/// (EdgeJS's defaults; `IsGuestDefaultV8Flags` in v8/src/unofficial_napi.cc).
+pub(crate) const MAX_DEFAULT_ENGINE_FLAGS_LENGTH: usize = 64;
 
 pub(crate) fn read_env_create(
     env: &mut FunctionEnvMut<NapiEnv>,

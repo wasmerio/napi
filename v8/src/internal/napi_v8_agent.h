@@ -49,6 +49,10 @@ struct napi_agent__ {
   // NapiWebAssemblyPolicy::kRestricted: no context of the isolate has the
   // WebAssembly global or compiles wasm. Fixed once the agent is set up.
   bool webassembly_restricted = false;
+  // The instance lane bound when the isolate was created
+  // (snapi_v8_lane_current_id), or 0 for a standalone isolate. Fixed once the
+  // agent is set up.
+  uint64_t lane_id = 0;
 
   // Isolate-wide keys for wraps, buffer records and type tags.
   v8::Global<v8::Private> wrap_private_key;

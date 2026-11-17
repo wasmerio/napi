@@ -258,7 +258,7 @@ void BoundTargetDoesNotWake(EdgeV8Platform* platform,
 // process-wide.
 int main() {
   EdgeV8Platform::SetWorkerThreadCount(2);
-  auto platform = EdgeV8Platform::Create();
+  auto platform = EdgeV8Platform::Create(/*standalone_workers=*/true);
   if (!platform) return 1;
   v8::V8::InitializePlatform(platform.get());
   if (!v8::V8::Initialize()) return 1;

@@ -168,7 +168,6 @@ impl NapiRuntimeControl {
     }
 }
 
-#[derive(Debug)]
 struct NapiCtxInner {
     limits: NapiLimits,
     webassembly: WasmPolicy,
@@ -179,6 +178,18 @@ struct NapiCtxInner {
     budget: Arc<ResourceBudget>,
     envs: Arc<Mutex<crate::env::EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
+    /// Set for a managed embedder ([`NapiCtxBuilder::build_managed_imports`]).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    managed_lane_activator: Option<crate::ManagedV8LaneActivator>,
+}
+
+impl std::fmt::Debug for NapiCtxInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NapiCtxInner")
+            .field("limits", &self.limits)
+            .field("webassembly", &self.webassembly)
+            .finish_non_exhaustive()
+    }
 }
 
 struct NapiSessionInner {
@@ -243,7 +254,51 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Builds the import hooks of a managed embedder, which runs each
+    /// instance's V8 background work on a lane it owns ([`ManagedV8Lane`]).
+    ///
+    /// Building them, and linking a module with them, allocates no V8
+    /// isolate, platform or lane. When a guest of the instance first creates
+    /// an environment, from any of its stores, the provider calls `activator`
+    /// for the instance's lane and binds it to every call into that
+    /// environment, so its V8 worker tasks, delayed tasks and jobs run there
+    /// and never on a process-wide pool. An error from `activator` fails that
+    /// environment creation. Stopping the instance
+    /// ([`NapiRuntimeControl::terminate_all`]) makes later activations fail.
+    ///
+    /// [`ManagedV8Lane`]: crate::ManagedV8Lane
+    ///
+    /// The first call puts the process in managed mode: V8 starts without the
+    /// state its isolates share background work through (concurrent TurboFan
+    /// and Maglev compiles, the page pool, the wasm module cache), which no
+    /// lane could be charged for, and guests can no longer set V8 flags. Build
+    /// managed imports before the process's first environment: if V8 already
+    /// started without managed mode, managed environments are refused.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn build_managed_imports(
+        self,
+        activator: crate::ManagedV8LaneActivator,
+    ) -> NapiRuntimeHooks {
+        if !crate::lane::use_managed_runtime() {
+            eprintln!(
+                "[napi] V8 started without managed mode; this process refuses managed \
+                 environments (build managed imports before the first environment)"
+            );
+        }
+        self.build_with(Some(activator)).runtime_hooks()
+    }
+
     pub fn build(self) -> NapiCtx {
+        self.build_with(None)
+    }
+
+    fn build_with(
+        self,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] managed_lane_activator: Option<
+            crate::ManagedV8LaneActivator,
+        >,
+        #[cfg(all(target_arch = "wasm32", feature = "js"))] _managed_lane_activator: Option<()>,
+    ) -> NapiCtx {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
             None => match self.limits.memory_budget_bytes() {
@@ -259,6 +314,8 @@ impl NapiCtxBuilder {
                 budget,
                 envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),
                 host_stopped: Arc::new(AtomicBool::new(false)),
+                #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+                managed_lane_activator,
             }),
         }
     }
@@ -383,6 +440,21 @@ impl NapiCtx {
 }
 
 impl NapiRuntimeHooks {
+    /// The context these hooks make imports for.
+    pub fn context(&self) -> &NapiCtx {
+        &self.ctx
+    }
+
+    /// Stops the context's isolates; see [`NapiCtx::runtime_control`].
+    pub fn runtime_control(&self) -> NapiRuntimeControl {
+        self.ctx.runtime_control()
+    }
+
+    /// The context's resource budget; see [`NapiCtx::budget`].
+    pub fn budget(&self) -> Arc<ResourceBudget> {
+        self.ctx.budget()
+    }
+
     /// Creates N-API imports when `module` requests them.
     pub fn additional_imports(
         &self,
@@ -474,6 +546,10 @@ impl NapiSession {
             Arc::clone(&self.inner.ctx.host_stopped),
         );
         napi_env.webassembly = self.inner.ctx.webassembly;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            napi_env.managed_lane_activator = self.inner.ctx.managed_lane_activator.clone();
+        }
         let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self

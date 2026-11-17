@@ -40,6 +40,11 @@ extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out);
 
+// Provider-private (v8/src/unofficial_napi.cc): a guest's runtime
+// configuration, under the process's guest flag policy.
+extern "C" napi_status snapi_private_configure_guest_runtime(const char* engine_flags,
+                                                            size_t engine_flags_length);
+
 // The Rust side encodes `WasmPolicy` with these values (src/ctx.rs).
 static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kRestricted) == 0);
 static_assert(static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered) == 1);
@@ -172,6 +177,11 @@ struct SnapiAgentState {
   std::unordered_set<WasmInterruptRequest*> pending_interrupts;
   // Provider owner; releasing it tears down the isolate and all its envs.
   unofficial_napi_env_owner owner = nullptr;
+  // The embedder's instance lane bound when the isolate was created, or null
+  // for a standalone isolate. Every bridge call binds it again, so V8 work the
+  // call posts goes to that lane. The embedder keeps it until the agent is
+  // released.
+  void* background_lane = nullptr;
   // Envs on this agent; the first is the principal env.
   std::vector<SnapiEnvState*> envs;
 
@@ -641,13 +651,34 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
   state.agent->bytecode_handles.Remove(id);
 }
 
+// Binds an agent's instance lane to this thread, restoring the previous
+// binding on exit. Stores of different instances can share an OS thread.
+class AgentLaneScope {
+ public:
+  explicit AgentLaneScope(const SnapiAgentState* agent)
+      : previous_(snapi_v8_lane_swap_current(agent != nullptr ? agent->background_lane
+                                                                : nullptr)) {}
+  ~AgentLaneScope() { snapi_v8_lane_swap_current(previous_); }
+
+  AgentLaneScope(const AgentLaneScope&) = delete;
+  AgentLaneScope& operator=(const AgentLaneScope&) = delete;
+
+ private:
+  void* previous_;
+};
+
 // Several stores can share an OS thread. V8 consults the current isolate
 // even in APIs that take a context, so enter the isolate of the requested env
-// for each bridge call and restore the caller's isolate on return.
+// for each bridge call and restore the caller's isolate on return. The call
+// also binds the env's instance lane.
 class BridgeEnvScope {
  public:
   explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
-    if (state_ != nullptr && v8::Isolate::TryGetCurrent() != state_->env->isolate) {
+    if (state_ == nullptr) return;
+    // A WASIX thread can predate the platform's JIT key.
+    EdgeV8AllowJitKeyReads();
+    lane_scope_.emplace(state_->agent);
+    if (v8::Isolate::TryGetCurrent() != state_->env->isolate) {
       isolate_scope_.emplace(state_->env->isolate);
     }
   }
@@ -656,6 +687,7 @@ class BridgeEnvScope {
 
  private:
   SnapiEnvState* state_;
+  std::optional<AgentLaneScope> lane_scope_;
   std::optional<v8::Isolate::Scope> isolate_scope_;
 };
 
@@ -719,6 +751,8 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   }
   napi_status s = napi_ok;
   if (agent->owner != nullptr) {
+    // Disposing the isolate runs finalizers and V8's own teardown work.
+    AgentLaneScope lane_scope(agent);
     s = unofficial_napi_release_env(agent->owner, nullptr);
     agent->owner = nullptr;
   }
@@ -762,6 +796,7 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
   }
   NapiV8DetachEnvOwner(owner);
   agent->owner = owner;
+  agent->background_lane = snapi_v8_lane_current();
   agent->envs.push_back(state);
   state->agent = agent;
   state->env = env;
@@ -3395,15 +3430,12 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   return napi_ok;
 }
 
+// Guests configure the runtime through this; in a process with managed
+// instances they cannot set V8 flags (snapi_private_configure_guest_runtime).
 extern "C" int snapi_bridge_unofficial_configure_runtime(
     const char* engine_flags,
     uint32_t engine_flags_length) {
-  unofficial_napi_runtime_options options{};
-  options.size = sizeof(options);
-  options.version = UNOFFICIAL_NAPI_RUNTIME_OPTIONS_VERSION;
-  options.engine_flags = engine_flags;
-  options.engine_flags_length = engine_flags_length;
-  return unofficial_napi_configure_runtime(&options);
+  return snapi_private_configure_guest_runtime(engine_flags, engine_flags_length);
 }
 
 extern "C" int snapi_bridge_unofficial_create_env_with_options(
