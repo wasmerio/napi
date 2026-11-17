@@ -27,6 +27,7 @@
 #include "internal/napi_env_cpu_profile.h"
 #include "internal/napi_v8_env.h"
 #include "internal/napi_serdes_context.h"
+#include "internal/napi_wasm_policy.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "napi_testing.h"
 #include "unofficial_napi_error_utils.h"
@@ -2031,9 +2032,13 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_create_env(
+// Provider-private, never imported by guests: unofficial_napi_create_env with
+// the embedder's NapiWebAssemblyPolicy. The policy is an argument rather than
+// an env-create option because that descriptor is also the guest's wire ABI.
+extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out) {
   if (options != nullptr &&
@@ -2047,10 +2052,14 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   // function owns it from here on and must release it exactly once.
   unofficial_napi_guest_heap guest_heap =
       options != nullptr ? options->guest_heap : nullptr;
-  if (env_out == nullptr || owner_out == nullptr) {
+  NapiWebAssemblyPolicy policy = NapiWebAssemblyPolicy::kAllowUnmetered;
+  if (env_out == nullptr || owner_out == nullptr ||
+      !NapiWebAssemblyPolicyFromRaw(webassembly_policy, &policy)) {
     if (guest_heap != nullptr) napi_host_guest_heap_release(guest_heap);
     return napi_invalid_arg;
   }
+  const bool restrict_webassembly =
+      policy == NapiWebAssemblyPolicy::kRestricted;
   EdgeV8Platform* platform = nullptr;
   napi_status status = AcquireRuntime(&platform);
   if (status != napi_ok || platform == nullptr) {
@@ -2106,8 +2115,19 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   scope->agent = std::make_unique<napi_agent__>(isolate);
   scope->agent->allocator = allocator;
   scope->agent->hash_seed = GenerateHashSeed();
+  scope->agent->webassembly_restricted = restrict_webassembly;
+  // Installed under every policy: it refuses all wasm code of a restricted
+  // isolate and otherwise honors each realm's allow_code_gen_wasm.
+  isolate->SetAllowWasmCodeGenerationCallback(NapiV8AllowWasmCodeGeneration);
 
   v8::Local<v8::Context> context = v8::Context::New(isolate);
+  if (context.IsEmpty() ||
+      (restrict_webassembly && !RemoveWebAssemblyGlobal(context))) {
+    delete scope;
+    DisposeIsolateAndWait(platform, isolate);
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
@@ -2122,6 +2142,17 @@ napi_status NAPI_CDECL unofficial_napi_create_env(
   *env_out = scope->env;
   *owner_out = reinterpret_cast<unofficial_napi_env_owner>(scope);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out) {
+  return snapi_private_create_env(
+      module_api_version, options,
+      static_cast<uint32_t>(NapiWebAssemblyPolicy::kAllowUnmetered), env_out,
+      owner_out);
 }
 
 napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,

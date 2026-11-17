@@ -823,6 +823,28 @@ mod tests {
         (memory, heap)
     }
 
+    /// The bridge owns a guest-heap context once it is handed over, so a
+    /// policy it refuses must still release it, exactly once, and create no
+    /// environment.
+    #[test]
+    fn unknown_webassembly_policy_is_refused_and_releases_the_heap_ctx() {
+        let mut store = Store::default();
+        let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let weak_before = Arc::weak_count(&heap);
+        let ctx = heap.make_alloc_ctx();
+        assert_eq!(Arc::weak_count(&heap), weak_before + 1);
+
+        let unknown_policy = crate::WasmPolicy::EnabledUnmetered.bridge_code() + 1;
+        let mut env: crate::snapi::SnapiEnv = std::ptr::null_mut();
+        // napi_invalid_arg, refused before the process-wide runtime is used.
+        let status = unsafe {
+            crate::snapi::snapi_bridge_unofficial_create_env(8, ctx, unknown_policy, &mut env)
+        };
+        assert_eq!(status, 1);
+        assert!(env.is_null());
+        assert_eq!(Arc::weak_count(&heap), weak_before);
+    }
+
     #[test]
     fn chunk_node_budget_scales_with_chunk_size() {
         // What this pins: `OffsetAllocator::new` sizes every chunk for 128Ki

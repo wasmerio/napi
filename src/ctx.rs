@@ -32,10 +32,60 @@ impl NapiLimits {
     }
 }
 
+/// Whether JavaScript in guest environments can use V8's `WebAssembly`.
+///
+/// Guest environments allocate V8 array buffers in the guest's linear memory,
+/// where they count against the context's memory budget. V8 does not allocate
+/// WebAssembly memories and compiled wasm code that way: they come from V8's
+/// page allocator, outside the guest heap and outside every limit this crate
+/// enforces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WasmPolicy {
+    /// No `WebAssembly` in guest environments. The global is absent from an
+    /// environment's own realm and from every realm made in it (`vm`
+    /// contexts), and V8 refuses to compile wasm in all of them, also in
+    /// realms V8 makes on its own, such as `ShadowRealm`s. asm.js still runs,
+    /// as ordinary JavaScript: V8 no longer translates it to wasm.
+    ///
+    /// The host-JavaScript backend runs guest JavaScript with the host's own
+    /// `WebAssembly` and cannot remove it, so environment creation fails
+    /// there under this policy.
+    Restricted,
+    /// V8's `WebAssembly` as the engine ships it, **without resource
+    /// accounting** (the default).
+    ///
+    /// Guest JavaScript can make V8 reserve address space for wasm memories
+    /// (by default 4 GiB for each 32-bit memory without a declared maximum)
+    /// and commit memory as they grow, compile and commit executable wasm
+    /// code, also on V8 background threads, and use compiler working memory
+    /// that grows with the module size. None of it is charged to
+    /// [`NapiLimits::total_memory_bytes`], to a [`NapiMemoryAccountant`] or to
+    /// any other limit of the context; only process-wide V8 flags bound it.
+    /// It also exposes V8's wasm compilers to guest code.
+    ///
+    /// Realms follow their own `allow_code_gen_wasm` option (`vm`'s
+    /// `codeGeneration.wasm`).
+    #[default]
+    EnabledUnmetered,
+}
+
+impl WasmPolicy {
+    /// The value passed to the native bridge; `NapiWebAssemblyPolicy` in
+    /// `v8/src/internal/napi_wasm_policy.h`.
+    pub(crate) const fn bridge_code(self) -> u32 {
+        match self {
+            Self::Restricted => 0,
+            Self::EnabledUnmetered => 1,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
+    webassembly: WasmPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +171,7 @@ impl NapiRuntimeControl {
 #[derive(Debug)]
 struct NapiCtxInner {
     limits: NapiLimits,
+    webassembly: WasmPolicy,
     active_sessions: AtomicUsize,
     /// One shared accountant per app, `Arc`-shared into the engine's budgeted
     /// tunables (guest wasm linear memory) and, in later phases, the V8 heap,
@@ -183,6 +234,15 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Whether guest JavaScript can use V8's `WebAssembly` (default:
+    /// [`WasmPolicy::EnabledUnmetered`], which no limit of this context
+    /// covers). Applies to every environment a guest creates through this
+    /// context, including those of its WASIX worker threads.
+    pub fn webassembly(mut self, policy: WasmPolicy) -> Self {
+        self.webassembly = policy;
+        self
+    }
+
     pub fn build(self) -> NapiCtx {
         let budget = match self.accountant {
             Some(accountant) => ResourceBudget::with_accountant(accountant),
@@ -194,6 +254,7 @@ impl NapiCtxBuilder {
         NapiCtx {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,
+                webassembly: self.webassembly,
                 active_sessions: AtomicUsize::new(0),
                 budget,
                 envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),
@@ -216,6 +277,11 @@ impl NapiCtx {
 
     pub fn limits(&self) -> &NapiLimits {
         &self.inner.limits
+    }
+
+    /// The WebAssembly policy of this context's guest environments.
+    pub fn webassembly_policy(&self) -> WasmPolicy {
+        self.inner.webassembly
     }
 
     pub fn active_sessions(&self) -> usize {
@@ -401,12 +467,13 @@ impl NapiSession {
     fn add_imports(&self, store: &mut StoreMut<'_>, import_object: &mut Imports) -> Result<()> {
         register_env_imports(store, import_object);
 
-        let napi_env = NapiEnv::new(
+        let mut napi_env = NapiEnv::new(
             Arc::clone(&self.inner.ctx.budget),
             self.inner.ctx.limits.max_envs,
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
         );
+        napi_env.webassembly = self.inner.ctx.webassembly;
         let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self
@@ -655,6 +722,50 @@ mod tests {
                 state_a,
             )
             .expect("configure instance A");
+    }
+
+    #[test]
+    fn webassembly_policy_reaches_every_store_env() {
+        assert_eq!(
+            super::WasmPolicy::default(),
+            super::WasmPolicy::EnabledUnmetered
+        );
+        // NapiWebAssemblyPolicy in v8/src/internal/napi_wasm_policy.h.
+        assert_eq!(super::WasmPolicy::Restricted.bridge_code(), 0);
+        assert_eq!(super::WasmPolicy::EnabledUnmetered.bridge_code(), 1);
+
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+                (import "env" "memory" (memory 1 512))
+            )"#,
+        );
+        for policy in [
+            super::WasmPolicy::Restricted,
+            super::WasmPolicy::EnabledUnmetered,
+        ] {
+            let ctx = NapiCtx::builder().webassembly(policy).build();
+            assert_eq!(ctx.webassembly_policy(), policy);
+            let hooks = ctx.runtime_hooks();
+            // Each store (a guest's and each of its WASIX threads') gets the
+            // context's policy.
+            for _ in 0..2 {
+                let (_imports, state) = hooks
+                    .additional_imports(&module, &mut store.as_store_mut())
+                    .expect("imports register");
+                let session = state.session.expect("an N-API module has a session");
+                let func_env = session
+                    .inner
+                    .func_env
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("imports made the function env");
+                assert_eq!(func_env.as_ref(&store).webassembly, policy);
+            }
+        }
     }
 
     #[test]

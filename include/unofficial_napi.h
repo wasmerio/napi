@@ -376,8 +376,10 @@ enum { UNOFFICIAL_NAPI_REALM_OPTIONS_VERSION = 1 };
 // - `allow_code_gen_strings`: V8 only. When false, eval and the Function
 //   constructors throw an EvalError in the realm.
 // - `own_microtask_queue`: V8 only.
-// - `allow_code_gen_wasm`, `name` and `origin`: no provider. WebAssembly code
-//   generation stays allowed wherever the engine has WebAssembly.
+// - `allow_code_gen_wasm`: V8 only. When false, compiling WebAssembly in the
+//   realm throws a WebAssembly.CompileError. An env whose embedder restricted
+//   WebAssembly refuses it in every realm, whatever this option says.
+// - `name` and `origin`: no provider.
 typedef struct {
   uint32_t size;
   uint32_t version;

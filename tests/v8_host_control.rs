@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wasmer_napi::NapiCtx;
+use wasmer_napi::{NapiCtx, WasmPolicy};
 
 mod common;
 use common::{build_wasix_test, run_guest};
@@ -167,4 +167,76 @@ fn isolate_creation_is_refused_below_the_budget_floor() {
         usage.v8_heap_reserved, 0,
         "a refused isolate still holds a heap reservation: {usage:?}"
     );
+}
+
+/// Runs `program` under `policy` and checks that it printed `marker` and
+/// exited cleanly.
+fn assert_guest_passes(program: &str, policy: WasmPolicy, marker: &str) {
+    let wasm = build_wasix_test(program);
+    let ctx = NapiCtx::builder().webassembly(policy).build();
+    assert_eq!(ctx.webassembly_policy(), policy);
+    let (exit_code, stdout, stderr) = run_guest(&ctx, &wasm).expect("guest run failed");
+    assert!(
+        stdout.contains(marker) && exit_code == 0,
+        "{program} under {policy:?} exited with {exit_code}\
+         \n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// `WasmPolicy::Restricted` takes `WebAssembly` out of the env's realm and
+/// out of every realm made in it, also realms that allow wasm code
+/// generation.
+#[test]
+fn restricted_webassembly_is_absent_from_every_realm() {
+    assert_guest_passes(
+        "test_js_wasm_restricted",
+        WasmPolicy::Restricted,
+        "JS_WASM_RESTRICTED_OK",
+    );
+}
+
+/// The default policy keeps V8's WebAssembly, and a realm's
+/// `allow_code_gen_wasm` (vm's `codeGeneration.wasm`) now decides whether it
+/// compiles.
+#[test]
+fn default_webassembly_honors_each_realms_code_generation_option() {
+    assert_eq!(WasmPolicy::default(), WasmPolicy::EnabledUnmetered);
+    assert_eq!(
+        NapiCtx::default().webassembly_policy(),
+        WasmPolicy::EnabledUnmetered
+    );
+    assert_guest_passes(
+        "test_js_wasm_enabled",
+        WasmPolicy::EnabledUnmetered,
+        "JS_WASM_ENABLED_OK",
+    );
+}
+
+/// The policy belongs to the context whose guest created the env, not to
+/// the process: a restricted guest and an unrestricted one run in the same
+/// process, in either order.
+#[test]
+fn webassembly_policy_is_per_context() {
+    for policy in [
+        WasmPolicy::Restricted,
+        WasmPolicy::EnabledUnmetered,
+        WasmPolicy::Restricted,
+    ] {
+        match policy {
+            WasmPolicy::Restricted => {
+                assert_guest_passes("test_js_wasm_restricted", policy, "JS_WASM_RESTRICTED_OK")
+            }
+            _ => assert_guest_passes("test_js_wasm_enabled", policy, "JS_WASM_ENABLED_OK"),
+        }
+    }
+}
+
+/// asm.js runs as ordinary JavaScript under every policy: V8 15.2 and later
+/// no longer translate it to wasm, so it cannot reach wasm code generation
+/// in a restricted env.
+#[test]
+fn asmjs_runs_as_plain_javascript_under_every_policy() {
+    for policy in [WasmPolicy::Restricted, WasmPolicy::EnabledUnmetered] {
+        assert_guest_passes("test_js_asmjs_plain", policy, "ASMJS_RUNS_AS_PLAIN_JS_OK");
+    }
 }
