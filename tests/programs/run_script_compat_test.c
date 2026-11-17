@@ -660,10 +660,20 @@ int main(void) {
   NAPI_CALL(env2, RunInt32Script(
                       env2, "globalThis.__napi_env_isolation_marker = 99", &marker));
   CHECK_OR_FAIL(marker == 99, "failed to set the second environment marker");
+#if defined(__wasm__)
+  // The host bridge enters the isolate of the env each call names, so a guest
+  // can use both environments in turn while both are alive.
   NAPI_CALL(env, RunInt32Script(
                      env, "globalThis.__napi_env_isolation_marker", &marker));
   CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
+#endif
   NAPI_CALL(env, unofficial_napi_release_env(env2_scope, NULL));
+  // Natively nothing switches isolates per call: unofficial_napi_create_env
+  // leaves the new env's isolate entered on this thread until its release, so
+  // the first env is usable again only now.
+  NAPI_CALL(env, RunInt32Script(
+                     env, "globalThis.__napi_env_isolation_marker", &marker));
+  CHECK_OR_FAIL(marker == 41, "the second environment mutated the first global");
 
   // Every code-generation path must select its execution scope explicitly.
   // In particular, vm compile-function and module compilation must honor the

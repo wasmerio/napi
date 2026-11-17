@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREBUILT_V8_VERSION="11.9.9"
+# Keep in step with PREBUILT_V8_VERSION in build.rs and NAPI_V8_PREBUILT_VERSION
+# in the Makefile: this script links the V8 that build.rs downloaded.
+PREBUILT_V8_VERSION="15.9.111.1"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <test-name>" >&2
@@ -48,11 +50,47 @@ resolve_primary_library() {
   return 1
 }
 
+# A static V8 on macOS needs these system frameworks (build.rs links the same
+# for its prebuilt V8, and the Makefile passes them to CMake).
+add_darwin_v8_frameworks() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    V8_LINK_ARGS+=(-framework CoreFoundation -framework Security)
+  fi
+}
+
+# NAPI_V8_EXTRA_LIBS (or NAPI_V8_V8_EXTRA_LIBS), as build.rs reads it: entries
+# separated by ';' or ',', each a framework path (*.framework), a library path,
+# or a bare library name.
+add_extra_links_from_env() {
+  local raw="$1"
+  local entry name
+  local -a entries
+  IFS=';,' read -r -a entries <<< "$raw"
+  for entry in "${entries[@]}"; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" == *.framework ]]; then
+      name="$(basename "$entry" .framework)"
+      V8_LINK_ARGS+=(-F "$(dirname "$entry")" -framework "$name")
+    elif [[ "$entry" == */* ]]; then
+      V8_LINK_ARGS+=("$entry")
+    else
+      V8_LINK_ARGS+=("-l$entry")
+    fi
+  done
+}
+
 add_local_v8_extra_links() {
   local library_path="$1"
   local lib_dir
   lib_dir="$(dirname "$library_path")"
   local candidate
+
+  if [[ -n "$V8_EXTRA_LIBS" ]]; then
+    add_extra_links_from_env "$V8_EXTRA_LIBS"
+    return 0
+  fi
 
   for candidate in libv8_libplatform.a libv8_libplatform.so libv8_libplatform.dylib; do
     if [[ -f "$lib_dir/$candidate" ]]; then
@@ -67,6 +105,10 @@ add_local_v8_extra_links() {
       break
     fi
   done
+
+  if [[ "$library_path" == *.a ]]; then
+    add_darwin_v8_frameworks
+  fi
 }
 
 resolve_cached_prebuilt_v8() {
@@ -113,8 +155,10 @@ resolve_cached_prebuilt_v8() {
   V8_LIBRARY_PATH="$(resolve_primary_library "$root_dir/lib")" || return 1
   V8_INCLUDE_DIR="$include_dir"
   V8_LINK_ARGS=("$V8_LIBRARY_PATH")
-  if [[ "$target_os" == "darwin" ]]; then
-    V8_LINK_ARGS+=("-framework" "CoreFoundation")
+  if [[ -n "$V8_EXTRA_LIBS" ]]; then
+    add_extra_links_from_env "$V8_EXTRA_LIBS"
+  else
+    add_darwin_v8_frameworks
   fi
 }
 
@@ -144,6 +188,7 @@ V8_DEFINES="${V8_DEFINES:-${NAPI_V8_DEFINES:-V8_COMPRESS_POINTERS}}"
 V8_INCLUDE_DIR="${V8_INCLUDE_DIR:-${NAPI_V8_INCLUDE_DIR:-}}"
 V8_LIB_DIR="${V8_LIB_DIR:-}"
 V8_LIBRARY_PATH="${NAPI_V8_LIBRARY:-${NAPI_V8_V8_LIBRARY:-${NAPI_V8_V8_MONOLITH_LIB:-}}}"
+V8_EXTRA_LIBS="${NAPI_V8_EXTRA_LIBS:-${NAPI_V8_V8_EXTRA_LIBS:-}}"
 V8_LINK_ARGS=()
 PLATFORM_LINK_ARGS=()
 C_COMPILER=clang
@@ -192,7 +237,7 @@ mkdir -p "$OUT_DIR"
 HEADER_DEPS=()
 while IFS= read -r dep; do
   HEADER_DEPS+=("$dep")
-done < <(find "$NAPI_INCLUDE_DIR" "$TEST_INCLUDE_DIR" -type f \( -name '*.h' -o -name '*.hpp' \) | sort)
+done < <(find "$NAPI_INCLUDE_DIR" "$TEST_INCLUDE_DIR" "$NAPI_LIB_SRC" "$NAPI_V8_SRC" -type f \( -name '*.h' -o -name '*.hpp' \) | sort)
 
 NAPI_V8_SOURCES=(
   "$NAPI_LIB_SRC/napi_buffer_lease.cc"
@@ -220,7 +265,9 @@ NAPI_V8_SOURCES=(
   "$NAPI_V8_SRC/edge_v8_platform.cc"
 )
 
-DEPS=("$TEST_SRC" "$NATIVE_INIT_SRC")
+# The V8 library and this script count too, so a V8 bump or a link change
+# relinks instead of reusing a binary built against the old one.
+DEPS=("$TEST_SRC" "$NATIVE_INIT_SRC" "$V8_LIBRARY_PATH" "${BASH_SOURCE[0]}")
 DEPS+=("${NAPI_V8_SOURCES[@]}")
 DEPS+=("${HEADER_DEPS[@]}")
 

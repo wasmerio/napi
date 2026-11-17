@@ -208,6 +208,13 @@ pub fn run_wasix_main_capture_stdio(
     run_wasix_main_capture_stdio_with_ctx(&ctx, wasm_path, args, extra_mounts)
 }
 
+/// Runs the guest's `_start` and returns its exit code with what it wrote to
+/// stdout and stderr.
+///
+/// This returns once WASIX has the guest's exit status. The guest's thread
+/// drops the guest's store only after reporting it, so the N-API environments
+/// the guest still held, and their charges against `ctx`'s budget, may be
+/// released a moment after this returns.
 pub fn run_wasix_main_capture_stdio_with_ctx(
     ctx: &NapiCtx,
     wasm_path: &Path,
