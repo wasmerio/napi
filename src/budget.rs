@@ -56,9 +56,53 @@ const MIB: u64 = 1024 * 1024;
 pub const DEFAULT_INITIAL_ISOLATE_HEAP: u64 = 64 * MIB;
 /// Increment the near-heap-limit callback reserves per grow grant.
 pub const DEFAULT_HEAP_GROW_STEP: u64 = 32 * MIB;
-/// One-time V8 heap slack reserved up front so a denied growth callback can
-/// terminate and unwind without entering V8s fatal out-of-memory path.
+/// One-time V8 heap slack reserved up front (and charged to the budget) so a
+/// denied growth callback can terminate and unwind without entering V8's fatal
+/// out-of-memory path.
 pub const DEFAULT_UNWIND_SLACK: u64 = 16 * MIB;
+/// Heap headroom, beyond the budget, that a refused growth exposes to V8 once
+/// per isolate, together with [`DEFAULT_UNWIND_SLACK`], while the isolate is
+/// terminated.
+///
+/// V8 asks the near-heap-limit callback once before the last-resort collection
+/// of a failed allocation and retries the allocation against the answer; a
+/// retry that still does not fit is `FatalProcessOutOfMemory`, which aborts
+/// the whole process. The headroom therefore covers the largest single
+/// allocation JavaScript can request: V8 caps every heap object at 1 GiB
+/// (`FixedArray` and `FixedDoubleArray` at 128 Mi entries, strings at
+/// `String::kMaxLength` two-byte characters), plus large-object page headers
+/// and the small allocations a builtin makes before it sees the termination.
+/// Raising the limit commits no memory: what the isolate takes from the
+/// headroom is what it allocates before termination lands, and it is freed
+/// with the isolate.
+pub const DEFAULT_HEAP_EMERGENCY_HEADROOM: u64 = 1088 * MIB;
+
+/// Isolates that were granted emergency heap headroom, process-wide.
+static HEAP_EMERGENCY_GRANTS: AtomicU64 = AtomicU64::new(0);
+/// Near-heap-limit callbacks that found the emergency headroom already spent,
+/// process-wide. Each means a stopping isolate asked for more heap than the
+/// headroom before its termination landed; V8 aborts the process if its retry
+/// then fails, so a non-zero value is an incident, not a metric.
+static HEAP_EMERGENCY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide counters of the emergency heap headroom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapEmergencyStats {
+    /// Isolates that were stopped and granted emergency headroom.
+    pub grants: u64,
+    /// Callbacks that could not raise the limit further. V8 may have aborted
+    /// the process after any of them.
+    pub exhausted: u64,
+}
+
+/// Process-wide counters of the emergency heap headroom, for the embedder's
+/// metrics and alerts.
+pub fn heap_emergency_stats() -> HeapEmergencyStats {
+    HeapEmergencyStats {
+        grants: HEAP_EMERGENCY_GRANTS.load(Ordering::Acquire),
+        exhausted: HEAP_EMERGENCY_EXHAUSTED.load(Ordering::Acquire),
+    }
+}
 /// Fixed per-isolate overhead charged to cover young generation, code range,
 /// and V8's own malloc'd metadata without sampling.
 pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
@@ -102,7 +146,9 @@ pub enum Pool {
     /// V8 per-isolate heap *ceiling* (old + young + code range + per-isolate
     /// overhead + pre-reserved unwind slack), charged by reservation at env
     /// creation and raised in grow-steps by the near-heap-limit callback. Charged by ceiling, not
-    /// live usage, so the guarantee never races V8's GC.
+    /// live usage, so the guarantee never races V8's GC. A refused grow step
+    /// stops the isolate and exposes [`DEFAULT_HEAP_EMERGENCY_HEADROOM`]
+    /// outside the budget (see [`ResourceUsage::v8_heap_emergency`]).
     V8HeapReserved,
     /// V8 external memory the guest has explicitly declared via
     /// `napi_adjust_external_memory` (`NapiEnv::charge_declared_external`).
@@ -198,6 +244,15 @@ pub struct ResourceUsage {
     pub host_transient: u64,
     /// Charged serialized messages ([`Pool::SerializedMessage`]).
     pub serialized_message: u64,
+    /// V8 heap headroom currently exposed *outside* the budget to isolates
+    /// whose growth was refused and that are being terminated (see
+    /// [`DEFAULT_HEAP_EMERGENCY_HEADROOM`]). Not part of `mem_charged`.
+    pub v8_heap_emergency: u64,
+    /// V8 heap headroom currently lent, uncharged, to isolates for an
+    /// allocation that may be pending, until the isolate's next interrupt
+    /// check (see [`napi_host_near_heap_limit_grant`]). Not part of
+    /// `mem_charged`.
+    pub v8_heap_lease: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -253,6 +308,13 @@ pub struct ResourceBudget {
     host_bookkeeping: AtomicU64,
     host_transient: AtomicU64,
     serialized_message: AtomicU64,
+    /// Heap headroom a refused grow step exposes per isolate.
+    heap_emergency_headroom: AtomicU64,
+    /// Emergency headroom currently exposed, over all stopping isolates. Not
+    /// a charge: the budget is exhausted when it is used.
+    v8_heap_emergency: AtomicU64,
+    /// Headroom currently lent to isolates for a pending allocation.
+    v8_heap_lease: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -319,6 +381,9 @@ impl ResourceBudget {
             host_bookkeeping: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
             serialized_message: AtomicU64::new(0),
+            heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
+            v8_heap_emergency: AtomicU64::new(0),
+            v8_heap_lease: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -334,6 +399,9 @@ impl ResourceBudget {
             host_bookkeeping: AtomicU64::new(0),
             host_transient: AtomicU64::new(0),
             serialized_message: AtomicU64::new(0),
+            heap_emergency_headroom: AtomicU64::new(DEFAULT_HEAP_EMERGENCY_HEADROOM),
+            v8_heap_emergency: AtomicU64::new(0),
+            v8_heap_lease: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -468,6 +536,8 @@ impl ResourceBudget {
             host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
             host_transient: self.host_transient.load(Ordering::Acquire),
             serialized_message: self.serialized_message.load(Ordering::Acquire),
+            v8_heap_emergency: self.v8_heap_emergency.load(Ordering::Acquire),
+            v8_heap_lease: self.v8_heap_lease.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -475,6 +545,34 @@ impl ResourceBudget {
     /// Number of live V8 isolates counted against `max_envs`.
     pub fn live_isolates(&self) -> usize {
         self.live_isolates.load(Ordering::Acquire)
+    }
+
+    /// Heap headroom exposed to an isolate whose growth this budget refused
+    /// (see [`DEFAULT_HEAP_EMERGENCY_HEADROOM`]).
+    pub fn heap_emergency_headroom(&self) -> u64 {
+        self.heap_emergency_headroom.load(Ordering::Acquire)
+    }
+
+    /// Overrides the emergency headroom for refusals after this call.
+    ///
+    /// Less than [`DEFAULT_HEAP_EMERGENCY_HEADROOM`] lets a single allocation
+    /// larger than the value abort the process again; it is for a host that
+    /// runs few, large isolates and prefers a smaller transient overshoot.
+    pub fn set_heap_emergency_headroom(&self, bytes: u64) {
+        self.heap_emergency_headroom.store(bytes, Ordering::Release);
+    }
+
+    /// Records headroom exposed to a stopping isolate.
+    fn expose_heap_emergency(&self, bytes: u64) {
+        self.v8_heap_emergency.fetch_add(bytes, Ordering::AcqRel);
+        HEAP_EMERGENCY_GRANTS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The isolate that was exposed `bytes` of emergency headroom is gone.
+    pub(crate) fn release_heap_emergency(&self, bytes: u64) {
+        if bytes != 0 {
+            self.v8_heap_emergency.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 
     /// Reserve budget for a new V8 env: acquire an isolate slot against
@@ -595,65 +693,298 @@ impl ResourceBudget {
 /// Per-V8-env heap-growth tracker shared with the host-owned near-heap-limit
 /// callback.
 ///
-/// Boxed at env creation and handed to the callback as an opaque pointer; the
-/// owning [`crate::env::NapiEnv`] reclaims it at env teardown to release the
-/// bytes granted beyond the initial ceiling.
+/// Boxed at env creation and handed to the bridge as an opaque pointer; the
+/// owning [`crate::env::NapiEnv`] reclaims it at env teardown, after the
+/// isolate is gone, to release the bytes granted beyond the initial ceiling,
+/// any lease and any emergency headroom.
 pub(crate) struct EnvHeapCharge {
     pub(crate) budget: Arc<ResourceBudget>,
     pub(crate) env: usize,
     pub(crate) host_stopped: Arc<AtomicBool>,
-    pub(crate) unwind_slack_available: AtomicBool,
-    /// Bytes granted beyond the initial ceiling by grow-step grants.
+    /// Heap exposed outside the budget by the first refused grow step (the
+    /// pre-charged unwind slack plus the emergency headroom); `0` until then.
+    /// Set once, so a stopping isolate cannot expand its limit repeatedly.
+    pub(crate) emergency_exposed: AtomicU64,
+    /// Bytes granted beyond the initial ceiling (grow steps and reconciles).
     pub(crate) granted: AtomicU64,
+    /// The old-generation limit the budget paid for: the ceiling forwarded at
+    /// creation plus `granted`.
+    pub(crate) charged_limit: AtomicU64,
+    /// The isolate's old-generation limit as last answered or set: what V8's
+    /// post-collection check compares the committed old generation with.
+    /// Above `charged_limit` by `lease` while a lease is out.
+    pub(crate) old_limit: AtomicU64,
+    /// Headroom lent to V8, uncharged, for an allocation that may be pending
+    /// (see [`napi_host_near_heap_limit_grant`]); `0` when none is out.
+    pub(crate) lease: AtomicU64,
+}
+
+impl EnvHeapCharge {
+    pub(crate) fn new(
+        budget: Arc<ResourceBudget>,
+        env: usize,
+        host_stopped: Arc<AtomicBool>,
+        old_limit: u64,
+    ) -> Self {
+        Self {
+            budget,
+            env,
+            host_stopped,
+            emergency_exposed: AtomicU64::new(0),
+            granted: AtomicU64::new(0),
+            charged_limit: AtomicU64::new(old_limit),
+            old_limit: AtomicU64::new(old_limit),
+            lease: AtomicU64::new(0),
+        }
+    }
+
+    /// Stops the isolate's application for good: the budget refused its
+    /// heap. Sticky, so the env's release runs no guest code either.
+    fn deny(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        if self.env != 0 {
+            unsafe {
+                crate::snapi::snapi_bridge_unofficial_stop_execution(
+                    self.env as crate::snapi::SnapiEnv,
+                );
+            }
+        }
+    }
+
+    /// Sets the outstanding lease, keeping the budget's lease counter exact.
+    fn set_lease(&self, bytes: u64) {
+        let previous = self.lease.swap(bytes, Ordering::AcqRel);
+        if bytes > previous {
+            self.budget
+                .v8_heap_lease
+                .fetch_add(bytes - previous, Ordering::AcqRel);
+        } else if previous > bytes {
+            self.budget
+                .v8_heap_lease
+                .fetch_sub(previous - bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Exposes, once, the unwind slack and the emergency headroom (or `need`
+    /// past the current limit, if larger) to a stopping isolate. The new
+    /// limit, or `None` if they were exposed before.
+    fn expose_emergency(&self, current_limit: usize, need: u64) -> Option<usize> {
+        let exposed =
+            DEFAULT_UNWIND_SLACK.saturating_add(self.budget.heap_emergency_headroom().max(need));
+        self.emergency_exposed
+            .compare_exchange(0, exposed, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        self.budget.expose_heap_emergency(exposed);
+        Some(current_limit.saturating_add(usize::try_from(exposed).unwrap_or(usize::MAX)))
+    }
+
+    /// Returns what the tracker still holds outside the grants: the lease
+    /// and the emergency exposure. At env teardown.
+    pub(crate) fn release_exposure(&self) {
+        self.set_lease(0);
+        self.budget
+            .release_heap_emergency(self.emergency_exposed.load(Ordering::Acquire));
+    }
 }
 
 /// Host-owned near-heap-limit callback for a budgeted V8 isolate.
 ///
-/// When V8 approaches a heap ceiling it invokes this on the isolate's JS
-/// thread. We charge one [`DEFAULT_HEAP_GROW_STEP`] against the budget and, if
-/// granted, raise the limit by that step. If the budget is exhausted, request
-/// isolate termination and expose the pre-reserved unwind slack once. A second
-/// denial leaves the limit unchanged, so the quota cannot be expanded repeatedly. The budget is atomic, so this is safe
-/// to call concurrently with charges on other threads.
+/// V8 calls it on the isolate's thread when the heap nears its limit, and
+/// takes one answer per occasion: if the answer is too small V8 aborts the
+/// whole process. Three cases matter (`Heap::CollectAllAvailableGarbage`,
+/// `Heap::CheckHeapLimitReached`, `HeapAllocator::RetryCustomAllocateOrFail`
+/// in V8 15.9):
+///
+/// * After a collection the old generation is over the limit
+///   (`committed_old_generation > current_limit`): V8 aborts unless the
+///   answer covers it. The old generation can get there with no earlier
+///   callback, because `NewLargeObjectSpace::AllocateRaw` admits the first
+///   large young object regardless of the limit (`new Array(3e7)` is one
+///   240 MB object) and the next full collection promotes it. The callback
+///   charges the overshoot past what the budget paid for, plus one
+///   [`DEFAULT_HEAP_GROW_STEP`].
+/// * Before the last-resort collection of a failed allocation, or after
+///   ineffective mark-compacts, the old generation is within the limit: an
+///   allocation of unknown size (up to one maximal object, 1 GiB) is pending,
+///   and V8 retries it against the answer once, with no further callback, and
+///   aborts if it does not fit. A paid step alone may not cover it, so the
+///   answer also *lends* headroom for one maximal object, uncharged
+///   ([`ResourceUsage::v8_heap_lease`]). `reconcile_out` then asks the bridge
+///   for an interrupt, which runs after the allocation: it charges what the
+///   heap really uses and lowers V8's limit back to what the budget paid for
+///   ([`napi_host_heap_reconcile`]). The next return from JavaScript does the
+///   same if the interrupt did not run.
+/// * If the budget refuses, the callback stops the application (sticky) and
+///   exposes, once, the pre-charged unwind slack plus the budget's emergency
+///   headroom ([`DEFAULT_HEAP_EMERGENCY_HEADROOM`], or the overshoot if
+///   larger), so the failed allocation completes while termination lands.
+///   After that it can only nudge the limit by a page, which keeps V8's
+///   ineffective-mark-compact check from aborting.
+///
+/// The budget is atomic, so this is safe concurrently with charges on other
+/// threads.
 ///
 /// # Safety
 /// `data` must be null or a pointer to an [`EnvHeapCharge`] that outlives the
-/// call. The tracker is freed only at env teardown — after the callback is
-/// removed from the isolate and while no JS runs — so a non-null pointer is
-/// valid for every real invocation.
+/// call, and `reconcile_out` null or writable. The tracker is freed only
+/// after the env's isolate is disposed, so a non-null pointer is valid for
+/// every real invocation.
 #[unsafe(no_mangle)]
-pub extern "C" fn napi_host_near_heap_limit_grant(
+pub unsafe extern "C" fn napi_host_near_heap_limit_grant(
     data: *const c_void,
     current_limit: usize,
     _initial_limit: usize,
+    committed_old_generation: usize,
+    young_large_objects: usize,
+    reconcile_out: *mut i32,
 ) -> usize {
     if data.is_null() {
         return current_limit;
     }
     // SAFETY: see the function's safety contract.
     let tracker = unsafe { &*(data as *const EnvHeapCharge) };
-    let step = DEFAULT_HEAP_GROW_STEP;
-    match tracker.budget.try_charge(Pool::V8HeapReserved, step) {
+    let committed = committed_old_generation as u64;
+    let charged = tracker.charged_limit.load(Ordering::Acquire);
+    let overshoot = committed.saturating_sub(charged);
+    let grant = overshoot.saturating_add(DEFAULT_HEAP_GROW_STEP);
+    let answer = match tracker.budget.try_charge(Pool::V8HeapReserved, grant) {
         Ok(()) => {
-            tracker.granted.fetch_add(step, Ordering::AcqRel);
-            current_limit.saturating_add(step as usize)
+            tracker.granted.fetch_add(grant, Ordering::AcqRel);
+            let paid = charged.saturating_add(grant);
+            tracker.charged_limit.store(paid, Ordering::Release);
+            // V8 applies only a limit above the current one, and aborts if a
+            // forced call gets none.
+            let mut answer = paid.max((current_limit.saturating_add(HEAP_PAGE)) as u64);
+            // An allocation may be pending (see above): lend it room, unless
+            // the isolate is already stopping on its emergency headroom (whose
+            // exposure is counted there). Every paid grant lends: the
+            // committed figure can exceed the limit while V8's capacity, which
+            // its retry is checked against, does not.
+            let lease = if tracker.emergency_exposed.load(Ordering::Acquire) == 0 {
+                let pending = committed
+                    .saturating_add(young_large_objects as u64)
+                    .saturating_add(tracker.budget.heap_emergency_headroom());
+                answer = answer.max(pending);
+                answer - paid
+            } else {
+                0
+            };
+            tracker.set_lease(lease);
+            if lease > 0 && !reconcile_out.is_null() {
+                // SAFETY: see the function's safety contract.
+                unsafe { reconcile_out.write(1) };
+            }
+            usize::try_from(answer).unwrap_or(usize::MAX)
         }
         Err(_) => {
-            tracker.host_stopped.store(true, Ordering::Release);
-            if tracker.env != 0 {
-                unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                        tracker.env as crate::snapi::SnapiEnv,
-                    );
-                }
-            }
-            if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
-                current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
-            } else {
-                current_limit
-            }
+            tracker.deny();
+            tracker
+                .expose_emergency(current_limit, overshoot)
+                .unwrap_or_else(|| {
+                    // The stopping isolate went past the headroom before
+                    // reaching an interrupt check. Nothing more can be
+                    // granted safely.
+                    HEAP_EMERGENCY_EXHAUSTED.fetch_add(1, Ordering::AcqRel);
+                    current_limit.saturating_add(HEAP_PAGE)
+                })
         }
+    };
+    tracker.old_limit.store(answer as u64, Ordering::Release);
+    answer
+}
+
+/// What V8 needs to move a limit by at least one page.
+const HEAP_PAGE: usize = 256 * 1024;
+
+/// Ends a lease [`napi_host_near_heap_limit_grant`] lent V8. On the isolate's
+/// thread, outside a collection, after the pending allocation: charges what
+/// the heap uses past what the budget paid for, and what V8 will keep when its
+/// limit is restored (never below 1.25 times the live bytes), then writes the
+/// limit V8 must be lowered to. Returns 1 when V8's limit must be lowered, 0
+/// otherwise (no lease, or the budget refused: the application is then
+/// stopped, and the lent headroom becomes its emergency headroom).
+///
+/// # Safety
+/// As [`napi_host_near_heap_limit_grant`]; `limit_out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_heap_reconcile(
+    data: *const c_void,
+    committed_old_generation: usize,
+    young_large_objects: usize,
+    used: usize,
+    limit_out: *mut usize,
+) -> i32 {
+    if data.is_null() || limit_out.is_null() {
+        return 0;
     }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let lease = tracker.lease.load(Ordering::Acquire);
+    if lease == 0 {
+        return 0;
+    }
+    tracker.set_lease(0);
+    if tracker.emergency_exposed.load(Ordering::Acquire) != 0 {
+        return 0;
+    }
+    let charged = tracker.charged_limit.load(Ordering::Acquire);
+    let in_use = (committed_old_generation as u64).saturating_add(young_large_objects as u64);
+    let floor = (used as u64).saturating_add(used as u64 / 4);
+    let target = in_use.max(floor).max(charged);
+    let growth = target - charged;
+    if tracker
+        .budget
+        .try_charge(Pool::V8HeapReserved, growth)
+        .is_err()
+    {
+        // The lent headroom stays: the isolate is stopping on it.
+        tracker.deny();
+        let current = tracker.old_limit.load(Ordering::Acquire);
+        let exposed = current.saturating_sub(charged);
+        if tracker
+            .emergency_exposed
+            .compare_exchange(0, exposed, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracker.budget.expose_heap_emergency(exposed);
+        }
+        return 0;
+    }
+    tracker.granted.fetch_add(growth, Ordering::AcqRel);
+    tracker.charged_limit.store(target, Ordering::Release);
+    tracker.old_limit.store(target, Ordering::Release);
+    // SAFETY: see the function's safety contract.
+    unsafe { limit_out.write(usize::try_from(target).unwrap_or(usize::MAX)) };
+    1
+}
+
+/// Whether a lease is out (the bridge then reconciles it at the next return
+/// from JavaScript).
+///
+/// # Safety
+/// As [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_heap_lease_pending(data: *const c_void) -> i32 {
+    if data.is_null() {
+        return 0;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    i32::from(tracker.lease.load(Ordering::Acquire) != 0)
+}
+
+/// The isolate's old-generation limit as last answered or set.
+///
+/// # Safety
+/// As [`napi_host_near_heap_limit_grant`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_heap_old_limit(data: *const c_void) -> u64 {
+    if data.is_null() {
+        return 0;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    tracker.old_limit.load(Ordering::Acquire)
 }
 
 /// Charges `bytes` of host bookkeeping for the native bridge (see
@@ -1340,75 +1671,216 @@ mod tests {
         assert_eq!(budget.live_isolates(), 1, "still counted for observability");
     }
 
+    fn grant(data: *const c_void, current: usize, committed: usize) -> (usize, bool) {
+        let mut reconcile = 0;
+        let answer = unsafe {
+            napi_host_near_heap_limit_grant(data, current, current, committed, 0, &mut reconcile)
+        };
+        (answer, reconcile != 0)
+    }
+
     #[test]
     fn near_heap_limit_callback_grants_until_budget_exhausted() {
         let step = DEFAULT_HEAP_GROW_STEP as usize;
         // The unwind slack is pre-reserved as part of the env ceiling, with room
-        // for exactly two additional grow-step grants.
-        let budget =
-            ResourceBudget::with_memory_limit(DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP);
+        // for exactly two grow steps, each with a one-byte overshoot.
+        let budget = ResourceBudget::with_memory_limit(
+            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP + 2,
+        );
         budget
             .try_charge(Pool::V8HeapReserved, DEFAULT_UNWIND_SLACK)
             .unwrap();
+        // No headroom: the grants below lend nothing (see the lease tests).
+        budget.set_heap_emergency_headroom(0);
         let host_stopped = Arc::new(AtomicBool::new(false));
-        let ptr = Box::into_raw(Box::new(EnvHeapCharge {
-            budget: Arc::clone(&budget),
-            env: 0,
-            host_stopped: Arc::clone(&host_stopped),
-            unwind_slack_available: AtomicBool::new(true),
-            granted: AtomicU64::new(0),
-        }));
-        let data = ptr as *const c_void;
         let base = 100 * 1024 * 1024usize;
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::clone(&host_stopped),
+            base as u64,
+        )));
+        let data = ptr as *const c_void;
+        // With no headroom configured, the exposure is the slack plus the
+        // overshoot.
+        let emergency = (DEFAULT_UNWIND_SLACK + 1) as usize;
+        let grants_before = heap_emergency_stats().grants;
 
-        // Each of the first two grants raises the limit by a step and charges it.
+        // Forced calls (the old generation already past the limit) raise the
+        // limit by the overshoot plus a step.
+        assert_eq!(grant(data, base, base + 1), (base + step + 1, false));
         assert_eq!(
-            napi_host_near_heap_limit_grant(data, base, base),
-            base + step
-        );
-        assert_eq!(
-            napi_host_near_heap_limit_grant(data, base + step, base),
-            base + 2 * step
+            grant(data, base + step + 1, base + step + 2),
+            (base + 2 * step + 2, false)
         );
         assert_eq!(
             budget.snapshot().v8_heap_reserved,
-            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP
+            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP + 2
         );
+        assert_eq!(budget.snapshot().v8_heap_lease, 0);
 
-        // Budget exhaustion requests termination and exposes the already-reserved
-        // unwind slack exactly once.
+        // Budget exhaustion requests termination and exposes the unwind slack
+        // plus the emergency headroom (here: the overshoot) exactly once; it
+        // is reported outside the budget, not charged to it.
+        let limit = base + 2 * step + 2;
+        assert_eq!(grant(data, limit, limit + 1), (limit + emergency, false));
+        // Later refusals only nudge the limit by a page.
         assert_eq!(
-            napi_host_near_heap_limit_grant(data, base + 2 * step, base),
-            base + 2 * step + DEFAULT_UNWIND_SLACK as usize
+            grant(data, limit + emergency, limit + emergency + 1),
+            (limit + emergency + HEAP_PAGE, false)
         );
-        assert_eq!(
-            napi_host_near_heap_limit_grant(
-                data,
-                base + 2 * step + DEFAULT_UNWIND_SLACK as usize,
-                base,
-            ),
-            base + 2 * step + DEFAULT_UNWIND_SLACK as usize
-        );
-        assert_eq!(
-            budget.snapshot().v8_heap_reserved,
-            DEFAULT_UNWIND_SLACK + 2 * DEFAULT_HEAP_GROW_STEP
-        );
-
+        let usage = budget.snapshot();
+        assert_eq!(usage.v8_heap_emergency, emergency as u64);
+        assert!(heap_emergency_stats().grants > grants_before);
         assert!(host_stopped.load(Ordering::Acquire));
 
-        // The tracker recorded exactly what was granted, and releasing it (as
-        // env teardown does) returns the pool to zero.
+        // Teardown returns the grants and the exposure.
         let tracker = unsafe { Box::from_raw(ptr) };
         let granted = tracker.granted.load(Ordering::Acquire);
-        assert_eq!(granted, 2 * DEFAULT_HEAP_GROW_STEP);
         budget.uncharge(Pool::V8HeapReserved, granted + DEFAULT_UNWIND_SLACK);
-        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        tracker.release_exposure();
+        let usage = budget.snapshot();
+        assert_eq!(usage.v8_heap_reserved, 0);
+        assert_eq!(usage.v8_heap_emergency, 0);
+    }
+
+    #[test]
+    fn a_grant_before_a_pending_allocation_lends_headroom_until_reconciled() {
+        let budget = ResourceBudget::with_memory_limit(1024 * MIB);
+        let limit = 64 * MIB as usize;
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            limit as u64,
+        )));
+        let data = ptr as *const c_void;
+        // Within the limit: an allocation (up to one maximal object) may be
+        // pending. One step is paid; a maximal object's room is lent.
+        let committed = limit - MIB as usize;
+        let (answer, reconcile) = grant(data, limit, committed);
+        assert!(reconcile);
+        assert_eq!(
+            answer as u64,
+            committed as u64 + budget.heap_emergency_headroom()
+        );
+        let paid = limit as u64 + DEFAULT_HEAP_GROW_STEP;
+        assert_eq!(budget.snapshot().v8_heap_reserved, DEFAULT_HEAP_GROW_STEP);
+        assert_eq!(budget.snapshot().v8_heap_lease, answer as u64 - paid);
+        assert_eq!(unsafe { napi_host_heap_lease_pending(data) }, 1);
+
+        // The allocation used 200 MiB of it: the reconcile charges that and
+        // lowers V8's limit to it.
+        let in_use = paid as usize + 200 * MIB as usize;
+        let mut lowered = 0usize;
+        assert_eq!(
+            unsafe { napi_host_heap_reconcile(data, in_use, 0, in_use / 2, &mut lowered) },
+            1
+        );
+        assert_eq!(lowered, in_use);
+        assert_eq!(budget.snapshot().v8_heap_lease, 0);
+        assert_eq!(
+            budget.snapshot().v8_heap_reserved,
+            in_use as u64 - limit as u64
+        );
+        assert_eq!(unsafe { napi_host_heap_old_limit(data) }, in_use as u64);
+        assert_eq!(unsafe { napi_host_heap_lease_pending(data) }, 0);
+        // Nothing to reconcile twice.
+        assert_eq!(
+            unsafe { napi_host_heap_reconcile(data, in_use, 0, 0, &mut lowered) },
+            0
+        );
+
+        // The live bytes V8 keeps on restore (1.25x) are charged as well.
+        let (_, reconcile) = grant(data, in_use, in_use - MIB as usize);
+        assert!(reconcile);
+        let used = in_use;
+        assert_eq!(
+            unsafe { napi_host_heap_reconcile(data, in_use, 0, used, &mut lowered) },
+            1
+        );
+        assert_eq!(lowered as u64, used as u64 + used as u64 / 4);
+        let tracker = unsafe { Box::from_raw(ptr) };
+        budget.uncharge(
+            Pool::V8HeapReserved,
+            tracker.granted.load(Ordering::Acquire),
+        );
+        tracker.release_exposure();
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn a_refused_reconcile_stops_the_isolate_on_its_lent_headroom() {
+        let limit = 64 * MIB as usize;
+        let budget = ResourceBudget::with_memory_limit(DEFAULT_HEAP_GROW_STEP);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::clone(&stopped),
+            limit as u64,
+        )));
+        let data = ptr as *const c_void;
+        let (answer, reconcile) = grant(data, limit, limit / 2);
+        assert!(reconcile);
+        let mut lowered = 0usize;
+        // The pending allocation used more than the budget has left.
+        let in_use = limit + 2 * DEFAULT_HEAP_GROW_STEP as usize;
+        assert_eq!(
+            unsafe { napi_host_heap_reconcile(data, in_use, 0, 0, &mut lowered) },
+            0
+        );
+        assert!(stopped.load(Ordering::Acquire));
+        let usage = budget.snapshot();
+        assert_eq!(usage.v8_heap_lease, 0);
+        assert_eq!(
+            usage.v8_heap_emergency,
+            answer as u64 - limit as u64 - DEFAULT_HEAP_GROW_STEP
+        );
+        let tracker = unsafe { Box::from_raw(ptr) };
+        budget.uncharge(
+            Pool::V8HeapReserved,
+            tracker.granted.load(Ordering::Acquire),
+        );
+        tracker.release_exposure();
+        assert_eq!(budget.snapshot().v8_heap_emergency, 0);
+    }
+
+    #[test]
+    fn a_paid_grant_always_raises_the_limit() {
+        // A stopping isolate (its emergency headroom exposed) whose budget
+        // frees up again: a paid grant must still raise V8's limit, which
+        // already sits above the paid figure, or V8 aborts.
+        let budget = ResourceBudget::with_memory_limit(1024 * MIB);
+        let limit = 64 * MIB as usize;
+        let ptr = Box::into_raw(Box::new(EnvHeapCharge::new(
+            Arc::clone(&budget),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            limit as u64,
+        )));
+        let tracker = unsafe { &*ptr };
+        tracker.emergency_exposed.store(1, Ordering::Release);
+        let current = limit + 1024 * MIB as usize;
+        let (answer, reconcile) = grant(ptr as *const c_void, current, current - 4 * MIB as usize);
+        assert!(answer > current, "{answer} <= {current}");
+        assert!(!reconcile, "a stopping isolate is lent nothing");
+        assert_eq!(budget.snapshot().v8_heap_lease, 0);
+        let tracker = unsafe { Box::from_raw(ptr) };
+        budget.uncharge(
+            Pool::V8HeapReserved,
+            tracker.granted.load(Ordering::Acquire),
+        );
+        tracker.emergency_exposed.store(0, Ordering::Release);
+        tracker.release_exposure();
     }
 
     #[test]
     fn near_heap_limit_callback_ignores_null_data() {
         assert_eq!(
-            napi_host_near_heap_limit_grant(std::ptr::null(), 42, 7),
+            unsafe {
+                napi_host_near_heap_limit_grant(std::ptr::null(), 42, 7, 0, 0, std::ptr::null_mut())
+            },
             42,
             "a null tracker leaves the limit unchanged"
         );

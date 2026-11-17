@@ -107,6 +107,15 @@ fn with_cb_context<R>(
 ) -> Result<R, WasiError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
     let r = with_callback_state(env, snapi_env, f);
+    if !snapi_env.is_null() {
+        // JavaScript may have left memory past the heap limit that no
+        // collection examined; settle it before the guest goes on (see
+        // `napi_host_near_heap_limit_grant`). The check is not free, so the
+        // tracker decides, lock-free, whether this return is due.
+        if env.data().heap_tracker_for(snapi_env).is_some() {
+            unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
+        }
+    }
     if let Some(code) = take_pending_guest_exit() {
         return Err(WasiError::Exit(code));
     }
@@ -681,7 +690,7 @@ fn guest_unofficial_napi_cancel_terminate_execution(
     let env_handle = snapi_env(&env, napi_env);
     if env.data().host_stopped() {
         unsafe {
-            snapi_bridge_unofficial_terminate_execution(env_handle);
+            snapi_bridge_unofficial_stop_execution(env_handle);
         }
         return 1;
     }

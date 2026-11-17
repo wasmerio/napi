@@ -136,6 +136,10 @@ unsafe extern "C" {
     /// Register a host-owned near-heap-limit callback that charges V8 heap
     /// growth against the resource budget. `data` is an
     /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
+    /// After JavaScript ran on this thread: runs a collection if the heap
+    /// holds memory past `old_generation_limit` that no collection examined,
+    /// so the near-heap-limit callback sees it. Nonzero when one ran.
+    pub fn snapi_bridge_unofficial_settle_heap(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
         env: SnapiEnv,
         data: *const c_void,
@@ -202,6 +206,9 @@ unsafe extern "C" {
         accepted_hooks_out: *mut u64,
     ) -> i32;
     pub fn snapi_bridge_unofficial_terminate_execution(env: SnapiEnv) -> i32;
+    /// Like terminate, but sticky: the host stopped the application, so the
+    /// env's release runs no guest code either.
+    pub fn snapi_bridge_unofficial_stop_execution(env: SnapiEnv) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_retain_env(env: SnapiEnv);
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]

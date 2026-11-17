@@ -2115,14 +2115,20 @@ napi_status StructuredCloneImpl(
 
 }  // namespace
 
-void napi_agent__::Shutdown() {
-  DisposeProfilers(this);
+void napi_agent__::RemoveNearHeapLimitCallback() {
   if (near_heap_limit_installed) {
     near_heap_limit_installed = false;
     isolate->RemoveNearHeapLimitCallback(NearHeapLimitCallback, 0);
   }
   near_heap_limit_callback = nullptr;
   near_heap_limit_data = nullptr;
+}
+
+void napi_agent__::Shutdown() {
+  DisposeProfilers(this);
+  // The near-heap-limit callback stays until the release has run the env's
+  // hooks and finalizers (ReleaseEnvScope): their JavaScript can still
+  // exhaust the heap, and without the callback V8 would abort the process.
   fatal_error_callback = nullptr;
   oom_error_callback = nullptr;
   // The release runs its hooks and finalizers with JS usable. As a cancel,
@@ -2410,6 +2416,155 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
+}  // extern "C"
+
+namespace {
+
+struct HeapSpaces {
+  int young_large_objects = -1;
+  std::vector<size_t> old_generation;
+};
+
+// Which heap spaces are which, by name: Heap::OldGenerationCapacity() (what
+// V8 compares with the hard limit) covers the paged old-generation spaces and
+// the old large-object spaces, i.e. everything but the young generation and
+// the read-only space.
+HeapSpaces ResolveHeapSpaces(v8::Isolate* isolate) {
+  HeapSpaces spaces;
+  const size_t count = isolate->NumberOfHeapSpaces();
+  for (size_t index = 0; index < count; ++index) {
+    v8::HeapSpaceStatistics stats;
+    if (!isolate->GetHeapSpaceStatistics(&stats, index)) continue;
+    const char* name = stats.space_name();
+    if (name == nullptr || std::strcmp(name, "read_only_space") == 0 ||
+        std::strcmp(name, "new_space") == 0) {
+      continue;
+    }
+    if (std::strcmp(name, "new_large_object_space") == 0) {
+      spaces.young_large_objects = static_cast<int>(index);
+      continue;
+    }
+    spaces.old_generation.push_back(index);
+  }
+  return spaces;
+}
+
+// The isolate's young large-object space (or -1) and old-generation spaces,
+// cached on its agent when there is one (`scratch` otherwise): read on every
+// return from JavaScript, so nothing is copied.
+int YoungLargeObjectSpace(v8::Isolate* isolate, napi_agent__* agent, HeapSpaces* scratch) {
+  if (agent == nullptr) {
+    *scratch = ResolveHeapSpaces(isolate);
+    return scratch->young_large_objects;
+  }
+  if (!agent->heap_spaces_resolved) {
+    HeapSpaces resolved = ResolveHeapSpaces(isolate);
+    agent->young_large_object_space = resolved.young_large_objects;
+    agent->old_generation_spaces = std::move(resolved.old_generation);
+    agent->heap_spaces_resolved = true;
+  }
+  return agent->young_large_object_space;
+}
+
+const std::vector<size_t>& OldGenerationSpaces(napi_agent__* agent, const HeapSpaces& scratch) {
+  return agent != nullptr ? agent->old_generation_spaces : scratch.old_generation;
+}
+
+size_t SpaceSize(v8::Isolate* isolate, size_t index) {
+  v8::HeapSpaceStatistics stats;
+  return isolate->GetHeapSpaceStatistics(&stats, index) ? stats.space_size() : 0;
+}
+
+}  // namespace
+
+// Reading space statistics neither allocates nor collects, so this is safe
+// inside a near-heap-limit callback. The committed figure bounds V8's
+// capacity from above, so a limit raised to cover it satisfies V8.
+napi_status NapiV8GetHeapUsage(napi_env env, NapiV8HeapUsage* result) {
+  if (result == nullptr) return napi_invalid_arg;
+  *result = {};
+  v8::Isolate* isolate =
+      env != nullptr ? env->isolate : v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return napi_invalid_arg;
+  HeapSpaces scratch;
+  napi_agent__* agent = env != nullptr ? env->agent : nullptr;
+  const int young_large = YoungLargeObjectSpace(isolate, agent, &scratch);
+  for (size_t index : OldGenerationSpaces(agent, scratch)) {
+    result->committed_old_generation += SpaceSize(isolate, index);
+  }
+  if (young_large >= 0) {
+    result->young_large_objects = SpaceSize(isolate, static_cast<size_t>(young_large));
+  }
+  v8::HeapStatistics heap;
+  isolate->GetHeapStatistics(&heap);
+  result->used = heap.used_heap_size();
+  return napi_ok;
+}
+
+napi_status NapiV8CollectGarbageIfOverHeapLimit(
+    napi_env env, size_t old_generation_limit, bool* collected) {
+  if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
+    return napi_invalid_arg;
+  }
+  *collected = false;
+  v8::Isolate* isolate = env->isolate;
+  // The old generation is limit-checked on every allocation, also on the
+  // retry of a failed one. What V8 admits without a check is the first large
+  // object of the young generation (NewLargeObjectSpace::AllocateRaw): only
+  // then can the heap hold more than its limit with no callback having run.
+  // Its counter is the one read on every return.
+  HeapSpaces scratch;
+  const int young_large_space = YoungLargeObjectSpace(isolate, env->agent, &scratch);
+  if (young_large_space < 0) return napi_ok;
+  const size_t young_large = SpaceSize(isolate, static_cast<size_t>(young_large_space));
+  if (young_large == 0) return napi_ok;
+  size_t committed_old = 0;
+  for (size_t index : OldGenerationSpaces(env->agent, scratch)) {
+    committed_old += SpaceSize(isolate, index);
+  }
+  size_t limit = old_generation_limit;
+  if (limit == 0) {
+    v8::HeapStatistics heap;
+    isolate->GetHeapStatistics(&heap);
+    limit = heap.heap_size_limit();
+  }
+  if (committed_old + young_large <= limit) return napi_ok;
+  // A full collection promotes the young large objects (or frees them, if
+  // they are garbage), then compares the live old generation with the limit
+  // and calls the near-heap-limit callback if it is still exceeded, which
+  // charges the growth or stops the env. So this stops only an env that
+  // *retains* memory past its budget. The callback may create handles.
+  v8::HandleScope handle_scope(isolate);
+  isolate->LowMemoryNotification();
+  *collected = true;
+  return napi_ok;
+}
+
+// This part of cancellation neither enters JavaScript nor calls the waker.
+napi_status NapiV8ClearTermination(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (env->agent != nullptr) {
+    env->agent->termination_requested.store(false, std::memory_order_release);
+  }
+  env->isolate->CancelTerminateExecution();
+  // Drop the termination sentinel so a later call cannot throw it as null.
+  napi_v8_drop_pending_termination(env);
+  return napi_ok;
+}
+
+void NapiV8WakeAfterTermination(napi_env env) {
+  // Checkpoints refused during termination left work queued. Wake the host
+  // again so it can take the checkpoint that runs it.
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
+}
+
+extern "C" {
+
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
                                                            napi_value* result) {
@@ -2583,6 +2738,8 @@ napi_status ReleaseEnvScope(unofficial_napi_env_owner owner,
     status = DestroyEnvInstance(scope->env);
     scope->env = nullptr;
   }
+  // The env's hooks and finalizers ran; no more JavaScript.
+  if (scope->agent != nullptr) scope->agent->RemoveNearHeapLimitCallback();
 
   v8::Isolate* isolate = scope->isolate;
   // Keeps the allocator alive until the isolate is disposed.
@@ -2818,26 +2975,9 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
 }
 
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  if (env->agent != nullptr) {
-    env->agent->termination_requested.store(false, std::memory_order_release);
-  }
-  env->isolate->CancelTerminateExecution();
-  // A call the termination failed left its null pending. Nothing threw it:
-  // left there, the native function that cancels would throw it into its
-  // caller as a catchable null.
-  napi_v8_drop_pending_termination(env);
-  // The checkpoints the termination refused ran none of the tasks V8 queued
-  // for them, and the host's foreground task waker was called only when each
-  // was posted: call it again, so that a host that sleeps until it is woken
-  // takes the checkpoint that runs them now.
-  EdgeV8Platform* platform = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    platform = g_runtime.platform.get();
-  }
-  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
-  return napi_ok;
+  const napi_status status = NapiV8ClearTermination(env);
+  if (status == napi_ok) NapiV8WakeAfterTermination(env);
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(

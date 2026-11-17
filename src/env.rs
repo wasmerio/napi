@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -378,19 +378,18 @@ impl NapiEnv {
             if self.host_stopped.load(Ordering::Acquire) {
                 // SAFETY: `env` is the isolate just created and is still live.
                 unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
+                    crate::snapi::snapi_bridge_unofficial_stop_execution(env);
                 }
             }
         }
 
         let tracker = if reservation.clamped {
-            let boxed = Box::into_raw(Box::new(EnvHeapCharge {
-                budget: Arc::clone(&self.budget),
-                env: env as usize,
-                host_stopped: Arc::clone(&self.host_stopped),
-                unwind_slack_available: std::sync::atomic::AtomicBool::new(true),
-                granted: AtomicU64::new(0),
-            }));
+            let boxed = Box::into_raw(Box::new(EnvHeapCharge::new(
+                Arc::clone(&self.budget),
+                env as usize,
+                Arc::clone(&self.host_stopped),
+                u64::from(reservation.max_old),
+            )));
             // SAFETY: `env` is the isolate just created; `boxed` outlives the
             // callback (freed only at this env's teardown, below).
             unsafe {
@@ -422,6 +421,19 @@ impl NapiEnv {
             },
         );
         (env_id, scope_id)
+    }
+
+    /// The heap tracker of a live budgeted env, or `None` for an env under
+    /// an unlimited budget (which has no heap limit to settle).
+    pub(crate) fn heap_tracker_for(&self, env: SnapiEnv) -> Option<&EnvHeapCharge> {
+        let env_id = self.napi_state_to_guest_env.get(&(env as usize))?;
+        let tracker = self.env_heap_charges.get(env_id)?.tracker;
+        if tracker == 0 {
+            return None;
+        }
+        // SAFETY: the box lives until `finish_unregister_napi_env` removes
+        // the handle, which happens only while no JavaScript runs on the env.
+        Some(unsafe { &*(tracker as *const EnvHeapCharge) })
     }
 
     /// Release a reservation whose env creation failed after [`reserve_isolate`].
@@ -639,6 +651,7 @@ impl NapiEnv {
                 // release has returned: its isolate, and with it the
                 // near-heap-limit callback holding this pointer, are gone.
                 let boxed = unsafe { Box::from_raw(handle.tracker as *mut EnvHeapCharge) };
+                boxed.release_exposure();
                 boxed.granted.load(Ordering::Acquire)
             } else {
                 0

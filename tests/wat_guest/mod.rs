@@ -466,6 +466,18 @@ impl Guest {
         self.call0("arm_spinning_finalizer")
     }
 
+    /// Replaces the script the [`Self::arm_spinning_finalizer`] finalizer
+    /// runs (at most 79 bytes; it spins for 30 s by default).
+    pub fn set_finalizer_script(&mut self, script: &str) {
+        assert!(script.len() < 80 && !script.contains('\0'));
+        let mut bytes = script.as_bytes().to_vec();
+        bytes.push(0);
+        self.memory
+            .view(&self.store)
+            .write(200, &bytes)
+            .expect("failed to write the finalizer script");
+    }
+
     /// Drains microtasks; returns the checkpoint status.
     pub fn checkpoint(&mut self) -> i32 {
         self.call0("checkpoint")

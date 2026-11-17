@@ -22,6 +22,11 @@ pub struct NapiLimits {
     pub total_memory_bytes: Option<u64>,
     pub max_total_external_memory: Option<u64>,
     pub max_total_heap_bytes: Option<u64>,
+    /// V8 heap headroom exposed outside the budget to an isolate whose growth
+    /// was refused, so V8 can finish the failed allocation while the isolate
+    /// is terminated instead of aborting the process. `None` uses
+    /// [`crate::budget::DEFAULT_HEAP_EMERGENCY_HEADROOM`].
+    pub heap_emergency_headroom_bytes: Option<u64>,
 }
 
 impl NapiLimits {
@@ -164,8 +169,9 @@ impl NapiRuntimeControl {
         {
             let envs = self.envs.lock().expect("poisoned N-API env registry");
             for env in envs.envs.values().copied() {
+                // Sticky: the env's release runs no guest code either.
                 unsafe {
-                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                    crate::snapi::snapi_bridge_unofficial_stop_execution(
                         env as crate::snapi::SnapiEnv,
                     );
                 }
@@ -248,6 +254,15 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Overrides the V8 heap headroom exposed to an isolate whose growth was
+    /// refused (see [`NapiLimits::heap_emergency_headroom_bytes`]). Less than
+    /// [`crate::budget::DEFAULT_HEAP_EMERGENCY_HEADROOM`] lets single
+    /// allocations larger than the override abort the process again.
+    pub fn heap_emergency_headroom(mut self, bytes: u64) -> Self {
+        self.limits.heap_emergency_headroom_bytes = Some(bytes);
+        self
+    }
+
     /// Delegate total-memory admission to the embedder.
     pub fn memory_accountant(mut self, accountant: Arc<dyn NapiMemoryAccountant>) -> Self {
         self.accountant = Some(accountant);
@@ -315,6 +330,9 @@ impl NapiCtxBuilder {
                 None => ResourceBudget::unlimited(),
             },
         };
+        if let Some(bytes) = self.limits.heap_emergency_headroom_bytes {
+            budget.set_heap_emergency_headroom(bytes);
+        }
         NapiCtx {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,

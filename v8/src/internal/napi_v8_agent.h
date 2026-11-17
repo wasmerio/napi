@@ -130,6 +130,15 @@ struct napi_agent__ {
   // NapiWebAssemblyPolicy::kRestricted: no context of the isolate has the
   // WebAssembly global or compiles wasm. Fixed once the agent is set up.
   bool webassembly_restricted = false;
+  // Heap space indices, resolved by name on first use: the young large-object
+  // space, and the spaces the hard old-generation limit governs.
+  int young_large_object_space = -1;
+  std::vector<size_t> old_generation_spaces;
+  bool heap_spaces_resolved = false;
+  // Removes the near-heap-limit callback. The release keeps it through the
+  // env's hooks and finalizers, which can run JavaScript.
+  void RemoveNearHeapLimitCallback();
+
   // The embedder's budget for host memory the provider allocates for this
   // isolate (NapiHostMemory), or null when nothing is charged.
   std::shared_ptr<NapiHostMemory> host_memory;

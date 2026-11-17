@@ -265,8 +265,11 @@ struct SnapiAgentState {
   // Under g_mu. Teardown runs guest finalizers, which can run JavaScript.
   // teardown_guest_calls counts guest code running from teardown; while it is
   // non-zero the napi_env and isolate are alive, so a foreign terminate can
-  // still stop it. A terminate during teardown also sets stop_requested, after
-  // which no more guest code starts.
+  // still stop it. stop_requested is sticky: the host stopped the
+  // application (snapi_bridge_unofficial_stop_execution, or a terminate
+  // during teardown), and once the agent closes no guest code starts. The
+  // provider's release cancels V8's termination before finalizers run, so
+  // only this flag carries a stop that came before the release.
   uint32_t teardown_guest_calls = 0;
   bool stop_requested = false;
   // Owner thread only. Guest code that an env of this agent called into (a
@@ -337,6 +340,14 @@ struct SnapiAgentState {
   // Host memory of the tables above (and the envs' callback registrations
   // and bindings), charged to the context's budget.
   BookkeepingAccount bookkeeping;
+
+  // The principal env's EnvHeapCharge (Rust), for a budgeted isolate. Owned
+  // by Rust, which frees it only after the agent is released.
+  const void* heap_tracker = nullptr;
+  // The near-heap-limit callback lent V8 headroom (see budget.rs): the end
+  // of the bridge call that allocated, or the next interrupt, reconciles it.
+  // Owner thread only (the callback runs on it too).
+  bool heap_lease_pending = false;
 
   SnapiAgentState() {
     module_wrap_handles.account = &bookkeeping;
@@ -807,6 +818,8 @@ class AgentLaneScope {
 // even in APIs that take a context, so enter the isolate of the requested env
 // for each bridge call and restore the caller's isolate on return. The call
 // also binds the env's instance lane.
+void ReconcileHeapLease(SnapiAgentState& agent, napi_env env);
+
 class BridgeEnvScope {
  public:
   explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
@@ -818,6 +831,17 @@ class BridgeEnvScope {
       isolate_scope_.emplace(state_->env->isolate);
     }
   }
+  // The call's allocations are done: a heap lease V8 needed for one of them
+  // is reconciled now, also for calls that run no JavaScript (where the
+  // lease's interrupt would wait for the next one).
+  ~BridgeEnvScope() {
+    if (state_ != nullptr && state_->agent != nullptr && state_->agent->heap_lease_pending &&
+        state_->env != nullptr) {
+      ReconcileHeapLease(*state_->agent, state_->env);
+    }
+  }
+  BridgeEnvScope(const BridgeEnvScope&) = delete;
+  BridgeEnvScope& operator=(const BridgeEnvScope&) = delete;
 
   SnapiEnvState* get() const { return state_; }
 
@@ -3707,31 +3731,116 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   return napi_ok;
 }
 
-// Rust-exported grant callback (see budget.rs). Charges a grow-step against
-// the resource budget and returns the raised (or unchanged) heap limit.
-extern "C" size_t napi_host_near_heap_limit_grant(const void* data,
+// Rust-exported heap budget hooks (see budget.rs). `tracker` is the env's
+// EnvHeapCharge. The grant answers V8's near-heap-limit callback; when it
+// lends V8 headroom for an allocation that may be pending, it asks for a
+// reconcile, which charges what was really used and returns the limit V8 must
+// be lowered to (nonzero when it must).
+extern "C" size_t napi_host_near_heap_limit_grant(const void* tracker,
                                                   size_t current_limit,
-                                                  size_t initial_limit);
+                                                  size_t initial_limit,
+                                                  size_t committed_old_generation,
+                                                  size_t young_large_objects,
+                                                  int32_t* reconcile_out);
+extern "C" int napi_host_heap_reconcile(const void* tracker,
+                                        size_t committed_old_generation,
+                                        size_t young_large_objects,
+                                        size_t used,
+                                        size_t* limit_out);
+extern "C" int napi_host_heap_lease_pending(const void* tracker);
+extern "C" uint64_t napi_host_heap_old_limit(const void* tracker);
 
 namespace {
-// V8-shaped trampoline forwarding to the Rust grant callback. The budget
-// tracker rides in `data`.
-size_t HostNearHeapLimitTrampoline(napi_env /*env*/, void* data,
+size_t HostNearHeapLimitTrampoline(napi_env env, void* data,
+                                   size_t current_limit,
+                                   size_t initial_limit);
+
+// Charges a lease and lowers V8's heap limit back to what the budget paid
+// for. On the isolate's thread, outside a collection.
+void ReconcileHeapLease(SnapiAgentState& agent, napi_env env) {
+  if (!agent.heap_lease_pending) return;
+  agent.heap_lease_pending = false;
+  if (agent.heap_tracker == nullptr || env == nullptr) return;
+  if (napi_host_heap_lease_pending(agent.heap_tracker) == 0) return;
+  NapiV8HeapUsage usage{};
+  if (NapiV8GetHeapUsage(env, &usage) != napi_ok) return;
+  size_t limit = 0;
+  if (napi_host_heap_reconcile(agent.heap_tracker, usage.committed_old_generation,
+                               usage.young_large_objects, usage.used, &limit) == 0) {
+    return;
+  }
+  // Removing the callback restores the limit (V8 keeps it at least 1.25
+  // times the live bytes, which the reconcile charged); adding it back keeps
+  // the budget in charge.
+  (void)unofficial_napi_configure_near_heap_limit_callback(env, nullptr, nullptr, limit);
+  (void)unofficial_napi_configure_near_heap_limit_callback(
+      env, HostNearHeapLimitTrampoline, &agent, 0);
+}
+
+// Runs at the next interrupt check after V8's retried allocation.
+void HeapLeaseInterrupt(v8::Isolate* /*isolate*/, void* data) {
+  auto* agent = static_cast<SnapiAgentState*>(data);
+  // A closing agent's isolate is going away; its lease goes with it.
+  if (agent == nullptr || agent->closing || agent->envs.empty()) return;
+  ReconcileHeapLease(*agent, agent->envs.front()->env);
+}
+
+// V8-shaped trampoline forwarding to the Rust grant callback. `data` is the
+// agent, which holds the env's heap tracker. `env` is null once the release
+// deleted the env (its finalizers still run with the callback installed).
+size_t HostNearHeapLimitTrampoline(napi_env env, void* data,
                                    size_t current_limit,
                                    size_t initial_limit) {
-  return napi_host_near_heap_limit_grant(data, current_limit, initial_limit);
+  auto* agent = static_cast<SnapiAgentState*>(data);
+  if (agent == nullptr || agent->heap_tracker == nullptr) return current_limit;
+  NapiV8HeapUsage usage{};
+  if (NapiV8GetHeapUsage(env, &usage) != napi_ok) usage = {};
+  int32_t reconcile = 0;
+  const size_t answer = napi_host_near_heap_limit_grant(
+      agent->heap_tracker, current_limit, initial_limit, usage.committed_old_generation,
+      usage.young_large_objects, &reconcile);
+  if (reconcile != 0) {
+    // The bridge call under way reconciles it when it ends; JavaScript that
+    // keeps running without one gets the interrupt. A closing agent is still
+    // reconciled by its finalizers' bridge calls.
+    agent->heap_lease_pending = true;
+    if (env != nullptr && !agent->closing) {
+      env->isolate->RequestInterrupt(HeapLeaseInterrupt, agent);
+    }
+  }
+  return answer;
 }
 }  // namespace
 
+// After JavaScript ran on this thread: reconcile a heap lease the interrupt
+// did not get to, then collect if young large objects (which V8 admits
+// without a limit check) put the heap past its limit. The collection routes
+// the figure through the near-heap-limit callback, which charges it or stops
+// the env. Nonzero when a collection ran.
+extern "C" int snapi_bridge_unofficial_settle_heap(SnapiEnvState* env_state) {
+  BridgeEnvScope env_scope(env_state);
+  auto* state = env_scope.get();
+  if (state == nullptr || state->agent->heap_tracker == nullptr) return 0;
+  ReconcileHeapLease(*state->agent, state->env);
+  bool collected = false;
+  const napi_status status = NapiV8CollectGarbageIfOverHeapLimit(
+      state->env, static_cast<size_t>(napi_host_heap_old_limit(state->agent->heap_tracker)),
+      &collected);
+  return status == napi_ok && collected ? 1 : 0;
+}
+
+// Host-only: the env's heap is charged to the budget through `data`, its
+// EnvHeapCharge, which lives until the agent is released.
 extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
     SnapiEnvState* env_state, const void* data) {
   BridgeEnvScope env_scope(env_state);
   auto* state = env_scope.get();
-  if (state == nullptr) return napi_invalid_arg;
+  if (state == nullptr || data == nullptr) return napi_invalid_arg;
+  state->agent->heap_tracker = data;
   return unofficial_napi_configure_near_heap_limit_callback(
       state->env,
       HostNearHeapLimitTrampoline,
-      const_cast<void*>(data),
+      state->agent,
       0);
 }
 
@@ -4038,13 +4147,36 @@ extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_st
   return unofficial_napi_terminate_execution(env_state->env);
 }
 
+// Host-only: stops the application's JavaScript for good, as terminate does,
+// and remembers it, so the env's release runs no guest code either (its
+// finalizers could otherwise re-enter JavaScript after the provider cancels
+// the termination). For a budget refusal and terminate_all; the guest's own
+// terminate stays cancellable.
+extern "C" int snapi_bridge_unofficial_stop_execution(SnapiEnvState* env_state) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!g_envs.count(env_state)) return napi_invalid_arg;
+  SnapiAgentState* agent = env_state->agent;
+  agent->stop_requested = true;
+  if (agent->closing && agent->teardown_guest_calls == 0) return napi_ok;
+  return unofficial_napi_terminate_execution(env_state->env);
+}
+
 extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
     SnapiEnvState* env_state) {
   BridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  return unofficial_napi_cancel_terminate_execution(env);
+  {
+    // Check the sticky stop and clear V8's termination under the same lock
+    // used by the host stop. The waker can re-enter the bridge.
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (bridge_state->agent->stop_requested) return napi_generic_failure;
+    const napi_status status = NapiV8ClearTermination(env);
+    if (status != napi_ok) return status;
+  }
+  NapiV8WakeAfterTermination(env);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_state,

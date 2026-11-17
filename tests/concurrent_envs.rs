@@ -228,6 +228,37 @@ fn host_terminate_reaches_javascript_a_finalizer_runs_during_release() {
     guest.join().expect("guest thread panicked");
 }
 
+/// A host stop that comes *before* the release (a budget refusal, or
+/// `terminate_all` while the guest idles) holds through it: the provider's
+/// release cancels V8's termination before finalizers run, so without the
+/// bridge remembering the stop, a guest finalizer would re-enter JavaScript.
+#[test]
+fn a_host_stop_before_release_blocks_guest_finalizers() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let control = ctx.runtime_control();
+    let (signal_tx, signal_rx) = mpsc::channel();
+    let (released_tx, released_rx) = mpsc::channel();
+    let guest = thread::spawn(move || {
+        let mut guest = Guest::new(&ctx, &engine, &module, signal_tx);
+        guest.create();
+        assert_eq!(guest.arm_spinning_finalizer(), 0);
+        control.terminate_all();
+        let _ = released_tx.send(guest.release());
+    });
+    assert_eq!(
+        released_rx
+            .recv_timeout(TIMEOUT)
+            .expect("the release ran the stopped guest's finalizer JavaScript"),
+        0
+    );
+    assert!(
+        signal_rx.try_recv().is_err(),
+        "a stopped guest's finalizer ran"
+    );
+    guest.join().expect("guest thread panicked");
+}
+
 /// A store dropped on a thread other than the one that created its env cannot
 /// release the env there. The isolate must then stay charged to the budget,
 /// not leak unaccounted.
