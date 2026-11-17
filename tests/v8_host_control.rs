@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wasmer_napi::{NapiCtx, WasmPolicy};
+use wasmer_napi::{NapiCtx, ResourceUsage, WasmPolicy};
 
 mod common;
 use common::{build_wasix_test, run_guest};
@@ -28,6 +28,32 @@ const NAPI_PENDING_EXCEPTION: i32 = 10;
 /// slack), so no isolate can be admitted no matter how far its old-space
 /// ceiling is clamped.
 const BUDGET_BELOW_ISOLATE_FLOOR: u64 = 20 * 1024 * 1024;
+
+/// How long a guest's thread gets to drop its store after `run_guest` returns.
+const GUEST_TEARDOWN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The budget once the guest's V8 charges are gone, or as it stands at
+/// [`GUEST_TEARDOWN_DEADLINE`].
+///
+/// `run_guest` returns as soon as WASIX has the guest's exit status. The
+/// guest's own thread reports that status (`WasiEnv::blocking_on_exit`) and
+/// only then drops the guest's store, and with it the N-API environments the
+/// guest never released, so their isolates go away a moment after `run_guest`
+/// returns. They are released on their owner thread as they should be; the
+/// caller just has to wait for it. One that is still charged at the deadline
+/// is a leak.
+fn usage_after_guest_teardown(ctx: &NapiCtx) -> ResourceUsage {
+    let deadline = Instant::now() + GUEST_TEARDOWN_DEADLINE;
+    loop {
+        let usage = ctx.budget().snapshot();
+        let released =
+            usage.live_isolates == 0 && usage.v8_heap_reserved == 0 && usage.v8_external == 0;
+        if released || Instant::now() >= deadline {
+            return usage;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 
 /// The kill path Edge relies on: a JS loop that never returns on its own has
 /// to stop when the host says so. Nothing in the guest cooperates here — the
@@ -116,7 +142,7 @@ fn isolate_reservations_are_released_when_the_guest_exits() {
         "guest did not report success\n--- stdout ---\n{stdout}"
     );
 
-    let usage = ctx.budget().snapshot();
+    let usage = usage_after_guest_teardown(&ctx);
     assert_eq!(
         usage.live_isolates, 0,
         "an isolate outlived the guest: {usage:?}"
