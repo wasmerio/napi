@@ -389,6 +389,33 @@ fn refused_code_charge_stops_the_context_without_leaking() {
 }
 
 #[test]
+fn code_commit_after_wasm_memory_fills_the_quota_stops_the_context() {
+    let limit = 4 * MIB;
+    let lane = metered_lane(limit, Caps::default());
+    let acct = Arc::clone(&lane.accountant);
+    let env = lane.env();
+    env.load_wasmgen();
+    env.eval("globalThis.mem = new WebAssembly.Memory({ initial: 64 }); ''");
+    assert_eq!(acct.memory(), limit);
+    assert_eq!(env.eval(&outcome("mem.grow(1)")), "RangeError");
+    assert!(acct.code_limits.lock().unwrap().is_empty());
+
+    // A memoryless module reaches code generation with zero quota remaining.
+    let result = env.try_eval(
+        "new WebAssembly.Instance(new WebAssembly.Module(wasmgen.add())).exports.add(40, 2);
+         'unexpected success'",
+    );
+    let limits = acct.code_limits.lock().unwrap().clone();
+    assert_eq!(result, Err(NAPI_PENDING_EXCEPTION), "{limits:?}");
+    assert!(
+        matches!(limits.as_slice(), [(LIMIT_MEMORY, _, _)]),
+        "{limits:?}"
+    );
+    env.release();
+    lane.finish();
+}
+
+#[test]
 fn module_size_and_function_count_are_capped() {
     let lane = metered_lane(256 * MIB, Caps::default());
     let env = lane.env();
