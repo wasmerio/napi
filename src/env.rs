@@ -1208,15 +1208,19 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         env.configured = true;
-        env.next_napi_env_id = i32::MAX as u32;
+        env.next_native_env_id
+            .store(i32::MAX as u32, Ordering::Release);
         env.next_napi_scope_id = i32::MAX as u32;
         let request = env.prepare_native_creation().unwrap();
         assert_eq!(request.ids.env, i32::MAX as u32);
         assert_eq!(request.ids.scope, i32::MAX as u32);
         assert!(env.prepare_native_creation().is_none());
-        assert_eq!(env.next_napi_env_id, i32::MAX as u32 + 1);
+        assert_eq!(
+            env.next_native_env_id.load(Ordering::Acquire),
+            i32::MAX as u32 + 1
+        );
         assert_eq!(env.next_napi_scope_id, i32::MAX as u32 + 1);
-        env.next_napi_env_id = 1;
+        env.next_native_env_id.store(1, Ordering::Release);
         assert!(
             env.prepare_native_creation().is_none(),
             "scope exhaustion is independent"

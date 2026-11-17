@@ -36,8 +36,6 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-#[cfg(all(not(target_arch = "wasm32"), not(napi_standalone_legacy_wait)))]
-use wasmer::sys::vm::StoreId;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer::sys::vm::{
     ExpectedValue, LinearMemory, MemoryError, ThreadConditions, VMMemory, VMMemoryDefinition,
@@ -1174,19 +1172,37 @@ struct MemoryCharge {
     budget: Arc<ResourceBudget>,
     /// Bytes currently charged for this allocation.
     bytes: AtomicU64,
-    /// Shared clones must serialize the full size/reserve/mutate/reconcile
-    /// sequence, not only the backend's growth operation.
-    operation: Mutex<()>,
+    /// One mutation owns the complete reserve/grow/reconcile operation.
+    /// Competing or reentrant callbacks must fail instead of waiting on themselves.
+    mutating: AtomicBool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MemoryMutation<'a>(&'a AtomicBool);
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for MemoryMutation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl MemoryCharge {
+    fn begin_mutation(&self) -> Result<MemoryMutation<'_>, MemoryError> {
+        self.mutating
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                MemoryError::Generic("a shared memory mutation is already active".into())
+            })?;
+        Ok(MemoryMutation(&self.mutating))
+    }
+
     fn new(budget: Arc<ResourceBudget>, bytes: u64) -> Result<Arc<Self>, OverBudget> {
         budget.try_charge(Pool::WasmLinear, bytes)?;
         Ok(Arc::new(Self {
             budget,
             bytes: AtomicU64::new(bytes),
-            operation: Mutex::new(()),
+            mutating: AtomicBool::new(false),
         }))
     }
 
@@ -1321,7 +1337,10 @@ impl LinearMemory for BudgetedMemory {
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
         let charge = Arc::clone(&self.charge);
         wasmer::sys::with_memory_grow_callback(|| {
-            let _operation = charge.operation.lock();
+            if delta == Pages(0) {
+                return self.inner.grow(delta);
+            }
+            let _operation = charge.begin_mutation()?;
             let before = pages_to_bytes(self.inner.size());
             let high_water = charge.bytes.load(Ordering::Acquire);
             let target = before.saturating_add(pages_to_bytes(delta));
@@ -1353,7 +1372,7 @@ impl LinearMemory for BudgetedMemory {
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
         let charge = Arc::clone(&self.charge);
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = charge.operation.lock();
+            let _operation = charge.begin_mutation()?;
             let before = pages_to_bytes(self.inner.size());
             if min_size <= before {
                 return self.inner.grow_at_least(min_size);
@@ -1388,7 +1407,7 @@ impl LinearMemory for BudgetedMemory {
     fn reset(&mut self) -> Result<(), MemoryError> {
         let charge = Arc::clone(&self.charge);
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = charge.operation.lock();
+            let _operation = charge.begin_mutation()?;
             // Wasmer resets the logical size but retains accessible backing.
             // The high-water charge stays until the final handle drops.
             self.inner.reset()
@@ -1405,7 +1424,7 @@ impl LinearMemory for BudgetedMemory {
         // the last handle drops.
         // `VMMemory::try_clone` (inherent) already yields a `VMMemory`.
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = self.charge.operation.lock();
+            let _operation = self.charge.begin_mutation()?;
             let inner = self.inner.try_clone()?;
             Ok(Box::new(BudgetedMemory {
                 inner,
@@ -1417,7 +1436,7 @@ impl LinearMemory for BudgetedMemory {
 
     fn copy(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = self.charge.operation.lock();
+            let _operation = self.charge.begin_mutation()?;
             // Copy retains the source mapping's accessible backing even after
             // reset has lowered its logical size. Reserve that high-water
             // allocation before the backend allocates the copy.
@@ -2978,11 +2997,13 @@ mod shared_memory_mutation_tests {
         assert_eq!(memory.grow(Pages(1)).unwrap(), Pages(1));
         memory.grow_at_least(2 * page).unwrap();
         assert_eq!(budget.snapshot().wasm_linear, 2 * page);
+        let retained = budget.snapshot().wasm_linear;
         memory.reset().unwrap();
         assert_eq!(memory.size(), Pages(0));
-        assert_eq!(budget.snapshot().wasm_linear, 0);
+        // Reset retains the native backing; Edge bills its high-water allocation.
+        assert_eq!(budget.snapshot().wasm_linear, retained);
         memory.grow_at_least(page).unwrap();
-        assert_eq!(budget.snapshot().wasm_linear, page);
+        assert_eq!(budget.snapshot().wasm_linear, retained.max(page));
         drop(memory);
         assert_eq!(budget.snapshot().wasm_linear, 0);
         assert_eq!(accountant.memory_charged(), 0);

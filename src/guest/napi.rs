@@ -43,6 +43,7 @@ macro_rules! native_import {
     };
     (@item [$($mutable:tt)?] $(#[$attribute:meta])* fn $name:ident($env:ident $(, $arg:ident: $ty:ty)*) -> $result:ty $body:block) => {
         $(#[$attribute])*
+        #[allow(unused_mut)] // The shared expansion must also support parked provider calls.
         fn $name($env: FunctionEnvMut<NapiEnv> $(, $arg: $ty)*) -> Result<
             <$result as super::callback::NativeImportOutput>::Value,
             RuntimeError,
@@ -1409,8 +1410,8 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
 }
 }
 
-#[allow(clippy::too_many_arguments)]
 native_import! {
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_make_context(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1462,8 +1463,8 @@ fn guest_unofficial_napi_contextify_make_context(
 }
 }
 
-#[allow(clippy::too_many_arguments)]
 native_import! {
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1522,8 +1523,8 @@ fn guest_unofficial_napi_contextify_run_script(
 }
 }
 
-#[allow(clippy::too_many_arguments)]
 native_import! {
+#[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -3664,8 +3665,8 @@ fn guest_napi_create_typedarray(
 }
 }
 
-#[allow(clippy::too_many_arguments)]
 native_import! {
+#[allow(clippy::too_many_arguments)]
 fn guest_napi_get_typedarray_info(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4183,8 +4184,8 @@ fn guest_napi_get_new_target(
 //   offset 28: void* data               (4 bytes, guest pointer)
 const PROP_DESC_SIZE: usize = 32;
 
-#[allow(clippy::too_many_arguments)]
 native_import! {
+#[allow(clippy::too_many_arguments)]
 fn guest_napi_define_class(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -5214,8 +5215,8 @@ fn guest_napi_get_buffer_info(
 }
 }
 
-#[allow(clippy::too_many_arguments)] // The imported C ABI has eight operands.
 native_import! {
+#[allow(clippy::too_many_arguments)] // The imported C ABI has eight operands.
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,

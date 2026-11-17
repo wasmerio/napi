@@ -403,6 +403,16 @@ enum SessionState {
     Deactivated,
 }
 
+#[cfg(test)]
+impl SessionState {
+    fn as_ref(&self) -> Option<&FunctionEnv<NapiEnv>> {
+        match self {
+            Self::Attached(env) => Some(env),
+            _ => None,
+        }
+    }
+}
+
 // Session admission is metadata only; custom tunables and accounting must not
 // run under this mutex. Partial Store objects retain their existing Store owner.
 struct SessionPreparation<'a>(&'a Mutex<SessionState>);
@@ -1242,7 +1252,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .inner
-                .func_env
+                .state
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -1415,7 +1425,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .inner
-            .func_env
+            .state
             .lock()
             .unwrap()
             .as_ref()
@@ -1696,7 +1706,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .inner
-            .func_env
+            .state
             .lock()
             .unwrap()
             .as_ref()
@@ -1839,7 +1849,7 @@ mod tests {
         let instance = Instance::new(&mut store, &available, &imports).unwrap();
         let heap_before = session
             .inner
-            .func_env
+            .state
             .lock()
             .unwrap()
             .as_ref()
@@ -1859,7 +1869,7 @@ mod tests {
             .unwrap();
         let heap_after = session
             .inner
-            .func_env
+            .state
             .lock()
             .unwrap()
             .as_ref()

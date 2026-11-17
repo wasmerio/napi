@@ -5398,11 +5398,12 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
 
 // Allocate a registration ID for a new callback
 extern "C" uint32_t snapi_bridge_alloc_cb_reg_id(SnapiEnvState *env_state) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   auto entry_lease = RequireEnvState(env_state);
   env_state = entry_lease.get();
   if (env_state == nullptr)
     return 0;
+  BridgeOperationScope entry(env_state);
+  if (!entry) return 0;
   // Registrations live until env teardown. 0 signals failure so the
   // registration chain aborts instead of growing cb_registry unbounded.
   if (!ChargeBookkeeping(*env_state, kCallbackBytes, /*reclaimable=*/false))
@@ -5416,7 +5417,6 @@ extern "C" void snapi_bridge_register_callback(SnapiEnvState *env_state,
                                                uint32_t guest_env,
                                                uint32_t wasm_fn_ptr,
                                                uint64_t data_val) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   auto entry_lease = RequireEnvState(env_state);
   env_state = entry_lease.get();
   if (env_state == nullptr || reg_id == 0)
@@ -5430,7 +5430,6 @@ extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState *env_state,
                                                     uint32_t wasm_getter_fn_ptr,
                                                     uint32_t wasm_setter_fn_ptr,
                                                     uint64_t data_val) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
   auto entry_lease = RequireEnvState(env_state);
   env_state = entry_lease.get();
   if (env_state == nullptr || reg_id == 0)

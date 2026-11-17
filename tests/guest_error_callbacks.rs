@@ -7,9 +7,13 @@ use wasmer::{AsStoreMut, Function, Instance, Module, RuntimeError, Store};
 use wasmer_napi::NapiCtx;
 // A guest error payload must survive the bridge independently of a legacy runtime.
 #[derive(Debug)]
-enum GuestExit { Exit(i32) }
+enum GuestExit {
+    Exit(i32),
+}
 impl std::fmt::Display for GuestExit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for GuestExit {}
 
@@ -67,9 +71,9 @@ fn source_map_callback_exit_crosses_error_metadata_imports() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(GuestExit::Exit(
-                    i32::from(code),
-                ))))
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(i32::from(
+                    code,
+                )))))
             }),
         );
         let observed = Arc::clone(&callback_count);

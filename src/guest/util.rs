@@ -212,7 +212,6 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     let Some(memory) = env.data().memory.clone() else {
         return 0;
     };
-    let (_, store) = env.data_and_store_mut();
     memory.view(&*env).data_size()
 }
 

@@ -6,7 +6,7 @@
 
 use std::ffi::{CString, c_void};
 
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
+use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasm_bindgen::JsValue;
@@ -33,15 +33,18 @@ use super::{abi, util::*};
 const JS_BACKING_TOKEN_MARKER: u64 = 1 << 63;
 const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
-fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
+fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
     if !env.data().creation_enabled() {
-        return 0;
+        // TODO(wasixv2): NAPI-START — configured attachment owns activation.
+        return Err(RuntimeError::new(
+            "N-API activation before instance configuration is unsupported",
+        ));
     }
     let _ = unsafe { snapi_bridge_init() };
     let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
 
     if let Some(env_id) = env.data().default_napi_env_id {
-        return env_id as i32;
+        return Ok(env_id as i32);
     }
 
     let webassembly_policy = env.data().webassembly.bridge_code();
@@ -55,21 +58,21 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         )
     };
     if status != 0 || snapi_env_state.is_null() {
-        return 0;
+        return Ok(0);
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     let async_env = env.as_async_mut();
     let Some((env_id, _scope_id)) = env.data_mut().register_napi_env(snapi_env_state) else {
         unsafe { snapi_bridge_unofficial_release_env(snapi_env_state) };
-        return 0;
+        return Ok(0);
     };
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if let Some(async_env) = async_env {
         install_persistent_callback_state(&mut env, env_id, snapi_env_state, async_env);
     }
     env.data_mut().default_napi_env_id = Some(env_id);
-    env_id as i32
+    Ok(env_id as i32)
 }
 
 fn with_cb_context<R>(
