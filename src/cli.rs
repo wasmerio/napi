@@ -91,7 +91,10 @@ fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {
     let prepared = wasixv2_dylink::prepare_image(&binary)?;
     let (compiler_input, failed) = match wasixv2::instrument(&prepared) {
         Ok(instrumented) => (instrumented, None),
-        Err(error) if prepared == binary.as_ref() => (prepared, Some(error)),
+        Err(error) if prepared == binary.as_ref() => {
+            let fallback = error.fallback_source(&prepared)?;
+            (fallback, Some(error))
+        }
         Err(error) => return Err(error.into()),
     };
     // Dynamic preparation precedes instrumentation, and the persistent cache

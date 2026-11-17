@@ -153,7 +153,7 @@ macro_rules! reserve_property_array {
 native_import! {
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
     if !env.data().creation_enabled() {
-        // TODO(wasixv2): NAPI-START — replaced by the prepared-memory activation phase.
+        // Direct instantiation must configure the attachment before calling N-API.
         return Err(RuntimeError::new("N-API activation before instance configuration is unsupported"));
     }
     let _ = unsafe { parked_bridge!(env, snapi_bridge_init()) };

@@ -1778,7 +1778,7 @@ mod tests {
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     fn start_section_activation_is_rejected_before_configuration() {
-        // TODO(wasixv2): NAPI-START — direct Instance::new has no configured attachment.
+        // Direct Instance::new bypasses the facade's configure-before-start protocol.
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, _finished_rx) = mpsc::channel();
         let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);

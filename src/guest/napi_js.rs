@@ -35,7 +35,7 @@ const JS_BACKING_TOKEN_OFFSET_MASK: u64 = u32::MAX as u64;
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
     if !env.data().creation_enabled() {
-        // TODO(wasixv2): NAPI-START — configured attachment owns activation.
+        // Direct instantiation must configure the attachment before calling N-API.
         return Err(RuntimeError::new(
             "N-API activation before instance configuration is unsupported",
         ));
