@@ -878,17 +878,6 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_take(
 
 NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_message_drop(unofficial_napi_message message);
 
-// Whether any SharedArrayBuffer backing store `message` holds overlaps the
-// address range [begin, end). An embedder that puts backing stores in a
-// guest's memory asks it for that memory, to keep the memory mapped while the
-// message is queued and to refuse the message to a receiver on another
-// memory.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_shares_range(
-    unofficial_napi_message message,
-    uintptr_t begin,
-    uintptr_t end,
-    bool* result);
-
 // Returns own property keys while filtering indexed elements inside the
 // provider. This bulk operation avoids materializing every array index and
 // crossing the guest/host boundary once per key.

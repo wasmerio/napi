@@ -4558,9 +4558,8 @@ extern "C" int snapi_bridge_unofficial_message_create(
   if (status != napi_ok) return status;
   bool in_range = false;
   if (range_begin < range_end &&
-      unofficial_napi_message_shares_range(message, static_cast<uintptr_t>(range_begin),
-                                           static_cast<uintptr_t>(range_end),
-                                           &in_range) != napi_ok) {
+      NapiV8MessageSharesRange(message, static_cast<uintptr_t>(range_begin),
+                               static_cast<uintptr_t>(range_end), &in_range) != napi_ok) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
   }

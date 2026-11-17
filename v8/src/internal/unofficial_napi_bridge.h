@@ -31,4 +31,12 @@ void NapiV8TrackProviderPromise(v8::Isolate* isolate,
                                 v8::Local<v8::Promise> promise);
 bool NapiV8HasPendingProviderWork(napi_env env);
 
+// Whether a SharedArrayBuffer backing store in `message` overlaps the guest
+// memory range [begin, end). The bridge uses this to keep that memory mapped
+// while the message is queued and to check the receiver's memory.
+napi_status NapiV8MessageSharesRange(unofficial_napi_message message,
+                                     uintptr_t begin,
+                                     uintptr_t end,
+                                     bool* result);
+
 #endif  // NAPI_V8_UNOFFICIAL_NAPI_BRIDGE_H_

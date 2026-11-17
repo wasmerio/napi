@@ -1097,7 +1097,10 @@ fn guest_unofficial_napi_message_create(
     {
         return 9;
     }
-    write_guest_u32(&mut env, payload_out_ptr, payload);
+    if !write_guest_u32(&mut env, payload_out_ptr, payload) {
+        guest_unofficial_napi_message_drop(env, payload);
+        return 1; // napi_invalid_arg
+    }
     0
 }
 

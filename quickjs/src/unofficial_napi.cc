@@ -877,20 +877,6 @@ extern "C"
         napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
     }
 
-    // QuickJS SharedArrayBuffers are refcounted host memory the payload
-    // keeps alive, never a guest's memory.
-    napi_status NAPI_CDECL unofficial_napi_message_shares_range(
-        unofficial_napi_message message,
-        uintptr_t /*begin*/,
-        uintptr_t /*end*/,
-        bool *result)
-    {
-        if (message == nullptr || result == nullptr)
-            return napi_invalid_arg;
-        *result = false;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
         napi_env env,
         napi_value value,
