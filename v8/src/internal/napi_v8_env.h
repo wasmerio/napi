@@ -18,12 +18,14 @@
 #include <cppgc/persistent.h>
 
 #include "js_native_api.h"
+#include "node_api_types.h"
 #include "napi_error_state.h"
 #include "napi_periodic_gate.h"
 #include "internal/napi_factory.h"
 #include "internal/napi_lifetime_tracker.h"
 #include "internal/napi_ref_tracker.h"
 #include "internal/napi_v8_agent.h"
+#include "internal/napi_v8_node_api.h"
 #include "unofficial_napi.h"
 
 typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
@@ -183,6 +185,9 @@ struct napi_env__ {
   void* instance_data_finalize_hint = nullptr;
   std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
+  // The embedder's part of the release (unofficial_napi_set_env_cleanup_callback).
+  unofficial_napi_env_cleanup_callback embedder_cleanup_callback = nullptr;
+  void* embedder_cleanup_data = nullptr;
   std::vector<napi_buffer_record__*> buffer_records;
   std::unordered_set<napi_external_backing_store_hint__*> external_backing_store_hints;
   // The array buffers of the external stores with a user finalizer, by store
@@ -327,5 +332,6 @@ napi_status napi_v8_create_external_arraybuffer_with_free(
 napi_status napi_v8_create_external_buffer_with_free(
     napi_env env, size_t length, void* data, napi_v8_external_free_callback free_cb,
     void* free_hint, napi_value* result);
+
 
 #endif  // NAPI_V8_ENV_H_

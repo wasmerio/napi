@@ -20,6 +20,20 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+// windows.h would otherwise define min and max macros, which break the
+// std::min and std::numeric_limits<...>::max() calls below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #include <libplatform/libplatform.h>
 #include <v8.h>
 #include <v8-profiler.h>
@@ -705,6 +719,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     if (data != nullptr) {
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
     }
+    if (data != nullptr && IsLargeBackingStore(length)) {
+      FreeLargeBackingStore(data, length);
+      return;
+    }
     if (backing_ != nullptr) {
       backing_->Free(data, length);
     }
@@ -756,7 +774,9 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     // No guest-heap context: this is the native (non-guest) embedder, which
     // has no budget concept for this allocator. Plain host allocation.
     void* data = nullptr;
-    if (backing_ != nullptr) {
+    if (IsLargeBackingStore(length)) {
+      data = AllocateLargeBackingStore(length);
+    } else if (backing_ != nullptr) {
       data = zeroed ? backing_->Allocate(length)
                     : backing_->AllocateUninitialized(length);
     }
@@ -764,6 +784,42 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
     }
     return data;
+  }
+
+  // Large backing stores come straight from the OS, zeroed, and fail with
+  // null: V8 then throws a RangeError. The prebuilt V8 replaces the process's
+  // malloc with PartitionAlloc, whose calloc (behind the default allocator)
+  // aborts the process on a request it cannot serve instead of returning
+  // null, so new ArrayBuffer(2 ** 32) would crash. Free gets the length the
+  // store was allocated with, which picks the same path.
+  //
+  // Not with the V8 sandbox: backing stores must then lie inside the
+  // sandbox's reserved address space (V8 checks), which only the default
+  // allocator allocates from, and it does not go through malloc.
+#if defined(V8_ENABLE_SANDBOX)
+  static bool IsLargeBackingStore(size_t /*length*/) { return false; }
+#else
+  static constexpr size_t kLargeBackingStore = size_t{1} << 20;
+
+  static bool IsLargeBackingStore(size_t length) { return length >= kLargeBackingStore; }
+#endif
+
+  static void* AllocateLargeBackingStore(size_t length) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* data = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return data == MAP_FAILED ? nullptr : data;
+#endif
+  }
+
+  static void FreeLargeBackingStore(void* data, size_t length) {
+#if defined(_WIN32)
+    (void)length;
+    VirtualFree(data, 0, MEM_RELEASE);
+#else
+    munmap(data, length);
+#endif
   }
 
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
@@ -1178,36 +1234,6 @@ void ThrowTypeErrorWithCode(v8::Local<v8::Context> context,
   napi_v8_throw_unless_terminating(isolate, exception);
 }
 
-v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
-                                         v8::Local<v8::ArrayBuffer> array_buffer,
-                                         size_t offset,
-                                         size_t length) {
-  v8::Isolate* isolate = v8::Isolate::GetCurrent();
-  v8::Local<v8::Object> global = context->Global();
-
-  v8::Local<v8::Value> buffer_ctor_value;
-  if (global->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor_value) &&
-      buffer_ctor_value->IsObject()) {
-    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
-    v8::Local<v8::Value> from_value;
-    if (buffer_ctor->Get(context, OneByteString(isolate, "from")).ToLocal(&from_value) &&
-        from_value->IsFunction()) {
-      v8::Local<v8::Value> argv[3] = {
-          array_buffer,
-          v8::Number::New(isolate, static_cast<double>(offset)),
-          v8::Number::New(isolate, static_cast<double>(length)),
-      };
-      v8::Local<v8::Value> maybe_buffer;
-      if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
-          maybe_buffer->IsObject()) {
-        return maybe_buffer.As<v8::Object>();
-      }
-    }
-  }
-
-  return v8::Uint8Array::New(array_buffer, offset, length);
-}
-
 bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
                               const uint8_t** data_out,
                               size_t* size_out) {
@@ -1375,7 +1401,9 @@ void SerializerContext::ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>&
       return;
     }
     v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
-    args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
+    // A plain Uint8Array: Buffer is the embedder's, which gives it its
+    // prototype where its API promises a Buffer (v8.serialize).
+    args.GetReturnValue().Set(v8::Uint8Array::New(ab, 0, serialized.second));
 }
 
 void SerializerContext::TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -2102,6 +2130,54 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
   return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
 }
 
+napi_status NAPI_CDECL unofficial_napi_create_uint8array(
+    napi_env env, size_t length, napi_value prototype_or_null, void** data,
+    napi_value* result) {
+  if (env == nullptr || data == nullptr || result == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  v8::Isolate* isolate = env->isolate;
+  v8::Local<v8::Value> prototype;
+  if (prototype_or_null != nullptr) {
+    prototype = napi_v8_unwrap_value(prototype_or_null);
+    if (!prototype->IsObject() && !prototype->IsNull()) return napi_invalid_arg;
+  }
+  // Beyond what V8 can make, NewBackingStore aborts instead of failing.
+  if (length > v8::Uint8Array::kMaxLength) return napi_generic_failure;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+  // Fallible: the allocator may decline (on WASIX, at the guest heap's
+  // limit), and the infallible ArrayBuffer::New would abort the process.
+  std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(
+      isolate, length, v8::BackingStoreInitializationMode::kZeroInitialized,
+      v8::BackingStoreOnFailureMode::kReturnNull);
+  if (!store) return napi_generic_failure;
+  void* bytes = store->Data();
+  v8::Local<v8::ArrayBuffer> arraybuffer = v8::ArrayBuffer::New(isolate, std::move(store));
+  v8::Local<v8::Uint8Array> array = v8::Uint8Array::New(arraybuffer, 0, length);
+  // A fresh typed array's [[SetPrototypeOf]] is ordinary: no JS runs.
+  if (!prototype.IsEmpty() && array->SetPrototype(context, prototype).IsNothing()) {
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, array);
+  if (*result == nullptr) return napi_generic_failure;
+  *data = bytes;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_uint8array_copy(
+    napi_env env, const void* data, size_t length, napi_value prototype_or_null,
+    napi_value* result) {
+  if (env == nullptr || result == nullptr || (length > 0 && data == nullptr)) {
+    return napi_invalid_arg;
+  }
+  void* bytes = nullptr;
+  napi_status status =
+      unofficial_napi_create_uint8array(env, length, prototype_or_null, &bytes, result);
+  if (status != napi_ok) return status;
+  if (length > 0) std::memcpy(bytes, data, length);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks,
@@ -2146,6 +2222,21 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   env->isolate->SetOOMErrorHandler(
       hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
   *accepted_hooks_out = unofficial_napi_env_hooks_requested(hooks);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_env env, unofficial_napi_env_cleanup_callback callback, void* data) {
+  if (env == nullptr || env->isolate == nullptr || callback == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (env->embedder_cleanup_callback != nullptr) {
+    return env->embedder_cleanup_callback == callback && env->embedder_cleanup_data == data
+               ? napi_ok
+               : napi_invalid_arg;
+  }
+  env->embedder_cleanup_callback = callback;
+  env->embedder_cleanup_data = data;
   return napi_ok;
 }
 

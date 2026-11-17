@@ -117,6 +117,9 @@ fn main() {
                 .unwrap(),
         )
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
+        // Deprecated node_api.h calls: the host still serves them to guests
+        // built before their embedder defined them.
+        .file(napi_v8_src.join("node_api_v8.cc").to_str().unwrap())
         .file(
             napi_v8_src
                 .join("internal/napi_escapable_handle_scope_wrapper.cc")

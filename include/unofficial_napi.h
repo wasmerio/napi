@@ -228,6 +228,32 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks,
     uint64_t* accepted_hooks_out);
+// The embedder's part of an env's release: runs the cleanup work the embedder
+// keeps for `env` (Edge.js: the napi_add_env_cleanup_hook hooks it defines)
+// and returns whether it ran any.
+typedef bool (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
+// Sets `callback(env, data)` as the embedder's part of `env`'s release,
+// interleaved with the provider's: it runs each time the release runs the
+// cleanup hooks (step 1 of unofficial_napi_release_env), before them, and
+// again whenever the release would otherwise be done. It returns whether it
+// ran anything; while it does, the release goes on, so work a finalizer or
+// hook gives the embedder during the release runs too, on a still-valid env.
+// It must return false once it has nothing left, or the release never ends.
+// It runs as the hooks do: on the env's thread, in the env's realm, with what
+// it leaves pending dropped. It is not called outside the release.
+//
+// It is apart from unofficial_napi_attach_env, so an embedder can set it
+// before or after attaching its hooks, or without attaching any. An env has
+// one: setting the same callback and data again returns napi_ok and changes
+// nothing, and another callback or data is refused with napi_invalid_arg, so
+// napi_ok means the release will call this one. An embedder that defines
+// node_api.h's napi_add_env_cleanup_hook keeps those hooks and runs them here,
+// and keeps none it cannot run. The WASIX host runs no guest callback at the
+// release and returns napi_generic_failure to a guest.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
+    napi_env env,
+    unofficial_napi_env_cleanup_callback callback,
+    void* data);
 // Releases an env made by unofficial_napi_create_env and the engine instance
 // it owns. Before anything is freed, the release runs what the env still
 // holds, in this order (the providers' contract; Node up to 20 also finalized
@@ -235,7 +261,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
 // other finalizers):
 //
 // 1. The cleanup hooks run, most recent first. A hook added while releasing,
-//    by a hook or by a finalizer, runs too.
+//    by a hook or by a finalizer, runs too. The embedder's cleanup callback
+//    (unofficial_napi_set_env_cleanup_callback) runs before them, and again
+//    when 1 and 2 have nothing left, which goes on while it runs something.
 // 2. The finalizer of every value still pending runs: napi_wrap,
 //    napi_create_external, napi_add_finalizer, external ArrayBuffers and
 //    Buffers. Values of one kind are finalized most recent first, as Node's
@@ -588,6 +616,31 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_guest_backed_typ
     napi_typedarray_type type,
     size_t length,
     void** data,
+    napi_value* result);
+// Creates a zero-filled Uint8Array of the current realm over its own
+// ArrayBuffer, with `prototype_or_null` as its prototype when given (an
+// embedder's Buffer.prototype, say). Its memory is placed as
+// unofficial_napi_create_guest_backed_typedarray places it, so on WASIX
+// `*data` is a stable guest pointer. It reads no global and runs no JS, and is
+// refused while the env terminates. It is how an embedder makes a Node Buffer
+// in one call: the provider has no notion of Buffer.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uint8array(
+    napi_env env,
+    size_t length,
+    napi_value prototype_or_null,
+    void** data,
+    napi_value* result);
+// Like unofficial_napi_create_uint8array, but holding a copy of the `length`
+// bytes at `data` (NULL when `length` is 0), and returning no pointer into
+// it: the array's memory is its own, and on the host-JavaScript provider
+// JavaScript owns it (no guest memory backs or mirrors it). For copies native
+// code does not touch afterwards, such as a Buffer napi_create_buffer_copy
+// makes without result_data. Reads no global and runs no JS.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uint8array_copy(
+    napi_env env,
+    const void* data,
+    size_t length,
+    napi_value prototype_or_null,
     napi_value* result);
 // Creates an ArrayBuffer using the provider's native ownership policy without
 // exposing a raw pointer to Edge. Embedded providers may adopt an uninitialized
@@ -1135,7 +1188,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_continuation_preser
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(napi_env env);
 
 // Unofficial helper. Creates the native internalBinding('serdes') object
-// containing Serializer and Deserializer constructors.
+// containing Serializer and Deserializer constructors. Serializer's
+// releaseBuffer returns a plain Uint8Array over its own ArrayBuffer, never a
+// Buffer: an embedder whose API promises one (v8.serialize) gives it its
+// Buffer.prototype.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(napi_env env,
                                                               napi_value* result_out);
 

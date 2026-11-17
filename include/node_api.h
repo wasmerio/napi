@@ -1,3 +1,9 @@
+// napi provides node_api.h for addons and embedders, but its implementation
+// of the calls that belong to Node's runtime (the Buffer calls, the env
+// cleanup hooks, napi_fatal_error and napi_fatal_exception) is deprecated:
+// the embedder defines them, as Edge.js does. Build napi with
+// NAPI_PROVIDE_NODE_API=OFF to leave napi's out. See docs/node-api.md. The
+// declarations below are Node's, unchanged.
 #ifndef SRC_NODE_API_H_
 #define SRC_NODE_API_H_
 

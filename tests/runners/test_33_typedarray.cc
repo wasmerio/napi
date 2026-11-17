@@ -2,10 +2,12 @@
 #undef NAPI_MODULE
 #endif
 #include "node_api.h"
+#include "unofficial_napi.h"
 
 #include "test_env.h"
 #include "upstream_js_test.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <utility>
@@ -802,6 +804,156 @@ TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
 // The serdes binding's Serializer copies a view's own bytes: neither what a
 // script redefined on DataView.prototype nor a length-tracking view's length
 // from before its buffer grew.
+// An embedder makes a Node Buffer with one call: a zeroed Uint8Array over its
+// own ArrayBuffer, given its prototype, made without reading a global or
+// running JS. The provider has no notion of Buffer.
+TEST_F(Test33TypedArray, CreateUint8ArrayIsZeroedAndTakesItsPrototype) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.bufferReads = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { configurable: true,"
+                  "  get() { bufferReads++; throw new Error('Buffer read'); } });"
+                  "globalThis.proto = Object.create(Uint8Array.prototype,"
+                  "  { tag: { value: 'buffer' } });"
+                  "0");
+  napi_value proto = NamedGlobal(s.env, "proto");
+
+  void* data = nullptr;
+  napi_value made = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 16, proto, &data, &made), napi_ok);
+  ASSERT_NE(data, nullptr);
+  auto* bytes = static_cast<uint8_t*>(data);
+  EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + 16), std::vector<uint8_t>(16, 0));
+  bytes[3] = 7;
+  SetGlobal(s.env, "made", made);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(made) === proto &&"
+                  " made.tag === 'buffer' && made.length === 16 && made[3] === 7 &&"
+                  " made.byteOffset === 0 && made.buffer.byteLength === 16 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+
+  napi_value plain = nullptr;
+  data = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 0, nullptr, &data, &plain), napi_ok);
+  SetGlobal(s.env, "plain", plain);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(plain) === Uint8Array.prototype &&"
+                  " plain.length === 0 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "bufferReads"), 0) << "the provider read the global Buffer";
+
+  // A length past what the engine can make fails, with no abort, and the env
+  // stays usable. (An allocator that declines is covered on WASIX, where the
+  // guest heap's allocator returns null: tests/guest_create_uint8array.rs.)
+  {
+    napi_value refused = nullptr;
+    data = nullptr;
+    EXPECT_NE(unofficial_napi_create_uint8array(s.env, SIZE_MAX, proto, &data, &refused), napi_ok);
+    EXPECT_EQ(refused, nullptr);
+    napi_value ignored = nullptr;
+    (void)napi_get_and_clear_last_exception(s.env, &ignored);
+  }
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 8, proto, &data, &made), napi_ok);
+
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, nullptr, &made), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, &data, nullptr), napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  napi_value refused = nullptr;
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, &data, &refused),
+            napi_pending_exception);
+  EXPECT_EQ(refused, nullptr);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  napi_value pending = nullptr;
+  (void)napi_get_and_clear_last_exception(s.env, &pending);
+}
+
+// The copy variant: a Uint8Array over an ArrayBuffer of its own holding the
+// bytes, given its prototype, independent of the source.
+TEST_F(Test33TypedArray, CreateUint8ArrayCopyOwnsItsBytes) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.bufferReads = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { configurable: true,"
+                  "  get() { bufferReads++; throw new Error('Buffer read'); } });"
+                  "globalThis.proto = Object.create(Uint8Array.prototype);"
+                  "0");
+  napi_value proto = NamedGlobal(s.env, "proto");
+  uint8_t source[6] = {1, 2, 3, 4, 5, 6};
+  napi_value copy = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(s.env, source + 1, 4, proto, &copy), napi_ok);
+  source[2] = 99;  // the copy is its own
+  SetGlobal(s.env, "copy", copy);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(copy) === proto &&"
+                  " copy.length === 4 && copy.byteOffset === 0 &&"
+                  " copy.buffer.byteLength === 4 && copy.join() === '2,3,4,5' ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+
+  napi_value empty = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(s.env, nullptr, 0, nullptr, &empty), napi_ok);
+  SetGlobal(s.env, "empty", empty);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(empty) === Uint8Array.prototype &&"
+                  " empty.length === 0 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "bufferReads"), 0);
+
+  EXPECT_EQ(unofficial_napi_create_uint8array_copy(s.env, nullptr, 4, nullptr, &copy),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_uint8array_copy(s.env, source, 4, nullptr, nullptr),
+            napi_invalid_arg);
+}
+
+// Memory the provider declines (QuickJS past its runtime's limit) fails the
+// call: never napi_ok with no memory behind the array. V8 keeps backing
+// stores out of the heap limit, so there they are made.
+TEST_F(Test33TypedArray, CreateUint8ArrayFailsWhenTheMemoryIsDeclined) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  options.max_old_generation_size_in_bytes = size_t{2} << 20;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_ok);
+  constexpr size_t kLength = size_t{4} << 20;
+  std::vector<uint8_t> source(kLength, 7);
+
+  void* data = nullptr;
+  napi_value array = nullptr;
+  napi_status status = unofficial_napi_create_uint8array(env, kLength, nullptr, &data, &array);
+  if (status == napi_ok) {
+    EXPECT_NE(data, nullptr);
+    EXPECT_NE(array, nullptr);
+  } else {
+    EXPECT_EQ(array, nullptr);
+  }
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  napi_value copy = nullptr;
+  status = unofficial_napi_create_uint8array_copy(env, source.data(), kLength, nullptr, &copy);
+  EXPECT_EQ(status == napi_ok, copy != nullptr);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  void* buffer_data = nullptr;
+  napi_value arraybuffer = nullptr;
+  status = napi_create_arraybuffer(env, kLength, &buffer_data, &arraybuffer);
+  if (status == napi_ok) EXPECT_NE(buffer_data, nullptr);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  // The env goes on: a small one is made.
+  napi_value small = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(env, source.data(), 16, nullptr, &small),
+            napi_ok);
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+
 TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
   EnvScope s(runtime_.get());
   napi_value serdes = nullptr;
@@ -828,9 +980,19 @@ TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
       "  return serializer.releaseBuffer();"
       "})()");
   ASSERT_NE(released, nullptr);
+  napi_typedarray_type type = napi_int8_array;
   void* data = nullptr;
   size_t length = 0;
-  ASSERT_EQ(napi_get_buffer_info(s.env, released, &data, &length), napi_ok);
+  ASSERT_EQ(napi_get_typedarray_info(s.env, released, &type, &length, &data, nullptr, nullptr),
+            napi_ok);
+  EXPECT_EQ(type, napi_uint8_array);
+  // A plain Uint8Array: Buffer is the embedder's to apply.
+  SetGlobal(s.env, "released", released);
+  RunBufferScript(s.env,
+                  "globalThis.plain = Object.getPrototypeOf(released) === Uint8Array.prototype &&"
+                  " released.byteOffset === 0 && released.buffer.byteLength === released.length"
+                  " ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "plain"), 1);
   const std::vector<uint8_t> expected = {2, 3, 4, 5, 101, 102, 103, 104, 105, 106, 107};
   const auto* bytes = static_cast<const uint8_t*>(data);
   EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + length), expected);
@@ -948,6 +1110,29 @@ TEST_F(Test33TypedArray, InfoCallsKeepThePendingExceptionWhenErrorFormattingCall
   // V8 makes no error to read a buffer or a view, so only QuickJS gets here.
   EXPECT_GT(native_calls, 0) << "the getter never ran: nothing was tested";
 #endif
+}
+
+// Past 2 GiB the prebuilt V8's process-wide malloc (PartitionAlloc) aborts
+// instead of failing. An ArrayBuffer that large is backed or is a
+// RangeError, as in Node (test-buffer-creation-regression), never an abort.
+TEST_F(Test33TypedArray, MultiGigabyteArrayBufferIsBackedOrARangeError) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.huge = (() => {"
+                  "  try {"
+                  "    const bytes = new Uint8Array(new ArrayBuffer(2 ** 32 + 1000));"
+                  "    bytes[bytes.length - 1] = 7;"
+                  "    return bytes[0] === 0 && bytes[bytes.length - 1] === 7 ? 1 : 'bad';"
+                  "  } catch (e) { return e instanceof RangeError ? 1 : 'other'; }"
+                  "})();"
+                  "globalThis.large = (() => {"
+                  "  const bytes = new Uint8Array(new ArrayBuffer(64 * 1024 * 1024));"
+                  "  bytes[bytes.length - 1] = 7;"
+                  "  return bytes[0] === 0 && bytes[bytes.length - 1] === 7 ? 1 : 0;"
+                  "})();"
+                  "0");
+  EXPECT_EQ(GlobalInt(s.env, "huge"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "large"), 1);
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)

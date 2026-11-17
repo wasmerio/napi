@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
@@ -432,6 +433,109 @@ TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   EXPECT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_invalid_arg);
 
   ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+
+namespace {
+
+// Stands for an embedder's own cleanup work (Edge.js's env cleanup hooks).
+struct EmbedderCleanupProbe {
+  napi_env env = nullptr;
+  std::vector<int> pending;
+  std::vector<int> ran;
+  int calls = 0;
+};
+
+bool RunEmbedderCleanupProbe(napi_env env, void* data) {
+  auto* probe = static_cast<EmbedderCleanupProbe*>(data);
+  ++probe->calls;
+  EXPECT_EQ(env, probe->env);
+  bool ran = false;
+  while (!probe->pending.empty()) {
+    const int id = probe->pending.back();
+    probe->pending.pop_back();
+    probe->ran.push_back(id);
+    ran = true;
+    // The env is still usable here.
+    napi_value value = nullptr;
+    EXPECT_EQ(napi_create_object(env, &value), napi_ok);
+  }
+  return ran;
+}
+
+bool RunOtherEmbedderCleanup(napi_env /*env*/, void* /*data*/) {
+  ADD_FAILURE() << "a refused cleanup callback ran";
+  return false;
+}
+
+void GiveEmbedderCleanupFromHook(void* data) {
+  static_cast<EmbedderCleanupProbe*>(data)->pending.push_back(3);
+}
+
+void GiveEmbedderCleanupFromFinalizer(node_api_basic_env /*env*/, void* data, void* /*hint*/) {
+  static_cast<EmbedderCleanupProbe*>(data)->pending.push_back(2);
+}
+
+}  // namespace
+
+// The release runs the embedder's cleanup callback with the env's own
+// cleanup, while the env is valid, and goes on while it runs something: work
+// a cleanup hook or a finalizer gives the embedder during the release runs
+// too.
+TEST_F(Test21General, EnvCleanupCallbackRunsWithTheReleaseUntilDone) {
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  ASSERT_EQ(unofficial_napi_create_env(
+                NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_ok);
+
+  EmbedderCleanupProbe probe;
+  probe.env = env;
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(nullptr, RunEmbedderCleanupProbe, &probe),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(env, nullptr, &probe), napi_invalid_arg);
+  ASSERT_EQ(unofficial_napi_set_env_cleanup_callback(env, RunEmbedderCleanupProbe, &probe),
+            napi_ok);
+  // Setting it again changes nothing; another callback or data is refused,
+  // so napi_ok means the release calls this one.
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(env, RunEmbedderCleanupProbe, &probe),
+            napi_ok);
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(env, RunOtherEmbedderCleanup, &probe),
+            napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(env, RunEmbedderCleanupProbe, nullptr),
+            napi_invalid_arg);
+  // It does not take the env's one attachment, before or after it.
+  unofficial_napi_env_hooks hooks{};
+  hooks.size = sizeof(hooks);
+  hooks.version = UNOFFICIAL_NAPI_ENV_HOOKS_VERSION;
+  uint64_t accepted_hooks = 0;
+  ASSERT_EQ(unofficial_napi_attach_env(env, &hooks, &accepted_hooks), napi_ok);
+  EXPECT_EQ(unofficial_napi_set_env_cleanup_callback(env, RunEmbedderCleanupProbe, &probe),
+            napi_ok);
+
+  probe.pending.push_back(1);
+  ASSERT_EQ(napi_add_env_cleanup_hook(env, GiveEmbedderCleanupFromHook, &probe), napi_ok);
+  {
+    // A value alive at the release, whose finalizer runs in it.
+    napi_handle_scope scope = nullptr;
+    ASSERT_EQ(napi_open_handle_scope(env, &scope), napi_ok);
+    napi_value external = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_create_external(env, &probe, GiveEmbedderCleanupFromFinalizer, nullptr,
+                                   &external),
+              napi_ok);
+    ASSERT_EQ(napi_get_global(env, &global), napi_ok);
+    ASSERT_EQ(napi_set_named_property(env, global, "kept", external), napi_ok);
+    ASSERT_EQ(napi_close_handle_scope(env, scope), napi_ok);
+  }
+  EXPECT_EQ(probe.calls, 0) << "the callback runs only at the release";
+
+  ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  // First the embedder's own work, then what the cleanup hook gave it, then
+  // what the finalizer gave it after the hooks were done.
+  EXPECT_EQ(probe.ran, (std::vector<int>{1, 3, 2}));
+  EXPECT_TRUE(probe.pending.empty());
 }
 
 TEST_F(Test21General, GarbageCollectionUsesProductionProviderPrimitive) {

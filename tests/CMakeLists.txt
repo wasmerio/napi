@@ -71,6 +71,16 @@ set(_napi_engine_defines_var "NAPI_${_napi_test_engine_upper}_DEFINES")
 set(_napi_engine_extra_libs_var "NAPI_${_napi_test_engine_upper}_EXTRA_LIBS")
 set(_napi_engine_library_var "NAPI_${_napi_test_engine_upper}_LIBRARY")
 
+# The public headers compile as C11, C _Static_asserts included.
+add_library(${_napi_test_prefix}_c_headers OBJECT "${NAPI_TESTS_ROOT}/src/c_headers_check.c")
+set_target_properties(${_napi_test_prefix}_c_headers PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  C_EXTENSIONS OFF
+)
+target_include_directories(${_napi_test_prefix}_c_headers PRIVATE "${NAPI_INCLUDE_ROOT}")
+target_compile_definitions(${_napi_test_prefix}_c_headers PRIVATE NAPI_EXTERN=)
+
 add_library(${_napi_test_prefix}_gtest STATIC
   "${_napi_gtest_root}/src/gtest-all.cc"
   "${_napi_gtest_root}/src/gtest_main.cc"
@@ -117,6 +127,11 @@ function(add_fixture_test target_name)
       ${_napi_test_prefix}_gtest
       ${_napi_test_engine_target}
   )
+  # Built with NAPI_PROVIDE_NODE_API off (inside Edge.js), the provider leaves
+  # out node_api.h's deprecated calls; the tests still use them.
+  if(TARGET ${_napi_test_engine_target}_node_api)
+    target_link_libraries(${target_name} PRIVATE ${_napi_test_engine_target}_node_api)
+  endif()
   if(_napi_test_engine STREQUAL "quickjs")
     if(TARGET qjs)
       target_link_libraries(${target_name} PRIVATE qjs)
