@@ -2107,6 +2107,25 @@ void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner) {
   reinterpret_cast<UnofficialEnvScope*>(owner)->isolate_scope.reset();
 }
 
+napi_status NapiV8MessageSharesRange(unofficial_napi_message message,
+                                     uintptr_t begin,
+                                     uintptr_t end,
+                                     bool* result) {
+  if (message == nullptr || result == nullptr) return napi_invalid_arg;
+  const auto* payload = reinterpret_cast<const SerializedClonePayload*>(message);
+  *result = false;
+  for (const std::shared_ptr<v8::BackingStore>& store : payload->shared_array_buffers) {
+    if (store == nullptr || store->Data() == nullptr || store->ByteLength() == 0) continue;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(store->Data());
+    const uintptr_t last = first + store->ByteLength();
+    if (first < end && begin < last) {
+      *result = true;
+      break;
+    }
+  }
+  return napi_ok;
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
@@ -2848,26 +2867,6 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
   delete reinterpret_cast<SerializedClonePayload*>(message);
-}
-
-napi_status NAPI_CDECL unofficial_napi_message_shares_range(
-    unofficial_napi_message message,
-    uintptr_t begin,
-    uintptr_t end,
-    bool* result) {
-  if (message == nullptr || result == nullptr) return napi_invalid_arg;
-  const auto* payload = reinterpret_cast<const SerializedClonePayload*>(message);
-  *result = false;
-  for (const std::shared_ptr<v8::BackingStore>& store : payload->shared_array_buffers) {
-    if (store == nullptr || store->Data() == nullptr || store->ByteLength() == 0) continue;
-    const uintptr_t first = reinterpret_cast<uintptr_t>(store->Data());
-    const uintptr_t last = first + store->ByteLength();
-    if (first < end && begin < last) {
-      *result = true;
-      break;
-    }
-  }
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_trusted_script(
