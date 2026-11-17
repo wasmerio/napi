@@ -604,6 +604,8 @@ EdgeV8Platform::~EdgeV8Platform() = default;
 bool EdgeV8Platform::EnableStandaloneWorkers() {
   std::lock_guard<std::mutex> lock(standalone_workers_mutex_);
   if (standalone_workers_ != nullptr) return true;
+  // The pool's threads inherit this thread's key rights.
+  EdgeV8AllowJitKeyReads();
   std::unique_ptr<v8::Platform> workers =
       v8::platform::NewDefaultPlatform(g_worker_thread_count.load(std::memory_order_acquire));
   if (!workers) return false;

@@ -25,6 +25,7 @@ mod common;
 use common::build_wasix_test;
 
 unsafe extern "C" {
+    fn snapi_v8_runtime_is_managed() -> bool;
     fn snapi_v8_standalone_pool_created() -> bool;
     fn snapi_v8_unattributed_worker_posts() -> u64;
 }
@@ -168,6 +169,8 @@ fn a_lane_starts_with_the_first_env_and_runs_the_instances_v8_work() {
     }
     assert!(lane.started());
     assert_eq!(lane.activations.load(Ordering::SeqCst), 2);
+    // V8 runs without the work its isolates would share across lanes.
+    assert!(unsafe { snapi_v8_runtime_is_managed() });
 
     lane.stop_after_work();
     let started = lane.tasks_started.load(Ordering::SeqCst);

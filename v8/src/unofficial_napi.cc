@@ -89,7 +89,25 @@ struct SharedRuntime {
   std::unique_ptr<EdgeV8Platform> platform;
   std::string engine_flags;
   uint32_t refcount = 0;
+  // V8 started with kManagedV8Flags, so instance lanes can be used.
+  bool managed = false;
 };
+
+// Set by an embedder that builds managed imports, before or after the runtime
+// starts (snapi_v8_use_managed_runtime).
+std::atomic<bool> g_managed_runtime_requested{false};
+
+// V8 flags of a process that runs instances on their own lanes. Every
+// isolate of this build shares one isolate group (it can't create private
+// ones), and the group owns state whose background work no lane can be
+// charged for:
+// - TurboFan's concurrent compiles: one queue and one job per group, so a
+//   worker posted by one instance would run another's compiles on its lane,
+//   and a stopped lane would strand the job for all. Without it TurboFan
+//   compiles on the isolate's own thread.
+// - The page pool: pages one isolate frees are kept for any other, and a
+//   group-wide release task reposts itself on whichever lane ran it.
+constexpr char kManagedV8Flags[] = "--no-concurrent-recompilation --no-memory-pool";
 
 class TrackingArrayBufferAllocator;
 
@@ -835,6 +853,12 @@ napi_status ConfigureRuntime(const char* engine_flags,
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
   }
+  // After the caller's flags, so none of them turns these back on.
+  if (g_managed_runtime_requested.load(std::memory_order_acquire)) {
+    v8::V8::SetFlagsFromString(kManagedV8Flags,
+                               static_cast<int>(sizeof(kManagedV8Flags) - 1));
+    g_runtime.managed = true;
+  }
   v8::V8::InitializeICUDefaultLocation("");
   v8::V8::InitializeExternalStartupData("");
   // The process-wide worker pool waits for the first env created with no
@@ -849,18 +873,46 @@ napi_status ConfigureRuntime(const char* engine_flags,
   return napi_ok;
 }
 
+}  // namespace
+
+// Declares that this process runs instances on embedder lanes. V8 then starts
+// with kManagedV8Flags. False if it already started without them: managed envs
+// are refused then.
+extern "C" bool snapi_v8_use_managed_runtime() {
+  g_managed_runtime_requested.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  return g_runtime.platform == nullptr || g_runtime.managed;
+}
+
+// Test hook: whether V8 started in managed mode.
+extern "C" bool snapi_v8_runtime_is_managed() {
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  return g_runtime.managed;
+}
+
+namespace {
+
 napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform == nullptr) return napi_invalid_arg;
-  // An env created with no instance lane bound runs its worker tasks on the
-  // standalone pool.
-  if (snapi_v8_lane_current() == nullptr &&
-      !g_runtime.platform->EnableStandaloneWorkers()) {
+  // The isolate is made, and later entered, on this thread, and the
+  // standalone pool's threads inherit its key rights.
+  EdgeV8AllowJitKeyReads();
+  if (snapi_v8_lane_current() != nullptr) {
+    // A lane can't hold an instance's V8 work apart from others' unless V8
+    // runs without group-wide background work (kManagedV8Flags).
+    if (!g_runtime.managed) {
+      std::fprintf(stderr,
+                   "[napi] refusing a managed env: the V8 runtime started without "
+                   "managed-mode flags (build managed imports before the first env)\n");
+      return napi_generic_failure;
+    }
+  } else if (!g_runtime.platform->EnableStandaloneWorkers()) {
+    // An env created with no instance lane bound runs its worker tasks on the
+    // standalone pool.
     return napi_generic_failure;
   }
-  // The isolate is made, and later entered, on this thread.
-  EdgeV8AllowJitKeyReads();
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;

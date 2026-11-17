@@ -299,15 +299,16 @@ impl NapiEnv {
 
     /// Binds the instance's V8 lane to this thread for an env creation, so
     /// the isolate's V8 work goes to it. A managed context gets the lane from
-    /// its embedder the first time; a standalone context has none, and its
-    /// envs use the process-wide worker pool. Fails once the instance is
-    /// stopped, and when the embedder refuses the lane.
+    /// its embedder the first time. A standalone context has none, and binds
+    /// none: its envs use the process-wide worker pool, also when created
+    /// from inside a call into a managed env, whose lane is bound then. Fails
+    /// once the instance is stopped, and when the embedder refuses the lane.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn enter_background_lane(
         &mut self,
-    ) -> anyhow::Result<Option<crate::lane::ManagedV8LaneScope>> {
+    ) -> anyhow::Result<crate::lane::ManagedV8LaneScope> {
         let Some(activate) = &self.managed_lane_activator else {
-            return Ok(None);
+            return Ok(crate::lane::ManagedV8LaneScope::no_lane());
         };
         if self.host_stopped.load(Ordering::Acquire) {
             anyhow::bail!("the N-API instance has stopped");
@@ -320,7 +321,11 @@ impl NapiEnv {
             }
             self.managed_lane = Some(lane);
         }
-        Ok(self.managed_lane.as_ref().map(crate::ManagedV8Lane::enter))
+        let lane = self
+            .managed_lane
+            .as_ref()
+            .expect("the lane was set above");
+        Ok(lane.enter())
     }
 
     /// Reserve budget for a new V8 env before creating it: acquire an isolate

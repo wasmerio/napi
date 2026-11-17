@@ -267,11 +267,23 @@ impl NapiCtxBuilder {
     /// ([`NapiRuntimeControl::terminate_all`]) makes later activations fail.
     ///
     /// [`ManagedV8Lane`]: crate::ManagedV8Lane
+    ///
+    /// The first call puts the process in managed mode: V8 starts without the
+    /// background work that all isolates share (concurrent TurboFan compiles
+    /// and the page pool), which no lane could be charged for. Build managed
+    /// imports before the process's first environment: if V8 already started
+    /// without managed mode, managed environments are refused.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn build_managed_imports(
         self,
         activator: crate::ManagedV8LaneActivator,
     ) -> NapiRuntimeHooks {
+        if !crate::lane::use_managed_runtime() {
+            eprintln!(
+                "[napi] V8 started without managed mode; this process refuses managed \
+                 environments (build managed imports before the first environment)"
+            );
+        }
         self.build_with(Some(activator)).runtime_hooks()
     }
 

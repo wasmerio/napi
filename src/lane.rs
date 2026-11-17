@@ -32,6 +32,14 @@ unsafe extern "C" {
     fn snapi_v8_lane_stop(handle: *mut c_void);
     fn snapi_v8_lane_delete(handle: *mut c_void);
     fn snapi_v8_lane_swap_current(handle: *mut c_void) -> *mut c_void;
+    fn snapi_v8_use_managed_runtime() -> bool;
+}
+
+/// Declares that this process runs instances on lanes, so that V8 starts
+/// without the background work an isolate group shares. False if V8 already
+/// started without that: managed environments are refused then.
+pub(crate) fn use_managed_runtime() -> bool {
+    unsafe { snapi_v8_use_managed_runtime() }
 }
 
 /// The V8 background task queue of one instance.
@@ -113,24 +121,7 @@ impl ManagedV8Lane {
     /// Binds this lane to the calling thread, so V8 work posted from it goes
     /// to the lane, until the returned scope is dropped.
     pub(crate) fn enter(self: &Arc<Self>) -> ManagedV8LaneScope {
-        let id = CURRENT_LANES.with(|scopes| {
-            let mut scopes = scopes.borrow_mut();
-            let previous = unsafe { snapi_v8_lane_swap_current(self.handle.as_ptr()) };
-            if scopes.entries.is_empty() {
-                scopes.base = previous;
-            }
-            let id = scopes.next_id;
-            scopes.next_id = scopes
-                .next_id
-                .checked_add(1)
-                .expect("V8 lane scope ID overflow");
-            scopes.entries.push((id, Arc::clone(self)));
-            id
-        });
-        ManagedV8LaneScope {
-            id,
-            _thread_bound: std::marker::PhantomData,
-        }
+        ManagedV8LaneScope::bind(Some(Arc::clone(self)))
     }
 }
 
@@ -174,19 +165,52 @@ unsafe extern "C" fn signal_overload(context: *mut c_void) {
     }));
 }
 
-/// A binding made by [`ManagedV8Lane::enter`]. Dropping it restores the
-/// binding below it, also when scopes are dropped out of order.
+/// A lane binding of the calling thread, made by [`ManagedV8Lane::enter`] or
+/// [`ManagedV8LaneScope::no_lane`]. Dropping it restores the binding below it,
+/// also when scopes are dropped out of order.
 pub(crate) struct ManagedV8LaneScope {
     id: u64,
     // A thread binding is restored only on the thread that made it.
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+impl ManagedV8LaneScope {
+    /// Binds no lane, for an env that must not inherit the caller's: a
+    /// standalone env created from inside a call into a managed one.
+    pub(crate) fn no_lane() -> Self {
+        Self::bind(None)
+    }
+
+    fn bind(lane: Option<Arc<ManagedV8Lane>>) -> Self {
+        let handle = lane
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |lane| lane.handle.as_ptr());
+        let id = CURRENT_LANES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let previous = unsafe { snapi_v8_lane_swap_current(handle) };
+            if scopes.entries.is_empty() {
+                scopes.base = previous;
+            }
+            let id = scopes.next_id;
+            scopes.next_id = scopes
+                .next_id
+                .checked_add(1)
+                .expect("V8 lane scope ID overflow");
+            scopes.entries.push((id, lane));
+            id
+        });
+        Self {
+            id,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThreadLaneScopes {
     next_id: u64,
     base: *mut c_void,
-    entries: Vec<(u64, Arc<ManagedV8Lane>)>,
+    entries: Vec<(u64, Option<Arc<ManagedV8Lane>>)>,
 }
 
 thread_local! {
@@ -205,10 +229,10 @@ impl Drop for ManagedV8LaneScope {
             let was_top = index + 1 == scopes.entries.len();
             let removed = scopes.entries.remove(index);
             if was_top {
-                let previous = scopes
-                    .entries
-                    .last()
-                    .map_or(scopes.base, |(_, lane)| lane.handle.as_ptr());
+                let previous = scopes.entries.last().map_or(scopes.base, |(_, lane)| {
+                    lane.as_ref()
+                        .map_or(std::ptr::null_mut(), |lane| lane.handle.as_ptr())
+                });
                 unsafe { snapi_v8_lane_swap_current(previous) };
             }
             if scopes.entries.is_empty() {
@@ -292,6 +316,25 @@ mod tests {
         drop(second_scope);
         let active = unsafe { snapi_v8_lane_swap_current(std::ptr::null_mut()) };
         assert!(active.is_null());
+    }
+
+    fn current() -> *mut c_void {
+        let active = unsafe { snapi_v8_lane_swap_current(std::ptr::null_mut()) };
+        unsafe { snapi_v8_lane_swap_current(active) };
+        active
+    }
+
+    #[test]
+    fn a_no_lane_scope_hides_the_callers_lane_until_dropped() {
+        let lane = ManagedV8Lane::new(1, Arc::new(|| Box::new(())), Arc::new(|| {})).unwrap();
+        let outer = lane.enter();
+        assert_eq!(current(), lane.handle.as_ptr());
+        let inner = ManagedV8LaneScope::no_lane();
+        assert!(current().is_null());
+        drop(inner);
+        assert_eq!(current(), lane.handle.as_ptr());
+        drop(outer);
+        assert!(current().is_null());
     }
 
     #[test]
