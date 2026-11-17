@@ -24,9 +24,9 @@ budget controls alongside the v2 frame/GC and callback error custody.
 The v2 facade configures the attachment before invoking the deferred Wasm start
 section. NAPI activation during start therefore uses the same protected heap and
 refill as ordinary entry. No extra NAPI hook phase or opt-in is needed. Source
-must pass through exec/facade loading or instrumentation. The CLI's permitted
-instrumentation fallback uses `InstrumentError::fallback_source`, preserving
-start deferral and its admission metadata in the cached compiler input.
+must pass through exec/facade loading or `prepare_for_compile`. The CLI caches
+the prepared bytes, which retain start deferral and its admission metadata
+even when the preemption rewrite falls back.
 Direct unconfigured instantiation still rejects NAPI activation; it bypasses this
 facade lifecycle. Old compiled caches must be invalidated when adopting deferral.
 
