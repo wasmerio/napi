@@ -2312,6 +2312,8 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
+}  // extern "C"
+
 namespace {
 
 struct HeapSpaces {
@@ -2374,8 +2376,7 @@ size_t SpaceSize(v8::Isolate* isolate, size_t index) {
 // Reading space statistics neither allocates nor collects, so this is safe
 // inside a near-heap-limit callback. The committed figure bounds V8's
 // capacity from above, so a limit raised to cover it satisfies V8.
-napi_status NAPI_CDECL unofficial_napi_get_heap_usage(napi_env env,
-                                                      unofficial_napi_heap_usage* result) {
+napi_status NapiV8GetHeapUsage(napi_env env, NapiV8HeapUsage* result) {
   if (result == nullptr) return napi_invalid_arg;
   *result = {};
   v8::Isolate* isolate =
@@ -2396,7 +2397,7 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_usage(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+napi_status NapiV8CollectGarbageIfOverHeapLimit(
     napi_env env, size_t old_generation_limit, bool* collected) {
   if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
     return napi_invalid_arg;
@@ -2434,6 +2435,31 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
   *collected = true;
   return napi_ok;
 }
+
+// This part of cancellation neither enters JavaScript nor calls the waker.
+napi_status NapiV8ClearTermination(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (env->agent != nullptr) {
+    env->agent->termination_requested.store(false, std::memory_order_release);
+  }
+  env->isolate->CancelTerminateExecution();
+  // Drop the termination sentinel so a later call cannot throw it as null.
+  napi_v8_drop_pending_termination(env);
+  return napi_ok;
+}
+
+void NapiV8WakeAfterTermination(napi_env env) {
+  // Checkpoints refused during termination left work queued. Wake the host
+  // again so it can take the checkpoint that runs it.
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
+}
+
+extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
@@ -2845,26 +2871,9 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
 }
 
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  if (env->agent != nullptr) {
-    env->agent->termination_requested.store(false, std::memory_order_release);
-  }
-  env->isolate->CancelTerminateExecution();
-  // A call the termination failed left its null pending. Nothing threw it:
-  // left there, the native function that cancels would throw it into its
-  // caller as a catchable null.
-  napi_v8_drop_pending_termination(env);
-  // The checkpoints the termination refused ran none of the tasks V8 queued
-  // for them, and the host's foreground task waker was called only when each
-  // was posted: call it again, so that a host that sleeps until it is woken
-  // takes the checkpoint that runs them now.
-  EdgeV8Platform* platform = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    platform = g_runtime.platform.get();
-  }
-  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
-  return napi_ok;
+  const napi_status status = NapiV8ClearTermination(env);
+  if (status == napi_ok) NapiV8WakeAfterTermination(env);
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(
