@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   EdgeV8Platform::SetWorkerThreadCount(workers);
-  auto platform = EdgeV8Platform::Create();
+  auto platform = EdgeV8Platform::Create(/*standalone_workers=*/true);
   if (!platform) return 1;
   if (platform->NumberOfWorkerThreads() != workers) {
     std::fprintf(stderr, "platform has %d workers, asked for %d\n",

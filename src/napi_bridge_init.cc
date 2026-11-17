@@ -172,6 +172,11 @@ struct SnapiAgentState {
   std::unordered_set<WasmInterruptRequest*> pending_interrupts;
   // Provider owner; releasing it tears down the isolate and all its envs.
   unofficial_napi_env_owner owner = nullptr;
+  // The embedder's instance lane bound when the isolate was created, or null
+  // for a standalone isolate. Every bridge call binds it again, so V8 work the
+  // call posts goes to that lane. The embedder keeps it until the agent is
+  // released.
+  void* background_lane = nullptr;
   // Envs on this agent; the first is the principal env.
   std::vector<SnapiEnvState*> envs;
 
@@ -641,13 +646,34 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
   state.agent->bytecode_handles.Remove(id);
 }
 
+// Binds an agent's instance lane to this thread, restoring the previous
+// binding on exit. Stores of different instances can share an OS thread.
+class AgentLaneScope {
+ public:
+  explicit AgentLaneScope(const SnapiAgentState* agent)
+      : previous_(snapi_v8_lane_swap_current(agent != nullptr ? agent->background_lane
+                                                                : nullptr)) {}
+  ~AgentLaneScope() { snapi_v8_lane_swap_current(previous_); }
+
+  AgentLaneScope(const AgentLaneScope&) = delete;
+  AgentLaneScope& operator=(const AgentLaneScope&) = delete;
+
+ private:
+  void* previous_;
+};
+
 // Several stores can share an OS thread. V8 consults the current isolate
 // even in APIs that take a context, so enter the isolate of the requested env
-// for each bridge call and restore the caller's isolate on return.
+// for each bridge call and restore the caller's isolate on return. The call
+// also binds the env's instance lane.
 class BridgeEnvScope {
  public:
   explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
-    if (state_ != nullptr && v8::Isolate::TryGetCurrent() != state_->env->isolate) {
+    if (state_ == nullptr) return;
+    // A WASIX thread can predate the platform's JIT key.
+    EdgeV8AllowJitKeyReads();
+    lane_scope_.emplace(state_->agent);
+    if (v8::Isolate::TryGetCurrent() != state_->env->isolate) {
       isolate_scope_.emplace(state_->env->isolate);
     }
   }
@@ -656,6 +682,7 @@ class BridgeEnvScope {
 
  private:
   SnapiEnvState* state_;
+  std::optional<AgentLaneScope> lane_scope_;
   std::optional<v8::Isolate::Scope> isolate_scope_;
 };
 
@@ -719,6 +746,8 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   }
   napi_status s = napi_ok;
   if (agent->owner != nullptr) {
+    // Disposing the isolate runs finalizers and V8's own teardown work.
+    AgentLaneScope lane_scope(agent);
     s = unofficial_napi_release_env(agent->owner, nullptr);
     agent->owner = nullptr;
   }
@@ -762,6 +791,7 @@ SnapiEnvState* NewAgentWithPrincipalEnv(napi_env env, unofficial_napi_env_owner 
   }
   NapiV8DetachEnvOwner(owner);
   agent->owner = owner;
+  agent->background_lane = snapi_v8_lane_current();
   agent->envs.push_back(state);
   state->agent = agent;
   state->env = env;

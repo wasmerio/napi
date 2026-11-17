@@ -32,6 +32,10 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return env_id as i32;
     }
 
+    // A managed instance's isolate posts its V8 work to the instance lane.
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
+        return 0;
+    };
     let Ok(reservation) = env.data().reserve_isolate(RequestedHeap::default()) else {
         return 0;
     };
@@ -248,6 +252,10 @@ fn guest_unofficial_napi_create_env(
         (0, 0, 0, 0, 0, 0)
     };
 
+    // A managed instance's isolate posts its V8 work to the instance lane.
+    let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
+        return 9; // napi_generic_failure: the instance stopped or refused its lane
+    };
     let requested = RequestedHeap {
         max_young: max_young_generation_size_in_bytes,
         max_old: max_old_generation_size_in_bytes,

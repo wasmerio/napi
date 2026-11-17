@@ -837,7 +837,10 @@ napi_status ConfigureRuntime(const char* engine_flags,
   }
   v8::V8::InitializeICUDefaultLocation("");
   v8::V8::InitializeExternalStartupData("");
-  g_runtime.platform = EdgeV8Platform::Create();
+  // The process-wide worker pool waits for the first env created with no
+  // instance lane bound (AcquireRuntime): a process of managed envs never
+  // builds it.
+  g_runtime.platform = EdgeV8Platform::Create(/*standalone_workers=*/false);
   if (g_runtime.platform == nullptr) return napi_generic_failure;
   v8::V8::InitializePlatform(g_runtime.platform.get());
   v8::V8::Initialize();
@@ -850,6 +853,14 @@ napi_status AcquireRuntime(EdgeV8Platform** platform_out) {
   if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime.platform == nullptr) return napi_invalid_arg;
+  // An env created with no instance lane bound runs its worker tasks on the
+  // standalone pool.
+  if (snapi_v8_lane_current() == nullptr &&
+      !g_runtime.platform->EnableStandaloneWorkers()) {
+    return napi_generic_failure;
+  }
+  // The isolate is made, and later entered, on this thread.
+  EdgeV8AllowJitKeyReads();
   g_runtime.refcount++;
   *platform_out = g_runtime.platform.get();
   return *platform_out != nullptr ? napi_ok : napi_generic_failure;
