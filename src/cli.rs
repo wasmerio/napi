@@ -89,13 +89,10 @@ fn wasmer_cache_dir() -> PathBuf {
 fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {
     let binary = wasmer::wat2wasm(wasm_bytes).context("failed to parse wasm module")?;
     let prepared = wasixv2_dylink::prepare_image(&binary)?;
-    let (compiler_input, failed) = match wasixv2::instrument(&prepared) {
-        Ok(instrumented) => (instrumented, None),
-        Err(error) if prepared == binary.as_ref() => {
-            let fallback = error.fallback_source(&prepared)?;
-            (fallback, Some(error))
-        }
-        Err(error) => return Err(error.into()),
+    let (compiler_input, failed) = if prepared == binary.as_ref() {
+        wasixv2::prepare_for_compile(&prepared)?
+    } else {
+        (wasixv2::instrument(&prepared)?, None)
     };
     // Dynamic preparation precedes instrumentation, and the persistent cache
     // identifies the exact compiler input rather than its original source.
