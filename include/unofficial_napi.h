@@ -1242,7 +1242,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_open(
 
 // Engine bytes for persistence, as a Uint8Array (V8: raw CachedData;
 // QuickJS: self-validating QJSB header [shape, source, params, filename,
-// payload hashes] + JS_WriteObject output).
+// payload hashes] + JS_WriteObject output). It is a plain Uint8Array of the
+// current realm over its own ArrayBuffer, never a Buffer: an embedder whose
+// API promises a Buffer (vm.Script#createCachedData) gives it its prototype.
+// Making it runs no JS.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_bytecode_serialize(
     napi_env env,
     unofficial_napi_bytecode bytecode,
@@ -1519,6 +1522,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_get_module_
     unofficial_napi_module module,
     napi_value* result_out);
 
+// The module's code cache (vm.SourceTextModule#createCachedData), empty when
+// the engine has none. Like unofficial_napi_bytecode_serialize, a plain
+// Uint8Array over its own ArrayBuffer, never a Buffer, made without running JS.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_module_wrap_create_cached_data(
     napi_env env,
     unofficial_napi_module module,

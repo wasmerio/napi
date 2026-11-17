@@ -1,5 +1,8 @@
-//! Cache serialization can call the guest's Buffer.from. Exercise both
-//! imports through real Wasmer dispatch, including exception and exit paths.
+//! Cache serialization makes a plain Uint8Array and runs no JS, so it never
+//! reaches the guest: not through a global Buffer, its getter or Buffer.from
+//! (wasmerio/napi#146). Both imports keep their callback context all the same.
+//! Exercise them through real Wasmer dispatch with a guest-native Buffer
+//! getter installed that would throw or exit the guest if it ran.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -167,7 +170,8 @@ impl Guest {
             .typed::<(), ()>("create")
             .call(&mut guest.store)
             .unwrap();
-        let source = "globalThis.Buffer = function Buffer() {}; Buffer.from = from;";
+        let source = "Object.defineProperty(globalThis, 'Buffer', \
+                      { get: from, configurable: true });";
         guest
             .memory
             .view(&guest.store)
@@ -216,43 +220,16 @@ impl Guest {
 }
 
 #[test]
-fn cache_imports_reenter_guest_buffer_from() {
+fn cache_imports_never_run_guest_code() {
     let mut guest = Guest::new();
-    for (index, export) in EXPORTS.iter().enumerate() {
-        assert_eq!(guest.cache(export, 0).unwrap(), 0, "{export}");
-        assert_eq!(guest.call0("calls"), index as i32 + 1, "{export}");
-        assert_ne!(guest.output(), 0, "{export}");
-        assert_ne!(guest.output(), UNWRITTEN, "{export}");
+    // Mode 0 returns from the getter, 1 throws from it, 2 exits the guest.
+    for mode in 0..3 {
+        for export in EXPORTS {
+            assert_eq!(guest.cache(export, mode).unwrap(), 0, "{export} mode {mode}");
+            assert_ne!(guest.output(), 0, "{export} mode {mode}");
+            assert_ne!(guest.output(), UNWRITTEN, "{export} mode {mode}");
+        }
     }
-    assert_eq!(guest.call0("release"), 0);
-}
-
-#[test]
-fn cache_imports_preserve_callback_exceptions_and_output_slots() {
-    let mut guest = Guest::new();
-    for (index, export) in EXPORTS.iter().enumerate() {
-        assert_eq!(guest.cache(export, 1).unwrap(), 10, "{export}");
-        assert_eq!(guest.call0("calls"), index as i32 + 1, "{export}");
-        assert_eq!(guest.output(), UNWRITTEN, "{export}");
-        assert_eq!(guest.call0("clear_exception"), 0);
-    }
-    assert_eq!(guest.call0("release"), 0);
-}
-
-#[test]
-fn cache_imports_reraise_guest_exit_and_restore_callback_state() {
-    let mut guest = Guest::new();
-    for export in EXPORTS {
-        let error = guest.cache(export, 2).expect_err(export);
-        assert!(
-            matches!(error.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if code.raw() == 37),
-            "{export}: {error}"
-        );
-        assert_eq!(guest.output(), UNWRITTEN, "{export}");
-        // The exit belongs to the enclosing import and is consumed there;
-        // it does not poison callback state or the host's next guest call.
-        assert_eq!(guest.cache(export, 0).unwrap(), 0, "{export}");
-    }
-    assert_eq!(guest.call0("calls"), 4);
+    assert_eq!(guest.call0("calls"), 0);
     assert_eq!(guest.call0("release"), 0);
 }

@@ -450,6 +450,66 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
 }
 
+// The bytes behind vm.Script#createCachedData() are a plain Uint8Array over
+// its own ArrayBuffer, made without running JS: the provider reads no global
+// Buffer, so a script's Buffer cannot run, and the bytes are never a slice of
+// Buffer's pool (wasmerio/napi#146). The embedder makes them a Buffer.
+TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesPlainUint8ArraysWithoutRunningJs) {
+  EnvScope s(runtime_.get());
+  auto run = [&](const char* source) {
+    napi_value result = nullptr;
+    napi_value text = nullptr;
+    char out[64] = {};
+    size_t length = 0;
+    if (napi_run_script(s.env, Str(s.env, source), &result) != napi_ok ||
+        napi_coerce_to_string(s.env, result, &text) != napi_ok ||
+        napi_get_value_string_utf8(s.env, text, out, sizeof(out), &length) != napi_ok) {
+      return std::string("<threw>");
+    }
+    return std::string(out, length);
+  };
+  ASSERT_EQ(run("globalThis.bufferReads = 0;"
+                "Object.defineProperty(globalThis, 'Buffer', {"
+                "  get() { bufferReads++; throw Error('Buffer read'); }, configurable: true});"
+                "'ok'"),
+            "ok");
+  napi_value global = nullptr;
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  unofficial_napi_bytecode_open_options open_options{};
+  open_options.size = sizeof(open_options);
+  open_options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  open_options.filename = Str(s.env, "pool.js");
+  open_options.shape = unofficial_napi_bytecode_shape_script;
+  open_options.params_or_undefined = undef;
+  open_options.host_defined_option_id = Sym(s.env, "hdo");
+  for (int i = 0; i < 50; ++i) {
+    // Small scripts, whose cache Buffer.from would have put in the pool.
+    const std::string source =
+        "(function f" + std::to_string(i) + "(a) { return a + " + std::to_string(i) + "; })";
+    open_options.source_text = Str(s.env, source.c_str());
+    unofficial_napi_bytecode_open_result open_result{};
+    ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+    ASSERT_NE(open_result.bytecode, nullptr);
+    napi_value cached_data = nullptr;
+    ASSERT_EQ(unofficial_napi_bytecode_serialize(s.env, open_result.bytecode, &cached_data),
+              napi_ok);
+    ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "cache", cached_data), napi_ok);
+    ASSERT_EQ(run("Object.getPrototypeOf(cache) === Uint8Array.prototype &&"
+                  " cache.byteLength > 0 && cache.byteOffset === 0 &&"
+                  " cache.buffer.byteLength === cache.byteLength"),
+              "true")
+        << "iteration " << i;
+  }
+  EXPECT_EQ(run("bufferReads"), "0");
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+}
+
 TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EnvScope s(runtime_.get());
 

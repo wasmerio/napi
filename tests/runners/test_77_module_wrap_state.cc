@@ -1343,19 +1343,41 @@ TEST_F(Test77ModuleWrapState, CancelledModuleErrorIsCatchableAndCheckpointExcept
   EXPECT_FALSE(ExceptionPending(s.env));
 }
 
-#if defined(NAPI_TEST_ENGINE_V8)
-TEST_F(Test77ModuleWrapState, CachedDataPropagatesBufferExceptionsAndRefusesTermination) {
+// Cached data is a plain Uint8Array over its own ArrayBuffer, made without
+// running JS: the provider reads no global Buffer, so a script's Buffer cannot
+// run, and the bytes are never a slice of Buffer's pool (wasmerio/napi#146).
+TEST_F(Test77ModuleWrapState, CachedDataIsAPlainUint8ArrayMadeWithoutRunningJs) {
   EnvScope s(runtime_.get());
   auto module = CreateSourceTextModule(s.env, "export default 1;");
-  ASSERT_EQ(RunText(s.env, "globalThis.Buffer = function Buffer() {}; Buffer.from = () => {throw Error('buffer failure');}; 'ok'"), "ok");
+  ASSERT_EQ(RunText(s.env,
+      "globalThis.bufferReads = 0;"
+      "Object.defineProperty(globalThis, 'Buffer', {"
+      "  get() { bufferReads++; throw Error('Buffer read'); }, configurable: true});"
+      "'ok'"), "ok");
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  for (int i = 0; i < 50; ++i) {
+    napi_value cache = nullptr;
+    ASSERT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "cache", cache), napi_ok);
+    ASSERT_EQ(RunText(s.env,
+        "Object.getPrototypeOf(cache) === Uint8Array.prototype && cache.byteLength > 0 &&"
+        " cache.byteOffset === 0 && cache.buffer.byteLength === cache.byteLength"),
+        "true") << "iteration " << i;
+  }
+  EXPECT_EQ(RunText(s.env, "bufferReads"), "0");
+  EXPECT_FALSE(ExceptionPending(s.env));
+}
+
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test77ModuleWrapState, CachedDataRefusesTermination) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "export default 1;");
   napi_value cache = nullptr;
-  EXPECT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_pending_exception);
-  EXPECT_EQ(TakePendingMessage(s.env), "buffer failure");
-  ASSERT_EQ(RunText(s.env, "Object.defineProperty(globalThis, 'Buffer', {get() {globalThis.bufferGetterRan = true;}, configurable: true}); 'ok'"), "ok");
   ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
   EXPECT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_pending_exception);
+  EXPECT_EQ(cache, nullptr);
   ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
-  EXPECT_EQ(RunText(s.env, "typeof bufferGetterRan"), "undefined");
 }
 #endif
 
