@@ -2216,10 +2216,7 @@ mod tests {
         unsafe extern "C" {
             fn snapi_bridge_unofficial_get_live_env_count() -> u64;
             fn snapi_bridge_unofficial_get_live_state_allocation_count() -> u64;
-            fn snapi_bridge_unofficial_set_value_limit(
-                env: crate::snapi::SnapiEnv,
-                limit: u64,
-            ) -> i32;
+
         }
         fn with_env<R>(store: &mut Store, f: impl FnOnce(&mut crate::NapiEnv) -> R) -> R {
             for owner in VMFunctionEnvironment::list_mut(store.objects_mut().as_sys_mut()) {
@@ -2255,7 +2252,8 @@ mod tests {
                 let registration = crate::snapi::snapi_bridge_alloc_cb_reg_id(state);
                 crate::snapi::snapi_bridge_register_callback(state, 1, id, 1, 0);
                 crate::snapi::snapi_bridge_register_callback_pair(state, 1, id, 1, 1, 0);
-                registration == 0 && snapi_bridge_unofficial_set_value_limit(state, 8) != 0
+                let mut value = 0;
+                registration == 0 && crate::snapi::snapi_bridge_get_global(state, &mut value) != 0
             };
             instance
                 .exports
