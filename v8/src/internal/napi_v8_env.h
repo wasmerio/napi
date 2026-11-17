@@ -313,16 +313,6 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_finalize_buffer_records(napi_env env);
 
-// A Buffer viewing `ab`: a Uint8Array given the env's Buffer.prototype, as
-// Node makes Buffers natively. Calls no Buffer function. Reading Buffer and
-// Buffer.prototype from the env's main realm runs a getter if a script made
-// either an accessor; a caller that must see what it throws keeps a TryCatch.
-// Without a usable Buffer.prototype the result is a plain Uint8Array.
-v8::Local<v8::Object> napi_v8_create_buffer_view(napi_env env,
-                                                 v8::Local<v8::ArrayBuffer> ab,
-                                                 size_t offset,
-                                                 size_t length);
-
 // napi_create_external_arraybuffer and napi_create_external_buffer for memory
 // that only needs freeing. `free_cb` runs in the backing store's deleter,
 // wherever V8 frees it, so the memory comes back as V8 collects; a user

@@ -520,9 +520,9 @@ v8::Local<v8::Object> CreateBufferView(napi_env env,
   // type check, which fails when this runs inside a native libuv callback (e.g.
   // a UDP recv) — the call throws and every such buffer would silently degrade
   // to a plain Uint8Array (breaking msg.toString(), Buffer.isBuffer, etc.).
-  // Setting the prototype calls no JS, so it works regardless of the calling
-  // context and on the native-V8 lane alike. Only the two reads below run JS,
-  // and only when a script made Buffer or Buffer.prototype an accessor.
+  // Setting the prototype is a pure host-side V8 operation (Buffer and
+  // Buffer.prototype are ordinary JS objects), so it works regardless of the
+  // calling context and on the native-V8 lane alike.
   v8::Local<v8::Object> view = v8::Uint8Array::New(ab, offset, length);
 
   v8::Local<v8::String> buffer_name = v8::String::NewFromUtf8Literal(env->isolate, "Buffer");
@@ -1249,13 +1249,6 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
 
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value) {
   return V8LocalValueFromJsValue(value);
-}
-
-v8::Local<v8::Object> napi_v8_create_buffer_view(napi_env env,
-                                                 v8::Local<v8::ArrayBuffer> ab,
-                                                 size_t offset,
-                                                 size_t length) {
-  return CreateBufferView(env, ab, offset, length);
 }
 
 napi_status napi_v8_create_external_arraybuffer_with_free(

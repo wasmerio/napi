@@ -450,11 +450,11 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
 }
 
-#if defined(NAPI_TEST_ENGINE_V8)
-// vm.Script#createCachedData() returns this. As Node's Buffer::Copy, it is a
-// Buffer over its own ArrayBuffer, never a slice of Buffer's shared pool, and
-// the provider never calls Buffer.from for it (wasmerio/napi#146).
-TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesUnpooledBuffersWithoutBufferFrom) {
+// The bytes behind vm.Script#createCachedData() are a plain Uint8Array over
+// its own ArrayBuffer, made without running JS: the provider reads no global
+// Buffer, so a script's Buffer cannot run, and the bytes are never a slice of
+// Buffer's pool (wasmerio/napi#146). The embedder makes them a Buffer.
+TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesPlainUint8ArraysWithoutRunningJs) {
   EnvScope s(runtime_.get());
   auto run = [&](const char* source) {
     napi_value result = nullptr;
@@ -468,10 +468,10 @@ TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesUnpooledBuffersWithoutB
     }
     return std::string(out, length);
   };
-  ASSERT_EQ(run("globalThis.fromCalls = 0;"
-                "globalThis.Buffer = class Buffer extends Uint8Array {"
-                "  static from() { fromCalls++; throw Error('Buffer.from called'); }"
-                "}; 'ok'"),
+  ASSERT_EQ(run("globalThis.bufferReads = 0;"
+                "Object.defineProperty(globalThis, 'Buffer', {"
+                "  get() { bufferReads++; throw Error('Buffer read'); }, configurable: true});"
+                "'ok'"),
             "ok");
   napi_value global = nullptr;
   napi_value undef = nullptr;
@@ -486,7 +486,7 @@ TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesUnpooledBuffersWithoutB
   open_options.params_or_undefined = undef;
   open_options.host_defined_option_id = Sym(s.env, "hdo");
   for (int i = 0; i < 50; ++i) {
-    // Small scripts, whose cache Buffer.from would put in the pool.
+    // Small scripts, whose cache Buffer.from would have put in the pool.
     const std::string source =
         "(function f" + std::to_string(i) + "(a) { return a + " + std::to_string(i) + "; })";
     open_options.source_text = Str(s.env, source.c_str());
@@ -498,18 +498,17 @@ TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesUnpooledBuffersWithoutB
               napi_ok);
     ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
     ASSERT_EQ(napi_set_named_property(s.env, global, "cache", cached_data), napi_ok);
-    ASSERT_EQ(run("Object.getPrototypeOf(cache) === Buffer.prototype && cache.byteLength > 0 &&"
-                  " cache.byteLength < 4096 && cache.byteOffset === 0 &&"
+    ASSERT_EQ(run("Object.getPrototypeOf(cache) === Uint8Array.prototype &&"
+                  " cache.byteLength > 0 && cache.byteOffset === 0 &&"
                   " cache.buffer.byteLength === cache.byteLength"),
               "true")
         << "iteration " << i;
   }
-  EXPECT_EQ(run("fromCalls"), "0");
+  EXPECT_EQ(run("bufferReads"), "0");
   bool pending = true;
   ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
   EXPECT_FALSE(pending);
 }
-#endif
 
 TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EnvScope s(runtime_.get());

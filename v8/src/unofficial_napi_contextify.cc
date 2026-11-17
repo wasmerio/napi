@@ -722,13 +722,12 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
   return true;
 }
 
-// A Buffer over a copy of `data`, made as Node's Buffer::Copy makes it: its
-// own ArrayBuffer with Buffer.prototype. It never calls Buffer.from, which
-// copies anything under Buffer.poolSize / 2 into Buffer's shared pool (so the
-// result would be a slice of the pool, exposing its other bytes through
-// .buffer), and which a program may replace. Only reading the env's Buffer and
-// Buffer.prototype can run JS, when a script made either an accessor.
-bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, napi_value* out) {
+// A Uint8Array over its own ArrayBuffer holding a copy of `data`, as the
+// QuickJS provider makes it. It is no Buffer: Buffer belongs to the embedder,
+// which wraps the bytes itself where its API promises one. Making it reads no
+// global and calls no JS, so it cannot re-enter a guest, run a script's
+// getter, or hand back a slice of Buffer's shared pool (wasmerio/napi#146).
+bool CreateUint8ArrayFromBytes(napi_env env, const uint8_t* data, size_t size, napi_value* out) {
   if (out == nullptr) return false;
   *out = nullptr;
   if (napi_v8_terminating(env)) {
@@ -737,9 +736,8 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   }
 
   v8::Isolate* isolate = env->isolate;
-  v8::Context::Scope context_scope(env->main_context());
-  v8::TryCatch caught(isolate);
-
+  // The current realm's Uint8Array, as napi_create_typedarray makes it.
+  v8::Context::Scope context_scope(env->context());
   std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(isolate, size);
   if (!store) return false;
   if (size > 0 && data != nullptr) {
@@ -747,17 +745,7 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   }
 
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(store));
-  v8::Local<v8::Object> buffer = napi_v8_create_buffer_view(env, ab, 0, size);
-
-  if (napi_v8_terminating(env)) {
-    napi_v8_fail_terminating(env);
-    return false;
-  }
-  if (caught.HasCaught()) {
-    ThrowTryCatchException(env, caught);
-    return false;
-  }
-  *out = napi_v8_wrap_value(env, buffer);
+  *out = napi_v8_wrap_value(env, v8::Uint8Array::New(ab, 0, size));
   return *out != nullptr;
 }
 
@@ -2159,7 +2147,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
   v8::Context::Scope context_scope(context);
 
   napi_value buffer = nullptr;
-  if (!CreateNodeBufferFromBytes(env, record->bytes.data(), record->bytes.size(), &buffer) ||
+  if (!CreateUint8ArrayFromBytes(env, record->bytes.data(), record->bytes.size(), &buffer) ||
       buffer == nullptr) {
     return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   }
@@ -3311,13 +3299,13 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
   v8::Local<v8::Module> module = record->module.Get(isolate);
   napi_value out = nullptr;
   if (!module->IsSourceTextModule()) {
-    if (!CreateNodeBufferFromBytes(env, nullptr, 0, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
+    if (!CreateUint8ArrayFromBytes(env, nullptr, 0, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   } else {
     std::unique_ptr<v8::ScriptCompiler::CachedData> cached_data(
         v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
     const uint8_t* bytes = cached_data ? cached_data->data : nullptr;
     const size_t size = cached_data ? static_cast<size_t>(cached_data->length) : 0;
-    if (!CreateNodeBufferFromBytes(env, bytes, size, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
+    if (!CreateUint8ArrayFromBytes(env, bytes, size, &out) || out == nullptr) return env->last_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
   }
   v8::Local<v8::Value> out_value = napi_v8_unwrap_value(out);
   if (out_value.IsEmpty()) return napi_generic_failure;
