@@ -41,7 +41,7 @@ cli = [
 [dependencies]
 anyhow = "1"
 # Engine uses runtime/next; product packages use wasmer-next/main.
-# Refresh Cargo.standalone.lock after the product split is pushed to main.
+# Cargo.standalone.lock pins the same product/engine snapshot used for validation.
 wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
