@@ -1,5 +1,6 @@
 #include "unofficial_napi.h"
 
+#include <atomic>
 #include <cstdint>
 #include <new>
 
@@ -8,6 +9,10 @@ struct unofficial_napi_buffer_lease__ {
 };
 
 namespace {
+
+// Host-only allocation diagnostic. This counts actual published lease shells,
+// independently of an environment's reference factory or bridge handle maps.
+std::atomic<uint64_t> g_live_buffer_leases{0};
 
 size_t TypedArrayElementSize(napi_typedarray_type type) {
   switch (type) {
@@ -79,6 +84,10 @@ napi_status GetLeaseByteView(napi_env env, napi_value value, uint8_t **data,
 
 extern "C" {
 
+uint64_t snapi_bridge_unofficial_get_live_buffer_lease_count() {
+  return g_live_buffer_leases.load(std::memory_order_relaxed);
+}
+
 napi_status NAPI_CDECL unofficial_napi_acquire_buffer_lease(
     napi_env env, napi_value value, size_t byte_offset, size_t byte_length,
     unofficial_napi_buffer_access_mode mode,
@@ -107,6 +116,7 @@ napi_status NAPI_CDECL unofficial_napi_acquire_buffer_lease(
     return status;
   }
 
+  g_live_buffer_leases.fetch_add(1, std::memory_order_relaxed);
   *lease_out = lease;
   *data_out = base == nullptr ? nullptr : base + byte_offset;
   return napi_ok;
@@ -119,6 +129,7 @@ napi_status NAPI_CDECL unofficial_napi_release_buffer_lease(
     return napi_invalid_arg;
   napi_status status = napi_delete_reference(env, lease->value_ref);
   delete lease;
+  g_live_buffer_leases.fetch_sub(1, std::memory_order_relaxed);
   return status;
 }
 

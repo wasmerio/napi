@@ -9,12 +9,18 @@ mod guest_heap;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 mod lane;
 mod message;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub use guest_heap::{NativeGuestArena, NativeGuestChunk, NativeGuestRefill};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+mod native_frame;
 mod snapi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod snapi_js;
 #[cfg(feature = "wasix")]
 mod wasix;
 use std::fmt::Display;
+#[cfg(feature = "wasix")]
+pub use wasix::NapiHook;
 
 pub const NAPI_MODULE_NAME: &str = "napi";
 pub const NAPI_EXTENSION_WASMER_MODULE_PREFIX: &str = "napi_extension_wasmer_v";
@@ -56,9 +62,9 @@ pub struct HostJsCapabilities {
 pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     {
-        return Some(HostJsCapabilities {
+        Some(HostJsCapabilities {
             jspi: snapi_js::has_jspi(),
-        });
+        })
     }
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     {

@@ -74,7 +74,8 @@ pub(super) fn frozen_type_matches(name: &str, actual: &FunctionType) -> Option<b
 pub(super) fn register(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>, io: &mut Imports) {
     for (name, ty, has_result) in frozen_signatures() {
         let function = Function::new_with_env(store, fe, ty, move |env, args| {
-            let status = dispatch(name, env, args)?;
+            let status =
+                super::super::callback::with_native_import(env, |env| dispatch(name, env, args))?;
             Ok(if has_result {
                 vec![Value::I32(status)]
             } else {
@@ -130,7 +131,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             0,
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_create_env_with_options" => {
             let mut env = env;
             let options_ptr = args[1].unwrap_i32();
@@ -155,14 +156,12 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
         }
         "unofficial_napi_release_env" => {
             super::guest_unofficial_napi_release_env(env, args[0].unwrap_i32(), 0)
-                .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_release_env_with_loop" => super::guest_unofficial_napi_release_env(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
-        )
-        .map_err(|error| RuntimeError::user(Box::new(error))),
+        ),
         "unofficial_napi_set_enqueue_foreground_task_callback" => {
             Ok(legacy_set_foreground_task_callback(
                 env,
@@ -183,10 +182,10 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_cancel_terminate_execution" => Ok(
-            super::guest_unofficial_napi_cancel_terminate_execution(env, args[0].unwrap_i32()),
+            super::guest_unofficial_napi_cancel_terminate_execution(env, args[0].unwrap_i32())?,
         ),
         "unofficial_napi_contextify_contains_module_syntax" => {
             super::guest_unofficial_napi_contextify_contains_module_syntax(
@@ -198,7 +197,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[4].unwrap_i32(),
                 args[5].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_contextify_compile_function" => legacy_compile_function(env, args),
         "unofficial_napi_contextify_compile_function_for_cjs_loader" => {
@@ -218,7 +216,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[7].unwrap_i32(),
                 args[8].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_contextify_run_script" => legacy_run_script(env, args),
         "unofficial_napi_create_private_symbol" => {
@@ -228,40 +225,40 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_get_call_sites" => Ok(super::guest_unofficial_napi_get_call_sites(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_get_constructor_name" => {
             Ok(super::guest_unofficial_napi_get_constructor_name(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_get_continuation_preserved_embedder_data" => Ok(
             super::guest_unofficial_napi_get_continuation_preserved_embedder_data(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_get_hash_seed" => Ok(super::guest_unofficial_napi_get_hash_seed(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_get_heap_code_statistics" => {
             Ok(super::guest_unofficial_napi_get_heap_code_statistics(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_get_heap_statistics" => Ok(legacy_heap_statistics(
             env,
@@ -288,7 +285,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_get_promise_details" => {
             Ok(super::guest_unofficial_napi_get_promise_details(
@@ -298,7 +294,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
                 args[4].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_get_proxy_details" => Ok(super::guest_unofficial_napi_get_proxy_details(
             env,
@@ -306,14 +302,13 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
             args[3].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_mark_promise_as_handled" => {
             super::guest_unofficial_napi_mark_promise_as_handled(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_create_cached_data" => {
             Ok(super::guest_unofficial_napi_module_wrap_create_cached_data(
@@ -321,7 +316,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_create_source_text" => legacy_module_create(env, args, false),
         "unofficial_napi_module_wrap_create_synthetic" => legacy_module_create(env, args, true),
@@ -332,14 +327,13 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_destroy" => {
             Ok(super::guest_unofficial_napi_module_wrap_destroy(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_get_module_source_object" => Ok(
             super::guest_unofficial_napi_module_wrap_get_module_source_object(
@@ -347,7 +341,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_module_wrap_get_namespace" => {
             super::guest_unofficial_napi_module_wrap_get_namespace(
@@ -356,7 +350,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_get_module_requests" => {
             Ok(legacy_module_metadata(env, args, true))
@@ -372,7 +365,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
                 0,
                 0,
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_get_error" => {
             Ok(super::guest_unofficial_napi_module_wrap_get_state(
@@ -382,7 +375,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 0,
                 args[2].unwrap_i32(),
                 0,
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_has_async_graph" => {
             Ok(super::guest_unofficial_napi_module_wrap_get_state(
@@ -392,7 +385,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 0,
                 0,
                 args[2].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_check_unsettled_top_level_await" => {
             super::guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
@@ -402,7 +395,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_evaluate" => {
             super::guest_unofficial_napi_module_wrap_evaluate(
@@ -413,7 +405,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[3].unwrap_i32(),
                 args[4].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_evaluate_sync" => {
             super::guest_unofficial_napi_module_wrap_evaluate_sync(
@@ -424,7 +415,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[3].unwrap_i32(),
                 args[4].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_import_module_dynamically" => {
             legacy_import_module_dynamically(env, args)
@@ -435,7 +425,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_module_wrap_link" => super::guest_unofficial_napi_module_wrap_link(
             env,
@@ -443,8 +432,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
             args[3].unwrap_i32(),
-        )
-        .map_err(|error| RuntimeError::user(Box::new(error))),
+        ),
         "unofficial_napi_module_wrap_set_export" => {
             Ok(super::guest_unofficial_napi_module_wrap_set_export(
                 env,
@@ -452,7 +440,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
-            ))
+            )?)
         }
         "unofficial_napi_module_wrap_set_import_module_dynamically_callback" => Ok(
             legacy_module_hook(env, args[0].unwrap_i32(), args[1].unwrap_i32(), 0),
@@ -466,13 +454,13 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
                 args[2].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_notify_datetime_configuration_change" => Ok(
             super::guest_unofficial_napi_notify_datetime_configuration_change(
                 env,
                 args[0].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_preserve_error_source_message" => {
             super::guest_unofficial_napi_preserve_error_source_message(
@@ -480,11 +468,9 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_process_microtasks" => {
             super::guest_unofficial_napi_event_loop_checkpoint(env, args[0].unwrap_i32(), 0, 0, 0)
-                .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_preview_entries" => Ok(super::guest_unofficial_napi_preview_entries(
             env,
@@ -492,13 +478,13 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
             args[3].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_request_interrupt" => Ok(super::guest_unofficial_napi_request_interrupt(
             env,
             args[0].unwrap_i32(),
             args[1].unwrap_i32(),
             args[2].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_low_memory_notification" | "unofficial_napi_request_gc_for_testing" => {
             let mut env = env;
             let guest_env = args[0].unwrap_i32();
@@ -509,7 +495,6 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             super::with_cb_context(&mut env, guest_env, || unsafe {
                 crate::snapi::snapi_bridge_unofficial_collect_garbage(snapi_env)
             })
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_set_near_heap_limit_callback"
         | "unofficial_napi_remove_near_heap_limit_callback"
@@ -526,8 +511,7 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[1].unwrap_i32(),
             0,
             args[2].unwrap_i32(),
-        )
-        .map_err(|error| RuntimeError::user(Box::new(error))),
+        ),
         "unofficial_napi_structured_clone_with_transfer" => {
             super::guest_unofficial_napi_structured_clone(
                 env,
@@ -536,21 +520,20 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
                 args[2].unwrap_i32(),
                 args[3].unwrap_i32(),
             )
-            .map_err(|error| RuntimeError::user(Box::new(error)))
         }
         "unofficial_napi_set_continuation_preserved_embedder_data" => Ok(
             super::guest_unofficial_napi_set_continuation_preserved_embedder_data(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_set_prepare_stack_trace_callback" => Ok(
             super::guest_unofficial_napi_set_prepare_stack_trace_callback(
                 env,
                 args[0].unwrap_i32(),
                 args[1].unwrap_i32(),
-            ),
+            )?,
         ),
         "unofficial_napi_set_promise_hooks" => Ok(super::guest_unofficial_napi_set_promise_hooks(
             env,
@@ -559,9 +542,9 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             args[2].unwrap_i32(),
             args[3].unwrap_i32(),
             args[4].unwrap_i32(),
-        )),
+        )?),
         "unofficial_napi_terminate_execution" => Ok(
-            super::guest_unofficial_napi_terminate_execution(env, args[0].unwrap_i32()),
+            super::guest_unofficial_napi_terminate_execution(env, args[0].unwrap_i32())?,
         ),
         // Every released import has an exact type and a host function. An
         // operation with no safe compatibility path reports failure rather
@@ -771,8 +754,7 @@ fn legacy_import_module_dynamically(
             ids.as_ptr(),
             &mut result,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    })?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
         return Ok(1);
     }
@@ -1020,8 +1002,7 @@ fn legacy_compile_function(
             args[10].unwrap_i32().max(0) as u32,
             &mut result,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    })?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
         return Ok(1);
     }
@@ -1051,8 +1032,7 @@ fn legacy_compile_cjs(
             args[4].unwrap_i32(),
             &mut result,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    })?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
         return Ok(1);
     }
@@ -1090,8 +1070,7 @@ fn legacy_run_script(
             args[10].unwrap_i32().max(0) as u32,
             &mut result,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    })?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
         return Ok(1);
     }
@@ -1132,7 +1111,7 @@ fn legacy_create_cached_data(
         )
     });
     budget.uncharge(Pool::HostTransient, TRANSIENT_RESERVATION);
-    let status = status.map_err(|error| RuntimeError::user(Box::new(error)))?;
+    let status = status?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, result) {
         return Ok(1);
     }
@@ -1257,8 +1236,7 @@ fn legacy_deserialize_value(
             message as u32,
             &mut value,
         )
-    })
-    .map_err(|error| RuntimeError::user(Box::new(error)))?;
+    })?;
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, value) {
         return Ok(1);
     }

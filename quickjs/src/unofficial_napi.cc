@@ -409,6 +409,14 @@ extern "C"
         return napi_util__::check_env(env) ? napi_ok : napi_invalid_arg;
     }
 
+    napi_status NAPI_CDECL unofficial_napi_is_execution_terminating(napi_env env, bool *result)
+    {
+        if (!napi_util__::check_env(env) || result == nullptr)
+            return napi_invalid_arg;
+        *result = false;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_request_interrupt(
         napi_env env,
         unofficial_napi_interrupt_callback callback,
@@ -550,13 +558,7 @@ extern "C"
         napi_env env,
         napi_value promise)
     {
-        if (!napi_util__::check_value(env, promise))
-            return napi_invalid_arg;
-        JSValueConst raw = napi_quickjs_value_inner(env, promise);
-        if (!JS_IsPromise(raw))
-            return napi_invalid_arg;
-        JS_PromiseMarkAsHandled(napi_quickjs_value_context(env, promise), raw);
-        return napi_ok;
+        return (!napi_util__::check_env(env) || promise == nullptr) ? napi_invalid_arg : napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_proxy_details(napi_env env,

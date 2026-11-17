@@ -5,7 +5,13 @@ use std::sync::{
 
 use wasmer::{AsStoreMut, Function, Instance, Module, RuntimeError, Store};
 use wasmer_napi::NapiCtx;
-use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
+// A guest error payload must survive the bridge independently of a legacy runtime.
+#[derive(Debug)]
+enum GuestExit { Exit(i32) }
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+}
+impl std::error::Error for GuestExit {}
 
 #[test]
 fn source_map_callback_exit_crosses_error_metadata_imports() {
@@ -61,8 +67,8 @@ fn source_map_callback_exit_crosses_error_metadata_imports() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(WasiError::Exit(
-                    ExitCode::from(code),
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(
+                    i32::from(code),
                 ))))
             }),
         );
@@ -85,8 +91,8 @@ fn source_map_callback_exit_crosses_error_metadata_imports() {
         let error = run.call(&mut store, mode).unwrap_err();
         assert!(
             matches!(
-                error.downcast_ref::<WasiError>(),
-                Some(WasiError::Exit(code)) if *code == ExitCode::from(41)
+                error.downcast_ref::<GuestExit>(),
+                Some(GuestExit::Exit(code)) if *code == i32::from(41)
             ),
             "mode {mode}: {error}"
         );

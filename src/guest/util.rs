@@ -125,11 +125,11 @@ impl<T> Drop for HostCopy<T> {
 }
 
 pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data: &[u8]) -> bool {
-    let (state, store) = env.data_and_store_mut();
+    let state = env.data();
     let Some(memory) = state.memory.clone() else {
         return false;
     };
-    let view = memory.view(&store);
+    let view = memory.view(&*env);
     view.write(guest_ptr as u64, data).is_ok()
 }
 
@@ -165,9 +165,9 @@ pub fn read_guest_bytes(
     if guest_ptr < 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
+    let state = env.data();
     let memory = state.memory.clone()?;
-    let view = memory.view(&store);
+    let view = memory.view(&*env);
     // Validate the entire range before allocating. Checking only `len` lets a
     // guest point near the end of memory and request a huge host allocation
     // that the subsequent bounds-checked read would reject too late.
@@ -213,7 +213,7 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
         return 0;
     };
     let (_, store) = env.data_and_store_mut();
-    memory.view(&store).data_size()
+    memory.view(&*env).data_size()
 }
 
 /// Validate a guest-owned byte range without copying or allocating it. Native
@@ -234,12 +234,13 @@ pub fn guest_range_is_valid(env: &mut FunctionEnvMut<NapiEnv>, ptr: i32, len: us
 /// publish and rediscover it through runtime TLS.
 pub fn alloc_guest(
     env: &mut FunctionEnvMut<NapiEnv>,
-    heap: &crate::guest_heap::GuestHeap,
+    heap: &std::sync::Arc<crate::guest_heap::GuestHeap>,
     len: usize,
     zero: bool,
 ) -> Option<u32> {
+    let refill = env.data().native_guest_refill.clone();
     let mut store = env.as_store_mut();
-    heap.alloc_with_store(&mut store, len, zero)
+    heap.alloc_with_refill(&mut store, refill.as_deref(), len, zero)
 }
 
 // Used by optional guest import paths; the current V8 path allocates through
@@ -257,8 +258,8 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> O
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
     let memory = env.data().memory.clone()?;
-    let (_, store_ref) = env.data_and_store_mut();
-    let view = memory.view(&store_ref);
+
+    let view = memory.view(&*env);
     let host_base = view.data_ptr() as u64;
     let memory_len = view.data_size();
     if host_addr < host_base || host_addr >= host_base + memory_len {
@@ -291,9 +292,9 @@ pub fn read_guest_c_string(
         return None;
     }
     let len = {
-        let (state, store) = env.data_and_store_mut();
+        let state = env.data();
         let memory = state.memory.clone()?;
-        let view = memory.view(&store);
+        let view = memory.view(&*env);
         let mut len = None;
         for i in 0..super::MAX_GUEST_CSTRING_SCAN {
             let mut b = [0u8; 1];

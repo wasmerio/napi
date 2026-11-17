@@ -3,7 +3,13 @@
 
 use wasmer::{AsStoreMut, Extern, Function, Instance, Module, RuntimeError, Store, Type};
 use wasmer_napi::NapiCtx;
-use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
+// A guest error payload must survive the bridge independently of a legacy runtime.
+#[derive(Debug)]
+enum GuestExit { Exit(i32) }
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+}
+impl std::error::Error for GuestExit {}
 
 unsafe extern "C" {
     fn snapi_bridge_unofficial_legacy_message_is_live(message_id: u32) -> i32;
@@ -155,8 +161,8 @@ fn guest_getter_proc_exit_propagates_through_clone_and_message() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(WasiError::Exit(
-                    ExitCode::from(code),
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(
+                    i32::from(code),
                 ))))
             }),
         );
@@ -170,8 +176,8 @@ fn guest_getter_proc_exit_propagates_through_clone_and_message() {
             .unwrap();
         let error = run.call(&mut store, mode).unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<WasiError>(),
-            Some(WasiError::Exit(code)) if *code == ExitCode::from(23)
+            error.downcast_ref::<GuestExit>(),
+            Some(GuestExit::Exit(code)) if *code == i32::from(23)
         ));
         assert_eq!(ctx.budget().snapshot().serialized_message, 0);
         assert_eq!(ctx.budget().snapshot().host_transient, 0);
@@ -277,8 +283,8 @@ fn guest_getter_proc_exit_propagates_through_compile_and_module_create() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(WasiError::Exit(
-                    ExitCode::from(code),
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(
+                    i32::from(code),
                 ))))
             }),
         );
@@ -292,8 +298,8 @@ fn guest_getter_proc_exit_propagates_through_compile_and_module_create() {
             .unwrap();
         let error = run.call(&mut store, mode).unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<WasiError>(),
-            Some(WasiError::Exit(code)) if *code == ExitCode::from(29)
+            error.downcast_ref::<GuestExit>(),
+            Some(GuestExit::Exit(code)) if *code == i32::from(29)
         ));
         assert_eq!(ctx.budget().snapshot().host_transient, 0);
     }

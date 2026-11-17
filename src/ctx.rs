@@ -19,6 +19,7 @@ use crate::{
     guest::napi::{
         frozen_napi_type_matches, is_known_napi_import, register_env_imports, register_napi_imports,
     },
+    guest::{is_known_env_import, is_known_extension_import},
     message::PendingMessages,
 };
 
@@ -287,6 +288,14 @@ pub struct NapiInstantiationState {
     session: Option<NapiSession>,
 }
 
+impl NapiInstantiationState {
+    /// The session created for these imports. Retain a clone when an
+    /// instantiation attachment also owns explicit retirement of its resources.
+    pub fn session(&self) -> Option<&NapiSession> {
+        self.session.as_ref()
+    }
+}
+
 /// Runtime hooks that provide N-API imports for WASIX guests.
 // The import phase creates a lightweight per-instantiation binding for the
 // WASM host functions. V8 and the dedicated background lane start only when a
@@ -333,9 +342,9 @@ impl NapiRuntimeControl {
     /// when the instance was killed for an unrelated reason; N-API itself
     /// draws no distinction, since either way the app's JS must never run
     /// again. The stop is sticky: guest code cannot undo it with
-    /// `napi_cancel_terminate_execution`, and isolates created afterwards
-    /// stay terminated ([`NapiEnv::commit_isolate`] re-checks the flag under
-    /// the same registry lock this holds).
+    /// `napi_cancel_terminate_execution`. New native creation requests are
+    /// refused; a provider concurrently finishing publication stays terminated
+    /// ([`NapiEnv::commit_isolate`] checks the flag under this registry lock).
     ///
     /// [`NapiEnv::commit_isolate`]: crate::env::NapiEnv::commit_isolate
     pub fn terminate_all(&self) {
@@ -384,7 +393,50 @@ struct NapiSessionInner {
     lease: Arc<SessionLease>,
     imported_memory_type: Option<wasmer::MemoryType>,
     imported_table_type: Option<wasmer::TableType>,
-    func_env: Mutex<Option<FunctionEnv<NapiEnv>>>,
+    state: Mutex<SessionState>,
+}
+
+enum SessionState {
+    Unprepared,
+    Preparing,
+    Attached(FunctionEnv<NapiEnv>),
+    Deactivated,
+}
+
+// Session admission is metadata only; custom tunables and accounting must not
+// run under this mutex. Partial Store objects retain their existing Store owner.
+struct SessionPreparation<'a>(&'a Mutex<SessionState>);
+
+impl<'a> SessionPreparation<'a> {
+    fn begin(state: &'a Mutex<SessionState>) -> Result<Self> {
+        let mut current = state.lock().expect("poisoned NapiSession mutex");
+        if !matches!(*current, SessionState::Unprepared) {
+            bail!("N-API session imports have already been created or deactivated");
+        }
+        *current = SessionState::Preparing;
+        Ok(Self(state))
+    }
+
+    fn commit(self, env: FunctionEnv<NapiEnv>) -> std::result::Result<(), FunctionEnv<NapiEnv>> {
+        let mut pending = Some(env);
+        {
+            let mut current = self.0.lock().expect("poisoned NapiSession mutex");
+            if matches!(*current, SessionState::Preparing) {
+                *current = SessionState::Attached(pending.take().unwrap());
+            }
+        }
+        // Rejected provisional data is retired by the caller outside the lock.
+        pending.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SessionPreparation<'_> {
+    fn drop(&mut self) {
+        let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if matches!(*current, SessionState::Preparing) {
+            *current = SessionState::Unprepared;
+        }
+    }
 }
 
 impl std::fmt::Debug for NapiSession {
@@ -519,6 +571,17 @@ impl Default for NapiCtx {
 }
 
 impl NapiCtx {
+    /// Creates an empty native arena backed only by explicitly installed leases.
+    /// The arena shares this context's accounting policy and owns no Store.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn native_guest_arena(
+        &self,
+        store: &impl wasmer::AsStoreRef,
+        memory: &wasmer::Memory,
+    ) -> Option<crate::NativeGuestArena> {
+        crate::NativeGuestArena::new(store, memory, self.inner.budget.clone())
+    }
+
     pub fn builder() -> NapiCtxBuilder {
         NapiCtxBuilder::default()
     }
@@ -545,6 +608,16 @@ impl NapiCtx {
 
     pub fn prepare_module(&self, module: &Module) -> Result<NapiSession> {
         self.new_session(module)
+    }
+
+    /// Pure declaration matching the imports this binding can provide.
+    pub fn provides_import(namespace: &str, name: &str) -> bool {
+        match namespace {
+            NAPI_MODULE_NAME => is_known_napi_import(name),
+            NAPI_EXTENSION_WASMER_MODULE_NAME => is_known_extension_import(name),
+            "env" => is_known_env_import(name),
+            _ => false,
+        }
     }
 
     pub fn module_needs_napi(
@@ -640,7 +713,7 @@ fn new_session(ctx: &Arc<NapiProviderBindings>, module: &Module) -> Result<NapiS
             lease,
             imported_memory_type,
             imported_table_type,
-            func_env: Mutex::new(None),
+            state: Mutex::new(SessionState::Unprepared),
         }),
     })
 }
@@ -656,6 +729,12 @@ impl NapiRuntimeControl {
 }
 
 impl NapiRuntimeHooks {
+    pub(crate) fn context(&self) -> NapiCtx {
+        NapiCtx {
+            inner: self.inner.clone(),
+        }
+    }
+
     /// Shared resource budget for the guest store and all V8 environments.
     pub fn budget(&self) -> Arc<ResourceBudget> {
         Arc::clone(&self.inner.budget)
@@ -690,6 +769,18 @@ impl NapiRuntimeHooks {
     ) -> Result<NapiInstantiationState> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
+            if module
+                .imports()
+                .any(|import| import.module() == "env" && is_known_env_import(import.name()))
+            {
+                let mut additions = Imports::new();
+                register_env_imports(store, &mut additions);
+                for (namespace, name, value) in additions.iter() {
+                    if !imports.exists(namespace, name) {
+                        imports.define(namespace, name, value.clone());
+                    }
+                }
+            }
             return Ok(NapiInstantiationState { session: None });
         }
 
@@ -740,6 +831,39 @@ impl NapiRuntimeHooks {
 }
 
 impl NapiSession {
+    /// Clears this session's store-local provider and guest-memory resources.
+    /// Repeated calls do nothing. The session limit remains charged until the
+    /// last clone of this session is dropped. Browser callbacks queued before
+    /// guest entry are rejected host-only; already-entered continuations must
+    /// have settled before calling this method.
+    ///
+    /// # Safety
+    /// `store` must be the exact store used to create this session's imports.
+    /// All native invocations, callbacks, finalizers and browser Promise/JSPI
+    /// continuations using this session must have finished or been retired.
+    /// Call on the provider's owning thread.
+    pub unsafe fn deactivate(&self, store: &mut StoreMut<'_>) {
+        let attached = {
+            let state = self.inner.state.lock().expect("poisoned NapiSession mutex");
+            match &*state {
+                SessionState::Attached(func_env) => Some(func_env.clone()),
+                _ => None,
+            }
+        };
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let retirement =
+            attached.map(|func_env| func_env.as_mut(&mut *store).take_native_deactivation());
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        if let Some(func_env) = attached {
+            func_env.as_mut(&mut *store).deactivate();
+        }
+        *self.inner.state.lock().expect("poisoned NapiSession mutex") = SessionState::Deactivated;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        store.parked(|| drop(retirement));
+    }
+
+    /// Creates imports for exactly one store-local instance attachment.
+    /// Once imports are created or the session is deactivated, later calls fail.
     pub fn create_imports(&self, store: &mut StoreMut<'_>) -> Result<Imports> {
         let mut import_object = Imports::new();
         self.add_imports(store, &mut import_object)?;
@@ -747,32 +871,9 @@ impl NapiSession {
     }
 
     fn add_imports(&self, store: &mut StoreMut<'_>, import_object: &mut Imports) -> Result<()> {
-        register_env_imports(store, import_object);
-
-        let mut napi_env = NapiEnv::new(
-            Arc::clone(&self.inner.ctx.budget),
-            Arc::clone(&self.inner.ctx.pending_messages),
-            self.inner.ctx.limits.max_envs,
-            Arc::clone(&self.inner.ctx.envs),
-            Arc::clone(&self.inner.ctx.host_stopped),
-            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            Arc::clone(&self.inner.ctx.next_native_env_id),
-            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-            self.inner.ctx.managed_lane_activator.clone(),
-        );
-        napi_env.webassembly = self.inner.ctx.webassembly;
-        let func_env = FunctionEnv::new(store, napi_env);
-        {
-            let mut guard = self
-                .inner
-                .func_env
-                .lock()
-                .expect("poisoned NapiSession mutex");
-            *guard = Some(func_env.clone());
-        }
-        register_napi_imports(store, &func_env, import_object);
-
-        if let Some(memory_type) = self.inner.imported_memory_type {
+        let preparation = SessionPreparation::begin(&self.inner.state)?;
+        let mut additions = Imports::new();
+        let memory = if let Some(memory_type) = self.inner.imported_memory_type {
             let memory = if let Some(existing) = import_object.get_export("env", "memory") {
                 let Extern::Memory(memory) = existing else {
                     bail!("env.memory import for N-API module is not a memory");
@@ -780,13 +881,15 @@ impl NapiSession {
                 memory
             } else {
                 let memory = wasmer::Memory::new(&mut *store, memory_type)?;
-                import_object.define("env", "memory", memory.clone());
+                additions.define("env", "memory", memory.clone());
                 memory
             };
-            func_env.as_mut(&mut *store).memory = Some(memory);
-        }
+            Some(memory)
+        } else {
+            None
+        };
 
-        if let Some(table_type) = self.inner.imported_table_type {
+        let table = if let Some(table_type) = self.inner.imported_table_type {
             let table = if let Some(existing) =
                 import_object.get_export("env", "__indirect_function_table")
             {
@@ -796,17 +899,55 @@ impl NapiSession {
                 table
             } else {
                 let table = Table::new(&mut *store, table_type, Value::FuncRef(None))?;
-                import_object.define("env", "__indirect_function_table", table.clone());
+                additions.define("env", "__indirect_function_table", table.clone());
                 table
             };
-            func_env.as_mut(&mut *store).table = Some(table);
+            Some(table)
+        } else {
+            None
+        };
+
+        // Validate shared imports before appending an environment to the Store.
+        let mut napi_env = NapiEnv::new(
+            Arc::clone(&self.inner.ctx.budget),
+            self.inner.ctx.limits.max_envs,
+            Arc::clone(&self.inner.ctx.envs),
+            Arc::clone(&self.inner.ctx.host_stopped),
+        );
+        napi_env.pending_messages = self.inner.ctx.pending_messages.clone();
+        napi_env.webassembly = self.inner.ctx.webassembly;
+        napi_env.session_lease = Some(self.inner.lease.clone());
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            napi_env.next_native_env_id = self.inner.ctx.next_native_env_id.clone();
+            napi_env.managed_lane_activator = self.inner.ctx.managed_lane_activator.clone();
         }
+        napi_env.memory = memory;
+        napi_env.table = table;
+        let func_env = FunctionEnv::new(store, napi_env);
+        register_env_imports(store, &mut additions);
+        register_napi_imports(store, &func_env, &mut additions);
 
-        // Wasmer owns this FunctionEnv until its store is destroyed. Retain
-        // the admission slot with it; the setup session is consumed by
-        // configure_instance long before the guest module stops running.
-        func_env.as_mut(&mut *store).session_lease = Some(Arc::clone(&self.inner.lease));
-
+        let mut staged = import_object.clone();
+        for (namespace, name, value) in additions.iter() {
+            if !staged.exists(namespace, name) {
+                staged.define(namespace, name, value.clone());
+            }
+        }
+        if let Err(func_env) = preparation.commit(func_env) {
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            {
+                let retirement = func_env.as_mut(&mut *store).take_native_deactivation();
+                store.parked(|| drop(retirement));
+            }
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
+            func_env.as_mut(&mut *store).deactivate();
+            bail!("N-API session was deactivated during import preparation");
+        }
+        // Move publication is callback-free; old import payloads drop after
+        // session commit has released its mutex.
+        let previous = std::mem::replace(import_object, staged);
+        drop(previous);
         Ok(())
     }
 
@@ -816,35 +957,92 @@ impl NapiSession {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
     ) -> Result<()> {
+        self.configure_instance_inner(
+            store,
+            instance,
+            imported_memory,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            None,
+        )
+    }
+
+    /// Binds only protected native leases; never initializes the legacy grow heap.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn configure_leased_instance(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        memory: &wasmer::Memory,
+        arena: crate::NativeGuestArena,
+        refill: Arc<dyn crate::NativeGuestRefill>,
+    ) -> Result<()> {
+        self.configure_instance_inner(store, instance, Some(memory), Some((arena, refill)))
+    }
+
+    fn configure_instance_inner(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))] leased: Option<(
+            crate::NativeGuestArena,
+            Arc<dyn crate::NativeGuestRefill>,
+        )>,
+    ) -> Result<()> {
         let func_env = {
-            let guard = self
-                .inner
-                .func_env
-                .lock()
-                .expect("poisoned NapiSession mutex");
-            guard
-                .clone()
-                .context("missing runtime function env during instance setup")?
+            let guard = self.inner.state.lock().expect("poisoned NapiSession mutex");
+            let SessionState::Attached(func_env) = &*guard else {
+                bail!("missing runtime function env during instance setup");
+            };
+            func_env.clone()
         };
 
-        // Imports may already have bound a memory and a start section may
-        // already have created its guest heap from it. Never replace that
-        // memory with a different exported one in a multi-memory module.
-        // Otherwise a module-defined export can be bound after instantiation
-        // for a later first N-API call. Keep the guest heap lazy either way.
-        if func_env.as_ref(&*store).memory.is_none() {
-            let instance_memory = imported_memory
-                .cloned()
-                .or_else(|| instance.exports.get_memory("memory").ok().cloned());
-            if let Some(memory) = instance_memory {
-                func_env.as_mut(&mut *store).memory = Some(memory);
-            }
+        if func_env.as_ref(&*store).configured {
+            bail!("N-API session instance has already been configured");
         }
 
-        // Keep import-only modules cheap, including those with no linear
-        // memory. The first environment creation validates memory and installs
-        // the allocator after Edge has admitted the lane. A start section may
-        // already have installed its heap; never replace it here.
+        if let Some(memory) = imported_memory {
+            func_env.as_mut(&mut *store).memory = Some(memory.clone());
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            // Stand up the host-side guest-memory allocator now that the memory is
+            // final. All bridge allocations of guest memory go through it, AND it
+            // is the only backing store for V8 ArrayBuffers/Buffers/TypedArrays
+            // (see TrackingArrayBufferAllocator in unofficial_napi.cc) — the
+            // guest's own malloc is never called from the host, and host-heap
+            // allocation is never used for guest-visible V8 memory. A module that
+            // requests N-API imports without usable linear memory, or whose
+            // memory can't support a GuestHeap, cannot run under this bridge: we
+            // fail instantiation here rather than let allocation silently fall
+            // back to unbudgeted, non-guest-shared host memory later.
+            let memory = func_env
+                .as_ref(&*store)
+                .memory
+                .clone()
+                .context("N-API imports require the guest to have linear memory")?;
+            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
+            let (heap, refill) = if let Some((arena, refill)) = leased {
+                if !arena.matches(&*store, &memory, &budget) {
+                    bail!("leased N-API arena does not match this memory and context");
+                }
+                (arena.heap, Some(refill))
+            } else {
+                let heap = crate::guest_heap::GuestHeap::get_or_create(
+                    &mut *store,
+                    &memory,
+                    budget,
+                )
+                .context(
+                    "failed to initialize the guest-heap allocator over the guest's linear memory",
+                )?;
+                (heap, None)
+            };
+            let env = func_env.as_mut(&mut *store);
+            env.guest_heap = Some(heap);
+            env.native_guest_refill = refill;
+        }
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
         // Memory. Keep its established guest allocator: exported malloc owns
@@ -856,7 +1054,7 @@ impl NapiSession {
                 .find_map(|name| {
                     instance
                         .exports
-                        .get_typed_function::<i32, i32>(&mut *store, name)
+                        .get_typed_function::<i32, i32>(&*store, name)
                         .ok()
                 });
             func_env.as_mut(&mut *store).malloc_fn = malloc;
@@ -865,6 +1063,9 @@ impl NapiSession {
         if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
             func_env.as_mut(&mut *store).table = Some(table.clone());
         }
+        // Wasm start functions run during Instance::new, before this setup.
+        // Only a fully configured attachment may create provider environments.
+        func_env.as_mut(&mut *store).configured = true;
         Ok(())
     }
 }
@@ -901,6 +1102,70 @@ mod tests {
     use wat::parse_str;
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[test]
+    fn leased_configuration_rejects_wrong_arena_without_legacy_growth() {
+        struct NoRefill;
+        // SAFETY: this fixture never reserves or owns a Store.
+        unsafe impl crate::NativeGuestRefill for NoRefill {
+            fn reserve(
+                &self,
+                _: &mut wasmer::StoreMut<'_>,
+                _: u32,
+            ) -> Result<Option<crate::NativeGuestChunk>, wasmer::RuntimeError> {
+                panic!("configuration must not reserve through an inactive Store")
+            }
+        }
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "env" "memory" (memory 1 4 shared))
+            (import "napi" "napi_wasm_init_env" (func (result i32))))"#,
+        )
+        .unwrap();
+        let context = NapiCtx::default();
+        let (imports, state) = context
+            .runtime_hooks()
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        let session = state.session().unwrap().clone();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let Some(wasmer::Extern::Memory(memory)) = imports.get_export("env", "memory") else {
+            panic!("missing prepared memory");
+        };
+        let other =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(4), true)).unwrap();
+        let wrong = context.native_guest_arena(&store, &other).unwrap();
+        assert!(
+            session
+                .configure_leased_instance(
+                    &mut store.as_store_mut(),
+                    &instance,
+                    &memory,
+                    wrong,
+                    std::sync::Arc::new(NoRefill)
+                )
+                .is_err()
+        );
+        let arena = context.native_guest_arena(&store, &memory).unwrap();
+        session
+            .configure_leased_instance(
+                &mut store.as_store_mut(),
+                &instance,
+                &memory,
+                arena,
+                std::sync::Arc::new(NoRefill),
+            )
+            .unwrap();
+        assert_eq!(memory.size(&store).0, 1);
+        // No provider was entered; the paired Store is still on its owner.
+        unsafe { session.deactivate(&mut store.as_store_mut()) };
+        drop(state);
+        drop(session);
+        assert_eq!(context.active_sessions(), 0);
+    }
 
     #[test]
     fn runtime_stop_is_sticky_without_live_envs() {
@@ -1653,6 +1918,153 @@ mod tests {
     }
 
     #[test]
+    fn add_imports_preserves_earlier_bindings_and_shared_objects() {
+        use wasmer::{
+            Extern, Function, Imports, Memory, MemoryType, Table, TableType, Type, Value,
+        };
+
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "env" "memory" (memory 1 1))
+                (import "env" "__indirect_function_table" (table 2 2 funcref))
+                (import "env" "uv_get_total_memory" (func $total (result i64)))
+                (import "napi" "napi_get_undefined" (func $undefined (param i32 i32) (result i32)))
+                (import "napi" "napi_get_null" (func (param i32 i32) (result i32)))
+                (func (export "earlier_env") (result i64) call $total)
+                (func (export "earlier_napi") (result i32)
+                    i32.const 0 i32.const 0 call $undefined)
+            )"#,
+        );
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), false)).unwrap();
+        let table = Table::new(
+            &mut store,
+            TableType::new(Type::FuncRef, 2, Some(2)),
+            Value::FuncRef(None),
+        )
+        .unwrap();
+        let mut imports = Imports::new();
+        imports.define("env", "memory", memory.clone());
+        imports.define("env", "__indirect_function_table", table.clone());
+        imports.define(
+            "env",
+            "uv_get_total_memory",
+            Function::new_typed(&mut store, || -> i64 { 123 }),
+        );
+        imports.define(
+            "napi",
+            "napi_get_undefined",
+            Function::new_typed(&mut store, |_: i32, _: i32| -> i32 { 456 }),
+        );
+        let ctx = NapiCtx::default();
+        let state = ctx
+            .runtime_hooks()
+            .add_imports(&module, &mut store.as_store_mut(), &mut imports)
+            .unwrap();
+        assert_eq!(
+            imports.get_export("env", "memory"),
+            Some(Extern::Memory(memory.clone()))
+        );
+        assert_eq!(
+            imports.get_export("env", "__indirect_function_table"),
+            Some(Extern::Table(table.clone()))
+        );
+        let session = state.session.as_ref().unwrap();
+        let func_env = {
+            let state = session.inner.state.lock().unwrap();
+            let super::SessionState::Attached(func_env) = &*state else {
+                panic!("session must own its imported environment");
+            };
+            func_env.clone()
+        };
+        assert_eq!(func_env.as_ref(&store).memory.as_ref(), Some(&memory));
+        assert_eq!(func_env.as_ref(&store).table.as_ref(), Some(&table));
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i64>(&store, "earlier_env")
+                .unwrap()
+                .call(&mut store)
+                .unwrap(),
+            123
+        );
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&store, "earlier_napi")
+                .unwrap()
+                .call(&mut store)
+                .unwrap(),
+            456
+        );
+    }
+
+    #[test]
+    fn invalid_shared_import_does_not_publish_partial_bindings() {
+        use wasmer::{Function, Imports};
+
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            )"#,
+        );
+        let mut imports = Imports::new();
+        let invalid_memory = Function::new_typed(&mut store, || {});
+        imports.define("env", "memory", invalid_memory.clone());
+        let ctx = NapiCtx::default();
+        assert!(
+            ctx.runtime_hooks()
+                .add_imports(&module, &mut store.as_store_mut(), &mut imports)
+                .is_err()
+        );
+        assert_eq!(imports.iter().count(), 1);
+        assert_eq!(
+            imports.get_export("env", "memory"),
+            Some(invalid_memory.into())
+        );
+        assert_eq!(ctx.active_sessions(), 0);
+    }
+
+    #[test]
+    fn session_import_attachment_is_unique_and_cannot_be_reactivated() {
+        use wasmer::Extern;
+
+        let mut store = Store::default();
+        let mut other = Store::new(store.engine().clone());
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            )"#,
+        );
+        let ctx = NapiCtx::default();
+        let session = ctx.prepare_module(&module).unwrap();
+        let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+        assert!(session.create_imports(&mut store.as_store_mut()).is_err());
+        assert!(session.create_imports(&mut other.as_store_mut()).is_err());
+        // SAFETY: this session has never entered the provider or guest code.
+        unsafe {
+            session.deactivate(&mut store.as_store_mut());
+            session.deactivate(&mut store.as_store_mut());
+        }
+        assert!(session.create_imports(&mut store.as_store_mut()).is_err());
+        let Some(Extern::Function(init)) = imports.get_export("napi", "napi_wasm_init_env") else {
+            panic!("original imports must retain their environment");
+        };
+        assert_eq!(init.call(&mut store, &[]).unwrap()[0].i32(), Some(0));
+        assert_eq!(ctx.budget().snapshot().live_isolates, 0);
+        assert_eq!(ctx.active_sessions(), 1);
+        drop(session);
+        assert_eq!(ctx.active_sessions(), 0);
+    }
+
+    #[test]
     fn configure_instance_pairs_sessions_by_state() {
         let mut store_a = Store::default();
         let mut store_b = Store::new(store_a.engine().clone());
@@ -1734,6 +2146,56 @@ mod tests {
             )
             .expect_err("configuring an N-API instance without its session must fail");
         assert!(err.to_string().contains("missing N-API session"));
+    }
+
+    #[test]
+    fn import_declarations_match_registered_backend_functions() {
+        let mut store = Store::default();
+        let module = compile_wat(
+            &store,
+            r#"(module
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32)))
+            )"#,
+        );
+        let ctx = NapiCtx::default();
+        let (imports, state) = ctx
+            .runtime_hooks()
+            .additional_imports(&module, &mut store.as_store_mut())
+            .expect("backend functions register");
+        for (namespace, name, _) in imports.iter() {
+            assert!(
+                NapiCtx::provides_import(namespace, name),
+                "registered function {namespace}::{name} lacks a declaration"
+            );
+        }
+        for (namespace, name) in [
+            (
+                "napi_extension_wasmer_v0",
+                "unofficial_napi_event_loop_checkpoint",
+            ),
+            ("env", "uv_cpu_info"),
+        ] {
+            assert!(imports.exists(namespace, name));
+            assert!(NapiCtx::provides_import(namespace, name));
+        }
+        for (namespace, name) in [
+            (
+                "napi_extension_wasmer_v1",
+                "unofficial_napi_event_loop_checkpoint",
+            ),
+            (
+                "napi_extension_wasmer_v0",
+                "unofficial_napi_future_function",
+            ),
+            ("env", "malloc"),
+            ("env", "memory"),
+        ] {
+            assert!(!NapiCtx::provides_import(namespace, name));
+        }
+        drop(state);
+        drop(imports);
+        drop(store);
+        assert_eq!(ctx.active_sessions(), 0);
     }
 
     #[test]
@@ -1868,5 +2330,187 @@ mod tests {
             !NapiWasmerExtensionVersion::Unknown
                 .is_compatible_with(NapiWasmerExtensionVersion::Unknown)
         );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    mod preparation {
+        use super::super::*;
+        use std::{
+            cell::RefCell,
+            panic::{AssertUnwindSafe, catch_unwind, panic_any},
+            sync::atomic::AtomicU64,
+        };
+        use wasmer::sys::{Cranelift, EngineBuilder};
+        use wasmer::{AsStoreMut, Global, Store};
+
+        thread_local! {
+            static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+        struct Accountant(AtomicU64);
+        impl NapiMemoryAccountant for Accountant {
+            fn memory_limit(&self) -> u64 {
+                8 * wasmer::WASM_PAGE_SIZE as u64
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        }
+        fn setup() -> (NapiCtx, NapiSession, Store, Arc<Accountant>) {
+            let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+            let ctx = NapiCtx::builder()
+                .memory_accountant(accountant.clone())
+                .build();
+            let mut engine = EngineBuilder::new(Cranelift::default()).engine();
+            engine.set_tunables(crate::budgeted_tunables(ctx.budget()));
+            let store = Store::new(engine);
+            let module = Module::new(
+                &store,
+                r#"(module
+                (import "env" "memory" (memory 1 8))
+                (import "napi" "napi_get_undefined" (func (param i32 i32) (result i32))))"#,
+            )
+            .unwrap();
+            let session = ctx.prepare_module(&module).unwrap();
+            (ctx, session, store, accountant)
+        }
+
+        #[test]
+        fn preparation_releases_session_mutex_before_accounting() {
+            let (ctx, session, mut store, accountant) = setup();
+            let inner = session.inner.clone();
+            let unlocked = Arc::new(AtomicBool::new(false));
+            let observed = unlocked.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Old-source observation is nonblocking scalar metadata only:
+                    // never recursively enter the old held mutex or borrowed Store.
+                    observed.store(inner.state.try_lock().is_ok(), Ordering::SeqCst);
+                }))
+            });
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            drop(imports);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(
+                unlocked.load(Ordering::SeqCst),
+                "session preparation held its mutex during accounting"
+            );
+        }
+
+        #[test]
+        fn preparation_reentrant_create_fails_before_allocating_another_store() {
+            let (ctx, session, mut store, accountant) = setup();
+            let nested_session = session.clone();
+            let refused = Arc::new(AtomicBool::new(false));
+            let observed = refused.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let mut other = Store::default();
+                    observed.store(
+                        nested_session
+                            .create_imports(&mut other.as_store_mut())
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                }))
+            });
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            let charged = ctx.budget().snapshot().wasm_linear;
+            let attached = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Attached(_)
+            );
+            drop(imports);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(charged, wasmer::WASM_PAGE_SIZE as u64);
+            assert!(attached && refused.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn preparation_retries_after_error_or_panic_without_resurrecting_deactivation() {
+            let (ctx, session, mut store, accountant) = setup();
+            let mut wrong = Imports::new();
+            wrong.define("env", "memory", Global::new(&mut store, Value::I32(0)));
+            assert!(
+                session
+                    .add_imports(&mut store.as_store_mut(), &mut wrong)
+                    .is_err()
+            );
+            let reset_after_error = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Unprepared
+            );
+            let original = Arc::new(());
+            let payload = original.clone();
+            ON_CHARGE.with(|slot| *slot.borrow_mut() = Some(Box::new(move || panic_any(payload))));
+            let failure = catch_unwind(AssertUnwindSafe(|| {
+                let _ = session.create_imports(&mut store.as_store_mut());
+            }))
+            .unwrap_err();
+            let original_preserved =
+                Arc::ptr_eq(failure.downcast_ref::<Arc<()>>().unwrap(), &original);
+            let reset_after_panic = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Unprepared
+            );
+            let imports = session.create_imports(&mut store.as_store_mut()).unwrap();
+            drop(imports);
+            drop(wrong);
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(reset_after_error && reset_after_panic && original_preserved);
+
+            let (ctx, session, mut store, accountant) = setup();
+            let inner = session.inner.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Model the private metadata transition only; do not invoke
+                    // unsafe deactivate with another or currently borrowed Store.
+                    *inner.state.lock().unwrap() = SessionState::Deactivated;
+                }))
+            });
+            let mut unpublished = Imports::new();
+            let rejected = session
+                .add_imports(&mut store.as_store_mut(), &mut unpublished)
+                .is_err();
+            let no_imports_published = unpublished.iter().next().is_none();
+            let late_envs_inert = {
+                use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment};
+                let envs: Vec<_> = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+                    .iter()
+                    .filter_map(|owner| owner.as_ref().downcast_ref::<NapiEnv>())
+                    .collect();
+                envs.len() == 1
+                    && envs
+                        .iter()
+                        .all(|env| !env.configured && env.memory.is_none() && env.table.is_none())
+            };
+            let remained_closed = matches!(
+                *session.inner.state.lock().unwrap(),
+                SessionState::Deactivated
+            );
+            drop(session);
+            drop(store);
+            assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert!(rejected && remained_closed && no_imports_published && late_envs_inert);
+        }
     }
 }

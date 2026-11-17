@@ -1,4 +1,4 @@
-set(NAPI_V8_PREBUILT_VERSION "11.9.9")
+set(NAPI_V8_PREBUILT_VERSION "11.9.2")
 set(NAPI_V8_PREBUILT_BASE_URL
   "https://github.com/wasmerio/v8-custom-builds/releases/download/${NAPI_V8_PREBUILT_VERSION}")
 
@@ -66,12 +66,6 @@ function(_napi_v8_local_strategy out_ok out_include out_library out_extra out_de
         break()
       endif()
     endforeach()
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _extra STREQUAL "")
-    set(_extra "pthread;dl;m;rt")
-    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR
-       CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-      list(PREPEND _extra "atomic")
-    endif()
   endif()
 
   if(_include STREQUAL "")
@@ -115,15 +109,7 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND
      (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"))
     set(_platform "darwin-arm64")
-    set(_asset "v8-darwin-aarch64.tar.xz")
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND
-         (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64"))
-    set(_platform "darwin-amd64")
-    set(_asset "v8-darwin-amd64.tar.xz")
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-         (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"))
-    set(_platform "linux-arm64")
-    set(_asset "v8-linux-arm64.tar.xz")
+    set(_asset "v8-darwin-arm64.tar.xz")
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
          (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64"))
     set(_platform "linux-amd64")
@@ -201,18 +187,8 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
     set(_defines "${defines_override}")
   endif()
 
-  if(extra_override STREQUAL "")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-      set(_extra "/System/Library/Frameworks/CoreFoundation.framework")
-    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      set(_extra "pthread;dl;m;rt")
-      if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR
-         CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-        list(PREPEND _extra "atomic")
-      endif()
-    else()
-      set(_extra "")
-    endif()
+  if(extra_override STREQUAL "" AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(_extra "/System/Library/Frameworks/CoreFoundation.framework")
   else()
     set(_extra "${extra_override}")
   endif()

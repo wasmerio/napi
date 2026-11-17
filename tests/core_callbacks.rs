@@ -1,6 +1,12 @@
 use wasmer::{AsStoreMut, Function, Instance, Module, RuntimeError, Store};
 use wasmer_napi::NapiCtx;
-use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
+// A guest error payload must survive the bridge independently of a legacy runtime.
+#[derive(Debug)]
+enum GuestExit { Exit(i32) }
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+}
+impl std::error::Error for GuestExit {}
 #[test]
 fn core_callback_exit_probe() {
     let cases = [
@@ -186,8 +192,8 @@ fn core_callback_exit_probe() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(WasiError::Exit(
-                    ExitCode::from(code),
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(
+                    i32::from(code),
                 ))))
             }),
         );
@@ -200,7 +206,7 @@ fn core_callback_exit_probe() {
             .get_typed_function::<(), i32>(&store, "run")
             .unwrap()
             .call(&mut store);
-        if !matches!(result, Err(ref e) if matches!(e.downcast_ref::<WasiError>(), Some(WasiError::Exit(c)) if *c == ExitCode::from(57)))
+        if !matches!(result, Err(ref e) if matches!(e.downcast_ref::<GuestExit>(), Some(GuestExit::Exit(c)) if *c == i32::from(57)))
         {
             failures.push(format!("{name}: {result:?}"));
         }
@@ -260,8 +266,8 @@ fn module_error_construction_preserves_guest_exit_in_both_namespaces() {
             "wasi_snapshot_preview1",
             "proc_exit",
             Function::new_typed(&mut store, |code: i32| -> Result<(), RuntimeError> {
-                Err(RuntimeError::user(Box::new(WasiError::Exit(
-                    ExitCode::from(code),
+                Err(RuntimeError::user(Box::new(GuestExit::Exit(
+                    i32::from(code),
                 ))))
             }),
         );
@@ -275,7 +281,7 @@ fn module_error_construction_preserves_guest_exit_in_both_namespaces() {
             .unwrap()
             .call(&mut store, legacy);
         assert!(
-            matches!(result, Err(ref error) if matches!(error.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if *code == ExitCode::from(57))),
+            matches!(result, Err(ref error) if matches!(error.downcast_ref::<GuestExit>(), Some(GuestExit::Exit(code)) if *code == i32::from(57))),
             "legacy={legacy}: {result:?}"
         );
     }

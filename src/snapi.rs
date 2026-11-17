@@ -2,7 +2,7 @@
 // C++ bridge FFI declarations (from napi_bridge_init.cc)
 // ============================================================
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 
 #[repr(C)]
 pub struct SnapiEnvState {
@@ -88,13 +88,24 @@ unsafe extern "C" {
 // extension imports, so a native build does not reference every declaration.
 #[allow(dead_code)]
 unsafe extern "C" {
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_v8_allocator_active() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_heap_refill_allowed() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_current_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_retirement_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_fail_current();
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
-        engine_flags: *const c_char,
+        engine_flags: *const i8,
         engine_flags_length: u32,
     ) -> i32;
     /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
@@ -114,9 +125,32 @@ unsafe extern "C" {
         webassembly_policy: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_prepare_created_env(
+        state: SnapiEnv,
+        tracker: *const core::ffi::c_void,
+        value_limit: u64,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_publish_created_env(state: SnapiEnv);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_begin_retirement(states: *const SnapiEnv, count: usize) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_finish_retirement(
+        state: SnapiEnv,
+        cleanup: i32,
+        before_destroy: unsafe extern "C" fn(*mut core::ffi::c_void),
+        data: *mut core::ffi::c_void,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_destroy_retired_state(state: SnapiEnv);
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_env_alive(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub fn snapi_bridge_unofficial_can_release_env(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
@@ -125,14 +159,18 @@ unsafe extern "C" {
         has_runnable_work: i32,
         checkpoint_state: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_register_guest_buffer_finalizer(
         env: SnapiEnv,
         value_id: u32,
         guest_ptr: u32,
         recyclable: i32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_take_ready_guest_buffer_finalizer(
         env: SnapiEnv,
         force: i32,
@@ -198,7 +236,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_create_private_symbol(
         env: SnapiEnv,
-        str_ptr: *const c_char,
+        str_ptr: *const i8,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
@@ -291,6 +329,7 @@ unsafe extern "C" {
         expose_numeric_values: i32,
         json_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_free_buffer(data: *mut c_void);
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
@@ -555,13 +594,13 @@ unsafe extern "C" {
     pub fn snapi_bridge_get_global(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_create_string_utf8(
         env: SnapiEnv,
-        str_ptr: *const c_char,
+        str_ptr: *const i8,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_create_string_latin1(
         env: SnapiEnv,
-        str_ptr: *const c_char,
+        str_ptr: *const i8,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
@@ -580,14 +619,14 @@ unsafe extern "C" {
     pub fn snapi_bridge_get_value_string_utf8(
         env: SnapiEnv,
         id: u32,
-        buf: *mut c_char,
+        buf: *mut i8,
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
     pub fn snapi_bridge_get_value_string_latin1(
         env: SnapiEnv,
         id: u32,
-        buf: *mut c_char,
+        buf: *mut i8,
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
@@ -645,19 +684,19 @@ unsafe extern "C" {
     pub fn snapi_bridge_set_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const c_char,
+        name: *const i8,
         val_id: u32,
     ) -> i32;
     pub fn snapi_bridge_get_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const c_char,
+        name: *const i8,
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_has_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const c_char,
+        name: *const i8,
         result: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_set_element(env: SnapiEnv, obj_id: u32, index: u32, val_id: u32) -> i32;
@@ -715,17 +754,9 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_throw(env: SnapiEnv, error_id: u32) -> i32;
-    pub fn snapi_bridge_throw_error(env: SnapiEnv, code: *const c_char, msg: *const c_char) -> i32;
-    pub fn snapi_bridge_throw_type_error(
-        env: SnapiEnv,
-        code: *const c_char,
-        msg: *const c_char,
-    ) -> i32;
-    pub fn snapi_bridge_throw_range_error(
-        env: SnapiEnv,
-        code: *const c_char,
-        msg: *const c_char,
-    ) -> i32;
+    pub fn snapi_bridge_throw_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
+    pub fn snapi_bridge_throw_type_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
+    pub fn snapi_bridge_throw_range_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
     pub fn snapi_bridge_is_exception_pending(env: SnapiEnv, result: *mut i32) -> i32;
     pub fn snapi_bridge_get_and_clear_last_exception(env: SnapiEnv, out_id: *mut u32) -> i32;
     // Symbol
@@ -762,6 +793,7 @@ unsafe extern "C" {
         byte_length: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer(
         env: SnapiEnv,
         data_addr: u64,
@@ -769,6 +801,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer(
         env: SnapiEnv,
         data_addr: u64,
@@ -776,6 +809,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -785,6 +819,7 @@ unsafe extern "C" {
         out_id: *mut u32,
         ownership_transferred_out: *mut i32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -794,6 +829,7 @@ unsafe extern "C" {
         out_id: *mut u32,
         ownership_transferred_out: *mut i32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer_guest_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -805,6 +841,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer_guest_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -873,6 +910,7 @@ unsafe extern "C" {
         byte_offset_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_attach_guest_heap_finalizer(
         env: SnapiEnv,
         id: u32,
@@ -966,6 +1004,7 @@ unsafe extern "C" {
         adjusted: *mut i64,
     ) -> i32;
     // Node Buffers
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_buffer(
         env: SnapiEnv,
         length: u32,
@@ -980,6 +1019,7 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_is_buffer(env: SnapiEnv, id: u32, result: *mut i32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_get_buffer_info(
         env: SnapiEnv,
         id: u32,
@@ -987,6 +1027,7 @@ unsafe extern "C" {
         length_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_acquire_buffer_lease(
         env: SnapiEnv,
         value_id: u32,
@@ -996,11 +1037,13 @@ unsafe extern "C" {
         lease_out: *mut u32,
         data_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_release_buffer_lease(
         env: SnapiEnv,
         lease_id: u32,
         modified: i32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_create_guest_backed_typedarray(
         env: SnapiEnv,
         type_: i32,
@@ -1008,17 +1051,13 @@ unsafe extern "C" {
         data_out: *mut u64,
         value_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
     -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_overwrite_value_bytes(
         env: SnapiEnv,
         id: u32,
-        data: *const core::ffi::c_void,
-        len: u32,
-    ) -> i32;
-    pub fn snapi_bridge_overwrite_reference_bytes(
-        env: SnapiEnv,
-        reference_id: u32,
         data: *const core::ffi::c_void,
         len: u32,
     ) -> i32;
@@ -1075,11 +1114,12 @@ unsafe extern "C" {
     // Callback system
     pub fn snapi_bridge_create_function(
         env: SnapiEnv,
-        utf8name: *const c_char,
+        utf8name: *const i8,
         name_len: u32,
         reg_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_swap_active_callback_ctx(
         env: SnapiEnv,
         callback_ctx: *mut c_void,
@@ -1113,11 +1153,11 @@ unsafe extern "C" {
     // napi_define_class
     pub fn snapi_bridge_define_class(
         env: SnapiEnv,
-        utf8name: *const c_char,
+        utf8name: *const i8,
         name_len: u32,
         ctor_reg_id: u32,
         prop_count: u32,
-        prop_names: *const *const c_char,
+        prop_names: *const *const i8,
         prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,
@@ -1131,7 +1171,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         prop_count: u32,
-        prop_names: *const *const c_char,
+        prop_names: *const *const i8,
         prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,

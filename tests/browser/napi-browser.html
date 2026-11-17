@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>wasmer-napi browser test</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22/%3E">
+  </head>
+  <body>
+    <pre id="output">Loading scripts...</pre>
+    <pre id="console_output"></pre>
+    <script>
+      const nocapture = true;
+      const is_bench = false;
+      const original = {};
+      const orig = id => (...args) => {
+        const logs = document.getElementById(id);
+        for (const msg of args) logs.appendChild(document.createTextNode(String(msg) + "\n"));
+      };
+      const wrap = method => {
+        const onMethod = `on_console_${method}`;
+        original[method] = console[method];
+        console[method] = function (...args) {
+          original[method].apply(console, args);
+          orig(nocapture ? "output" : "console_output").apply(this, args);
+          if (!is_bench && window[onMethod]) window[onMethod](args);
+        };
+      };
+      wrap("debug");
+      wrap("log");
+      wrap("info");
+      wrap("warn");
+      wrap("error");
+      window.__wbg_test_invoke = f => f();
+    </script>
+    <script type="importmap">
+      {"imports":{"acorn":"/acorn.js"}}
+    </script>
+    <script type="module" src="/run.js"></script>
+  </body>
+</html>

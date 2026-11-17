@@ -6,52 +6,54 @@ edition = "2024"
 license = "MIT"
 resolver = "2"
 
-[package.metadata.napi]
-# The pinned public Wasmer SDK predates LinearMemory::do_wait_interruptible.
-# build.rs uses this marker so the compatibility path cannot be changed by
-# --no-default-features or --all-features.
-standalone_legacy_wait = true
-
 [features]
+# Host-only native stack validation instrumentation; never enabled by default.
+native-stack-diagnostics = []
+# Native managed invocation profile; ordinary sys builds remain synchronous.
+experimental-async = ["wasmer/experimental-async"]
+# Uses the browser/Node JavaScript realm as the N-API value engine when this
+# crate is compiled as part of a wasm32-unknown-unknown wasm-bindgen module.
+# On native targets this feature is inert and the V8 backend remains active.
 js = [
   "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
   "wasmer/experimental-async",
   "wasmer/js-default",
+  "wasixv2-exec?/js",
 ]
-# Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
-# `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
-# trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
-# not activate the dependency.
-wasix = []
+# Implements the WASIX v2 runtime's per-instance hook.
+wasix = ["experimental-async", "dep:wasixv2-exec", "dep:wasixv2-host", "dep:wasixv2-syscalls"]
 cli = [
   "wasix",
   "dep:wasmer-cache",
   "dep:wasmer-c-api-imports",
-  "wasmer-c-api-imports/wasi",
+  "wasmer-c-api-imports/wasixv2",
   "dep:tokio",
-  "dep:virtual-fs",
+  "tokio/signal",
+  "dep:wasixv2",
+  "wasixv2/terminal",
+  "dep:wasixv2-dylink",
+  "wasixv2-host/tokio",
   "dep:wasmer-types",
 ]
 
 [dependencies]
 anyhow = "1"
-# Standalone builds use one immutable Wasmer source revision. The N-API
-# instantiation hook and shared-memory bridge are developed together on the SDK
-# branch, so mixing this source with crates.io lacks required APIs. This public
-# revision also carries the APIs needed by the wasm32+js backend. Edge's WASIX
-# child-reap integration uses its separately reviewed Wasmer source.
-wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false }
+# Engine uses runtime/next; product packages use wasmer-next/main.
+# Refresh Cargo.standalone.lock after the product split is pushed to main.
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
-wasmer-c-api-imports = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true, default-features = false }
-wasmer-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
-# Non-optional: `mod guest` (always compiled) re-raises guest WASI process
-# exits through the N-API import layers and needs the WASIX error type.
-virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+wasmer-cache = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasmer-c-api-imports = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true, default-features = false }
+wasmer-types = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["sys"], optional = true }
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
+wasixv2-syscalls = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
 parking_lot = "0.12"
@@ -60,20 +62,16 @@ parking_lot = "0.12"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
-  "js",
-] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, optional = true, features = ["sys"] }
+wasmer = { version = "=7.5.0", git = "https://github.com/wasmerio/wasmer-runtime", branch = "next", default-features = false, features = [
   "sys-default",
-] }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "c83ba6d315d051739339636da7080ed5987845de", default-features = false, features = [
-  "sys",
 ] }
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.11"
 tar = "0.4"
 ureq = "2"
 xz = "0.1"
@@ -83,6 +81,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wat = "1"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main" }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", default-features = false, features = ["js", "web", "wasix1"] }
+wasixv2-host = { git = "https://github.com/wasmerio/wasmer-next.git", branch = "main", features = ["web"] }
+wasm-bindgen-test = "0.3.70"
+
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
 
@@ -91,6 +99,5 @@ name = "napi_wasmer"
 path = "src/bin/napi_wasmer.rs"
 required-features = ["cli"]
 
-# Keep this manifest independent when cargo-standalone.sh materializes it in a
-# temporary directory below a larger checkout that also has a Cargo workspace.
+# Standalone exports are independent of an enclosing Cargo workspace.
 [workspace]
