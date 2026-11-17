@@ -5623,7 +5623,11 @@ fn evaluate_module_sync(
             let promise = wasmer_napi_resolved_module_evaluation()?;
             update_module(access, handle, |status, _, saved| {
                 *status = 4;
-                *saved = Some(promise);
+                // Evaluate() may already own the promise being completed.
+                // Keep that same identity for repeated/reentrant evaluation.
+                if saved.is_none() {
+                    *saved = Some(promise);
+                }
             })?;
             Ok(namespace)
         }
@@ -5643,7 +5647,11 @@ fn evaluate_module_sync(
             let promise = wasmer_napi_resolved_module_evaluation()?;
             update_module(access, handle, |status, _, saved| {
                 *status = 4;
-                *saved = Some(promise);
+                // Evaluate() may already own the promise being completed.
+                // Keep that same identity for repeated/reentrant evaluation.
+                if saved.is_none() {
+                    *saved = Some(promise);
+                }
             })?;
             Ok(namespace)
         }
