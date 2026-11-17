@@ -201,7 +201,7 @@ pub(crate) fn read_runtime_options(
     guest_ptr: i32,
 ) -> Option<HostCopy<u8>> {
     if guest_ptr == 0 {
-        return Some(HostCopy::empty());
+        return Some(HostCopy::default());
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
     let flags_ptr = u32_at(
@@ -213,7 +213,7 @@ pub(crate) fn read_runtime_options(
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
     )? as usize;
     if flags_length == 0 {
-        return Some(HostCopy::empty());
+        return Some(HostCopy::default());
     }
     if flags_ptr <= 0 {
         return None;
