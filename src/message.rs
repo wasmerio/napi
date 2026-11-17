@@ -71,9 +71,14 @@ impl MessageCharge {
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     fn belongs_to_memory(&self, memory: &Arc<crate::guest_heap::GuestHeap>) -> bool {
-        self.memory
-            .as_ref()
-            .is_some_and(|bound| Arc::ptr_eq(bound, memory))
+        // The split runtime's detached SharedMemory owner pins the source
+        // mapping independently of its Store. Within this app, another worker
+        // may deserialize that backing safely even into a different memory.
+        self.shared_memory.is_some()
+            || self
+                .memory
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(bound, memory))
     }
 
     pub(crate) fn shrink(&mut self, retained_bytes: u64) -> bool {
@@ -159,9 +164,9 @@ impl PendingMessages {
         self.take_kind(id, false)
     }
 
-    /// Deserialization may only access native backing stores while an env
-    /// attached to the producer's exact memory is alive. Leave a mismatched
-    /// payload queued so the producer can still release it.
+    /// Retained shared mappings can cross this app's worker memories. Direct
+    /// nonshared heaps still require the producer's exact memory. Leave a
+    /// mismatched payload queued so the producer can still release it.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn take_for_memory(
         &self,

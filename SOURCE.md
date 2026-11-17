@@ -1,19 +1,17 @@
 # NAPI source ownership
 
-This directory is maintained as source in Wasmer-next so WASIX integration changes
-can be reviewed and delivered with their runtime consumers.
+This is the standalone wasmerio/napi `edge-wasixv2` branch, based on Edge's
+`edge-napi-webassembly-metered` at `af20edeae76192e3cdd49c5966c34cc81d0192d6`.
+It ports the WASIX v2 hooks, split engine and protected-memory integration
+from napi `next` at `c17595ac738853fa3935096bf3ec28718c62deda` onto Edge's features.
 
-The source was imported from `https://github.com/wasmerio/napi` at
-`bdc247406e9cecd46888ce648a62d51ed2732378`, preserving the native GC/frame repair
-and legacy runtime path migration. The protected native refill recovery is tracked against draft `1ac102cde91dec6710865f22037ac44fccc862fd`, relative to its parent
-`d81f068`.
+The reference `next` tree originally imported napi at
+`bdc247406e9cecd46888ce648a62d51ed2732378`, including native GC/frame repairs;
+its protected native refill recovery tracked draft `1ac102cde91dec6710865f22037ac44fccc862fd`.
+This port preserves those ownership protocols and restores Edge's upstream
+provider updates lost through the recursive merge bases.
 
-The nested QuickJS dependency remains at
-`ff1471cf525483ea1e5b8030d5ecf274ed00eb70` and is registered in the repository's
-root `.gitmodules`. Existing copyright notices and the package's MIT license
-declaration are retained. No separate upstream LICENSE file was present in the
-imported tree.
-
-Local adaptations connect the binding to the WASIX v2 instantiation and protected
-memory lease contracts. Historical fixtures remain with this source; the import
-itself does not establish runtime parity or supported-profile acceptance.
+QuickJS is v0.17 at `89fb17a82ba1d38f605e01558c3928aacc4ffd54`, registered in
+this repository's `.gitmodules`. Existing copyright and MIT license declarations
+are retained. See `WASIXV2.md` for supported provider decisions, review repairs
+and executed validation. Historical fixtures alone do not establish parity.
