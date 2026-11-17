@@ -1670,7 +1670,7 @@ mod tests {
 
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    fn managed_imports_bind_the_existing_wasix_memory_before_start() {
+    fn managed_imports_bind_the_existing_wasix_memory_before_activation() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let (finished_tx, finished_rx) = mpsc::channel();
         let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
@@ -1684,7 +1684,7 @@ mod tests {
                 (memory (export "memory") 1 512)
                 (global $result (mut i32) (i32.const 0))
                 (func $start call $init global.set $result)
-                (start $start)
+                (export "init_after_bind" (func $start))
                 (func (export "start_result") (result i32) global.get $result)
                 (func (export "helper_result") (result i64) call $free_memory)
             )"#,
@@ -1731,6 +1731,12 @@ mod tests {
         hooks
             .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
             .unwrap();
+        instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "init_after_bind")
+            .unwrap()
+            .call(&mut store)
+            .unwrap();
         assert!(func_env.as_ref(&store).guest_heap.is_some());
         assert_eq!(
             func_env
@@ -1741,7 +1747,7 @@ mod tests {
                 .view(&store)
                 .data_ptr(),
             memory.view(&store).data_ptr(),
-            "configure_instance must retain the memory used by the start-section heap"
+            "configure_instance must retain the imported memory used by activation"
         );
         assert!(
             instance
@@ -1771,17 +1777,14 @@ mod tests {
 
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    fn start_section_initialization_requires_a_guest_heap() {
+    fn start_section_activation_is_rejected_before_configuration() {
+        // TODO(wasixv2): NAPI-START — direct Instance::new has no configured attachment.
         let spawns = Arc::new(AtomicUsize::new(0));
-        let (finished_tx, finished_rx) = mpsc::channel();
+        let (finished_tx, _finished_rx) = mpsc::channel();
         let (hooks, lane_slot) = managed_hooks(Arc::clone(&spawns), finished_tx);
-        let mut store = Store::default();
-
-        // A module-defined memory cannot be reached by imports until after
-        // instantiation, so its start section must fail before V8 starts.
-        let unavailable = compile_wat(
-            &store,
-            r#"(module
+        for (wat, status_only) in [
+            (
+                r#"(module
             (import "napi" "napi_wasm_init_env" (func $init (result i32)))
             (memory 1 512)
             (global $result (mut i32) (i32.const -1))
@@ -1789,22 +1792,10 @@ mod tests {
             (start $start)
             (func (export "start_result") (result i32) global.get $result)
         )"#,
-        );
-        let (imports, _state) = hooks
-            .additional_imports(&unavailable, &mut store.as_store_mut())
-            .unwrap();
-        let instance = Instance::new(&mut store, &unavailable, &imports).unwrap();
-        let result = instance
-            .exports
-            .get_typed_function::<(), i32>(&store, "start_result")
-            .unwrap();
-        assert_eq!(result.call(&mut store).unwrap(), 0);
-        assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        assert!(!lane_slot.lock().unwrap().is_some());
-
-        let unavailable_extension = compile_wat(
-            &store,
-            r#"(module
+                false,
+            ),
+            (
+                r#"(module
             (import "napi_extension_wasmer_v0" "unofficial_napi_create_env"
               (func $create (param i32 i32 i32 i32) (result i32)))
             (memory 1 512)
@@ -1815,24 +1806,10 @@ mod tests {
             (start $start)
             (func (export "start_result") (result i32) global.get $result)
         )"#,
-        );
-        let (imports, _state) = hooks
-            .additional_imports(&unavailable_extension, &mut store.as_store_mut())
-            .unwrap();
-        let instance = Instance::new(&mut store, &unavailable_extension, &imports).unwrap();
-        let result = instance
-            .exports
-            .get_typed_function::<(), i32>(&store, "start_result")
-            .unwrap();
-        assert_ne!(result.call(&mut store).unwrap(), 0);
-        assert_eq!(spawns.load(Ordering::SeqCst), 0);
-        assert!(!lane_slot.lock().unwrap().is_some());
-
-        // Imported memory is available during start. The first call installs
-        // the guest heap before V8, and setup retains that same allocator.
-        let available = compile_wat(
-            &store,
-            r#"(module
+                true,
+            ),
+            (
+                r#"(module
             (import "napi" "napi_wasm_init_env" (func $init (result i32)))
             (import "env" "memory" (memory 1 512))
             (global $result (mut i32) (i32.const -1))
@@ -1841,58 +1818,32 @@ mod tests {
             (func (export "start_result") (result i32) global.get $result)
             (func (export "invoke") (result i32) call $init)
         )"#,
-        );
-        let (imports, state) = hooks
-            .additional_imports(&available, &mut store.as_store_mut())
-            .unwrap();
-        let session = state.session.as_ref().unwrap().clone();
-        let instance = Instance::new(&mut store, &available, &imports).unwrap();
-        let heap_before = session
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .as_ref(&store)
-            .guest_heap
-            .clone()
-            .expect("start section installs guest heap");
-        hooks
-            .configure_instance(
-                &available,
-                &mut store.as_store_mut(),
-                &instance,
-                None,
-                state,
-            )
-            .unwrap();
-        let heap_after = session
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .as_ref(&store)
-            .guest_heap
-            .clone()
-            .unwrap();
-        assert!(Arc::ptr_eq(&heap_before, &heap_after));
-        let result = instance
-            .exports
-            .get_typed_function::<(), i32>(&store, "start_result")
-            .unwrap();
-        let start_id = result.call(&mut store).unwrap();
-        assert!(start_id > 0);
-        let invoke = instance
-            .exports
-            .get_typed_function::<(), i32>(&store, "invoke")
-            .unwrap();
-        assert_eq!(invoke.call(&mut store).unwrap(), start_id);
-        assert_eq!(spawns.load(Ordering::SeqCst), 1);
-        lane_slot.lock().unwrap().as_ref().unwrap().stop();
-        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                false,
+            ),
+        ] {
+            let mut store = Store::default();
+            let module = compile_wat(&store, wat);
+            let (imports, _state) = hooks
+                .additional_imports(&module, &mut store.as_store_mut())
+                .unwrap();
+            let result = Instance::new(&mut store, &module, &imports);
+            if status_only {
+                let instance = result.unwrap();
+                let status = instance
+                    .exports
+                    .get_typed_function::<(), i32>(&store, "start_result")
+                    .unwrap();
+                assert_ne!(status.call(&mut store).unwrap(), 0);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("before instance configuration"),
+                    "{error}"
+                );
+            }
+            assert_eq!(spawns.load(Ordering::SeqCst), 0);
+            assert!(lane_slot.lock().unwrap().is_none());
+        }
     }
 
     #[test]
