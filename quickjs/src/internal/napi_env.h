@@ -193,6 +193,8 @@ struct napi_env__
   const quickjs::detail::napi_module_wrap__ &module_wrap() const;
 
   bool attach_embedder_hooks(const unofficial_napi_env_hooks &hooks);
+  // unofficial_napi_set_env_cleanup_callback: false if another is set.
+  bool set_embedder_cleanup(unofficial_napi_env_cleanup_callback callback, void *data);
 
   // At release: drops the exception a hook or finalizer left pending.
   void drop_finalizer_exception();
@@ -256,6 +258,9 @@ private:
 
   // Cleanup hooks in registration order.
   std::vector<napi_env_cleanup_hook__ *> env_cleanup_hooks_;
+  // The embedder's part of the release.
+  unofficial_napi_env_cleanup_callback embedder_cleanup_callback_ = nullptr;
+  void *embedder_cleanup_data_ = nullptr;
 
   // Hints whose finalizers have yet to run, the most recent first. Declared
   // before the hints' allocator, so it is destroyed after every hint.

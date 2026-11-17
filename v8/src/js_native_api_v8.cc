@@ -241,18 +241,18 @@ void RunEnvCleanupHooks(napi_env env) {
   }
 }
 
-// The embedder's env_cleanup_callback (unofficial_napi_env_hooks), as a
-// cleanup hook runs: in the env's realm, what it leaves pending dropped.
+// The embedder's cleanup callback (unofficial_napi_set_env_cleanup_callback),
+// as a cleanup hook runs: in the env's realm, what it leaves pending dropped.
 // Returns whether it ran anything.
 bool RunEmbedderEnvCleanup(napi_env env) {
-  if (!CheckEnv(env) || env->agent == nullptr) return false;
-  unofficial_napi_env_cleanup_callback callback = env->agent->env_cleanup_callback;
+  if (!CheckEnv(env)) return false;
+  unofficial_napi_env_cleanup_callback callback = env->embedder_cleanup_callback;
   if (callback == nullptr) return false;
   v8::HandleScope handle_scope(env->isolate);
   v8::Context::Scope context_scope(env->main_context());
   napi_realm_frame_scope__ realm_frame(env, nullptr);
   v8::TryCatch try_catch(env->isolate);
-  const bool ran = callback(env, env->agent->env_cleanup_data);
+  const bool ran = callback(env, env->embedder_cleanup_data);
   ClearLastException(env);
   return ran;
 }

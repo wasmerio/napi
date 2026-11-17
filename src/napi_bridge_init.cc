@@ -3776,20 +3776,6 @@ extern "C" int snapi_bridge_unofficial_attach_env(
   return unofficial_napi_attach_env(env, &hooks, accepted_hooks_out);
 }
 
-extern "C" int snapi_bridge_unofficial_get_env_hooks(
-    SnapiEnvState* env_state, int* attached_out, uint64_t* accepted_hooks_out) {
-  BridgeEnvScope env_scope(env_state);
-  auto* bridge_state = env_scope.get();
-  if (bridge_state == nullptr || attached_out == nullptr || accepted_hooks_out == nullptr) {
-    return napi_invalid_arg;
-  }
-  bool attached = false;
-  napi_status status =
-      unofficial_napi_get_env_hooks(bridge_state->env, &attached, accepted_hooks_out);
-  if (status == napi_ok) *attached_out = attached ? 1 : 0;
-  return status;
-}
-
 // Keeps `env_state` allocated (not alive) until the matching unretain, so a
 // holder that hands the pointer to other threads never sees it reused for a
 // different env. Call while the env is alive, e.g. right after creation.

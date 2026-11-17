@@ -415,24 +415,19 @@ extern "C"
             hooks->version != UNOFFICIAL_NAPI_ENV_HOOKS_VERSION ||
             !env->attach_embedder_hooks(*hooks))
             return napi_invalid_arg;
-        // Of the provider-owned hook classes QuickJS drives only the env
-        // cleanup callback (run_cleanup_hooks); the others are attached but
-        // not advertised until the corresponding engine callback exists.
-        *accepted_hooks_out = hooks->env_cleanup_callback != nullptr
-                                  ? static_cast<uint64_t>(unofficial_napi_env_hook_env_cleanup)
-                                  : 0;
-        env->agent()->set_accepted_embedder_hooks(*accepted_hooks_out);
+        // QuickJS currently drives none of the remaining provider-owned hook
+        // classes. Attaching the transaction is valid, but no capability is
+        // advertised until the corresponding engine callback exists.
+        *accepted_hooks_out = 0;
         return napi_ok;
     }
 
-    napi_status NAPI_CDECL unofficial_napi_get_env_hooks(
-        napi_env env, bool *attached_out, uint64_t *accepted_hooks_out)
+    napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+        napi_env env, unofficial_napi_env_cleanup_callback callback, void *data)
     {
-        if (!napi_util__::check_env(env) || attached_out == nullptr || accepted_hooks_out == nullptr)
+        if (!napi_util__::check_env(env) || callback == nullptr)
             return napi_invalid_arg;
-        *attached_out = env->agent()->embedder_hooks_attached();
-        *accepted_hooks_out = env->agent()->accepted_embedder_hooks();
-        return napi_ok;
+        return env->set_embedder_cleanup(callback, data) ? napi_ok : napi_invalid_arg;
     }
 
     napi_status NAPI_CDECL unofficial_napi_release_env(

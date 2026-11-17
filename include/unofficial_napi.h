@@ -139,10 +139,6 @@ typedef void (*unofficial_napi_oom_error_callback)(napi_env env,
                                                    const char* location,
                                                    bool is_heap_oom,
                                                    const char* detail);
-// The embedder's part of an env's release (see unofficial_napi_release_env):
-// runs the cleanup work the embedder keeps for `env` (Edge.js: the
-// napi_add_env_cleanup_hook hooks it defines) and returns whether it ran any.
-typedef bool (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
 
 typedef enum {
   unofficial_napi_env_hook_context_token_assign
@@ -152,7 +148,6 @@ typedef enum {
   unofficial_napi_env_hook_enqueue_foreground_task = 1u << 2,
   unofficial_napi_env_hook_fatal_error = 1u << 3,
   unofficial_napi_env_hook_oom_error = 1u << 4,
-  unofficial_napi_env_hook_env_cleanup = 1u << 5,
 } unofficial_napi_env_hook;
 
 enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
@@ -160,19 +155,6 @@ enum { UNOFFICIAL_NAPI_ENV_HOOKS_VERSION = 1 };
 // Immutable embedder callbacks attached as one complete environment state
 // transition. `size` and `version` make additions ABI-compatible. `data` is
 // owned by the embedder and must remain valid until the environment is released.
-//
-// `env_cleanup_callback(env, data)` lets the embedder run its own cleanup at
-// the env's release, interleaved with the provider's: it runs each time the
-// release runs the cleanup hooks (step 1 of unofficial_napi_release_env),
-// before them, and again whenever the release would otherwise be done. It
-// returns whether it ran anything; while it does, the release goes on, so
-// work a finalizer or hook gives the embedder during the release runs too, on
-// a still-valid env. It must return false once it has nothing left, or the
-// release never ends. It runs as the hooks do: on the env's thread, in the
-// env's realm, with what it leaves pending dropped. It is not called outside
-// the release. An embedder that defines node_api.h's napi_add_env_cleanup_hook
-// keeps those hooks and runs them here. The WASIX host does not accept it
-// (nor the other hooks) from a guest.
 //
 // Deprecated: the context-token callbacks. Use unofficial_napi_create_realm and
 // keep per-realm state keyed by the realm's global instead. They are kept for
@@ -212,7 +194,6 @@ typedef struct {
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback;
   unofficial_napi_fatal_error_callback fatal_error_callback;
   unofficial_napi_oom_error_callback oom_error_callback;
-  unofficial_napi_env_cleanup_callback env_cleanup_callback;
 } unofficial_napi_env_hooks;
 
 // Reads the deprecated fields too, without warning.
@@ -230,8 +211,6 @@ static inline uint64_t unofficial_napi_env_hooks_requested(
     requested |= unofficial_napi_env_hook_fatal_error;
   if (hooks->oom_error_callback != NULL)
     requested |= unofficial_napi_env_hook_oom_error;
-  if (hooks->env_cleanup_callback != NULL)
-    requested |= unofficial_napi_env_hook_env_cleanup;
   return requested;
 }
 UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_END
@@ -249,15 +228,32 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_attach_env(
     napi_env env,
     const unofficial_napi_env_hooks* hooks,
     uint64_t* accepted_hooks_out);
-// Whether hooks are attached to `env` (unofficial_napi_attach_env), and the
-// ones the provider accepted then (0 when none are attached). An embedder
-// asks before relying on one: whether the env's release will call its
-// env_cleanup_callback, say, which neither the WASIX host nor an env no one
-// attached will.
-NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_env_hooks(
+// The embedder's part of an env's release: runs the cleanup work the embedder
+// keeps for `env` (Edge.js: the napi_add_env_cleanup_hook hooks it defines)
+// and returns whether it ran any.
+typedef bool (*unofficial_napi_env_cleanup_callback)(napi_env env, void* data);
+// Sets `callback(env, data)` as the embedder's part of `env`'s release,
+// interleaved with the provider's: it runs each time the release runs the
+// cleanup hooks (step 1 of unofficial_napi_release_env), before them, and
+// again whenever the release would otherwise be done. It returns whether it
+// ran anything; while it does, the release goes on, so work a finalizer or
+// hook gives the embedder during the release runs too, on a still-valid env.
+// It must return false once it has nothing left, or the release never ends.
+// It runs as the hooks do: on the env's thread, in the env's realm, with what
+// it leaves pending dropped. It is not called outside the release.
+//
+// It is apart from unofficial_napi_attach_env, so an embedder can set it
+// before or after attaching its hooks, or without attaching any. An env has
+// one: setting the same callback and data again returns napi_ok and changes
+// nothing, and another callback or data is refused with napi_invalid_arg, so
+// napi_ok means the release will call this one. An embedder that defines
+// node_api.h's napi_add_env_cleanup_hook keeps those hooks and runs them here,
+// and keeps none it cannot run. The WASIX host runs no guest callback at the
+// release and returns napi_generic_failure to a guest.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_env_cleanup_callback(
     napi_env env,
-    bool* attached_out,
-    uint64_t* accepted_hooks_out);
+    unofficial_napi_env_cleanup_callback callback,
+    void* data);
 // Releases an env made by unofficial_napi_create_env and the engine instance
 // it owns. Before anything is freed, the release runs what the env still
 // holds, in this order (the providers' contract; Node up to 20 also finalized
@@ -265,10 +261,9 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_get_env_hooks(
 // other finalizers):
 //
 // 1. The cleanup hooks run, most recent first. A hook added while releasing,
-//    by a hook or by a finalizer, runs too. The embedder's
-//    env_cleanup_callback (unofficial_napi_env_hooks) runs before them, and
-//    again when 1 and 2 have nothing left, which goes on while it runs
-//    something.
+//    by a hook or by a finalizer, runs too. The embedder's cleanup callback
+//    (unofficial_napi_set_env_cleanup_callback) runs before them, and again
+//    when 1 and 2 have nothing left, which goes on while it runs something.
 // 2. The finalizer of every value still pending runs: napi_wrap,
 //    napi_create_external, napi_add_finalizer, external ArrayBuffers and
 //    Buffers. Values of one kind are finalized most recent first, as Node's

@@ -638,29 +638,19 @@ fn guest_unofficial_napi_attach_env(
     status
 }
 
-fn guest_unofficial_napi_get_env_hooks(
-    mut env: FunctionEnvMut<NapiEnv>,
+// The host runs no guest callback at a guest env's release (nor any other
+// unofficial_napi_env_hooks callback from a guest), so it takes none: an
+// embedder learns its cleanup would not run and keeps no work for it.
+fn guest_unofficial_napi_set_env_cleanup_callback(
+    _env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
-    attached_ptr: u32,
-    accepted_hooks_ptr: u32,
+    callback: u32,
+    _data: u32,
 ) -> i32 {
-    if napi_env == 0 || attached_ptr == 0 || accepted_hooks_ptr == 0 {
+    if napi_env == 0 || callback == 0 {
         return 1;
     }
-    let mut attached = 0i32;
-    let mut accepted_hooks = 0u64;
-    let status = unsafe {
-        snapi_bridge_unofficial_get_env_hooks(
-            snapi_env(&env, napi_env),
-            &mut attached,
-            &mut accepted_hooks,
-        )
-    };
-    if status == 0 {
-        write_guest_u8(&mut env, attached_ptr, u8::from(attached != 0));
-        write_guest_u64(&mut env, accepted_hooks_ptr, accepted_hooks);
-    }
-    status
+    9
 }
 
 fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: u32) -> i32 {
@@ -3931,10 +3921,18 @@ fn guest_napi_get_dataview_info(
             snapi_env(&env, e),
             vh,
             &mut bl,
-            &mut host_data_addr,
+            if dp != 0 {
+                &mut host_data_addr
+            } else {
+                std::ptr::null_mut()
+            },
             &mut ab,
             &mut bo,
-            &mut backing_store_token,
+            if dp != 0 {
+                &mut backing_store_token
+            } else {
+                std::ptr::null_mut()
+            },
         )
     };
     if s == 0 {
@@ -6021,7 +6019,7 @@ pub fn register_napi_imports(
         "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
-        "unofficial_napi_get_env_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_env_hooks),
+        "unofficial_napi_set_env_cleanup_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_env_cleanup_callback),
         "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),

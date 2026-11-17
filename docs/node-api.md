@@ -43,9 +43,7 @@ JS. It allocates fallibly: at the memory's limit it fails with
 `napi_generic_failure` instead of aborting. `unofficial_napi_create_uint8array_copy`
 makes one holding a copy of given bytes, with no pointer back (on host JS a
 JavaScript-owned copy; `napi_create_buffer_copy` without `result_data`).
-`unofficial_napi_get_env_hooks` tells whether an env's release will call the
-embedder's `env_cleanup_callback`. The other Buffer calls compose from
-`js_native_api.h`:
+The other Buffer calls compose from `js_native_api.h`:
 
 - `napi_create_external_buffer`: `napi_create_external_arraybuffer`, then
   `napi_create_typedarray` and `node_api_set_prototype`.
@@ -60,3 +58,17 @@ napi's own APIs that return bytes return plain Uint8Arrays, never Buffers:
 `unofficial_napi_bytecode_serialize`, `unofficial_napi_module_wrap_create_cached_data`
 and the serdes binding's `Serializer#releaseBuffer`. The embedder gives them
 its Buffer prototype where its API promises a Buffer.
+
+## Env cleanup hooks
+
+An embedder that defines `napi_add_env_cleanup_hook` keeps the hooks and runs
+them at the env's release through `unofficial_napi_set_env_cleanup_callback`:
+napi calls that callback in step 1 of `unofficial_napi_release_env`, before
+its own hooks, and again until it runs nothing more. It is set apart from
+`unofficial_napi_attach_env`, at any time and as often as wanted with the same
+callback, so it does not take the env's one attachment: an addon can add a
+hook before the embedder attaches its hooks. An env has one such callback;
+another is refused with `napi_invalid_arg`, so `napi_ok` means the release
+will call this one. The WASIX host runs no guest callback at a release and
+refuses it (`napi_generic_failure`): there, a hook the embedder could not run
+is refused rather than kept.

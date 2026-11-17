@@ -41,7 +41,6 @@ struct Wasm32EnvHooksV1 {
     enqueue_foreground_task_callback: u32,
     fatal_error_callback: u32,
     oom_error_callback: u32,
-    env_cleanup_callback: u32,
 }
 
 #[repr(C)]
@@ -153,7 +152,7 @@ const _: () = assert!(MODULE_CREATE_V2_SIZE == 44);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateJsPayload>() == 16);
 const _: () = assert!(std::mem::size_of::<Wasm32ModuleCreateSyntheticPayload>() == 16);
 const _: () = assert!(MODULE_HOOKS_SIZE == 16);
-const _: () = assert!(ENV_HOOKS_SIZE == 36);
+const _: () = assert!(ENV_HOOKS_SIZE == 32);
 const _: () = assert!(REALM_OPTIONS_SIZE == 28);
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -653,10 +652,6 @@ pub(crate) fn read_env_hooks(
         (
             std::mem::offset_of!(Wasm32EnvHooksV1, oom_error_callback),
             1u64 << 4,
-        ),
-        (
-            std::mem::offset_of!(Wasm32EnvHooksV1, env_cleanup_callback),
-            1u64 << 5,
         ),
     ];
     let mut requested = 0;

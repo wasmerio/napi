@@ -388,6 +388,10 @@ extern "C"
 
     auto rt = JS_GetRuntime(env->context());
     auto buf = js_malloc_rt(rt, byte_length);
+    // The runtime declines past its memory limit: fail, rather than make an
+    // ArrayBuffer of byte_length over no memory.
+    if (buf == nullptr && byte_length > 0)
+      return napi_generic_failure;
     if (data != nullptr)
     {
       *data = buf;

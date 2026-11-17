@@ -905,6 +905,55 @@ TEST_F(Test33TypedArray, CreateUint8ArrayCopyOwnsItsBytes) {
             napi_invalid_arg);
 }
 
+// Memory the provider declines (QuickJS past its runtime's limit) fails the
+// call: never napi_ok with no memory behind the array. V8 keeps backing
+// stores out of the heap limit, so there they are made.
+TEST_F(Test33TypedArray, CreateUint8ArrayFailsWhenTheMemoryIsDeclined) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  options.max_old_generation_size_in_bytes = size_t{2} << 20;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  ASSERT_EQ(unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner),
+            napi_ok);
+  constexpr size_t kLength = size_t{4} << 20;
+  std::vector<uint8_t> source(kLength, 7);
+
+  void* data = nullptr;
+  napi_value array = nullptr;
+  napi_status status = unofficial_napi_create_uint8array(env, kLength, nullptr, &data, &array);
+  if (status == napi_ok) {
+    EXPECT_NE(data, nullptr);
+    EXPECT_NE(array, nullptr);
+  } else {
+    EXPECT_EQ(array, nullptr);
+  }
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  napi_value copy = nullptr;
+  status = unofficial_napi_create_uint8array_copy(env, source.data(), kLength, nullptr, &copy);
+  EXPECT_EQ(status == napi_ok, copy != nullptr);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  void* buffer_data = nullptr;
+  napi_value arraybuffer = nullptr;
+  status = napi_create_arraybuffer(env, kLength, &buffer_data, &arraybuffer);
+  if (status == napi_ok) EXPECT_NE(buffer_data, nullptr);
+#if defined(NAPI_TEST_ENGINE_QUICKJS)
+  EXPECT_EQ(status, napi_generic_failure);
+#endif
+
+  // The env goes on: a small one is made.
+  napi_value small = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array_copy(env, source.data(), 16, nullptr, &small),
+            napi_ok);
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+
 TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
   EnvScope s(runtime_.get());
   napi_value serdes = nullptr;

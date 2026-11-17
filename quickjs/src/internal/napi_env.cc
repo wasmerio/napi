@@ -305,17 +305,25 @@ void napi_env__::clear_refs_for_teardown()
   clearing_refs_for_teardown_ = false;
 }
 
-// The embedder's env_cleanup_callback (unofficial_napi_env_hooks), as a
-// cleanup hook runs. Returns whether it ran anything.
+bool napi_env__::set_embedder_cleanup(unofficial_napi_env_cleanup_callback callback, void *data)
+{
+  if (embedder_cleanup_callback_ != nullptr)
+    return embedder_cleanup_callback_ == callback && embedder_cleanup_data_ == data;
+  embedder_cleanup_callback_ = callback;
+  embedder_cleanup_data_ = data;
+  return true;
+}
+
+// The embedder's cleanup callback (unofficial_napi_set_env_cleanup_callback),
+// as a cleanup hook runs. Returns whether it ran anything.
 bool napi_env__::run_embedder_cleanup()
 {
-  const unofficial_napi_env_hooks &hooks = agent_->embedder_hooks();
-  if (hooks.env_cleanup_callback == nullptr)
+  if (embedder_cleanup_callback_ == nullptr)
     return false;
   bool ran = false;
   {
     napi_realm_frame_scope__ realm_frame{this, nullptr, JS_UNDEFINED};
-    ran = hooks.env_cleanup_callback(this, hooks.data);
+    ran = embedder_cleanup_callback_(this, embedder_cleanup_data_);
   }
   drop_finalizer_exception();
   return ran;

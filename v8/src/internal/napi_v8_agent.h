@@ -65,16 +65,11 @@ struct napi_agent__ {
 
   // Embedder hooks from unofficial_napi_attach_env, attached once.
   bool embedder_hooks_attached = false;
-  // What unofficial_napi_attach_env accepted.
-  uint64_t accepted_embedder_hooks = 0;
   unofficial_napi_fatal_error_callback fatal_error_callback = nullptr;
   unofficial_napi_oom_error_callback oom_error_callback = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback =
       nullptr;
   void* enqueue_foreground_task_target = nullptr;
-  // Runs at the release of the agent's env, with the hooks' `data`.
-  unofficial_napi_env_cleanup_callback env_cleanup_callback = nullptr;
-  void* env_cleanup_data = nullptr;
   // The deprecated context-token hooks, called for the realms of the agent's
   // env. `context_token_data` is the hooks' `data`.
   unofficial_napi_context_token_callback context_token_assign_callback = nullptr;

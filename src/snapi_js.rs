@@ -1342,22 +1342,99 @@ export function wasmer_napi_uint8array_copy(buffer, offset, length) {
     [new IntrinsicUint8Array(buffer, offset, length)]);
   return copy;
 }
+// The intrinsic getters that read a view's layout from its internal slots,
+// captured at load. What a script can change does not reach them: a view's
+// own `length` (a Buffer may have one), a replaced getter on a prototype, or
+// a replaced Function.prototype.call. They work on the views of any realm
+// (Edge's virtual global's included), where `instanceof` would not.
+const wasmerNapiSlotGetter = (prototype, key) =>
+  Function.call.bind(Object.getOwnPropertyDescriptor(prototype, key).get);
+const wasmerNapiTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const wasmerNapiTypedArrayName =
+  wasmerNapiSlotGetter(wasmerNapiTypedArrayPrototype, Symbol.toStringTag);
+const wasmerNapiTypedArrayBuffer = wasmerNapiSlotGetter(wasmerNapiTypedArrayPrototype, 'buffer');
+const wasmerNapiTypedArrayLength = wasmerNapiSlotGetter(wasmerNapiTypedArrayPrototype, 'length');
+const wasmerNapiTypedArrayByteOffset =
+  wasmerNapiSlotGetter(wasmerNapiTypedArrayPrototype, 'byteOffset');
+const wasmerNapiTypedArrayByteLength =
+  wasmerNapiSlotGetter(wasmerNapiTypedArrayPrototype, 'byteLength');
+const wasmerNapiDataViewBuffer = wasmerNapiSlotGetter(DataView.prototype, 'buffer');
+const wasmerNapiDataViewByteOffset = wasmerNapiSlotGetter(DataView.prototype, 'byteOffset');
+const wasmerNapiDataViewByteLength = wasmerNapiSlotGetter(DataView.prototype, 'byteLength');
+const wasmerNapiSharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+  ? wasmerNapiSlotGetter(SharedArrayBuffer.prototype, 'byteLength')
+  : undefined;
+// napi_typedarray_type by [[TypedArrayName]].
+const wasmerNapiTypedArrayKinds = Object.freeze({
+  __proto__: null,
+  Int8Array: 0, Uint8Array: 1, Uint8ClampedArray: 2, Int16Array: 3, Uint16Array: 4,
+  Int32Array: 5, Uint32Array: 6, Float32Array: 7, Float64Array: 8, BigInt64Array: 9,
+  BigUint64Array: 10, Float16Array: 11,
+});
 export function wasmer_napi_typed_array_kind(value) {
-  const names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
-    'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
-    'BigInt64Array', 'BigUint64Array', 'Float16Array'];
-  // `instanceof globalThis.Uint8Array` rejects genuine views created through
-  // Edge's virtual global (and any other same-origin realm). ArrayBuffer's
-  // intrinsic brand check is realm-independent; the intrinsic tag then gives
-  // us the N-API typed-array enum without trusting the current global's
-  // constructors.
-  if (!ArrayBuffer.isView(value)) return -1;
-  const tag = Object.prototype.toString.call(value);
-  return names.indexOf(tag.slice(8, -1));
+  // %TypedArray%.prototype[@@toStringTag] is a typed array's
+  // [[TypedArrayName]], and undefined for anything else (a DataView, a
+  // Proxy), without throwing or running the value's code.
+  const kind = wasmerNapiTypedArrayKinds[wasmerNapiTypedArrayName(value)];
+  return kind === undefined ? -1 : kind;
+}
+// [kind, buffer, length, byteOffset, byteLength] of a typed array, from its
+// internal slots (length and offsets are 0 once its buffer is detached or it
+// is out of bounds), or null for anything else.
+export function wasmer_napi_typed_array_info(value) {
+  const kind = wasmer_napi_typed_array_kind(value);
+  if (kind < 0) return null;
+  return [kind, wasmerNapiTypedArrayBuffer(value), wasmerNapiTypedArrayLength(value),
+    wasmerNapiTypedArrayByteOffset(value), wasmerNapiTypedArrayByteLength(value)];
+}
+// [buffer, byteOffset, byteLength] of a DataView, from its internal slots
+// (offsets 0 once its buffer is detached or it is out of bounds, where those
+// getters throw), or null for anything else.
+export function wasmer_napi_dataview_info(value) {
+  let buffer;
+  try {
+    buffer = wasmerNapiDataViewBuffer(value);
+  } catch {
+    return null;
+  }
+  try {
+    return [buffer, wasmerNapiDataViewByteOffset(value), wasmerNapiDataViewByteLength(value)];
+  } catch {
+    return [buffer, 0, 0];
+  }
+}
+// An intrinsic Uint8Array over the bytes an ArrayBuffer, SharedArrayBuffer,
+// typed array or DataView covers (empty once detached), or null for anything
+// else.
+export function wasmer_napi_byte_view(value) {
+  let range = null;
+  const view = wasmer_napi_typed_array_info(value);
+  if (view !== null) {
+    range = [view[1], view[3], view[4]];
+  } else {
+    range = wasmer_napi_dataview_info(value);
+  }
+  if (range === null) {
+    try {
+      range = [value, 0, wasmerNapiArrayBufferByteLength(value)];
+    } catch {
+      try {
+        if (wasmerNapiSharedArrayBufferByteLength === undefined) return null;
+        range = [value, 0, wasmerNapiSharedArrayBufferByteLength(value)];
+      } catch {
+        return null;
+      }
+    }
+  }
+  try {
+    return new wasmerNapiUint8Array(range[0], range[1], range[2]);
+  } catch {
+    return new wasmerNapiUint8Array(0);
+  }
 }
 export function wasmer_napi_is_arraybuffer(value) {
   try {
-    Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get.call(value);
+    wasmerNapiArrayBufferByteLength(value);
     return true;
   } catch {
     return false;
@@ -1393,8 +1470,10 @@ export function wasmer_napi_arraybuffer_detached_state(value) {
   }
 }
 export function wasmer_napi_is_dataview(value) {
+  // The buffer getter: byteLength throws for a DataView whose buffer is
+  // detached, which is still a DataView.
   try {
-    Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get.call(value);
+    wasmerNapiDataViewBuffer(value);
     return true;
   } catch {
     return false;
@@ -1740,6 +1819,9 @@ extern "C" {
         length: u32,
     ) -> Result<JsValue, JsValue>;
     fn wasmer_napi_typed_array_kind(value: &JsValue) -> i32;
+    fn wasmer_napi_typed_array_info(value: &JsValue) -> JsValue;
+    fn wasmer_napi_dataview_info(value: &JsValue) -> JsValue;
+    fn wasmer_napi_byte_view(value: &JsValue) -> JsValue;
     fn wasmer_napi_is_arraybuffer(value: &JsValue) -> bool;
     fn wasmer_napi_arraybuffer_detached_state(value: &JsValue) -> i32;
     fn wasmer_napi_is_dataview(value: &JsValue) -> bool;
@@ -2561,25 +2643,19 @@ fn store_bytes(data: Vec<u8>) -> u64 {
     ptr as u64
 }
 
+// The bytes a buffer or view covers, located through its internal slots
+// (wasmer_napi_byte_view), never its overridable properties.
 fn value_byte_view(value: &JsValue) -> Option<Uint8Array> {
-    if value.is_instance_of::<ArrayBuffer>() || value.is_instance_of::<SharedArrayBuffer>() {
-        return Some(Uint8Array::new(value));
+    let view = wasmer_napi_byte_view(value);
+    if view.is_null() {
+        None
+    } else {
+        Some(view.unchecked_into())
     }
-    if ArrayBuffer::is_view(value) {
-        let buffer = Reflect::get(value, &JsValue::from_str("buffer")).ok()?;
-        let byte_offset = Reflect::get(value, &JsValue::from_str("byteOffset"))
-            .ok()?
-            .as_f64()? as u32;
-        let byte_length = Reflect::get(value, &JsValue::from_str("byteLength"))
-            .ok()?
-            .as_f64()? as u32;
-        return Some(Uint8Array::new_with_byte_offset_and_length(
-            &buffer,
-            byte_offset,
-            byte_length,
-        ));
-    }
-    None
+}
+
+fn info_u32(info: &Array, index: u32) -> u32 {
+    info.get(index).as_f64().unwrap_or(0.0) as u32
 }
 
 fn value_bytes(value: &JsValue) -> Option<Vec<u8>> {
@@ -4817,25 +4893,6 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_set_continuation_preserved_embe
 ) -> i32 {
     let _ = (env, value_id);
     NAPI_GENERIC_FAILURE
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapi_bridge_unofficial_get_env_hooks(
-    env: SnapiEnv,
-    attached_out: *mut i32,
-    accepted_hooks_out: *mut u64,
-) -> i32 {
-    let Ok(state) = (unsafe { env_mut(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    if attached_out.is_null() || accepted_hooks_out.is_null() {
-        return NAPI_INVALID_ARG;
-    }
-    // This backend accepts no hooks (see snapi_bridge_unofficial_attach_env).
-    unsafe {
-        attached_out.write(i32::from(state.agent.embedder_hooks_attached));
-        accepted_hooks_out.write(0);
-    }
-    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -7364,21 +7421,17 @@ pub unsafe extern "C" fn snapi_bridge_get_typedarray_info(
     let Some(value) = state.agent.get(id).cloned() else {
         return NAPI_INVALID_ARG;
     };
-    let kind = wasmer_napi_typed_array_kind(&value);
-    if kind < 0 {
+    // From the view's internal slots: a Buffer's own `length`, say, is not
+    // its length.
+    let info = wasmer_napi_typed_array_info(&value);
+    if info.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let Ok(buffer) = Reflect::get(&value, &JsValue::from_str("buffer")) else {
-        return NAPI_INVALID_ARG;
-    };
-    let length = Reflect::get(&value, &JsValue::from_str("length"))
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as u32;
-    let byte_offset = Reflect::get(&value, &JsValue::from_str("byteOffset"))
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as u32;
+    let info: Array = info.unchecked_into();
+    let kind = info.get(0).as_f64().unwrap_or(-1.0) as i32;
+    let buffer = info.get(1);
+    let length = info_u32(&info, 2);
+    let byte_offset = info_u32(&info, 3);
     if (!type_out.is_null() && unsafe { write(type_out, kind) }.is_err())
         || (!length_out.is_null() && unsafe { write(length_out, length) }.is_err())
         || (!byte_offset_out.is_null() && unsafe { write(byte_offset_out, byte_offset) }.is_err())
@@ -7386,12 +7439,7 @@ pub unsafe extern "C" fn snapi_bridge_get_typedarray_info(
         return NAPI_INVALID_ARG;
     }
     if !data_out.is_null() {
-        let byte_length = Reflect::get(&value, &JsValue::from_str("byteLength"))
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as u32;
-        let raw =
-            Uint8Array::new_with_byte_offset_and_length(&buffer, byte_offset, byte_length).to_vec();
+        let raw = value_byte_view(&value).map(|view| view.to_vec()).unwrap_or_default();
         let data = store_bytes(raw);
         if unsafe { write(data_out, data) }.is_err() {
             return NAPI_INVALID_ARG;
@@ -7432,16 +7480,44 @@ pub unsafe extern "C" fn snapi_bridge_get_dataview_info(
     byte_offset_out: *mut u32,
     backing_store_token_out: *mut u64,
 ) -> i32 {
-    let _ = (
-        env,
-        id,
-        byte_length_out,
-        data_out,
-        arraybuffer_out,
-        byte_offset_out,
-        backing_store_token_out,
-    );
-    NAPI_GENERIC_FAILURE
+    let Ok(state) = (unsafe { env_mut(env) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(value) = state.agent.get(id).cloned() else {
+        return NAPI_INVALID_ARG;
+    };
+    let info = wasmer_napi_dataview_info(&value);
+    if info.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let info: Array = info.unchecked_into();
+    let buffer = info.get(0);
+    let byte_offset = info_u32(&info, 1);
+    let byte_length = info_u32(&info, 2);
+    if (!byte_length_out.is_null() && unsafe { write(byte_length_out, byte_length) }.is_err())
+        || (!byte_offset_out.is_null() && unsafe { write(byte_offset_out, byte_offset) }.is_err())
+    {
+        return NAPI_INVALID_ARG;
+    }
+    if !data_out.is_null() {
+        let raw = value_byte_view(&value).map(|view| view.to_vec()).unwrap_or_default();
+        if unsafe { write(data_out, store_bytes(raw)) }.is_err() {
+            return NAPI_INVALID_ARG;
+        }
+        if !backing_store_token_out.is_null() {
+            let backing_store_token = state.agent.backing_store_token(id).unwrap_or(id as u64);
+            if unsafe { write(backing_store_token_out, backing_store_token) }.is_err() {
+                return NAPI_INVALID_ARG;
+            }
+        }
+    }
+    if !arraybuffer_out.is_null() {
+        let buffer_id = state.agent.insert(buffer);
+        if unsafe { write(arraybuffer_out, buffer_id) }.is_err() {
+            return NAPI_INVALID_ARG;
+        }
+    }
+    NAPI_OK
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapi_bridge_create_external(
@@ -8449,6 +8525,135 @@ mod tests {
             };
             assert_eq!(left_behind(returning), (0, false));
             assert_eq!(left_behind(throwing), (0, true));
+        });
+    }
+
+    // napi_get_typedarray_info, napi_get_dataview_info and
+    // napi_get_buffer_info locate a view's bytes through its internal slots:
+    // an own `length` (a Buffer may have one) or `byteLength` changes nothing.
+    #[wasm_bindgen_test]
+    fn view_info_comes_from_internal_slots() {
+        with_env(|env, state| {
+            let make = Function::new_no_args(
+                "const buffer = new ArrayBuffer(16);\
+                 new Uint8Array(buffer).forEach((_, i, a) => { a[i] = i; });\
+                 const bytes = new Uint8Array(buffer, 4, 8);\
+                 Object.defineProperty(bytes, 'length', { value: 999 });\
+                 Object.defineProperty(bytes, 'byteOffset', { value: 999 });\
+                 Object.defineProperty(bytes, 'byteLength', { value: 999 });\
+                 const view = new DataView(buffer, 2, 6);\
+                 Object.defineProperty(view, 'byteLength', { value: 999 });\
+                 Object.defineProperty(view, 'byteOffset', { value: 999 });\
+                 const detached = new DataView(new ArrayBuffer(4), 1, 2);\
+                 detached.buffer.transfer?.();\
+                 return [bytes, view, detached];",
+            );
+            let values: Array = make.call0(&JsValue::UNDEFINED).unwrap().unchecked_into();
+            let bytes = state.agent.insert(values.get(0));
+            let view = state.agent.insert(values.get(1));
+            let detached = state.agent.insert(values.get(2));
+            let null32 = std::ptr::null_mut::<u32>();
+            let null64 = std::ptr::null_mut::<u64>();
+
+            let (mut kind, mut length, mut offset) = (-1, 0u32, 0u32);
+            let mut data = 0u64;
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_get_typedarray_info(
+                        env,
+                        bytes,
+                        &mut kind,
+                        &mut length,
+                        &mut data,
+                        null32,
+                        &mut offset,
+                        null64,
+                    )
+                },
+                NAPI_OK
+            );
+            assert_eq!((kind, length, offset), (1, 8, 4));
+            let copied = unsafe { std::slice::from_raw_parts(data as *const u8, 8) }.to_vec();
+            assert_eq!(copied, (4u8..12).collect::<Vec<_>>());
+            unsafe { snapi_bridge_free_buffer(data as *mut c_void) };
+
+            let mut byte_length = 0u32;
+            let mut buffer_id = 0u32;
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_get_dataview_info(
+                        env,
+                        view,
+                        &mut byte_length,
+                        &mut data,
+                        &mut buffer_id,
+                        &mut offset,
+                        null64,
+                    )
+                },
+                NAPI_OK
+            );
+            assert_eq!((byte_length, offset), (6, 2));
+            let copied = unsafe { std::slice::from_raw_parts(data as *const u8, 6) }.to_vec();
+            assert_eq!(copied, (2u8..8).collect::<Vec<_>>());
+            unsafe { snapi_bridge_free_buffer(data as *mut c_void) };
+            assert!(value(env, buffer_id).is_instance_of::<ArrayBuffer>());
+
+            // napi_get_buffer_info: the bytes the view covers, a DataView too.
+            let mut size = 0u32;
+            assert_eq!(
+                unsafe { snapi_bridge_get_buffer_info(env, bytes, &mut data, &mut size, null64) },
+                NAPI_OK
+            );
+            assert_eq!(size, 8);
+            unsafe { snapi_bridge_free_buffer(data as *mut c_void) };
+            assert_eq!(
+                unsafe { snapi_bridge_get_buffer_info(env, view, &mut data, &mut size, null64) },
+                NAPI_OK
+            );
+            assert_eq!(size, 6);
+            unsafe { snapi_bridge_free_buffer(data as *mut c_void) };
+
+            // A DataView over a detached buffer is still one, of no bytes.
+            let mut is_view = 0;
+            assert_eq!(
+                unsafe { snapi_bridge_is_dataview(env, detached, &mut is_view) },
+                NAPI_OK
+            );
+            assert_eq!(is_view, 1);
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_get_dataview_info(
+                        env,
+                        detached,
+                        &mut byte_length,
+                        null64,
+                        null32,
+                        &mut offset,
+                        null64,
+                    )
+                },
+                NAPI_OK
+            );
+            assert_eq!((byte_length, offset), (0, 0));
+
+            // Neither call takes the other's view.
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_get_dataview_info(
+                        env, bytes, &mut byte_length, null64, null32, null32, null64,
+                    )
+                },
+                NAPI_INVALID_ARG
+            );
+            assert_eq!(
+                unsafe {
+                    snapi_bridge_get_typedarray_info(
+                        env, view, &mut kind, &mut length, null64, null32, null32, null64,
+                    )
+                },
+                NAPI_INVALID_ARG
+            );
         });
     }
 

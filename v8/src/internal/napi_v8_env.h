@@ -185,6 +185,9 @@ struct napi_env__ {
   void* instance_data_finalize_hint = nullptr;
   std::vector<napi_env_cleanup_hook__*> env_cleanup_hooks;
   uint64_t env_cleanup_hook_counter = 0;
+  // The embedder's part of the release (unofficial_napi_set_env_cleanup_callback).
+  unofficial_napi_env_cleanup_callback embedder_cleanup_callback = nullptr;
+  void* embedder_cleanup_data = nullptr;
   std::vector<napi_buffer_record__*> buffer_records;
   std::unordered_set<napi_external_backing_store_hint__*> external_backing_store_hints;
   // The array buffers of the external stores with a user finalizer, by store

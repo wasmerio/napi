@@ -21,6 +21,14 @@
 #include <vector>
 
 #if defined(_WIN32)
+// windows.h would otherwise define min and max macros, which break the
+// std::min and std::numeric_limits<...>::max() calls below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <sys/mman.h>
@@ -726,9 +734,17 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
   // aborts the process on a request it cannot serve instead of returning
   // null, so new ArrayBuffer(2 ** 32) would crash. Free gets the length the
   // store was allocated with, which picks the same path.
+  //
+  // Not with the V8 sandbox: backing stores must then lie inside the
+  // sandbox's reserved address space (V8 checks), which only the default
+  // allocator allocates from, and it does not go through malloc.
+#if defined(V8_ENABLE_SANDBOX)
+  static bool IsLargeBackingStore(size_t /*length*/) { return false; }
+#else
   static constexpr size_t kLargeBackingStore = size_t{1} << 20;
 
   static bool IsLargeBackingStore(size_t length) { return length >= kLargeBackingStore; }
+#endif
 
   static void* AllocateLargeBackingStore(size_t length) {
 #if defined(_WIN32)
@@ -2032,8 +2048,6 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   agent->context_token_data = hooks->data;
   agent->fatal_error_callback = hooks->fatal_error_callback;
   agent->oom_error_callback = hooks->oom_error_callback;
-  agent->env_cleanup_callback = hooks->env_cleanup_callback;
-  agent->env_cleanup_data = hooks->data;
   {
     // Backing-store deleters read the hook on other threads.
     std::lock_guard<std::mutex> lock(NapiV8ExternalHintsMutex());
@@ -2047,18 +2061,21 @@ napi_status NAPI_CDECL unofficial_napi_attach_env(
   env->isolate->SetOOMErrorHandler(
       hooks->oom_error_callback != nullptr ? OOMErrorCallback : nullptr);
   *accepted_hooks_out = unofficial_napi_env_hooks_requested(hooks);
-  agent->accepted_embedder_hooks = *accepted_hooks_out;
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_get_env_hooks(
-    napi_env env, bool* attached_out, uint64_t* accepted_hooks_out) {
-  if (env == nullptr || env->agent == nullptr || attached_out == nullptr ||
-      accepted_hooks_out == nullptr) {
+napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_env env, unofficial_napi_env_cleanup_callback callback, void* data) {
+  if (env == nullptr || env->isolate == nullptr || callback == nullptr) {
     return napi_invalid_arg;
   }
-  *attached_out = env->agent->embedder_hooks_attached;
-  *accepted_hooks_out = env->agent->accepted_embedder_hooks;
+  if (env->embedder_cleanup_callback != nullptr) {
+    return env->embedder_cleanup_callback == callback && env->embedder_cleanup_data == data
+               ? napi_ok
+               : napi_invalid_arg;
+  }
+  env->embedder_cleanup_callback = callback;
+  env->embedder_cleanup_data = data;
   return napi_ok;
 }
 

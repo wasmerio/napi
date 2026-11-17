@@ -35,7 +35,6 @@ typedef struct {
   uint32_t enqueue_foreground_task_callback;
   uint32_t fatal_error_callback;
   uint32_t oom_error_callback;
-  uint32_t env_cleanup_callback;
 } unofficial_napi_wasm32_env_hooks_v1;
 
 typedef struct {
@@ -106,7 +105,7 @@ typedef struct {
 #if defined(__cplusplus)
 static_assert(sizeof(unofficial_napi_wasm32_runtime_options_v1) == 16);
 static_assert(sizeof(unofficial_napi_wasm32_env_create_options_v1) == 48);
-static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 36);
+static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 32);
 static_assert(sizeof(unofficial_napi_wasm32_js_source) == 12);
 static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v1) == 48);
 static_assert(sizeof(unofficial_napi_wasm32_bytecode_open_options_v2) == 52);
@@ -119,7 +118,7 @@ _Static_assert(sizeof(unofficial_napi_wasm32_runtime_options_v1) == 16,
                "wasm32 runtime-options wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_env_create_options_v1) == 48,
                "wasm32 env-create wire layout changed");
-_Static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 36,
+_Static_assert(sizeof(unofficial_napi_wasm32_env_hooks_v1) == 32,
                "wasm32 env-hooks wire layout changed");
 _Static_assert(sizeof(unofficial_napi_wasm32_js_source) == 12,
                "wasm32 JS-source wire layout changed");
