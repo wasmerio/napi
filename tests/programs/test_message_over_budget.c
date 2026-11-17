@@ -4,8 +4,21 @@
 #include "napi_test_helpers.h"
 #include "unofficial_napi.h"
 
-// A message bigger than what the budget has left fails like V8's own clone
-// out-of-memory error, which JavaScript can catch; a small one still works.
+static int check_clone_out_of_memory(napi_env env) {
+  napi_value error;
+  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &error));
+  napi_value text;
+  NAPI_CALL(env, napi_coerce_to_string(env, error, &text));
+  char buffer[256] = {0};
+  size_t length = 0;
+  NAPI_CALL(env, napi_get_value_string_utf8(env, text, buffer, sizeof buffer, &length));
+  printf("REFUSAL=%s\n", buffer);
+  CHECK_OR_FAIL(strstr(buffer, "out of memory") != NULL, "not a clone out-of-memory error");
+  return 0;
+}
+
+// Message creation and structured clone both report a retrievable exception
+// when serialization exceeds the remaining budget.
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -20,18 +33,17 @@ int main(void) {
   napi_status status = unofficial_napi_message_create(env, big, &message);
   CHECK_OR_FAIL(status == napi_pending_exception, "the big message was not refused");
   CHECK_OR_FAIL(message == NULL, "a refused message was returned");
-  napi_value error;
-  NAPI_CALL(env, napi_get_and_clear_last_exception(env, &error));
-  napi_value text;
-  NAPI_CALL(env, napi_coerce_to_string(env, error, &text));
-  char buffer[256] = {0};
-  size_t length = 0;
-  NAPI_CALL(env, napi_get_value_string_utf8(env, text, buffer, sizeof buffer, &length));
-  printf("REFUSAL=%s\n", buffer);
-  CHECK_OR_FAIL(strstr(buffer, "out of memory") != NULL, "not a clone out-of-memory error");
+  if (check_clone_out_of_memory(env) != 0) return 1;
+
+  napi_value cloned = NULL;
+  status = unofficial_napi_structured_clone(env, big, NULL, &cloned);
+  CHECK_OR_FAIL(status == napi_pending_exception, "the big clone was not refused");
+  CHECK_OR_FAIL(cloned == NULL, "a refused clone was returned");
+  if (check_clone_out_of_memory(env) != 0) return 1;
 
   napi_value small;
   NAPI_CALL(env, napi_create_int32(env, 7, &small));
+  NAPI_CALL(env, unofficial_napi_structured_clone(env, small, NULL, &cloned));
   NAPI_CALL(env, unofficial_napi_message_create(env, small, &message));
   napi_value received;
   NAPI_CALL(env, unofficial_napi_message_take(env, message, &received));
